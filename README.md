@@ -11,7 +11,7 @@ A comprehensive payment infrastructure system with multi-role authentication, PS
 - **WebSocket** real-time updates
 - **Production Ready** with environment variables
 
-## 🚀 Quick Start
+## 🚀 Quick Start (Updated for Render Deployment)
 
 ### Environment Variables
 
