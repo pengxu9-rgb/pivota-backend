@@ -1,0 +1,83 @@
+{
+  "summary": {
+    "total": 989,
+    "success": 987,
+    "fail": 1,
+    "retries": 1
+  },
+  "psp": {
+    "stripe": {
+      "success_count": 987,
+      "fail_count": 0,
+      "retry_count": 1,
+      "avg_latency": 200.0,
+      "total": 988
+    },
+    "adyen": {
+      "success_count": 0,
+      "fail_count": 1,
+      "retry_count": 0,
+      "avg_latency": 450.0,
+      "total": 1
+    }
+  },
+  "agent": {
+    "AGENT_001": {
+      "success_count": 1,
+      "fail_count": 0,
+      "retry_count": 1,
+      "avg_latency": 275.0,
+      "total": 2,
+      "agent_name": "TravelBot A"
+    },
+    "AGENT_002": {
+      "success_count": 0,
+      "fail_count": 1,
+      "retry_count": 0,
+      "avg_latency": 450.0,
+      "total": 1,
+      "agent_name": "ShoppingBot B"
+    },
+    "AGENT_TEST": {
+      "success_count": 986,
+      "fail_count": 0,
+      "retry_count": 0,
+      "avg_latency": 200.0,
+      "total": 986,
+      "agent_name": "Test Agent"
+    }
+  },
+  "merchant": {
+    "MERCH_001": {
+      "success_count": 1,
+      "fail_count": 0,
+      "retry_count": 1,
+      "avg_latency": 275.0,
+      "total": 2,
+      "merchant_name": "Shopify Store A"
+    },
+    "MERCH_002": {
+      "success_count": 0,
+      "fail_count": 1,
+      "retry_count": 0,
+      "avg_latency": 450.0,
+      "total": 1,
+      "merchant_name": "Wix Store B"
+    },
+    "MERCH_TEST": {
+      "success_count": 986,
+      "fail_count": 0,
+      "retry_count": 0,
+      "avg_latency": 200.0,
+      "total": 986,
+      "merchant_name": "Test Merchant"
+    }
+  },
+  "psp_usage": {
+    "stripe": 988,
+    "adyen": 1
+  },
+  "timestamp": 1760331950.1185238,
+  "window_size_seconds": 3600,
+  "total_events": 989
+}

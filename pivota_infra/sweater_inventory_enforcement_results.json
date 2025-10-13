@@ -1,0 +1,12 @@
+[
+  {
+    "variant_id": 52108743410003,
+    "status": "expected_failure",
+    "error": "HTTP 201"
+  },
+  {
+    "variant_id": 52108743442771,
+    "status": "expected_failure",
+    "error": "HTTP 201"
+  }
+]

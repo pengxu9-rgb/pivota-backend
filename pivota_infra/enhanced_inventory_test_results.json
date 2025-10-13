@@ -1,0 +1,17 @@
+[
+  {
+    "scenario": "Test with Available Stock (Should Succeed)",
+    "result": "success_as_expected",
+    "order_id": 6912079757651
+  },
+  {
+    "scenario": "Test with Over-Stock (Should FAIL)",
+    "result": "failure_as_expected",
+    "error": "Cannot fulfill order: XL has INSUFFICIENT STOCK (1 available, 2 requested). Inventory policy is set to 'deny' which prevents overselling."
+  },
+  {
+    "scenario": "Test with Exact Stock (Should Succeed)",
+    "result": "success_as_expected",
+    "order_id": 6912079823187
+  }
+]

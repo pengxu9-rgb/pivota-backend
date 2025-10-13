@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PSP Metrics Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        table { border-collapse: collapse; width: 50%; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+        th { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <h1>PSP Metrics Dashboard</h1>
+    <table>
+        <thead>
+            <tr>
+                <th>PSP</th>
+                <th>Success Rate</th>
+                <th>Latency (ms)</th>
+                <th>Cost</th>
+            </tr>
+        </thead>
+        <tbody id="metrics-body">
+        </tbody>
+    </table>
+
+    <script>
+        async function fetchMetrics() {
+            const response = await fetch("/psp/metrics");
+            const data = await response.json();
+            const tbody = document.getElementById("metrics-body");
+            tbody.innerHTML = "";
+            for (let psp in data.metrics) {
+                const row = `<tr>
+                    <td>${psp}</td>
+                    <td>${(data.metrics[psp].success_rate*100).toFixed(2)}%</td>
+                    <td>${data.metrics[psp].latency}</td>
+                    <td>${data.metrics[psp].cost}</td>
+                </tr>`;
+                tbody.innerHTML += row;
+            }
+        }
+
+        fetchMetrics();
+        setInterval(fetchMetrics, 3000); // refresh every 3s
+    </script>
+</body>
+</html>

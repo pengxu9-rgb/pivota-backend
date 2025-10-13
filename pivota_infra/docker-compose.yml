@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  pivota-dashboard:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/pivota
+      - JWT_SECRET_KEY=your-super-secret-jwt-key-change-this-in-production
+      - STRIPE_SECRET_KEY=sk_test_your_stripe_key
+      - ADYEN_API_KEY=your_adyen_api_key
+      - ADYEN_MERCHANT_ACCOUNT=your_merchant_account
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./pivota_infra:/app/pivota_infra
+
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_DB: pivota
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:6-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:

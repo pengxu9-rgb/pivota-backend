@@ -1,0 +1,24 @@
+[
+  {
+    "scenario": "Test with Available Stock (Should NOT be $0.00)",
+    "success": true,
+    "shopify_order_id": 6912073990483,
+    "warnings": []
+  },
+  {
+    "scenario": "Test with Low Stock (Should show warnings)",
+    "success": true,
+    "shopify_order_id": 6912074056019,
+    "warnings": [
+      "XL: INSUFFICIENT STOCK (1 available, 2 requested)"
+    ]
+  },
+  {
+    "scenario": "Test with Very Low Stock (Should adjust quantity)",
+    "success": true,
+    "shopify_order_id": 6912074088787,
+    "warnings": [
+      "XL: INSUFFICIENT STOCK (3 available, 5 requested)"
+    ]
+  }
+]
