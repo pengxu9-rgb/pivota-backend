@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+stripe
+SQLAlchemy
+Databases
+pydantic
+pydantic-settings
+alembic      # optional for migrations later
+aiosqlite    # required for sqlite async driver
