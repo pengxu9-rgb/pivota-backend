@@ -23,7 +23,9 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
 # User Role Types
-class UserRole(str):
+from enum import Enum
+
+class UserRole(str, Enum):
     EMPLOYEE = "employee"
     AGENT = "agent"
     MERCHANT = "merchant"
