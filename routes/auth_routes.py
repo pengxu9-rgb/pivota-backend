@@ -5,7 +5,8 @@ Supports the Lovable admin approval system
 
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
+from typing import Optional
 from typing import Optional, List
 import jwt
 import hashlib
@@ -31,13 +32,13 @@ class UserRole(str):
 
 # Pydantic Models
 class UserSignup(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     role: UserRole
     full_name: Optional[str] = None
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 class UserProfile(BaseModel):
