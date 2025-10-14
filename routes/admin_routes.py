@@ -214,9 +214,137 @@ admin_store = {
             }
         }
     },
-    "routing_rules": [],
-    "merchant_kyb": {},
-    "system_logs": [],
+    "routing_rules": [
+        {
+            "id": "RULE_1736864340",
+            "name": "EU Cards to Stripe",
+            "rule_type": "geographic",
+            "conditions": {
+                "country": ["FR", "DE", "IT", "ES", "NL"],
+                "currency": "EUR"
+            },
+            "target_psp": "stripe",
+            "enabled": True,
+            "priority": 1,
+            "created_at": "2025-01-13T10:45:00Z",
+            "performance": {
+                "success_rate": 0.96,
+                "avg_latency": 1500,
+                "total_transactions": 1200
+            }
+        },
+        {
+            "id": "RULE_1736864341", 
+            "name": "High Risk to Adyen",
+            "rule_type": "risk_level",
+            "conditions": {
+                "risk_score": ">0.7",
+                "amount": ">1000"
+            },
+            "target_psp": "adyen",
+            "enabled": True,
+            "priority": 2,
+            "created_at": "2025-01-13T11:15:00Z",
+            "performance": {
+                "success_rate": 0.94,
+                "avg_latency": 1600,
+                "total_transactions": 450
+            }
+        }
+    ],
+    "merchant_kyb": {
+        "MERCHANT_1736864340": {
+            "id": "MERCHANT_1736864340",
+            "name": "TechGear Store (Shopify)",
+            "platform": "shopify",
+            "store_url": "https://chydantest.myshopify.com",
+            "status": KYBStatus.APPROVED,
+            "created_at": "2025-01-13T10:30:00Z",
+            "integration_data": {
+                "shop_domain": "chydantest",
+                "platform": "shopify",
+                "store_accessible": True,
+                "integration_status": "connected"
+            },
+            "kyb_documents": [
+                {
+                    "type": "business_license",
+                    "status": "approved",
+                    "uploaded_at": "2025-01-13T10:35:00Z"
+                },
+                {
+                    "type": "bank_statement",
+                    "status": "approved", 
+                    "uploaded_at": "2025-01-13T10:40:00Z"
+                }
+            ],
+            "verification_status": "approved",
+            "volume_processed": 25000,
+            "last_activity": "2025-01-14T09:15:00Z"
+        },
+        "MERCHANT_1736864341": {
+            "id": "MERCHANT_1736864341", 
+            "name": "Fashion Hub (Wix)",
+            "platform": "wix",
+            "store_url": "https://peng652.wixsite.com/aydan-1",
+            "status": KYBStatus.IN_PROGRESS,
+            "created_at": "2025-01-13T11:00:00Z",
+            "integration_data": {
+                "store_url": "https://peng652.wixsite.com/aydan-1",
+                "platform": "wix", 
+                "store_accessible": True,
+                "integration_status": "connected"
+            },
+            "kyb_documents": [
+                {
+                    "type": "business_license",
+                    "status": "pending",
+                    "uploaded_at": "2025-01-13T11:05:00Z"
+                }
+            ],
+            "verification_status": "pending",
+            "volume_processed": 15000,
+            "last_activity": "2025-01-14T08:30:00Z"
+        }
+    },
+    "system_logs": [
+        {
+            "id": "LOG_1736864340",
+            "timestamp": "2025-01-14T09:15:00Z",
+            "level": "INFO",
+            "action": "merchant_kyb_approved",
+            "message": "TechGear Store (Shopify) KYB approved",
+            "details": {
+                "merchant_id": "MERCHANT_1736864340",
+                "platform": "shopify",
+                "documents_verified": 2
+            }
+        },
+        {
+            "id": "LOG_1736864341",
+            "timestamp": "2025-01-14T08:30:00Z", 
+            "level": "WARN",
+            "action": "merchant_kyb_pending",
+            "message": "Fashion Hub (Wix) KYB pending document review",
+            "details": {
+                "merchant_id": "MERCHANT_1736864341",
+                "platform": "wix",
+                "pending_documents": 1
+            }
+        },
+        {
+            "id": "LOG_1736864342",
+            "timestamp": "2025-01-14T10:30:00Z",
+            "level": "SUCCESS", 
+            "action": "psp_health_check",
+            "message": "PSP health check completed successfully",
+            "details": {
+                "stripe_status": "healthy",
+                "adyen_status": "healthy",
+                "total_psps": 2
+            }
+        }
+    ],
     "api_keys": {},
     "webhook_endpoints": {},
     "sandbox_mode": True
