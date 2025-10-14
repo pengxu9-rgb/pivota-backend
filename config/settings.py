@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     """Application settings"""
     
     # Database
-    database_url: str = "sqlite:///./pivota.db"
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./pivota.db")
     
     # API Keys
     stripe_secret_key: Optional[str] = os.getenv("STRIPE_SECRET_KEY")
