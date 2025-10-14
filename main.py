@@ -30,6 +30,7 @@ from routes.simple_ws_routes import router as simple_ws_router
 from routes.auth_routes import router as auth_router
 from routes.auth_ws_routes import router as auth_ws_router
 from routes.debug_routes import router as debug_router
+from routes.eventfeed_routes import router as eventfeed_router
 
 # Service routers (only include what exists)
 try:
@@ -78,6 +79,7 @@ app.include_router(payment_router)
 app.include_router(auth_router)  # Authentication
 app.include_router(auth_ws_router)  # Authenticated WebSocket
 app.include_router(debug_router)  # Debug routes
+app.include_router(eventfeed_router)  # EventFeed routes
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
