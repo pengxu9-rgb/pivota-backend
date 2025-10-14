@@ -1065,61 +1065,6 @@
         }
 
         // Load Merchant KYB
-        async function loadMerchantKYB() {
-            try {
-                const response = await fetch('/admin/merchants/kyb/status', {
-                    headers: {
-                        'Authorization': `Bearer ${authToken}`
-                    }
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-                
-                const data = await response.json();
-                const container = document.getElementById('merchantKYBList');
-                
-                // Show KYB status summary
-                container.innerHTML = `
-                    <div class="kyb-summary">
-                        <div class="summary-card">
-                            <h3>Total Merchants: ${data.total_merchants}</h3>
-                            <p>Pending Review: ${data.pending_review}</p>
-                        </div>
-                        <div class="kyb-status">
-                            <h4>KYB Status Breakdown:</h4>
-                            <ul>
-                                ${Object.entries(data.kyb_status).map(([status, count]) => `
-                                    <li>${status.replace('_', ' ').toUpperCase()}: ${count}</li>
-                                `).join('')}
-                            </ul>
-                        </div>
-                    </div>
-                `;
-                
-            } catch (error) {
-                console.warn('API failed, using demo data:', error);
-                // Use demo data when API fails
-                const container = document.getElementById('merchantKYBList');
-                container.innerHTML = `
-                    <div class="kyb-summary">
-                        <div class="summary-card">
-                            <h3>Total Merchants: 15</h3>
-                            <p>Pending Review: 3</p>
-                        </div>
-                        <div class="kyb-status">
-                            <h4>KYB Status Breakdown:</h4>
-                            <ul>
-                                <li>APPROVED: 12</li>
-                                <li>IN PROGRESS: 2</li>
-                                <li>PENDING DOCUMENTS: 1</li>
-                            </ul>
-                        </div>
-                    </div>
-                `;
-            }
-        }
 
         // Load Analytics
         async function loadAnalytics() {
