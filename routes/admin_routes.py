@@ -1231,7 +1231,18 @@ async def test_endpoint():
         "status": "success",
         "message": "Admin API is working",
         "timestamp": datetime.utcnow().isoformat(),
-        "data_source": "real_time"
+        "data_source": "real_time",
+        "endpoint": "/admin/test"
+    }
+
+# Health check endpoint
+@router.get("/health")
+async def admin_health():
+    """Admin health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "admin",
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 # Analytics

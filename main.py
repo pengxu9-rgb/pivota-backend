@@ -350,5 +350,15 @@ async def health():
         "database": "connected"
     }
 
+@app.get("/test")
+async def test_root():
+    """Simple test endpoint at root level"""
+    return {
+        "status": "success",
+        "message": "Root API is working",
+        "timestamp": time.time(),
+        "endpoint": "/test"
+    }
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
