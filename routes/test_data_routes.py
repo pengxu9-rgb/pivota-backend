@@ -71,9 +71,15 @@ async def generate_sample_data():
         # Also send individual event to WebSocket for EventFeed
         if WS_AVAILABLE:
             try:
+                print(f"🔔 Sending WebSocket event: {event}")
                 await publish_event_to_ws(event)
+                print(f"✅ WebSocket event sent successfully")
             except Exception as e:
-                print(f"Error sending WebSocket event: {e}")
+                print(f"❌ Error sending WebSocket event: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"⚠️ WebSocket not available (WS_AVAILABLE=False)")
         
         events_generated += 1
     
@@ -114,9 +120,15 @@ async def generate_live_events(count: int = 5):
         # Also send individual event to WebSocket for EventFeed
         if WS_AVAILABLE:
             try:
+                print(f"🔔 Sending live WebSocket event: {event}")
                 await publish_event_to_ws(event)
+                print(f"✅ Live WebSocket event sent successfully")
             except Exception as e:
-                print(f"Error sending WebSocket event: {e}")
+                print(f"❌ Error sending live WebSocket event: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"⚠️ WebSocket not available for live events (WS_AVAILABLE=False)")
         
         await asyncio.sleep(0.1)  # Small delay between events
     
