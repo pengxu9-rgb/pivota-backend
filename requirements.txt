@@ -16,3 +16,4 @@ aiohttp      # for async HTTP requests in admin routes
 email-validator  # for email validation in auth routes
 supabase>=2.0.0  # for Supabase integration
 asyncpg      # for PostgreSQL async connections (Supabase)
+psycopg2-binary  # for PostgreSQL synchronous connections (Supabase)
