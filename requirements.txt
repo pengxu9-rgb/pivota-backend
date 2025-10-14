@@ -12,3 +12,4 @@ aiosqlite    # required for sqlite async driver
 PyJWT        # for JWT token handling
 jinja2       # for HTML templates
 websockets   # for WebSocket support
+aiohttp      # for async HTTP requests in admin routes
