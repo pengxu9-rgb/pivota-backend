@@ -445,3 +445,18 @@ async def test_supabase_connection():
             "supabase_service_role_key": "Set" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "Not set",
             "database_accessible": False
         }
+
+@router.get("/test-auth")
+async def test_auth_flow():
+    """Test authentication flow without requiring token"""
+    return {
+        "status": "success",
+        "message": "Auth endpoints are accessible",
+        "endpoints": {
+            "signup": "POST /auth/signup",
+            "signin": "POST /auth/signin", 
+            "me": "GET /auth/me (requires Authorization header)",
+            "admin_users": "GET /auth/admin/users (requires admin token)"
+        },
+        "note": "For /me and /admin/users, include Authorization: Bearer <token> header"
+    }
