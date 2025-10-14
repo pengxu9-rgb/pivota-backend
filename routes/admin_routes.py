@@ -59,7 +59,44 @@ class MerchantKYBRequest(BaseModel):
 
 # In-memory storage for admin system
 admin_store = {
-    "psp_configs": {},
+    "psp_configs": {
+        "stripe": {
+            "psp_id": "stripe",
+            "name": "Stripe",
+            "type": "stripe",
+            "status": "active",
+            "enabled": True,
+            "sandbox_mode": True,
+            "connection_health": "healthy",
+            "api_response_time": 1500,
+            "last_tested": "2025-10-14T15:00:00Z",
+            "test_results": {
+                "success": True,
+                "response_time_ms": 1500,
+                "account_id": "acct_1SH15HKBoATcx2vH",
+                "country": "FR",
+                "currency": "eur"
+            }
+        },
+        "adyen": {
+            "psp_id": "adyen",
+            "name": "Adyen",
+            "type": "adyen",
+            "status": "active",
+            "enabled": True,
+            "sandbox_mode": True,
+            "connection_health": "healthy",
+            "api_response_time": 1600,
+            "last_tested": "2025-10-14T15:00:00Z",
+            "test_results": {
+                "success": True,
+                "response_time_ms": 1600,
+                "result_code": "Authorised",
+                "psp_reference": "NC47WHM6XC2QWSV5",
+                "merchant_account": "WoopayECOM"
+            }
+        }
+    },
     "routing_rules": [],
     "merchant_kyb": {},
     "system_logs": [],
