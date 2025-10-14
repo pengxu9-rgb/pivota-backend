@@ -140,9 +140,23 @@ async def publish_event_to_ws(event: dict):
     """Global function to publish events to WebSocket clients"""
     from realtime.metrics_store import record_event
     from realtime.ws_manager import publish_event_to_ws as ws_publish
+    from routes.simple_ws_routes import simple_manager
     
     record_event(event)
+    
+    # Broadcast to authenticated WebSocket clients
     await ws_publish(event)
+    
+    # Also broadcast to simple WebSocket clients
+    try:
+        event_data = {
+            "type": "event",
+            "event": event,
+            "timestamp": time.time()
+        }
+        await simple_manager.broadcast(event_data)
+    except Exception as e:
+        print(f"Error broadcasting to simple WebSocket clients: {e}")
 
 @app.get("/")
 async def root():
