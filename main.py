@@ -217,7 +217,6 @@ async def root():
             "simple_mapping": SIMPLE_MAPPING_AVAILABLE,
             "end_to_end": E2E_AVAILABLE,
             "mcp": MCP_AVAILABLE,
-            "operations": OPERATIONS_AVAILABLE,
             "admin": ADMIN_AVAILABLE,
             "dashboard": True
         },
