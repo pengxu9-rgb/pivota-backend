@@ -186,18 +186,17 @@ async def signin(login_data: UserLogin):
                 detail="Invalid credentials"
             )
         
-        # Check if user has approved role
-        user_roles = [role for role in user_roles_db.values() 
-                     if role["user_id"] == user["id"] and role["approved"]]
+        # Check if user has approved role using Supabase
+        user_role = await get_user_role(user["id"])
         
-        if not user_roles:
+        if not user_role or not user_role.get("approved", False):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account pending admin approval"
             )
         
-        # Get primary role (first approved role)
-        primary_role = user_roles[0]["role"]
+        # Get primary role
+        primary_role = user_role["role"]
         
         # Create JWT token
         token = create_jwt_token(user["id"], primary_role)
@@ -307,24 +306,18 @@ async def approve_user(
 ):
     """Approve or reject user (admin only)"""
     try:
-        # Find user role
-        role_found = None
-        for role_id, role_data in user_roles_db.items():
-            if role_data["user_id"] == user_id:
-                role_found = role_data
-                break
+        # Update user role approval status using Supabase
+        result = await update_user_role(
+            user_id=user_id,
+            role=approval_data.role if hasattr(approval_data, 'role') else None,
+            approved=approval_data.approved
+        )
         
-        if not role_found:
+        if not result["success"]:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="User role not found"
+                detail=f"Failed to update user role: {result['error']}"
             )
-        
-        # Update approval status
-        role_found["approved"] = approval_data.approved
-        if approval_data.approved:
-            role_found["approved_by"] = admin_user["user_id"]
-            role_found["approved_at"] = datetime.utcnow().isoformat()
         
         return {
             "status": "success",
