@@ -794,6 +794,7 @@ async def setup_agent_capabilities(agent_data: dict):
         }
         
         # Set up real API keys for agent
+        agent_id = f"AGENT_{int(time.time())}"
         api_key = f"AGENT_API_{agent_id}_{int(time.time())}"
         
         return {
