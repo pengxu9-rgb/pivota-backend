@@ -430,6 +430,7 @@
         <div id="merchants" class="tab-content">
             <div class="card">
                 <h3>🏪 Merchant KYB Management</h3>
+                <button class="btn btn-primary" onclick="showMerchantOnboardModal()">+ Onboard New Merchant</button>
                 <div id="merchantKYB">
                     <div class="loading">
                         <div class="spinner"></div>
@@ -627,6 +628,53 @@
                 <div style="display: flex; gap: 12px; margin-top: 20px;">
                     <button type="submit" class="btn btn-primary">Generate Key</button>
                     <button type="button" class="btn btn-secondary" onclick="closeModal('apiKeyModal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Merchant Onboarding Modal -->
+    <div id="merchantOnboardModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🏪 Onboard New Merchant</h3>
+                <button class="close" onclick="closeModal('merchantOnboardModal')">&times;</button>
+            </div>
+            <form id="merchantOnboardForm">
+                <div class="form-group">
+                    <label>Merchant Name *</label>
+                    <input type="text" id="merchantName" required placeholder="e.g., TechGear Store">
+                </div>
+                <div class="form-group">
+                    <label>Store URL *</label>
+                    <input type="url" id="storeUrl" required placeholder="https://your-store.myshopify.com">
+                </div>
+                <div class="form-group">
+                    <label>Platform *</label>
+                    <select id="platform" required>
+                        <option value="">Select Platform</option>
+                        <option value="shopify">Shopify</option>
+                        <option value="wix">Wix</option>
+                        <option value="woocommerce">WooCommerce</option>
+                        <option value="magento">Magento</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Contact Email</label>
+                    <input type="email" id="contactEmail" placeholder="merchant@example.com">
+                </div>
+                <div class="form-group">
+                    <label>Business Type</label>
+                    <select id="businessType">
+                        <option value="ecommerce">E-commerce</option>
+                        <option value="saas">SaaS</option>
+                        <option value="marketplace">Marketplace</option>
+                        <option value="subscription">Subscription</option>
+                    </select>
+                </div>
+                <div style="display: flex; gap: 12px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-primary">Onboard Merchant</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('merchantOnboardModal')">Cancel</button>
                 </div>
             </form>
         </div>
@@ -1583,6 +1631,10 @@
             document.getElementById('apiKeyModal').style.display = 'block';
         }
 
+        function showMerchantOnboardModal() {
+            document.getElementById('merchantOnboardModal').style.display = 'block';
+        }
+
         function closeModal(modalId) {
             document.getElementById(modalId).style.display = 'none';
         }
@@ -1681,6 +1733,49 @@
                 alert('❌ Error toggling sandbox mode');
             }
         }
+
+        // Merchant onboarding form handler
+        document.getElementById('merchantOnboardForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = {
+                name: document.getElementById('merchantName').value,
+                store_url: document.getElementById('storeUrl').value,
+                platform: document.getElementById('platform').value,
+                contact_email: document.getElementById('contactEmail').value,
+                business_type: document.getElementById('businessType').value
+            };
+            
+            try {
+                const response = await fetch('/admin/merchants/onboard', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify(formData)
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert(`✅ Merchant ${formData.name} onboarded successfully!\n\nMerchant ID: ${result.merchant_id}\nIntegration: ${result.integration_result.success ? 'Connected' : 'Failed'}`);
+                    
+                    // Close modal and refresh merchant list
+                    closeModal('merchantOnboardModal');
+                    loadMerchantKYB();
+                    
+                    // Reset form
+                    document.getElementById('merchantOnboardForm').reset();
+                } else {
+                    alert(`❌ Onboarding failed: ${result.message}`);
+                }
+                
+            } catch (error) {
+                console.error('Error onboarding merchant:', error);
+                alert('❌ Error onboarding merchant');
+            }
+        });
     </script>
 </body>
 </html>
