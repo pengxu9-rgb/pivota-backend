@@ -13,6 +13,7 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 import os
+from utils.supabase_client import supabase, create_user_in_supabase, get_user_role, update_user_role
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
@@ -136,39 +137,23 @@ def require_admin(current_user: dict = Depends(verify_jwt_token)):
 async def signup(user_data: UserSignup):
     """User signup with role selection"""
     try:
-        # Check if user already exists
-        if user_data.email in users_db:
+        # Create user in Supabase
+        supabase_result = await create_user_in_supabase(
+            email=user_data.email,
+            password=user_data.password,
+            role=user_data.role
+        )
+        
+        if not supabase_result["success"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="User already exists"
+                detail=f"Failed to create user: {supabase_result['error']}"
             )
-        
-        # Create user
-        user_id = secrets.token_urlsafe(16)
-        hashed_password = hash_password(user_data.password)
-        
-        users_db[user_data.email] = {
-            "id": user_id,
-            "email": user_data.email,
-            "password": hashed_password,
-            "full_name": user_data.full_name,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        # Create user role (pending approval)
-        role_id = secrets.token_urlsafe(16)
-        user_roles_db[role_id] = {
-            "id": role_id,
-            "user_id": user_id,
-            "role": user_data.role,
-            "approved": False,
-            "created_at": datetime.utcnow().isoformat()
-        }
         
         return {
             "status": "success",
             "message": "Account created successfully. Awaiting admin approval.",
-            "user_id": user_id,
+            "user_id": supabase_result["user_id"],
             "role": user_data.role,
             "approved": False
         }
@@ -410,3 +395,36 @@ async def signout(current_user: dict = Depends(verify_jwt_token)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Signout failed: {str(e)}"
         )
+
+@router.get("/test-supabase")
+async def test_supabase_connection():
+    """Test Supabase connection and configuration"""
+    try:
+        if not supabase:
+            return {
+                "status": "error",
+                "message": "Supabase not configured",
+                "supabase_url": os.getenv("SUPABASE_URL", "Not set"),
+                "supabase_service_role_key": "Not set" if not os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "Set"
+            }
+        
+        # Test Supabase connection by trying to query the profiles table
+        result = supabase.table("profiles").select("id").limit(1).execute()
+        
+        return {
+            "status": "success",
+            "message": "Supabase connection successful",
+            "supabase_url": os.getenv("SUPABASE_URL", "Not set"),
+            "supabase_service_role_key": "Set" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "Not set",
+            "database_accessible": True,
+            "test_query_result": result.data if result.data else []
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Supabase connection failed: {str(e)}",
+            "supabase_url": os.getenv("SUPABASE_URL", "Not set"),
+            "supabase_service_role_key": "Set" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "Not set",
+            "database_accessible": False
+        }
