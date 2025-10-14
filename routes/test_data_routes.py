@@ -10,6 +10,13 @@ from typing import Dict, Any
 from fastapi import APIRouter
 from realtime.metrics_store import record_event
 
+# Import WebSocket publishing function
+try:
+    from main import publish_event_to_ws
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+
 router = APIRouter(prefix="/api/test", tags=["test-data"])
 
 @router.post("/generate-sample-data")
@@ -60,6 +67,14 @@ async def generate_sample_data():
         }
         
         record_event(event)
+        
+        # Also send individual event to WebSocket for EventFeed
+        if WS_AVAILABLE:
+            try:
+                await publish_event_to_ws(event)
+            except Exception as e:
+                print(f"Error sending WebSocket event: {e}")
+        
         events_generated += 1
     
     return {
@@ -95,11 +110,84 @@ async def generate_live_events(count: int = 5):
         }
         
         record_event(event)
+        
+        # Also send individual event to WebSocket for EventFeed
+        if WS_AVAILABLE:
+            try:
+                await publish_event_to_ws(event)
+            except Exception as e:
+                print(f"Error sending WebSocket event: {e}")
+        
         await asyncio.sleep(0.1)  # Small delay between events
     
     return {
         "status": "success",
         "message": f"Generated {count} live events",
+        "events_generated": count,
+        "timestamp": time.time()
+    }
+
+@router.post("/generate-eventfeed-events")
+async def generate_eventfeed_events(count: int = 10):
+    """Generate individual events specifically for EventFeed testing"""
+    
+    agents = [
+        {"id": "AGENT_001", "name": "TravelBot A"},
+        {"id": "AGENT_002", "name": "ShoppingBot B"},
+        {"id": "AGENT_003", "name": "FashionBot C"},
+        {"id": "AGENT_004", "name": "ElectronicsBot D"}
+    ]
+    
+    merchants = [
+        {"id": "MERCH_001", "name": "Shopify Fashion Store"},
+        {"id": "MERCH_002", "name": "Wix Electronics Store"},
+        {"id": "MERCH_003", "name": "Shopify Travel Store"},
+        {"id": "MERCH_004", "name": "Wix Home Decor Store"}
+    ]
+    
+    psps = ["stripe", "adyen", "paypal", "square"]
+    statuses = ["succeeded", "failed", "queued_for_retry"]
+    
+    events_sent = 0
+    for i in range(count):
+        agent = random.choice(agents)
+        merchant = random.choice(merchants)
+        psp = random.choice(psps)
+        status = random.choices(statuses, weights=[75, 20, 5])[0]  # 75% success, 20% fail, 5% retry
+        
+        # Create event in the exact format expected by EventFeed
+        event = {
+            "type": "payment_result",
+            "order_id": f"EVT_{int(time.time())}_{i}",
+            "agent": agent["name"],
+            "merchant": merchant["name"],
+            "psp": psp.upper(),
+            "status": status,
+            "amount": round(random.uniform(15, 300), 2),
+            "currency": random.choice(["EUR", "USD", "GBP"]),
+            "timestamp": time.time(),
+            "latency_ms": random.randint(120, 650),
+            "attempt": random.randint(1, 3)
+        }
+        
+        # Record to metrics store
+        record_event(event)
+        
+        # Send individual event to WebSocket for EventFeed
+        if WS_AVAILABLE:
+            try:
+                await publish_event_to_ws(event)
+                events_sent += 1
+            except Exception as e:
+                print(f"Error sending WebSocket event: {e}")
+        
+        # Small delay between events for better visualization
+        await asyncio.sleep(0.5)
+    
+    return {
+        "status": "success",
+        "message": f"Generated {count} EventFeed events",
+        "events_sent_to_websocket": events_sent,
         "events_generated": count,
         "timestamp": time.time()
     }
