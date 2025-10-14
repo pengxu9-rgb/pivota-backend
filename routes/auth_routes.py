@@ -1,106 +1,409 @@
 """
-Authentication Routes
-JWT token management and authentication endpoints
+Authentication and User Management Routes
+Supports the Lovable admin approval system
 """
 
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Optional, Dict, Any
-from utils.auth import (
-    create_jwt_token, 
-    verify_jwt_token, 
-    create_demo_tokens,
-    get_role_permissions,
-    ROLES
-)
-from realtime.metrics_store import snapshot
+from pydantic import BaseModel, EmailStr
+from typing import Optional, List
+import jwt
+import hashlib
+import secrets
+from datetime import datetime, timedelta
+import os
 
-router = APIRouter(prefix="/api/auth", tags=["authentication"])
+router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
-    """Get current authenticated user from JWT token"""
-    token = credentials.credentials
-    payload = verify_jwt_token(token)
-    return payload
+# JWT Configuration
+JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
 
-@router.post("/login")
-async def login(username: str, password: str, role: str = "viewer"):
-    """Login endpoint - creates JWT token"""
-    # In production, validate against real user database
-    # For demo, accept any username/password
-    
-    if role not in ROLES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid role. Available roles: {list(ROLES.keys())}"
-        )
-    
-    # Create token based on role
-    entity_id = None
-    if role in ["agent", "merchant"]:
-        entity_id = f"{role.upper()}_001"  # Demo entity ID
-    
-    token = create_jwt_token(username, role, entity_id)
-    
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user_id": username,
+# User Role Types
+class UserRole(str):
+    EMPLOYEE = "employee"
+    AGENT = "agent"
+    MERCHANT = "merchant"
+    OPERATOR = "operator"
+    ADMIN = "admin"
+
+# Pydantic Models
+class UserSignup(BaseModel):
+    email: EmailStr
+    password: str
+    role: UserRole
+    full_name: Optional[str] = None
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserProfile(BaseModel):
+    id: str
+    email: str
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    created_at: str
+
+class UserRoleInfo(BaseModel):
+    id: str
+    user_id: str
+    role: UserRole
+    approved: bool
+    approved_by: Optional[str] = None
+    approved_at: Optional[str] = None
+    created_at: str
+
+class PendingUser(BaseModel):
+    id: str
+    user_id: str
+    role: UserRole
+    approved: bool
+    email: str
+    full_name: Optional[str] = None
+    created_at: str
+
+class RoleUpdate(BaseModel):
+    role: UserRole
+
+class ApprovalUpdate(BaseModel):
+    approved: bool
+
+# In-memory storage for demo (replace with database in production)
+users_db = {}
+user_roles_db = {}
+sessions_db = {}
+
+def hash_password(password: str) -> str:
+    """Hash password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify password against hash"""
+    return hash_password(password) == hashed
+
+def create_jwt_token(user_id: str, role: str) -> str:
+    """Create JWT token for user"""
+    payload = {
+        "user_id": user_id,
         "role": role,
-        "entity_id": entity_id,
-        "permissions": get_role_permissions(role)
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
+        "iat": datetime.utcnow()
     }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify JWT token and return user info"""
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("user_id")
+        role = payload.get("role")
+        
+        if not user_id or not role:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+        
+        return {"user_id": user_id, "role": role}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
+def require_admin(current_user: dict = Depends(verify_jwt_token)):
+    """Require admin role for access"""
+    if current_user["role"] != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
+
+@router.post("/signup")
+async def signup(user_data: UserSignup):
+    """User signup with role selection"""
+    try:
+        # Check if user already exists
+        if user_data.email in users_db:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User already exists"
+            )
+        
+        # Create user
+        user_id = secrets.token_urlsafe(16)
+        hashed_password = hash_password(user_data.password)
+        
+        users_db[user_data.email] = {
+            "id": user_id,
+            "email": user_data.email,
+            "password": hashed_password,
+            "full_name": user_data.full_name,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        # Create user role (pending approval)
+        role_id = secrets.token_urlsafe(16)
+        user_roles_db[role_id] = {
+            "id": role_id,
+            "user_id": user_id,
+            "role": user_data.role,
+            "approved": False,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        return {
+            "status": "success",
+            "message": "Account created successfully. Awaiting admin approval.",
+            "user_id": user_id,
+            "role": user_data.role,
+            "approved": False
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Signup failed: {str(e)}"
+        )
+
+@router.post("/signin")
+async def signin(login_data: UserLogin):
+    """User signin"""
+    try:
+        # Check if user exists
+        if login_data.email not in users_db:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+        
+        user = users_db[login_data.email]
+        
+        # Verify password
+        if not verify_password(login_data.password, user["password"]):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+        
+        # Check if user has approved role
+        user_roles = [role for role in user_roles_db.values() 
+                     if role["user_id"] == user["id"] and role["approved"]]
+        
+        if not user_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account pending admin approval"
+            )
+        
+        # Get primary role (first approved role)
+        primary_role = user_roles[0]["role"]
+        
+        # Create JWT token
+        token = create_jwt_token(user["id"], primary_role)
+        
+        return {
+            "status": "success",
+            "message": "Login successful",
+            "token": token,
+            "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "full_name": user["full_name"],
+                "role": primary_role
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Login failed: {str(e)}"
+        )
 
 @router.get("/me")
-async def get_current_user_info(current_user: Dict[str, Any] = Depends(get_current_user)):
+async def get_current_user(current_user: dict = Depends(verify_jwt_token)):
     """Get current user information"""
-    return {
-        "user_id": current_user["sub"],
-        "role": current_user["role"],
-        "entity_id": current_user.get("entity_id"),
-        "permissions": get_role_permissions(current_user["role"]),
-        "expires_at": current_user["exp"]
-    }
-
-@router.get("/demo-tokens")
-async def get_demo_tokens():
-    """Get demo tokens for testing different roles"""
-    tokens = create_demo_tokens()
-    return {
-        "message": "Demo tokens created for testing",
-        "tokens": tokens,
-        "usage": {
-            "admin_token": "Full system access",
-            "operator_token": "Read/write access",
-            "viewer_token": "Read-only access",
-            "agent_token": "Agent-specific access (AGENT_001)",
-            "merchant_token": "Merchant-specific access (MERCH_001)"
-        }
-    }
-
-@router.get("/roles")
-async def get_available_roles():
-    """Get available roles and their permissions"""
-    return {
-        "roles": ROLES,
-        "message": "Available roles and their permissions"
-    }
-
-@router.post("/validate-token")
-async def validate_token(token: str):
-    """Validate a JWT token"""
     try:
-        payload = verify_jwt_token(token)
+        # Find user by ID
+        user = None
+        for email, user_data in users_db.items():
+            if user_data["id"] == current_user["user_id"]:
+                user = user_data
+                break
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
         return {
-            "valid": True,
-            "user_id": payload["sub"],
-            "role": payload["role"],
-            "entity_id": payload.get("entity_id"),
-            "expires_at": payload["exp"]
+            "status": "success",
+            "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "full_name": user["full_name"],
+                "role": current_user["role"],
+                "created_at": user["created_at"]
+            }
         }
-    except HTTPException as e:
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get user info: {str(e)}"
+        )
+
+@router.get("/admin/users")
+async def get_pending_users(admin_user: dict = Depends(require_admin)):
+    """Get all users for admin approval (admin only)"""
+    try:
+        pending_users = []
+        
+        for role_id, role_data in user_roles_db.items():
+            # Find user data
+            user = None
+            for email, user_data in users_db.items():
+                if user_data["id"] == role_data["user_id"]:
+                    user = user_data
+                    break
+            
+            if user:
+                pending_users.append(PendingUser(
+                    id=role_id,
+                    user_id=role_data["user_id"],
+                    role=role_data["role"],
+                    approved=role_data["approved"],
+                    email=user["email"],
+                    full_name=user["full_name"],
+                    created_at=role_data["created_at"]
+                ))
+        
+        # Sort by creation date (newest first)
+        pending_users.sort(key=lambda x: x.created_at, reverse=True)
+        
         return {
-            "valid": False,
-            "error": e.detail
+            "status": "success",
+            "users": pending_users
         }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get users: {str(e)}"
+        )
+
+@router.post("/admin/users/{user_id}/approve")
+async def approve_user(
+    user_id: str, 
+    approval_data: ApprovalUpdate,
+    admin_user: dict = Depends(require_admin)
+):
+    """Approve or reject user (admin only)"""
+    try:
+        # Find user role
+        role_found = None
+        for role_id, role_data in user_roles_db.items():
+            if role_data["user_id"] == user_id:
+                role_found = role_data
+                break
+        
+        if not role_found:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User role not found"
+            )
+        
+        # Update approval status
+        role_found["approved"] = approval_data.approved
+        if approval_data.approved:
+            role_found["approved_by"] = admin_user["user_id"]
+            role_found["approved_at"] = datetime.utcnow().isoformat()
+        
+        return {
+            "status": "success",
+            "message": f"User {'approved' if approval_data.approved else 'rejected'}",
+            "user_id": user_id,
+            "approved": approval_data.approved
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update approval: {str(e)}"
+        )
+
+@router.put("/admin/users/{user_id}/role")
+async def update_user_role(
+    user_id: str,
+    role_data: RoleUpdate,
+    admin_user: dict = Depends(require_admin)
+):
+    """Update user role (admin only)"""
+    try:
+        # Find user role
+        role_found = None
+        for role_id, role_info in user_roles_db.items():
+            if role_info["user_id"] == user_id:
+                role_found = role_info
+                break
+        
+        if not role_found:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User role not found"
+            )
+        
+        # Update role
+        role_found["role"] = role_data.role
+        
+        return {
+            "status": "success",
+            "message": f"Role updated to {role_data.role}",
+            "user_id": user_id,
+            "role": role_data.role
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update role: {str(e)}"
+        )
+
+@router.post("/signout")
+async def signout(current_user: dict = Depends(verify_jwt_token)):
+    """User signout"""
+    try:
+        # In a real implementation, you might blacklist the token
+        return {
+            "status": "success",
+            "message": "Signed out successfully"
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Signout failed: {str(e)}"
+        )

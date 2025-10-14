@@ -13,3 +13,4 @@ PyJWT        # for JWT token handling
 jinja2       # for HTML templates
 websockets   # for WebSocket support
 aiohttp      # for async HTTP requests in admin routes
+email-validator  # for email validation in auth routes
