@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pivota Admin Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f8fafc;
+            color: #1a202c;
+            line-height: 1.6;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1a365d 0%, #2d3748 100%);
+            color: white;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            margin-bottom: 8px;
+        }
+
+        .header .subtitle {
+            opacity: 0.9;
+            font-size: 1.1rem;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .nav-tabs {
+            display: flex;
+            background: white;
+            border-radius: 12px;
+            padding: 8px;
+            margin-bottom: 24px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            overflow-x: auto;
+        }
+
+        .nav-tab {
+            padding: 12px 24px;
+            cursor: pointer;
+            border-radius: 8px;
+            color: #718096;
+            font-weight: 500;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .nav-tab.active {
+            background: #3182ce;
+            color: white;
+        }
+
+        .nav-tab:hover:not(.active) {
+            background: #edf2f7;
+            color: #4a5568;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            border: 1px solid #e2e8f0;
+        }
+
+        .card h3 {
+            color: #2d3748;
+            margin-bottom: 16px;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .stat-number {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #3182ce;
+            margin-bottom: 8px;
+        }
+
+        .stat-label {
+            color: #718096;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-active { background: #c6f6d5; color: #2f855a; }
+        .status-inactive { background: #fed7d7; color: #c53030; }
+        .status-maintenance { background: #fef5e7; color: #d69e2e; }
+        .status-error { background: #fed7d7; color: #c53030; }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .btn-primary { background: #3182ce; color: white; }
+        .btn-success { background: #38a169; color: white; }
+        .btn-warning { background: #d69e2e; color: white; }
+        .btn-danger { background: #e53e3e; color: white; }
+        .btn-secondary { background: #e2e8f0; color: #4a5568; }
+
+        .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 16px;
+        }
+
+        .table th,
+        .table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .table th {
+            background: #f7fafc;
+            font-weight: 600;
+            color: #4a5568;
+        }
+
+        .table tr:hover {
+            background: #f7fafc;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #2d3748;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #3182ce;
+            box-shadow: 0 0 0 3px rgba(49, 130, 206, 0.1);
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+        }
+
+        .modal-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-header h3 {
+            margin: 0;
+            color: #2d3748;
+        }
+
+        .close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #718096;
+        }
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            border-left: 4px solid;
+        }
+
+        .alert-warning {
+            background: #fffaf0;
+            border-left-color: #d69e2e;
+            color: #744210;
+        }
+
+        .alert-info {
+            background: #ebf8ff;
+            border-left-color: #3182ce;
+            color: #2a4365;
+        }
+
+        .alert-success {
+            background: #f0fff4;
+            border-left-color: #38a169;
+            color: #22543d;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+
+        .spinner {
+            border: 3px solid #e2e8f0;
+            border-top: 3px solid #3182ce;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .chart-container {
+            position: relative;
+            height: 300px;
+            margin: 20px 0;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+
+        .empty-state h3 {
+            margin-bottom: 8px;
+            color: #4a5568;
+        }
+
+        @media (max-width: 768px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .container {
+                padding: 10px;
+            }
+            
+            .card {
+                padding: 16px;
+            }
+            
+            .nav-tabs {
+                flex-wrap: wrap;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🏢 Pivota Admin Dashboard</h1>
+        <p class="subtitle">Complete system control and monitoring for Pivota operations team</p>
+    </div>
+
+    <div class="container">
+        <!-- Navigation Tabs -->
+        <div class="nav-tabs">
+            <div class="nav-tab active" onclick="switchTab('dashboard')">📊 Dashboard</div>
+            <div class="nav-tab" onclick="switchTab('psp')">💳 PSP Management</div>
+            <div class="nav-tab" onclick="switchTab('routing')">🔄 Routing Rules</div>
+            <div class="nav-tab" onclick="switchTab('merchants')">🏪 Merchants</div>
+            <div class="nav-tab" onclick="switchTab('agents')">🤖 Agents</div>
+            <div class="nav-tab" onclick="switchTab('analytics')">📈 Analytics</div>
+            <div class="nav-tab" onclick="switchTab('logs')">📋 System Logs</div>
+            <div class="nav-tab" onclick="switchTab('dev')">🛠️ Developer Tools</div>
+        </div>
+
+        <!-- Dashboard Tab -->
+        <div id="dashboard" class="tab-content active">
+            <div class="dashboard-grid">
+                <div class="card">
+                    <h3>🏥 System Health</h3>
+                    <div class="stat-number" id="systemStatus">-</div>
+                    <div class="stat-label">Status</div>
+                </div>
+                <div class="card">
+                    <h3>💳 PSP Health</h3>
+                    <div class="stat-number" id="pspHealth">-</div>
+                    <div class="stat-label">Active PSPs</div>
+                </div>
+                <div class="card">
+                    <h3>🔄 Routing Rules</h3>
+                    <div class="stat-number" id="routingRules">-</div>
+                    <div class="stat-label">Active Rules</div>
+                </div>
+                <div class="card">
+                    <h3>🏪 Merchant KYB</h3>
+                    <div class="stat-number" id="kybApproval">-</div>
+                    <div class="stat-label">Approval Rate</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>📊 Transaction Metrics</h3>
+                <div class="chart-container">
+                    <canvas id="transactionChart"></canvas>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>🚨 System Alerts</h3>
+                <div id="systemAlerts">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading alerts...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- PSP Management Tab -->
+        <div id="psp" class="tab-content">
+            <div class="card">
+                <h3>💳 PSP Management</h3>
+                <button class="btn btn-primary" onclick="showPSPModal()">+ Add PSP Configuration</button>
+                <div id="pspList" style="margin-top: 20px;">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading PSP configurations...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Routing Rules Tab -->
+        <div id="routing" class="tab-content">
+            <div class="card">
+                <h3>🔄 Routing Rules</h3>
+                <button class="btn btn-primary" onclick="showRoutingModal()">+ Add Routing Rule</button>
+                <div id="routingRulesList" style="margin-top: 20px;">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading routing rules...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Merchants Tab -->
+        <div id="merchants" class="tab-content">
+            <div class="card">
+                <h3>🏪 Merchant KYB Management</h3>
+                <div id="merchantKYB">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading merchant KYB status...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Agents Tab -->
+        <div id="agents" class="tab-content">
+            <div class="card">
+                <h3>🤖 Agent Management</h3>
+                <div id="agentManagement">
+                    <div class="empty-state">
+                        <h3>Agent Management</h3>
+                        <p>Agent directory and performance tracking coming soon...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Analytics Tab -->
+        <div id="analytics" class="tab-content">
+            <div class="card">
+                <h3>📈 System Analytics</h3>
+                <div class="chart-container">
+                    <canvas id="analyticsChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Logs Tab -->
+        <div id="logs" class="tab-content">
+            <div class="card">
+                <h3>📋 System Logs</h3>
+                <div id="systemLogs">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading system logs...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Developer Tools Tab -->
+        <div id="dev" class="tab-content">
+            <div class="card">
+                <h3>🛠️ Developer Tools</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
+                    <div>
+                        <h4>API Key Management</h4>
+                        <button class="btn btn-primary" onclick="showAPIKeyModal()">Generate API Key</button>
+                        <div id="apiKeysList" style="margin-top: 16px;">
+                            <div class="loading">
+                                <div class="spinner"></div>
+                                <p>Loading API keys...</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div>
+                        <h4>Sandbox Mode</h4>
+                        <button class="btn btn-warning" onclick="toggleSandboxMode()" id="sandboxToggle">
+                            Toggle Sandbox Mode
+                        </button>
+                        <p style="margin-top: 8px; color: #718096;">
+                            Current mode: <span id="sandboxStatus">Loading...</span>
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PSP Configuration Modal -->
+    <div id="pspModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Add PSP Configuration</h3>
+                <button class="close" onclick="closeModal('pspModal')">&times;</button>
+            </div>
+            <form id="pspForm">
+                <div class="form-group">
+                    <label>PSP Type *</label>
+                    <select id="pspType" required>
+                        <option value="stripe">Stripe</option>
+                        <option value="adyen">Adyen</option>
+                        <option value="paypal">PayPal</option>
+                        <option value="square">Square</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>API Key *</label>
+                    <input type="text" id="pspApiKey" required>
+                </div>
+                <div class="form-group">
+                    <label>Webhook Secret *</label>
+                    <input type="text" id="pspWebhookSecret" required>
+                </div>
+                <div class="form-group">
+                    <label>Merchant Account</label>
+                    <input type="text" id="pspMerchantAccount">
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="pspEnabled" checked> Enabled
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="pspSandbox" checked> Sandbox Mode
+                    </label>
+                </div>
+                <div style="display: flex; gap: 12px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-primary">Add PSP</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('pspModal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Routing Rule Modal -->
+    <div id="routingModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Add Routing Rule</h3>
+                <button class="close" onclick="closeModal('routingModal')">&times;</button>
+            </div>
+            <form id="routingForm">
+                <div class="form-group">
+                    <label>Rule Name *</label>
+                    <input type="text" id="ruleName" required>
+                </div>
+                <div class="form-group">
+                    <label>Rule Type *</label>
+                    <select id="ruleType" required>
+                        <option value="geographic">Geographic</option>
+                        <option value="currency">Currency</option>
+                        <option value="risk_level">Risk Level</option>
+                        <option value="amount">Amount</option>
+                        <option value="merchant">Merchant</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Target PSP *</label>
+                    <select id="targetPSP" required>
+                        <option value="stripe">Stripe</option>
+                        <option value="adyen">Adyen</option>
+                        <option value="paypal">PayPal</option>
+                        <option value="square">Square</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Priority</label>
+                    <input type="number" id="rulePriority" value="100" min="1" max="1000">
+                </div>
+                <div class="form-group">
+                    <label>Conditions (JSON)</label>
+                    <textarea id="ruleConditions" rows="4" placeholder='{"region": "EU", "currency": "EUR"}'></textarea>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="ruleEnabled" checked> Enabled
+                    </label>
+                </div>
+                <div style="display: flex; gap: 12px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-primary">Add Rule</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('routingModal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- API Key Modal -->
+    <div id="apiKeyModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Generate API Key</h3>
+                <button class="close" onclick="closeModal('apiKeyModal')">&times;</button>
+            </div>
+            <form id="apiKeyForm">
+                <div class="form-group">
+                    <label>Key Name *</label>
+                    <input type="text" id="keyName" required>
+                </div>
+                <div class="form-group">
+                    <label>Permissions</label>
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;">
+                        <label><input type="checkbox" value="read" checked> Read</label>
+                        <label><input type="checkbox" value="write" checked> Write</label>
+                        <label><input type="checkbox" value="admin"> Admin</label>
+                        <label><input type="checkbox" value="webhook"> Webhook</label>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 12px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-primary">Generate Key</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('apiKeyModal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let authToken = 'demo_admin_token';
+        let transactionChart = null;
+        let analyticsChart = null;
+
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDashboard();
+            
+            // Auto-refresh every 30 seconds
+            setInterval(() => {
+                loadDashboard();
+            }, 30000);
+        });
+
+        // Tab switching
+        function switchTab(tabName) {
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Remove active class from all tabs
+            document.querySelectorAll('.nav-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected tab content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to clicked tab
+            event.target.classList.add('active');
+            
+            // Load tab-specific data
+            switch(tabName) {
+                case 'dashboard':
+                    loadDashboard();
+                    break;
+                case 'psp':
+                    loadPSPList();
+                    break;
+                case 'routing':
+                    loadRoutingRules();
+                    break;
+                case 'merchants':
+                    loadMerchantKYB();
+                    break;
+                case 'analytics':
+                    loadAnalytics();
+                    break;
+                case 'logs':
+                    loadSystemLogs();
+                    break;
+                case 'dev':
+                    loadDeveloperTools();
+                    break;
+            }
+        }
+
+        // Load dashboard overview
+        async function loadDashboard() {
+            try {
+                const response = await fetch('/admin/dashboard', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                // Update dashboard metrics
+                document.getElementById('systemStatus').textContent = data.system_health.status;
+                document.getElementById('pspHealth').textContent = `${data.psp_management.active_psps}/${data.psp_management.total_psps}`;
+                document.getElementById('routingRules').textContent = data.routing_rules.active_rules;
+                document.getElementById('kybApproval').textContent = `${data.merchant_kyb.approval_rate.toFixed(1)}%`;
+                
+                // Update transaction chart
+                updateTransactionChart(data.transaction_metrics);
+                
+                // Show alerts
+                showAlerts(data.alerts);
+                
+            } catch (error) {
+                console.error('Error loading dashboard:', error);
+            }
+        }
+
+        // Update transaction chart
+        function updateTransactionChart(metrics) {
+            const ctx = document.getElementById('transactionChart').getContext('2d');
+            
+            if (transactionChart) {
+                transactionChart.destroy();
+            }
+            
+            transactionChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                    datasets: [{
+                        label: 'Transactions',
+                        data: [120, 190, 300, 500, 200, 300, 450],
+                        borderColor: '#3182ce',
+                        backgroundColor: 'rgba(49, 130, 206, 0.1)',
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    }
+                }
+            });
+        }
+
+        // Show alerts
+        function showAlerts(alerts) {
+            const container = document.getElementById('systemAlerts');
+            
+            if (!alerts || alerts.length === 0) {
+                container.innerHTML = '<p style="color: #38a169;">✅ No active alerts</p>';
+                return;
+            }
+            
+            container.innerHTML = alerts.filter(alert => alert).map(alert => `
+                <div class="alert alert-${alert.type}">
+                    <strong>${alert.type.toUpperCase()}:</strong> ${alert.message}
+                    <br><small>Action: ${alert.action}</small>
+                </div>
+            `).join('');
+        }
+
+        // Load PSP list
+        async function loadPSPList() {
+            try {
+                const response = await fetch('/admin/psp/list', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                const container = document.getElementById('pspList');
+                
+                if (data.psps.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <h3>No PSP configurations</h3>
+                            <p>Add your first PSP configuration to get started.</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>PSP Type</th>
+                                <th>Status</th>
+                                <th>Enabled</th>
+                                <th>Last Tested</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.psps.map(psp => `
+                                <tr>
+                                    <td>${psp.psp_type}</td>
+                                    <td><span class="status-badge status-${psp.status}">${psp.status}</span></td>
+                                    <td>${psp.enabled ? 'Yes' : 'No'}</td>
+                                    <td>${psp.last_tested || 'Never'}</td>
+                                    <td>
+                                        <button class="btn btn-primary" onclick="testPSP('${psp.id}')">Test</button>
+                                        <button class="btn btn-secondary" onclick="togglePSP('${psp.id}', ${!psp.enabled})">
+                                            ${psp.enabled ? 'Disable' : 'Enable'}
+                                        </button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                console.error('Error loading PSP list:', error);
+                document.getElementById('pspList').innerHTML = `
+                    <div class="empty-state">
+                        <h3>Error loading PSPs</h3>
+                        <p>Please try refreshing the page.</p>
+                    </div>
+                `;
+            }
+        }
+
+        // Load routing rules
+        async function loadRoutingRules() {
+            try {
+                const response = await fetch('/admin/routing/rules', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                const container = document.getElementById('routingRulesList');
+                
+                if (data.rules.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <h3>No routing rules</h3>
+                            <p>Create your first routing rule to control transaction routing.</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Rule Name</th>
+                                <th>Type</th>
+                                <th>Target PSP</th>
+                                <th>Priority</th>
+                                <th>Enabled</th>
+                                <th>Usage</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.rules.map(rule => `
+                                <tr>
+                                    <td>${rule.name}</td>
+                                    <td>${rule.rule_type}</td>
+                                    <td>${rule.target_psp}</td>
+                                    <td>${rule.priority}</td>
+                                    <td>${rule.enabled ? 'Yes' : 'No'}</td>
+                                    <td>${rule.usage_count || 0}</td>
+                                    <td>
+                                        <button class="btn btn-warning" onclick="toggleRule('${rule.id}', ${!rule.enabled})">
+                                            ${rule.enabled ? 'Disable' : 'Enable'}
+                                        </button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                console.error('Error loading routing rules:', error);
+            }
+        }
+
+        // Load merchant KYB
+        async function loadMerchantKYB() {
+            try {
+                const response = await fetch('/admin/merchants/kyb/status', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                const container = document.getElementById('merchantKYB');
+                
+                container.innerHTML = `
+                    <div class="dashboard-grid">
+                        <div class="card">
+                            <h3>📊 KYB Status Overview</h3>
+                            <div class="stat-number">${data.total_merchants}</div>
+                            <div class="stat-label">Total Merchants</div>
+                        </div>
+                        <div class="card">
+                            <h3>✅ Approved</h3>
+                            <div class="stat-number">${data.kyb_status.approved || 0}</div>
+                            <div class="stat-label">Merchants</div>
+                        </div>
+                        <div class="card">
+                            <h3>⏳ Pending</h3>
+                            <div class="stat-number">${data.pending_review}</div>
+                            <div class="stat-label">Reviews</div>
+                        </div>
+                    </div>
+                `;
+                
+            } catch (error) {
+                console.error('Error loading merchant KYB:', error);
+            }
+        }
+
+        // Load analytics
+        async function loadAnalytics() {
+            try {
+                const response = await fetch('/admin/analytics/overview', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                // Update analytics chart
+                const ctx = document.getElementById('analyticsChart').getContext('2d');
+                
+                if (analyticsChart) {
+                    analyticsChart.destroy();
+                }
+                
+                analyticsChart = new Chart(ctx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: ['Stripe', 'Adyen', 'PayPal', 'Square'],
+                        datasets: [{
+                            data: [40, 30, 20, 10],
+                            backgroundColor: ['#3182ce', '#38a169', '#d69e2e', '#e53e3e']
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false
+                    }
+                });
+                
+            } catch (error) {
+                console.error('Error loading analytics:', error);
+            }
+        }
+
+        // Load system logs
+        async function loadSystemLogs() {
+            try {
+                const response = await fetch('/admin/logs', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                const container = document.getElementById('systemLogs');
+                
+                if (data.logs.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <h3>No system logs</h3>
+                            <p>System logs will appear here as actions are performed.</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Action</th>
+                                <th>Admin User</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.logs.map(log => `
+                                <tr>
+                                    <td>${new Date(log.timestamp).toLocaleString()}</td>
+                                    <td>${log.action}</td>
+                                    <td>${log.admin_user}</td>
+                                    <td>${JSON.stringify(log.details)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                console.error('Error loading system logs:', error);
+            }
+        }
+
+        // Load developer tools
+        async function loadDeveloperTools() {
+            try {
+                const response = await fetch('/admin/dev/api-keys', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                const container = document.getElementById('apiKeysList');
+                
+                if (data.api_keys.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <h3>No API keys</h3>
+                            <p>Generate your first API key to get started.</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Permissions</th>
+                                <th>Created</th>
+                                <th>Usage</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.api_keys.map(key => `
+                                <tr>
+                                    <td>${key.name}</td>
+                                    <td>${key.permissions.join(', ')}</td>
+                                    <td>${new Date(key.created_at).toLocaleDateString()}</td>
+                                    <td>${key.usage_count}</td>
+                                    <td>${key.enabled ? 'Active' : 'Disabled'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                console.error('Error loading developer tools:', error);
+            }
+        }
+
+        // Modal functions
+        function showPSPModal() {
+            document.getElementById('pspModal').style.display = 'block';
+        }
+
+        function showRoutingModal() {
+            document.getElementById('routingModal').style.display = 'block';
+        }
+
+        function showAPIKeyModal() {
+            document.getElementById('apiKeyModal').style.display = 'block';
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).style.display = 'none';
+        }
+
+        // Form submissions
+        document.getElementById('pspForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = {
+                psp_type: document.getElementById('pspType').value,
+                api_key: document.getElementById('pspApiKey').value,
+                webhook_secret: document.getElementById('pspWebhookSecret').value,
+                merchant_account: document.getElementById('pspMerchantAccount').value,
+                enabled: document.getElementById('pspEnabled').checked,
+                sandbox_mode: document.getElementById('pspSandbox').checked
+            };
+            
+            try {
+                const response = await fetch('/admin/psp/add', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify(formData)
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert(`✅ ${result.message}`);
+                    closeModal('pspModal');
+                    loadPSPList();
+                } else {
+                    alert(`❌ Error: ${result.message}`);
+                }
+                
+            } catch (error) {
+                console.error('Error adding PSP:', error);
+                alert('❌ Error adding PSP configuration');
+            }
+        });
+
+        // Test PSP connection
+        async function testPSP(pspId) {
+            try {
+                const response = await fetch(`/admin/psp/${pspId}/test`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert(`✅ PSP test completed successfully`);
+                    loadPSPList();
+                } else {
+                    alert(`❌ PSP test failed: ${result.message}`);
+                }
+                
+            } catch (error) {
+                console.error('Error testing PSP:', error);
+                alert('❌ Error testing PSP connection');
+            }
+        }
+
+        // Toggle sandbox mode
+        async function toggleSandboxMode() {
+            try {
+                const currentStatus = document.getElementById('sandboxStatus').textContent;
+                const newStatus = currentStatus === 'Enabled' ? false : true;
+                
+                const response = await fetch('/admin/dev/sandbox/toggle', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({ enabled: newStatus })
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    document.getElementById('sandboxStatus').textContent = newStatus ? 'Enabled' : 'Disabled';
+                    document.getElementById('sandboxToggle').textContent = newStatus ? 'Disable Sandbox' : 'Enable Sandbox';
+                    alert(`✅ Sandbox mode ${newStatus ? 'enabled' : 'disabled'}`);
+                } else {
+                    alert(`❌ Error: ${result.message}`);
+                }
+                
+            } catch (error) {
+                console.error('Error toggling sandbox mode:', error);
+                alert('❌ Error toggling sandbox mode');
+            }
+        }
+    </script>
+</body>
+</html>

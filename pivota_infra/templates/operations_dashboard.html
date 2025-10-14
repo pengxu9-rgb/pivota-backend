@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pivota Operations Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+
+        .header .subtitle {
+            opacity: 0.9;
+            font-size: 1.1rem;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            border: 1px solid #e2e8f0;
+        }
+
+        .card h3 {
+            color: #2d3748;
+            margin-bottom: 16px;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .stat-number {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 8px;
+        }
+
+        .stat-label {
+            color: #718096;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-pending { background: #fed7d7; color: #c53030; }
+        .status-approved { background: #c6f6d5; color: #2f855a; }
+        .status-active { background: #bee3f8; color: #2b6cb0; }
+        .status-rejected { background: #fed7d7; color: #c53030; }
+
+        .queue-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            background: #f7fafc;
+        }
+
+        .queue-item:hover {
+            background: #edf2f7;
+            cursor: pointer;
+        }
+
+        .queue-info h4 {
+            margin-bottom: 4px;
+            color: #2d3748;
+        }
+
+        .queue-info p {
+            color: #718096;
+            font-size: 0.9rem;
+        }
+
+        .queue-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary { background: #667eea; color: white; }
+        .btn-success { background: #48bb78; color: white; }
+        .btn-warning { background: #ed8936; color: white; }
+        .btn-danger { background: #f56565; color: white; }
+        .btn-secondary { background: #e2e8f0; color: #4a5568; }
+
+        .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+
+        .activity-feed {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .activity-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .activity-item:last-child {
+            border-bottom: none;
+        }
+
+        .activity-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 12px;
+            font-weight: bold;
+            color: white;
+        }
+
+        .activity-icon.onboard { background: #48bb78; }
+        .activity-icon.approve { background: #667eea; }
+        .activity-icon.verify { background: #ed8936; }
+
+        .activity-content {
+            flex: 1;
+        }
+
+        .activity-content h5 {
+            margin-bottom: 4px;
+            color: #2d3748;
+        }
+
+        .activity-content p {
+            color: #718096;
+            font-size: 0.9rem;
+        }
+
+        .activity-time {
+            color: #a0aec0;
+            font-size: 0.8rem;
+        }
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            border-left: 4px solid;
+        }
+
+        .alert-warning {
+            background: #fffaf0;
+            border-left-color: #ed8936;
+            color: #744210;
+        }
+
+        .alert-info {
+            background: #ebf8ff;
+            border-left-color: #3182ce;
+            color: #2a4365;
+        }
+
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid #e2e8f0;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 12px 24px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            color: #718096;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .tab.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+
+        .tab:hover {
+            color: #4a5568;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #2d3748;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+
+        .spinner {
+            border: 3px solid #e2e8f0;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+
+        .empty-state h3 {
+            margin-bottom: 8px;
+            color: #4a5568;
+        }
+
+        @media (max-width: 768px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .container {
+                padding: 10px;
+            }
+            
+            .card {
+                padding: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🏢 Pivota Operations Dashboard</h1>
+        <p class="subtitle">Manage agent and merchant onboarding with full operational control</p>
+    </div>
+
+    <div class="container">
+        <!-- Dashboard Summary -->
+        <div class="dashboard-grid">
+            <div class="card">
+                <h3>📊 System Overview</h3>
+                <div class="stat-number" id="totalAgents">-</div>
+                <div class="stat-label">Active Agents</div>
+            </div>
+            <div class="card">
+                <h3>🏪 Merchant Network</h3>
+                <div class="stat-number" id="totalMerchants">-</div>
+                <div class="stat-label">Active Merchants</div>
+            </div>
+            <div class="card">
+                <h3>⏳ Onboarding Queue</h3>
+                <div class="stat-number" id="queueLength">-</div>
+                <div class="stat-label">Pending Reviews</div>
+            </div>
+            <div class="card">
+                <h3>✅ Success Rate</h3>
+                <div class="stat-number" id="successRate">-</div>
+                <div class="stat-label">System Performance</div>
+            </div>
+        </div>
+
+        <!-- Alerts -->
+        <div id="alertsContainer"></div>
+
+        <!-- Main Content Tabs -->
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('onboarding')">Onboarding Queue</div>
+            <div class="tab" onclick="switchTab('agents')">Agent Management</div>
+            <div class="tab" onclick="switchTab('merchants')">Merchant Management</div>
+            <div class="tab" onclick="switchTab('verifications')">Verifications</div>
+            <div class="tab" onclick="switchTab('activity')">Activity Log</div>
+        </div>
+
+        <!-- Onboarding Queue Tab -->
+        <div id="onboarding" class="tab-content active">
+            <div class="card">
+                <h3>🚀 Onboarding Queue</h3>
+                <div id="onboardingQueue">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading onboarding queue...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Agent Management Tab -->
+        <div id="agents" class="tab-content">
+            <div class="card">
+                <h3>🤖 Agent Management</h3>
+                <button class="btn btn-primary" onclick="showOnboardForm('agent')">+ Onboard New Agent</button>
+                <div id="agentsList" style="margin-top: 20px;">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading agents...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Merchant Management Tab -->
+        <div id="merchants" class="tab-content">
+            <div class="card">
+                <h3>🏪 Merchant Management</h3>
+                <button class="btn btn-primary" onclick="showOnboardForm('merchant')">+ Onboard New Merchant</button>
+                <div id="merchantsList" style="margin-top: 20px;">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading merchants...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Verifications Tab -->
+        <div id="verifications" class="tab-content">
+            <div class="card">
+                <h3>🔍 Verification Tasks</h3>
+                <div id="verificationTasks">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading verification tasks...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Activity Log Tab -->
+        <div id="activity" class="tab-content">
+            <div class="card">
+                <h3>📋 Activity Log</h3>
+                <div class="activity-feed" id="activityLog">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Loading activity log...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Onboarding Modal -->
+    <div id="onboardingModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000;">
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; border-radius: 12px; padding: 24px; max-width: 500px; width: 90%; max-height: 80vh; overflow-y: auto;">
+            <h3 id="modalTitle">Onboard New Agent</h3>
+            <form id="onboardingForm">
+                <div class="form-group">
+                    <label>Name *</label>
+                    <input type="text" id="entityName" required>
+                </div>
+                <div class="form-group">
+                    <label>Email *</label>
+                    <input type="email" id="entityEmail" required>
+                </div>
+                <div class="form-group" id="companyGroup">
+                    <label>Company</label>
+                    <input type="text" id="entityCompany">
+                </div>
+                <div class="form-group" id="storeUrlGroup" style="display: none;">
+                    <label>Store URL *</label>
+                    <input type="url" id="entityStoreUrl">
+                </div>
+                <div class="form-group" id="platformGroup" style="display: none;">
+                    <label>Platform</label>
+                    <select id="entityPlatform">
+                        <option value="shopify">Shopify</option>
+                        <option value="wix">Wix</option>
+                        <option value="woocommerce">WooCommerce</option>
+                        <option value="magento">Magento</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Description</label>
+                    <textarea id="entityDescription" rows="3"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Expected Monthly Volume</label>
+                    <input type="number" id="entityVolume" placeholder="e.g., 1000">
+                </div>
+                <div style="display: flex; gap: 12px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-primary">Submit Onboarding</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let currentEntityType = 'agent';
+        let authToken = null;
+
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+            // In a real implementation, you'd get this from login
+            authToken = 'demo_token_for_operations';
+            
+            loadDashboardSummary();
+            loadOnboardingQueue();
+            
+            // Auto-refresh every 30 seconds
+            setInterval(() => {
+                loadDashboardSummary();
+                loadOnboardingQueue();
+            }, 30000);
+        });
+
+        // Tab switching
+        function switchTab(tabName) {
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Remove active class from all tabs
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected tab content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to clicked tab
+            event.target.classList.add('active');
+            
+            // Load tab-specific data
+            switch(tabName) {
+                case 'onboarding':
+                    loadOnboardingQueue();
+                    break;
+                case 'agents':
+                    loadAgents();
+                    break;
+                case 'merchants':
+                    loadMerchants();
+                    break;
+                case 'verifications':
+                    loadVerifications();
+                    break;
+                case 'activity':
+                    loadActivityLog();
+                    break;
+            }
+        }
+
+        // Load dashboard summary
+        async function loadDashboardSummary() {
+            try {
+                const response = await fetch('/api/operations/dashboard-summary', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                document.getElementById('totalAgents').textContent = data.onboarding.active_agents;
+                document.getElementById('totalMerchants').textContent = data.onboarding.active_merchants;
+                document.getElementById('queueLength').textContent = data.onboarding.queue_length;
+                document.getElementById('successRate').textContent = 
+                    (data.system_health.success_rate * 100).toFixed(1) + '%';
+                
+                // Show alerts
+                showAlerts(data.alerts);
+                
+            } catch (error) {
+                console.error('Error loading dashboard summary:', error);
+            }
+        }
+
+        // Load onboarding queue
+        async function loadOnboardingQueue() {
+            try {
+                const response = await fetch('/api/operations/onboarding-queue', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                const data = await response.json();
+                
+                const container = document.getElementById('onboardingQueue');
+                
+                if (data.queue.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <h3>No pending onboardings</h3>
+                            <p>All entities have been processed. Great job! 🎉</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = data.queue.map(item => `
+                    <div class="queue-item">
+                        <div class="queue-info">
+                            <h4>${item.entity_data.name} (${item.entity_type})</h4>
+                            <p>Email: ${item.entity_data.email}</p>
+                            <p>Days in queue: ${item.days_in_queue.toFixed(1)}</p>
+                        </div>
+                        <div class="queue-actions">
+                            <button class="btn btn-success" onclick="updateStatus('${item.entity_id}', 'approved')">
+                                Approve
+                            </button>
+                            <button class="btn btn-warning" onclick="startVerification('${item.entity_id}', '${item.entity_type}')">
+                                Verify
+                            </button>
+                            <button class="btn btn-secondary" onclick="viewDetails('${item.entity_id}', '${item.entity_type}')">
+                                Details
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+                
+            } catch (error) {
+                console.error('Error loading onboarding queue:', error);
+                document.getElementById('onboardingQueue').innerHTML = `
+                    <div class="empty-state">
+                        <h3>Error loading queue</h3>
+                        <p>Please try refreshing the page.</p>
+                    </div>
+                `;
+            }
+        }
+
+        // Show alerts
+        function showAlerts(alerts) {
+            const container = document.getElementById('alertsContainer');
+            container.innerHTML = '';
+            
+            alerts.filter(alert => alert).forEach(alert => {
+                const alertDiv = document.createElement('div');
+                alertDiv.className = `alert alert-${alert.type}`;
+                alertDiv.innerHTML = `
+                    <strong>${alert.type.toUpperCase()}:</strong> ${alert.message}
+                    <br><small>Action: ${alert.action}</small>
+                `;
+                container.appendChild(alertDiv);
+            });
+        }
+
+        // Update entity status
+        async function updateStatus(entityId, status) {
+            try {
+                const response = await fetch(`/api/operations/onboarding/${entityId}/status`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({
+                        status: status,
+                        notes: `Status updated to ${status}`,
+                        assigned_to: 'current_operator'
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert(`✅ ${result.message}`);
+                    loadOnboardingQueue();
+                    loadDashboardSummary();
+                } else {
+                    alert(`❌ Error: ${result.message}`);
+                }
+                
+            } catch (error) {
+                console.error('Error updating status:', error);
+                alert('❌ Error updating status');
+            }
+        }
+
+        // Start verification
+        async function startVerification(entityId, entityType) {
+            try {
+                const response = await fetch('/api/operations/verify', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({
+                        entity_id: entityId,
+                        entity_type: entityType,
+                        verification_type: 'api_test'
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert(`✅ Verification started for ${entityId}`);
+                    loadVerifications();
+                } else {
+                    alert(`❌ Error: ${result.message}`);
+                }
+                
+            } catch (error) {
+                console.error('Error starting verification:', error);
+                alert('❌ Error starting verification');
+            }
+        }
+
+        // Show onboarding form
+        function showOnboardForm(entityType) {
+            currentEntityType = entityType;
+            const modal = document.getElementById('onboardingModal');
+            const title = document.getElementById('modalTitle');
+            const companyGroup = document.getElementById('companyGroup');
+            const storeUrlGroup = document.getElementById('storeUrlGroup');
+            const platformGroup = document.getElementById('platformGroup');
+            
+            if (entityType === 'agent') {
+                title.textContent = 'Onboard New Agent';
+                companyGroup.style.display = 'block';
+                storeUrlGroup.style.display = 'none';
+                platformGroup.style.display = 'none';
+            } else {
+                title.textContent = 'Onboard New Merchant';
+                companyGroup.style.display = 'none';
+                storeUrlGroup.style.display = 'block';
+                platformGroup.style.display = 'block';
+            }
+            
+            modal.style.display = 'block';
+        }
+
+        // Close modal
+        function closeModal() {
+            document.getElementById('onboardingModal').style.display = 'none';
+            document.getElementById('onboardingForm').reset();
+        }
+
+        // Handle onboarding form submission
+        document.getElementById('onboardingForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = {
+                agent_name: document.getElementById('entityName').value,
+                contact_email: document.getElementById('entityEmail').value,
+                description: document.getElementById('entityDescription').value,
+                expected_volume: parseInt(document.getElementById('entityVolume').value) || null
+            };
+            
+            if (currentEntityType === 'agent') {
+                formData.company_name = document.getElementById('entityCompany').value;
+            } else {
+                formData.merchant_name = formData.agent_name;
+                formData.store_url = document.getElementById('entityStoreUrl').value;
+                formData.platform = document.getElementById('entityPlatform').value;
+            }
+            
+            try {
+                const endpoint = currentEntityType === 'agent' 
+                    ? '/api/operations/agents/onboard'
+                    : '/api/operations/merchants/onboard';
+                
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify(formData)
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert(`✅ ${result.message}`);
+                    closeModal();
+                    loadOnboardingQueue();
+                    loadDashboardSummary();
+                } else {
+                    alert(`❌ Error: ${result.message}`);
+                }
+                
+            } catch (error) {
+                console.error('Error submitting onboarding:', error);
+                alert('❌ Error submitting onboarding');
+            }
+        });
+
+        // Load other tabs (placeholder implementations)
+        async function loadAgents() {
+            document.getElementById('agentsList').innerHTML = `
+                <div class="empty-state">
+                    <h3>Agent Management</h3>
+                    <p>Agent list and management features coming soon...</p>
+                </div>
+            `;
+        }
+
+        async function loadMerchants() {
+            document.getElementById('merchantsList').innerHTML = `
+                <div class="empty-state">
+                    <h3>Merchant Management</h3>
+                    <p>Merchant list and management features coming soon...</p>
+                </div>
+            `;
+        }
+
+        async function loadVerifications() {
+            document.getElementById('verificationTasks').innerHTML = `
+                <div class="empty-state">
+                    <h3>Verification Tasks</h3>
+                    <p>Verification management features coming soon...</p>
+                </div>
+            `;
+        }
+
+        async function loadActivityLog() {
+            document.getElementById('activityLog').innerHTML = `
+                <div class="empty-state">
+                    <h3>Activity Log</h3>
+                    <p>Activity log features coming soon...</p>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>

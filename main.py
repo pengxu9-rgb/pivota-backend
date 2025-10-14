@@ -8,8 +8,10 @@ import asyncio
 import logging
 import time
 import uvicorn
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 
 # Database
 from db.database import database
@@ -50,6 +52,12 @@ try:
     MCP_AVAILABLE = True
 except ImportError:
     MCP_AVAILABLE = False
+
+try:
+    from routes.admin_routes import router as admin_router
+    ADMIN_AVAILABLE = True
+except ImportError:
+    ADMIN_AVAILABLE = False
 
 # Utils
 from utils.logger import logger
@@ -98,6 +106,10 @@ if E2E_AVAILABLE:
 if MCP_AVAILABLE:
     app.include_router(mcp_router)
     logger.info("✅ MCP router included")
+
+if ADMIN_AVAILABLE:
+    app.include_router(admin_router)
+    logger.info("✅ Admin router included")
 
 @app.on_event("startup")
 async def startup():
@@ -195,6 +207,8 @@ async def root():
             "simple_mapping": SIMPLE_MAPPING_AVAILABLE,
             "end_to_end": E2E_AVAILABLE,
             "mcp": MCP_AVAILABLE,
+            "operations": OPERATIONS_AVAILABLE,
+            "admin": ADMIN_AVAILABLE,
             "dashboard": True
         },
         "metrics": {
@@ -203,6 +217,24 @@ async def root():
             "connections_by_role": connection_manager.get_connections_by_role() if connection_manager else {}
         }
     }
+
+@app.get("/operations", response_class=HTMLResponse)
+async def operations_dashboard():
+    """Serve the operations dashboard"""
+    try:
+        with open("templates/operations_dashboard.html", "r") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard():
+    """Serve the admin dashboard"""
+    try:
+        with open("templates/admin_dashboard.html", "r") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Admin Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
 
 @app.get("/health")
 async def health():

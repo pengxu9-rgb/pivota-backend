@@ -61,6 +61,18 @@ class Payment:
         self.created_at = datetime.utcnow()
         self.updated_at = datetime.utcnow()
 
+class PSPConfig:
+    """PSP Configuration model"""
+    def __init__(self, psp_type: PSPType, api_key: str, webhook_secret: str, 
+                 merchant_account: Optional[str] = None, enabled: bool = True):
+        self.psp_type = psp_type
+        self.api_key = api_key
+        self.webhook_secret = webhook_secret
+        self.merchant_account = merchant_account
+        self.enabled = enabled
+        self.created_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+
 class DashboardCore:
     """Dashboard core functionality"""
     
