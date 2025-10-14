@@ -37,6 +37,7 @@ from routes.user_approval_routes import router as user_approval_router
 from routes.real_psp_routes import router as real_psp_router
 from routes.simple_real_psp_routes import router as simple_real_psp_router
 from routes.public_psp_routes import router as public_psp_router
+from routes.psp_fix_routes import router as psp_fix_router
 
 # Service routers (only include what exists)
 try:
@@ -96,6 +97,7 @@ app.include_router(user_approval_router)  # User approval for Lovable
 app.include_router(real_psp_router)  # Real PSP status for admin panel
 app.include_router(simple_real_psp_router)  # Simple real PSP status for testing
 app.include_router(public_psp_router)  # Public PSP status without authentication
+app.include_router(psp_fix_router)  # Direct PSP fix for loading error
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
