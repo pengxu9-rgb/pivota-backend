@@ -170,24 +170,37 @@ async def signup(user_data: UserSignup):
 async def signin(login_data: UserLogin):
     """User signin"""
     try:
-        # Check if user exists
-        if login_data.email not in users_db:
+        # Authenticate with Supabase
+        if not supabase:
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Supabase not configured"
             )
         
-        user = users_db[login_data.email]
-        
-        # Verify password
-        if not verify_password(login_data.password, user["password"]):
+        try:
+            # Sign in with Supabase Auth
+            auth_response = supabase.auth.sign_in_with_password({
+                "email": login_data.email,
+                "password": login_data.password
+            })
+            
+            if not auth_response.user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid credentials"
+                )
+            
+            user_id = auth_response.user.id
+            user_email = auth_response.user.email
+            
+        except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials"
             )
         
         # Check if user has approved role using Supabase
-        user_role = await get_user_role(user["id"])
+        user_role = await get_user_role(user_id)
         
         if not user_role or not user_role.get("approved", False):
             raise HTTPException(
@@ -199,16 +212,16 @@ async def signin(login_data: UserLogin):
         primary_role = user_role["role"]
         
         # Create JWT token
-        token = create_jwt_token(user["id"], primary_role)
+        token = create_jwt_token(user_id, primary_role)
         
         return {
             "status": "success",
             "message": "Login successful",
             "token": token,
             "user": {
-                "id": user["id"],
-                "email": user["email"],
-                "full_name": user["full_name"],
+                "id": user_id,
+                "email": user_email,
+                "full_name": user_email,  # Will be updated from profiles table
                 "role": primary_role
             }
         }
@@ -225,17 +238,28 @@ async def signin(login_data: UserLogin):
 async def get_current_user(current_user: dict = Depends(verify_jwt_token)):
     """Get current user information"""
     try:
-        # Find user by ID
-        user = None
-        for email, user_data in users_db.items():
-            if user_data["id"] == current_user["user_id"]:
-                user = user_data
-                break
-        
-        if not user:
+        # Get user from Supabase
+        if not supabase:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Supabase not configured"
+            )
+        
+        try:
+            # Get user from Supabase profiles table
+            result = supabase.table("profiles").select("*").eq("id", current_user["user_id"]).execute()
+            
+            if not result.data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
+            
+            user = result.data[0]
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to get user: {str(e)}"
             )
         
         return {
