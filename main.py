@@ -127,6 +127,10 @@ async def startup():
     try:
         await database.connect()
         logger.info("Database connected")
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        # Don't fail the entire app if database connection fails
+        # This allows the app to start even if database is not available
         
         # Initialize services if available
         if SIMPLE_MAPPING_AVAILABLE:

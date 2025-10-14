@@ -27,5 +27,11 @@ transactions = Table(
 raw_url = str(DATABASE_URL)
 # Build a synchronous URL for SQLAlchemy engine (remove +aiosqlite driver)
 sync_url = raw_url.replace("+aiosqlite", "")
-engine = create_engine(sync_url)
-metadata.create_all(engine)
+
+# Only create tables for SQLite, not for PostgreSQL (Supabase)
+if "sqlite" in sync_url:
+    engine = create_engine(sync_url)
+    metadata.create_all(engine)
+else:
+    # For PostgreSQL (Supabase), tables are managed by Supabase
+    engine = create_engine(sync_url)

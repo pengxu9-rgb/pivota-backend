@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 60 * 24  # 24 hours
     
+    # Supabase
+    supabase_url: Optional[str] = os.getenv("SUPABASE_URL")
+    supabase_anon_key: Optional[str] = os.getenv("SUPABASE_ANON_KEY")
+    supabase_service_role_key: Optional[str] = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    
     # CORS
     allowed_origins: list = [
         "https://*.lovable.app",
