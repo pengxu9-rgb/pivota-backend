@@ -393,6 +393,30 @@ async def test_psp_connection(psp_id: str):
         "test_results": test_results
     }
 
+@router.post("/psp/{psp_id}/toggle")
+async def toggle_psp_status(psp_id: str, enable: bool):
+    """Toggle PSP enabled/disabled status"""
+    
+    if psp_id not in admin_store["psp_configs"]:
+        raise HTTPException(status_code=404, detail="PSP configuration not found")
+    
+    # Update PSP status
+    admin_store["psp_configs"][psp_id]["enabled"] = enable
+    admin_store["psp_configs"][psp_id]["status"] = PSPStatus.ACTIVE if enable else PSPStatus.INACTIVE
+    
+    # Log the action
+    log_admin_action("psp_toggled", {
+        "psp_id": psp_id,
+        "enabled": enable
+    }, "admin")
+    
+    return {
+        "status": "success",
+        "message": f"PSP {psp_id} {'enabled' if enable else 'disabled'} successfully",
+        "psp_id": psp_id,
+        "enabled": enable
+    }
+
 # Routing Rules Management
 @router.post("/routing/rules/add")
 async def add_routing_rule(

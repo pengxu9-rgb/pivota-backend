@@ -822,6 +822,103 @@
             `).join('');
         }
 
+        // PSP Management Functions
+        async function testPSP(pspId) {
+            try {
+                showNotification('Testing PSP connection...', 'info');
+                
+                const response = await fetch(`/admin/psp/${pspId}/test`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showNotification(`PSP test successful: ${result.latency_ms}ms`, 'success');
+                    // Reload PSP list to show updated test results
+                    loadPSPList();
+                } else {
+                    showNotification(`PSP test failed: ${result.details?.error || 'Unknown error'}`, 'error');
+                }
+                
+            } catch (error) {
+                console.error('Error testing PSP:', error);
+                showNotification('Failed to test PSP connection', 'error');
+            }
+        }
+
+        async function togglePSP(pspId, enable) {
+            try {
+                const action = enable ? 'enable' : 'disable';
+                showNotification(`${action.charAt(0).toUpperCase() + action.slice(1)}ing PSP...`, 'info');
+                
+                const response = await fetch(`/admin/psp/${pspId}/toggle`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({ enable: enable })
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    showNotification(`PSP ${action}d successfully`, 'success');
+                    // Reload PSP list to show updated status
+                    loadPSPList();
+                } else {
+                    showNotification(`Failed to ${action} PSP: ${result.message}`, 'error');
+                }
+                
+            } catch (error) {
+                console.error('Error toggling PSP:', error);
+                showNotification('Failed to toggle PSP status', 'error');
+            }
+        }
+
+        async function addPSP() {
+            try {
+                const formData = {
+                    psp_type: document.getElementById('pspType').value,
+                    api_key: document.getElementById('apiKey').value,
+                    webhook_secret: document.getElementById('webhookSecret').value,
+                    merchant_account: document.getElementById('merchantAccount').value,
+                    enabled: document.getElementById('pspEnabled').checked,
+                    sandbox_mode: document.getElementById('sandboxMode').checked
+                };
+                
+                showNotification('Adding PSP configuration...', 'info');
+                
+                const response = await fetch('/admin/psp/add', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify(formData)
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    showNotification(`PSP added successfully: ${result.psp_id}`, 'success');
+                    // Close modal and reload PSP list
+                    document.getElementById('addPSPModal').style.display = 'none';
+                    loadPSPList();
+                } else {
+                    showNotification(`Failed to add PSP: ${result.message}`, 'error');
+                }
+                
+            } catch (error) {
+                console.error('Error adding PSP:', error);
+                showNotification('Failed to add PSP', 'error');
+            }
+        }
+
         // Load PSP list
         async function loadPSPList() {
             try {
