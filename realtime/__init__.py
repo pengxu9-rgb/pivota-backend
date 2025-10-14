@@ -29,10 +29,13 @@ class AsyncRealtimeChannel:
 
 class AsyncRealtimeClient:
     """Async realtime client for WebSocket connections"""
-    def __init__(self, url: str, key: str):
+    def __init__(self, url: str, token: str = None, **options):
         self.url = url
-        self.key = key
+        self.token = token
+        self.key = token  # For backward compatibility
+        self.options = options
         self.channels = {}
+        self.connected = False
     
     def channel(self, channel_name: str, options: dict = None):
         """Create a channel"""
@@ -42,10 +45,18 @@ class AsyncRealtimeClient:
     
     async def connect(self):
         """Connect to realtime service"""
+        self.connected = True
         return self
     
     async def disconnect(self):
         """Disconnect from realtime service"""
+        self.connected = False
+        return self
+    
+    def set_auth(self, token: str):
+        """Set authentication token"""
+        self.token = token
+        self.key = token
         return self
 
 class RealtimeChannelOptions:
@@ -125,10 +136,13 @@ class SyncRealtimeChannel:
 
 class SyncRealtimeClient:
     """Sync realtime client for WebSocket connections"""
-    def __init__(self, url: str, key: str):
+    def __init__(self, url: str, token: str = None, **options):
         self.url = url
-        self.key = key
+        self.token = token
+        self.key = token  # For backward compatibility
+        self.options = options
         self.channels = {}
+        self.connected = False
     
     def channel(self, channel_name: str, options: dict = None):
         """Create a channel"""
@@ -138,10 +152,18 @@ class SyncRealtimeClient:
     
     def connect(self):
         """Connect to realtime service"""
+        self.connected = True
         return self
     
     def disconnect(self):
         """Disconnect from realtime service"""
+        self.connected = False
+        return self
+    
+    def set_auth(self, token: str):
+        """Set authentication token"""
+        self.token = token
+        self.key = token
         return self
 
 # Additional common realtime classes that might be needed
