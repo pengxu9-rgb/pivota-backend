@@ -542,7 +542,7 @@ async def list_psp_configs(
     }
 
 @router.post("/psp/{psp_id}/test")
-async def test_psp_connection(psp_id: str):
+async def test_psp_connection(psp_id: str, credentials: dict = Depends(verify_jwt_token)):
     """Test PSP connection with real API calls"""
     
     if psp_id not in admin_store["psp_configs"]:

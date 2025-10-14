@@ -1623,30 +1623,7 @@
             }
         });
 
-        // Test PSP connection
-        async function testPSP(pspId) {
-            try {
-                const response = await fetch(`/psp-fix/status`, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${authToken}`
-                    }
-                });
-                
-                const result = await response.json();
-                
-                if (result.status === 'success') {
-                    alert(`✅ PSP test completed successfully`);
-                    loadPSPList();
-                } else {
-                    alert(`❌ PSP test failed: ${result.message}`);
-                }
-                
-            } catch (error) {
-                console.error('Error testing PSP:', error);
-                alert('❌ Error testing PSP connection');
-            }
-        }
+        // Test PSP connection - REMOVED DUPLICATE FUNCTION
 
         // Toggle sandbox mode
         async function toggleSandboxMode() {
