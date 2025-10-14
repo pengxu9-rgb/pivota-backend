@@ -780,7 +780,7 @@
                 
                 const container = document.getElementById('pspList');
                 
-                if (data.psps.length === 0) {
+                if (!data.psp || Object.keys(data.psp).length === 0) {
                     container.innerHTML = `
                         <div class="empty-state">
                             <h3>No PSP configurations</h3>
@@ -802,16 +802,16 @@
                             </tr>
                         </thead>
                         <tbody>
-                            ${data.psps.map(psp => `
+                            ${Object.entries(data.psp).map(([pspId, pspData]) => `
                                 <tr>
-                                    <td>${psp.psp_type}</td>
-                                    <td><span class="status-badge status-${psp.status}">${psp.status}</span></td>
-                                    <td>${psp.enabled ? 'Yes' : 'No'}</td>
-                                    <td>${psp.last_tested || 'Never'}</td>
+                                    <td>${pspData.name || pspId.toUpperCase()}</td>
+                                    <td><span class="status-badge status-${pspData.status}">${pspData.status}</span></td>
+                                    <td>${pspData.enabled ? 'Yes' : 'No'}</td>
+                                    <td>${pspData.last_tested || 'Never'}</td>
                                     <td>
-                                        <button class="btn btn-primary" onclick="testPSP('${psp.id}')">Test</button>
-                                        <button class="btn btn-secondary" onclick="togglePSP('${psp.id}', ${!psp.enabled})">
-                                            ${psp.enabled ? 'Disable' : 'Enable'}
+                                        <button class="btn btn-primary" onclick="testPSP('${pspId}')">Test</button>
+                                        <button class="btn btn-secondary" onclick="togglePSP('${pspId}', ${!pspData.enabled})">
+                                            ${pspData.enabled ? 'Disable' : 'Enable'}
                                         </button>
                                     </td>
                                 </tr>
