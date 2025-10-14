@@ -26,18 +26,21 @@
 
     <script>
         async function fetchMetrics() {
-            const response = await fetch("/psp/metrics");
+            const response = await fetch("/psp-fix/status");
             const data = await response.json();
             const tbody = document.getElementById("metrics-body");
             tbody.innerHTML = "";
-            for (let psp in data.metrics) {
-                const row = `<tr>
-                    <td>${psp}</td>
-                    <td>${(data.metrics[psp].success_rate*100).toFixed(2)}%</td>
-                    <td>${data.metrics[psp].latency}</td>
-                    <td>${data.metrics[psp].cost}</td>
-                </tr>`;
-                tbody.innerHTML += row;
+            if (data.status === 'success' && data.psp) {
+                for (let psp in data.psp) {
+                    const pspData = data.psp[psp];
+                    const row = `<tr>
+                        <td>${pspData.name || psp}</td>
+                        <td>${pspData.connection_health === 'healthy' ? '100.00' : '0.00'}%</td>
+                        <td>${pspData.api_response_time || 'N/A'}</td>
+                        <td>${pspData.status === 'active' ? 'Active' : 'Inactive'}</td>
+                    </tr>`;
+                    tbody.innerHTML += row;
+                }
             }
         }
 

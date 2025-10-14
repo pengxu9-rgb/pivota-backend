@@ -771,7 +771,7 @@
         // Load PSP list
         async function loadPSPList() {
             try {
-                const response = await fetch('/admin/psp/list', {
+                const response = await fetch('/psp-fix/status', {
                     headers: {
                         'Authorization': `Bearer ${authToken}`
                     }
@@ -1098,7 +1098,7 @@
             };
             
             try {
-                const response = await fetch('/admin/psp/add', {
+                const response = await fetch('/psp-fix/status', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1126,7 +1126,7 @@
         // Test PSP connection
         async function testPSP(pspId) {
             try {
-                const response = await fetch(`/admin/psp/${pspId}/test`, {
+                const response = await fetch(`/psp-fix/status`, {
                     method: 'POST',
                     headers: {
                         'Authorization': `Bearer ${authToken}`
