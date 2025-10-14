@@ -154,9 +154,13 @@ async def publish_event_to_ws(event: dict):
             "event": event,
             "timestamp": time.time()
         }
+        print(f"🔔 Broadcasting event to {len(simple_manager.active_connections)} simple WebSocket clients: {event_data}")
         await simple_manager.broadcast(event_data)
+        print(f"✅ Event broadcasted successfully")
     except Exception as e:
-        print(f"Error broadcasting to simple WebSocket clients: {e}")
+        print(f"❌ Error broadcasting to simple WebSocket clients: {e}")
+        import traceback
+        traceback.print_exc()
 
 @app.get("/")
 async def root():
