@@ -83,9 +83,37 @@ const EnhancedAdminDashboard: React.FC = () => {
     fetchAllData();
   }, []);
 
+  const testApiConnection = async () => {
+    try {
+      const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      console.log('Testing API connection to:', `${API_URL}/admin/test`);
+      
+      const response = await fetch(`${API_URL}/admin/test`);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      console.log('API connection test successful:', data);
+      return true;
+    } catch (error) {
+      console.error('API connection test failed:', error);
+      toast.error(`API connection failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return false;
+    }
+  };
+
   const fetchAllData = async () => {
     setLoading(true);
     try {
+      // Test API connection first
+      const connectionOk = await testApiConnection();
+      if (!connectionOk) {
+        toast.error('Cannot connect to backend API. Check VITE_API_URL environment variable.');
+        return;
+      }
+
       await Promise.all([
         fetchPendingUsers(),
         fetchPSPs(),
@@ -160,48 +188,66 @@ const EnhancedAdminDashboard: React.FC = () => {
   const fetchAnalytics = async () => {
     try {
       const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      console.log('Fetching analytics from:', `${API_URL}/admin/analytics/overview?days=30`);
+      
       const response = await fetch(`${API_URL}/admin/analytics/overview?days=30`);
       
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorText = await response.text();
+        console.error('Analytics API error:', response.status, errorText);
+        throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
       }
       
       const data = await response.json();
+      console.log('Analytics data received:', data);
       setAnalytics(data);
     } catch (error) {
       console.error('Error fetching analytics:', error);
+      toast.error(`Analytics error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 
   const fetchSystemLogs = async () => {
     try {
       const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      console.log('Fetching system logs from:', `${API_URL}/admin/logs?limit=50&hours=24`);
+      
       const response = await fetch(`${API_URL}/admin/logs?limit=50&hours=24`);
       
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorText = await response.text();
+        console.error('System logs API error:', response.status, errorText);
+        throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
       }
       
       const data = await response.json();
+      console.log('System logs data received:', data);
       setSystemLogs(data.logs || []);
     } catch (error) {
       console.error('Error fetching system logs:', error);
+      toast.error(`System logs error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 
   const fetchApiKeys = async () => {
     try {
       const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      console.log('Fetching API keys from:', `${API_URL}/admin/dev/api-keys`);
+      
       const response = await fetch(`${API_URL}/admin/dev/api-keys`);
       
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorText = await response.text();
+        console.error('API keys error:', response.status, errorText);
+        throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
       }
       
       const data = await response.json();
+      console.log('API keys data received:', data);
       setApiKeys(data.api_keys || []);
     } catch (error) {
       console.error('Error fetching API keys:', error);
+      toast.error(`API keys error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 

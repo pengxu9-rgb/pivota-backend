@@ -1223,6 +1223,17 @@ async def toggle_sandbox_mode(
         "sandbox_mode": enabled
     }
 
+# Test endpoint for debugging
+@router.get("/test")
+async def test_endpoint():
+    """Simple test endpoint to verify connection"""
+    return {
+        "status": "success",
+        "message": "Admin API is working",
+        "timestamp": datetime.utcnow().isoformat(),
+        "data_source": "real_time"
+    }
+
 # Analytics
 @router.get("/analytics/overview")
 async def get_analytics_overview(
