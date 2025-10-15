@@ -22,11 +22,15 @@ async def create_user_in_supabase(email: str, password: str, role: str = "employ
         return {"success": False, "error": "Supabase not configured"}
     
     try:
-        # Create user in Supabase Auth
+        # Create user in Supabase Auth using admin API
+        # This bypasses email confirmation
         auth_response = supabase.auth.admin.create_user({
             "email": email,
             "password": password,
-            "email_confirm": True
+            "email_confirm": True,  # Auto-confirm email
+            "user_metadata": {
+                "role": role
+            }
         })
         
         if auth_response.user:
@@ -35,7 +39,11 @@ async def create_user_in_supabase(email: str, password: str, role: str = "employ
         else:
             return {"success": False, "error": "Failed to create user"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        error_msg = str(e)
+        # Provide more helpful error messages
+        if "User not allowed" in error_msg:
+            return {"success": False, "error": "Email signup is disabled in Supabase settings. Please enable it in Authentication > Providers > Email."}
+        return {"success": False, "error": error_msg}
 
 async def get_user_role(user_id: str):
     """Get user role from Supabase"""
