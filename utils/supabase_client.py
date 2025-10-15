@@ -22,27 +22,48 @@ async def create_user_in_supabase(email: str, password: str, role: str = "employ
         return {"success": False, "error": "Supabase not configured"}
     
     try:
-        # Create user in Supabase Auth using admin API
-        # This bypasses email confirmation
-        auth_response = supabase.auth.admin.create_user({
-            "email": email,
-            "password": password,
-            "email_confirm": True,  # Auto-confirm email
-            "user_metadata": {
-                "role": role
-            }
-        })
-        
-        if auth_response.user:
-            # The trigger will automatically create profile and user_role
-            return {"success": True, "user_id": auth_response.user.id}
-        else:
-            return {"success": False, "error": "Failed to create user"}
+        # Try using admin.create_user first (requires service role key)
+        try:
+            auth_response = supabase.auth.admin.create_user({
+                "email": email,
+                "password": password,
+                "email_confirm": True,  # Auto-confirm email
+                "user_metadata": {
+                    "role": role
+                }
+            })
+            
+            if auth_response.user:
+                return {"success": True, "user_id": auth_response.user.id}
+        except Exception as admin_error:
+            # If admin.create_user fails, try regular signup
+            print(f"Admin create failed: {admin_error}, trying regular signup")
+            
+            # Use regular signup (this will require email confirmation if enabled)
+            signup_response = supabase.auth.sign_up({
+                "email": email,
+                "password": password,
+                "options": {
+                    "data": {
+                        "role": role
+                    }
+                }
+            })
+            
+            if signup_response.user:
+                return {"success": True, "user_id": signup_response.user.id}
+            else:
+                return {"success": False, "error": "Failed to create user"}
+                
     except Exception as e:
         error_msg = str(e)
+        print(f"User creation error: {error_msg}")
+        
         # Provide more helpful error messages
-        if "User not allowed" in error_msg:
-            return {"success": False, "error": "Email signup is disabled in Supabase settings. Please enable it in Authentication > Providers > Email."}
+        if "User not allowed" in error_msg or "Signups not allowed" in error_msg:
+            return {"success": False, "error": "User signup is restricted. Please check Supabase Auth settings or contact admin."}
+        if "already registered" in error_msg.lower():
+            return {"success": False, "error": "Email already registered"}
         return {"success": False, "error": error_msg}
 
 async def get_user_role(user_id: str):
