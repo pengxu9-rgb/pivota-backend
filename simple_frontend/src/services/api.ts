@@ -51,12 +51,15 @@ api.interceptors.response.use(
     return response;
   },
   (error) => {
-    console.error('❌ API error:', {
+    console.error('❌ API error - Full error object:', error);
+    console.error('❌ API error details:', {
       status: error.response?.status,
       statusText: error.response?.statusText,
       url: error.config?.url,
       message: error.message,
-      response: error.response?.data
+      responseData: error.response?.data,
+      code: error.code,
+      stack: error.stack
     });
     
     if (error.response?.status === 401) {

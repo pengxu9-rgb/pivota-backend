@@ -184,6 +184,10 @@ async def get_admin_dashboard(current_user: dict = Depends(require_admin)):
             "success_rate": stats["success_rate"],
             "configured_psps": len(psps),
             "configured_stores": len(stores)
+        },
+        "psp_management": {
+            "active_psps": len(psps),
+            "total_configured": len(psps)
         }
     }
 

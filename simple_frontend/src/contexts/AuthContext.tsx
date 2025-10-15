@@ -79,10 +79,14 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       console.log('✅ User set:', response.user);
     } catch (error: any) {
       console.error('❌ Signin failed at:', new Date().toISOString());
+      console.error('❌ Full error object:', error);
       console.error('❌ Error details:', {
         message: error.message,
         name: error.name,
-        response: error.response?.data,
+        code: error.code,
+        responseStatus: error.response?.status,
+        responseData: error.response?.data,
+        responseDataDetail: error.response?.data?.detail,
       });
       
       // Provide user-friendly error messages

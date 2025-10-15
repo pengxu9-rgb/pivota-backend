@@ -91,12 +91,21 @@ export const AdminDashboard: React.FC = () => {
 
   const handleTestPSP = async (pspId: string) => {
     try {
-      await adminApi.testPSP(pspId);
+      console.log(`🧪 Testing PSP: ${pspId}`);
+      const result = await adminApi.testPSP(pspId);
+      console.log('✅ PSP test result:', result);
+      
+      // Show success message
+      alert(`✅ PSP ${pspId} test successful!\n${result.message || 'Connection OK'}`);
+      
       // Reload PSP data after test
       const pspData = await adminApi.getPSPStatus();
       setPsps(pspData.psp);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'PSP test failed');
+      console.error('❌ PSP test failed:', err);
+      const errorMsg = err.response?.data?.detail || err.message || 'PSP test failed';
+      setError(errorMsg);
+      alert(`❌ PSP test failed: ${errorMsg}`);
     }
   };
 
@@ -298,13 +307,19 @@ export const AdminDashboard: React.FC = () => {
 
                 <div className="flex gap-2">
                   <button
-                    onClick={() => handleTestPSP(pspId)}
+                    onClick={() => {
+                      console.log('🔘 Test button clicked for PSP:', pspId);
+                      handleTestPSP(pspId);
+                    }}
                     className="btn btn-primary btn-sm flex-1"
                   >
                     Test Connection
                   </button>
                   <button
-                    onClick={() => handleTogglePSP(pspId, !psp.enabled)}
+                    onClick={() => {
+                      console.log('🔘 Toggle button clicked for PSP:', pspId, 'New state:', !psp.enabled);
+                      handleTogglePSP(pspId, !psp.enabled);
+                    }}
                     className={`btn btn-sm flex-1 ${
                       psp.enabled ? 'btn-danger' : 'btn-success'
                     }`}
@@ -397,8 +412,20 @@ export const AdminDashboard: React.FC = () => {
             </button>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {Object.entries(merchants).map(([merchantId, merchant]) => (
+          {Object.keys(merchants).length === 0 ? (
+            <div className="card text-center py-12">
+              <h3 className="text-lg font-semibold mb-2">No Merchants Configured</h3>
+              <p className="text-gray-600 mb-4">
+                Configure Shopify or Wix stores in Render environment variables:
+              </p>
+              <ul className="text-sm text-gray-500 space-y-1">
+                <li>SHOPIFY_ACCESS_TOKEN + SHOPIFY_STORE_URL</li>
+                <li>WIX_API_KEY + WIX_STORE_URL</li>
+              </ul>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {Object.entries(merchants).map(([merchantId, merchant]) => (
               <div key={merchantId} className="card">
                 <div className="flex justify-between items-start mb-4">
                   <div>
@@ -450,8 +477,9 @@ export const AdminDashboard: React.FC = () => {
                   </button>
                 </div>
               </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
