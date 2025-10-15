@@ -82,17 +82,29 @@ export const AdminDashboard: React.FC = () => {
       console.log('✅ Routing rules:', rulesData);
       setRoutingRules(rulesData.rules);
 
-      // Load merchants from new API
+      // Load BOTH configured stores AND onboarded merchants
+      const merchantsObj: Record<string, any> = {};
+      
+      // 1. Load configured stores (Shopify, Wix)
+      try {
+        const configuredStores = await adminApi.getMerchantKYB();
+        console.log('📊 Configured stores:', configuredStores);
+        Object.assign(merchantsObj, configuredStores.merchants || {});
+      } catch (err) {
+        console.error('❌ Failed to fetch configured stores:', err);
+      }
+      
+      // 2. Load onboarded merchants from database
       try {
         const merchantsData = await merchantApi.listMerchants();
-        console.log('📊 Real merchants data:', merchantsData);
+        console.log('📊 Onboarded merchants:', merchantsData);
         
-        // Convert array to object for compatibility
-        const merchantsObj: Record<string, any> = {};
         if (merchantsData.merchants && Array.isArray(merchantsData.merchants)) {
           merchantsData.merchants.forEach((m: any) => {
-            merchantsObj[m.id] = {
-              id: m.id,
+            // Use "merchant_" prefix to avoid ID conflicts with configured stores
+            merchantsObj[`merchant_${m.id}`] = {
+              id: `merchant_${m.id}`,
+              merchant_id: m.id,  // Store actual merchant ID for API calls
               name: m.business_name,
               platform: m.platform,
               store_url: m.store_url,
@@ -100,17 +112,16 @@ export const AdminDashboard: React.FC = () => {
               verification_status: m.verification_status,
               volume_processed: m.volume_processed || 0,
               kyb_documents: [],
-              last_activity: m.updated_at || m.created_at
+              last_activity: m.updated_at || m.created_at,
+              is_onboarded: true  // Flag to identify onboarded merchants
             };
           });
         }
-        setMerchants(merchantsObj);
       } catch (err) {
-        console.error('❌ Failed to fetch real merchants:', err);
-        // Fallback to configured stores
-        const merchantData = await adminApi.getMerchantKYB();
-        setMerchants(merchantData.merchants);
+        console.error('❌ Failed to fetch onboarded merchants:', err);
       }
+      
+      setMerchants(merchantsObj);
 
       // Load system logs
       const logsData = await adminApi.getSystemLogs(20, 24);
@@ -213,7 +224,13 @@ export const AdminDashboard: React.FC = () => {
   const handleApproveMerchant = async (merchantId: string) => {
     try {
       console.log('✅ Approving merchant:', merchantId);
-      const result = await merchantApi.approve(Number(merchantId));
+      
+      // Extract actual merchant ID if it has "merchant_" prefix
+      const actualId = merchantId.startsWith('merchant_') 
+        ? Number(merchantId.replace('merchant_', ''))
+        : Number(merchantId);
+      
+      const result = await merchantApi.approve(actualId);
       console.log('Merchant approved:', result);
       alert(`✅ ${result.message}`);
       await loadDashboardData();
@@ -227,7 +244,13 @@ export const AdminDashboard: React.FC = () => {
   const handleRejectMerchant = async (merchantId: string, reason: string) => {
     try {
       console.log('❌ Rejecting merchant:', merchantId, 'Reason:', reason);
-      const result = await merchantApi.reject(Number(merchantId), reason);
+      
+      // Extract actual merchant ID if it has "merchant_" prefix
+      const actualId = merchantId.startsWith('merchant_') 
+        ? Number(merchantId.replace('merchant_', ''))
+        : Number(merchantId);
+      
+      const result = await merchantApi.reject(actualId, reason);
       console.log('Merchant rejected:', result);
       alert(`❌ ${result.message}\nReason: ${reason}`);
       await loadDashboardData();
@@ -603,7 +626,11 @@ export const AdminDashboard: React.FC = () => {
                 <div className="flex gap-2 flex-wrap">
                   <button 
                     onClick={() => {
-                      setSelectedMerchant(merchant);
+                      // Use merchant_id for onboarded merchants, id for configured stores
+                      setSelectedMerchant({
+                        ...merchant,
+                        id: merchant.merchant_id || merchant.id
+                      });
                       setShowDocumentUploadModal(true);
                     }}
                     className="btn btn-success btn-sm flex-1"
