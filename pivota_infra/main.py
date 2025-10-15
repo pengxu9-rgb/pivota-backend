@@ -215,5 +215,25 @@ async def health():
         "database": "connected"
     }
 
+@app.get("/config-check")
+async def config_check():
+    """Public endpoint to check environment variable configuration (no auth required)"""
+    from config.settings import settings
+    
+    return {
+        "status": "success",
+        "message": "Environment variable configuration check",
+        "config": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
+        },
+        "instructions": "If any values show '❌ NOT SET', add them in Render Environment Variables and redeploy"
+    }
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
