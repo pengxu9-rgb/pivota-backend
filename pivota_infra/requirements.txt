@@ -9,3 +9,5 @@ pydantic
 pydantic-settings
 alembic      # optional for migrations later
 aiosqlite    # required for sqlite async driver
+psycopg2-binary  # required for PostgreSQL
+asyncpg      # required for async PostgreSQL
