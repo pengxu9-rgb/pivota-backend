@@ -1,222 +1,196 @@
-# ✅ READY TO TEST - Everything Fixed!
+# 🎯 Ready to Test - Merchant Onboarding System
 
-## 🎉 Status: READY FOR TESTING
+## ✅ What's Built (Locally)
 
-**Backend:** ✅ Running and warmed up  
-**Frontend:** ✅ Dev server running with fixes  
-**Timeout Issue:** ✅ FIXED (switched to fetch API with 30s timeout)  
-**Cold Start:** ✅ Backend pre-warmed
+### Backend Files Created:
+- ✅ `pivota_infra/db/merchants.py` - Database tables & operations
+- ✅ `pivota_infra/routes/merchant_routes.py` - API endpoints
+- ✅ `pivota_infra/main.py` - Updated with merchant router
 
----
+### Frontend Files Updated:
+- ✅ `simple_frontend/src/services/api.ts` - Added `merchantApi`
+- ✅ `simple_frontend/src/pages/AdminDashboard.tsx` - Integrated real API calls
+- ✅ `simple_frontend/src/index.css` - Fixed modal backdrop styling
 
-## 🔧 What Was Fixed
-
-### Problem You Reported:
-```
-❌ Signin failed: AxiosError {message: 'timeout of 10000ms exceeded'}
-```
-
-### Root Cause:
-- Axios had a 10-second timeout
-- Render free tier has "cold starts" that can take 10-20 seconds
-- Your requests were timing out during cold starts
-
-### Solutions Applied:
-1. ✅ **Increased timeout to 30 seconds**
-2. ✅ **Switched from Axios to native Fetch API** (more reliable)
-3. ✅ **Added better error handling and logging**
-4. ✅ **Pre-warmed the backend** (just did this)
-5. ✅ **Restarted dev server** with new code
+### Modals Created:
+- ✅ `MerchantOnboardingModal.tsx` - Onboarding form
+- ✅ `KYBReviewModal.tsx` - KYB review interface
+- ✅ `MerchantDetailsModal.tsx` - Merchant details viewer
 
 ---
 
-## 🚀 TEST NOW
+## 🚀 How to Test (2 Options)
 
-### Step 1: Open the App
-1. Open your browser
-2. Go to: **http://localhost:3000/**
-3. Press **Ctrl+Shift+R** (or **Cmd+Shift+R**) to hard reload and clear cache
+### Option A: Test Locally (Backend + Frontend)
 
-### Step 2: Open Developer Tools
-1. Press **F12** (or Cmd+Option+I on Mac)
-2. Go to the **Console** tab
-3. Keep it open so you can see the logs
-
-### Step 3: Login
-1. You should see the login form
-2. Enter:
-   - **Email:** `admin@pivota.com`
-   - **Password:** `admin123`
-3. Click **"Sign In"**
-
-### Step 4: Watch the Console
-You should see logs like this:
-```
-🔐 Attempting signin with: {email: "admin@pivota.com"}
-⏰ Starting signin request at: 2025-10-15T05:30:00.000Z
-🔐 [FETCH] Attempting signin: {email: "admin@pivota.com", url: "..."}
-📥 [FETCH] Response status: 200
-✅ [FETCH] Signin successful: {access_token: "...", user: {...}}
-✅ Signin response received at: 2025-10-15T05:30:02.000Z
-✅ User set: {id: "...", email: "admin@pivota.com", role: "admin"}
-```
-
-### Step 5: Check Network Tab
-1. Go to **Network** tab in DevTools
-2. You should see a POST request to `/auth/signin`
-3. Status should be **200 OK**
-4. Time should be **1-5 seconds** (since backend is warmed up)
-
----
-
-## ✅ Expected Results
-
-### If Login Succeeds:
-- ✅ You'll be redirected to `/admin`
-- ✅ You'll see the Admin Dashboard
-- ✅ You'll see tabs: User Management, PSP Management, Analytics
-
-### If You See the Dashboard:
-**Congratulations! The frontend is working!** 🎉
-
-Next, test these features:
-1. **User Management Tab** - See pending users
-2. **PSP Management Tab** - See configured PSPs
-3. **Analytics Tab** - See system metrics
-
----
-
-## ❌ If It Still Fails
-
-### Scenario A: Still Times Out After 30 Seconds
-This means there's a network issue between your machine and Render.
-
-**Test:**
+#### 1. Start Backend Locally:
 ```bash
-# In terminal:
-time curl -X POST https://pivota-dashboard.onrender.com/auth/signin \
-  -H "Content-Type: application/json" \
-  -d '{"email":"admin@pivota.com","password":"admin123"}'
+cd pivota_infra
+uvicorn main:app --reload --port 8000
 ```
 
-- If this works quickly → Browser/CORS issue
-- If this also times out → Network/firewall issue
+#### 2. Update Frontend API URL:
+Edit `simple_frontend/src/services/api.ts`:
+```typescript
+const API_BASE_URL = 'http://localhost:8000';  // Change from Render URL
+```
 
-**Solutions:**
-1. Try a different network (phone hotspot)
-2. Try a VPN
-3. Check firewall settings
-
-### Scenario B: Different Error Message
-**Copy the exact error** from the console and tell me. I'll fix it immediately.
-
-### Scenario C: Login Form Doesn't Appear
-**Check console for errors.** There might be a React rendering issue.
-
-### Scenario D: Login Succeeds But Dashboard is Empty
-This is actually progress! It means auth works. We just need to fix the dashboard data loading.
+#### 3. Test the Flow:
+1. Open http://localhost:3000
+2. Login as admin
+3. Click "Onboard Merchant"
+4. Fill form → Submit
+5. Check browser console for API response
+6. See if merchant appears in list
 
 ---
 
-## 🔍 Debugging Info to Collect
+### Option B: Deploy to Render (Recommended)
 
-If it doesn't work, please tell me:
+#### 1. Commit Changes:
+```bash
+git add .
+git commit -m "Add merchant onboarding system with KYB flow"
+git push origin main
+```
 
-### 1. Console Output
-Copy/paste everything from the Console tab, especially:
-- Any red errors
-- The signin logs (🔐, ⏰, ✅, ❌)
-- The timestamps
+#### 2. Wait for Render Deploy:
+- Go to https://dashboard.render.com
+- Check deployment logs
+- Wait for "Live" status
 
-### 2. Network Tab
-- Do you see the POST to `/auth/signin`?
-- What's the status? (200, timeout, failed?)
-- How long did it take? (shown in "Time" column)
-- Click on the request → Response tab → What does it say?
-
-### 3. What You See
-- Does the page show loading?
-- Does it show login form?
-- Does it show dashboard?
-- Does it show error message?
+#### 3. Test on Render:
+1. Open http://localhost:3000
+2. Frontend will call https://pivota-dashboard.onrender.com
+3. Test the complete flow
 
 ---
 
-## 📊 Performance Expectations
+## 🧪 Quick Test Script
 
-### First Request (Cold Start):
-- **Expected:** 10-20 seconds
-- **Status:** Backend was just warmed up, so should be fast now
+### Test via API (No Frontend Needed):
 
-### Normal Request (Warm):
-- **Expected:** 1-3 seconds
-- **Status:** This is what you should see now
+```bash
+# 1. Login and get token
+TOKEN=$(curl -s -X POST https://pivota-dashboard.onrender.com/auth/signin \
+  -H "Content-Type: application/json" \
+  -d '{"email": "superadmin@pivota.com", "password": "YOUR_PASSWORD"}' \
+  | jq -r '.access_token')
 
-### Timeout Threshold:
-- **Old:** 10 seconds (too short)
-- **New:** 30 seconds (should handle cold starts)
+# 2. Onboard merchant
+curl -X POST https://pivota-dashboard.onrender.com/merchants/onboard \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "business_name": "Quick Test Store",
+    "legal_name": "Quick Test LLC",
+    "platform": "shopify",
+    "store_url": "https://quicktest.com",
+    "contact_email": "test@quicktest.com",
+    "contact_phone": "+1234567890",
+    "business_type": "ecommerce",
+    "country": "US",
+    "expected_monthly_volume": 5000,
+    "description": "Test store"
+  }'
 
----
-
-## 🎯 Success Criteria
-
-You'll know it's working when:
-1. ✅ Login form appears
-2. ✅ You can type credentials
-3. ✅ Click "Sign In" triggers network request
-4. ✅ Console shows signin logs
-5. ✅ Request completes in < 5 seconds
-6. ✅ You're redirected to admin dashboard
-7. ✅ Dashboard loads with data
-
----
-
-## 🚨 IMPORTANT
-
-**The backend is currently warmed up**, so your login should be **FAST** (1-3 seconds).
-
-If it still times out after 30 seconds, there's likely a network/firewall issue on your machine or network.
+# 3. List merchants
+curl https://pivota-dashboard.onrender.com/merchants/ \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 ---
 
-## 📞 Next Steps
+## ⚠️ Current Status
 
-### If Login Works:
-Tell me and we'll test:
-1. User approval workflow
-2. PSP management
-3. Analytics dashboard
+### Backend:
+- ✅ Code written locally
+- ❌ **NOT deployed to Render yet**
+- ❌ Database tables not created yet (need deployment)
 
-### If Login Fails:
-Tell me:
-1. Exact error message
-2. How long it took before failing
-3. Network tab status
-4. Console logs
+### Frontend:
+- ✅ Running on http://localhost:3000
+- ✅ All modals working
+- ⚠️ Will call Render backend (which doesn't have merchant endpoints yet)
 
----
-
-## 🎉 Current Status Summary
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Backend | ✅ Running | Warmed up and responding fast |
-| Frontend Build | ✅ Success | No TypeScript errors |
-| Dev Server | ✅ Running | Port 3000 |
-| Timeout Fix | ✅ Applied | 30s timeout with fetch API |
-| Error Handling | ✅ Improved | Better user messages |
-| Logging | ✅ Enhanced | Detailed console logs |
-| Cold Start | ✅ Avoided | Backend pre-warmed |
+### What This Means:
+**You can test the UI locally, but API calls will fail until backend is deployed.**
 
 ---
 
-## 🚀 GO TEST IT NOW!
+## 📋 Testing Checklist
 
-1. Open: **http://localhost:3000/**
-2. Press: **Ctrl+Shift+R** (hard reload)
-3. Login with: `admin@pivota.com` / `admin123`
-4. Watch the console logs
-5. Report back what happens!
+### Frontend UI Test (Works Now):
+- [ ] Open http://localhost:3000
+- [ ] Login as admin
+- [ ] Go to Merchants tab
+- [ ] Click "Onboard Merchant" → Modal opens ✅
+- [ ] Fill form → Form accepts input ✅
+- [ ] Click submit → **API call will fail** ❌ (backend not deployed)
 
-**I'm confident this will work now!** 🎉
+### Full Integration Test (After Deploy):
+- [ ] Commit & push code
+- [ ] Wait for Render deploy
+- [ ] Open http://localhost:3000
+- [ ] Complete merchant onboarding
+- [ ] Upload documents (via API)
+- [ ] Review & approve merchant
+- [ ] Verify merchant status changes
 
+---
+
+## 🔄 Recommended Next Steps
+
+### Step 1: Deploy Backend ⭐
+```bash
+git add pivota_infra/db/merchants.py
+git add pivota_infra/routes/merchant_routes.py
+git add pivota_infra/main.py
+git commit -m "Add merchant onboarding backend"
+git push origin main
+```
+
+### Step 2: Test Frontend
+- Wait for deploy to complete
+- Test at http://localhost:3000
+- Merchant onboarding should work end-to-end
+
+### Step 3: Document Issues
+- Note any bugs or missing features
+- Decide which missing components to build next:
+  - PSP Connection
+  - API Key Management
+  - Webhook System
+
+---
+
+## 🎯 What You Can Test RIGHT NOW
+
+Even without deployment, you can test:
+
+1. **Frontend Modal UI**:
+   - Click "Onboard Merchant" button
+   - Fill the form
+   - See if it looks good
+   - Check if backdrop is visible
+
+2. **Frontend Code Review**:
+   - Check console for any errors
+   - Verify modal closes properly
+   - Test form validation
+
+3. **Backend Code Locally**:
+   - Run `cd pivota_infra && uvicorn main:app --reload`
+   - Test endpoints with curl
+   - Check database tables get created
+
+---
+
+**What would you like to do?**
+
+A) **Test frontend UI now** (modals, forms) → Open http://localhost:3000
+B) **Deploy backend first** → Commit & push to Render
+C) **Run backend locally** → Test complete flow on localhost
+D) **Skip testing** → Build remaining features (PSP, API keys)
+
+Let me know and I'll guide you! 🚀

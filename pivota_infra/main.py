@@ -19,7 +19,6 @@ from db.database import database
 # Core routers (only include what exists)
 from routes.agent_routes import router as agent_router
 from routes.psp_routes import router as psp_router
-from routes.merchant_routes import router as merchant_router
 from routes.payment_routes import router as payment_router
 
 # Dashboard routers
@@ -32,6 +31,7 @@ from routes.simple_ws_routes import router as simple_ws_router
 from routes.auth_routes import router as auth_router
 from routes.auth_ws_routes import router as auth_ws_router
 from routes.admin_api import router as admin_api_router
+from routes.merchant_routes import router as merchant_router
 
 # Service routers (only include what exists)
 try:
@@ -81,11 +81,11 @@ app.add_middleware(
 # Include available routers
 app.include_router(agent_router)
 app.include_router(psp_router)
-app.include_router(merchant_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # Authentication
 app.include_router(auth_ws_router)  # Authenticated WebSocket
 app.include_router(admin_api_router)  # Admin API endpoints
+app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
@@ -115,6 +115,12 @@ async def startup():
     try:
         await database.connect()
         logger.info("Database connected")
+        
+        # Create merchant tables if they don't exist
+        from db.merchants import merchants, kyb_documents
+        from db.database import metadata, engine
+        metadata.create_all(engine)
+        logger.info("Merchant tables created")
         
         # Initialize services if available
         if SIMPLE_MAPPING_AVAILABLE:

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { adminApi } from '../services/api';
+import { adminApi, merchantApi } from '../services/api';
 import { PSP, RoutingRule, Merchant, SystemLog, ApiKey, Analytics } from '../types';
 import { 
   CreditCard, 
@@ -12,6 +12,9 @@ import {
   Clock,
   TrendingUp
 } from 'lucide-react';
+import { MerchantOnboardingModal, MerchantFormData } from '../components/MerchantOnboardingModal';
+import { KYBReviewModal } from '../components/KYBReviewModal';
+import { MerchantDetailsModal } from '../components/MerchantDetailsModal';
 
 export const AdminDashboard: React.FC = () => {
   const [activeTab, setActiveTab] = useState('overview');
@@ -27,12 +30,31 @@ export const AdminDashboard: React.FC = () => {
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
 
-  console.log('📊 AdminDashboard rendered', { loading, error, activeTab });
+  // Modal states
+  const [showOnboardingModal, setShowOnboardingModal] = useState(false);
+  const [showKYBModal, setShowKYBModal] = useState(false);
+  const [showDetailsModal, setShowDetailsModal] = useState(false);
+  const [selectedMerchant, setSelectedMerchant] = useState<any>(null);
+
+  console.log('📊 AdminDashboard rendered', {
+    loading,
+    error,
+    activeTab,
+    showOnboardingModal,
+    showKYBModal,
+    showDetailsModal
+  });
+
+  console.log('🔍 Will render test modal?', showOnboardingModal && 'YES, should render red modal');
 
   useEffect(() => {
     console.log('📊 AdminDashboard useEffect - loading data');
     loadDashboardData();
   }, []);
+
+  useEffect(() => {
+    console.log('🎭 showOnboardingModal changed to:', showOnboardingModal);
+  }, [showOnboardingModal]);
 
   const loadDashboardData = async () => {
     try {
@@ -117,6 +139,53 @@ export const AdminDashboard: React.FC = () => {
       setPsps(pspData.psp);
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to toggle PSP');
+    }
+  };
+
+  // Merchant handlers
+  const handleMerchantOnboard = async (merchantData: MerchantFormData) => {
+    try {
+      console.log('🏪 Onboarding merchant:', merchantData);
+      const result = await merchantApi.onboard(merchantData);
+      console.log('✅ Merchant onboarded:', result);
+      
+      // Show success message with merchant ID and next steps
+      alert(`✅ Merchant "${merchantData.business_name}" onboarded successfully!\n\nMerchant ID: ${result.merchant_id}\n\nNext steps:\n1. Upload KYB documents\n2. Wait for admin approval\n\nYou can now upload documents for this merchant.`);
+      
+      // Reload merchants list
+      await loadDashboardData();
+    } catch (err: any) {
+      console.error('❌ Merchant onboarding failed:', err);
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to onboard merchant';
+      throw new Error(errorMsg);
+    }
+  };
+
+  const handleApproveMerchant = async (merchantId: string) => {
+    try {
+      console.log('✅ Approving merchant:', merchantId);
+      const result = await merchantApi.approve(Number(merchantId));
+      console.log('Merchant approved:', result);
+      alert(`✅ ${result.message}`);
+      await loadDashboardData();
+    } catch (err: any) {
+      console.error('❌ Failed to approve merchant:', err);
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to approve merchant';
+      throw new Error(errorMsg);
+    }
+  };
+
+  const handleRejectMerchant = async (merchantId: string, reason: string) => {
+    try {
+      console.log('❌ Rejecting merchant:', merchantId, 'Reason:', reason);
+      const result = await merchantApi.reject(Number(merchantId), reason);
+      console.log('Merchant rejected:', result);
+      alert(`❌ ${result.message}\nReason: ${reason}`);
+      await loadDashboardData();
+    } catch (err: any) {
+      console.error('❌ Failed to reject merchant:', err);
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to reject merchant';
+      throw new Error(errorMsg);
     }
   };
 
@@ -407,7 +476,15 @@ export const AdminDashboard: React.FC = () => {
         <div className="space-y-6">
           <div className="flex justify-between items-center">
             <h2 className="text-xl font-semibold">Merchant Management</h2>
-            <button className="btn btn-primary">
+            <button 
+              onClick={() => {
+                console.log('🔘 Onboard Merchant button clicked');
+                console.log('Current showOnboardingModal state:', showOnboardingModal);
+                setShowOnboardingModal(true);
+                console.log('Set showOnboardingModal to true');
+              }}
+              className="btn btn-primary"
+            >
               Onboard Merchant
             </button>
           </div>
@@ -422,6 +499,12 @@ export const AdminDashboard: React.FC = () => {
                 <li>SHOPIFY_ACCESS_TOKEN + SHOPIFY_STORE_URL</li>
                 <li>WIX_API_KEY + WIX_STORE_URL</li>
               </ul>
+              <button 
+                onClick={() => window.open('https://dashboard.render.com', '_blank')}
+                className="btn btn-primary mt-4"
+              >
+                Configure in Render
+              </button>
             </div>
           ) : (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -469,10 +552,22 @@ export const AdminDashboard: React.FC = () => {
                 </div>
 
                 <div className="flex gap-2">
-                  <button className="btn btn-primary btn-sm flex-1">
+                  <button 
+                    onClick={() => {
+                      setSelectedMerchant(merchant);
+                      setShowKYBModal(true);
+                    }}
+                    className="btn btn-primary btn-sm flex-1"
+                  >
                     Review KYB
                   </button>
-                  <button className="btn btn-secondary btn-sm flex-1">
+                  <button 
+                    onClick={() => {
+                      setSelectedMerchant(merchant);
+                      setShowDetailsModal(true);
+                    }}
+                    className="btn btn-secondary btn-sm flex-1"
+                  >
                     View Details
                   </button>
                 </div>
@@ -611,6 +706,54 @@ export const AdminDashboard: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Modals - with CSS class backdrop */}
+      <div 
+        className={showOnboardingModal ? 'modal-backdrop' : 'modal-backdrop-hidden'}
+        onClick={() => setShowOnboardingModal(false)}
+      >
+        <MerchantOnboardingModal
+          isOpen={showOnboardingModal}
+          onClose={() => setShowOnboardingModal(false)}
+          onSubmit={handleMerchantOnboard}
+        />
+      </div>
+
+      <div 
+        className={showKYBModal ? 'modal-backdrop' : 'modal-backdrop-hidden'}
+        onClick={() => {
+          setShowKYBModal(false);
+          setSelectedMerchant(null);
+        }}
+      >
+        <KYBReviewModal
+          isOpen={showKYBModal}
+          onClose={() => {
+            setShowKYBModal(false);
+            setSelectedMerchant(null);
+          }}
+          merchant={selectedMerchant}
+          onApprove={handleApproveMerchant}
+          onReject={handleRejectMerchant}
+        />
+      </div>
+
+      <div 
+        className={showDetailsModal ? 'modal-backdrop' : 'modal-backdrop-hidden'}
+        onClick={() => {
+          setShowDetailsModal(false);
+          setSelectedMerchant(null);
+        }}
+      >
+        <MerchantDetailsModal
+          isOpen={showDetailsModal}
+          onClose={() => {
+            setShowDetailsModal(false);
+            setSelectedMerchant(null);
+          }}
+          merchant={selectedMerchant}
+        />
+      </div>
     </div>
   );
 };

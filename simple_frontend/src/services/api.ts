@@ -104,6 +104,55 @@ export const authApi = {
   },
 };
 
+// Merchant API
+export const merchantApi = {
+  onboard: async (merchantData: any) => {
+    const response = await api.post('/merchants/onboard', merchantData);
+    return response.data;
+  },
+
+  uploadDocument: async (merchantId: number, documentType: string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('document_type', documentType);
+    
+    const response = await api.post(`/merchants/${merchantId}/documents/upload`, formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+    return response.data;
+  },
+
+  getMerchant: async (merchantId: number) => {
+    const response = await api.get(`/merchants/${merchantId}`);
+    return response.data;
+  },
+
+  listMerchants: async (status?: string) => {
+    const response = await api.get('/merchants/', { params: { status } });
+    return response.data;
+  },
+
+  approve: async (merchantId: number) => {
+    const response = await api.post(`/merchants/${merchantId}/approve`);
+    return response.data;
+  },
+
+  reject: async (merchantId: number, reason: string) => {
+    const response = await api.post(`/merchants/${merchantId}/reject`, { 
+      status: 'rejected',
+      rejection_reason: reason 
+    });
+    return response.data;
+  },
+
+  verifyDocument: async (documentId: number) => {
+    const response = await api.post(`/merchants/documents/${documentId}/verify`);
+    return response.data;
+  },
+};
+
 // Admin API
 export const adminApi = {
   // Dashboard
