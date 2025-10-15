@@ -36,7 +36,7 @@ class UserRole(str, Enum):
 class UserSignup(BaseModel):
     email: str
     password: str
-    role: UserRole
+    role: UserRole = UserRole.EMPLOYEE  # Default to employee role
     full_name: Optional[str] = None
 
 class UserLogin(BaseModel):
