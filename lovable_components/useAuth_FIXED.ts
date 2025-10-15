@@ -1,7 +1,7 @@
 import { useState, useEffect, createContext, useContext } from 'react';
 import { toast } from 'sonner';
 
-export type UserRole = 'employee' | 'agent' | 'merchant' | 'operator' | 'admin';
+type UserRole = 'employee' | 'agent' | 'merchant' | 'operator' | 'admin';
 
 interface User {
   id: string;
