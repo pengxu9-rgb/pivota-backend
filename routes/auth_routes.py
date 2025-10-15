@@ -479,3 +479,23 @@ async def test_post_response():
         "method": "POST",
         "endpoint": "/auth/test-post-response"
     }
+
+@router.get("/test-get-simple")
+async def test_get_simple():
+    """Simple GET test"""
+    return {"status": "success", "message": "GET works"}
+
+@router.post("/test-post-simple")
+async def test_post_simple():
+    """Simple POST test"""
+    return {"status": "success", "message": "POST works"}
+
+@router.post("/test-post-minimal")
+async def test_post_minimal():
+    """Minimal POST test with no dependencies"""
+    return {"message": "Minimal POST endpoint works"}
+
+@router.options("/test-post-simple")
+async def test_post_simple_options():
+    """Handle OPTIONS request for CORS"""
+    return {"message": "OPTIONS handled"}
