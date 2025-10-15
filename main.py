@@ -70,20 +70,23 @@ from utils.logger import logger
 
 app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
 
-# CORS middleware - Allow Lovable origins
+# CORS middleware - Allow all origins and methods
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # Allow all origins for development
-        "https://*.lovable.app",  # Lovable production
-        "https://lovable.app",  # Lovable main domain
-        "http://localhost:3000",  # Local development
-        "http://localhost:5173",  # Vite dev server
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,  # Set to False when using wildcard origins
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all requests to debug POST method issues"""
+    logger.info(f"Request: {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response: {response.status_code}")
+    return response
 
 # Include available routers
 app.include_router(agent_router)
