@@ -31,6 +31,7 @@ from routes.test_data_routes import router as test_data_router
 from routes.simple_ws_routes import router as simple_ws_router
 from routes.auth_routes import router as auth_router
 from routes.auth_ws_routes import router as auth_ws_router
+from routes.test_routes import test_router
 from routes.debug_routes import router as debug_router
 from routes.eventfeed_routes import router as eventfeed_router
 from routes.user_approval_routes import router as user_approval_router
@@ -91,6 +92,7 @@ app.include_router(merchant_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # Authentication
 app.include_router(auth_ws_router)  # Authenticated WebSocket
+app.include_router(test_router)  # Test routes for debugging
 app.include_router(debug_router)  # Debug routes
 app.include_router(eventfeed_router)  # EventFeed routes
 app.include_router(user_approval_router)  # User approval for Lovable

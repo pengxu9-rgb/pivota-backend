@@ -6,7 +6,6 @@ Supports the Lovable admin approval system
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import Optional
 from typing import Optional, List
 import jwt
 import hashlib
