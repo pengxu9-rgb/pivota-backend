@@ -8,12 +8,12 @@ from pydantic import BaseModel
 # Create minimal test router
 minimal_router = APIRouter(prefix="/minimal", tags=["minimal"])
 
-@minimal_router.get("/")
+@minimal_router.get("/get")
 async def minimal_get():
     """Minimal GET test"""
     return {"status": "success", "method": "GET"}
 
-@minimal_router.post("/")
+@minimal_router.post("/post")
 async def minimal_post():
     """Minimal POST test"""
     return {"status": "success", "method": "POST"}

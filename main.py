@@ -71,6 +71,11 @@ from utils.logger import logger
 
 app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
 
+# Basic root endpoint to test if app is running
+@app.get("/")
+async def root():
+    return {"message": "Pivota Infra Dashboard is running", "status": "ok"}
+
 # CORS middleware - Allow all origins and methods
 app.add_middleware(
     CORSMiddleware,
