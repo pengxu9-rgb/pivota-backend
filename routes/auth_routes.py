@@ -150,12 +150,26 @@ async def signup(user_data: UserSignup):
                 detail=f"Failed to create user: {supabase_result['error']}"
             )
         
+        # Auto-approve admin users (for first admin setup)
+        approved = False
+        if user_data.role == UserRole.ADMIN:
+            # Auto-approve the first admin user
+            approval_result = await update_user_role_in_supabase(
+                user_id=supabase_result["user_id"],
+                role=user_data.role,
+                approved=True
+            )
+            if approval_result["success"]:
+                approved = True
+        
+        message = "Account created and approved!" if approved else "Account created successfully. Awaiting admin approval."
+        
         return {
             "status": "success",
-            "message": "Account created successfully. Awaiting admin approval.",
+            "message": message,
             "user_id": supabase_result["user_id"],
             "role": user_data.role,
-            "approved": False
+            "approved": approved
         }
         
     except HTTPException:
