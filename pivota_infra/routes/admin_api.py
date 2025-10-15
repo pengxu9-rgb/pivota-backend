@@ -192,16 +192,26 @@ async def get_psp_status(current_user: dict = Depends(require_admin)):
     """Get status of all configured PSPs"""
     psps = get_configured_psps()
     
+    # Debug info
+    debug_info = {
+        "stripe_key_set": bool(settings.stripe_secret_key),
+        "adyen_key_set": bool(settings.adyen_api_key),
+        "shopify_token_set": bool(settings.shopify_access_token),
+        "wix_key_set": bool(settings.wix_api_key)
+    }
+    
     if not psps:
         return {
             "status": "success",
             "psp": {},
-            "message": "No PSPs configured. Please add Stripe or Adyen API keys in environment variables."
+            "message": "No PSPs configured. Please add Stripe or Adyen API keys in Render environment variables.",
+            "debug": debug_info
         }
     
     return {
         "status": "success",
-        "psp": psps
+        "psp": psps,
+        "debug": debug_info
     }
 
 @router.get("/psp/list")
@@ -452,4 +462,21 @@ async def get_analytics(days: int = 30, current_user: dict = Depends(require_adm
         "average_transaction_value": stats["average_transaction_value"],
         "psp_breakdown": list(psp_stats.values()),
         "daily_stats": list(reversed(daily_stats))  # Oldest to newest
+    }
+
+@router.get("/config/check")
+async def check_config(current_user: dict = Depends(require_admin)):
+    """Check which environment variables are configured (for debugging)"""
+    return {
+        "status": "success",
+        "config": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "adyen_merchant_account": settings.adyen_merchant_account or "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "shopify_store_url": settings.shopify_store_url or "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+            "wix_store_url": settings.wix_store_url or "❌ NOT SET",
+        },
+        "message": "If any values show '❌ NOT SET', add them in Render Environment Variables"
     }
