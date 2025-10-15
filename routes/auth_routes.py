@@ -136,6 +136,7 @@ def require_admin(current_user: dict = Depends(verify_jwt_token)):
 @router.post("/signup")
 async def signup(user_data: UserSignup):
     """User signup with role selection"""
+    print(f"DEBUG: Signup endpoint called with data: {user_data}")
     try:
         # Create user in Supabase
         supabase_result = await create_user_in_supabase(
@@ -169,6 +170,7 @@ async def signup(user_data: UserSignup):
 @router.post("/signin")
 async def signin(login_data: UserLogin):
     """User signin"""
+    print(f"DEBUG: Signin endpoint called with data: {login_data}")
     try:
         # Authenticate with Supabase
         if not supabase:
@@ -459,4 +461,23 @@ async def test_auth_flow():
             "admin_users": "GET /auth/admin/users (requires admin token)"
         },
         "note": "For /me and /admin/users, include Authorization: Bearer <token> header"
+    }
+
+@router.get("/test-post")
+async def test_post_method():
+    """Test if POST methods are working"""
+    return {
+        "status": "success",
+        "message": "GET method works, testing POST method availability",
+        "test_post_endpoint": "POST /auth/test-post-response"
+    }
+
+@router.post("/test-post-response")
+async def test_post_response():
+    """Test POST method response"""
+    return {
+        "status": "success",
+        "message": "POST method is working correctly",
+        "method": "POST",
+        "endpoint": "/auth/test-post-response"
     }
