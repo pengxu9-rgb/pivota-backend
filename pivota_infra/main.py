@@ -31,6 +31,7 @@ from routes.test_data_routes import router as test_data_router
 from routes.simple_ws_routes import router as simple_ws_router
 from routes.auth_routes import router as auth_router
 from routes.auth_ws_routes import router as auth_ws_router
+from routes.admin_api import router as admin_api_router
 
 # Service routers (only include what exists)
 try:
@@ -84,6 +85,7 @@ app.include_router(merchant_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # Authentication
 app.include_router(auth_ws_router)  # Authenticated WebSocket
+app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API

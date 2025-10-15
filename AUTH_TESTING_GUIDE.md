@@ -98,3 +98,5 @@ fetch('https://your-render-app.onrender.com/auth/signup', {
 
 DO NOT test POST endpoints by typing URL in browser address bar - that only works for GET requests!
 
+
+

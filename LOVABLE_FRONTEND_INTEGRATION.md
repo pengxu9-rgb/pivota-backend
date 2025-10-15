@@ -498,3 +498,5 @@ Your Lovable frontend is now connected to your FastAPI backend with:
 
 **Need help?** Check the `ADMIN_TESTING_COMPLETE.md` file for backend endpoint details!
 
+
+

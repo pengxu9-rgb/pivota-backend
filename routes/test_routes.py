@@ -21,3 +21,5 @@ async def test_post():
 async def test_post_with_data(data: dict):
     """Test POST method with data"""
     return {"status": "success", "message": "POST with data works", "received": data}
+
+

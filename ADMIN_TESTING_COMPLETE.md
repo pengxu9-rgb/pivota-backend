@@ -120,3 +120,5 @@ eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGI0MWQzYTMtMGViYS00ZGIyLTh
 
 The backend authentication system is fully functional and ready to be connected to your Lovable frontend!
 
+
+

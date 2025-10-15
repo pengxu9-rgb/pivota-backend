@@ -21,3 +21,5 @@ async def simple_post():
 async def simple_options():
     """Ultra-simple OPTIONS for CORS"""
     return {"method": "OPTIONS", "status": "ok"}
+
+

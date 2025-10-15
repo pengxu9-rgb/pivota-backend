@@ -175,3 +175,5 @@ Or simply:
 2. **Set VITE_API_URL** environment variable
 3. **Test** - everything should work!
 
+
+

@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pivota API Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .test-section {
+            background: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 5px;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #2563eb;
+        }
+        button.success {
+            background: #10b981;
+        }
+        button.danger {
+            background: #ef4444;
+        }
+        .result {
+            margin-top: 10px;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .success-result {
+            background: #dcfce7;
+            border: 1px solid #10b981;
+            color: #059669;
+        }
+        .error-result {
+            background: #fee2e2;
+            border: 1px solid #ef4444;
+            color: #dc2626;
+        }
+        .info-result {
+            background: #dbeafe;
+            border: 1px solid #3b82f6;
+            color: #2563eb;
+        }
+        input {
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            margin: 5px;
+            font-size: 14px;
+        }
+        h1 {
+            color: #1e293b;
+            border-bottom: 3px solid #3b82f6;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #475569;
+            margin-top: 0;
+        }
+        .status {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .status.online {
+            background: #dcfce7;
+            color: #059669;
+        }
+        .status.offline {
+            background: #fee2e2;
+            color: #dc2626;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 Pivota API Comprehensive Test Suite</h1>
+    
+    <div class="test-section">
+        <h2>📊 Environment Check</h2>
+        <button onclick="checkEnvironment()">Check Environment</button>
+        <div id="env-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>🌐 Backend Connection Test</h2>
+        <button onclick="testBackendConnection()">Test Backend</button>
+        <div id="backend-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>🔐 Authentication Test</h2>
+        <div>
+            <input type="email" id="email" placeholder="Email" value="admin@pivota.com">
+            <input type="password" id="password" placeholder="Password" value="admin123">
+            <button onclick="testSignin()">Test Sign In</button>
+            <button onclick="testSignup()">Test Sign Up</button>
+            <button onclick="testMe()">Test /me</button>
+        </div>
+        <div id="auth-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>🚀 Browser Capabilities</h2>
+        <button onclick="testBrowserCapabilities()">Check Browser</button>
+        <div id="browser-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>📡 Network Test (Fetch vs Axios)</h2>
+        <button onclick="testFetch()">Test with Fetch</button>
+        <button onclick="testAxios()">Test with Axios</button>
+        <div id="network-result"></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/axios@1.3.0/dist/axios.min.js"></script>
+    <script>
+        const API_URL = 'https://pivota-dashboard.onrender.com';
+        
+        function showResult(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            element.innerHTML = `<div class="result ${type}-result">${message}</div>`;
+        }
+
+        function checkEnvironment() {
+            const info = {
+                userAgent: navigator.userAgent,
+                platform: navigator.platform,
+                language: navigator.language,
+                cookiesEnabled: navigator.cookieEnabled,
+                onLine: navigator.onLine,
+                localStorage: typeof localStorage !== 'undefined',
+                sessionStorage: typeof sessionStorage !== 'undefined',
+                fetch: typeof fetch !== 'undefined',
+                WebSocket: typeof WebSocket !== 'undefined',
+                currentURL: window.location.href,
+                apiURL: API_URL
+            };
+            showResult('env-result', JSON.stringify(info, null, 2), 'info');
+        }
+
+        async function testBackendConnection() {
+            showResult('backend-result', '⏳ Testing backend connection...', 'info');
+            
+            try {
+                console.log('🔍 Testing backend at:', API_URL);
+                const response = await fetch(`${API_URL}/`, {
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                console.log('📥 Response status:', response.status);
+                const data = await response.json();
+                console.log('📦 Response data:', data);
+                
+                showResult('backend-result', 
+                    `✅ Backend Online!\nStatus: ${response.status}\nResponse: ${JSON.stringify(data, null, 2)}`, 
+                    'success'
+                );
+            } catch (error) {
+                console.error('❌ Backend test failed:', error);
+                showResult('backend-result', 
+                    `❌ Backend Connection Failed!\n${error.message}\n\nCheck:\n1. Is backend running?\n2. CORS enabled?\n3. Network connectivity?`, 
+                    'error'
+                );
+            }
+        }
+
+        async function testSignin() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            showResult('auth-result', '⏳ Testing signin...', 'info');
+            
+            try {
+                console.log('🔐 Attempting signin:', { email });
+                const response = await fetch(`${API_URL}/auth/signin`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                console.log('📥 Signin response status:', response.status);
+                const data = await response.json();
+                console.log('📦 Signin response data:', data);
+                
+                if (response.ok && data.access_token) {
+                    localStorage.setItem('auth_token', data.access_token);
+                    showResult('auth-result', 
+                        `✅ Signin Successful!\nToken: ${data.access_token.substring(0, 30)}...\nUser: ${JSON.stringify(data.user, null, 2)}`, 
+                        'success'
+                    );
+                } else {
+                    showResult('auth-result', 
+                        `❌ Signin Failed!\nStatus: ${response.status}\nResponse: ${JSON.stringify(data, null, 2)}`, 
+                        'error'
+                    );
+                }
+            } catch (error) {
+                console.error('❌ Signin error:', error);
+                showResult('auth-result', 
+                    `❌ Signin Error!\n${error.message}`, 
+                    'error'
+                );
+            }
+        }
+
+        async function testSignup() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            showResult('auth-result', '⏳ Testing signup...', 'info');
+            
+            try {
+                console.log('📝 Attempting signup:', { email });
+                const response = await fetch(`${API_URL}/auth/signup`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ 
+                        email: `test_${Date.now()}@example.com`, 
+                        password,
+                        role: 'employee'
+                    })
+                });
+                
+                console.log('📥 Signup response status:', response.status);
+                const data = await response.json();
+                console.log('📦 Signup response data:', data);
+                
+                showResult('auth-result', 
+                    response.ok ? 
+                    `✅ Signup Successful!\n${JSON.stringify(data, null, 2)}` : 
+                    `⚠️  Signup Response:\nStatus: ${response.status}\n${JSON.stringify(data, null, 2)}`, 
+                    response.ok ? 'success' : 'error'
+                );
+            } catch (error) {
+                console.error('❌ Signup error:', error);
+                showResult('auth-result', 
+                    `❌ Signup Error!\n${error.message}`, 
+                    'error'
+                );
+            }
+        }
+
+        async function testMe() {
+            const token = localStorage.getItem('auth_token');
+            
+            if (!token) {
+                showResult('auth-result', '⚠️  No token found. Please sign in first.', 'error');
+                return;
+            }
+            
+            showResult('auth-result', '⏳ Testing /me endpoint...', 'info');
+            
+            try {
+                console.log('👤 Testing /me with token:', token.substring(0, 30) + '...');
+                const response = await fetch(`${API_URL}/auth/me`, {
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+                
+                console.log('📥 /me response status:', response.status);
+                const data = await response.json();
+                console.log('📦 /me response data:', data);
+                
+                showResult('auth-result', 
+                    response.ok ? 
+                    `✅ User Authenticated!\n${JSON.stringify(data, null, 2)}` : 
+                    `❌ Authentication Failed!\nStatus: ${response.status}\n${JSON.stringify(data, null, 2)}`, 
+                    response.ok ? 'success' : 'error'
+                );
+            } catch (error) {
+                console.error('❌ /me error:', error);
+                showResult('auth-result', 
+                    `❌ /me Error!\n${error.message}`, 
+                    'error'
+                );
+            }
+        }
+
+        function testBrowserCapabilities() {
+            const capabilities = {
+                fetch: typeof fetch !== 'undefined',
+                promises: typeof Promise !== 'undefined',
+                async: typeof (async () => {}) === 'function',
+                localStorage: (() => {
+                    try {
+                        localStorage.setItem('test', 'test');
+                        localStorage.removeItem('test');
+                        return true;
+                    } catch (e) {
+                        return false;
+                    }
+                })(),
+                json: typeof JSON !== 'undefined',
+                console: typeof console !== 'undefined',
+                es6Modules: typeof import !== 'undefined',
+                cors: 'withCredentials' in new XMLHttpRequest()
+            };
+            
+            const allSupported = Object.values(capabilities).every(v => v === true);
+            
+            showResult('browser-result', 
+                `Browser Capabilities:\n${JSON.stringify(capabilities, null, 2)}\n\n${allSupported ? '✅ All features supported!' : '⚠️  Some features missing!'}`, 
+                allSupported ? 'success' : 'error'
+            );
+        }
+
+        async function testFetch() {
+            showResult('network-result', '⏳ Testing with Fetch API...', 'info');
+            
+            try {
+                console.log('🌐 Fetch test to:', API_URL);
+                const startTime = Date.now();
+                const response = await fetch(`${API_URL}/`, {
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                const endTime = Date.now();
+                const data = await response.json();
+                
+                showResult('network-result', 
+                    `✅ Fetch Successful!\nTime: ${endTime - startTime}ms\nStatus: ${response.status}\nResponse: ${JSON.stringify(data, null, 2)}`, 
+                    'success'
+                );
+            } catch (error) {
+                console.error('❌ Fetch error:', error);
+                showResult('network-result', 
+                    `❌ Fetch Failed!\n${error.message}`, 
+                    'error'
+                );
+            }
+        }
+
+        async function testAxios() {
+            if (typeof axios === 'undefined') {
+                showResult('network-result', '⚠️  Axios not loaded!', 'error');
+                return;
+            }
+            
+            showResult('network-result', '⏳ Testing with Axios...', 'info');
+            
+            try {
+                console.log('🌐 Axios test to:', API_URL);
+                const startTime = Date.now();
+                const response = await axios.get(`${API_URL}/`);
+                const endTime = Date.now();
+                
+                showResult('network-result', 
+                    `✅ Axios Successful!\nTime: ${endTime - startTime}ms\nStatus: ${response.status}\nResponse: ${JSON.stringify(response.data, null, 2)}`, 
+                    'success'
+                );
+            } catch (error) {
+                console.error('❌ Axios error:', error);
+                showResult('network-result', 
+                    `❌ Axios Failed!\n${error.message}\n${error.response ? JSON.stringify(error.response.data, null, 2) : ''}`, 
+                    'error'
+                );
+            }
+        }
+
+        // Auto-run environment check on load
+        window.addEventListener('load', () => {
+            console.log('🚀 Test page loaded');
+            checkEnvironment();
+            testBackendConnection();
+        });
+    </script>
+</body>
+</html>
+
+
