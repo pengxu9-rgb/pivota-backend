@@ -166,7 +166,9 @@ async def approve_merchant(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    await update_merchant_status(merchant_id, "approved", current_user["id"])
+    # Use user_id from current_user dict (from JWT token)
+    admin_user_id = current_user.get("user_id", current_user.get("id", "unknown"))
+    await update_merchant_status(merchant_id, "approved", admin_user_id)
     
     return {
         "status": "success",
@@ -187,7 +189,9 @@ async def reject_merchant(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    await update_merchant_status(merchant_id, "rejected", current_user["id"])
+    # Use user_id from current_user dict (from JWT token)
+    admin_user_id = current_user.get("user_id", current_user.get("id", "unknown"))
+    await update_merchant_status(merchant_id, "rejected", admin_user_id)
     
     return {
         "status": "success",

@@ -145,11 +145,23 @@ export const merchantApi = {
   },
 
   reject: async (merchantId: number, reason: string) => {
-    const response = await api.post(`/merchants/${merchantId}/reject`, { 
-      status: 'rejected',
-      rejection_reason: reason 
-    });
-    return response.data;
+    console.log('🔴 Rejecting merchant API call:', { merchantId, reason });
+    try {
+      const response = await api.post(`/merchants/${merchantId}/reject`, { 
+        status: 'rejected',
+        rejection_reason: reason 
+      });
+      console.log('✅ Reject response:', response.data);
+      return response.data;
+    } catch (error: any) {
+      console.error('❌ Reject API error:', {
+        message: error.message,
+        code: error.code,
+        response: error.response?.data,
+        status: error.response?.status
+      });
+      throw error;
+    }
   },
 
   verifyDocument: async (documentId: number) => {
