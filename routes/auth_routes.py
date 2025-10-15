@@ -136,7 +136,6 @@ def require_admin(current_user: dict = Depends(verify_jwt_token)):
 @router.post("/signup")
 async def signup(user_data: UserSignup):
     """User signup with role selection"""
-    print(f"DEBUG: Signup endpoint called with data: {user_data}")
     try:
         # Create user in Supabase
         supabase_result = await create_user_in_supabase(
@@ -170,7 +169,6 @@ async def signup(user_data: UserSignup):
 @router.post("/signin")
 async def signin(login_data: UserLogin):
     """User signin"""
-    print(f"DEBUG: Signin endpoint called with data: {login_data}")
     try:
         # Authenticate with Supabase
         if not supabase:

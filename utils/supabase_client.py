@@ -9,8 +9,12 @@ from config.settings import settings
 SUPABASE_URL = settings.supabase_url
 SUPABASE_KEY = settings.supabase_service_role_key
 
-# Create Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# Create Supabase client with error handling
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+except Exception as e:
+    print(f"Warning: Failed to initialize Supabase client: {e}")
+    supabase = None
 
 async def create_user_in_supabase(email: str, password: str, role: str = "employee"):
     """Create user in Supabase Auth"""
