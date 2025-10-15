@@ -116,11 +116,16 @@ export const merchantApi = {
     formData.append('file', file);
     formData.append('document_type', documentType);
     
+    console.log(`📤 Uploading document: ${file.name} (${(file.size / 1024).toFixed(1)} KB) as ${documentType}`);
+    
     const response = await api.post(`/merchants/${merchantId}/documents/upload`, formData, {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
+      timeout: 60000, // 60 seconds for file upload
     });
+    
+    console.log('✅ Document uploaded:', response.data);
     return response.data;
   },
 

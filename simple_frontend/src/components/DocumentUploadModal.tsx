@@ -67,20 +67,35 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
 
     try {
       let successCount = 0;
+      let failedFiles: string[] = [];
       
       for (let i = 0; i < selectedFiles.length; i++) {
         const { file, documentType } = selectedFiles[i];
         setUploadProgress(`Uploading ${i + 1} of ${selectedFiles.length}: ${file.name}...`);
         
-        await onUpload(merchantId, documentType, file);
-        successCount++;
+        try {
+          await onUpload(merchantId, documentType, file);
+          successCount++;
+          console.log(`✅ Uploaded: ${file.name}`);
+        } catch (err: any) {
+          console.error(`❌ Failed to upload ${file.name}:`, err);
+          failedFiles.push(`${file.name} (${err.message || 'Unknown error'})`);
+        }
       }
       
       // Reset and close
       setSelectedFiles([]);
       setUploadProgress('');
-      alert(`✅ Successfully uploaded ${successCount} document(s)!`);
-      onClose();
+      
+      if (failedFiles.length > 0) {
+        alert(`⚠️ Uploaded ${successCount} of ${selectedFiles.length} document(s)\n\nFailed:\n${failedFiles.join('\n')}`);
+      } else {
+        alert(`✅ Successfully uploaded ${successCount} document(s)!`);
+      }
+      
+      if (successCount > 0) {
+        onClose();
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to upload documents');
       setUploadProgress('');
