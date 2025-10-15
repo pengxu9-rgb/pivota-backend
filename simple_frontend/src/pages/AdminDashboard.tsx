@@ -230,13 +230,14 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
-  const handleApproveMerchant = async (merchantId: string) => {
+  const handleApproveMerchant = async (merchantId: string | number) => {
     try {
       console.log('✅ Approving merchant:', merchantId);
       
       // Extract actual merchant ID if it has "merchant_" prefix
-      const actualId = merchantId.startsWith('merchant_') 
-        ? Number(merchantId.replace('merchant_', ''))
+      const merchantIdStr = String(merchantId);
+      const actualId = merchantIdStr.startsWith('merchant_') 
+        ? Number(merchantIdStr.replace('merchant_', ''))
         : Number(merchantId);
       
       const result = await merchantApi.approve(actualId);
@@ -250,13 +251,14 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
-  const handleRejectMerchant = async (merchantId: string, reason: string) => {
+  const handleRejectMerchant = async (merchantId: string | number, reason: string) => {
     try {
       console.log('❌ Rejecting merchant:', merchantId, 'Reason:', reason);
       
       // Extract actual merchant ID if it has "merchant_" prefix
-      const actualId = merchantId.startsWith('merchant_') 
-        ? Number(merchantId.replace('merchant_', ''))
+      const merchantIdStr = String(merchantId);
+      const actualId = merchantIdStr.startsWith('merchant_') 
+        ? Number(merchantIdStr.replace('merchant_', ''))
         : Number(merchantId);
       
       const result = await merchantApi.reject(actualId, reason);
