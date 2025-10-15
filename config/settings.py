@@ -13,8 +13,13 @@ class Settings(BaseSettings):
     
     # API Keys
     stripe_secret_key: Optional[str] = os.getenv("STRIPE_SECRET_KEY")
+    stripe_webhook_secret: Optional[str] = os.getenv("STRIPE_WEBHOOK_SECRET")
+    
     adyen_api_key: Optional[str] = os.getenv("ADYEN_API_KEY")
     adyen_merchant_account: Optional[str] = os.getenv("ADYEN_MERCHANT_ACCOUNT", "WoopayECOM")
+    adyen_webhook_secret: Optional[str] = os.getenv("ADYEN_WEBHOOK_SECRET")
+    adyen_webhook_username: Optional[str] = os.getenv("ADYEN_WEBHOOK_USERNAME", "adyen_webhook_user")
+    adyen_webhook_password: Optional[str] = os.getenv("ADYEN_WEBHOOK_PASSWORD")
     
     # Shopify
     shopify_access_token: Optional[str] = os.getenv("SHOPIFY_ACCESS_TOKEN")
