@@ -170,5 +170,6 @@ const useAuth = () => {
 };
 
 // Named exports for compatibility
-export { AuthProvider, useAuth, UserRole };
+export { AuthProvider, useAuth };
+export type { UserRole };
 
