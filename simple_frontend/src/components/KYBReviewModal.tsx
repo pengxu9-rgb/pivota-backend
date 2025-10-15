@@ -23,10 +23,15 @@ export const KYBReviewModal: React.FC<KYBReviewModalProps> = ({
   const handleApprove = async () => {
     setIsSubmitting(true);
     try {
-      await onApprove(merchant.id);
+      // Use merchant_id for onboarded merchants, id for others
+      const merchantId = merchant.merchant_id || merchant.id;
+      console.log('🟢 Approving merchant:', merchantId);
+      await onApprove(merchantId);
+      alert('✅ Merchant approved successfully!');
       onClose();
-    } catch (err) {
-      console.error('Approval failed:', err);
+    } catch (err: any) {
+      console.error('❌ Approval failed:', err);
+      alert(`❌ Approval failed: ${err.message || 'Unknown error'}`);
     } finally {
       setIsSubmitting(false);
     }
@@ -40,12 +45,17 @@ export const KYBReviewModal: React.FC<KYBReviewModalProps> = ({
     
     setIsSubmitting(true);
     try {
-      await onReject(merchant.id, rejectionReason);
+      // Use merchant_id for onboarded merchants, id for others
+      const merchantId = merchant.merchant_id || merchant.id;
+      console.log('🔴 Rejecting merchant:', merchantId, 'Reason:', rejectionReason);
+      await onReject(merchantId, rejectionReason);
+      alert(`✅ Merchant rejected. Reason: ${rejectionReason}`);
       onClose();
       setRejectionReason('');
       setShowRejectForm(false);
-    } catch (err) {
-      console.error('Rejection failed:', err);
+    } catch (err: any) {
+      console.error('❌ Rejection failed:', err);
+      alert(`❌ Rejection failed: ${err.message || 'Unknown error'}`);
     } finally {
       setIsSubmitting(false);
     }
