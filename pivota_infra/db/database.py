@@ -6,7 +6,8 @@ import datetime
 from config.settings import settings
 
 DATABASE_URL = settings.database_url
-database = Database(DATABASE_URL)
+# Disable prepared statements to avoid stale statement cache errors in pooled connections
+database = Database(DATABASE_URL, force_rollback=True, min_size=1, max_size=5)
 metadata = MetaData()
 
 transactions = Table(

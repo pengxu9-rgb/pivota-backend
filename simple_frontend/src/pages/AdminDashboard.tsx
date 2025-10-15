@@ -16,6 +16,7 @@ import { MerchantOnboardingModal, MerchantFormData } from '../components/Merchan
 import { KYBReviewModal } from '../components/KYBReviewModal';
 import { MerchantDetailsModal } from '../components/MerchantDetailsModal';
 import { DocumentUploadModal } from '../components/DocumentUploadModal';
+import { OnboardingAdminView } from '../components/OnboardingAdminView';
 
 export const AdminDashboard: React.FC = () => {
   const [activeTab, setActiveTab] = useState('overview');
@@ -278,7 +279,8 @@ export const AdminDashboard: React.FC = () => {
     { id: 'overview', label: 'Overview', icon: BarChart3 },
     { id: 'psp', label: 'PSP Management', icon: CreditCard },
     { id: 'routing', label: 'Routing Rules', icon: Settings },
-    { id: 'merchants', label: 'Merchants', icon: Users },
+    { id: 'merchants', label: 'Merchants (Legacy)', icon: Users },
+    { id: 'onboarding', label: 'Onboarding (Phase 2)', icon: Users },
     { id: 'logs', label: 'System Logs', icon: Activity },
     { id: 'analytics', label: 'Analytics', icon: TrendingUp },
   ];
@@ -325,6 +327,23 @@ export const AdminDashboard: React.FC = () => {
             );
           })}
         </nav>
+      </div>
+
+      {/* Quick Actions Bar */}
+      <div className="mb-6 flex gap-3">
+        <a
+          href="/merchant/onboarding"
+          className="btn btn-primary inline-flex items-center gap-2"
+        >
+          <Users size={16} />
+          Merchant Onboarding (Phase 2)
+        </a>
+        <button
+          onClick={() => window.open(`${import.meta.env.VITE_API_URL || 'https://pivota-dashboard.onrender.com'}/docs`, '_blank')}
+          className="btn btn-secondary inline-flex items-center gap-2"
+        >
+          API Docs
+        </button>
       </div>
 
       {/* Tab Content */}
@@ -756,6 +775,20 @@ export const AdminDashboard: React.FC = () => {
               ))}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Onboarding (Phase 2) Tab */}
+      {activeTab === 'onboarding' && (
+        <div className="space-y-6">
+          <div className="flex justify-between items-center">
+            <h2 className="text-xl font-semibold">Merchant Onboarding (Phase 2)</h2>
+            <a href="/merchant/onboarding" className="btn btn-primary">
+              New Merchant Onboarding
+            </a>
+          </div>
+
+          <OnboardingAdminView />
         </div>
       )}
 

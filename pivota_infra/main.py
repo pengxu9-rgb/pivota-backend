@@ -32,6 +32,7 @@ from routes.auth_routes import router as auth_router
 from routes.auth_ws_routes import router as auth_ws_router
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
+from routes.merchant_onboarding_routes import router as merchant_onboarding_router
 
 # Service routers (only include what exists)
 try:
@@ -86,6 +87,7 @@ app.include_router(auth_router)  # Authentication
 app.include_router(auth_ws_router)  # Authenticated WebSocket
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
+app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
@@ -118,9 +120,11 @@ async def startup():
         
         # Create merchant tables if they don't exist
         from db.merchants import merchants, kyb_documents
+        from db.merchant_onboarding import merchant_onboarding
+        from db.payment_router import payment_router_config
         from db.database import metadata, engine
         metadata.create_all(engine)
-        logger.info("Merchant tables created")
+        logger.info("Merchant tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config)")
         
         # Initialize services if available
         if SIMPLE_MAPPING_AVAILABLE:

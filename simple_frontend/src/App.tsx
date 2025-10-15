@@ -5,6 +5,7 @@ import { ProtectedRoute } from './components/ProtectedRoute';
 import { Layout } from './components/Layout';
 import { LoginPage } from './pages/LoginPage';
 import { AdminDashboard } from './pages/AdminDashboard';
+import { MerchantOnboardingDashboard } from './components/MerchantOnboardingDashboard';
 
 const AppRoutes: React.FC = () => {
   const { user, loading } = useAuth();
@@ -44,6 +45,7 @@ const AppRoutes: React.FC = () => {
             <AdminDashboard />
           </ProtectedRoute>
         } />
+        <Route path="/merchant/onboarding" element={<MerchantOnboardingDashboard />} />
         <Route path="/login" element={<Navigate to="/admin" replace />} />
         <Route path="/" element={<Navigate to="/admin" replace />} />
         <Route path="*" element={<Navigate to="/admin" replace />} />
