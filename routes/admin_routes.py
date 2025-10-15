@@ -514,6 +514,16 @@ async def add_psp_config(config: PSPConfigRequest):
         ]
     }
 
+@router.get("/psp/status")
+async def get_psp_status(credentials: dict = Depends(verify_jwt_token)):
+    """Get PSP status - returns PSP configurations in format expected by frontend"""
+    check_permission(credentials, "admin")
+    
+    return {
+        "status": "success",
+        "psp": admin_store["psp_configs"]
+    }
+
 @router.get("/psp/list")
 async def list_psp_configs(
     credentials: dict = Depends(verify_jwt_token)
