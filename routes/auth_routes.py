@@ -12,7 +12,8 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 import os
-from utils.supabase_client import supabase, create_user_in_supabase, get_user_role, update_user_role
+from utils.supabase_client import supabase, create_user_in_supabase, get_user_role
+from utils.supabase_client import update_user_role as update_user_role_in_supabase
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
@@ -323,23 +324,32 @@ async def get_pending_users(admin_user: dict = Depends(require_admin)):
 
 @router.post("/admin/users/{user_id}/approve")
 async def approve_user(
-    user_id: str, 
+    user_id: str,
     approval_data: ApprovalUpdate,
     admin_user: dict = Depends(require_admin)
 ):
     """Approve or reject user (admin only)"""
     try:
-        # Update user role approval status using Supabase
-        result = await update_user_role(
+        # Get current user role from Supabase
+        user_role_info = await get_user_role(user_id)
+        
+        if not user_role_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User role not found"
+            )
+        
+        # Update approval status in Supabase, keeping the existing role
+        result = await update_user_role_in_supabase(
             user_id=user_id,
-            role=approval_data.role if hasattr(approval_data, 'role') else None,
+            role=user_role_info.get("role", "employee"),
             approved=approval_data.approved
         )
         
         if not result["success"]:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Failed to update user role: {result['error']}"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to update approval: {result['error']}"
             )
         
         return {
