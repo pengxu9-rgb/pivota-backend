@@ -209,10 +209,18 @@ async def operations_dashboard():
 @app.get("/health")
 async def health():
     """Health check endpoint"""
+    from config.settings import settings
+    
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "database": "connected"
+        "database": "connected",
+        "config_check": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+        }
     }
 
 @app.get("/config-check")
