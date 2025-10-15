@@ -28,7 +28,7 @@ merchants = Table(
     Column("volume_processed", Float, default=0),
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
-    Column("approved_by", Integer, nullable=True),
+    Column("approved_by", String, nullable=True),  # UUID from Supabase
     Column("approved_at", DateTime, nullable=True),
 )
 
@@ -70,11 +70,11 @@ async def get_all_merchants(status: Optional[str] = None) -> List[Dict[str, Any]
     results = await database.fetch_all(query)
     return [dict(row) for row in results]
 
-async def update_merchant_status(merchant_id: int, status: str, admin_id: int) -> bool:
+async def update_merchant_status(merchant_id: int, status: str, admin_id: str) -> bool:
     """Update merchant status (approve/reject)"""
     update_data = {
         "status": status,
-        "approved_by": admin_id,
+        "approved_by": admin_id,  # UUID string from Supabase
         "approved_at": datetime.now()
     }
     if status == "approved":
