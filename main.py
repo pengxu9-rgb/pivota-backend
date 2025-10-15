@@ -33,6 +33,7 @@ from routes.auth_routes import router as auth_router
 from routes.auth_ws_routes import router as auth_ws_router
 from routes.test_routes import test_router
 from routes.minimal_test import minimal_router
+from routes.simple_post import simple_post_router
 from routes.debug_routes import router as debug_router
 from routes.eventfeed_routes import router as eventfeed_router
 from routes.user_approval_routes import router as user_approval_router
@@ -76,13 +77,20 @@ app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
 async def root():
     return {"message": "Pivota Infra Dashboard is running", "status": "ok"}
 
-# CORS middleware - Allow all origins and methods
+# Global OPTIONS handler for CORS preflight
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    """Handle CORS preflight requests"""
+    return {"status": "ok", "method": "OPTIONS"}
+
+# CORS middleware - Ultra permissive for debugging
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # Set to False when using wildcard origins
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Request logging middleware
@@ -103,6 +111,7 @@ app.include_router(auth_router)  # Authentication
 app.include_router(auth_ws_router)  # Authenticated WebSocket
 app.include_router(test_router)  # Test routes for debugging
 app.include_router(minimal_router)  # Minimal test routes
+app.include_router(simple_post_router)  # Ultra-simple POST test routes
 app.include_router(debug_router)  # Debug routes
 app.include_router(eventfeed_router)  # EventFeed routes
 app.include_router(user_approval_router)  # User approval for Lovable
