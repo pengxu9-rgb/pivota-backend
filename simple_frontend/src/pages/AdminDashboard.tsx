@@ -15,6 +15,7 @@ import {
 import { MerchantOnboardingModal, MerchantFormData } from '../components/MerchantOnboardingModal';
 import { KYBReviewModal } from '../components/KYBReviewModal';
 import { MerchantDetailsModal } from '../components/MerchantDetailsModal';
+import { DocumentUploadModal } from '../components/DocumentUploadModal';
 
 export const AdminDashboard: React.FC = () => {
   const [activeTab, setActiveTab] = useState('overview');
@@ -34,6 +35,7 @@ export const AdminDashboard: React.FC = () => {
   const [showOnboardingModal, setShowOnboardingModal] = useState(false);
   const [showKYBModal, setShowKYBModal] = useState(false);
   const [showDetailsModal, setShowDetailsModal] = useState(false);
+  const [showDocumentUploadModal, setShowDocumentUploadModal] = useState(false);
   const [selectedMerchant, setSelectedMerchant] = useState<any>(null);
 
   console.log('📊 AdminDashboard rendered', {
@@ -80,9 +82,35 @@ export const AdminDashboard: React.FC = () => {
       console.log('✅ Routing rules:', rulesData);
       setRoutingRules(rulesData.rules);
 
-      // Load merchants
-      const merchantData = await adminApi.getMerchantKYB();
-      setMerchants(merchantData.merchants);
+      // Load merchants from new API
+      try {
+        const merchantsData = await merchantApi.listMerchants();
+        console.log('📊 Real merchants data:', merchantsData);
+        
+        // Convert array to object for compatibility
+        const merchantsObj: Record<string, any> = {};
+        if (merchantsData.merchants && Array.isArray(merchantsData.merchants)) {
+          merchantsData.merchants.forEach((m: any) => {
+            merchantsObj[m.id] = {
+              id: m.id,
+              name: m.business_name,
+              platform: m.platform,
+              store_url: m.store_url,
+              status: m.status,
+              verification_status: m.verification_status,
+              volume_processed: m.volume_processed || 0,
+              kyb_documents: [],
+              last_activity: m.updated_at || m.created_at
+            };
+          });
+        }
+        setMerchants(merchantsObj);
+      } catch (err) {
+        console.error('❌ Failed to fetch real merchants:', err);
+        // Fallback to configured stores
+        const merchantData = await adminApi.getMerchantKYB();
+        setMerchants(merchantData.merchants);
+      }
 
       // Load system logs
       const logsData = await adminApi.getSystemLogs(20, 24);
@@ -149,14 +177,35 @@ export const AdminDashboard: React.FC = () => {
       const result = await merchantApi.onboard(merchantData);
       console.log('✅ Merchant onboarded:', result);
       
-      // Show success message with merchant ID and next steps
-      alert(`✅ Merchant "${merchantData.business_name}" onboarded successfully!\n\nMerchant ID: ${result.merchant_id}\n\nNext steps:\n1. Upload KYB documents\n2. Wait for admin approval\n\nYou can now upload documents for this merchant.`);
+      // Set the newly created merchant for document upload
+      setSelectedMerchant({
+        id: result.merchant_id,
+        name: merchantData.business_name
+      });
+      
+      // Show document upload modal
+      setShowDocumentUploadModal(true);
       
       // Reload merchants list
       await loadDashboardData();
     } catch (err: any) {
       console.error('❌ Merchant onboarding failed:', err);
       const errorMsg = err.response?.data?.detail || err.message || 'Failed to onboard merchant';
+      throw new Error(errorMsg);
+    }
+  };
+
+  const handleDocumentUpload = async (merchantId: number, documentType: string, file: File) => {
+    try {
+      console.log('📄 Uploading document:', { merchantId, documentType, fileName: file.name });
+      const result = await merchantApi.uploadDocument(merchantId, documentType, file);
+      console.log('✅ Document uploaded:', result);
+      
+      // Reload merchants to show updated documents
+      await loadDashboardData();
+    } catch (err: any) {
+      console.error('❌ Document upload failed:', err);
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to upload document';
       throw new Error(errorMsg);
     }
   };
@@ -551,7 +600,16 @@ export const AdminDashboard: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
+                  <button 
+                    onClick={() => {
+                      setSelectedMerchant(merchant);
+                      setShowDocumentUploadModal(true);
+                    }}
+                    className="btn btn-success btn-sm flex-1"
+                  >
+                    Upload Docs
+                  </button>
                   <button 
                     onClick={() => {
                       setSelectedMerchant(merchant);
@@ -568,7 +626,7 @@ export const AdminDashboard: React.FC = () => {
                     }}
                     className="btn btn-secondary btn-sm flex-1"
                   >
-                    View Details
+                    Details
                   </button>
                 </div>
               </div>
@@ -717,6 +775,27 @@ export const AdminDashboard: React.FC = () => {
           onClose={() => setShowOnboardingModal(false)}
           onSubmit={handleMerchantOnboard}
         />
+      </div>
+
+      <div 
+        className={showDocumentUploadModal ? 'modal-backdrop' : 'modal-backdrop-hidden'}
+        onClick={() => {
+          setShowDocumentUploadModal(false);
+          setSelectedMerchant(null);
+        }}
+      >
+        {selectedMerchant && (
+          <DocumentUploadModal
+            isOpen={showDocumentUploadModal}
+            onClose={() => {
+              setShowDocumentUploadModal(false);
+              setSelectedMerchant(null);
+            }}
+            merchantId={selectedMerchant.id}
+            merchantName={selectedMerchant.name}
+            onUpload={handleDocumentUpload}
+          />
+        )}
       </div>
 
       <div 
