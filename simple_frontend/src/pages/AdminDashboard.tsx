@@ -97,13 +97,16 @@ export const AdminDashboard: React.FC = () => {
       // 2. Load onboarded merchants from database
       try {
         const merchantsData = await merchantApi.listMerchants();
-        console.log('📊 Onboarded merchants:', merchantsData);
+        console.log('📊 Onboarded merchants RAW:', merchantsData);
         
         if (merchantsData.merchants && Array.isArray(merchantsData.merchants)) {
+          console.log('📊 Processing', merchantsData.merchants.length, 'onboarded merchants');
           merchantsData.merchants.forEach((m: any) => {
+            console.log('  → Processing merchant:', m);
             // Use "merchant_" prefix to avoid ID conflicts with configured stores
-            merchantsObj[`merchant_${m.id}`] = {
-              id: `merchant_${m.id}`,
+            const merchantKey = `merchant_${m.id}`;
+            merchantsObj[merchantKey] = {
+              id: merchantKey,
               merchant_id: m.id,  // Store actual merchant ID for API calls
               name: m.business_name,
               platform: m.platform,
@@ -115,12 +118,18 @@ export const AdminDashboard: React.FC = () => {
               last_activity: m.updated_at || m.created_at,
               is_onboarded: true  // Flag to identify onboarded merchants
             };
+            console.log('  ✅ Added merchant:', merchantKey, merchantsObj[merchantKey]);
           });
+        } else {
+          console.log('📊 No onboarded merchants or invalid format');
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error('❌ Failed to fetch onboarded merchants:', err);
+        console.error('❌ Error details:', err.response?.data || err.message);
       }
       
+      console.log('📊 Final merchants object:', merchantsObj);
+      console.log('📊 Total merchants:', Object.keys(merchantsObj).length);
       setMerchants(merchantsObj);
 
       // Load system logs
@@ -638,8 +647,22 @@ export const AdminDashboard: React.FC = () => {
                     Upload Docs
                   </button>
                   <button 
-                    onClick={() => {
-                      setSelectedMerchant(merchant);
+                    onClick={async () => {
+                      // Fetch merchant details with documents if it's an onboarded merchant
+                      if (merchant.merchant_id) {
+                        try {
+                          const details = await merchantApi.getMerchant(merchant.merchant_id);
+                          setSelectedMerchant({
+                            ...merchant,
+                            kyb_documents: details.documents || []
+                          });
+                        } catch (err) {
+                          console.error('Failed to fetch merchant details:', err);
+                          setSelectedMerchant(merchant);
+                        }
+                      } else {
+                        setSelectedMerchant(merchant);
+                      }
                       setShowKYBModal(true);
                     }}
                     className="btn btn-primary btn-sm flex-1"

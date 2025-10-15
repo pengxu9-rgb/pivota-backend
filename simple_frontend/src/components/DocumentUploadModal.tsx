@@ -18,6 +18,11 @@ const DOCUMENT_TYPES = [
   { value: 'other', label: 'Other Document' }
 ];
 
+interface FileWithType {
+  file: File;
+  documentType: string;
+}
+
 export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
   isOpen,
   onClose,
@@ -25,21 +30,35 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
   merchantName,
   onUpload
 }) => {
-  const [documentType, setDocumentType] = useState('business_license');
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<FileWithType[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState('');
+  const [uploadProgress, setUploadProgress] = useState<string>('');
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setSelectedFile(e.target.files[0]);
+    if (e.target.files && e.target.files.length > 0) {
+      const newFiles: FileWithType[] = Array.from(e.target.files).map(file => ({
+        file,
+        documentType: 'other' // Default type, can be changed
+      }));
+      setSelectedFiles([...selectedFiles, ...newFiles]);
       setError('');
     }
   };
 
-  const handleUpload = async () => {
-    if (!selectedFile) {
-      setError('Please select a file to upload');
+  const handleRemoveFile = (index: number) => {
+    setSelectedFiles(selectedFiles.filter((_, i) => i !== index));
+  };
+
+  const handleChangeDocumentType = (index: number, type: string) => {
+    const updated = [...selectedFiles];
+    updated[index].documentType = type;
+    setSelectedFiles(updated);
+  };
+
+  const handleUploadAll = async () => {
+    if (selectedFiles.length === 0) {
+      setError('Please select at least one file to upload');
       return;
     }
 
@@ -47,15 +66,24 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
     setError('');
 
     try {
-      await onUpload(merchantId, documentType, selectedFile);
+      let successCount = 0;
+      
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const { file, documentType } = selectedFiles[i];
+        setUploadProgress(`Uploading ${i + 1} of ${selectedFiles.length}: ${file.name}...`);
+        
+        await onUpload(merchantId, documentType, file);
+        successCount++;
+      }
       
       // Reset and close
-      setSelectedFile(null);
-      setDocumentType('business_license');
-      alert(`✅ Document uploaded successfully!\n\nFile: ${selectedFile.name}\nType: ${DOCUMENT_TYPES.find(t => t.value === documentType)?.label}`);
+      setSelectedFiles([]);
+      setUploadProgress('');
+      alert(`✅ Successfully uploaded ${successCount} document(s)!`);
       onClose();
     } catch (err: any) {
-      setError(err.message || 'Failed to upload document');
+      setError(err.message || 'Failed to upload documents');
+      setUploadProgress('');
     } finally {
       setIsUploading(false);
     }
@@ -96,28 +124,16 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
             </div>
           )}
 
-          {/* Document Type */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Document Type *
-            </label>
-            <select
-              value={documentType}
-              onChange={(e) => setDocumentType(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-              {DOCUMENT_TYPES.map(type => (
-                <option key={type.value} value={type.value}>
-                  {type.label}
-                </option>
-              ))}
-            </select>
-          </div>
+          {uploadProgress && (
+            <div className="bg-blue-50 border border-blue-200 text-blue-700 px-4 py-3 rounded">
+              {uploadProgress}
+            </div>
+          )}
 
           {/* File Upload */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">
-              Select File *
+              Select Files (Multiple) *
             </label>
             <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center">
               <input
@@ -126,6 +142,7 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
                 className="hidden"
                 id="file-upload"
                 accept=".pdf,.jpg,.jpeg,.png"
+                multiple
               />
               <label
                 htmlFor="file-upload"
@@ -133,24 +150,53 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
               >
                 <Upload size={48} className="text-gray-400 mb-2" />
                 <span className="text-sm text-gray-600">
-                  {selectedFile ? selectedFile.name : 'Click to select a file'}
+                  Click to select files (or select multiple)
                 </span>
                 <span className="text-xs text-gray-500 mt-1">
-                  PDF, JPG, PNG (Max 10MB)
+                  PDF, JPG, PNG (Max 10MB each)
                 </span>
               </label>
             </div>
           </div>
 
-          {selectedFile && (
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 flex items-center gap-3">
-              <FileText className="text-blue-600" size={24} />
-              <div className="flex-1">
-                <p className="text-sm font-medium text-gray-900">{selectedFile.name}</p>
-                <p className="text-xs text-gray-600">
-                  {(selectedFile.size / 1024).toFixed(1)} KB
-                </p>
-              </div>
+          {/* Selected Files List */}
+          {selectedFiles.length > 0 && (
+            <div className="space-y-3">
+              <h3 className="text-sm font-medium text-gray-900">
+                Selected Files ({selectedFiles.length})
+              </h3>
+              {selectedFiles.map((item, index) => (
+                <div key={index} className="bg-gray-50 border border-gray-200 rounded-lg p-3">
+                  <div className="flex items-start gap-3">
+                    <FileText className="text-blue-600 mt-1" size={20} />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate">
+                        {item.file.name}
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        {(item.file.size / 1024).toFixed(1)} KB
+                      </p>
+                      <select
+                        value={item.documentType}
+                        onChange={(e) => handleChangeDocumentType(index, e.target.value)}
+                        className="mt-2 text-xs px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        {DOCUMENT_TYPES.map(type => (
+                          <option key={type.value} value={type.value}>
+                            {type.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <button
+                      onClick={() => handleRemoveFile(index)}
+                      className="text-red-500 hover:text-red-700"
+                    >
+                      <X size={18} />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
 
@@ -164,11 +210,11 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
               Cancel
             </button>
             <button
-              onClick={handleUpload}
+              onClick={handleUploadAll}
               className="btn btn-primary"
-              disabled={isUploading || !selectedFile}
+              disabled={isUploading || selectedFiles.length === 0}
             >
-              {isUploading ? 'Uploading...' : 'Upload Document'}
+              {isUploading ? 'Uploading...' : `Upload ${selectedFiles.length} Document(s)`}
             </button>
           </div>
 
