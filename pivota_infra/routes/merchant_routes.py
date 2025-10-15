@@ -8,8 +8,9 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from routes.auth_routes import get_current_user, require_admin
 from db.merchants import (
-    create_merchant, get_merchant, get_all_merchants, 
-    update_merchant_status, add_kyb_document, get_merchant_documents, verify_document
+    create_merchant, get_merchant, get_all_merchants,
+    update_merchant_status, add_kyb_document, get_merchant_documents,
+    verify_document, soft_delete_merchant
 )
 from datetime import datetime
 import os
@@ -214,4 +215,29 @@ async def verify_kyb_document(
         "status": "success",
         "message": "Document verified successfully",
         "document_id": doc_id
+    }
+
+# ---------------------------------------------------------------------------
+# Soft delete merchant (admin only)
+# ---------------------------------------------------------------------------
+@router.delete("/{merchant_id}")
+async def delete_merchant(
+    merchant_id: int,
+    reason: Optional[str] = None,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    Soft-delete a merchant by setting status='deleted'.
+    """
+    merchant = await get_merchant(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+
+    admin_user_id = current_user.get("user_id", current_user.get("id", "unknown"))
+    await soft_delete_merchant(merchant_id, admin_user_id, reason)
+
+    return {
+        "status": "success",
+        "message": f"Merchant {merchant['business_name']} removed",
+        "merchant_id": merchant_id
     }

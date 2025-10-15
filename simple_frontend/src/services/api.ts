@@ -9,7 +9,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
-  timeout: 30000, // 30 second timeout (Render cold start can be slow)
+  timeout: 60000, // 60 second timeout for Render cold starts
 });
 
 // Add request interceptor for debugging
@@ -162,6 +162,14 @@ export const merchantApi = {
       });
       throw error;
     }
+  },
+
+  deleteMerchant: async (merchantId: number, reason?: string) => {
+    console.log('🗑️ Deleting merchant:', { merchantId, reason });
+    const response = await api.delete(`/merchants/${merchantId}`, {
+      params: reason ? { reason } : undefined,
+    });
+    return response.data;
   },
 
   verifyDocument: async (documentId: number) => {

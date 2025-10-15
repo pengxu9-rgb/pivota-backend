@@ -64,8 +64,11 @@ async def get_merchant(merchant_id: int) -> Optional[Dict[str, Any]]:
 async def get_all_merchants(status: Optional[str] = None) -> List[Dict[str, Any]]:
     """Get all merchants, optionally filtered by status"""
     query = merchants.select()
+    # By default, exclude soft-deleted merchants
     if status:
         query = query.where(merchants.c.status == status)
+    else:
+        query = query.where(merchants.c.status != "deleted")
     query = query.order_by(merchants.c.created_at.desc())
     results = await database.fetch_all(query)
     return [dict(row) for row in results]
@@ -104,6 +107,23 @@ async def verify_document(doc_id: int, admin_id: int) -> bool:
         verified_at=datetime.now(),
         verified_by=admin_id
     )
+    await database.execute(query)
+    return True
+
+# ---------------------------------------------------------------------------
+# Soft delete merchant
+# ---------------------------------------------------------------------------
+async def soft_delete_merchant(merchant_id: int, admin_id: str, reason: Optional[str] = None) -> bool:
+    """Soft delete merchant by setting status to 'deleted'.
+
+    We keep the row for audit; listings exclude deleted by default.
+    """
+    update_data: Dict[str, Any] = {
+        "status": "deleted",
+        # also mark verification as rejected to avoid accidental activation
+        "verification_status": "rejected",
+    }
+    query = merchants.update().where(merchants.c.id == merchant_id).values(**update_data)
     await database.execute(query)
     return True
 

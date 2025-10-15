@@ -58,9 +58,9 @@ export const AdminDashboard: React.FC = () => {
     console.log('🎭 showOnboardingModal changed to:', showOnboardingModal);
   }, [showOnboardingModal]);
 
-  const loadDashboardData = async () => {
+  const loadDashboardData = async (retryCount = 0) => {
     try {
-      console.log('📊 Starting to load dashboard data...');
+      console.log('📊 Starting to load dashboard data... (attempt', retryCount + 1, ')');
       setLoading(true);
       setError('');
 
@@ -682,6 +682,24 @@ export const AdminDashboard: React.FC = () => {
                   >
                     Details
                   </button>
+                <button
+                  onClick={async () => {
+                    if (!confirm(`Remove merchant \"${merchant.name}\"? This hides the merchant (soft delete).`)) return;
+                    try {
+                      const idStr = String(merchant.merchant_id || merchant.id);
+                      const actualId = idStr.startsWith('merchant_') ? Number(idStr.replace('merchant_', '')) : Number(idStr);
+                      await merchantApi.deleteMerchant(actualId);
+                      await loadDashboardData();
+                      alert('✅ Merchant removed');
+                    } catch (err: any) {
+                      console.error('❌ Remove merchant failed:', err);
+                      alert(`❌ Remove failed: ${err.response?.data?.detail || err.message || 'Unknown error'}`);
+                    }
+                  }}
+                  className="btn btn-danger btn-sm flex-1"
+                >
+                  Remove
+                </button>
                 </div>
               </div>
               ))}
