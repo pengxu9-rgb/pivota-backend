@@ -197,6 +197,9 @@ export const AdminDashboard: React.FC = () => {
       const result = await merchantApi.onboard(merchantData);
       console.log('✅ Merchant onboarded:', result);
       
+      // Close onboarding modal first
+      setShowOnboardingModal(false);
+      
       // Set the newly created merchant for document upload
       setSelectedMerchant({
         id: result.merchant_id,
@@ -206,8 +209,7 @@ export const AdminDashboard: React.FC = () => {
       // Show document upload modal
       setShowDocumentUploadModal(true);
       
-      // Reload merchants list
-      await loadDashboardData();
+      // Don't reload here - will reload when upload modal closes
     } catch (err: any) {
       console.error('❌ Merchant onboarding failed:', err);
       const errorMsg = err.response?.data?.detail || err.message || 'Failed to onboard merchant';
@@ -842,6 +844,8 @@ export const AdminDashboard: React.FC = () => {
             onClose={() => {
               setShowDocumentUploadModal(false);
               setSelectedMerchant(null);
+              // Reload dashboard after closing upload modal
+              loadDashboardData();
             }}
             merchantId={selectedMerchant.id}
             merchantName={selectedMerchant.name}
