@@ -35,7 +35,15 @@ export const OnboardingAdminView: React.FC = () => {
       setMerchants(response.data.merchants || []);
     } catch (err: any) {
       console.error('Failed to load onboarding merchants:', err);
-      setError(err.response?.data?.detail || 'Failed to load merchants');
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to load merchants';
+      
+      if (err.response?.status === 401 || errorMsg.includes('Not authenticated')) {
+        setError('Authentication required. Please login as admin.');
+      } else if (err.response?.status === 500) {
+        setError('Server error. The backend may still be starting up. Please wait a moment and refresh.');
+      } else {
+        setError(errorMsg);
+      }
     } finally {
       setLoading(false);
     }
