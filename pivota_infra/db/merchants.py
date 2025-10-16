@@ -4,7 +4,7 @@ Merchant database tables and operations
 
 from sqlalchemy import Table, Column, Integer, String, DateTime, Float, Text, Boolean, ForeignKey
 from sqlalchemy.sql import func
-from pivota_infra.db.database import metadata, database
+from db.database import metadata, database
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 

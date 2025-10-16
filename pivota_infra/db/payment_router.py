@@ -5,7 +5,7 @@ Enables unified /payment/execute endpoint with automatic PSP routing
 
 from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Float, ForeignKey, JSON
 from sqlalchemy.sql import func
-from pivota_infra.db.database import metadata, database
+from db.database import metadata, database
 from typing import Dict, List, Any, Optional
 import json
 

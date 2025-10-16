@@ -1,8 +1,8 @@
 from typing import List
 from models.schemas import PaymentRequest, PaymentExecutionResponse
-from pivota_infra.orchestrator.psp_selector import select_psp_for_agent_pay
-from pivota_infra.utils.logger import logger
-from pivota_infra.routes.queue_routes import add_to_queue
+from orchestrator.psp_selector import select_psp_for_agent_pay
+from utils.logger import logger
+from routes.queue_routes import add_to_queue
 
 
 async def process_payment(req: PaymentRequest) -> PaymentExecutionResponse:

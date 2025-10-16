@@ -3,7 +3,7 @@ from sqlalchemy import (
     MetaData, Table, Column, Integer, String, Float, DateTime, JSON, create_engine
 )
 import datetime
-from pivota_infra.config.settings import settings
+from config.settings import settings
 
 # Normalize and prepare DATABASE_URL
 DATABASE_URL = settings.database_url

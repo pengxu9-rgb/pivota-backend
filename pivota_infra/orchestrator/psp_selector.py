@@ -1,6 +1,6 @@
 from typing import List
 from models.schemas import AgentPayRequest
-from pivota_infra.utils.logger import logger
+from utils.logger import logger
 
 
 async def select_psp_for_agent_pay(req: AgentPayRequest) -> List[str]:

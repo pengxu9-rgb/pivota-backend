@@ -10,9 +10,9 @@ import logging
 from datetime import datetime
 import secrets
 
-from pivota_infra.db.merchant_onboarding import get_merchant_onboarding, get_merchant_by_api_key
-from pivota_infra.db.payment_router import get_merchant_psp_route
-from pivota_infra.config.settings import settings
+from db.merchant_onboarding import get_merchant_onboarding, get_merchant_by_api_key
+from db.payment_router import get_merchant_psp_route
+from config.settings import settings
 import stripe
 import httpx
 

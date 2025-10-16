@@ -11,7 +11,7 @@ import asyncio
 import stripe
 import httpx
 
-from pivota_infra.db.merchant_onboarding import (
+from db.merchant_onboarding import (
     create_merchant_onboarding,
     get_merchant_onboarding,
     update_kyc_status,
@@ -21,9 +21,9 @@ from pivota_infra.db.merchant_onboarding import (
     soft_delete_merchant_onboarding,
     add_kyc_document
 )
-from pivota_infra.db.payment_router import register_merchant_psp_route
-from pivota_infra.db.database import database
-from pivota_infra.routes.auth_routes import get_current_user, require_admin
+from db.payment_router import register_merchant_psp_route
+from db.database import database
+from routes.auth_routes import get_current_user, require_admin
 
 router = APIRouter(prefix="/merchant/onboarding", tags=["merchant-onboarding"])
 

@@ -5,10 +5,10 @@ Provides endpoints for the admin dashboard with REAL data
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import Dict, List, Any, Optional
-from pivota_infra.routes.auth_routes import verify_jwt_token, require_admin
+from routes.auth_routes import verify_jwt_token, require_admin
 from datetime import datetime, timedelta
-from pivota_infra.config.settings import settings
-from pivota_infra.db.database import database, transactions
+from config.settings import settings
+from db.database import database, transactions
 from sqlalchemy import func, select, desc, and_
 import os
 

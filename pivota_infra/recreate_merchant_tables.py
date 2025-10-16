@@ -3,8 +3,8 @@ Script to recreate merchant tables with correct schema
 Run this once to fix the database schema
 """
 import asyncio
-from pivota_infra.db.database import database, metadata, engine
-from pivota_infra.db.merchants import merchants, kyb_documents
+from db.database import database, metadata, engine
+from db.merchants import merchants, kyb_documents
 
 async def recreate_tables():
     """Drop and recreate merchant tables"""

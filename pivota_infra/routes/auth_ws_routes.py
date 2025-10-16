@@ -9,7 +9,7 @@ import logging
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPException
 from realtime.metrics_store import snapshot
-from pivota_infra.utils.auth import verify_jwt_token
+from utils.auth import verify_jwt_token
 
 logger = logging.getLogger("auth_ws_routes")
 

@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from models.schemas import AgentPayRequest, PaymentResponse
-from pivota_infra.orchestrator.transaction_manager import create_transaction, update_transaction
-from pivota_infra.orchestrator.psp_selector import select_psp_for_agent_pay
-from pivota_infra.adapters.stripe_adapter import create_payment_intent
+from orchestrator.transaction_manager import create_transaction, update_transaction
+from orchestrator.psp_selector import select_psp_for_agent_pay
+from adapters.stripe_adapter import create_payment_intent
 # AI router functions (implemented locally to avoid import issues)
 from collections import defaultdict
 import random
@@ -36,7 +36,7 @@ def update_psp_metrics(psp: str, success: bool, latency: int):
     metrics["success_rate"] = 0.9 * old_success + 0.1 * (1.0 if success else 0.0)
     metrics["latency"] = 0.9 * metrics["latency"] + 0.1 * latency
     logger.info(f"Updated AI metrics for {psp}: success={success}, latency={latency}ms, new_success_rate={metrics['success_rate']:.3f}")
-from pivota_infra.utils.logger import logger
+from utils.logger import logger
 import time
 import asyncio
 

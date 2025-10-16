@@ -12,7 +12,7 @@ from datetime import datetime
 # Add the current directory to Python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from pivota_infra.config.production_settings import get_production_config, is_production
+from config.production_settings import get_production_config, is_production
 from setup_production import setup_production
 
 logger = logging.getLogger("production_deployment")

@@ -4,8 +4,9 @@ services:
     env: python
     region: frankfurt
     plan: free
-    buildCommand: pip install -r pivota_infra/requirements.txt
-    startCommand: uvicorn pivota_infra.main:app --host 0.0.0.0 --port $PORT
+    rootDirectory: pivota_infra
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION

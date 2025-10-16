@@ -6,7 +6,7 @@ Manually publish events for the real orders we created
 
 import time
 import random
-from pivota_infra.utils.event_publisher import event_publisher
+from utils.event_publisher import event_publisher
 
 def publish_real_order_events():
     """Publish events for the real orders we created"""

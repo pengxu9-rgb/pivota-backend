@@ -1,6 +1,6 @@
 import uuid
-from pivota_infra.db.database import database, transactions
-from pivota_infra.utils.logger import logger
+from db.database import database, transactions
+from utils.logger import logger
 from datetime import datetime
 
 async def create_transaction(merchant_id, amount, currency, meta=None):

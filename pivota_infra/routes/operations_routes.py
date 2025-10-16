@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from enum import Enum
 from datetime import datetime, timedelta
 
-from pivota_infra.utils.auth import verify_jwt_token, check_permission
+from utils.auth import verify_jwt_token, check_permission
 from realtime.metrics_store import get_metrics_store
 
 logger = logging.getLogger("operations_routes")
