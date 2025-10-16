@@ -207,7 +207,6 @@ async def register_merchant(
             "next_step": "Connect PSP" if validation_result["approved"] else "Wait for admin approval"
         }
     except Exception as e:
-        from db.database import database
         error_msg = str(e)
         
         # Handle database transaction errors
