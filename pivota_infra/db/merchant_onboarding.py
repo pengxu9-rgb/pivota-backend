@@ -74,16 +74,22 @@ async def get_merchant_onboarding(merchant_id: str) -> Optional[Dict[str, Any]]:
     result = await database.fetch_one(query)
     return dict(result) if result else None
 
-async def update_kyc_status(merchant_id: str, status: str, reason: Optional[str] = None) -> bool:
-    """Update KYC verification status"""
+async def update_kyc_status(merchant_id: str, status: str, reason: Optional[str] = None, rejection_reason: Optional[str] = None) -> bool:
+    """Update KYC verification status. 
+    When approving after rejection, pass rejection_reason=None to clear it."""
     update_data = {
         "status": status,
         "updated_at": datetime.now()
     }
     if status == "approved":
         update_data["verified_at"] = datetime.now()
+        # Clear rejection reason on approval unless explicitly provided
+        if rejection_reason is None and reason is None:
+            update_data["rejection_reason"] = None
     if reason:
         update_data["rejection_reason"] = reason
+    elif rejection_reason is not None:
+        update_data["rejection_reason"] = rejection_reason
         
     query = merchant_onboarding.update().where(
         merchant_onboarding.c.merchant_id == merchant_id
