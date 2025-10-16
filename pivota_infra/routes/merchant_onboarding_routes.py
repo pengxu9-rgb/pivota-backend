@@ -48,8 +48,8 @@ class PSPSetupRequest(BaseModel):
 # PSP VALIDATION
 # ============================================================================
 
-async def validate_stripe_key(api_key: str) -> bool:
-    """Validate Stripe API key by making a test request"""
+def validate_stripe_key_sync(api_key: str) -> bool:
+    """Validate Stripe API key by making a test request (synchronous)"""
     try:
         stripe.api_key = api_key
         # Try to retrieve account info - this will fail if key is invalid
@@ -64,6 +64,13 @@ async def validate_stripe_key(api_key: str) -> bool:
         # Any other error means the key format is valid but something else failed
         print(f"⚠️ Stripe validation error ({error_type}): {e}")
         return False
+
+async def validate_stripe_key(api_key: str) -> bool:
+    """Async wrapper for Stripe validation"""
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        return await loop.run_in_executor(pool, validate_stripe_key_sync, api_key)
 
 async def validate_adyen_key(api_key: str) -> bool:
     """Validate Adyen API key by making a test request"""
