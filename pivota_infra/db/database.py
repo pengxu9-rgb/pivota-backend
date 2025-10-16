@@ -9,13 +9,13 @@ DATABASE_URL = settings.database_url
 
 # Disable prepared statement cache for PostgreSQL/pgbouncer compatibility
 if "postgresql" in str(DATABASE_URL).lower():
-    # Add server_settings to disable statement cache
-    database = Database(
-        DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        server_settings={"statement_cache_size": "0"}  # Disable prepared statement cache
-    )
+    # Add statement_cache_size=0 to URL for pgbouncer compatibility
+    url_str = str(DATABASE_URL)
+    if "?" in url_str:
+        DATABASE_URL = url_str + "&statement_cache_size=0"
+    else:
+        DATABASE_URL = url_str + "?statement_cache_size=0"
+    database = Database(DATABASE_URL, min_size=1, max_size=5)
 else:
     # For SQLite or other databases
     database = Database(DATABASE_URL, min_size=1, max_size=1)
