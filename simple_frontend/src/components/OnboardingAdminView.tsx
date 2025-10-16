@@ -297,7 +297,7 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                     </button>
                   )}
                   
-                  {onRemove && (
+                  {onRemove && !isLegacy && (
                     <button
                       onClick={() => {
                         if (window.confirm(`Remove merchant "${merchant.business_name}"?`)) {
@@ -309,6 +309,20 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                     >
                       <Trash2 size={14} className="inline mr-1" />
                       Remove
+                    </button>
+                  )}
+                  
+                  {/* Legacy stores show info instead of remove */}
+                  {isLegacy && (
+                    <button
+                      onClick={() => {
+                        alert('⚠️ Legacy stores are configured via environment variables.\n\nTo remove this store:\n1. Go to Render Dashboard\n2. Remove the environment variables:\n   - SHOPIFY_ACCESS_TOKEN / SHOPIFY_STORE_URL\n   - WIX_API_KEY / WIX_STORE_URL\n3. Redeploy the application');
+                      }}
+                      className="btn btn-secondary btn-sm text-xs"
+                      title="Legacy Store Info"
+                    >
+                      <FileText size={14} className="inline mr-1" />
+                      Config Info
                     </button>
                   )}
                 </div>
