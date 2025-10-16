@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pivota-dashboard-1760371224
+    name: pivota-dashboard
     env: python
     region: frankfurt
     plan: free
