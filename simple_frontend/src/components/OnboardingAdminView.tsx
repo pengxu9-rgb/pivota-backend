@@ -4,8 +4,8 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { api } from '../services/api';
-import { CheckCircle, XCircle, Clock } from 'lucide-react';
+import { api, merchantApi } from '../services/api';
+import { CheckCircle, XCircle, Clock, Upload, Eye, FileText, Trash2 } from 'lucide-react';
 
 interface OnboardingMerchant {
   merchant_id: string;
@@ -14,9 +14,24 @@ interface OnboardingMerchant {
   psp_connected: boolean;
   psp_type?: string;
   created_at: string;
+  website?: string;
+  contact_email?: string;
+  status?: string;
 }
 
-export const OnboardingAdminView: React.FC = () => {
+interface OnboardingAdminViewProps {
+  onUploadDocs?: (merchantId: string) => void;
+  onReviewKYB?: (merchant: OnboardingMerchant) => void;
+  onViewDetails?: (merchant: OnboardingMerchant) => void;
+  onRemove?: (merchantId: string) => void;
+}
+
+export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
+  onUploadDocs,
+  onReviewKYB,
+  onViewDetails,
+  onRemove
+}) => {
   const [merchants, setMerchants] = useState<OnboardingMerchant[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -174,32 +189,88 @@ export const OnboardingAdminView: React.FC = () => {
                 </div>
               </div>
 
-              {/* Actions */}
-              {merchant.kyc_status === 'pending_verification' && (
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => handleApprove(merchant.merchant_id)}
-                    className="btn btn-success btn-sm flex-1"
-                  >
-                    Approve
-                  </button>
-                  <button
-                    onClick={() => handleReject(merchant.merchant_id)}
-                    className="btn btn-danger btn-sm flex-1"
-                  >
-                    Reject
-                  </button>
-                </div>
-              )}
+              {/* Action Buttons */}
+              <div className="space-y-2">
+                {/* Primary Actions for Pending */}
+                {merchant.kyc_status === 'pending_verification' && (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => handleApprove(merchant.merchant_id)}
+                      className="btn btn-success btn-sm flex-1"
+                    >
+                      <CheckCircle size={14} className="inline mr-1" />
+                      Approve
+                    </button>
+                    <button
+                      onClick={() => handleReject(merchant.merchant_id)}
+                      className="btn btn-danger btn-sm flex-1"
+                    >
+                      <XCircle size={14} className="inline mr-1" />
+                      Reject
+                    </button>
+                  </div>
+                )}
 
-              {merchant.kyc_status === 'approved' && !merchant.psp_connected && (
-                <div className="bg-blue-50 border border-blue-200 p-2 rounded text-sm text-blue-700">
-                  ℹ️ Waiting for merchant to connect PSP
-                </div>
-              )}
+                {/* PSP Setup Reminder */}
+                {merchant.kyc_status === 'approved' && !merchant.psp_connected && (
+                  <div className="bg-blue-50 border border-blue-200 p-2 rounded text-sm text-blue-700 mb-2">
+                    ℹ️ Waiting for merchant to connect PSP
+                  </div>
+                )}
 
-              {merchant.kyc_status === 'approved' && !merchant.psp_connected && (
-                <div className="mt-3 flex gap-2">
+                {/* Secondary Actions - Always visible */}
+                <div className="grid grid-cols-2 gap-2">
+                  {onUploadDocs && (
+                    <button
+                      onClick={() => onUploadDocs(merchant.merchant_id)}
+                      className="btn btn-secondary btn-sm text-xs"
+                      title="Upload Documents"
+                    >
+                      <Upload size={14} className="inline mr-1" />
+                      Upload Docs
+                    </button>
+                  )}
+                  
+                  {onReviewKYB && (
+                    <button
+                      onClick={() => onReviewKYB(merchant)}
+                      className="btn btn-primary btn-sm text-xs"
+                      title="Review KYB"
+                    >
+                      <Eye size={14} className="inline mr-1" />
+                      Review KYB
+                    </button>
+                  )}
+                  
+                  {onViewDetails && (
+                    <button
+                      onClick={() => onViewDetails(merchant)}
+                      className="btn btn-secondary btn-sm text-xs"
+                      title="View Details"
+                    >
+                      <FileText size={14} className="inline mr-1" />
+                      Details
+                    </button>
+                  )}
+                  
+                  {onRemove && (
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`Remove merchant "${merchant.business_name}"?`)) {
+                          onRemove(merchant.merchant_id);
+                        }
+                      }}
+                      className="btn btn-danger btn-sm text-xs"
+                      title="Remove Merchant"
+                    >
+                      <Trash2 size={14} className="inline mr-1" />
+                      Remove
+                    </button>
+                  )}
+                </div>
+
+                {/* Resume PSP Setup */}
+                {merchant.kyc_status === 'approved' && !merchant.psp_connected && (
                   <button
                     onClick={() => {
                       try {
@@ -207,12 +278,12 @@ export const OnboardingAdminView: React.FC = () => {
                       } catch {}
                       window.location.href = '/merchant/onboarding';
                     }}
-                    className="btn btn-primary btn-sm flex-1"
+                    className="btn btn-primary btn-sm w-full"
                   >
                     Resume PSP Setup
                   </button>
-                </div>
-              )}
+                )}
+              </div>
             </div>
           ))}
         </div>

@@ -579,170 +579,62 @@ export const AdminDashboard: React.FC = () => {
         <div className="space-y-6">
           <div className="flex justify-between items-center mb-4">
             <h2 className="text-xl font-semibold">Merchant Management</h2>
-            <div className="flex gap-3">
-              <button 
-                onClick={() => {
-                  console.log('🔘 Onboard Merchant button clicked');
-                  console.log('Current showOnboardingModal state:', showOnboardingModal);
-                  setShowOnboardingModal(true);
-                  console.log('Set showOnboardingModal to true');
-                }}
-                className="btn btn-primary"
-              >
-                + Onboard New Merchant
-              </button>
-              <a 
-                href="/merchant/onboarding" 
-                className="btn btn-secondary"
-                target="_blank"
-              >
-                Merchant Onboarding Portal
-              </a>
-            </div>
+            <a 
+              href="/merchant/onboarding" 
+              className="btn btn-primary"
+              target="_blank"
+            >
+              + Merchant Onboarding Portal
+            </a>
           </div>
 
-          {/* Phase 2 Onboarding View */}
-          <div className="mb-8">
-            <h3 className="text-lg font-semibold mb-4 text-gray-700">📋 Merchant Onboarding (Phase 2)</h3>
-            <OnboardingAdminView />
-          </div>
-
-          {/* Legacy Configured Stores */}
-          <div>
-            <h3 className="text-lg font-semibold mb-4 text-gray-700">🏪 Configured Stores (Legacy)</h3>
-
-          {Object.keys(merchants).length === 0 ? (
-            <div className="card text-center py-12">
-              <h3 className="text-lg font-semibold mb-2">No Merchants Configured</h3>
-              <p className="text-gray-600 mb-4">
-                Configure Shopify or Wix stores in Render environment variables:
-              </p>
-              <ul className="text-sm text-gray-500 space-y-1">
-                <li>SHOPIFY_ACCESS_TOKEN + SHOPIFY_STORE_URL</li>
-                <li>WIX_API_KEY + WIX_STORE_URL</li>
-              </ul>
-              <button 
-                onClick={() => window.open('https://dashboard.render.com', '_blank')}
-                className="btn btn-primary mt-4"
-              >
-                Configure in Render
-              </button>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {Object.entries(merchants).map(([merchantId, merchant]) => (
-              <div key={merchantId} className="card">
-                <div className="flex justify-between items-start mb-4">
-                  <div>
-                    <h3 className="text-lg font-semibold">{merchant.name}</h3>
-                    <p className="text-sm text-gray-600 capitalize">{merchant.platform}</p>
-                    <a 
-                      href={merchant.store_url} 
-                      target="_blank" 
-                      rel="noopener noreferrer"
-                      className="text-sm text-blue-600 hover:underline"
-                    >
-                      {merchant.store_url}
-                    </a>
-                  </div>
-                  <div className={`px-2 py-1 rounded text-xs font-medium ${
-                    merchant.status === 'approved' ? 'bg-green-100 text-green-800' :
-                    merchant.status === 'in_progress' ? 'bg-yellow-100 text-yellow-800' :
-                    'bg-red-100 text-red-800'
-                  }`}>
-                    {merchant.status}
-                  </div>
-                </div>
-
-                <div className="space-y-2 mb-4">
-                  <div className="flex justify-between text-sm">
-                    <span>Verification:</span>
-                    <span className="capitalize">{merchant.verification_status}</span>
-                  </div>
-                  <div className="flex justify-between text-sm">
-                    <span>Volume Processed:</span>
-                    <span>€{merchant.volume_processed?.toLocaleString()}</span>
-                  </div>
-                  <div className="flex justify-between text-sm">
-                    <span>Documents:</span>
-                    <span>{merchant.kyb_documents?.length || 0} uploaded</span>
-                  </div>
-                  <div className="flex justify-between text-sm">
-                    <span>Last Activity:</span>
-                    <span>{new Date(merchant.last_activity).toLocaleDateString()}</span>
-                  </div>
-                </div>
-
-                <div className="flex gap-2 flex-wrap">
-                  <button 
-                    onClick={() => {
-                      // Use merchant_id for onboarded merchants, id for configured stores
-                      setSelectedMerchant({
-                        ...merchant,
-                        id: merchant.merchant_id || merchant.id
-                      });
-                      setShowDocumentUploadModal(true);
-                    }}
-                    className="btn btn-success btn-sm flex-1"
-                  >
-                    Upload Docs
-                  </button>
-                  <button 
-                    onClick={async () => {
-                      // Fetch merchant details with documents if it's an onboarded merchant
-                      if (merchant.merchant_id) {
-                        try {
-                          const details = await merchantApi.getMerchant(merchant.merchant_id);
-                          setSelectedMerchant({
-                            ...merchant,
-                            kyb_documents: details.documents || []
-                          });
-                        } catch (err) {
-                          console.error('Failed to fetch merchant details:', err);
-                          setSelectedMerchant(merchant);
-                        }
-                      } else {
-                        setSelectedMerchant(merchant);
-                      }
-                      setShowKYBModal(true);
-                    }}
-                    className="btn btn-primary btn-sm flex-1"
-                  >
-                    Review KYB
-                  </button>
-                  <button 
-                    onClick={() => {
-                      setSelectedMerchant(merchant);
-                      setShowDetailsModal(true);
-                    }}
-                    className="btn btn-secondary btn-sm flex-1"
-                  >
-                    Details
-                  </button>
-                <button
-                  onClick={async () => {
-                    if (!confirm(`Remove merchant \"${merchant.name}\"? This hides the merchant (soft delete).`)) return;
-                    try {
-                      const idStr = String(merchant.merchant_id || merchant.id);
-                      const actualId = idStr.startsWith('merchant_') ? Number(idStr.replace('merchant_', '')) : Number(idStr);
-                      await merchantApi.deleteMerchant(actualId);
-                      await loadDashboardData();
-                      alert('✅ Merchant removed');
-                    } catch (err: any) {
-                      console.error('❌ Remove merchant failed:', err);
-                      alert(`❌ Remove failed: ${err.response?.data?.detail || err.message || 'Unknown error'}`);
-                    }
-                  }}
-                  className="btn btn-danger btn-sm flex-1"
-                >
-                  Remove
-                </button>
-                </div>
-              </div>
-              ))}
-            </div>
-          )}
-          </div>
+          {/* Unified Merchant List with Full Features */}
+          <OnboardingAdminView 
+            onUploadDocs={(merchantId) => {
+              setSelectedMerchant({ id: merchantId, merchant_id: merchantId });
+              setShowDocumentUploadModal(true);
+            }}
+            onReviewKYB={async (merchant) => {
+              try {
+                const details = await merchantApi.getMerchant(merchant.merchant_id);
+                setSelectedMerchant({
+                  ...merchant,
+                  id: merchant.merchant_id,
+                  merchant_id: merchant.merchant_id,
+                  name: merchant.business_name,
+                  kyb_documents: details.merchant?.kyb_documents || []
+                });
+              } catch (err) {
+                console.error('Failed to fetch merchant details:', err);
+                setSelectedMerchant({
+                  ...merchant,
+                  id: merchant.merchant_id,
+                  merchant_id: merchant.merchant_id,
+                  name: merchant.business_name
+                });
+              }
+              setShowKYBModal(true);
+            }}
+            onViewDetails={(merchant) => {
+              setSelectedMerchant({
+                ...merchant,
+                id: merchant.merchant_id,
+                merchant_id: merchant.merchant_id,
+                name: merchant.business_name
+              });
+              setShowDetailsModal(true);
+            }}
+            onRemove={async (merchantId) => {
+              try {
+                await merchantApi.deleteMerchant(Number(merchantId.replace('merch_', '')));
+                await loadDashboardData();
+                alert('✅ Merchant removed');
+              } catch (err: any) {
+                console.error('❌ Remove merchant failed:', err);
+                alert(`❌ Remove failed: ${err.response?.data?.detail || err.message || 'Unknown error'}`);
+              }
+            }}
+          />
         </div>
       )}
 
