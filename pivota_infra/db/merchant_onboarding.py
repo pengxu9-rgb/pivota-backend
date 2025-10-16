@@ -3,7 +3,7 @@ Merchant Onboarding Database - Phase 2
 Handles merchant registration, KYC verification, PSP setup, and API key issuance
 """
 
-from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Text, JSON
+from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Text, JSON, Float
 from sqlalchemy.sql import func
 from db.database import metadata, database
 from typing import Dict, List, Any, Optional
