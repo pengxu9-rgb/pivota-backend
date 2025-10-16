@@ -6,8 +6,19 @@ import datetime
 from config.settings import settings
 
 DATABASE_URL = settings.database_url
-# Initialize async database connection pool; keep pool size = 1 to avoid reusing aborted connections
-database = Database(DATABASE_URL, min_size=1, max_size=1)
+
+# Disable prepared statement cache for PostgreSQL/pgbouncer compatibility
+if "postgresql" in str(DATABASE_URL).lower():
+    # Add server_settings to disable statement cache
+    database = Database(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        server_settings={"statement_cache_size": "0"}  # Disable prepared statement cache
+    )
+else:
+    # For SQLite or other databases
+    database = Database(DATABASE_URL, min_size=1, max_size=1)
 metadata = MetaData()
 
 transactions = Table(
