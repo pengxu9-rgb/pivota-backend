@@ -49,7 +49,9 @@ async def create_merchant_onboarding(merchant_data: Dict[str, Any]) -> str:
         merchant_data["status"] = "pending_verification"
         
         query = merchant_onboarding.insert().values(**merchant_data)
-        await database.execute(query)
+        # Ensure clean rollback on failure using an explicit transaction
+        async with database.transaction():
+            await database.execute(query)
         return merchant_id
     except Exception as e:
         print(f"❌ Error creating merchant onboarding: {e}")

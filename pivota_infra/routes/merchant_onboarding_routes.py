@@ -159,7 +159,20 @@ async def register_merchant(
                 await database.disconnect()
                 await asyncio.sleep(1)
                 await database.connect()
-                print("✅ Database reconnected, please try again")
+                print("✅ Database reconnected, retrying once...")
+                # Retry once after reconnection
+                try:
+                    merchant_dict = merchant_data.dict()
+                    merchant_id = await create_merchant_onboarding(merchant_dict)
+                    background_tasks.add_task(auto_approve_kyc, merchant_id)
+                    return {
+                        "status": "success",
+                        "message": "Merchant registered successfully. KYC verification in progress.",
+                        "merchant_id": merchant_id,
+                        "next_step": "Upload KYC documents or wait for auto-verification"
+                    }
+                except Exception as retry_err:
+                    print(f"⚠️ Retry after reconnect failed: {retry_err}")
             except Exception as reconnect_error:
                 print(f"⚠️ Database reconnect attempt failed: {reconnect_error}")
             # Always return 503 to prompt a retry on the client
