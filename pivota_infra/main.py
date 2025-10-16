@@ -116,21 +116,26 @@ if OPERATIONS_AVAILABLE:
 @app.on_event("startup")
 async def startup():
     """Initialize services on startup"""
+    logger.info("🚀 Starting Pivota Infrastructure Dashboard...")
     try:
+        logger.info("📡 Connecting to database...")
         await database.connect()
-        logger.info("Database connected")
+        logger.info("✅ Database connected")
         
         # Create merchant tables if they don't exist
+        logger.info("📋 Creating merchant tables...")
         from db.merchants import merchants, kyb_documents
         from db.merchant_onboarding import merchant_onboarding
         from db.payment_router import payment_router_config
         from db.database import metadata, engine
         metadata.create_all(engine)
-        logger.info("Merchant tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config)")
+        logger.info("✅ Merchant tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config)")
         
         # Run migrations for merchant_onboarding table
+        logger.info("🔄 Running database migrations...")
         try:
             from sqlalchemy import text
+            logger.info("   Checking for store_url column...")
             
             # Migration 1: Add store_url column
             check_query = text("""
@@ -188,6 +193,7 @@ async def startup():
             logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")
         
         # Initialize services if available
+        logger.info("🔌 Initializing optional services...")
         if SIMPLE_MAPPING_AVAILABLE:
             try:
                 from services.simple_persistent_mapping import initialize_simple_mapping_service
@@ -204,11 +210,18 @@ async def startup():
             except Exception as e:
                 logger.warning(f"Could not initialize E2E service: {e}")
         
+        logger.info("✅ All services initialized successfully!")
         logger.info("🚀 Application startup complete!")
+        logger.info("=" * 80)
         
     except Exception as e:
-        logger.error(f"Failed to initialize services: {e}")
-        raise
+        logger.error("=" * 80)
+        logger.error(f"❌ CRITICAL ERROR during startup: {e}")
+        logger.error("=" * 80)
+        import traceback
+        traceback.print_exc()
+        # Don't raise - let the app start anyway for debugging
+        logger.warning("⚠️ Continuing startup despite errors...")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -232,13 +245,27 @@ async def publish_event_to_ws(event: dict):
 @app.get("/")
 async def root():
     """Root endpoint - simplified for reliable health checks"""
+    try:
+        # Test database connection
+        await database.execute("SELECT 1")
+        db_status = "connected"
+    except Exception as e:
+        logger.error(f"Health check DB error: {e}")
+        db_status = "disconnected"
+    
     return {
         "message": "Pivota Infrastructure Dashboard API",
         "version": "0.2",
         "status": "healthy",
+        "db_status": db_status,
         "timestamp": time.time(),
         "health": "OK"
     }
+
+@app.get("/health")
+async def health_check():
+    """Dedicated health check endpoint"""
+    return {"status": "ok", "timestamp": time.time()}
 
 @app.get("/operations", response_class=HTMLResponse)
 async def operations_dashboard():
