@@ -13,24 +13,32 @@ url_str = str(DATABASE_URL or "").strip()
 if url_str.startswith("postgres://"):
     url_str = url_str.replace("postgres://", "postgresql://", 1)
 
+# Initialize database variable
+database = None
+
 lower_url = url_str.lower()
 if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.startswith("postgres")):
-    # For PostgreSQL (Supabase Direct Connection)
-    # Using Direct Connection (Session mode, port 5432) instead of Transaction Pooler
-    # This avoids pgbouncer prepared statement issues
+    # For PostgreSQL (Railway, Supabase, etc.)
     DATABASE_URL = url_str
     
-    # Conservative connection pool for Direct Connection
-    # Supabase free tier has 60 connection limit
+    # Conservative connection pool
     database = Database(
         DATABASE_URL, 
         min_size=1, 
-        max_size=5  # Conservative pool size to avoid connection limit
+        max_size=5
     )
-else:
-    DATABASE_URL = url_str
+elif url_str and len(url_str) > 0:
     # For SQLite or other databases
+    DATABASE_URL = url_str
     database = Database(DATABASE_URL, min_size=1, max_size=1)
+else:
+    # Fallback to SQLite if no DATABASE_URL is set
+    DATABASE_URL = "sqlite:///./pivota.db"
+    database = Database(DATABASE_URL, min_size=1, max_size=1)
+
+# Ensure database is initialized
+if database is None:
+    raise RuntimeError("Database connection could not be initialized. Check DATABASE_URL environment variable.")
 
 metadata = MetaData()
 
