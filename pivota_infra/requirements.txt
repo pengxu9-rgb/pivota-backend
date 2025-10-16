@@ -1,4 +1,4 @@
-fastapi
+fastapi==0.104.1
 uvicorn[standard]
 httpx
 python-dotenv
@@ -9,5 +9,14 @@ pydantic
 pydantic-settings
 alembic      # optional for migrations later
 aiosqlite    # required for sqlite async driver
-psycopg2-binary  # required for PostgreSQL
-asyncpg      # required for async PostgreSQL
+PyJWT        # for JWT token handling
+jinja2       # for HTML templates
+websockets   # for WebSocket support
+aiohttp      # for async HTTP requests in admin routes
+email-validator  # for email validation in auth routes
+supabase>=2.0.0  # for Supabase integration
+asyncpg      # for PostgreSQL async connections (Supabase)
+psycopg2-binary  # for PostgreSQL synchronous connections (Supabase)
+python-multipart  # for form data handling
+cryptography  # for JWT and security
+requests  # for HTTP requests (backup to httpx)

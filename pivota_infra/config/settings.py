@@ -9,12 +9,17 @@ class Settings(BaseSettings):
     """Application settings"""
     
     # Database
-    database_url: str = "sqlite:///./pivota.db"
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./pivota.db")
     
     # API Keys
     stripe_secret_key: Optional[str] = os.getenv("STRIPE_SECRET_KEY")
+    stripe_webhook_secret: Optional[str] = os.getenv("STRIPE_WEBHOOK_SECRET")
+    
     adyen_api_key: Optional[str] = os.getenv("ADYEN_API_KEY")
     adyen_merchant_account: Optional[str] = os.getenv("ADYEN_MERCHANT_ACCOUNT", "WoopayECOM")
+    adyen_webhook_secret: Optional[str] = os.getenv("ADYEN_WEBHOOK_SECRET")
+    adyen_webhook_username: Optional[str] = os.getenv("ADYEN_WEBHOOK_USERNAME", "adyen_webhook_user")
+    adyen_webhook_password: Optional[str] = os.getenv("ADYEN_WEBHOOK_PASSWORD")
     
     # Shopify
     shopify_access_token: Optional[str] = os.getenv("SHOPIFY_ACCESS_TOKEN")
@@ -29,6 +34,11 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 60 * 24  # 24 hours
     
+    # Supabase
+    supabase_url: Optional[str] = os.getenv("SUPABASE_URL")
+    supabase_anon_key: Optional[str] = os.getenv("SUPABASE_ANON_KEY")
+    supabase_service_role_key: Optional[str] = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    
     # CORS
     allowed_origins: list = [
         "https://*.lovable.app",
@@ -42,4 +52,3 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
-
