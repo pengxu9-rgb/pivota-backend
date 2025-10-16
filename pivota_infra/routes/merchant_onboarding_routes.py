@@ -282,10 +282,12 @@ async def setup_psp(psp_data: PSPSetupRequest):
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    if merchant["status"] != "approved":
+    # Allow PSP setup if merchant is approved OR auto-approved
+    is_auto_approved = merchant.get("auto_approved", False)
+    if merchant["status"] != "approved" and not is_auto_approved:
         raise HTTPException(
             status_code=400,
-            detail=f"KYC must be approved first. Current status: {merchant['status']}"
+            detail=f"KYC must be approved first. Current status: {merchant['status']}, auto_approved: {is_auto_approved}"
         )
     
     if merchant["psp_connected"]:

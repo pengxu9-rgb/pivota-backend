@@ -32,7 +32,11 @@ export default function PSPSetupStep({ merchantId, onComplete }: PSPSetupStepPro
       });
     } catch (err: any) {
       console.error('PSP setup error:', err);
+      console.error('Error response:', err.response);
+      console.error('Error data:', err.response?.data);
+      
       const errorMsg = err.response?.data?.detail || err.message || 'PSP setup failed. Please check your API key.';
+      
       // Handle validation errors (422)
       if (err.response?.status === 422 && err.response?.data?.detail) {
         const validationErrors = err.response.data.detail;
@@ -43,7 +47,17 @@ export default function PSPSetupStep({ merchantId, onComplete }: PSPSetupStepPro
         } else {
           setError(JSON.stringify(validationErrors));
         }
-      } else if (typeof errorMsg === 'string') {
+      } 
+      // Handle 400 errors (business logic)
+      else if (err.response?.status === 400) {
+        if (typeof errorMsg === 'string') {
+          setError(errorMsg);
+        } else {
+          setError(`Error: ${JSON.stringify(errorMsg)}`);
+        }
+      }
+      // Handle other errors
+      else if (typeof errorMsg === 'string') {
         setError(errorMsg);
       } else {
         setError('PSP setup failed. Please try again.');
