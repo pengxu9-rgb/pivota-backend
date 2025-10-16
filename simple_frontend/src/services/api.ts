@@ -132,7 +132,12 @@ export const merchantApi = {
     return response.data;
   },
 
-  getMerchant: async (merchantId: number) => {
+  getMerchant: async (merchantId: string | number) => {
+    // Phase 2 string id -> onboarding details endpoint
+    if (typeof merchantId === 'string' && merchantId.startsWith('merch_')) {
+      const response = await api.get(`/merchant/onboarding/details/${merchantId}`);
+      return response.data;
+    }
     const response = await api.get(`/merchants/${merchantId}`);
     return response.data;
   },

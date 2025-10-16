@@ -320,6 +320,31 @@ async def get_onboarding_status(merchant_id: str):
         "verified_at": merchant["verified_at"].isoformat() if merchant.get("verified_at") else None,
     }
 
+@router.get("/details/{merchant_id}", response_model=Dict[str, Any])
+async def get_onboarding_details(
+    merchant_id: str,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    Get full onboarding merchant details including KYB documents
+    """
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    # Normalize response for frontend expectations
+    result = {
+        "merchant_id": merchant["merchant_id"],
+        "business_name": merchant["business_name"],
+        "website": merchant.get("website"),
+        "platform": merchant.get("region"),  # reuse region as platform label
+        "status": merchant["status"],
+        "kyb_documents": merchant.get("kyc_documents") or [],
+        "psp_connected": merchant.get("psp_connected", False),
+        "psp_type": merchant.get("psp_type"),
+        "created_at": merchant.get("created_at").isoformat() if merchant.get("created_at") else None,
+    }
+    return {"status": "success", "merchant": result}
+
 @router.get("/all", response_model=Dict[str, Any])
 async def list_all_onboardings(
     status: Optional[str] = None,
