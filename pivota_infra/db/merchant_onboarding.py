@@ -46,30 +46,14 @@ merchant_onboarding = Table(
 
 async def create_merchant_onboarding(merchant_data: Dict[str, Any]) -> str:
     """Create a new merchant onboarding record and return merchant_id"""
-    try:
-        # Generate unique merchant_id
-        merchant_id = f"merch_{secrets.token_hex(8)}"
-        merchant_data["merchant_id"] = merchant_id
-        merchant_data["status"] = "pending_verification"
-        
-        query = merchant_onboarding.insert().values(**merchant_data)
-        # Ensure clean rollback on failure using an explicit transaction
-        async with database.transaction():
-            await database.execute(query)
-        return merchant_id
-    except Exception as e:
-        print(f"❌ Error creating merchant onboarding: {e}")
-        # Attempt to recover from aborted transaction state
-        try:
-            await database.disconnect()
-            import asyncio as _asyncio
-            await _asyncio.sleep(0.5)
-            await database.connect()
-            print("✅ Database reconnected after create error")
-        except Exception as _reconnect_err:
-            print(f"⚠️ Database reconnect failed: {_reconnect_err}")
-        # Re-raise to let the endpoint handle it
-        raise
+    # Generate unique merchant_id
+    merchant_id = f"merch_{secrets.token_hex(8)}"
+    merchant_data["merchant_id"] = merchant_id
+    merchant_data["status"] = "pending_verification"
+    
+    query = merchant_onboarding.insert().values(**merchant_data)
+    await database.execute(query)
+    return merchant_id
 
 async def get_merchant_onboarding(merchant_id: str) -> Optional[Dict[str, Any]]:
     """Get merchant onboarding record by ID"""
