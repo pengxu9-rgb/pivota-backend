@@ -522,3 +522,27 @@ async def test_post_minimal():
 async def test_post_simple_options():
     """Handle OPTIONS request for CORS"""
     return {"message": "OPTIONS handled"}
+
+@router.get("/admin-token")
+async def get_admin_test_token():
+    """
+    Generate a test admin JWT token for dashboard access
+    ⚠️ FOR DEVELOPMENT ONLY - Remove in production!
+    """
+    payload = {
+        "sub": "superadmin@pivota.com",
+        "email": "superadmin@pivota.com",
+        "role": "admin",
+        "exp": datetime.utcnow() + timedelta(days=30)
+    }
+    
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    
+    return {
+        "status": "success",
+        "token": token,
+        "expires_in": "30 days",
+        "user": "superadmin@pivota.com",
+        "role": "admin",
+        "note": "⚠️ This is a test endpoint. Remove in production!"
+    }
