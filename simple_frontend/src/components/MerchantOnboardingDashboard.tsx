@@ -111,12 +111,23 @@ export const MerchantOnboardingDashboard: React.FC = () => {
       setApiKey(key);
       localStorage.setItem('merchant_api_key', key);
       
-      alert(`🎉 PSP Connected Successfully!\n\nYour API Key (save this!):\n${key}\n\nYou can now use /payment/execute with header:\nX-Merchant-API-Key: ${key}`);
+      const validated = response.data.validated ? ' (Credentials Validated ✓)' : '';
+      alert(`🎉 PSP Connected Successfully!${validated}\n\nYour API Key (save this!):\n${key}\n\nYou can now use /payment/execute with header:\nX-Merchant-API-Key: ${key}`);
       
       setStep('complete');
       loadStatus(merchantId);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'PSP setup failed');
+      console.error('PSP Setup Error:', err);
+      const errorDetail = err.response?.data?.detail || err.message || 'PSP setup failed';
+      const errorMsg = `❌ PSP Setup Failed:\n\n${errorDetail}\n\n${
+        err.response?.status === 500 
+          ? 'Server error - PSP validation may be temporarily unavailable. The backend is still deploying or there may be an issue with the PSP API.'
+          : err.response?.status === 400
+          ? 'This usually means the API key is invalid or KYC is not approved yet.'
+          : 'Please check your API key and try again.'
+      }`;
+      setError(errorMsg);
+      alert(errorMsg);
     } finally {
       setLoading(false);
     }
