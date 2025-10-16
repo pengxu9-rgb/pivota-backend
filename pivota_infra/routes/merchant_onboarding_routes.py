@@ -255,10 +255,15 @@ async def setup_psp(psp_data: PSPSetupRequest):
         )
     
     if merchant["psp_connected"]:
-        raise HTTPException(
-            status_code=400,
-            detail="PSP already connected"
-        )
+        # Idempotent behavior: if already connected, return existing credentials
+        return {
+            "status": "success",
+            "message": "PSP already connected",
+            "merchant_id": merchant["merchant_id"],
+            "api_key": merchant.get("api_key"),
+            "psp_type": merchant.get("psp_type"),
+            "validated": True
+        }
     
     # ✨ NEW: Validate PSP credentials
     print(f"🔍 Validating {psp_data.psp_type} credentials...")
