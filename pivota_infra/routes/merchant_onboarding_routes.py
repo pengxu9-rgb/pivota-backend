@@ -55,10 +55,14 @@ async def validate_stripe_key(api_key: str) -> bool:
         # Try to retrieve account info - this will fail if key is invalid
         stripe.Account.retrieve()
         return True
-    except stripe.error.AuthenticationError:
-        return False
     except Exception as e:
-        print(f"⚠️ Stripe validation error: {e}")
+        # Check if it's an authentication error (invalid key)
+        error_type = type(e).__name__
+        if 'AuthenticationError' in error_type:
+            print(f"🔒 Invalid Stripe API key: {api_key[:15]}...")
+            return False
+        # Any other error means the key format is valid but something else failed
+        print(f"⚠️ Stripe validation error ({error_type}): {e}")
         return False
 
 async def validate_adyen_key(api_key: str) -> bool:
