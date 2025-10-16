@@ -53,6 +53,15 @@ async def create_merchant_onboarding(merchant_data: Dict[str, Any]) -> str:
         return merchant_id
     except Exception as e:
         print(f"❌ Error creating merchant onboarding: {e}")
+        # Attempt to recover from aborted transaction state
+        try:
+            await database.disconnect()
+            import asyncio as _asyncio
+            await _asyncio.sleep(0.5)
+            await database.connect()
+            print("✅ Database reconnected after create error")
+        except Exception as _reconnect_err:
+            print(f"⚠️ Database reconnect failed: {_reconnect_err}")
         # Re-raise to let the endpoint handle it
         raise
 

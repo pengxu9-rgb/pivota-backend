@@ -154,18 +154,19 @@ async def register_merchant(
         
         # Handle database transaction errors
         if "transaction is aborted" in error_msg.lower():
+            print("🔄 Attempting to recover from transaction error...")
             try:
-                print("🔄 Attempting to recover from transaction error...")
                 await database.disconnect()
                 await asyncio.sleep(1)
                 await database.connect()
                 print("✅ Database reconnected, please try again")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Database connection reset. Please try your request again."
-                )
-            except:
-                pass
+            except Exception as reconnect_error:
+                print(f"⚠️ Database reconnect attempt failed: {reconnect_error}")
+            # Always return 503 to prompt a retry on the client
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database connection reset. Please try your request again."
+            )
         
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
