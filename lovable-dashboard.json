@@ -1,0 +1,272 @@
+{
+  "name": "Pivota Admin Dashboard",
+  "description": "Modern merchant onboarding and management dashboard",
+  "version": "1.0.0",
+  "pages": [
+    {
+      "path": "/",
+      "title": "Merchants",
+      "component": "MerchantDashboard"
+    },
+    {
+      "path": "/settings",
+      "title": "Settings",
+      "component": "Settings"
+    }
+  ],
+  "components": {
+    "MerchantDashboard": {
+      "type": "page",
+      "layout": {
+        "header": {
+          "title": "Merchant Management",
+          "subtitle": "Unified onboarding and merchant dashboard",
+          "actions": [
+            {
+              "type": "button",
+              "variant": "outline",
+              "label": "Merchant Portal",
+              "icon": "external-link",
+              "onClick": "window.open('https://web-production-fedb.up.railway.app/merchant/onboarding/portal', '_blank')"
+            }
+          ]
+        },
+        "body": [
+          {
+            "type": "stats-grid",
+            "columns": 3,
+            "items": [
+              {
+                "label": "Total Merchants",
+                "value": "{{ merchants.length }}",
+                "icon": "users",
+                "color": "blue"
+              },
+              {
+                "label": "Auto Approved",
+                "value": "{{ merchants.filter(m => m.auto_approved).length }}",
+                "icon": "zap",
+                "color": "green"
+              },
+              {
+                "label": "Pending Review",
+                "value": "{{ merchants.filter(m => m.status === 'pending_verification').length }}",
+                "icon": "clock",
+                "color": "yellow"
+              }
+            ]
+          },
+          {
+            "type": "toolbar",
+            "items": [
+              {
+                "type": "input",
+                "placeholder": "Paste Admin JWT Token here...",
+                "value": "{{ adminToken }}",
+                "onChange": "setAdminToken($event); localStorage.setItem('pivota_admin_jwt', $event)",
+                "width": "400px"
+              },
+              {
+                "type": "select",
+                "label": "Status Filter",
+                "value": "{{ statusFilter }}",
+                "onChange": "setStatusFilter($event)",
+                "options": [
+                  { "label": "All", "value": "all" },
+                  { "label": "Approved", "value": "approved" },
+                  { "label": "Pending", "value": "pending_verification" },
+                  { "label": "Rejected", "value": "rejected" }
+                ]
+              },
+              {
+                "type": "input",
+                "placeholder": "Search merchants...",
+                "icon": "search",
+                "value": "{{ searchText }}",
+                "onChange": "setSearchText($event)"
+              },
+              {
+                "type": "button",
+                "label": "Refresh",
+                "icon": "refresh-cw",
+                "onClick": "fetchMerchants()"
+              }
+            ]
+          },
+          {
+            "type": "data-table",
+            "data": "{{ filteredMerchants }}",
+            "columns": [
+              {
+                "header": "Merchant ID",
+                "accessorKey": "merchant_id",
+                "cell": "{{ row.merchant_id }}"
+              },
+              {
+                "header": "Business Name",
+                "accessorKey": "business_name",
+                "cell": "{{ row.business_name }}"
+              },
+              {
+                "header": "Store URL",
+                "accessorKey": "store_url",
+                "cell": "<a href='{{ row.store_url }}' target='_blank' class='text-blue-600 hover:underline'>{{ row.store_url }}</a>"
+              },
+              {
+                "header": "Email",
+                "accessorKey": "contact_email",
+                "cell": "{{ row.contact_email }}"
+              },
+              {
+                "header": "Status",
+                "accessorKey": "status",
+                "cell": {
+                  "type": "badge",
+                  "variant": "{{ row.status === 'approved' ? 'success' : row.status === 'pending_verification' ? 'warning' : 'destructive' }}",
+                  "label": "{{ row.status }}"
+                }
+              },
+              {
+                "header": "Auto",
+                "accessorKey": "auto_approved",
+                "cell": "{{ row.auto_approved ? '✓' : '-' }}"
+              },
+              {
+                "header": "Confidence",
+                "accessorKey": "approval_confidence",
+                "cell": "{{ row.approval_confidence ? (row.approval_confidence * 100).toFixed(0) + '%' : '-' }}"
+              },
+              {
+                "header": "Created",
+                "accessorKey": "created_at",
+                "cell": "{{ new Date(row.created_at).toLocaleDateString() }}"
+              },
+              {
+                "header": "Actions",
+                "cell": {
+                  "type": "action-menu",
+                  "items": [
+                    {
+                      "label": "View Details",
+                      "icon": "eye",
+                      "onClick": "viewMerchant(row)"
+                    },
+                    {
+                      "label": "Review KYB",
+                      "icon": "file-check",
+                      "onClick": "reviewKYB(row)"
+                    },
+                    {
+                      "label": "Upload Docs",
+                      "icon": "upload",
+                      "onClick": "uploadDocs(row)"
+                    },
+                    {
+                      "label": "Delete",
+                      "icon": "trash",
+                      "variant": "destructive",
+                      "onClick": "deleteMerchant(row)"
+                    }
+                  ]
+                }
+              }
+            ],
+            "pagination": true,
+            "sorting": true,
+            "filtering": true
+          }
+        ]
+      },
+      "state": {
+        "adminToken": "localStorage.getItem('pivota_admin_jwt') || ''",
+        "merchants": [],
+        "statusFilter": "all",
+        "searchText": "",
+        "selectedMerchant": null,
+        "isLoading": false
+      },
+      "computed": {
+        "filteredMerchants": "merchants.filter(m => (statusFilter === 'all' || m.status === statusFilter) && (searchText === '' || m.business_name?.toLowerCase().includes(searchText.toLowerCase()) || m.contact_email?.toLowerCase().includes(searchText.toLowerCase()) || m.merchant_id?.toLowerCase().includes(searchText.toLowerCase())))"
+      },
+      "methods": {
+        "fetchMerchants": {
+          "async": true,
+          "code": "const response = await fetch('https://web-production-fedb.up.railway.app/merchant/onboarding/all', { headers: { 'Authorization': `Bearer ${adminToken}`, 'Content-Type': 'application/json' } }); const data = await response.json(); if (data.merchants) { setMerchants(data.merchants); } else { toast.error('Failed to load merchants'); }"
+        },
+        "viewMerchant": {
+          "code": "setSelectedMerchant(merchant); openDialog('merchantDetails')"
+        },
+        "reviewKYB": {
+          "code": "setSelectedMerchant(merchant); openDialog('kybReview')"
+        },
+        "uploadDocs": {
+          "code": "setSelectedMerchant(merchant); openDialog('uploadDocs')"
+        },
+        "deleteMerchant": {
+          "async": true,
+          "code": "if (!confirm('Are you sure you want to delete this merchant?')) return; const response = await fetch(`https://web-production-fedb.up.railway.app/merchant/onboarding/delete/${merchant.merchant_id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${adminToken}` } }); if (response.ok) { toast.success('Merchant deleted'); fetchMerchants(); } else { toast.error('Failed to delete merchant'); }"
+        }
+      },
+      "lifecycle": {
+        "onMount": "fetchMerchants()"
+      },
+      "dialogs": [
+        {
+          "id": "merchantDetails",
+          "title": "Merchant Details",
+          "content": {
+            "type": "key-value-list",
+            "items": [
+              { "label": "Merchant ID", "value": "{{ selectedMerchant?.merchant_id }}" },
+              { "label": "Business Name", "value": "{{ selectedMerchant?.business_name }}" },
+              { "label": "Store URL", "value": "{{ selectedMerchant?.store_url }}" },
+              { "label": "Contact Email", "value": "{{ selectedMerchant?.contact_email }}" },
+              { "label": "Phone", "value": "{{ selectedMerchant?.contact_phone || '-' }}" },
+              { "label": "Status", "value": "{{ selectedMerchant?.status }}" },
+              { "label": "Auto Approved", "value": "{{ selectedMerchant?.auto_approved ? 'Yes' : 'No' }}" },
+              { "label": "Confidence", "value": "{{ selectedMerchant?.approval_confidence ? (selectedMerchant.approval_confidence * 100).toFixed(0) + '%' : '-' }}" },
+              { "label": "PSP Connected", "value": "{{ selectedMerchant?.psp_connected ? 'Yes' : 'No' }}" },
+              { "label": "PSP Type", "value": "{{ selectedMerchant?.psp_type || '-' }}" },
+              { "label": "API Key", "value": "{{ selectedMerchant?.api_key || '-' }}" },
+              { "label": "KYB Deadline", "value": "{{ selectedMerchant?.full_kyb_deadline ? new Date(selectedMerchant.full_kyb_deadline).toLocaleDateString() : '-' }}" }
+            ]
+          }
+        }
+      ]
+    },
+    "Settings": {
+      "type": "page",
+      "layout": {
+        "header": {
+          "title": "Settings",
+          "subtitle": "Configure your dashboard"
+        },
+        "body": [
+          {
+            "type": "card",
+            "title": "API Configuration",
+            "content": [
+              {
+                "type": "input",
+                "label": "API Base URL",
+                "value": "https://web-production-fedb.up.railway.app",
+                "disabled": true
+              },
+              {
+                "type": "button",
+                "label": "Clear Admin JWT",
+                "variant": "destructive",
+                "onClick": "localStorage.removeItem('pivota_admin_jwt'); window.location.reload()"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "theme": {
+    "primaryColor": "#3b82f6",
+    "mode": "light"
+  }
+}
+
