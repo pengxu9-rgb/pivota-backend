@@ -149,6 +149,24 @@ async def register_merchant(
             "next_step": "Upload KYC documents or wait for auto-verification"
         }
     except Exception as e:
+        from db.database import database
+        error_msg = str(e)
+        
+        # Handle database transaction errors
+        if "transaction is aborted" in error_msg.lower():
+            try:
+                print("🔄 Attempting to recover from transaction error...")
+                await database.disconnect()
+                await asyncio.sleep(1)
+                await database.connect()
+                print("✅ Database reconnected, please try again")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Database connection reset. Please try your request again."
+                )
+            except:
+                pass
+        
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to register merchant: {str(e)}"
@@ -324,4 +342,24 @@ async def reject_kyc(
         "merchant_id": merchant_id,
         "reason": reason
     }
+
+@router.post("/db/reset", response_model=Dict[str, Any])
+async def reset_database_connection(current_user: dict = Depends(require_admin)):
+    """
+    Admin: Reset database connection (for transaction errors)
+    """
+    from db.database import database
+    try:
+        await database.disconnect()
+        await asyncio.sleep(1)
+        await database.connect()
+        return {
+            "status": "success",
+            "message": "Database connection reset successfully"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reset database: {str(e)}"
+        )
 
