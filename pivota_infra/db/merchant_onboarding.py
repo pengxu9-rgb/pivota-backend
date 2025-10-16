@@ -162,11 +162,15 @@ async def get_merchant_by_api_key(api_key: str) -> Optional[Dict[str, Any]]:
     """Get merchant by API key (alias for verify_api_key)"""
     return await verify_api_key(api_key)
 
-async def get_all_merchant_onboardings(status: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all merchant onboarding records, optionally filtered by status"""
+async def get_all_merchant_onboardings(status: Optional[str] = None, include_deleted: bool = False) -> List[Dict[str, Any]]:
+    """Get all merchant onboarding records, optionally filtered by status.
+    Excludes deleted by default unless include_deleted=True.
+    """
     query = merchant_onboarding.select()
     if status:
         query = query.where(merchant_onboarding.c.status == status)
+    if not include_deleted:
+        query = query.where(merchant_onboarding.c.status != "deleted")
     query = query.order_by(merchant_onboarding.c.created_at.desc())
     results = await database.fetch_all(query)
     return [dict(row) for row in results]

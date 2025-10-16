@@ -323,13 +323,14 @@ async def get_onboarding_status(merchant_id: str):
 @router.get("/all", response_model=Dict[str, Any])
 async def list_all_onboardings(
     status: Optional[str] = None,
+    include_deleted: bool = False,
     current_user: dict = Depends(require_admin)
 ):
     """
     Admin: List all merchant onboardings (filtered by status if provided)
     """
     try:
-        merchants = await get_all_merchant_onboardings(status)
+        merchants = await get_all_merchant_onboardings(status, include_deleted=include_deleted)
         
         return {
             "status": "success",
