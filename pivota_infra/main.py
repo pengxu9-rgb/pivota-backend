@@ -231,41 +231,13 @@ async def publish_event_to_ws(event: dict):
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
-    try:
-        from realtime.metrics_store import get_metrics_store
-        from realtime.ws_manager import get_connection_manager
-        
-        metrics_store = get_metrics_store()
-        connection_manager = get_connection_manager()
-    except ImportError:
-        # Fallback if realtime modules aren't available
-        metrics_store = None
-        connection_manager = None
-    
+    """Root endpoint - simplified for reliable health checks"""
     return {
         "message": "Pivota Infrastructure Dashboard API",
         "version": "0.2",
-        "status": "running",
+        "status": "healthy",
         "timestamp": time.time(),
-        "features": {
-            "dashboard": True,
-            "websocket": True,
-            "real_time_metrics": True,
-            "event_publishing": True
-        },
-        "available_routers": {
-            "simple_mapping": SIMPLE_MAPPING_AVAILABLE,
-            "end_to_end": E2E_AVAILABLE,
-            "mcp": MCP_AVAILABLE,
-            "operations": OPERATIONS_AVAILABLE,
-            "dashboard": True
-        },
-        "metrics": {
-            "total_events": len(metrics_store.events) if metrics_store else 0,
-            "active_connections": connection_manager.get_connection_count() if connection_manager else 0,
-            "connections_by_role": connection_manager.get_connections_by_role() if connection_manager else {}
-        }
+        "health": "OK"
     }
 
 @app.get("/operations", response_class=HTMLResponse)
