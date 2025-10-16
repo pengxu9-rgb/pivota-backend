@@ -73,7 +73,8 @@ app.add_middleware(
         "https://*.lovable.app",  # Lovable production
         "https://lovable.app",  # Lovable main domain
         "http://localhost:3000",  # Local development
-        "http://localhost:5173",  # Vite dev server
+        "http://localhost:5173",  # Vite dev server (Admin Dashboard)
+        "http://localhost:5174",  # Vite dev server (Merchant Portal)
     ],
     allow_credentials=True,
     allow_methods=["*"],
