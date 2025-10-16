@@ -69,12 +69,13 @@ app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "*",  # Allow all origins for development
-        "https://*.lovable.app",  # Lovable production
-        "https://lovable.app",  # Lovable main domain
-        "http://localhost:3000",  # Local development
-        "http://localhost:5173",  # Vite dev server (Admin Dashboard)
-        "http://localhost:5174",  # Vite dev server (Merchant Portal)
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:5175",
+        "https://web-production-fedb.up.railway.app",
+        "https://*.lovable.app",
+        "https://lovable.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
