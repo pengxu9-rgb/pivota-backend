@@ -5,20 +5,29 @@ from sqlalchemy import (
 import datetime
 from config.settings import settings
 
+# Normalize and prepare DATABASE_URL
 DATABASE_URL = settings.database_url
+url_str = str(DATABASE_URL or "").strip()
 
-# Disable prepared statement cache for PostgreSQL/pgbouncer compatibility
-if "postgresql" in str(DATABASE_URL).lower():
-    # Add statement_cache_size=0 to URL for pgbouncer compatibility
-    url_str = str(DATABASE_URL)
-    if "?" in url_str:
-        DATABASE_URL = url_str + "&statement_cache_size=0"
-    else:
-        DATABASE_URL = url_str + "?statement_cache_size=0"
+# Heroku/Render sometimes provide postgres:// which SQLAlchemy doesn't accept
+if url_str.startswith("postgres://"):
+    url_str = url_str.replace("postgres://", "postgresql://", 1)
+
+# Add pgbouncer compatibility flag for PostgreSQL
+lower_url = url_str.lower()
+if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.startswith("postgres")):
+    if "statement_cache_size=" not in lower_url:
+        if "?" in url_str:
+            url_str = url_str + "&statement_cache_size=0"
+        else:
+            url_str = url_str + "?statement_cache_size=0"
+    DATABASE_URL = url_str
     database = Database(DATABASE_URL, min_size=1, max_size=5)
 else:
+    DATABASE_URL = url_str
     # For SQLite or other databases
     database = Database(DATABASE_URL, min_size=1, max_size=1)
+
 metadata = MetaData()
 
 transactions = Table(
@@ -39,5 +48,15 @@ transactions = Table(
 raw_url = str(DATABASE_URL)
 # Build a synchronous URL for SQLAlchemy engine (remove +aiosqlite driver)
 sync_url = raw_url.replace("+aiosqlite", "")
-engine = create_engine(sync_url)
-metadata.create_all(engine)
+
+# Normalize postgres scheme for sync engine as well
+if sync_url.startswith("postgres://"):
+    sync_url = sync_url.replace("postgres://", "postgresql://", 1)
+
+try:
+    engine = create_engine(sync_url)
+    metadata.create_all(engine)
+except Exception as err:
+    # Helpful log for dialect/engine issues (e.g., f405)
+    # Common fix: ensure scheme is postgresql:// not postgres:// and driver packages installed
+    raise
