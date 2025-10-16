@@ -530,10 +530,10 @@ async def get_admin_test_token():
     ⚠️ FOR DEVELOPMENT ONLY - Remove in production!
     """
     payload = {
-        "sub": "superadmin@pivota.com",
-        "email": "superadmin@pivota.com",
+        "user_id": "superadmin@pivota.com",  # Changed from "sub" to "user_id"
         "role": "admin",
-        "exp": datetime.utcnow() + timedelta(days=30)
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
+        "iat": datetime.utcnow()
     }
     
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -541,7 +541,7 @@ async def get_admin_test_token():
     return {
         "status": "success",
         "token": token,
-        "expires_in": "30 days",
+        "expires_in": f"{JWT_EXPIRATION_HOURS} hours",
         "user": "superadmin@pivota.com",
         "role": "admin",
         "note": "⚠️ This is a test endpoint. Remove in production!"
