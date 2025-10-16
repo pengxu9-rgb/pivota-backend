@@ -18,11 +18,42 @@ const api = axios.create({
 // Add auth token to requests
 api.interceptors.request.use((config) => {
   const token = getAdminToken();
+  console.log('🔑 API Request - Token exists:', !!token);
+  console.log('🔑 Token length:', token.length);
+  console.log('🔑 Token preview:', token.substring(0, 20) + '...');
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
+  console.log('📡 Making API request:', {
+    method: config.method,
+    url: config.url,
+    baseURL: config.baseURL,
+    fullURL: `${config.baseURL}${config.url}`,
+    headers: config.headers,
+  });
   return config;
 });
+
+// Add response interceptor for debugging
+api.interceptors.response.use(
+  (response) => {
+    console.log('✅ API response received:', {
+      status: response.status,
+      url: response.config.url,
+      data: response.data,
+    });
+    return response;
+  },
+  (error) => {
+    console.error('❌ API error:', {
+      status: error.response?.status,
+      url: error.config?.url,
+      data: error.response?.data,
+      message: error.message,
+    });
+    return Promise.reject(error);
+  }
+);
 
 export interface Merchant {
   merchant_id: string;

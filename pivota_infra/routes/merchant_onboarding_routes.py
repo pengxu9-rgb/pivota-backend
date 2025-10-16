@@ -396,8 +396,14 @@ async def list_all_onboardings(
                 {
                     "merchant_id": m["merchant_id"],
                     "business_name": m["business_name"],
-                    "kyc_status": m["status"],
-                    "psp_connected": m["psp_connected"],
+                    "store_url": m.get("store_url") or "N/A",
+                    "region": m.get("region") or "Unknown",
+                    "contact_email": m.get("contact_email"),
+                    "status": m["status"],
+                    "auto_approved": m.get("auto_approved", False),
+                    "approval_confidence": m.get("approval_confidence"),
+                    "full_kyb_deadline": m.get("full_kyb_deadline").isoformat() if m.get("full_kyb_deadline") else None,
+                    "psp_connected": m.get("psp_connected", False),
                     "psp_type": m.get("psp_type"),
                     "created_at": m["created_at"].isoformat() if m["created_at"] else None,
                 }

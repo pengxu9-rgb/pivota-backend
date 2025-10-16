@@ -19,7 +19,11 @@ export default function TokenInput({ onTokenSet }: TokenInputProps) {
   }, []);
 
   const handleSave = () => {
-    localStorage.setItem('pivota_admin_jwt', token);
+    const cleanToken = token.trim(); // Remove whitespace
+    console.log('💾 Saving token:', cleanToken.substring(0, 20) + '...');
+    console.log('💾 Token length:', cleanToken.length);
+    localStorage.setItem('pivota_admin_jwt', cleanToken);
+    setToken(cleanToken);
     setShowInput(false);
     onTokenSet();
   };
