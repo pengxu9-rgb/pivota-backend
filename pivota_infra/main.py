@@ -119,8 +119,14 @@ async def startup():
     logger.info("🚀 Starting Pivota Infrastructure Dashboard...")
     try:
         logger.info("📡 Connecting to database...")
+        logger.info(f"   Database URL type: {type(database.url)}")
+        logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         await database.connect()
-        logger.info("✅ Database connected")
+        logger.info("✅ Database connected successfully")
+        
+        # Test the connection
+        await database.execute("SELECT 1")
+        logger.info("✅ Database connection test passed")
         
         # Create merchant tables if they don't exist
         logger.info("📋 Creating merchant tables...")
@@ -217,11 +223,14 @@ async def startup():
     except Exception as e:
         logger.error("=" * 80)
         logger.error(f"❌ CRITICAL ERROR during startup: {e}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        logger.error(f"❌ Error details: {str(e)}")
         logger.error("=" * 80)
         import traceback
         traceback.print_exc()
-        # Don't raise - let the app start anyway for debugging
-        logger.warning("⚠️ Continuing startup despite errors...")
+        # Re-raise the exception to prevent the app from starting with a broken database
+        logger.error("🛑 Cannot continue without database connection")
+        raise RuntimeError(f"Database initialization failed: {e}") from e
 
 @app.on_event("shutdown")
 async def shutdown():
