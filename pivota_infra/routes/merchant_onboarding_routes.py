@@ -423,6 +423,7 @@ async def reset_database_connection(current_user: dict = Depends(require_admin))
 @router.delete("/delete/{merchant_id}", response_model=Dict[str, Any])
 async def delete_onboarding_merchant(
     merchant_id: str,
+    reason: Optional[str] = None,
     current_user: dict = Depends(require_admin)
 ):
     """
@@ -431,11 +432,15 @@ async def delete_onboarding_merchant(
     """
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
-        raise HTTPException(status_code=404, detail="Merchant not found")
-    await soft_delete_merchant_onboarding(merchant_id)
+        raise HTTPException(status_code=404, detail=f"Merchant {merchant_id} not found")
+    
+    success = await soft_delete_merchant_onboarding(merchant_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete merchant")
+    
     return {
         "status": "success",
-        "message": f"Merchant {merchant_id} soft-deleted",
+        "message": f"Merchant {merchant['business_name']} soft-deleted successfully",
         "merchant_id": merchant_id
     }
 
