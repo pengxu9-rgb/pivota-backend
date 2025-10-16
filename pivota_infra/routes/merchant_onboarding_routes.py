@@ -19,7 +19,8 @@ from db.merchant_onboarding import (
     setup_psp_connection,
     get_all_merchant_onboardings,
     soft_delete_merchant_onboarding,
-    add_kyc_document
+    add_kyc_document,
+    merchant_onboarding  # Table object for direct queries
 )
 from db.payment_router import register_merchant_psp_route
 from db.database import database
