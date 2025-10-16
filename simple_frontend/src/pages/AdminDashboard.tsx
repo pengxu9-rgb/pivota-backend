@@ -590,6 +590,7 @@ export const AdminDashboard: React.FC = () => {
 
           {/* Unified Merchant List with Full Features */}
           <OnboardingAdminView 
+            legacyStores={merchants}
             onUploadDocs={(merchantId) => {
               setSelectedMerchant({ id: merchantId, merchant_id: merchantId });
               setShowDocumentUploadModal(true);
