@@ -130,9 +130,37 @@ async def startup():
         
         # Run migration to add store_url column if needed
         try:
-            from migrate_add_store_url import migrate_add_store_url
-            await migrate_add_store_url(skip_connect=True)  # Database already connected above
-            logger.info("✅ Database migration for store_url completed")
+            from sqlalchemy import text
+            # Check if store_url column exists
+            check_query = text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='merchant_onboarding' 
+                AND column_name='store_url';
+            """)
+            result = await database.fetch_one(check_query)
+            
+            if not result:
+                logger.info("📝 Adding store_url column to merchant_onboarding...")
+                # Add column (nullable first)
+                await database.execute(text("""
+                    ALTER TABLE merchant_onboarding 
+                    ADD COLUMN IF NOT EXISTS store_url VARCHAR(500);
+                """))
+                # Populate with existing data
+                await database.execute(text("""
+                    UPDATE merchant_onboarding 
+                    SET store_url = COALESCE(website, 'https://placeholder.com')
+                    WHERE store_url IS NULL;
+                """))
+                # Make it NOT NULL
+                await database.execute(text("""
+                    ALTER TABLE merchant_onboarding 
+                    ALTER COLUMN store_url SET NOT NULL;
+                """))
+                logger.info("✅ store_url column added successfully")
+            else:
+                logger.info("✅ store_url column already exists")
         except Exception as migration_err:
             logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")
         
