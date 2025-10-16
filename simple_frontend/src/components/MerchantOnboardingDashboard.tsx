@@ -338,26 +338,61 @@ export const MerchantOnboardingDashboard: React.FC = () => {
         </div>
       )}
 
-      {/* Step 2: KYC Verification */}
+      {/* Step 2: KYC Verification - Simplified (No upload required here) */}
       {step === 'kyc' && (
         <div className="card">
-          <h2 className="text-2xl font-semibold mb-4">Step 2: KYC Verification</h2>
-          <div className="bg-blue-50 border border-blue-200 p-4 rounded mb-4">
+          <h2 className="text-2xl font-semibold mb-4">✅ Registration Complete!</h2>
+          <div className="bg-green-50 border border-green-200 p-4 rounded mb-4">
             <p className="font-medium">Merchant ID: {merchantId}</p>
             <p className="text-sm text-gray-600 mt-1">Status: {status?.kyc_status || 'pending_verification'}</p>
           </div>
           
           {status?.kyc_status === 'pending_verification' && (
-            <div className="text-center py-8">
-              <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4"></div>
-              <p className="text-gray-600">KYC verification in progress...</p>
-              <p className="text-sm text-gray-500 mt-2">Auto-approval simulation (5 seconds)</p>
-              <button
-                onClick={handleRefreshStatus}
-                className="btn btn-secondary mt-4"
-              >
-                Refresh Status
-              </button>
+            <div className="py-6">
+              <div className="text-center mb-6">
+                <div className="text-blue-600 text-5xl mb-4">📋</div>
+                <p className="text-xl font-semibold text-gray-900">Next Steps</p>
+                <p className="text-gray-600 mt-2">Your registration is complete. Our team will review your application.</p>
+              </div>
+              
+              <div className="bg-gray-50 rounded-lg p-6 space-y-4">
+                <div className="flex items-start gap-3">
+                  <div className="w-8 h-8 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center flex-shrink-0 font-bold">1</div>
+                  <div>
+                    <p className="font-medium">Upload KYB Documents (Optional)</p>
+                    <p className="text-sm text-gray-600">You or our team will upload required documents for verification</p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <div className="w-8 h-8 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center flex-shrink-0 font-bold">2</div>
+                  <div>
+                    <p className="font-medium">Admin Review</p>
+                    <p className="text-sm text-gray-600">Our team will review your documents and approve/reject your application</p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <div className="w-8 h-8 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center flex-shrink-0 font-bold">3</div>
+                  <div>
+                    <p className="font-medium">Connect Payment Provider</p>
+                    <p className="text-sm text-gray-600">After approval, connect your PSP and start processing payments</p>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="mt-6 flex gap-3 justify-center">
+                <button
+                  onClick={handleRefreshStatus}
+                  className="btn btn-secondary"
+                >
+                  Check Status
+                </button>
+                <button
+                  onClick={() => window.location.href = '/admin'}
+                  className="btn btn-primary"
+                >
+                  Go to Dashboard
+                </button>
+              </div>
             </div>
           )}
           
@@ -365,6 +400,7 @@ export const MerchantOnboardingDashboard: React.FC = () => {
             <div className="text-center py-8">
               <div className="text-green-600 text-5xl mb-4">✓</div>
               <p className="text-xl font-semibold text-green-600">KYC Approved!</p>
+              <p className="text-gray-600 mt-2">You can now connect your payment provider</p>
               <button
                 onClick={() => updateStep('psp')}
                 className="btn btn-primary mt-4"
@@ -375,10 +411,29 @@ export const MerchantOnboardingDashboard: React.FC = () => {
           )}
           
           {status?.kyc_status === 'rejected' && (
-            <div className="text-center py-8">
-              <div className="text-red-600 text-5xl mb-4">✗</div>
-              <p className="text-xl font-semibold text-red-600">KYC Rejected</p>
-              <p className="text-gray-600 mt-2">Please contact support</p>
+            <div className="py-6">
+              <div className="text-center mb-6">
+                <div className="text-red-600 text-5xl mb-4">✗</div>
+                <p className="text-xl font-semibold text-red-600">KYC Rejected</p>
+                <p className="text-gray-600 mt-2">Your application was rejected. Please review the feedback and resubmit.</p>
+              </div>
+              
+              <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
+                <p className="text-sm font-medium text-red-900">Rejection Reason:</p>
+                <p className="text-sm text-red-700 mt-1">{status?.rejection_reason || 'No reason provided'}</p>
+              </div>
+              
+              <div className="text-center">
+                <p className="text-sm text-gray-600 mb-4">
+                  Please upload correct documents via the admin dashboard, or contact our support team for assistance.
+                </p>
+                <button
+                  onClick={() => window.location.href = '/admin'}
+                  className="btn btn-primary"
+                >
+                  Go to Dashboard
+                </button>
+              </div>
             </div>
           )}
         </div>

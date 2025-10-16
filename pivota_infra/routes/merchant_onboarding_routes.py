@@ -393,12 +393,14 @@ async def manual_approve_kyc(
 ):
     """
     Admin: Manually approve merchant KYC
+    After rejection, merchant can upload new documents and be re-approved
     """
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    await update_kyc_status(merchant_id, "approved")
+    # Clear rejection reason when approving
+    await update_kyc_status(merchant_id, "approved", rejection_reason=None)
     
     return {
         "status": "success",
