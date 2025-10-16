@@ -13,14 +13,9 @@ url_str = str(DATABASE_URL or "").strip()
 if url_str.startswith("postgres://"):
     url_str = url_str.replace("postgres://", "postgresql://", 1)
 
-# Add pgbouncer compatibility flag for PostgreSQL
 lower_url = url_str.lower()
 if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.startswith("postgres")):
-    if "statement_cache_size=" not in lower_url:
-        if "?" in url_str:
-            url_str = url_str + "&statement_cache_size=0"
-        else:
-            url_str = url_str + "?statement_cache_size=0"
+    # Do NOT append statement_cache_size; psycopg2 treats it as invalid DSN option
     DATABASE_URL = url_str
     database = Database(DATABASE_URL, min_size=1, max_size=5)
 else:
