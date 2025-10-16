@@ -625,28 +625,41 @@ export const AdminDashboard: React.FC = () => {
               });
               setShowDetailsModal(true);
             }}
-            onRemove={async (merchantId) => {
+            onRemove={async (merchant) => {
               try {
-                console.log('🗑️ Attempting to remove merchant:', merchantId);
-                
-                // Extract numeric ID from merchant_id (e.g., "merch_abc123" -> need to fetch from DB)
-                // For Phase 2 merchants, we need to use the database ID, not the merchant_id string
-                
-                // Try to find the merchant in the loaded data first
-                const merchantsData = await merchantApi.listMerchants();
-                const merchant = merchantsData.merchants?.find((m: any) => m.merchant_id === merchantId);
-                
-                if (!merchant) {
-                  throw new Error('Merchant not found');
+                console.log('🗑️ Attempting to remove merchant:', merchant);
+                // Prefer Phase 2 delete by merchant_id (string)
+                if (typeof merchant.merchant_id === 'string' && merchant.merchant_id.startsWith('merch_')) {
+                  try {
+                    await merchantApi.deleteOnboardingByMerchantId(merchant.merchant_id);
+                    await loadDashboardData();
+                    alert('✅ Merchant removed successfully');
+                    return;
+                  } catch (err: any) {
+                    const status = err.response?.status;
+                    console.warn('Phase 2 delete failed with status:', status);
+                    if (status !== 404) {
+                      throw err;
+                    }
+                    // If onboarding record not found, fallback to DB deletion
+                    console.log('Falling back to DB deletion by mapping listMerchants');
+                  }
                 }
-                
-                console.log('Found merchant with DB id:', merchant.id);
-                await merchantApi.deleteMerchant(merchant.id);
+                // Fallback: map via DB list and delete by numeric id
+                const merchantsData = await merchantApi.listMerchants();
+                const match = merchantsData.merchants?.find((m: any) => 
+                  m.merchant_id === merchant.merchant_id ||
+                  (merchant.contact_email && m.contact_email === merchant.contact_email) ||
+                  (merchant.business_name && m.business_name === merchant.business_name)
+                );
+                if (!match) {
+                  throw new Error('Merchant not found in DB');
+                }
+                await merchantApi.deleteMerchant(match.id);
                 await loadDashboardData();
                 alert('✅ Merchant removed successfully');
               } catch (err: any) {
                 console.error('❌ Remove merchant failed:', err);
-                console.error('Error response:', err.response);
                 const errorMsg = err.response?.data?.detail || err.message || JSON.stringify(err);
                 alert(`❌ Remove failed: ${errorMsg}`);
               }

@@ -3,7 +3,7 @@ Merchant Onboarding Routes - Phase 2
 Handles merchant registration, KYC, PSP setup, and API key issuance
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -17,7 +17,9 @@ from db.merchant_onboarding import (
     update_kyc_status,
     upload_kyc_documents,
     setup_psp_connection,
-    get_all_merchant_onboardings
+    get_all_merchant_onboardings,
+    soft_delete_merchant_onboarding,
+    add_kyc_document
 )
 from db.payment_router import register_merchant_psp_route
 from db.database import database
@@ -417,4 +419,62 @@ async def reset_database_connection(current_user: dict = Depends(require_admin))
             status_code=500,
             detail=f"Failed to reset database: {str(e)}"
         )
+
+@router.delete("/delete/{merchant_id}", response_model=Dict[str, Any])
+async def delete_onboarding_merchant(
+    merchant_id: str,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    Admin: Soft delete Phase 2 onboarding merchant by merchant_id (string)
+    This is separate from legacy merchants table deletion.
+    """
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    await soft_delete_merchant_onboarding(merchant_id)
+    return {
+        "status": "success",
+        "message": f"Merchant {merchant_id} soft-deleted",
+        "merchant_id": merchant_id
+    }
+
+@router.post("/kyc/upload/file/{merchant_id}", response_model=Dict[str, Any])
+async def upload_kyc_file(
+    merchant_id: str,
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Upload a KYB document for onboarding merchant (Phase 2) via multipart form.
+    We only store metadata for now (no real file storage).
+    """
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    # Build simple metadata
+    meta = {
+        "name": file.filename,
+        "content_type": file.content_type,
+        "size": None,
+        "document_type": document_type,
+        "uploaded_at": datetime.now().isoformat()
+    }
+    try:
+        # Try to read length if available
+        content = await file.read()
+        meta["size"] = len(content)
+    except Exception:
+        meta["size"] = None
+    # Append to onboarding record
+    ok = await add_kyc_document(merchant_id, meta)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save document metadata")
+    return {
+        "status": "success",
+        "message": "Document uploaded",
+        "merchant_id": merchant_id,
+        "document": meta
+    }
 

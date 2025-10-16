@@ -23,7 +23,7 @@ interface OnboardingAdminViewProps {
   onUploadDocs?: (merchantId: string) => void;
   onReviewKYB?: (merchant: OnboardingMerchant) => void;
   onViewDetails?: (merchant: OnboardingMerchant) => void;
-  onRemove?: (merchantId: string) => void;
+  onRemove?: (merchant: OnboardingMerchant) => void;
   legacyStores?: Record<string, any>; // Legacy configured stores (Shopify/Wix)
 }
 
@@ -264,7 +264,7 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
 
                 {/* Secondary Actions - Always visible */}
                 <div className="grid grid-cols-2 gap-2">
-                  {onUploadDocs && (
+                  {onUploadDocs && !isLegacy && (
                     <button
                       onClick={() => onUploadDocs(merchant.merchant_id)}
                       className="btn btn-secondary btn-sm text-xs"
@@ -275,7 +275,7 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                     </button>
                   )}
                   
-                  {onReviewKYB && (
+                  {onReviewKYB && !isLegacy && (
                     <button
                       onClick={() => onReviewKYB(merchant)}
                       className="btn btn-primary btn-sm text-xs"
@@ -301,7 +301,7 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                     <button
                       onClick={() => {
                         if (window.confirm(`Remove merchant "${merchant.business_name}"?`)) {
-                          onRemove(merchant.merchant_id);
+                          onRemove(merchant);
                         }
                       }}
                       className="btn btn-danger btn-sm text-xs"

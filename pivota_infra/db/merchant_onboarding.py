@@ -98,6 +98,25 @@ async def upload_kyc_documents(merchant_id: str, documents: Dict[str, Any]) -> b
     await database.execute(query)
     return True
 
+async def add_kyc_document(merchant_id: str, document: Dict[str, Any]) -> bool:
+    """Append a single KYB document metadata to the onboarding record."""
+    # Fetch existing
+    query = merchant_onboarding.select().where(merchant_onboarding.c.merchant_id == merchant_id)
+    record = await database.fetch_one(query)
+    if not record:
+        return False
+    data = dict(record)
+    docs = data.get("kyc_documents") or []
+    if isinstance(docs, dict):
+        # Normalize old structure
+        docs = [docs]
+    docs.append(document)
+    upd = merchant_onboarding.update().where(
+        merchant_onboarding.c.merchant_id == merchant_id
+    ).values(kyc_documents=docs, updated_at=datetime.now())
+    await database.execute(upd)
+    return True
+
 async def setup_psp_connection(
     merchant_id: str,
     psp_type: str,
@@ -151,4 +170,20 @@ async def get_all_merchant_onboardings(status: Optional[str] = None) -> List[Dic
     query = query.order_by(merchant_onboarding.c.created_at.desc())
     results = await database.fetch_all(query)
     return [dict(row) for row in results]
+
+async def soft_delete_merchant_onboarding(merchant_id: str) -> bool:
+    """Soft delete onboarding merchant by setting status='deleted'"""
+    query = merchant_onboarding.update().where(
+        merchant_onboarding.c.merchant_id == merchant_id
+    ).values(status="deleted", updated_at=datetime.now())
+    await database.execute(query)
+    return True
+
+async def hard_delete_merchant_onboarding(merchant_id: str) -> bool:
+    """Hard delete onboarding merchant (permanent)"""
+    delete_q = merchant_onboarding.delete().where(
+        merchant_onboarding.c.merchant_id == merchant_id
+    )
+    await database.execute(delete_q)
+    return True
 

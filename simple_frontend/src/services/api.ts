@@ -113,22 +113,22 @@ export const merchantApi = {
     const response = await api.post('/merchants/onboard', merchantData);
     return response.data;
   },
-
-  uploadDocument: async (merchantId: number, documentType: string, file: File) => {
+  uploadDocument: async (merchantId: number | string, documentType: string, file: File) => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('document_type', documentType);
-    
-    console.log(`📤 Uploading document: ${file.name} (${(file.size / 1024).toFixed(1)} KB) as ${documentType}`);
-    
+    // Phase 2 merchant uses merch_ string id -> onboarding endpoint
+    if (typeof merchantId === 'string' && merchantId.startsWith('merch_')) {
+      const response = await api.post(`/merchant/onboarding/kyc/upload/file/${merchantId}` , formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 60000,
+      });
+      return response.data;
+    }
     const response = await api.post(`/merchants/${merchantId}/documents/upload`, formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
-      timeout: 60000, // 60 seconds for file upload
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
     });
-    
-    console.log('✅ Document uploaded:', response.data);
     return response.data;
   },
 
@@ -167,11 +167,12 @@ export const merchantApi = {
     }
   },
 
-  deleteMerchant: async (merchantId: number, reason?: string) => {
-    console.log('🗑️ Deleting merchant:', { merchantId, reason });
-    const response = await api.delete(`/merchants/${merchantId}`, {
-      params: reason ? { reason } : undefined,
-    });
+  deleteMerchant: async (merchantId: number) => {
+    const response = await api.delete(`/merchants/${merchantId}`);
+    return response.data;
+  },
+  deleteOnboardingByMerchantId: async (merchantId: string) => {
+    const response = await api.delete(`/merchant/onboarding/delete/${merchantId}`);
     return response.data;
   },
 
@@ -303,3 +304,8 @@ export const adminApi = {
     return response.data;
   },
 };
+
+// Better error message extractor
+export function getApiErrorMessage(err: any): string {
+  return err?.response?.data?.detail || err?.message || err?.code || 'Unknown error';
+}

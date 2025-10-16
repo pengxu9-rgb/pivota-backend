@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { X, Upload, FileText } from 'lucide-react';
+import { merchantApi, getApiErrorMessage } from '../services/api';
 
 interface DocumentUploadModalProps {
   isOpen: boolean;
@@ -74,12 +75,12 @@ export const DocumentUploadModal: React.FC<DocumentUploadModalProps> = ({
         setUploadProgress(`Uploading ${i + 1} of ${selectedFiles.length}: ${file.name}...`);
         
         try {
-          await onUpload(merchantId, documentType, file);
+          await onUpload(merchantId as any, documentType, file);
           successCount++;
           console.log(`✅ Uploaded: ${file.name}`);
         } catch (err: any) {
           console.error(`❌ Failed to upload ${file.name}:`, err);
-          failedFiles.push(`${file.name} (${err.message || 'Unknown error'})`);
+          failedFiles.push(`${file.name} (${getApiErrorMessage(err)})`);
         }
       }
       
