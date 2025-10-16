@@ -444,6 +444,27 @@ async def delete_onboarding_merchant(
         "merchant_id": merchant_id
     }
 
+@router.delete("/{merchant_id}/delete", response_model=Dict[str, Any])
+async def delete_onboarding_merchant_alias(
+    merchant_id: str,
+    reason: Optional[str] = None,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    Alias: Admin soft delete by merchant_id (string). Mirrors /delete/{merchant_id}
+    """
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail=f"Merchant {merchant_id} not found")
+    success = await soft_delete_merchant_onboarding(merchant_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete merchant")
+    return {
+        "status": "success",
+        "message": f"Merchant {merchant['business_name']} soft-deleted successfully",
+        "merchant_id": merchant_id
+    }
+
 @router.post("/kyc/upload/file/{merchant_id}", response_model=Dict[str, Any])
 async def upload_kyc_file(
     merchant_id: str,

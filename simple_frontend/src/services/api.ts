@@ -172,8 +172,18 @@ export const merchantApi = {
     return response.data;
   },
   deleteOnboardingByMerchantId: async (merchantId: string) => {
-    const response = await api.delete(`/merchant/onboarding/delete/${merchantId}`);
-    return response.data;
+    try {
+      const response = await api.delete(`/merchant/onboarding/delete/${merchantId}`);
+      return response.data;
+    } catch (err: any) {
+      // If 404, try alias path
+      if (err?.response?.status === 404) {
+        console.warn('⚠️ Primary delete path 404, trying alias path');
+        const response2 = await api.delete(`/merchant/onboarding/${merchantId}/delete`);
+        return response2.data;
+      }
+      throw err;
+    }
   },
 
   verifyDocument: async (documentId: number) => {
