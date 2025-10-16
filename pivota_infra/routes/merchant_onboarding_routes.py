@@ -8,6 +8,8 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any
 from datetime import datetime
 import asyncio
+import stripe
+import httpx
 
 from db.merchant_onboarding import (
     create_merchant_onboarding,
@@ -49,7 +51,6 @@ class PSPSetupRequest(BaseModel):
 async def validate_stripe_key(api_key: str) -> bool:
     """Validate Stripe API key by making a test request"""
     try:
-        import stripe
         stripe.api_key = api_key
         # Try to retrieve account info - this will fail if key is invalid
         stripe.Account.retrieve()
@@ -63,7 +64,6 @@ async def validate_stripe_key(api_key: str) -> bool:
 async def validate_adyen_key(api_key: str) -> bool:
     """Validate Adyen API key by making a test request"""
     try:
-        import httpx
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://checkout-test.adyen.com/v70/paymentMethods",
