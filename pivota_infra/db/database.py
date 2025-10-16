@@ -15,9 +15,16 @@ if url_str.startswith("postgres://"):
 
 lower_url = url_str.lower()
 if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.startswith("postgres")):
-    # Do NOT append statement_cache_size; psycopg2 treats it as invalid DSN option
+    # Disable prepared statement cache for pgbouncer compatibility
+    # pgbouncer in transaction/statement mode doesn't support prepared statements
     DATABASE_URL = url_str
-    database = Database(DATABASE_URL, min_size=1, max_size=5)
+    database = Database(
+        DATABASE_URL, 
+        min_size=1, 
+        max_size=5,
+        # Disable prepared statement cache for pgbouncer
+        server_settings={'statement_cache_size': '0'}
+    )
 else:
     DATABASE_URL = url_str
     # For SQLite or other databases
