@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: pivota-dashboard-1760371224
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r pivota_infra/requirements.txt
+    startCommand: uvicorn pivota_infra.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.4
