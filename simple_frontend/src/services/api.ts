@@ -71,6 +71,9 @@ api.interceptors.response.use(
   }
 );
 
+// Export the base axios instance
+export { api };
+
 // Auth API
 export const authApi = {
   signin: async (email: string, password: string) => {
