@@ -128,6 +128,14 @@ async def startup():
         metadata.create_all(engine)
         logger.info("Merchant tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config)")
         
+        # Run migration to add store_url column if needed
+        try:
+            from migrate_add_store_url import migrate_add_store_url
+            await migrate_add_store_url()
+            logger.info("✅ Database migration for store_url completed")
+        except Exception as migration_err:
+            logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")
+        
         # Initialize services if available
         if SIMPLE_MAPPING_AVAILABLE:
             try:
