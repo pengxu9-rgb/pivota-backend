@@ -33,10 +33,11 @@ router = APIRouter(prefix="/merchant/onboarding", tags=["merchant-onboarding"])
 
 class MerchantRegisterRequest(BaseModel):
     business_name: str
-    website: str
+    store_url: str  # Required for KYB and MCP integration
     region: str  # US, EU, APAC
     contact_email: EmailStr
     contact_phone: Optional[str] = None
+    website: Optional[str] = None  # Optional, for backward compatibility
 
 class KYCUploadRequest(BaseModel):
     merchant_id: str
@@ -335,6 +336,7 @@ async def get_onboarding_details(
     result = {
         "merchant_id": merchant["merchant_id"],
         "business_name": merchant["business_name"],
+        "store_url": merchant.get("store_url"),
         "website": merchant.get("website"),
         "platform": merchant.get("region"),  # reuse region as platform label
         "status": merchant["status"],

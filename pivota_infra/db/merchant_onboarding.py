@@ -18,7 +18,8 @@ merchant_onboarding = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("merchant_id", String(50), unique=True, index=True),  # Auto-generated
     Column("business_name", String(255), nullable=False),
-    Column("website", String(500)),
+    Column("store_url", String(500), nullable=False),  # Required for KYB and MCP
+    Column("website", String(500)),  # Optional, for additional info
     Column("region", String(50)),  # e.g., US, EU, APAC
     Column("contact_email", String(255), nullable=False),
     Column("contact_phone", String(50)),

@@ -37,7 +37,7 @@ export const MerchantOnboardingDashboard: React.FC = () => {
 
   // Registration form
   const [businessName, setBusinessName] = useState('');
-  const [website, setWebsite] = useState('');
+  const [storeUrl, setStoreUrl] = useState('');
   const [region, setRegion] = useState('US');
   const [contactEmail, setContactEmail] = useState('');
   const [contactPhone, setContactPhone] = useState('');
@@ -102,7 +102,7 @@ export const MerchantOnboardingDashboard: React.FC = () => {
     try {
       const response = await api.post('/merchant/onboarding/register', {
         business_name: businessName,
-        website,
+        store_url: storeUrl,
         region,
         contact_email: contactEmail,
         contact_phone: contactPhone,
@@ -282,15 +282,16 @@ export const MerchantOnboardingDashboard: React.FC = () => {
               />
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1">Website *</label>
+              <label className="block text-sm font-medium mb-1">Store URL *</label>
               <input
                 type="url"
                 required
-                value={website}
-                onChange={(e) => setWebsite(e.target.value)}
+                value={storeUrl}
+                onChange={(e) => setStoreUrl(e.target.value)}
                 className="w-full px-3 py-2 border rounded"
-                placeholder="https://example.com"
+                placeholder="https://mystore.shopify.com or https://mystore.com"
               />
+              <p className="text-xs text-gray-500 mt-1">Required for KYB verification and MCP integration</p>
             </div>
             <div>
               <label className="block text-sm font-medium mb-1">Region *</label>
