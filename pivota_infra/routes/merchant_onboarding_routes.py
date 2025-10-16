@@ -71,9 +71,13 @@ def validate_stripe_key_sync(api_key: str) -> bool:
         if resp.status_code == 200:
             print("✅ Stripe key valid (200)")
             return True
-        if resp.status_code in (401, 403):
-            print(f"🔒 Stripe key invalid (status={resp.status_code})")
+        if resp.status_code == 401:
+            print(f"🔒 Stripe key invalid (status=401)")
             return False
+        if resp.status_code == 403:
+            # 403 代表密钥被识别但权限不足（受限密钥/权限配置），视为“有效但权限不足”
+            print("✅ Stripe key recognized but insufficient permissions (403) — treating as valid")
+            return True
         print(f"⚠️ Stripe validation unexpected status={resp.status_code}, body={resp.text[:200]}")
         return False
     except Exception as e:
