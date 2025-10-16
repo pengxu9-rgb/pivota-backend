@@ -627,12 +627,28 @@ export const AdminDashboard: React.FC = () => {
             }}
             onRemove={async (merchantId) => {
               try {
-                await merchantApi.deleteMerchant(Number(merchantId.replace('merch_', '')));
+                console.log('🗑️ Attempting to remove merchant:', merchantId);
+                
+                // Extract numeric ID from merchant_id (e.g., "merch_abc123" -> need to fetch from DB)
+                // For Phase 2 merchants, we need to use the database ID, not the merchant_id string
+                
+                // Try to find the merchant in the loaded data first
+                const merchantsData = await merchantApi.listMerchants();
+                const merchant = merchantsData.merchants?.find((m: any) => m.merchant_id === merchantId);
+                
+                if (!merchant) {
+                  throw new Error('Merchant not found');
+                }
+                
+                console.log('Found merchant with DB id:', merchant.id);
+                await merchantApi.deleteMerchant(merchant.id);
                 await loadDashboardData();
-                alert('✅ Merchant removed');
+                alert('✅ Merchant removed successfully');
               } catch (err: any) {
                 console.error('❌ Remove merchant failed:', err);
-                alert(`❌ Remove failed: ${err.response?.data?.detail || err.message || 'Unknown error'}`);
+                console.error('Error response:', err.response);
+                const errorMsg = err.response?.data?.detail || err.message || JSON.stringify(err);
+                alert(`❌ Remove failed: ${errorMsg}`);
               }
             }}
           />
