@@ -23,16 +23,14 @@ interface OnboardingAdminViewProps {
   onUploadDocs?: (merchantId: string) => void;
   onReviewKYB?: (merchant: OnboardingMerchant) => void;
   onViewDetails?: (merchant: OnboardingMerchant) => void;
-  onRemove?: (merchant: OnboardingMerchant) => void;
-  legacyStores?: Record<string, any>; // Legacy configured stores (Shopify/Wix)
+  onRemove?: (merchant: OnboardingMerchant) => Promise<boolean>;
 }
 
 export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
   onUploadDocs,
   onReviewKYB,
   onViewDetails,
-  onRemove,
-  legacyStores = {}
+  onRemove
 }) => {
   const [merchants, setMerchants] = useState<OnboardingMerchant[]>([]);
   const [loading, setLoading] = useState(true);
@@ -67,26 +65,10 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
     }
   };
 
-  // Convert legacy stores to merchant format
-  const legacyMerchants: OnboardingMerchant[] = Object.entries(legacyStores).map(([id, store]: [string, any]) => ({
-    merchant_id: id,
-    business_name: store.name || id,
-    kyc_status: 'approved', // Legacy stores are pre-approved
-    psp_connected: true, // Legacy stores are pre-configured
-    psp_type: store.platform || 'legacy',
-    created_at: store.last_sync || new Date().toISOString(),
-    website: store.store_url,
-    status: 'approved',
-    contact_email: store.contact_email || ''
-  }));
-
-  // Combine Phase 2 merchants and legacy stores
-  const allMerchants = [...merchants, ...legacyMerchants];
-
-  // Apply filter
+  // Apply filter to Phase 2 merchants only
   const filteredMerchants = selectedFilter === 'all' 
-    ? allMerchants 
-    : allMerchants.filter(m => m.kyc_status === selectedFilter || m.status === selectedFilter);
+    ? merchants 
+    : merchants.filter(m => m.kyc_status === selectedFilter || m.status === selectedFilter);
 
   const handleApprove = async (merchantId: string) => {
     if (!window.confirm('Approve this merchant?')) return;
@@ -177,20 +159,11 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {filteredMerchants.map((merchant) => {
-            const isLegacy = legacyStores.hasOwnProperty(merchant.merchant_id);
-            return (
+          {filteredMerchants.map((merchant) => (
             <div key={merchant.merchant_id} className="card">
               <div className="flex justify-between items-start mb-3">
                 <div>
-                  <div className="flex items-center gap-2">
-                    <h3 className="text-lg font-semibold">{merchant.business_name}</h3>
-                    {isLegacy && (
-                      <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-xs rounded">
-                        Legacy
-                      </span>
-                    )}
-                  </div>
+                  <h3 className="text-lg font-semibold">{merchant.business_name}</h3>
                   <p className="text-sm text-gray-500">ID: {merchant.merchant_id}</p>
                   {merchant.website && (
                     <a 
@@ -235,8 +208,8 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
 
               {/* Action Buttons */}
               <div className="space-y-2">
-                {/* Primary Actions for Pending (not for legacy stores) */}
-                {!isLegacy && merchant.kyc_status === 'pending_verification' && (
+                {/* Primary Actions for Pending */}
+                {merchant.kyc_status === 'pending_verification' && (
                   <div className="flex gap-2">
                     <button
                       onClick={() => handleApprove(merchant.merchant_id)}
@@ -255,8 +228,8 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                   </div>
                 )}
 
-                {/* PSP Setup Reminder (not for legacy stores) */}
-                {!isLegacy && merchant.kyc_status === 'approved' && !merchant.psp_connected && (
+                {/* PSP Setup Reminder */}
+                {merchant.kyc_status === 'approved' && !merchant.psp_connected && (
                   <div className="bg-blue-50 border border-blue-200 p-2 rounded text-sm text-blue-700 mb-2">
                     ℹ️ Waiting for merchant to connect PSP
                   </div>
@@ -264,7 +237,7 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
 
                 {/* Secondary Actions - Always visible */}
                 <div className="grid grid-cols-2 gap-2">
-                  {onUploadDocs && !isLegacy && (
+                  {onUploadDocs && (
                     <button
                       onClick={() => onUploadDocs(merchant.merchant_id)}
                       className="btn btn-secondary btn-sm text-xs"
@@ -275,7 +248,7 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                     </button>
                   )}
                   
-                  {onReviewKYB && !isLegacy && (
+                  {onReviewKYB && (
                     <button
                       onClick={() => onReviewKYB(merchant)}
                       className="btn btn-primary btn-sm text-xs"
@@ -297,11 +270,15 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                     </button>
                   )}
                   
-                  {onRemove && !isLegacy && (
+                  {onRemove && (
                     <button
-                      onClick={() => {
+                      onClick={async () => {
                         if (window.confirm(`Remove merchant "${merchant.business_name}"?`)) {
-                          onRemove(merchant);
+                          const success = await onRemove(merchant);
+                          if (success) {
+                            // Reload merchant list after successful deletion
+                            loadMerchants();
+                          }
                         }
                       }}
                       className="btn btn-danger btn-sm text-xs"
@@ -311,24 +288,10 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                       Remove
                     </button>
                   )}
-                  
-                  {/* Legacy stores show info instead of remove */}
-                  {isLegacy && (
-                    <button
-                      onClick={() => {
-                        alert('⚠️ Legacy stores are configured via environment variables.\n\nTo remove this store:\n1. Go to Render Dashboard\n2. Remove the environment variables:\n   - SHOPIFY_ACCESS_TOKEN / SHOPIFY_STORE_URL\n   - WIX_API_KEY / WIX_STORE_URL\n3. Redeploy the application');
-                      }}
-                      className="btn btn-secondary btn-sm text-xs"
-                      title="Legacy Store Info"
-                    >
-                      <FileText size={14} className="inline mr-1" />
-                      Config Info
-                    </button>
-                  )}
                 </div>
 
-                {/* Resume PSP Setup (not for legacy stores) */}
-                {!isLegacy && merchant.kyc_status === 'approved' && !merchant.psp_connected && (
+                {/* Resume PSP Setup */}
+                {merchant.kyc_status === 'approved' && !merchant.psp_connected && (
                   <button
                     onClick={() => {
                       try {
@@ -343,8 +306,7 @@ export const OnboardingAdminView: React.FC<OnboardingAdminViewProps> = ({
                 )}
               </div>
             </div>
-            );
-          })}
+          ))}
         </div>
       )}
     </div>

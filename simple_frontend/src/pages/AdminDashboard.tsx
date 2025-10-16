@@ -27,7 +27,6 @@ export const AdminDashboard: React.FC = () => {
   const [dashboard, setDashboard] = useState<any>(null);
   const [psps, setPsps] = useState<Record<string, PSP>>({});
   const [routingRules, setRoutingRules] = useState<RoutingRule[]>([]);
-  const [merchants, setMerchants] = useState<Record<string, Merchant>>({});
   const [logs, setLogs] = useState<SystemLog[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
@@ -83,55 +82,8 @@ export const AdminDashboard: React.FC = () => {
       console.log('✅ Routing rules:', rulesData);
       setRoutingRules(rulesData.rules);
 
-      // Load BOTH configured stores AND onboarded merchants
-      const merchantsObj: Record<string, any> = {};
-      
-      // 1. Load configured stores (Shopify, Wix)
-      try {
-        const configuredStores = await adminApi.getMerchantKYB();
-        console.log('📊 Configured stores:', configuredStores);
-        Object.assign(merchantsObj, configuredStores.merchants || {});
-      } catch (err) {
-        console.error('❌ Failed to fetch configured stores:', err);
-      }
-      
-      // 2. Load onboarded merchants from database
-      try {
-        const merchantsData = await merchantApi.listMerchants();
-        console.log('📊 Onboarded merchants RAW:', merchantsData);
-        
-        if (merchantsData.merchants && Array.isArray(merchantsData.merchants)) {
-          console.log('📊 Processing', merchantsData.merchants.length, 'onboarded merchants');
-          merchantsData.merchants.forEach((m: any) => {
-            console.log('  → Processing merchant:', m);
-            // Use "merchant_" prefix to avoid ID conflicts with configured stores
-            const merchantKey = `merchant_${m.id}`;
-            merchantsObj[merchantKey] = {
-              id: merchantKey,
-              merchant_id: m.id,  // Store actual merchant ID for API calls
-              name: m.business_name,
-              platform: m.platform,
-              store_url: m.store_url,
-              status: m.status,
-              verification_status: m.verification_status,
-              volume_processed: m.volume_processed || 0,
-              kyb_documents: [],
-              last_activity: m.updated_at || m.created_at,
-              is_onboarded: true  // Flag to identify onboarded merchants
-            };
-            console.log('  ✅ Added merchant:', merchantKey, merchantsObj[merchantKey]);
-          });
-        } else {
-          console.log('📊 No onboarded merchants or invalid format');
-        }
-      } catch (err: any) {
-        console.error('❌ Failed to fetch onboarded merchants:', err);
-        console.error('❌ Error details:', err.response?.data || err.message);
-      }
-      
-      console.log('📊 Final merchants object:', merchantsObj);
-      console.log('📊 Total merchants:', Object.keys(merchantsObj).length);
-      setMerchants(merchantsObj);
+      // Merchants are now loaded directly by OnboardingAdminView component
+      // No need to load them here anymore
 
       // Load system logs
       const logsData = await adminApi.getSystemLogs(20, 24);
@@ -590,7 +542,6 @@ export const AdminDashboard: React.FC = () => {
 
           {/* Unified Merchant List with Full Features */}
           <OnboardingAdminView 
-            legacyStores={merchants}
             onUploadDocs={(merchantId) => {
               setSelectedMerchant({ id: merchantId, merchant_id: merchantId });
               setShowDocumentUploadModal(true);
@@ -627,41 +578,15 @@ export const AdminDashboard: React.FC = () => {
             }}
             onRemove={async (merchant) => {
               try {
-                console.log('🗑️ Attempting to remove merchant:', merchant);
-                // Prefer Phase 2 delete by merchant_id (string)
-                if (typeof merchant.merchant_id === 'string' && merchant.merchant_id.startsWith('merch_')) {
-                  try {
-                    await merchantApi.deleteOnboardingByMerchantId(merchant.merchant_id);
-                    await loadDashboardData();
-                    alert('✅ Merchant removed successfully');
-                    return;
-                  } catch (err: any) {
-                    const status = err.response?.status;
-                    console.warn('Phase 2 delete failed with status:', status);
-                    if (status !== 404) {
-                      throw err;
-                    }
-                    // If onboarding record not found, fallback to DB deletion
-                    console.log('Falling back to DB deletion by mapping listMerchants');
-                  }
-                }
-                // Fallback: map via DB list and delete by numeric id
-                const merchantsData = await merchantApi.listMerchants();
-                const match = merchantsData.merchants?.find((m: any) => 
-                  m.merchant_id === merchant.merchant_id ||
-                  (merchant.contact_email && m.contact_email === merchant.contact_email) ||
-                  (merchant.business_name && m.business_name === merchant.business_name)
-                );
-                if (!match) {
-                  throw new Error('Merchant not found in DB');
-                }
-                await merchantApi.deleteMerchant(match.id);
-                await loadDashboardData();
+                console.log('🗑️ Removing Phase 2 merchant:', merchant.merchant_id);
+                await merchantApi.deleteOnboardingByMerchantId(merchant.merchant_id);
                 alert('✅ Merchant removed successfully');
+                return true; // Signal successful deletion
               } catch (err: any) {
                 console.error('❌ Remove merchant failed:', err);
-                const errorMsg = err.response?.data?.detail || err.message || JSON.stringify(err);
+                const errorMsg = err.response?.data?.detail || err.message || 'Unknown error';
                 alert(`❌ Remove failed: ${errorMsg}`);
+                return false;
               }
             }}
           />
