@@ -6,8 +6,8 @@ import datetime
 from config.settings import settings
 
 DATABASE_URL = settings.database_url
-# Initialize async database connection pool (no forced rollback in production)
-database = Database(DATABASE_URL, min_size=1, max_size=5)
+# Initialize async database connection pool; keep pool size = 1 to avoid reusing aborted connections
+database = Database(DATABASE_URL, min_size=1, max_size=1)
 metadata = MetaData()
 
 transactions = Table(
