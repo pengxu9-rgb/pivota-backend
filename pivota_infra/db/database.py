@@ -4,7 +4,6 @@ from sqlalchemy import (
 )
 import datetime
 from config.settings import settings
-import asyncpg
 
 # Normalize and prepare DATABASE_URL
 DATABASE_URL = settings.database_url
@@ -16,25 +15,17 @@ if url_str.startswith("postgres://"):
 
 lower_url = url_str.lower()
 if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.startswith("postgres")):
-    # For PostgreSQL (including Supabase with pgbouncer)
-    # Supabase Transaction Pooler uses pgbouncer which doesn't support prepared statements
-    # We need to create a custom Database class that disables statement cache
+    # For PostgreSQL (Supabase Direct Connection)
+    # Using Direct Connection (Session mode, port 5432) instead of Transaction Pooler
+    # This avoids pgbouncer prepared statement issues
     DATABASE_URL = url_str
     
-    # Monkey-patch asyncpg.create_pool to always set statement_cache_size=0
-    _original_create_pool = asyncpg.create_pool
-    
-    async def _patched_create_pool(*args, **kwargs):
-        """Wrapper that forces statement_cache_size=0 for pgbouncer compatibility"""
-        kwargs['statement_cache_size'] = 0
-        return await _original_create_pool(*args, **kwargs)
-    
-    asyncpg.create_pool = _patched_create_pool
-    
+    # Conservative connection pool for Direct Connection
+    # Supabase free tier has 60 connection limit
     database = Database(
         DATABASE_URL, 
         min_size=1, 
-        max_size=10
+        max_size=5  # Conservative pool size to avoid connection limit
     )
 else:
     DATABASE_URL = url_str
