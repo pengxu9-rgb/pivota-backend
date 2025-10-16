@@ -41,7 +41,7 @@ export const onboardingApi = {
     const response = await api.post('/merchant/onboarding/psp/setup', {
       merchant_id: merchantId,
       psp_type: pspType,
-      api_key: apiKey,
+      psp_key: apiKey,
     });
     return response.data;
   },

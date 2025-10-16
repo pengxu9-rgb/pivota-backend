@@ -47,7 +47,7 @@ class KYCUploadRequest(BaseModel):
 class PSPSetupRequest(BaseModel):
     merchant_id: str
     psp_type: str  # stripe, adyen, shoppay
-    psp_sandbox_key: str  # Test API key from PSP
+    psp_key: str  # API key from PSP
 
 # ============================================================================
 # PSP VALIDATION
@@ -293,7 +293,7 @@ async def setup_psp(psp_data: PSPSetupRequest):
     print(f"🔍 Validating {psp_data.psp_type} credentials...")
     is_valid, error_message = await validate_psp_credentials(
         psp_data.psp_type,
-        psp_data.psp_sandbox_key
+        psp_data.psp_key
     )
     
     if not is_valid:
@@ -309,14 +309,14 @@ async def setup_psp(psp_data: PSPSetupRequest):
     result = await setup_psp_connection(
         psp_data.merchant_id,
         psp_data.psp_type,
-        psp_data.psp_sandbox_key
+        psp_data.psp_key
     )
     
     # Register merchant in payment router for unified /payment/execute
     await register_merchant_psp_route(
         merchant_id=psp_data.merchant_id,
         psp_type=psp_data.psp_type,
-        psp_credentials=psp_data.psp_sandbox_key
+        psp_credentials=psp_data.psp_key
     )
     
     return {

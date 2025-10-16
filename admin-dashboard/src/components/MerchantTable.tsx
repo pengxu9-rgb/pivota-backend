@@ -149,15 +149,19 @@ export default function MerchantTable({ merchants, loading, onRefresh }: Merchan
                     </div>
                   </td>
                   <td className="px-4 py-3">
-                    <a
-                      href={merchant.store_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-sm text-primary hover:underline flex items-center gap-1"
-                    >
-                      {merchant.store_url.replace(/^https?:\/\//, '').slice(0, 30)}...
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
+                    {merchant.store_url ? (
+                      <a
+                        href={merchant.store_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-sm text-primary hover:underline flex items-center gap-1"
+                      >
+                        {merchant.store_url.replace(/^https?:\/\//, '').slice(0, 30)}...
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    ) : (
+                      <span className="text-sm text-slate-400">N/A</span>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     <span
