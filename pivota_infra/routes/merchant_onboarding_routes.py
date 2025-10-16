@@ -184,21 +184,40 @@ async def register_merchant(
                 await database.connect()
 
         # 1. 自动 KYB 预审批验证
-        from utils.auto_kyb_validator import auto_kyb_pre_approval
+        print("🔍 Starting auto-KYB pre-approval validation...")
+        try:
+            from utils.auto_kyb_validator import auto_kyb_pre_approval
+            print("✅ auto_kyb_validator imported successfully")
+        except Exception as import_err:
+            print(f"❌ Failed to import auto_kyb_validator: {import_err}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
         from datetime import datetime
         
-        validation_result = await auto_kyb_pre_approval(
-            business_name=merchant_data.business_name,
-            store_url=merchant_data.store_url,
-            region=merchant_data.region
-        )
+        try:
+            validation_result = await auto_kyb_pre_approval(
+                business_name=merchant_data.business_name,
+                store_url=merchant_data.store_url,
+                region=merchant_data.region
+            )
+            print(f"✅ Auto-KYB validation completed: {validation_result}")
+        except Exception as val_err:
+            print(f"❌ Auto-KYB validation failed: {val_err}")
+            import traceback
+            traceback.print_exc()
+            # Continue without auto-approval
+            validation_result = {"approved": False, "confidence_score": 0}
         
         # 2. 创建商户记录
         merchant_dict = merchant_data.dict()
         merchant_id = await create_merchant_onboarding(merchant_dict)
+        print(f"✅ Merchant created: {merchant_id}")
         
         # 3. 如果自动批准，立即更新状态为 approved
         if validation_result["approved"]:
+            print(f"🎉 Auto-approving merchant {merchant_id}...")
             await update_kyc_status(merchant_id, "approved")
             # Update additional fields
             query = merchant_onboarding.update().where(
@@ -209,6 +228,7 @@ async def register_merchant(
                 full_kyb_deadline=datetime.fromisoformat(validation_result["full_kyb_deadline"]) if validation_result.get("full_kyb_deadline") else None
             )
             await database.execute(query)
+            print(f"✅ Merchant {merchant_id} auto-approved successfully")
         
         return {
             "status": "success",
