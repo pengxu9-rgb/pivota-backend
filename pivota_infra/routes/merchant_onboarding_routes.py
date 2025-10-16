@@ -332,10 +332,16 @@ async def setup_psp(psp_data: PSPSetupRequest):
     
     # ✨ NEW: Validate PSP credentials
     print(f"🔍 Validating {psp_data.psp_type} credentials...")
-    is_valid, error_message = await validate_psp_credentials(
-        psp_data.psp_type,
-        psp_data.psp_key
-    )
+    try:
+        is_valid, error_message = await validate_psp_credentials(
+            psp_data.psp_type,
+            psp_data.psp_key
+        )
+    except Exception as e:
+        import traceback
+        print(f"❌ PSP validation raised exception: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"PSP validation error: {str(e)}")
     
     if not is_valid:
         print(f"❌ PSP validation failed: {error_message}")
@@ -347,18 +353,40 @@ async def setup_psp(psp_data: PSPSetupRequest):
     print(f"✅ {psp_data.psp_type} credentials validated successfully")
     
     # Setup PSP and generate API key
-    result = await setup_psp_connection(
-        psp_data.merchant_id,
-        psp_data.psp_type,
-        psp_data.psp_key
-    )
+    try:
+        result = await setup_psp_connection(
+            psp_data.merchant_id,
+            psp_data.psp_type,
+            psp_data.psp_key
+        )
+    except Exception as e:
+        import traceback
+        print(f"❌ setup_psp_connection failed: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to persist PSP connection: {str(e)}")
     
     # Register merchant in payment router for unified /payment/execute
-    await register_merchant_psp_route(
-        merchant_id=psp_data.merchant_id,
-        psp_type=psp_data.psp_type,
-        psp_credentials=psp_data.psp_key
-    )
+    try:
+        await register_merchant_psp_route(
+            merchant_id=psp_data.merchant_id,
+            psp_type=psp_data.psp_type,
+            # 存为JSON对象，避免JSON列存储纯字符串时的类型问题
+            psp_credentials={"api_key": psp_data.psp_key}
+        )
+    except Exception as e:
+        import traceback
+        print(f"❌ register_merchant_psp_route failed: {e}")
+        traceback.print_exc()
+        # 不阻断主流程，但提示客户端路由注册失败
+        return {
+            "status": "success",
+            "message": f"{psp_data.psp_type.title()} connected. Routing registration failed: {str(e)}",
+            "merchant_id": result["merchant_id"],
+            "api_key": result["api_key"],
+            "psp_type": result["psp_type"],
+            "validated": True,
+            "next_step": "Use this API key to call /payment/execute with header 'X-Merchant-API-Key'"
+        }
     
     return {
         "status": "success",
