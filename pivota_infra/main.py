@@ -128,10 +128,11 @@ async def startup():
         metadata.create_all(engine)
         logger.info("Merchant tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config)")
         
-        # Run migration to add store_url column if needed
+        # Run migrations for merchant_onboarding table
         try:
             from sqlalchemy import text
-            # Check if store_url column exists
+            
+            # Migration 1: Add store_url column
             check_query = text("""
                 SELECT column_name 
                 FROM information_schema.columns 
@@ -142,18 +143,15 @@ async def startup():
             
             if not result:
                 logger.info("📝 Adding store_url column to merchant_onboarding...")
-                # Add column (nullable first)
                 await database.execute(text("""
                     ALTER TABLE merchant_onboarding 
                     ADD COLUMN IF NOT EXISTS store_url VARCHAR(500);
                 """))
-                # Populate with existing data
                 await database.execute(text("""
                     UPDATE merchant_onboarding 
                     SET store_url = COALESCE(website, 'https://placeholder.com')
                     WHERE store_url IS NULL;
                 """))
-                # Make it NOT NULL
                 await database.execute(text("""
                     ALTER TABLE merchant_onboarding 
                     ALTER COLUMN store_url SET NOT NULL;
@@ -161,6 +159,31 @@ async def startup():
                 logger.info("✅ store_url column added successfully")
             else:
                 logger.info("✅ store_url column already exists")
+            
+            # Migration 2: Add auto-approval columns
+            auto_approval_columns = [
+                ("auto_approved", "BOOLEAN DEFAULT FALSE"),
+                ("approval_confidence", "REAL DEFAULT 0.0"),
+                ("full_kyb_deadline", "TIMESTAMP")
+            ]
+            
+            for col_name, col_type in auto_approval_columns:
+                check_col = text(f"""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='merchant_onboarding' 
+                    AND column_name='{col_name}';
+                """)
+                col_exists = await database.fetch_one(check_col)
+                
+                if not col_exists:
+                    logger.info(f"📝 Adding {col_name} column to merchant_onboarding...")
+                    await database.execute(text(f"""
+                        ALTER TABLE merchant_onboarding 
+                        ADD COLUMN IF NOT EXISTS {col_name} {col_type};
+                    """))
+                    logger.info(f"✅ {col_name} column added successfully")
+            
         except Exception as migration_err:
             logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")
         

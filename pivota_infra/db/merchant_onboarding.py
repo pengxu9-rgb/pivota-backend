@@ -23,6 +23,9 @@ merchant_onboarding = Table(
     Column("region", String(50)),  # e.g., US, EU, APAC
     Column("contact_email", String(255), nullable=False),
     Column("contact_phone", String(50)),
+    Column("auto_approved", Boolean, default=False),  # 是否自动批准
+    Column("approval_confidence", Float, default=0.0),  # 自动批准置信度
+    Column("full_kyb_deadline", DateTime, nullable=True),  # 完整KYB截止日期（7天）
     Column("status", String(50), default="pending_verification"),  # pending_verification, approved, rejected
     Column("psp_connected", Boolean, default=False),
     Column("psp_type", String(50), nullable=True),  # stripe, adyen, shoppay

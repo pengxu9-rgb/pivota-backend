@@ -145,8 +145,8 @@ async def register_merchant(
     background_tasks: BackgroundTasks
 ):
     """
-    Step 1: Register a new merchant
-    Returns merchant_id and triggers async KYC verification
+    Step 1: Register a new merchant with intelligent auto-approval
+    快速自动审批：验证 Store URL 和名称匹配后自动批准，允许立即连接PSP
     """
     try:
         # Pre-flight connection check to avoid aborted transaction state
@@ -163,17 +163,47 @@ async def register_merchant(
                 await asyncio.sleep(0.5)
                 await database.connect()
 
+        # 1. 自动 KYB 预审批验证
+        from utils.auto_kyb_validator import auto_kyb_pre_approval
+        from datetime import datetime
+        
+        validation_result = await auto_kyb_pre_approval(
+            business_name=merchant_data.business_name,
+            store_url=merchant_data.store_url,
+            region=merchant_data.region
+        )
+        
+        # 2. 创建商户记录
         merchant_dict = merchant_data.dict()
         merchant_id = await create_merchant_onboarding(merchant_dict)
         
-        # Trigger background KYC auto-approval (simulated)
-        background_tasks.add_task(auto_approve_kyc, merchant_id)
+        # 3. 如果自动批准，立即更新状态为 approved
+        if validation_result["approved"]:
+            await update_kyc_status(merchant_id, "approved")
+            # Update additional fields
+            query = merchant_onboarding.update().where(
+                merchant_onboarding.c.merchant_id == merchant_id
+            ).values(
+                auto_approved=True,
+                approval_confidence=validation_result["confidence_score"],
+                full_kyb_deadline=datetime.fromisoformat(validation_result["full_kyb_deadline"]) if validation_result.get("full_kyb_deadline") else None
+            )
+            await database.execute(query)
         
         return {
             "status": "success",
-            "message": "Merchant registered successfully. KYC verification in progress.",
+            "message": (
+                "✅ Registration approved! You can now connect your PSP and start processing payments.\n"
+                "⚠️ Please complete full KYB documentation within 7 days."
+                if validation_result["approved"]
+                else "Registration received. Manual review required before PSP connection."
+            ),
             "merchant_id": merchant_id,
-            "next_step": "Upload KYC documents or wait for auto-verification"
+            "auto_approved": validation_result["approved"],
+            "confidence_score": validation_result["confidence_score"],
+            "validation_details": validation_result["validation_results"],
+            "full_kyb_deadline": validation_result.get("full_kyb_deadline"),
+            "next_step": "Connect PSP" if validation_result["approved"] else "Wait for admin approval"
         }
     except Exception as e:
         from db.database import database
