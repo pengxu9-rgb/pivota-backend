@@ -18,13 +18,21 @@ if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.sta
     # Disable prepared statement cache for pgbouncer compatibility
     # pgbouncer in transaction/statement mode doesn't support prepared statements
     DATABASE_URL = url_str
-    database = Database(
-        DATABASE_URL, 
-        min_size=1, 
-        max_size=5,
-        # Disable prepared statement cache for pgbouncer
-        server_settings={'statement_cache_size': '0'}
-    )
+    # Pass statement_cache_size=0 as a connection option to asyncpg
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url_str)
+    query_params = urllib.parse.parse_qs(parsed.query)
+    query_params['statement_cache_size'] = ['0']
+    new_query = urllib.parse.urlencode(query_params, doseq=True)
+    url_with_cache_disabled = urllib.parse.urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment
+    ))
+    database = Database(url_with_cache_disabled, min_size=1, max_size=5)
 else:
     DATABASE_URL = url_str
     # For SQLite or other databases
