@@ -15,14 +15,18 @@ if url_str.startswith("postgres://"):
 
 lower_url = url_str.lower()
 if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.startswith("postgres")):
-    # For PostgreSQL (including Supabase)
-    # Supabase Transaction Pooler already handles connection pooling
-    # We don't need to disable prepared statements for Supabase's pooler
+    # For PostgreSQL (including Supabase with pgbouncer)
+    # Supabase Transaction Pooler uses pgbouncer which doesn't support prepared statements
+    # We need to disable statement cache by passing it to asyncpg
     DATABASE_URL = url_str
+    
+    # Pass statement_cache_size=0 via server_settings to asyncpg
+    # The databases library will forward these to asyncpg.create_pool()
     database = Database(
         DATABASE_URL, 
         min_size=1, 
-        max_size=10
+        max_size=10,
+        server_settings={"statement_cache_size": "0"}
     )
 else:
     DATABASE_URL = url_str
