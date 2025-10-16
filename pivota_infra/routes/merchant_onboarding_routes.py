@@ -71,22 +71,16 @@ def validate_stripe_key_sync(api_key: str) -> bool:
         print(f"   Account ID: {account.get('id', 'N/A')}")
         print(f"   Business name: {account.get('business_profile', {}).get('name', 'N/A')}")
         return True
-    except stripe.error.AuthenticationError as e:
-        print(f"🔒 Stripe Authentication Error: {str(e)}")
-        print(f"   Key used: {api_key[:20]}...")
-        return False
-    except stripe.error.APIConnectionError as e:
-        print(f"🌐 Stripe API Connection Error: {str(e)}")
-        print(f"   This might be a network issue, not an invalid key")
-        return False
-    except stripe.error.StripeError as e:
-        print(f"⚠️ Stripe Error ({type(e).__name__}): {str(e)}")
-        return False
     except Exception as e:
+        # 兼容不同版本 stripe SDK：不要直接引用 stripe.error.*
         error_type = type(e).__name__
-        print(f"❌ Unexpected error during Stripe validation ({error_type}): {str(e)}")
-        import traceback
-        traceback.print_exc()
+        msg_short = str(e)[:200]
+        print(f"⚠️ Stripe validation error ({error_type}): {msg_short}")
+        # 常见认证失败场景：返回 AuthenticationError/HTTP 401
+        if 'AuthenticationError' in error_type or '401' in msg_short:
+            print("🔒 Treating as invalid Stripe key")
+            return False
+        # 其它错误（网络/环境）统一视为验证失败（保持严格）
         return False
 
 async def validate_stripe_key(api_key: str) -> bool:
