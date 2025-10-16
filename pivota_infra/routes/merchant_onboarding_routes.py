@@ -20,6 +20,7 @@ from db.merchant_onboarding import (
     get_all_merchant_onboardings
 )
 from db.payment_router import register_merchant_psp_route
+from db.database import database
 from routes.auth_routes import get_current_user, require_admin
 
 router = APIRouter(prefix="/merchant/onboarding", tags=["merchant-onboarding"])
@@ -136,6 +137,20 @@ async def register_merchant(
     Returns merchant_id and triggers async KYC verification
     """
     try:
+        # Pre-flight connection check to avoid aborted transaction state
+        try:
+            await database.execute("SELECT 1")
+        except Exception as pre_err:
+            if "transaction is aborted" in str(pre_err).lower():
+                # Attempt rollback then reconnect
+                try:
+                    await database.execute("ROLLBACK")
+                except Exception:
+                    pass
+                await database.disconnect()
+                await asyncio.sleep(0.5)
+                await database.connect()
+
         merchant_dict = merchant_data.dict()
         merchant_id = await create_merchant_onboarding(merchant_dict)
         
