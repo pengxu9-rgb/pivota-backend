@@ -17,13 +17,23 @@ interface OnboardingStatus {
   verified_at?: string;
 }
 
+type OnboardingStep = 'register' | 'kyc' | 'psp' | 'complete';
+
 export const MerchantOnboardingDashboard: React.FC = () => {
-  const [step, setStep] = useState<'register' | 'kyc' | 'psp' | 'complete'>('register');
+  const [step, setStep] = useState<OnboardingStep>('register');
   const [merchantId, setMerchantId] = useState<string>('');
   const [apiKey, setApiKey] = useState<string>('');
   const [status, setStatus] = useState<OnboardingStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [resumeInput, setResumeInput] = useState('');
+
+  const updateStep = (next: OnboardingStep) => {
+    setStep(next);
+    try {
+      localStorage.setItem('merchant_onboarding_step', next);
+    } catch {}
+  };
 
   // Registration form
   const [businessName, setBusinessName] = useState('');
@@ -39,10 +49,17 @@ export const MerchantOnboardingDashboard: React.FC = () => {
   // Load status if merchant_id exists in localStorage
   useEffect(() => {
     const savedMerchantId = localStorage.getItem('merchant_onboarding_id');
+    const savedStep = localStorage.getItem('merchant_onboarding_step') as OnboardingStep | null;
     if (savedMerchantId) {
       setMerchantId(savedMerchantId);
+      if (savedStep && savedStep !== 'complete') {
+        // Optimistically show last step while status loads
+        setStep(savedStep);
+      }
       loadStatus(savedMerchantId);
     }
+    const savedApiKey = localStorage.getItem('merchant_api_key');
+    if (savedApiKey) setApiKey(savedApiKey);
   }, []);
 
   const loadStatus = async (id: string) => {
@@ -52,15 +69,28 @@ export const MerchantOnboardingDashboard: React.FC = () => {
       
       // Determine current step based on status
       if (response.data.psp_connected) {
-        setStep('complete');
+        updateStep('complete');
       } else if (response.data.kyc_status === 'approved') {
-        setStep('psp');
+        updateStep('psp');
       } else if (response.data.kyc_status === 'pending_verification') {
-        setStep('kyc');
+        updateStep('kyc');
       }
     } catch (err: any) {
       console.error('Failed to load status:', err);
       setError(err.response?.data?.detail || 'Failed to load status');
+    }
+  };
+
+  const handleManualResume = async () => {
+    const id = resumeInput.trim();
+    if (!id) return;
+    try {
+      setError('');
+      setMerchantId(id);
+      localStorage.setItem('merchant_onboarding_id', id);
+      await loadStatus(id);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to resume with this Merchant ID');
     }
   };
 
@@ -84,7 +114,7 @@ export const MerchantOnboardingDashboard: React.FC = () => {
       
       alert(`✅ Registration successful!\nMerchant ID: ${newMerchantId}\n\nKYC verification in progress (auto-approve in 5 seconds)...`);
       
-      setStep('kyc');
+      updateStep('kyc');
       
       // Poll for KYC approval
       setTimeout(() => loadStatus(newMerchantId), 6000);
@@ -114,7 +144,7 @@ export const MerchantOnboardingDashboard: React.FC = () => {
       const validated = response.data.validated ? ' (Credentials Validated ✓)' : '';
       alert(`🎉 PSP Connected Successfully!${validated}\n\nYour API Key (save this!):\n${key}\n\nYou can now use /payment/execute with header:\nX-Merchant-API-Key: ${key}`);
       
-      setStep('complete');
+      updateStep('complete');
       loadStatus(merchantId);
     } catch (err: any) {
       console.error('PSP Setup Error:', err);
@@ -142,6 +172,62 @@ export const MerchantOnboardingDashboard: React.FC = () => {
   return (
     <div className="max-w-4xl mx-auto p-6">
       <h1 className="text-3xl font-bold mb-6">Merchant Onboarding</h1>
+
+      {/* Resume section */}
+      <div className="card mb-6">
+        <h2 className="text-xl font-semibold mb-3">Resume Onboarding</h2>
+        {merchantId ? (
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div className="text-sm">
+              <p><strong>Merchant ID:</strong> <span className="font-mono">{merchantId}</span></p>
+              {apiKey && (
+                <p className="text-gray-600"><strong>Saved API Key:</strong> present</p>
+              )}
+              {status && !status.psp_connected && (
+                <p className="text-gray-600"><strong>Current Status:</strong> {status.kyc_status} • PSP Connected: {status.psp_connected ? 'Yes' : 'No'}</p>
+              )}
+            </div>
+            <div className="flex gap-2">
+              {!status?.psp_connected && (
+                <button
+                  onClick={() => updateStep(status?.kyc_status === 'approved' ? 'psp' : 'kyc')}
+                  className="btn btn-primary"
+                >
+                  Continue
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  localStorage.removeItem('merchant_onboarding_id');
+                  localStorage.removeItem('merchant_onboarding_step');
+                  setMerchantId('');
+                  setStatus(null);
+                  updateStep('register');
+                }}
+                className="btn btn-secondary"
+              >
+                Switch / Start Over
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col md:flex-row md:items-end gap-3">
+            <div className="flex-1">
+              <label className="block text-sm font-medium mb-1">Have a Merchant ID?</label>
+              <input
+                type="text"
+                value={resumeInput}
+                onChange={(e) => setResumeInput(e.target.value)}
+                className="w-full px-3 py-2 border rounded font-mono"
+                placeholder="merch_..."
+              />
+            </div>
+            <button onClick={handleManualResume} className="btn btn-primary md:w-auto">
+              Resume
+            </button>
+          </div>
+        )}
+      </div>
 
       {/* Progress Indicator */}
       <div className="mb-8">
@@ -271,7 +357,7 @@ export const MerchantOnboardingDashboard: React.FC = () => {
               <div className="text-green-600 text-5xl mb-4">✓</div>
               <p className="text-xl font-semibold text-green-600">KYC Approved!</p>
               <button
-                onClick={() => setStep('psp')}
+                onClick={() => updateStep('psp')}
                 className="btn btn-primary mt-4"
               >
                 Continue to PSP Setup
@@ -367,7 +453,8 @@ export const MerchantOnboardingDashboard: React.FC = () => {
             <button
               onClick={() => {
                 localStorage.removeItem('merchant_onboarding_id');
-                setStep('register');
+                localStorage.removeItem('merchant_onboarding_step');
+                updateStep('register');
                 setMerchantId('');
                 setApiKey('');
                 setStatus(null);

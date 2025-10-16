@@ -174,6 +174,22 @@ export const OnboardingAdminView: React.FC = () => {
                   ℹ️ Waiting for merchant to connect PSP
                 </div>
               )}
+
+              {merchant.kyc_status === 'approved' && !merchant.psp_connected && (
+                <div className="mt-3 flex gap-2">
+                  <button
+                    onClick={() => {
+                      try {
+                        localStorage.setItem('merchant_onboarding_id', merchant.merchant_id);
+                      } catch {}
+                      window.location.href = '/merchant/onboarding';
+                    }}
+                    className="btn btn-primary btn-sm flex-1"
+                  >
+                    Resume PSP Setup
+                  </button>
+                </div>
+              )}
             </div>
           ))}
         </div>
