@@ -131,7 +131,7 @@ async def startup():
         # Run migration to add store_url column if needed
         try:
             from migrate_add_store_url import migrate_add_store_url
-            await migrate_add_store_url()
+            await migrate_add_store_url(skip_connect=True)  # Database already connected above
             logger.info("✅ Database migration for store_url completed")
         except Exception as migration_err:
             logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")

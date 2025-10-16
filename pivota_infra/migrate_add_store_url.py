@@ -8,10 +8,15 @@ from sqlalchemy import text
 from db.database import database, DATABASE_URL
 from utils.logger import logger
 
-async def migrate_add_store_url():
-    """Add store_url column to merchant_onboarding table if it doesn't exist"""
+async def migrate_add_store_url(skip_connect=False):
+    """Add store_url column to merchant_onboarding table if it doesn't exist
+    
+    Args:
+        skip_connect: If True, assumes database is already connected (used during app startup)
+    """
     try:
-        await database.connect()
+        if not skip_connect:
+            await database.connect()
         
         # Check if store_url column exists
         check_query = text("""
@@ -57,7 +62,8 @@ async def migrate_add_store_url():
         logger.error(f"❌ Migration failed: {e}")
         raise
     finally:
-        await database.disconnect()
+        if not skip_connect:
+            await database.disconnect()
 
 if __name__ == "__main__":
     print("🔄 Running migration: add store_url column")
