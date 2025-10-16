@@ -54,33 +54,30 @@ class PSPSetupRequest(BaseModel):
 # ============================================================================
 
 def validate_stripe_key_sync(api_key: str) -> bool:
-    """Validate Stripe API key by making a test request (synchronous)"""
+    """Validate Stripe API key by calling Stripe HTTP API (sync)."""
+    # 1) 格式快速校验
+    if not api_key or not (api_key.startswith("sk_test_") or api_key.startswith("sk_live_")):
+        print(f"🔒 Invalid Stripe key format: {api_key[:15] if api_key else 'empty'} (len={len(api_key) if api_key else 0})")
+        return False
+
+    # 2) 真实请求 Stripe /v1/account 以验证密钥有效性
     try:
-        # Basic format check first
-        if not api_key or not (api_key.startswith('sk_test_') or api_key.startswith('sk_live_')):
-            error_msg = f"🔒 Invalid Stripe key format: {api_key[:15] if api_key else 'empty'}... (length: {len(api_key) if api_key else 0})"
-            print(error_msg)
+        print(f"🔍 Validating Stripe key via HTTP: {api_key[:20]}...")
+        resp = httpx.get(
+            "https://api.stripe.com/v1/account",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            print("✅ Stripe key valid (200)")
+            return True
+        if resp.status_code in (401, 403):
+            print(f"🔒 Stripe key invalid (status={resp.status_code})")
             return False
-        
-        print(f"🔍 Validating Stripe key: {api_key[:20]}... (length: {len(api_key)})")
-        stripe.api_key = api_key
-        
-        # Try to retrieve account info - this will fail if key is invalid
-        account = stripe.Account.retrieve()
-        print(f"✅ Stripe API key validated successfully!")
-        print(f"   Account ID: {account.get('id', 'N/A')}")
-        print(f"   Business name: {account.get('business_profile', {}).get('name', 'N/A')}")
-        return True
+        print(f"⚠️ Stripe validation unexpected status={resp.status_code}, body={resp.text[:200]}")
+        return False
     except Exception as e:
-        # 兼容不同版本 stripe SDK：不要直接引用 stripe.error.*
-        error_type = type(e).__name__
-        msg_short = str(e)[:200]
-        print(f"⚠️ Stripe validation error ({error_type}): {msg_short}")
-        # 常见认证失败场景：返回 AuthenticationError/HTTP 401
-        if 'AuthenticationError' in error_type or '401' in msg_short:
-            print("🔒 Treating as invalid Stripe key")
-            return False
-        # 其它错误（网络/环境）统一视为验证失败（保持严格）
+        print(f"❌ Stripe HTTP validation error: {type(e).__name__}: {str(e)[:200]}")
         return False
 
 async def validate_stripe_key(api_key: str) -> bool:
