@@ -109,15 +109,24 @@ export const MerchantOnboardingDashboard: React.FC = () => {
       });
 
       const newMerchantId = response.data.merchant_id;
+      const autoApproved = response.data.auto_approved;
+      const validationMessage = response.data.message;
+      const confidenceScore = response.data.confidence_score || 0;
+      
       setMerchantId(newMerchantId);
       localStorage.setItem('merchant_onboarding_id', newMerchantId);
       
-      alert(`✅ Registration successful!\nMerchant ID: ${newMerchantId}\n\nKYC verification in progress (auto-approve in 5 seconds)...`);
-      
-      updateStep('kyc');
-      
-      // Poll for KYC approval
-      setTimeout(() => loadStatus(newMerchantId), 6000);
+      // Show auto-approval result
+      if (autoApproved) {
+        alert(`🎉 Registration Approved!\n\n✅ Auto-approved (Confidence: ${(confidenceScore * 100).toFixed(0)}%)\n📅 Complete full KYB within 7 days\n\n${validationMessage}\n\nYou can now connect your PSP!`);
+        // Skip KYC waiting, go directly to PSP setup
+        loadStatus(newMerchantId);
+        setTimeout(() => updateStep('psp'), 1000);
+      } else {
+        alert(`📋 Registration Received\n\n${validationMessage}\n\nManual review required. We'll notify you once approved.`);
+        updateStep('kyc');  // Show waiting screen
+        loadStatus(newMerchantId);
+      }
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Registration failed');
     } finally {
