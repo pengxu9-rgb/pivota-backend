@@ -279,8 +279,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'overview', label: 'Overview', icon: BarChart3 },
     { id: 'psp', label: 'PSP Management', icon: CreditCard },
     { id: 'routing', label: 'Routing Rules', icon: Settings },
-    { id: 'merchants', label: 'Merchants (Legacy)', icon: Users },
-    { id: 'onboarding', label: 'Onboarding (Phase 2)', icon: Users },
+    { id: 'merchants', label: 'Merchants', icon: Users },
     { id: 'logs', label: 'System Logs', icon: Activity },
     { id: 'analytics', label: 'Analytics', icon: TrendingUp },
   ];
@@ -578,20 +577,39 @@ export const AdminDashboard: React.FC = () => {
 
       {activeTab === 'merchants' && (
         <div className="space-y-6">
-          <div className="flex justify-between items-center">
+          <div className="flex justify-between items-center mb-4">
             <h2 className="text-xl font-semibold">Merchant Management</h2>
-            <button 
-              onClick={() => {
-                console.log('🔘 Onboard Merchant button clicked');
-                console.log('Current showOnboardingModal state:', showOnboardingModal);
-                setShowOnboardingModal(true);
-                console.log('Set showOnboardingModal to true');
-              }}
-              className="btn btn-primary"
-            >
-              Onboard Merchant
-            </button>
+            <div className="flex gap-3">
+              <button 
+                onClick={() => {
+                  console.log('🔘 Onboard Merchant button clicked');
+                  console.log('Current showOnboardingModal state:', showOnboardingModal);
+                  setShowOnboardingModal(true);
+                  console.log('Set showOnboardingModal to true');
+                }}
+                className="btn btn-primary"
+              >
+                + Onboard New Merchant
+              </button>
+              <a 
+                href="/merchant/onboarding" 
+                className="btn btn-secondary"
+                target="_blank"
+              >
+                Merchant Onboarding Portal
+              </a>
+            </div>
           </div>
+
+          {/* Phase 2 Onboarding View */}
+          <div className="mb-8">
+            <h3 className="text-lg font-semibold mb-4 text-gray-700">📋 Merchant Onboarding (Phase 2)</h3>
+            <OnboardingAdminView />
+          </div>
+
+          {/* Legacy Configured Stores */}
+          <div>
+            <h3 className="text-lg font-semibold mb-4 text-gray-700">🏪 Configured Stores (Legacy)</h3>
 
           {Object.keys(merchants).length === 0 ? (
             <div className="card text-center py-12">
@@ -724,6 +742,7 @@ export const AdminDashboard: React.FC = () => {
               ))}
             </div>
           )}
+          </div>
         </div>
       )}
 
@@ -778,19 +797,6 @@ export const AdminDashboard: React.FC = () => {
         </div>
       )}
 
-      {/* Onboarding (Phase 2) Tab */}
-      {activeTab === 'onboarding' && (
-        <div className="space-y-6">
-          <div className="flex justify-between items-center">
-            <h2 className="text-xl font-semibold">Merchant Onboarding (Phase 2)</h2>
-            <a href="/merchant/onboarding" className="btn btn-primary">
-              New Merchant Onboarding
-            </a>
-          </div>
-
-          <OnboardingAdminView />
-        </div>
-      )}
 
       {activeTab === 'analytics' && analytics && (
         <div className="space-y-6">

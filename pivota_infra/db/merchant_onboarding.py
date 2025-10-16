@@ -139,6 +139,10 @@ async def verify_api_key(api_key: str) -> Optional[Dict[str, Any]]:
     result = await database.fetch_one(query)
     return dict(result) if result else None
 
+async def get_merchant_by_api_key(api_key: str) -> Optional[Dict[str, Any]]:
+    """Get merchant by API key (alias for verify_api_key)"""
+    return await verify_api_key(api_key)
+
 async def get_all_merchant_onboardings(status: Optional[str] = None) -> List[Dict[str, Any]]:
     """Get all merchant onboarding records, optionally filtered by status"""
     query = merchant_onboarding.select()

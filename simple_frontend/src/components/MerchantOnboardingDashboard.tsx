@@ -149,6 +149,14 @@ export const MerchantOnboardingDashboard: React.FC = () => {
     } catch (err: any) {
       console.error('PSP Setup Error:', err);
       const errorDetail = err.response?.data?.detail || err.message || 'PSP setup failed';
+
+      // Idempotent handling: if PSP already connected, proceed to completion
+      if (typeof errorDetail === 'string' && errorDetail.toLowerCase().includes('already connected')) {
+        alert('ℹ️ PSP already connected. Refreshing status...');
+        await loadStatus(merchantId);
+        setLoading(false);
+        return;
+      }
       const errorMsg = `❌ PSP Setup Failed:\n\n${errorDetail}\n\n${
         err.response?.status === 500 
           ? 'Server error - PSP validation may be temporarily unavailable. The backend is still deploying or there may be an issue with the PSP API.'

@@ -33,6 +33,7 @@ from routes.auth_ws_routes import router as auth_ws_router
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
+from routes.payment_execution_routes import router as payment_execution_router
 
 # Service routers (only include what exists)
 try:
@@ -88,6 +89,7 @@ app.include_router(auth_ws_router)  # Authenticated WebSocket
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
+app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API

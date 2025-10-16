@@ -3,10 +3,11 @@ Payment Router Database - Links merchants to PSPs
 Enables unified /payment/execute endpoint with automatic PSP routing
 """
 
-from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Float, ForeignKey
+from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Float, ForeignKey, JSON
 from sqlalchemy.sql import func
 from db.database import metadata, database
 from typing import Dict, List, Any, Optional
+import json
 
 # Payment routing configuration
 payment_router_config = Table(
@@ -15,7 +16,7 @@ payment_router_config = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("merchant_id", String(50), index=True, unique=True),  # From merchant_onboarding
     Column("psp_type", String(50), nullable=False),  # stripe, adyen, shoppay
-    Column("psp_credentials", String(500), nullable=False),  # Encrypted PSP key
+    Column("psp_credentials", JSON, nullable=False),  # PSP credentials as JSON
     Column("routing_priority", Integer, default=1),  # For multi-PSP routing later
     Column("enabled", Boolean, default=True),
     Column("created_at", DateTime, server_default=func.now()),

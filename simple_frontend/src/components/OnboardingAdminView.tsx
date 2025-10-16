@@ -21,6 +21,7 @@ export const OnboardingAdminView: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [selectedFilter, setSelectedFilter] = useState<string>('all');
+  const [resumeId, setResumeId] = useState('');
 
   useEffect(() => {
     loadMerchants();
@@ -109,8 +110,30 @@ export const OnboardingAdminView: React.FC = () => {
 
       {/* Merchants List */}
       {merchants.length === 0 ? (
-        <div className="text-center py-12 bg-gray-50 rounded">
-          <p className="text-gray-600">No merchants found</p>
+        <div className="text-center py-12 bg-gray-50 rounded space-y-4">
+          <p className="text-gray-600">No onboarded merchants found.</p>
+          <div className="max-w-xl mx-auto flex flex-col md:flex-row gap-2 items-stretch md:items-end">
+            <div className="flex-1 text-left">
+              <label className="block text-sm font-medium mb-1">Resume with Merchant ID</label>
+              <input
+                type="text"
+                value={resumeId}
+                onChange={(e) => setResumeId(e.target.value)}
+                className="w-full px-3 py-2 border rounded font-mono"
+                placeholder="merch_..."
+              />
+            </div>
+            <button
+              onClick={() => {
+                if (!resumeId.trim()) return;
+                try { localStorage.setItem('merchant_onboarding_id', resumeId.trim()); } catch {}
+                window.location.href = '/merchant/onboarding';
+              }}
+              className="btn btn-primary md:w-auto"
+            >
+              Resume PSP Setup
+            </button>
+          </div>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
