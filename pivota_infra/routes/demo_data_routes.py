@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 
 from dashboard.core import dashboard_core, User, UserRole, Order, Payment, OrderStatus, PSPType
-from routes.dashboard_api import get_current_user
+from pivota_infra.routes.dashboard_api import get_current_user
 
 logger = logging.getLogger("demo_data_routes")
 router = APIRouter(prefix="/api/demo", tags=["demo_data"])

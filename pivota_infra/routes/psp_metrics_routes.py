@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from typing import Dict, Any
 from collections import defaultdict
-from utils.logger import logger
+from pivota_infra.utils.logger import logger
 
 # In-memory PSP metrics storage
 psp_metrics = defaultdict(lambda: {"success_rate": 0.95, "latency": 200, "cost": 1.0})

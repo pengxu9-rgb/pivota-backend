@@ -12,7 +12,7 @@ import json
 
 from psp.connectors import psp_manager, PaymentRequest, PaymentResponse
 from dashboard.core import dashboard_core, Order, Payment, OrderStatus, PSPType
-from utils.event_publisher import event_publisher
+from pivota_infra.utils.event_publisher import event_publisher
 
 logger = logging.getLogger("payment_orchestrator")
 

@@ -11,7 +11,7 @@ from typing import Dict, Any
 
 from dashboard.core import dashboard_core, User, UserRole, Order, Payment, OrderStatus, PSPType
 from psp.production_connectors import production_psp_manager
-from orchestrator.payment_orchestrator import payment_orchestrator
+from pivota_infra.orchestrator.payment_orchestrator import payment_orchestrator
 
 logger = logging.getLogger("production_setup")
 

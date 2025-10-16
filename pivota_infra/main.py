@@ -14,26 +14,26 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
 # Database
-from db.database import database
+from pivota_infra.db.database import database
 
 # Core routers (only include what exists)
-from routes.agent_routes import router as agent_router
-from routes.psp_routes import router as psp_router
-from routes.payment_routes import router as payment_router
+from pivota_infra.routes.agent_routes import router as agent_router
+from pivota_infra.routes.psp_routes import router as psp_router
+from pivota_infra.routes.payment_routes import router as payment_router
 
 # Dashboard routers
-from routes.dashboard_routes import router as dashboard_router
-from routes.dashboard_api import router as dashboard_api_router
-from routes.payment_routes import router as payment_routes_router
-from routes.demo_data_routes import router as demo_data_router
-from routes.test_data_routes import router as test_data_router
-from routes.simple_ws_routes import router as simple_ws_router
-from routes.auth_routes import router as auth_router
-from routes.auth_ws_routes import router as auth_ws_router
-from routes.admin_api import router as admin_api_router
-from routes.merchant_routes import router as merchant_router
-from routes.merchant_onboarding_routes import router as merchant_onboarding_router
-from routes.payment_execution_routes import router as payment_execution_router
+from pivota_infra.routes.dashboard_routes import router as dashboard_router
+from pivota_infra.routes.dashboard_api import router as dashboard_api_router
+from pivota_infra.routes.payment_routes import router as payment_routes_router
+from pivota_infra.routes.demo_data_routes import router as demo_data_router
+from pivota_infra.routes.test_data_routes import router as test_data_router
+from pivota_infra.routes.simple_ws_routes import router as simple_ws_router
+from pivota_infra.routes.auth_routes import router as auth_router
+from pivota_infra.routes.auth_ws_routes import router as auth_ws_router
+from pivota_infra.routes.admin_api import router as admin_api_router
+from pivota_infra.routes.merchant_routes import router as merchant_router
+from pivota_infra.routes.merchant_onboarding_routes import router as merchant_onboarding_router
+from pivota_infra.routes.payment_execution_routes import router as payment_execution_router
 
 # Service routers (only include what exists)
 try:
@@ -61,7 +61,7 @@ except ImportError:
     OPERATIONS_AVAILABLE = False
 
 # Utils
-from utils.logger import logger
+from pivota_infra.utils.logger import logger
 
 app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
 

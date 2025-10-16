@@ -1,5 +1,5 @@
-from db.database import database, transactions
-from utils.logger import logger
+from pivota_infra.db.database import database, transactions
+from pivota_infra.utils.logger import logger
 
 async def handle_psp_webhook(payment_intent_id, status, psp, psp_txn_id):
     # find transaction by metadata (in prototype we may store mapping)

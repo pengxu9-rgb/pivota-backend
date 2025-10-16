@@ -15,7 +15,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from realtime.metrics_store import get_metrics_store, record_event
-from utils.event_publisher import event_publisher
+from pivota_infra.utils.event_publisher import event_publisher
 
 async def test_dashboard_backend():
     """Test the dashboard backend functionality"""

@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Request, Header, HTTPException, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from adapters.stripe_adapter import verify_webhook_signature
-from orchestrator.callback_handler import handle_psp_webhook
-from config.settings import settings
-from utils.logger import logger
+from pivota_infra.adapters.stripe_adapter import verify_webhook_signature
+from pivota_infra.orchestrator.callback_handler import handle_psp_webhook
+from pivota_infra.config.settings import settings
+from pivota_infra.utils.logger import logger
 import hmac
 import hashlib
 import json

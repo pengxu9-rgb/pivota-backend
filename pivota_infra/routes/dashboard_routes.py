@@ -12,7 +12,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from realtime.metrics_store import get_metrics_store, snapshot
 from realtime.ws_manager import get_connection_manager
-from utils.auth import verify_jwt_token, validate_entity_access, check_permission
+from pivota_infra.utils.auth import verify_jwt_token, validate_entity_access, check_permission
 
 logger = logging.getLogger("dashboard_routes")
 

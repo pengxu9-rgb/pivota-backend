@@ -12,8 +12,8 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 import os
-from utils.supabase_client import supabase, create_user_in_supabase, get_user_role
-from utils.supabase_client import update_user_role as update_user_role_in_supabase
+from pivota_infra.utils.supabase_client import supabase, create_user_in_supabase, get_user_role
+from pivota_infra.utils.supabase_client import update_user_role as update_user_role_in_supabase
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()

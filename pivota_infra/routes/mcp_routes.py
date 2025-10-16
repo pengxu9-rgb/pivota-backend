@@ -16,7 +16,7 @@ from ai_router.merchant_store import (
     get_orders_by_status, cancel_order, get_inventory_summary, get_orders_summary,
     OrderStatus
 )
-from utils.logger import logger
+from pivota_infra.utils.logger import logger
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 

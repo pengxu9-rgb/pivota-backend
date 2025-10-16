@@ -9,9 +9,9 @@ from typing import Dict, List, Any, Optional
 from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 
-from orchestrator.payment_orchestrator import payment_orchestrator, OrchestrationResult
+from pivota_infra.orchestrator.payment_orchestrator import payment_orchestrator, OrchestrationResult
 from dashboard.core import dashboard_core, User
-from routes.dashboard_api import get_current_user
+from pivota_infra.routes.dashboard_api import get_current_user
 
 logger = logging.getLogger("payment_routes")
 router = APIRouter(prefix="/api/payments", tags=["payments"])

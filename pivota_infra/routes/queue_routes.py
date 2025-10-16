@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from typing import List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel
-from utils.logger import logger
+from pivota_infra.utils.logger import logger
 
 router = APIRouter(prefix="/queue", tags=["queue"])
 

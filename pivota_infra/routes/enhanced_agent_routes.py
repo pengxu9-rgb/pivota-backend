@@ -11,8 +11,8 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ai_router.merchant_store import get_merchant_inventory, create_order, update_order_status, OrderStatus
-from routes.agent_routes import get_best_psp, update_psp_metrics, simulate_payment_processing
-from utils.logger import logger
+from pivota_infra.routes.agent_routes import get_best_psp, update_psp_metrics, simulate_payment_processing
+from pivota_infra.utils.logger import logger
 import time
 import asyncio
 

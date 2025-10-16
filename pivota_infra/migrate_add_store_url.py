@@ -5,8 +5,8 @@ Run this once on Render to update existing database schema
 
 import asyncio
 from sqlalchemy import text
-from db.database import database, DATABASE_URL
-from utils.logger import logger
+from pivota_infra.db.database import database, DATABASE_URL
+from pivota_infra.utils.logger import logger
 
 async def migrate_add_store_url(skip_connect=False):
     """Add store_url column to merchant_onboarding table if it doesn't exist

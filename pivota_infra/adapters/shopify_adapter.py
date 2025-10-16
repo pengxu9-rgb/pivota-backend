@@ -1,7 +1,7 @@
 # Minimal demo adapter for Shopify - for prototype only
 # In real world: implement OAuth, webhooks, order fetch, inventory checks
 
-from utils.logger import logger
+from pivota_infra.utils.logger import logger
 
 async def get_product(merchant_id, sku):
     # MOCK: for prototype, return static product info
