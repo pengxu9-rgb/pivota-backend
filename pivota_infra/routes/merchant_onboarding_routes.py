@@ -58,27 +58,36 @@ def validate_stripe_key_sync(api_key: str) -> bool:
     try:
         # Basic format check first
         if not api_key or not (api_key.startswith('sk_test_') or api_key.startswith('sk_live_')):
-            print(f"🔒 Invalid Stripe key format: {api_key[:15] if api_key else 'empty'}...")
+            error_msg = f"🔒 Invalid Stripe key format: {api_key[:15] if api_key else 'empty'}... (length: {len(api_key) if api_key else 0})"
+            print(error_msg)
             return False
-            
+        
+        print(f"🔍 Validating Stripe key: {api_key[:20]}... (length: {len(api_key)})")
         stripe.api_key = api_key
+        
         # Try to retrieve account info - this will fail if key is invalid
-        stripe.Account.retrieve()
-        print(f"✅ Stripe API key validated successfully: {api_key[:15]}...")
+        account = stripe.Account.retrieve()
+        print(f"✅ Stripe API key validated successfully!")
+        print(f"   Account ID: {account.get('id', 'N/A')}")
+        print(f"   Business name: {account.get('business_profile', {}).get('name', 'N/A')}")
         return True
+    except stripe.error.AuthenticationError as e:
+        print(f"🔒 Stripe Authentication Error: {str(e)}")
+        print(f"   Key used: {api_key[:20]}...")
+        return False
+    except stripe.error.APIConnectionError as e:
+        print(f"🌐 Stripe API Connection Error: {str(e)}")
+        print(f"   This might be a network issue, not an invalid key")
+        return False
+    except stripe.error.StripeError as e:
+        print(f"⚠️ Stripe Error ({type(e).__name__}): {str(e)}")
+        return False
     except Exception as e:
-        # Check if it's an authentication error (invalid key)
         error_type = type(e).__name__
-        print(f"⚠️ Stripe validation error ({error_type}): {str(e)[:100]}")
-        
-        if 'AuthenticationError' in error_type:
-            print(f"🔒 Invalid Stripe API key (auth failed)")
-            return False
-        
-        # For other errors (like network), be lenient and accept the key
-        # since format is valid
-        print(f"⚠️ Stripe validation warning, but accepting key format")
-        return True
+        print(f"❌ Unexpected error during Stripe validation ({error_type}): {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 async def validate_stripe_key(api_key: str) -> bool:
     """Async wrapper for Stripe validation"""
