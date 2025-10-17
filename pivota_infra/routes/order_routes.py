@@ -376,8 +376,16 @@ async def confirm_payment(
             # 后台任务：创建 Shopify 订单
             async def create_shopify_order_task():
                 """创建 Shopify 订单通知商户发货"""
-                if merchant.get("mcp_connected") and merchant.get("mcp_platform") == "shopify":
-                    await create_shopify_order(payment_request.order_id)
+                try:
+                    if merchant.get("mcp_connected") and merchant.get("mcp_platform") == "shopify":
+                        logger.info(f"Creating Shopify order for {payment_request.order_id}")
+                        success = await create_shopify_order(payment_request.order_id)
+                        if success:
+                            logger.info(f"Shopify order created successfully for {payment_request.order_id}")
+                        else:
+                            logger.error(f"Failed to create Shopify order for {payment_request.order_id}")
+                except Exception as e:
+                    logger.error(f"Error in Shopify order creation task: {e}")
             
             background_tasks.add_task(create_shopify_order_task)
             
@@ -507,34 +515,53 @@ async def create_shopify_order(order_id: str) -> bool:
     - 记录事件日志用于后续重试
     """
     try:
+        logger.info(f"Starting Shopify order creation for {order_id}")
+        
         order = await get_order(order_id)
         if not order:
+            logger.error(f"Order {order_id} not found")
             return False
         
         merchant = await get_merchant_onboarding(order["merchant_id"])
         if not merchant or not merchant.get("mcp_connected"):
+            logger.error(f"Merchant not connected to Shopify: {order['merchant_id']}")
             return False
         
         shop_domain = merchant.get("mcp_shop_domain")
         access_token = merchant.get("mcp_access_token")
         
         if not shop_domain or not access_token:
+            logger.error(f"Missing Shopify credentials for merchant {order['merchant_id']}")
             return False
         
-        # 构造 Shopify 订单数据
+        logger.info(f"Using Shopify store: {shop_domain}")
+        
+        # 构造 Shopify 订单数据 - use title-based line items instead of variant_id
+        line_items = []
+        for item in order["items"]:
+            line_item = {
+                "title": item.get("product_title", "Product"),
+                "quantity": item["quantity"],
+                "price": str(item["unit_price"])
+            }
+            # Only add variant_id if it's valid
+            if item.get("variant_id"):
+                try:
+                    variant_id = int(item["variant_id"])
+                    # Only use variant_id if it's reasonable (not our test ID)
+                    if variant_id < 1000000000000:
+                        line_item["variant_id"] = variant_id
+                except (ValueError, TypeError):
+                    pass
+            line_items.append(line_item)
+        
         shopify_order_data = {
             "order": {
                 "email": order["customer_email"],
                 "financial_status": "paid",
                 "send_receipt": True,
                 "send_fulfillment_receipt": True,
-                "line_items": [
-                    {
-                        "variant_id": int(item["variant_id"]) if item.get("variant_id") else None,
-                        "quantity": item["quantity"],
-                        "price": str(item["unit_price"])
-                    } for item in order["items"] if item.get("variant_id")
-                ],
+                "line_items": line_items,
                 "shipping_address": order["shipping_address"],
                 "note": f"Pivota Order ID: {order_id}",
                 "tags": "pivota,agent-order"
@@ -548,16 +575,23 @@ async def create_shopify_order(order_id: str) -> bool:
             "Content-Type": "application/json"
         }
         
+        logger.info(f"Calling Shopify API: {url}")
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=shopify_order_data, headers=headers, timeout=10.0)
             
+            logger.info(f"Shopify API response: {response.status_code}")
+            
             if response.status_code == 201:
                 shopify_order = response.json()["order"]
+                shopify_order_id = str(shopify_order["id"])
+                
+                logger.info(f"Shopify order created: {shopify_order_id}")
                 
                 # 更新 Pivota 订单的 Shopify 订单 ID
                 await update_fulfillment_info(
                     order_id=order_id,
-                    shopify_order_id=str(shopify_order["id"]),
+                    shopify_order_id=shopify_order_id,
                     fulfillment_status="processing"
                 )
                 
@@ -566,11 +600,15 @@ async def create_shopify_order(order_id: str) -> bool:
                     event_type="shopify_order_created",
                     order_id=order_id,
                     merchant_id=order["merchant_id"],
-                    metadata={"shopify_order_id": shopify_order["id"]}
+                    metadata={"shopify_order_id": shopify_order_id}
                 )
                 
+                logger.info(f"Successfully created Shopify order {shopify_order_id} for Pivota order {order_id}")
                 return True
             else:
+                error_msg = response.text[:500]
+                logger.error(f"Shopify API error: {response.status_code} - {error_msg}")
+                
                 # 记录失败事件
                 await log_order_event(
                     event_type="shopify_order_failed",
@@ -578,17 +616,18 @@ async def create_shopify_order(order_id: str) -> bool:
                     merchant_id=order["merchant_id"],
                     metadata={
                         "status_code": response.status_code,
-                        "error": response.text[:500]
+                        "error": error_msg
                     }
                 )
                 return False
                 
     except Exception as e:
+        logger.error(f"Exception in create_shopify_order: {str(e)}")
         # 记录异常
         await log_order_event(
             event_type="shopify_order_error",
             order_id=order_id,
-            merchant_id=order.get("merchant_id", "unknown"),
+            merchant_id=order.get("merchant_id", "unknown") if order else "unknown",
             metadata={"error": str(e)}
         )
         return False
