@@ -96,9 +96,18 @@ async def create_new_order(
         try:
             # 获取商户的 PSP 类型和密钥
             psp_type = merchant.get("psp_type", "stripe")
-            psp_key = merchant.get("psp_key") or (
-                settings.stripe_secret_key if psp_type == "stripe" else settings.adyen_api_key
-            )
+            # 尝试获取 psp_sandbox_key 或 psp_key
+            psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
+            
+            # 如果商户没有配置密钥，使用系统默认（开发环境）
+            if not psp_key:
+                if psp_type == "stripe":
+                    psp_key = getattr(settings, "stripe_secret_key", None)
+                else:
+                    psp_key = getattr(settings, "adyen_api_key", None)
+            
+            if not psp_key:
+                raise ValueError(f"No PSP key found for merchant {merchant['merchant_id']}")
             
             # 创建 PSP 适配器
             psp_adapter = get_psp_adapter(psp_type, psp_key)
