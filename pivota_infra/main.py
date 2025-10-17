@@ -39,6 +39,7 @@ from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
 from routes.order_routes import router as order_router
+from routes.webhook_routes import router as webhook_router
 
 # Service routers (only include what exists)
 try:
@@ -93,6 +94,7 @@ app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
 app.include_router(order_router)  # Order processing
+app.include_router(webhook_router)  # Webhook handlers
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API

@@ -4,7 +4,7 @@ Pivota 核心业务流程：Agent 下单 → 支付 → 履约
 """
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal
 from datetime import datetime
 import httpx
@@ -25,8 +25,103 @@ from db.products import log_order_event
 from routes.auth_routes import require_admin
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
+from utils.logger import logger
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+
+
+# ============================================================================
+# 库存检查
+# ============================================================================
+
+async def check_inventory_availability(
+    merchant_id: str,
+    items: List[OrderItem]
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    检查 Shopify 库存是否充足
+    
+    返回: (是否有库存, 库存详情)
+    """
+    try:
+        merchant = await get_merchant_onboarding(merchant_id)
+        if not merchant or not merchant.get("mcp_connected"):
+            # 如果未连接 MCP，默认允许订单
+            return True, {"message": "MCP not connected, skipping inventory check"}
+        
+        if merchant.get("mcp_platform") != "shopify":
+            # 非 Shopify 平台，暂不检查库存
+            return True, {"message": f"Platform {merchant.get('mcp_platform')} inventory check not implemented"}
+        
+        shop_domain = merchant.get("mcp_shop_domain")
+        access_token = merchant.get("mcp_access_token")
+        
+        if not shop_domain or not access_token:
+            return True, {"message": "Shop credentials missing, skipping inventory check"}
+        
+        # 获取所有产品和变体
+        url = f"https://{shop_domain}/admin/api/2024-01/products.json"
+        headers = {
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, timeout=10.0)
+            
+            if response.status_code != 200:
+                return True, {"message": "Failed to fetch products, allowing order"}
+            
+            products = response.json().get("products", [])
+            
+            # 建立 variant_id -> inventory 的映射
+            inventory_map = {}
+            for product in products:
+                for variant in product.get("variants", []):
+                    variant_id = str(variant["id"])
+                    inventory_map[variant_id] = {
+                        "available": variant.get("inventory_quantity", 0),
+                        "tracked": variant.get("inventory_management") == "shopify",
+                        "sku": variant.get("sku"),
+                        "title": f"{product['title']} - {variant.get('title', '')}"
+                    }
+            
+            # 检查每个订单项的库存
+            insufficient_items = []
+            inventory_details = {}
+            
+            for item in items:
+                if not item.variant_id:
+                    # 如果没有 variant_id，跳过检查
+                    continue
+                
+                variant_id = str(item.variant_id)
+                if variant_id in inventory_map:
+                    inv = inventory_map[variant_id]
+                    inventory_details[variant_id] = inv
+                    
+                    if inv["tracked"] and inv["available"] < item.quantity:
+                        insufficient_items.append({
+                            "product": item.product_title,
+                            "requested": item.quantity,
+                            "available": inv["available"]
+                        })
+            
+            if insufficient_items:
+                return False, {
+                    "message": "Insufficient inventory",
+                    "items": insufficient_items
+                }
+            
+            return True, {
+                "message": "Inventory check passed",
+                "details": inventory_details
+            }
+            
+    except Exception as e:
+        # 库存检查失败时，默认允许订单（fail-open）
+        logger.error(f"Inventory check failed: {e}")
+        return True, {"message": f"Inventory check error: {str(e)}, allowing order"}
 
 
 # ============================================================================
@@ -66,13 +161,28 @@ async def create_new_order(
             detail="Merchant has not connected PSP. Cannot process payments."
         )
     
-    # 2. 计算订单金额
+    # 2. 检查库存（如果商户连接了 Shopify）
+    has_inventory, inventory_info = await check_inventory_availability(
+        order_request.merchant_id,
+        order_request.items
+    )
+    
+    if not has_inventory:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Insufficient inventory",
+                "items": inventory_info.get("items", [])
+            }
+        )
+    
+    # 3. 计算订单金额
     subtotal = sum(item.subtotal for item in order_request.items)
     shipping_fee = Decimal("0")  # TODO: 动态计算运费
     tax = Decimal("0")  # TODO: 动态计算税费
     total = subtotal + shipping_fee + tax
     
-    # 3. 创建订单
+    # 4. 创建订单
     # 使用 json.loads(x.json()) 确保 Decimal 被序列化为字符串
     order_data = {
         "merchant_id": order_request.merchant_id,
@@ -90,7 +200,7 @@ async def create_new_order(
     
     order_id = await create_order(order_data)
     
-    # 4. 创建 Payment Intent（后台任务，不阻塞）
+    # 5. 创建 Payment Intent（后台任务，不阻塞）
     async def create_payment_intent_task():
         """后台创建支付意图（支持多 PSP）"""
         try:
@@ -165,7 +275,7 @@ async def create_new_order(
     
     background_tasks.add_task(create_payment_intent_task)
     
-    # 5. 返回订单信息
+    # 6. 返回订单信息
     order = await get_order(order_id)
     
     return OrderResponse(

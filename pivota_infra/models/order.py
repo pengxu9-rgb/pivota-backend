@@ -15,6 +15,7 @@ class OrderItem(BaseModel):
     product_title: str
     variant_id: Optional[str] = None
     variant_title: Optional[str] = None
+    sku: Optional[str] = None  # SKU (用于库存追踪)
     quantity: int
     unit_price: Decimal
     subtotal: Decimal  # quantity * unit_price
