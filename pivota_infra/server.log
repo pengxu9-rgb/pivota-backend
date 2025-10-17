@@ -1,1 +1,87 @@
-nohup: uvicorn: No such file or directory
+[2025-10-17 16:26:14,472] INFO - ✅ MCP router included
+[2025-10-17 16:26:14,476] INFO - ✅ Operations router included
+/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py:169: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py:328: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("shutdown")
+INFO:     Will watch for changes in these directories: ['/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [30053] using WatchFiles
+[2025-10-17 16:26:15,551] INFO - ✅ MCP router included
+[2025-10-17 16:26:15,555] INFO - ✅ Operations router included
+[2025-10-17 16:26:15,733] INFO - ✅ MCP router included
+[2025-10-17 16:26:15,737] INFO - ✅ Operations router included
+INFO:     Started server process [30079]
+INFO:     Waiting for application startup.
+[2025-10-17 16:26:15,738] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 16:26:15,738] INFO - 📡 Connecting to database...
+[2025-10-17 16:26:15,738] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 16:26:15,738] INFO -    Database driver: sqlite
+[2025-10-17 16:26:15,738] INFO - ✅ Database connected successfully
+[2025-10-17 16:26:15,738] INFO - ✅ Database connection test passed
+[2025-10-17 16:26:15,738] INFO - 📋 Creating tables...
+[2025-10-17 16:26:15,759] INFO - ✅ Tables created:
+[2025-10-17 16:26:15,759] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 16:26:15,759] INFO -    - Cache: products_cache
+[2025-10-17 16:26:15,759] INFO -    - Events: api_call_events, order_events
+[2025-10-17 16:26:15,759] INFO -    - Analytics: merchant_analytics
+[2025-10-17 16:26:15,759] INFO - 🔄 Running database migrations...
+[2025-10-17 16:26:15,760] INFO -    Checking for store_url column...
+[2025-10-17 16:26:15,760] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 16:26:15,761] INFO - 🔌 Initializing optional services...
+[2025-10-17 16:26:15,761] INFO - ✅ All services initialized successfully!
+[2025-10-17 16:26:15,761] INFO - 🚀 Application startup complete!
+[2025-10-17 16:26:15,761] INFO - ================================================================================
+INFO:     Application startup complete.
+INFO:     127.0.0.1:52138 - "GET /auth/admin-token HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52140 - "POST /orders/create HTTP/1.1" 404 Not Found
+/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/openapi/utils.py:242: UserWarning: Duplicate Operation ID process_payment_api_payments_process_post for function process_payment at /Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/routes/payment_routes.py
+  warnings.warn(message, stacklevel=1)
+/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/openapi/utils.py:242: UserWarning: Duplicate Operation ID retry_payment_api_payments_retry_post for function retry_payment at /Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/routes/payment_routes.py
+  warnings.warn(message, stacklevel=1)
+/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/openapi/utils.py:242: UserWarning: Duplicate Operation ID get_payment_status_api_payments_status_get for function get_payment_status at /Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/routes/payment_routes.py
+  warnings.warn(message, stacklevel=1)
+/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/openapi/utils.py:242: UserWarning: Duplicate Operation ID get_available_psps_api_payments_psps_get for function get_available_psps at /Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/routes/payment_routes.py
+  warnings.warn(message, stacklevel=1)
+/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/openapi/utils.py:242: UserWarning: Duplicate Operation ID get_order_payment_status_api_payments_orders__order_id__get for function get_order_payment_status at /Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/routes/payment_routes.py
+  warnings.warn(message, stacklevel=1)
+INFO:     127.0.0.1:52184 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52244 - "GET /auth/admin-token HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52246 - "POST /orders/create HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:52307 - "GET /auth/admin-token HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52309 - "GET /merchant/onboarding/all HTTP/1.1" 200 OK
+🔍 Starting auto-KYB pre-approval validation...
+✅ auto_kyb_validator imported successfully
+✅ Auto-KYB validation completed: {'approved': True, 'confidence_score': 0.96, 'validation_results': {'url_validation': {'valid': True, 'message': 'Known e-commerce platform detected: chydantest.myshopify.com'}, 'name_match': {'match': True, 'message': 'Trusted platform auto-approval', 'score': 0.9}}, 'requires_full_kyb': True, 'full_kyb_deadline': '2025-10-24T08:27:35.223965'}
+✅ Merchant created: merch_6b90dc9838d5fd9c
+🎉 Auto-approving merchant merch_6b90dc9838d5fd9c...
+✅ Merchant merch_6b90dc9838d5fd9c auto-approved successfully
+INFO:     127.0.0.1:52348 - "POST /merchant/onboarding/register HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52390 - "POST /merchant/onboarding/psp/setup HTTP/1.1" 422 Unprocessable Entity
+🔍 Validating stripe credentials...
+🔍 Validating Stripe key via HTTP: sk_test_123456789012...
+🔒 Stripe key invalid (status=401)
+❌ PSP validation failed: Invalid Stripe API key. Please check your key and try again.
+INFO:     127.0.0.1:52432 - "POST /merchant/onboarding/psp/setup HTTP/1.1" 400 Bad Request
+🔍 Validating stripe credentials...
+🔍 Validating Stripe key via HTTP: sk_test_51HQvZFLqxXz...
+🔒 Stripe key invalid (status=401)
+❌ PSP validation failed: Invalid Stripe API key. Please check your key and try again.
+INFO:     127.0.0.1:52485 - "POST /merchant/onboarding/psp/setup HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:53229 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53336 - "POST /merchant/onboarding/register HTTP/1.1" 500 Internal Server Error
+INFO:     127.0.0.1:53386 - "POST /merchant/onboarding/register HTTP/1.1" 500 Internal Server Error
+INFO:     127.0.0.1:53448 - "GET /auth/admin-token HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53450 - "GET /merchant/onboarding/all HTTP/1.1" 403 Forbidden
+INFO:     127.0.0.1:53505 - "GET /auth/admin-token HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53507 - "GET /merchant/onboarding/all HTTP/1.1" 200 OK

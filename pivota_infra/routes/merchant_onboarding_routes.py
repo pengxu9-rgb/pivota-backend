@@ -26,7 +26,7 @@ from db.payment_router import register_merchant_psp_route
 from db.database import database
 from routes.auth_routes import get_current_user, require_admin
 from urllib.parse import urlparse
-from utils.r2_storage import upload_file_to_r2, get_presigned_url
+# from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
 from fastapi.responses import StreamingResponse
 import io
 
@@ -727,26 +727,26 @@ async def upload_kyc_files(
             content = await f.read()
             file_size = len(content)
             
-            # 上传到 R2
-            success, file_key, error = await upload_file_to_r2(
-                file_content=content,
-                filename=f.filename,
-                merchant_id=merchant_id,
-                content_type=f.content_type or "application/octet-stream"
-            )
+            # R2 存储功能推迟实现 - 暂时只保存元数据
+            # success, file_key, error = await upload_file_to_r2(
+            #     file_content=content,
+            #     filename=f.filename,
+            #     merchant_id=merchant_id,
+            #     content_type=f.content_type or "application/octet-stream"
+            # )
+            # 
+            # if not success:
+            #     errors.append(f"{f.filename}: {error}")
+            #     continue
             
-            if not success:
-                errors.append(f"{f.filename}: {error}")
-                continue
-            
-            # 存储元数据（包含 R2 文件键）
+            # 存储元数据（R2 功能推迟）
             meta = {
                 "name": f.filename,
                 "content_type": f.content_type,
                 "size": file_size,
                 "document_type": document_type,
                 "uploaded_at": datetime.now().isoformat(),
-                "r2_key": file_key  # R2 中的文件键，用于下载
+                "r2_key": None  # R2 功能推迟实现
             }
             
             ok = await add_kyc_document(merchant_id, meta)
@@ -793,16 +793,9 @@ async def download_kyc_document(
             detail="File not stored in R2 (legacy metadata-only document)"
         )
     
-    # 生成预签名 URL（1 小时有效）
-    success, presigned_url, error = await get_presigned_url(r2_key, expiration=3600)
-    
-    if not success:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate download URL: {error}"
-        )
-    
-    # 重定向到预签名 URL
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=presigned_url)
+    # R2 存储功能推迟实现
+    raise HTTPException(
+        status_code=501,
+        detail="File download functionality not yet implemented (R2 storage pending)"
+    )
 
