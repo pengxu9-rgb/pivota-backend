@@ -79,6 +79,7 @@ async def create_order(order_data: Dict[str, Any]) -> str:
     order_data["order_id"] = order_id
     order_data["status"] = "pending"
     order_data["payment_status"] = "unpaid"
+    order_data["is_deleted"] = False  # Explicitly set for PostgreSQL
     
     query = orders.insert().values(**order_data)
     await database.execute(query)
@@ -87,9 +88,10 @@ async def create_order(order_data: Dict[str, Any]) -> str:
 
 async def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     """获取订单详情"""
+    # PostgreSQL-compatible query
     query = orders.select().where(
         (orders.c.order_id == order_id) & 
-        (orders.c.is_deleted == False)
+        orders.c.is_deleted.is_(False)
     )
     result = await database.fetch_one(query)
     return dict(result) if result else None
@@ -104,7 +106,7 @@ async def get_orders_by_merchant(
     """获取商户的订单列表"""
     query = orders.select().where(
         (orders.c.merchant_id == merchant_id) & 
-        (orders.c.is_deleted == False)
+        orders.c.is_deleted.is_(False)
     )
     
     if status:
@@ -120,7 +122,7 @@ async def get_orders_by_customer(customer_email: str, limit: int = 50) -> List[D
     """获取客户的订单列表"""
     query = orders.select().where(
         (orders.c.customer_email == customer_email) & 
-        (orders.c.is_deleted == False)
+        orders.c.is_deleted.is_(False)
     ).order_by(orders.c.created_at.desc()).limit(limit)
     
     results = await database.fetch_all(query)
@@ -238,7 +240,7 @@ async def get_order_stats(merchant_id: str) -> Dict[str, Any]:
     # 总订单数
     total_query = select([func.count()]).select_from(orders).where(
         (orders.c.merchant_id == merchant_id) & 
-        (orders.c.is_deleted == False)
+        orders.c.is_deleted.is_(False)
     )
     total_orders = await database.fetch_val(total_query)
     
@@ -246,7 +248,7 @@ async def get_order_stats(merchant_id: str) -> Dict[str, Any]:
     paid_query = select([func.count()]).select_from(orders).where(
         (orders.c.merchant_id == merchant_id) & 
         (orders.c.payment_status == "paid") &
-        (orders.c.is_deleted == False)
+        orders.c.is_deleted.is_(False)
     )
     paid_orders = await database.fetch_val(paid_query)
     
@@ -254,7 +256,7 @@ async def get_order_stats(merchant_id: str) -> Dict[str, Any]:
     revenue_query = select([func.sum(orders.c.total)]).select_from(orders).where(
         (orders.c.merchant_id == merchant_id) & 
         (orders.c.payment_status == "paid") &
-        (orders.c.is_deleted == False)
+        orders.c.is_deleted.is_(False)
     )
     total_revenue = await database.fetch_val(revenue_query) or 0
     
