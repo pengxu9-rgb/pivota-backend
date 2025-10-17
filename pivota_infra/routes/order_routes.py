@@ -9,6 +9,7 @@ from decimal import Decimal
 from datetime import datetime
 import httpx
 import os
+import json
 
 from models.order import (
     CreateOrderRequest, OrderResponse, PaymentConfirmRequest, 
@@ -72,11 +73,12 @@ async def create_new_order(
     total = subtotal + shipping_fee + tax
     
     # 3. 创建订单
+    # 使用 json.loads(x.json()) 确保 Decimal 被序列化为字符串
     order_data = {
         "merchant_id": order_request.merchant_id,
         "customer_email": order_request.customer_email,
-        "items": [item.dict() for item in order_request.items],
-        "shipping_address": order_request.shipping_address.dict(),
+        "items": [json.loads(item.json()) for item in order_request.items],
+        "shipping_address": json.loads(order_request.shipping_address.json()),
         "subtotal": float(subtotal),
         "shipping_fee": float(shipping_fee),
         "tax": float(tax),

@@ -10,7 +10,7 @@ from decimal import Decimal
 
 # 配置
 BASE_URL = "https://web-production-fedb.up.railway.app"
-MERCHANT_ID = "merch_a4dc9a163f49d835"  # 使用测试商户
+MERCHANT_ID = "merch_208139f7600dbf42"  # chydantest.myshopify.com (已连接 PSP + MCP)
 
 
 def get_admin_token():
