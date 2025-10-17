@@ -599,8 +599,7 @@ async def delete_onboarding_merchant_alias(
 async def upload_kyc_file(
     merchant_id: str,
     document_type: str = Form(...),
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
+    file: UploadFile = File(...)
 ):
     """
     Upload a KYB document for onboarding merchant (Phase 2) via multipart form.
@@ -632,5 +631,41 @@ async def upload_kyc_file(
         "message": "Document uploaded",
         "merchant_id": merchant_id,
         "document": meta
+    }
+
+@router.post("/upload/{merchant_id}", response_model=Dict[str, Any])
+async def upload_kyc_files(
+    merchant_id: str,
+    files: List[UploadFile] = File(...),
+    document_type: str = Form("other")
+):
+    """Multipart 多文件上传（商户门户使用，无需鉴权）。仅存元数据。"""
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+
+    stored: List[Dict[str, Any]] = []
+    for f in files:
+        meta = {
+            "name": f.filename,
+            "content_type": f.content_type,
+            "size": None,
+            "document_type": document_type,
+            "uploaded_at": datetime.now().isoformat()
+        }
+        try:
+            content = await f.read()
+            meta["size"] = len(content)
+        except Exception:
+            meta["size"] = None
+        ok = await add_kyc_document(merchant_id, meta)
+        if ok:
+            stored.append(meta)
+
+    return {
+        "status": "success",
+        "message": f"Stored {len(stored)} document(s) metadata",
+        "merchant_id": merchant_id,
+        "documents": stored
     }
 
