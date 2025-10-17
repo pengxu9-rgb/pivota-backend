@@ -85,12 +85,16 @@ async def get_merchant_products_realtime(
                 product_ids=[p["id"] for p in products]
             )
             
+            # 从缓存返回的是字典，需要转换为 StandardProduct 对象
+            from models.standard_product import StandardProduct
+            product_objects = [StandardProduct(**p) for p in products]
+            
             return ProductListResponse(
                 status="success",
                 merchant_id=merchant_id,
                 platform=platform,
                 total=len(products),
-                products=products,
+                products=product_objects,
                 next_page_token=None,
                 fetched_at=datetime.now()
             )

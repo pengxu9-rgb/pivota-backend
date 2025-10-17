@@ -90,4 +90,9 @@ class ProductListResponse(BaseModel):
     products: List[StandardProduct]
     next_page_token: Optional[str] = None  # 分页游标（如果支持）
     fetched_at: datetime  # 数据获取时间（实时）
+    
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat() if v else None
+        }
 
