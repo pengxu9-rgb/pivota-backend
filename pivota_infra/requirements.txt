@@ -3,6 +3,7 @@ uvicorn[standard]
 httpx
 python-dotenv
 stripe
+Adyen>=11.0.0
 SQLAlchemy
 Databases
 pydantic
