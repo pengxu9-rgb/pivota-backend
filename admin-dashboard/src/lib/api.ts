@@ -89,7 +89,7 @@ export const merchantApi = {
   // Get merchant details
   async getDetails(merchantId: string): Promise<Merchant> {
     const response = await api.get(`/merchant/onboarding/details/${merchantId}`);
-    return response.data;
+    return response.data.merchant; // 后端返回 {status, merchant}
   },
 
   // Delete merchant
