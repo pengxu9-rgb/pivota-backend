@@ -5,7 +5,7 @@ Handles merchant registration, KYC, PSP setup, and API key issuance
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 import asyncio
 import stripe
