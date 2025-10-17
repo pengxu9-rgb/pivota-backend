@@ -195,7 +195,9 @@ async def startup():
             # Migration 3: MCP columns
             mcp_columns = [
                 ("mcp_connected", "BOOLEAN DEFAULT FALSE"),
-                ("mcp_platform", "VARCHAR(50)")
+                ("mcp_platform", "VARCHAR(50)"),
+                ("mcp_shop_domain", "VARCHAR(255)"),
+                ("mcp_access_token", "TEXT")
             ]
             for col_name, col_type in mcp_columns:
                 check_col = text(f"""
