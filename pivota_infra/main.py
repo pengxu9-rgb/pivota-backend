@@ -38,6 +38,7 @@ from routes.merchant_onboarding_routes import router as merchant_onboarding_rout
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
+from routes.order_routes import router as order_router
 
 # Service routers (only include what exists)
 try:
@@ -91,6 +92,7 @@ app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
+app.include_router(order_router)  # Order processing
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
@@ -196,10 +198,11 @@ async def startup():
         from db.products import (
             products_cache, api_call_events, order_events, merchant_analytics
         )
+        from db.orders import orders
         from db.database import metadata, engine
         metadata.create_all(engine)
         logger.info("✅ Tables created:")
-        logger.info("   - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config")
+        logger.info("   - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders")
         logger.info("   - Cache: products_cache")
         logger.info("   - Events: api_call_events, order_events")
         logger.info("   - Analytics: merchant_analytics")
