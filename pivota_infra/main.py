@@ -37,6 +37,7 @@ from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
+from routes.product_routes import router as product_router
 
 # Service routers (only include what exists)
 try:
@@ -89,6 +90,7 @@ app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
+app.include_router(product_router)  # Product management
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
@@ -187,13 +189,14 @@ async def startup():
         logger.info("✅ Database connection test passed")
         
         # Create merchant tables if they don't exist
-        logger.info("📋 Creating merchant tables...")
+        logger.info("📋 Creating tables...")
         from db.merchants import merchants, kyb_documents
         from db.merchant_onboarding import merchant_onboarding
         from db.payment_router import payment_router_config
+        from db.products import products, product_sync_history
         from db.database import metadata, engine
         metadata.create_all(engine)
-        logger.info("✅ Merchant tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config)")
+        logger.info("✅ Tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config, products, product_sync_history)")
         
         # Run migrations for merchant_onboarding table
         logger.info("🔄 Running database migrations...")
