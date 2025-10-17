@@ -637,6 +637,36 @@ async def create_shopify_order(order_id: str) -> bool:
 # 订单状态更新（Admin/Webhook 调用）
 # ============================================================================
 
+@router.post("/{order_id}/create-shopify")
+async def trigger_shopify_order(
+    order_id: str,
+    current_user: dict = Depends(require_admin)
+):
+    """Manually trigger Shopify order creation for debugging"""
+    order = await get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    if order.get("shopify_order_id"):
+        return {"status": "already_exists", "shopify_order_id": order["shopify_order_id"]}
+    
+    if order.get("payment_status") != "paid":
+        return {"status": "not_paid", "payment_status": order.get("payment_status")}
+    
+    try:
+        success = await create_shopify_order(order_id)
+        if success:
+            updated_order = await get_order(order_id)
+            return {
+                "status": "success",
+                "shopify_order_id": updated_order.get("shopify_order_id"),
+                "message": "Shopify order created"
+            }
+        else:
+            return {"status": "failed", "message": "Check logs for details"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 @router.post("/{order_id}/ship")
 async def mark_order_as_shipped(
     order_id: str,
