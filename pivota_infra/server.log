@@ -2260,3 +2260,564 @@ Traceback (most recent call last):
 RuntimeError: Database initialization failed: local variable 'metadata' referenced before assignment
 
 ERROR:    Application startup failed. Exiting.
+WARNING:  WatchFiles detected changes in 'main.py'. Reloading...
+[2025-10-17 21:56:58,935] INFO - ✅ MCP router included
+[2025-10-17 21:56:58,939] INFO - ✅ Operations router included
+[2025-10-17 21:56:59,013] INFO - ✅ MCP router included
+[2025-10-17 21:56:59,017] INFO - ✅ Operations router included
+INFO:     Started server process [37300]
+INFO:     Waiting for application startup.
+[2025-10-17 21:56:59,018] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 21:56:59,018] INFO - 📡 Connecting to database...
+[2025-10-17 21:56:59,018] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 21:56:59,018] INFO -    Database driver: sqlite
+[2025-10-17 21:56:59,018] INFO - ✅ Database connected successfully
+[2025-10-17 21:56:59,018] ERROR - ================================================================================
+[2025-10-17 21:56:59,018] ERROR - ❌ CRITICAL ERROR during startup: local variable 'metadata' referenced before assignment
+[2025-10-17 21:56:59,018] ERROR - ❌ Error type: UnboundLocalError
+[2025-10-17 21:56:59,018] ERROR - ❌ Error details: local variable 'metadata' referenced before assignment
+[2025-10-17 21:56:59,018] ERROR - ================================================================================
+Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+[2025-10-17 21:56:59,019] ERROR - 🛑 Cannot continue without database connection
+ERROR:    Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 694, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 571, in __aenter__
+    await self._router.startup()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 671, in startup
+    await handler()
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 341, in startup
+    raise RuntimeError(f"Database initialization failed: {e}") from e
+RuntimeError: Database initialization failed: local variable 'metadata' referenced before assignment
+
+ERROR:    Application startup failed. Exiting.
+WARNING:  WatchFiles detected changes in 'main.py', 'fix_database_tables.py'. Reloading...
+[2025-10-17 22:03:24,418] INFO - ✅ MCP router included
+[2025-10-17 22:03:24,422] INFO - ✅ Operations router included
+[2025-10-17 22:03:24,490] INFO - ✅ MCP router included
+[2025-10-17 22:03:24,493] INFO - ✅ Operations router included
+INFO:     Started server process [37698]
+INFO:     Waiting for application startup.
+[2025-10-17 22:03:24,494] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 22:03:24,494] INFO - 📡 Connecting to database...
+[2025-10-17 22:03:24,494] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 22:03:24,494] INFO -    Database driver: sqlite
+[2025-10-17 22:03:24,494] INFO - ✅ Database connected successfully
+[2025-10-17 22:03:24,494] ERROR - ================================================================================
+[2025-10-17 22:03:24,494] ERROR - ❌ CRITICAL ERROR during startup: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:24,494] ERROR - ❌ Error type: UnboundLocalError
+[2025-10-17 22:03:24,494] ERROR - ❌ Error details: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:24,494] ERROR - ================================================================================
+Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:24,495] ERROR - 🛑 Cannot continue without database connection
+ERROR:    Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 694, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 571, in __aenter__
+    await self._router.startup()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 671, in startup
+    await handler()
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 341, in startup
+    raise RuntimeError(f"Database initialization failed: {e}") from e
+RuntimeError: Database initialization failed: local variable 'metadata' referenced before assignment
+
+ERROR:    Application startup failed. Exiting.
+WARNING:  WatchFiles detected changes in 'fix_database_tables.py'. Reloading...
+[2025-10-17 22:03:30,074] INFO - ✅ MCP router included
+[2025-10-17 22:03:30,077] INFO - ✅ Operations router included
+[2025-10-17 22:03:30,136] INFO - ✅ MCP router included
+[2025-10-17 22:03:30,139] INFO - ✅ Operations router included
+INFO:     Started server process [37705]
+INFO:     Waiting for application startup.
+[2025-10-17 22:03:30,140] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 22:03:30,140] INFO - 📡 Connecting to database...
+[2025-10-17 22:03:30,140] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 22:03:30,140] INFO -    Database driver: sqlite
+[2025-10-17 22:03:30,140] INFO - ✅ Database connected successfully
+[2025-10-17 22:03:30,140] ERROR - ================================================================================
+[2025-10-17 22:03:30,140] ERROR - ❌ CRITICAL ERROR during startup: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:30,140] ERROR - ❌ Error type: UnboundLocalError
+[2025-10-17 22:03:30,140] ERROR - ❌ Error details: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:30,140] ERROR - ================================================================================
+Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:30,141] ERROR - 🛑 Cannot continue without database connection
+ERROR:    Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 694, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 571, in __aenter__
+    await self._router.startup()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 671, in startup
+    await handler()
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 341, in startup
+    raise RuntimeError(f"Database initialization failed: {e}") from e
+RuntimeError: Database initialization failed: local variable 'metadata' referenced before assignment
+
+ERROR:    Application startup failed. Exiting.
+WARNING:  WatchFiles detected changes in 'main.py'. Reloading...
+[2025-10-17 22:03:31,850] INFO - ✅ MCP router included
+[2025-10-17 22:03:31,853] INFO - ✅ Operations router included
+[2025-10-17 22:03:31,905] INFO - ✅ MCP router included
+[2025-10-17 22:03:31,909] INFO - ✅ Operations router included
+INFO:     Started server process [37709]
+INFO:     Waiting for application startup.
+[2025-10-17 22:03:31,909] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 22:03:31,910] INFO - 📡 Connecting to database...
+[2025-10-17 22:03:31,910] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 22:03:31,910] INFO -    Database driver: sqlite
+[2025-10-17 22:03:31,910] INFO - ✅ Database connected successfully
+[2025-10-17 22:03:31,910] ERROR - ================================================================================
+[2025-10-17 22:03:31,910] ERROR - ❌ CRITICAL ERROR during startup: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:31,910] ERROR - ❌ Error type: UnboundLocalError
+[2025-10-17 22:03:31,910] ERROR - ❌ Error details: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:31,910] ERROR - ================================================================================
+Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+[2025-10-17 22:03:31,910] ERROR - 🛑 Cannot continue without database connection
+ERROR:    Traceback (most recent call last):
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 199, in startup
+    metadata.create_all(engine)
+UnboundLocalError: local variable 'metadata' referenced before assignment
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 694, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/contextlib.py", line 175, in __aenter__
+    return await self.gen.__anext__()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/fastapi/routing.py", line 209, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 571, in __aenter__
+    await self._router.startup()
+  File "/Users/pengchydan/Library/Python/3.9/lib/python/site-packages/starlette/routing.py", line 671, in startup
+    await handler()
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 341, in startup
+    raise RuntimeError(f"Database initialization failed: {e}") from e
+RuntimeError: Database initialization failed: local variable 'metadata' referenced before assignment
+
+ERROR:    Application startup failed. Exiting.
+WARNING:  WatchFiles detected changes in 'main.py'. Reloading...
+[2025-10-17 22:06:14,305] INFO - ✅ MCP router included
+[2025-10-17 22:06:14,308] INFO - ✅ Operations router included
+[2025-10-17 22:06:14,383] INFO - ✅ MCP router included
+[2025-10-17 22:06:14,386] INFO - ✅ Operations router included
+INFO:     Started server process [37754]
+INFO:     Waiting for application startup.
+[2025-10-17 22:06:14,387] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 22:06:14,387] INFO - 📡 Connecting to database...
+[2025-10-17 22:06:14,387] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 22:06:14,387] INFO -    Database driver: sqlite
+[2025-10-17 22:06:14,387] INFO - ✅ Database connected successfully
+[2025-10-17 22:06:14,389] INFO - ✅ All database tables verified/created
+[2025-10-17 22:06:14,389] INFO - ✅ Database connection test passed
+[2025-10-17 22:06:14,389] INFO - 📋 Creating tables...
+[2025-10-17 22:06:14,390] INFO - ✅ Tables created:
+[2025-10-17 22:06:14,390] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 22:06:14,390] INFO -    - Agents: agents, agent_usage_logs
+[2025-10-17 22:06:14,390] INFO -    - Cache: products_cache
+[2025-10-17 22:06:14,390] INFO -    - Events: api_call_events, order_events
+[2025-10-17 22:06:14,390] INFO -    - Analytics: merchant_analytics
+[2025-10-17 22:06:14,390] INFO - 🔄 Running database migrations...
+[2025-10-17 22:06:14,390] INFO -    Checking for store_url column...
+[2025-10-17 22:06:14,391] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 22:06:14,391] INFO - 🔌 Initializing optional services...
+[2025-10-17 22:06:14,391] INFO - ✅ All services initialized successfully!
+[2025-10-17 22:06:14,391] INFO - 🚀 Application startup complete!
+[2025-10-17 22:06:14,391] INFO - ================================================================================
+INFO:     Application startup complete.

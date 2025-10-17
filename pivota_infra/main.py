@@ -195,6 +195,7 @@ async def startup():
         
         # Ensure all tables exist (important for PostgreSQL)
         from sqlalchemy import create_engine
+        from db.database import metadata
         engine = create_engine(str(database.url))
         metadata.create_all(engine)
         logger.info("✅ All database tables verified/created")
