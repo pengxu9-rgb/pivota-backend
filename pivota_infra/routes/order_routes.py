@@ -21,7 +21,7 @@ from db.orders import (
     update_fulfillment_info, mark_order_shipped, get_order_stats
 )
 from db.merchant_onboarding import get_merchant_onboarding
-from db.products import log_order_event
+from db.order_events import log_order_event
 from routes.auth_routes import require_admin
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
