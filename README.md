@@ -1,5 +1,6 @@
 # 🚀 Payment Infrastructure Dashboard
 
+<!-- deploy: trigger rebuild -->
 A comprehensive payment infrastructure system with multi-role authentication, PSP integration, and real-time analytics.
 
 ## ✨ Features
