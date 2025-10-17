@@ -116,16 +116,32 @@ if OPERATIONS_AVAILABLE:
 async def get_version():
     """
     返回当前部署的版本信息（Git commit hash）
+    优先使用 Railway 环境变量，本地开发时回退到 git 命令
     """
+    # Railway 自动注入的环境变量
+    railway_commit = os.getenv("RAILWAY_GIT_COMMIT_SHA")
+    railway_branch = os.getenv("RAILWAY_GIT_BRANCH")
+    railway_author = os.getenv("RAILWAY_GIT_AUTHOR")
+    
+    if railway_commit:
+        # 在 Railway 上运行
+        return {
+            "version": railway_commit[:8],  # 短 hash
+            "full_sha": railway_commit,
+            "branch": railway_branch,
+            "author": railway_author,
+            "environment": "production",
+            "status": "healthy"
+        }
+    
+    # 本地开发环境，尝试 git 命令
     try:
-        # 尝试获取 git commit hash
         commit = subprocess.check_output(
             ['git', 'rev-parse', '--short', 'HEAD'],
             cwd=os.path.dirname(__file__),
             stderr=subprocess.DEVNULL
         ).decode('utf-8').strip()
         
-        # 尝试获取 commit 时间
         commit_time = subprocess.check_output(
             ['git', 'log', '-1', '--format=%cd', '--date=iso'],
             cwd=os.path.dirname(__file__),
@@ -135,12 +151,14 @@ async def get_version():
         return {
             "version": commit,
             "commit_time": commit_time,
+            "environment": "local",
             "status": "healthy"
         }
     except Exception as e:
         return {
             "version": "unknown",
             "error": str(e),
+            "environment": "unknown",
             "status": "healthy"
         }
 
