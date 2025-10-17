@@ -13,7 +13,7 @@ from datetime import datetime
 
 from db.orders import get_order, update_order_status, mark_order_paid, mark_order_shipped
 from db.merchant_onboarding import get_merchant_onboarding
-from db.order_events import log_order_event
+from db.products import log_order_event
 from config.settings import settings
 from utils.logger import logger
 

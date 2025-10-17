@@ -40,6 +40,8 @@ from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
+from routes.agent_api import router as agent_api_router
+from routes.agent_management import router as agent_management_router
 
 # Service routers (only include what exists)
 try:
@@ -95,6 +97,8 @@ app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
 app.include_router(order_router)  # Order processing
 app.include_router(webhook_router)  # Webhook handlers
+app.include_router(agent_api_router)  # Agent API endpoints
+app.include_router(agent_management_router)  # Agent management
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
@@ -201,10 +205,12 @@ async def startup():
             products_cache, api_call_events, order_events, merchant_analytics
         )
         from db.orders import orders
+        from db.agents import agents, agent_usage_logs
         from db.database import metadata, engine
         metadata.create_all(engine)
         logger.info("✅ Tables created:")
         logger.info("   - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders")
+        logger.info("   - Agents: agents, agent_usage_logs")
         logger.info("   - Cache: products_cache")
         logger.info("   - Events: api_call_events, order_events")
         logger.info("   - Analytics: merchant_analytics")
