@@ -636,7 +636,7 @@ async def upload_kyc_file(
 @router.post("/upload/{merchant_id}", response_model=Dict[str, Any])
 async def upload_kyc_files(
     merchant_id: str,
-    files: List[UploadFile] = File(...),
+    files: list[UploadFile] = File(...),
     document_type: str = Form("other")
 ):
     """Multipart 多文件上传（商户门户使用，无需鉴权）。仅存元数据。"""
