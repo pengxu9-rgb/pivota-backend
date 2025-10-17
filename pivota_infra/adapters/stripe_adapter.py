@@ -53,19 +53,12 @@ def create_payment_intent(
             "client_secret": intent.client_secret
         }
         
-    except stripe.error.StripeError as e:
-        logger.error(f"Stripe error creating payment intent: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "stripe_error"
-        }
     except Exception as e:
-        logger.error(f"Unexpected error creating payment intent: {e}")
+        logger.error(f"Error creating payment intent: {e}")
         return {
             "success": False,
             "error": str(e),
-            "error_type": "unexpected_error"
+            "error_type": "error"
         }
 
 def verify_webhook_signature(
@@ -92,11 +85,8 @@ def verify_webhook_signature(
     except ValueError:
         logger.error("Invalid payload in webhook signature verification")
         return False
-    except stripe.error.SignatureVerificationError:
-        logger.error("Invalid signature in webhook verification")
-        return False
     except Exception as e:
-        logger.error(f"Unexpected error in webhook verification: {e}")
+        logger.error(f"Error in webhook verification: {e}")
         return False
 
 def get_payment_intent(payment_intent_id: str) -> Optional[Dict[str, Any]]:
@@ -112,11 +102,8 @@ def get_payment_intent(payment_intent_id: str) -> Optional[Dict[str, Any]]:
     try:
         intent = stripe.PaymentIntent.retrieve(payment_intent_id)
         return intent
-    except stripe.error.StripeError as e:
-        logger.error(f"Error retrieving payment intent {payment_intent_id}: {e}")
-        return None
     except Exception as e:
-        logger.error(f"Unexpected error retrieving payment intent: {e}")
+        logger.error(f"Error retrieving payment intent: {e}")
         return None
 
 def confirm_payment_intent(
@@ -146,17 +133,10 @@ def confirm_payment_intent(
             "status": intent.status
         }
         
-    except stripe.error.StripeError as e:
-        logger.error(f"Stripe error confirming payment intent: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "stripe_error"
-        }
     except Exception as e:
-        logger.error(f"Unexpected error confirming payment intent: {e}")
+        logger.error(f"Error confirming payment intent: {e}")
         return {
             "success": False,
             "error": str(e),
-            "error_type": "unexpected_error"
+            "error_type": "error"
         }

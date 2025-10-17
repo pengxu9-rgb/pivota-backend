@@ -116,7 +116,8 @@ async def execute_stripe_payment(merchant: dict, payment_data: PaymentExecuteReq
             "error_message": None
         }
     
-    except stripe.error.StripeError as e:
+    except Exception as e:
+        # Avoid referencing stripe.error.* which may be unavailable in some builds
         logger.error(f"Stripe payment failed: {e}")
         return {
             "success": False,
@@ -125,15 +126,7 @@ async def execute_stripe_payment(merchant: dict, payment_data: PaymentExecuteReq
             "transaction_id": None,
             "error_message": str(e)
         }
-    except Exception as e:
-        logger.error(f"Unexpected error in Stripe payment: {e}")
-        return {
-            "success": False,
-            "payment_id": f"error_{secrets.token_hex(8)}",
-            "status": "failed",
-            "transaction_id": None,
-            "error_message": str(e)
-        }
+    
 
 
 async def execute_adyen_payment(merchant: dict, payment_data: PaymentExecuteRequest) -> dict:

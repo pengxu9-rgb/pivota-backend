@@ -108,7 +108,8 @@ class StripeAdapter(PSPAdapter):
                 ),
                 None
             )
-        except stripe.error.StripeError as e:
+        except Exception as e:
+            # Fall back to generic exception to avoid dependency on stripe.error namespace
             return False, None, str(e)
     
     async def confirm_payment(
@@ -123,7 +124,8 @@ class StripeAdapter(PSPAdapter):
                 payment_method=payment_method_id
             )
             return True, payment_intent.status, None
-        except stripe.error.StripeError as e:
+        except Exception as e:
+            # Fall back to generic exception to avoid dependency on stripe.error namespace
             return False, "failed", str(e)
     
     async def get_payment_status(
@@ -134,7 +136,8 @@ class StripeAdapter(PSPAdapter):
         try:
             payment_intent = stripe.PaymentIntent.retrieve(payment_intent_id)
             return True, payment_intent.status, None
-        except stripe.error.StripeError as e:
+        except Exception as e:
+            # Fall back to generic exception to avoid dependency on stripe.error namespace
             return False, "unknown", str(e)
     
     async def refund_payment(
@@ -153,7 +156,8 @@ class StripeAdapter(PSPAdapter):
             
             refund = stripe.Refund.create(**refund_data)
             return True, refund.id, None
-        except stripe.error.StripeError as e:
+        except Exception as e:
+            # Fall back to generic exception to avoid dependency on stripe.error namespace
             return False, None, str(e)
 
 
