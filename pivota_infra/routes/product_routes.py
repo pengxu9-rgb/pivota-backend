@@ -4,7 +4,7 @@ Pivota 核心价值：实时代理 + 智能缓存 + 数据标准化
 防御性架构：Agent 只读，事件追踪，自动清理
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from typing import Optional, Dict, Any
 from datetime import datetime
 import os
@@ -27,6 +27,7 @@ router = APIRouter(prefix="/products", tags=["products"])
 @router.get("/{merchant_id}", response_model=ProductListResponse)
 async def get_merchant_products_realtime(
     merchant_id: str,
+    background_tasks: BackgroundTasks,
     limit: int = Query(50, ge=1, le=250, description="返回产品数量"),
     force_refresh: bool = Query(False, description="强制刷新缓存"),
     current_user: dict = Depends(require_admin)
@@ -68,23 +69,31 @@ async def get_merchant_products_realtime(
         if cached:
             cache_hit = True
             products = [c["product_data"] for c in cached[:limit]]
-            
-            # 更新访问统计
-            for c in cached[:limit]:
-                await mark_cache_accessed(c["id"])
-            
-            # 记录 API 调用事件（缓存命中）
             response_time_ms = int((time.time() - start_time) * 1000)
-            await log_api_call(
-                event_type="product_query",
-                merchant_id=merchant_id,
-                endpoint=f"/products/{merchant_id}",
-                request_params={"limit": limit, "force_refresh": force_refresh},
-                response_status=200,
-                cache_hit=True,
-                response_time_ms=response_time_ms,
-                product_ids=[p["id"] for p in products]
-            )
+            
+            # 🚀 后台任务：更新访问统计和日志（不阻塞响应）
+            cache_ids = [c["id"] for c in cached[:limit]]
+            product_ids = [p["id"] for p in products]
+            
+            async def background_logging():
+                """后台任务：访问统计 + 日志记录"""
+                # 批量更新访问统计
+                for cache_id in cache_ids:
+                    await mark_cache_accessed(cache_id)
+                
+                # 记录 API 调用事件
+                await log_api_call(
+                    event_type="product_query",
+                    merchant_id=merchant_id,
+                    endpoint=f"/products/{merchant_id}",
+                    request_params={"limit": limit, "force_refresh": force_refresh},
+                    response_status=200,
+                    cache_hit=True,
+                    response_time_ms=response_time_ms,
+                    product_ids=product_ids
+                )
+            
+            background_tasks.add_task(background_logging)
             
             # 从缓存返回的是字典，需要转换为 StandardProduct 对象
             from models.standard_product import StandardProduct
