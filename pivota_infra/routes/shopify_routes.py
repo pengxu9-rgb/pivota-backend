@@ -73,20 +73,26 @@ async def connect_shopify(req: ShopifyConnectRequest) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Shopify validation error: {e}")
 
-    # Mark MCP connected
+    # Mark MCP connected AND store credentials
     upd = (
         merchant_onboarding.update()
         .where(merchant_onboarding.c.merchant_id == req.merchant_id)
-        .values(mcp_connected=True, mcp_platform="shopify")
+        .values(
+            mcp_connected=True,
+            mcp_platform="shopify",
+            mcp_shop_domain=shop_domain,  # Store shop domain
+            mcp_access_token=access_token  # Store access token
+        )
     )
     await database.execute(upd)
 
     return {
         "status": "success",
-        "message": "Shopify connected",
+        "message": "Shopify connected and credentials stored",
         "merchant_id": req.merchant_id,
         "mcp_connected": True,
         "platform": "shopify",
+        "shop_domain": shop_domain
     }
 
 
