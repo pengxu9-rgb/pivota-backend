@@ -92,7 +92,10 @@ class StripeAdapter(PSPAdapter):
                 amount=int(amount * 100),  # Stripe 使用分为单位
                 currency=currency.lower(),
                 metadata=metadata,
-                automatic_payment_methods={"enabled": True}
+                automatic_payment_methods={
+                    "enabled": True,
+                    "allow_redirects": "never"  # Avoid requiring return_url for test payments
+                }
             )
             
             return (
