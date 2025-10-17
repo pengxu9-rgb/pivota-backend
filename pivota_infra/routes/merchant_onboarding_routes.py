@@ -487,6 +487,14 @@ async def get_onboarding_details(
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
+    
+    # Debug logging
+    kyc_docs = merchant.get("kyc_documents")
+    print(f"🔍 DEBUG /details/{merchant_id}:")
+    print(f"   kyc_documents type: {type(kyc_docs)}")
+    print(f"   kyc_documents value: {kyc_docs}")
+    print(f"   kyc_documents length: {len(kyc_docs) if kyc_docs else 0}")
+    
     # Normalize response for frontend expectations
     result = {
         "merchant_id": merchant["merchant_id"],
@@ -495,7 +503,7 @@ async def get_onboarding_details(
         "website": merchant.get("website"),
         "platform": merchant.get("region"),  # reuse region as platform label
         "status": merchant["status"],
-        "kyb_documents": merchant.get("kyc_documents") or [],
+        "kyc_documents": merchant.get("kyc_documents") or [],
         "psp_connected": merchant.get("psp_connected", False),
         "psp_type": merchant.get("psp_type"),
         "created_at": merchant.get("created_at").isoformat() if merchant.get("created_at") else None,
