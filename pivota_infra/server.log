@@ -1714,3 +1714,139 @@ INFO:     Waiting for application startup.
 [2025-10-17 21:17:57,815] INFO - 🚀 Application startup complete!
 [2025-10-17 21:17:57,815] INFO - ================================================================================
 INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[2025-10-17 21:18:16,238] INFO - Database disconnected
+[2025-10-17 21:18:16,238] INFO - 🛑 Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [36050]
+[2025-10-17 21:18:17,805] INFO - ✅ MCP router included
+[2025-10-17 21:18:17,809] INFO - ✅ Operations router included
+[2025-10-17 21:18:17,880] INFO - ✅ MCP router included
+[2025-10-17 21:18:17,885] INFO - ✅ Operations router included
+INFO:     Started server process [36085]
+INFO:     Waiting for application startup.
+[2025-10-17 21:18:17,887] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 21:18:17,887] INFO - 📡 Connecting to database...
+[2025-10-17 21:18:17,887] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 21:18:17,887] INFO -    Database driver: sqlite
+[2025-10-17 21:18:17,887] INFO - ✅ Database connected successfully
+[2025-10-17 21:18:17,888] INFO - ✅ Database connection test passed
+[2025-10-17 21:18:17,888] INFO - 📋 Creating tables...
+[2025-10-17 21:18:17,889] INFO - ✅ Tables created:
+[2025-10-17 21:18:17,889] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 21:18:17,889] INFO -    - Agents: agents, agent_usage_logs
+[2025-10-17 21:18:17,889] INFO -    - Cache: products_cache
+[2025-10-17 21:18:17,889] INFO -    - Events: api_call_events, order_events
+[2025-10-17 21:18:17,889] INFO -    - Analytics: merchant_analytics
+[2025-10-17 21:18:17,889] INFO - 🔄 Running database migrations...
+[2025-10-17 21:18:17,889] INFO -    Checking for store_url column...
+[2025-10-17 21:18:17,890] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 21:18:17,890] INFO - 🔌 Initializing optional services...
+[2025-10-17 21:18:17,890] INFO - ✅ All services initialized successfully!
+[2025-10-17 21:18:17,890] INFO - 🚀 Application startup complete!
+[2025-10-17 21:18:17,890] INFO - ================================================================================
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'routes/order_routes.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[2025-10-17 21:33:22,329] INFO - Database disconnected
+[2025-10-17 21:33:22,330] INFO - 🛑 Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [36085]
+[2025-10-17 21:33:23,687] INFO - ✅ MCP router included
+[2025-10-17 21:33:23,690] INFO - ✅ Operations router included
+[2025-10-17 21:33:23,755] INFO - ✅ MCP router included
+[2025-10-17 21:33:23,759] INFO - ✅ Operations router included
+INFO:     Started server process [36508]
+INFO:     Waiting for application startup.
+[2025-10-17 21:33:23,759] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 21:33:23,760] INFO - 📡 Connecting to database...
+[2025-10-17 21:33:23,760] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 21:33:23,760] INFO -    Database driver: sqlite
+[2025-10-17 21:33:23,760] INFO - ✅ Database connected successfully
+[2025-10-17 21:33:23,760] INFO - ✅ Database connection test passed
+[2025-10-17 21:33:23,760] INFO - 📋 Creating tables...
+[2025-10-17 21:33:23,761] INFO - ✅ Tables created:
+[2025-10-17 21:33:23,761] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 21:33:23,761] INFO -    - Agents: agents, agent_usage_logs
+[2025-10-17 21:33:23,761] INFO -    - Cache: products_cache
+[2025-10-17 21:33:23,761] INFO -    - Events: api_call_events, order_events
+[2025-10-17 21:33:23,761] INFO -    - Analytics: merchant_analytics
+[2025-10-17 21:33:23,761] INFO - 🔄 Running database migrations...
+[2025-10-17 21:33:23,761] INFO -    Checking for store_url column...
+[2025-10-17 21:33:23,762] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 21:33:23,762] INFO - 🔌 Initializing optional services...
+[2025-10-17 21:33:23,762] INFO - ✅ All services initialized successfully!
+[2025-10-17 21:33:23,762] INFO - 🚀 Application startup complete!
+[2025-10-17 21:33:23,762] INFO - ================================================================================
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'routes/order_routes.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[2025-10-17 21:33:40,937] INFO - Database disconnected
+[2025-10-17 21:33:40,937] INFO - 🛑 Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [36508]
+[2025-10-17 21:33:42,330] INFO - ✅ MCP router included
+[2025-10-17 21:33:42,334] INFO - ✅ Operations router included
+[2025-10-17 21:33:42,410] INFO - ✅ MCP router included
+[2025-10-17 21:33:42,414] INFO - ✅ Operations router included
+INFO:     Started server process [36525]
+INFO:     Waiting for application startup.
+[2025-10-17 21:33:42,415] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 21:33:42,415] INFO - 📡 Connecting to database...
+[2025-10-17 21:33:42,415] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 21:33:42,415] INFO -    Database driver: sqlite
+[2025-10-17 21:33:42,415] INFO - ✅ Database connected successfully
+[2025-10-17 21:33:42,417] INFO - ✅ Database connection test passed
+[2025-10-17 21:33:42,417] INFO - 📋 Creating tables...
+[2025-10-17 21:33:42,418] INFO - ✅ Tables created:
+[2025-10-17 21:33:42,418] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 21:33:42,418] INFO -    - Agents: agents, agent_usage_logs
+[2025-10-17 21:33:42,418] INFO -    - Cache: products_cache
+[2025-10-17 21:33:42,418] INFO -    - Events: api_call_events, order_events
+[2025-10-17 21:33:42,418] INFO -    - Analytics: merchant_analytics
+[2025-10-17 21:33:42,418] INFO - 🔄 Running database migrations...
+[2025-10-17 21:33:42,418] INFO -    Checking for store_url column...
+[2025-10-17 21:33:42,418] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 21:33:42,418] INFO - 🔌 Initializing optional services...
+[2025-10-17 21:33:42,418] INFO - ✅ All services initialized successfully!
+[2025-10-17 21:33:42,418] INFO - 🚀 Application startup complete!
+[2025-10-17 21:33:42,419] INFO - ================================================================================
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'routes/order_routes.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[2025-10-17 21:33:52,633] INFO - Database disconnected
+[2025-10-17 21:33:52,633] INFO - 🛑 Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [36525]
+[2025-10-17 21:33:53,904] INFO - ✅ MCP router included
+[2025-10-17 21:33:53,908] INFO - ✅ Operations router included
+[2025-10-17 21:33:53,970] INFO - ✅ MCP router included
+[2025-10-17 21:33:53,974] INFO - ✅ Operations router included
+INFO:     Started server process [36533]
+INFO:     Waiting for application startup.
+[2025-10-17 21:33:53,975] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 21:33:53,975] INFO - 📡 Connecting to database...
+[2025-10-17 21:33:53,975] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 21:33:53,975] INFO -    Database driver: sqlite
+[2025-10-17 21:33:53,975] INFO - ✅ Database connected successfully
+[2025-10-17 21:33:53,976] INFO - ✅ Database connection test passed
+[2025-10-17 21:33:53,976] INFO - 📋 Creating tables...
+[2025-10-17 21:33:53,978] INFO - ✅ Tables created:
+[2025-10-17 21:33:53,978] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 21:33:53,978] INFO -    - Agents: agents, agent_usage_logs
+[2025-10-17 21:33:53,978] INFO -    - Cache: products_cache
+[2025-10-17 21:33:53,978] INFO -    - Events: api_call_events, order_events
+[2025-10-17 21:33:53,978] INFO -    - Analytics: merchant_analytics
+[2025-10-17 21:33:53,978] INFO - 🔄 Running database migrations...
+[2025-10-17 21:33:53,978] INFO -    Checking for store_url column...
+[2025-10-17 21:33:53,979] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 21:33:53,979] INFO - 🔌 Initializing optional services...
+[2025-10-17 21:33:53,979] INFO - ✅ All services initialized successfully!
+[2025-10-17 21:33:53,979] INFO - 🚀 Application startup complete!
+[2025-10-17 21:33:53,979] INFO - ================================================================================
+INFO:     Application startup complete.

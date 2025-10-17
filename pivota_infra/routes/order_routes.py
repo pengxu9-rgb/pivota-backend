@@ -276,48 +276,23 @@ async def create_new_order(
     background_tasks.add_task(create_payment_intent_task)
     
     # 6. 返回订单信息
-    order = await get_order(order_id)
-    
-    if not order:
-        # 如果获取订单失败，返回基本信息
-        logger.error(f"Failed to retrieve order {order_id} after creation")
-        return OrderResponse(
-            order_id=order_id,
-            merchant_id=order_request.merchant_id,
-            customer_email=order_request.customer_email,
-            items=order_request.items,
-            shipping_address=order_request.shipping_address,
-            subtotal=float(subtotal),
-            shipping_fee=float(shipping_fee),
-            tax=float(tax),
-            total=float(total),
-            currency=order_request.currency,
-            status="pending",
-            payment_status="pending",
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-    
+    # Note: Order was just created, construct response from known data
+    # This avoids potential race conditions with database transactions
     return OrderResponse(
-        order_id=order["order_id"],
-        merchant_id=order["merchant_id"],
-        customer_email=order["customer_email"],
-        items=[OrderItem(**item) for item in order["items"]],
-        shipping_address=order["shipping_address"],
-        subtotal=order["subtotal"],
-        shipping_fee=order["shipping_fee"],
-        tax=order["tax"],
-        total=order["total"],
-        currency=order["currency"],
-        status=order["status"],
-        payment_status=order["payment_status"],
-        fulfillment_status=order.get("fulfillment_status"),
-        payment_intent_id=order.get("payment_intent_id"),
-        client_secret=order.get("client_secret"),
-        created_at=order["created_at"],
-        updated_at=order["updated_at"],
-        agent_session_id=order.get("agent_session_id"),
-        metadata=order.get("metadata")
+        order_id=order_id,
+        merchant_id=order_request.merchant_id,
+        customer_email=order_request.customer_email,
+        items=order_request.items,
+        shipping_address=order_request.shipping_address,
+        subtotal=float(subtotal),
+        shipping_fee=float(shipping_fee),
+        tax=float(tax),
+        total=float(total),
+        currency=order_request.currency,
+        status="pending",
+        payment_status="pending",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
     )
 
 
