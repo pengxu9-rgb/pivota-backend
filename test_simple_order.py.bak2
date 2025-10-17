@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 
 
-BASE_URL = "https://web-production-fedb.up.railway.app"
+BASE_URL = "http://localhost:8000"
 
 # Your real email to receive confirmation
 CUSTOMER_EMAIL = "peng@chydan.com"

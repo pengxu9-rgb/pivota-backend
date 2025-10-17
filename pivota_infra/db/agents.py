@@ -114,6 +114,7 @@ async def create_agent(
         description=description,
         api_key=api_key,
         api_key_hash=api_key_hash,
+        is_active=True,  # Explicitly set to active
         owner_email=owner_email,
         rate_limit=rate_limit,
         daily_quota=daily_quota,
