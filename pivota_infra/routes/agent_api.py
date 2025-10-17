@@ -14,7 +14,7 @@ from models.standard_product import StandardProduct
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import get_cached_products
 from db.orders import get_order, get_orders_by_merchant
-from routes.order_routes import create_order_endpoint
+from routes.order_routes import create_new_order
 from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from utils.logger import logger
 
@@ -348,8 +348,8 @@ async def agent_create_order(
             order_request.agent_session_id = f"{context.agent_id}_{int(datetime.utcnow().timestamp())}"
         
         # 调用标准订单创建
-        from routes.order_routes import create_order_endpoint
-        order_response = await create_order_endpoint(order_request, background_tasks)
+        from routes.order_routes import create_new_order
+        order_response = await create_new_order(order_request, background_tasks)
         
         # 计算订单总额
         order_amount = float(order_response.total)
