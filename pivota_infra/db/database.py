@@ -3,38 +3,39 @@ from sqlalchemy import (
     MetaData, Table, Column, Integer, String, Float, DateTime, JSON, create_engine
 )
 import datetime
+import os
 from config.settings import settings
 
-# Normalize and prepare DATABASE_URL
-DATABASE_URL = settings.database_url
-url_str = str(DATABASE_URL or "").strip()
+# PostgreSQL ONLY - No SQLite support
+DATABASE_URL = settings.database_url or os.getenv("DATABASE_URL", "")
 
-# Heroku/Render sometimes provide postgres:// which SQLAlchemy doesn't accept
+# Validate that DATABASE_URL exists
+if not DATABASE_URL:
+    raise RuntimeError(
+        "❌ DATABASE_URL is required!\n"
+        "Please set DATABASE_URL to your PostgreSQL connection string.\n"
+        "Example: postgresql://user:password@host:5432/database"
+    )
+
+url_str = str(DATABASE_URL).strip()
+
+# Heroku/Render/Railway sometimes provide postgres:// which SQLAlchemy doesn't accept
 if url_str.startswith("postgres://"):
     url_str = url_str.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = url_str
 
-# Initialize database variable
-database = None
-
+# Validate it's PostgreSQL
 lower_url = url_str.lower()
-if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.startswith("postgres")):
-    # For PostgreSQL (Railway, Supabase, etc.)
-    DATABASE_URL = url_str
-    
-    # Conservative connection pool
-    database = Database(DATABASE_URL)
-elif url_str and len(url_str) > 0:
-    # For SQLite or other databases
-    DATABASE_URL = url_str
-    database = Database(DATABASE_URL)
-else:
-    # Fallback to SQLite if no DATABASE_URL is set
-    DATABASE_URL = "sqlite:///./pivota.db"
-    database = Database(DATABASE_URL)
+if not any(x in lower_url for x in ["postgresql", "postgres"]):
+    raise RuntimeError(
+        f"❌ Invalid DATABASE_URL!\n"
+        f"Expected PostgreSQL URL but got: {url_str[:50]}...\n"
+        "URL must start with postgresql:// or postgres://"
+    )
 
-# Ensure database is initialized
-if database is None:
-    raise RuntimeError("Database connection could not be initialized. Check DATABASE_URL environment variable.")
+# Initialize PostgreSQL connection
+# Note: databases library handles connection pooling automatically
+database = Database(DATABASE_URL)
 
 metadata = MetaData()
 
@@ -53,18 +54,14 @@ transactions = Table(
     Column("meta", JSON, nullable=True)
 )
 
-raw_url = str(DATABASE_URL)
-# Build a synchronous URL for SQLAlchemy engine (remove +aiosqlite driver)
-sync_url = raw_url.replace("+aiosqlite", "")
-
-# Normalize postgres scheme for sync engine as well
-if sync_url.startswith("postgres://"):
-    sync_url = sync_url.replace("postgres://", "postgresql://", 1)
+# Create synchronous engine for table creation
+# PostgreSQL doesn't need special handling like SQLite did
+sync_url = str(DATABASE_URL)
 
 try:
     engine = create_engine(sync_url)
-    metadata.create_all(engine)
+    # Tables will be created in main.py startup to ensure proper initialization
 except Exception as err:
-    # Helpful log for dialect/engine issues (e.g., f405)
-    # Common fix: ensure scheme is postgresql:// not postgres:// and driver packages installed
-    raise
+    # Log helpful error for connection issues
+    print(f"⚠️ Could not create engine: {err}")
+    # Don't raise here - let the app handle it during startup

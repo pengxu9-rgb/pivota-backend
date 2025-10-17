@@ -3067,3 +3067,274 @@ INFO:     Waiting for application startup.
 [2025-10-17 22:20:49,965] INFO - 🚀 Application startup complete!
 [2025-10-17 22:20:49,965] INFO - ================================================================================
 INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'config/settings.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[2025-10-17 22:24:33,401] INFO - Database disconnected
+[2025-10-17 22:24:33,402] INFO - 🛑 Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [38185]
+[2025-10-17 22:24:34,926] INFO - ✅ MCP router included
+[2025-10-17 22:24:34,929] INFO - ✅ Operations router included
+[2025-10-17 22:24:34,994] INFO - ✅ MCP router included
+[2025-10-17 22:24:34,997] INFO - ✅ Operations router included
+INFO:     Started server process [38356]
+INFO:     Waiting for application startup.
+[2025-10-17 22:24:34,998] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 22:24:34,998] INFO - 📡 Connecting to database...
+[2025-10-17 22:24:34,999] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 22:24:34,999] INFO -    Database driver: sqlite
+[2025-10-17 22:24:34,999] INFO - ✅ Database connected successfully
+[2025-10-17 22:24:35,000] INFO - ✅ All database tables verified/created
+[2025-10-17 22:24:35,001] INFO - ✅ Database connection test passed
+[2025-10-17 22:24:35,001] INFO - 📋 Creating tables...
+[2025-10-17 22:24:35,001] INFO - ✅ Tables created:
+[2025-10-17 22:24:35,001] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 22:24:35,001] INFO -    - Agents: agents, agent_usage_logs
+[2025-10-17 22:24:35,001] INFO -    - Cache: products_cache
+[2025-10-17 22:24:35,001] INFO -    - Events: api_call_events, order_events
+[2025-10-17 22:24:35,001] INFO -    - Analytics: merchant_analytics
+[2025-10-17 22:24:35,001] INFO - 🔄 Running database migrations...
+[2025-10-17 22:24:35,001] INFO -    Checking for store_url column...
+[2025-10-17 22:24:35,002] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 22:24:35,002] INFO - 🔌 Initializing optional services...
+[2025-10-17 22:24:35,002] INFO - ✅ All services initialized successfully!
+[2025-10-17 22:24:35,002] INFO - 🚀 Application startup complete!
+[2025-10-17 22:24:35,002] INFO - ================================================================================
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'config/settings.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[2025-10-17 22:24:52,384] INFO - Database disconnected
+[2025-10-17 22:24:52,384] INFO - 🛑 Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [38356]
+[2025-10-17 22:24:53,888] INFO - ✅ MCP router included
+[2025-10-17 22:24:53,892] INFO - ✅ Operations router included
+[2025-10-17 22:24:53,977] INFO - ✅ MCP router included
+[2025-10-17 22:24:53,983] INFO - ✅ Operations router included
+INFO:     Started server process [38376]
+INFO:     Waiting for application startup.
+[2025-10-17 22:24:53,984] INFO - 🚀 Starting Pivota Infrastructure Dashboard...
+[2025-10-17 22:24:53,984] INFO - 📡 Connecting to database...
+[2025-10-17 22:24:53,984] INFO -    Database URL type: <class 'databases.core.DatabaseURL'>
+[2025-10-17 22:24:53,984] INFO -    Database driver: sqlite
+[2025-10-17 22:24:53,984] INFO - ✅ Database connected successfully
+[2025-10-17 22:24:53,986] INFO - ✅ All database tables verified/created
+[2025-10-17 22:24:53,988] INFO - ✅ Database connection test passed
+[2025-10-17 22:24:53,988] INFO - 📋 Creating tables...
+[2025-10-17 22:24:53,990] INFO - ✅ Tables created:
+[2025-10-17 22:24:53,990] INFO -    - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders
+[2025-10-17 22:24:53,990] INFO -    - Agents: agents, agent_usage_logs
+[2025-10-17 22:24:53,990] INFO -    - Cache: products_cache
+[2025-10-17 22:24:53,990] INFO -    - Events: api_call_events, order_events
+[2025-10-17 22:24:53,990] INFO -    - Analytics: merchant_analytics
+[2025-10-17 22:24:53,990] INFO - 🔄 Running database migrations...
+[2025-10-17 22:24:53,990] INFO -    Checking for store_url column...
+[2025-10-17 22:24:53,992] WARNING - ⚠️ Migration warning (may be already applied): no such table: information_schema.columns
+[2025-10-17 22:24:53,992] INFO - 🔌 Initializing optional services...
+[2025-10-17 22:24:53,992] INFO - ✅ All services initialized successfully!
+[2025-10-17 22:24:53,992] INFO - 🚀 Application startup complete!
+[2025-10-17 22:24:53,992] INFO - ================================================================================
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'db/database.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[2025-10-17 22:25:27,237] INFO - Database disconnected
+[2025-10-17 22:25:27,237] INFO - 🛑 Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [38376]
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database
+WARNING:  WatchFiles detected changes in 'db/database.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database
+WARNING:  WatchFiles detected changes in 'db/database.py'. Reloading...
+WARNING:  WatchFiles detected changes in 'db/database.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database
+WARNING:  WatchFiles detected changes in 'db/database.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database
+WARNING:  WatchFiles detected changes in 'db/database.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database
+WARNING:  WatchFiles detected changes in 'db/database.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database
+WARNING:  WatchFiles detected changes in 'verify_postgresql.py'. Reloading...
+WARNING:  WatchFiles detected changes in 'verify_postgresql.py'. Reloading...
+WARNING:  WatchFiles detected changes in 'verify_postgresql.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database
+WARNING:  WatchFiles detected changes in 'verify_postgresql.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 125, in _main
+    prepare(preparation_data)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 236, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/spawn.py", line 287, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/main.py", line 17, in <module>
+    from db.database import database
+  File "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota_infra/db/database.py", line 14, in <module>
+    raise RuntimeError(
+RuntimeError: ❌ DATABASE_URL is required!
+Please set DATABASE_URL to your PostgreSQL connection string.
+Example: postgresql://user:password@host:5432/database

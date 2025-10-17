@@ -9,7 +9,7 @@ Databases
 pydantic
 pydantic-settings
 alembic      # optional for migrations later
-aiosqlite    # required for sqlite async driver
+# aiosqlite removed - PostgreSQL only
 PyJWT        # for JWT token handling
 jinja2       # for HTML templates
 websockets   # for WebSocket support
