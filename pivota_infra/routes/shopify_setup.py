@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from datetime import datetime
 from typing import Dict, Any
 from config.settings import settings
-from db.merchant_onboarding import update_merchant_onboarding
+from db.merchant_onboarding import merchant_onboarding, get_merchant_onboarding
 from db.orders import orders
 from db.database import database
 from routes.order_routes import create_shopify_order
@@ -33,12 +33,18 @@ async def configure_shopify(
         "mcp_connected": True,
         "mcp_platform": "shopify",
         "mcp_shop_domain": shopify_store.replace("https://", "").replace("http://", ""),
-        "mcp_access_token": shopify_token
+        "mcp_access_token": shopify_token,
+        "updated_at": datetime.now()
     }
     
-    success = await update_merchant_onboarding(merchant_id, update_data)
+    # Use database operation directly
+    query = merchant_onboarding.update().where(
+        merchant_onboarding.c.merchant_id == merchant_id
+    ).values(**update_data)
     
-    if not success:
+    result = await database.execute(query)
+    
+    if not result:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
     logger.info(f"Configured Shopify for merchant {merchant_id}")
@@ -74,8 +80,6 @@ async def test_shopify_connection(
     current_user: dict = Depends(require_admin)
 ) -> Dict[str, Any]:
     """Test Shopify connection for a merchant"""
-    
-    from db.merchant_onboarding import get_merchant_onboarding
     
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
