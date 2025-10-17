@@ -15,6 +15,8 @@ from fastapi.responses import HTMLResponse
 
 # Database
 from db.database import database
+import subprocess
+import os
 
 # Core routers (only include what exists)
 from routes.agent_routes import router as agent_router
@@ -109,6 +111,38 @@ if MCP_AVAILABLE:
 if OPERATIONS_AVAILABLE:
     app.include_router(operations_router)
     logger.info("✅ Operations router included")
+
+@app.get("/version")
+async def get_version():
+    """
+    返回当前部署的版本信息（Git commit hash）
+    """
+    try:
+        # 尝试获取 git commit hash
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=os.path.dirname(__file__),
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8').strip()
+        
+        # 尝试获取 commit 时间
+        commit_time = subprocess.check_output(
+            ['git', 'log', '-1', '--format=%cd', '--date=iso'],
+            cwd=os.path.dirname(__file__),
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8').strip()
+        
+        return {
+            "version": commit,
+            "commit_time": commit_time,
+            "status": "healthy"
+        }
+    except Exception as e:
+        return {
+            "version": "unknown",
+            "error": str(e),
+            "status": "healthy"
+        }
 
 @app.on_event("startup")
 async def startup():
