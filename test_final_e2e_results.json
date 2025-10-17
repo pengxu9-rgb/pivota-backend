@@ -1,0 +1,37 @@
+{
+  "timestamp": "2025-10-17T21:05:39.667921",
+  "results": [
+    [
+      "Agent Creation",
+      "SUCCESS",
+      "agent_5842f685409de627"
+    ],
+    [
+      "Product Search",
+      "SKIPPED",
+      "API request failed: 500 - Search failed"
+    ],
+    [
+      "Order Creation",
+      "SUCCESS",
+      "ORD_69A710B928CAD076"
+    ],
+    [
+      "Payment",
+      "SKIPPED",
+      "No payment intent"
+    ],
+    [
+      "Shopify Order",
+      "PENDING",
+      "Still processing"
+    ],
+    [
+      "Email",
+      "CHECK EMAIL",
+      "peng@chydan.com"
+    ]
+  ],
+  "order_id": "ORD_69A710B928CAD076",
+  "agent_id": "agent_5842f685409de627"
+}

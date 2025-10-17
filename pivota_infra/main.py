@@ -127,6 +127,7 @@ async def get_version():
     """
     返回当前部署的版本信息（Git commit hash）
     优先使用 Railway 环境变量，本地开发时回退到 git 命令
+    Redeployed with Shopify/Stripe credentials
     """
     # Railway 自动注入的环境变量
     railway_commit = os.getenv("RAILWAY_GIT_COMMIT_SHA")
