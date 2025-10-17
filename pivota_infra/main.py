@@ -193,6 +193,12 @@ async def startup():
         await database.connect()
         logger.info("✅ Database connected successfully")
         
+        # Ensure all tables exist (important for PostgreSQL)
+        from sqlalchemy import create_engine
+        engine = create_engine(str(database.url))
+        metadata.create_all(engine)
+        logger.info("✅ All database tables verified/created")
+        
         # Test the connection
         await database.execute("SELECT 1")
         logger.info("✅ Database connection test passed")
