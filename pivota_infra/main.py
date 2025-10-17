@@ -68,15 +68,8 @@ app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
 # CORS middleware - Allow Lovable origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5175",
-        "https://web-production-fedb.up.railway.app",
-        "https://*.lovable.app",
-        "https://lovable.app",
-    ],
+    allow_origins=[],                # 不使用白名单
+    allow_origin_regex=".*",        # 允许任意来源
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
