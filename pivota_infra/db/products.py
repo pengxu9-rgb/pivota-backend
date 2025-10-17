@@ -73,8 +73,8 @@ api_call_events = Table(
     Column("created_at", DateTime, server_default=func.now(), index=True),
     
     # 索引优化
-    Index("idx_merchant_created", "merchant_id", "created_at"),
-    Index("idx_event_type_created", "event_type", "created_at"),
+    Index("idx_api_call_merchant_created", "merchant_id", "created_at"),
+    Index("idx_api_call_event_type_created", "event_type", "created_at"),
 )
 
 
@@ -103,8 +103,8 @@ order_events = Table(
     Column("created_at", DateTime, server_default=func.now(), index=True),
     
     # 索引优化
-    Index("idx_merchant_order", "merchant_id", "order_id"),
-    Index("idx_event_type_created", "event_type", "created_at"),
+    Index("idx_order_merchant_order", "merchant_id", "order_id"),
+    Index("idx_order_event_type_created", "event_type", "created_at"),
 )
 
 
