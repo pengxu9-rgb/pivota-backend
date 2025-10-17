@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 import os
 import time
+import json
 
 from models.standard_product import ProductListResponse
 from adapters.product_adapters import fetch_merchant_products
@@ -144,11 +145,12 @@ async def get_merchant_products_realtime(
     
     # 6. 更新缓存（后台任务，不阻塞响应）
     for p in products_obj:
+        # 使用 p.json() + json.loads() 确保 datetime 被序列化为 ISO 字符串
         await upsert_product_cache(
             merchant_id=merchant_id,
             platform=platform,
             platform_product_id=p.id,
-            product_data=p.dict(),
+            product_data=json.loads(p.json()),
             ttl_seconds=3600  # 1小时
         )
     
