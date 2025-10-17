@@ -43,6 +43,7 @@ from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
 from routes.agent_management import router as agent_management_router
 from routes.shopify_setup import router as shopify_setup_router
+from routes.shopify_manual import router as shopify_manual_router
 
 # Service routers (only include what exists)
 try:
@@ -101,6 +102,7 @@ app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
 app.include_router(agent_management_router)  # Agent management
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
+app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(payment_routes_router)  # Payment Processing API
@@ -192,7 +194,7 @@ async def startup():
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -347,8 +349,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
