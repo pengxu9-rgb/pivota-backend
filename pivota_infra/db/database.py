@@ -22,19 +22,15 @@ if ("postgresql" in lower_url) or ("postgres://" in lower_url) or (lower_url.sta
     DATABASE_URL = url_str
     
     # Conservative connection pool
-    database = Database(
-        DATABASE_URL, 
-        min_size=1, 
-        max_size=5
-    )
+    database = Database(DATABASE_URL)
 elif url_str and len(url_str) > 0:
     # For SQLite or other databases
     DATABASE_URL = url_str
-    database = Database(DATABASE_URL, min_size=1, max_size=1)
+    database = Database(DATABASE_URL)
 else:
     # Fallback to SQLite if no DATABASE_URL is set
     DATABASE_URL = "sqlite:///./pivota.db"
-    database = Database(DATABASE_URL, min_size=1, max_size=1)
+    database = Database(DATABASE_URL)
 
 # Ensure database is initialized
 if database is None:
