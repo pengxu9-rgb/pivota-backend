@@ -143,7 +143,8 @@ async def update_order_status(
     ).values(**update_data)
     
     result = await database.execute(query)
-    return result > 0
+    # Handle None result from PostgreSQL
+    return result is not None and result > 0
 
 
 async def update_payment_info(
@@ -163,7 +164,8 @@ async def update_payment_info(
     )
     
     result = await database.execute(query)
-    return result > 0
+    # Handle None result from PostgreSQL
+    return result is not None and result > 0
 
 
 async def mark_order_paid(order_id: str) -> bool:
@@ -178,7 +180,8 @@ async def mark_order_paid(order_id: str) -> bool:
     )
     
     result = await database.execute(query)
-    return result > 0
+    # Handle None result from PostgreSQL
+    return result is not None and result > 0
 
 
 async def update_fulfillment_info(
@@ -205,7 +208,8 @@ async def update_fulfillment_info(
     ).values(**update_data)
     
     result = await database.execute(query)
-    return result > 0
+    # Handle None result from PostgreSQL
+    return result is not None and result > 0
 
 
 async def mark_order_shipped(
@@ -226,7 +230,8 @@ async def mark_order_shipped(
     )
     
     result = await database.execute(query)
-    return result > 0
+    # Handle None result from PostgreSQL
+    return result is not None and result > 0
 
 
 # ============================================================================
