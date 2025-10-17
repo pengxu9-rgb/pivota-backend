@@ -278,6 +278,26 @@ async def create_new_order(
     # 6. 返回订单信息
     order = await get_order(order_id)
     
+    if not order:
+        # 如果获取订单失败，返回基本信息
+        logger.error(f"Failed to retrieve order {order_id} after creation")
+        return OrderResponse(
+            order_id=order_id,
+            merchant_id=order_request.merchant_id,
+            customer_email=order_request.customer_email,
+            items=order_request.items,
+            shipping_address=order_request.shipping_address,
+            subtotal=float(subtotal),
+            shipping_fee=float(shipping_fee),
+            tax=float(tax),
+            total=float(total),
+            currency=order_request.currency,
+            status="pending",
+            payment_status="pending",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+    
     return OrderResponse(
         order_id=order["order_id"],
         merchant_id=order["merchant_id"],

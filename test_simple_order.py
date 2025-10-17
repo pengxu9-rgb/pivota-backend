@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+Simple Order Test with Real Payment
+Direct test of order creation → payment → Shopify order → email
+"""
+
+import requests
+import json
+import time
+from datetime import datetime
+
+
+BASE_URL = "http://localhost:8000"
+
+# Your real email to receive confirmation
+CUSTOMER_EMAIL = "peng@chydan.com"
+MERCHANT_ID = "merch_208139f7600dbf42"  # chydantest
+
+
+def print_step(msg):
+    print(f"\n{'=' * 60}")
+    print(f"  {msg}")
+    print('=' * 60)
+
+
+def get_token():
+    """Get admin token"""
+    resp = requests.get(f"{BASE_URL}/auth/admin-token")
+    return resp.json()["token"]
+
+
+def create_simple_order(token):
+    """Create a test order"""
+    print_step("Creating Order")
+    
+    order_data = {
+        "merchant_id": MERCHANT_ID,
+        "customer_email": CUSTOMER_EMAIL,
+        "items": [
+            {
+                "product_id": "test_prod_001",
+                "product_title": "Test Product - Real Order",
+                "quantity": 2,
+                "unit_price": "25.50",
+                "subtotal": "51.00"
+            },
+            {
+                "product_id": "test_prod_002", 
+                "product_title": "Another Test Product",
+                "quantity": 1,
+                "unit_price": "15.00",
+                "subtotal": "15.00"
+            }
+        ],
+        "shipping_address": {
+            "name": "Real Test Customer",
+            "address_line1": "456 Market Street",
+            "city": "San Francisco",
+            "state": "CA",
+            "postal_code": "94103",
+            "country": "US",
+            "phone": "+14155551234"
+        },
+        "currency": "USD"
+    }
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.post(f"{BASE_URL}/orders/create", json=order_data, headers=headers)
+    
+    if resp.status_code == 200:
+        order = resp.json()
+        print(f"✅ Order created: {order['order_id']}")
+        print(f"   Total: ${order['total']} {order['currency']}")
+        print(f"   Status: {order['status']}")
+        print(f"   Payment Intent: {order.get('payment_intent_id', 'N/A')}")
+        return order
+    else:
+        print(f"❌ Failed: {resp.status_code} - {resp.text}")
+        return None
+
+
+def confirm_payment(token, order):
+    """Confirm payment with Stripe test card"""
+    print_step("Confirming Payment")
+    
+    if not order.get("payment_intent_id"):
+        print("⚠️  No payment intent found")
+        return False
+    
+    payment_data = {
+        "order_id": order["order_id"],
+        "payment_method_id": "pm_card_visa"  # Test visa card
+    }
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.post(f"{BASE_URL}/orders/payment/confirm", json=payment_data, headers=headers)
+    
+    if resp.status_code == 200:
+        result = resp.json()
+        print(f"✅ Payment status: {result['payment_status']}")
+        print(f"   Message: {result.get('message', '')}")
+        return result["payment_status"] == "succeeded"
+    else:
+        print(f"❌ Failed: {resp.text}")
+        return False
+
+
+def check_shopify_order(token, order_id):
+    """Check if Shopify order was created"""
+    print_step("Checking Shopify Order")
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    for i in range(10):
+        time.sleep(3)
+        resp = requests.get(f"{BASE_URL}/orders/{order_id}", headers=headers)
+        
+        if resp.status_code == 200:
+            order = resp.json()
+            print(f"   Attempt {i+1}: Status={order['status']}, Payment={order['payment_status']}")
+            
+            if order.get("shopify_order_id"):
+                print(f"✅ Shopify order created: {order['shopify_order_id']}")
+                return order["shopify_order_id"]
+        
+    print("⚠️  Shopify order not created yet (may still be processing)")
+    return None
+
+
+def main():
+    print("\n" + "🛍️" * 30)
+    print("SIMPLE ORDER TEST - REAL PAYMENT FLOW")
+    print(f"Customer Email: {CUSTOMER_EMAIL}")
+    print("🛍️" * 30)
+    
+    try:
+        # Get token
+        print("\n1. Getting admin token...")
+        token = get_token()
+        print("✅ Token obtained")
+        
+        # Create order
+        order = create_simple_order(token)
+        if not order:
+            return
+        
+        # Confirm payment
+        if confirm_payment(token, order):
+            # Check Shopify order
+            shopify_id = check_shopify_order(token, order["order_id"])
+            
+            print_step("RESULTS")
+            print(f"✅ Order ID: {order['order_id']}")
+            print(f"✅ Payment: CONFIRMED")
+            if shopify_id:
+                print(f"✅ Shopify Order: {shopify_id}")
+                print(f"✅ Email will be sent to: {CUSTOMER_EMAIL}")
+            else:
+                print(f"⚠️  Shopify order may still be processing")
+            
+            print("\n📧 CHECK YOUR EMAIL!")
+            print(f"   Email: {CUSTOMER_EMAIL}")
+            print("   Look for:")
+            print("   • Order confirmation from Shopify")
+            print("   • Receipt with order details")
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
