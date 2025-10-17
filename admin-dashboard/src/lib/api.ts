@@ -74,6 +74,9 @@ export interface Merchant {
   rejection_reason?: string;
   created_at: string;
   updated_at?: string;
+  // MCP 相关（占位，后端后续提供）
+  mcp_connected?: boolean;
+  mcp_platform?: string;
 }
 
 export const merchantApi = {
@@ -113,6 +116,27 @@ export const merchantApi = {
         'Content-Type': 'multipart/form-data',
       },
     });
+  },
+};
+
+export const integrationsApi = {
+  async connectShopify(merchantId: string, shopDomain?: string, accessToken?: string) {
+    const response = await api.post('/integrations/shopify/connect', {
+      merchant_id: merchantId,
+      shop_domain: shopDomain,
+      access_token: accessToken,
+    });
+    return response.data;
+  },
+
+  async syncShopifyProducts(merchantId: string, limit = 20, shopDomain?: string, accessToken?: string) {
+    const response = await api.post('/integrations/shopify/products/sync', {
+      merchant_id: merchantId,
+      limit,
+      shop_domain: shopDomain,
+      access_token: accessToken,
+    });
+    return response.data;
   },
 };
 

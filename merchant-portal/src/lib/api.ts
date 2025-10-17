@@ -60,5 +60,13 @@ export const onboardingApi = {
   },
 };
 
+export const integrationsApi = {
+  async startShopifyOAuth(merchantId: string, shopDomain: string) {
+    const params = new URLSearchParams({ merchant_id: merchantId, shop: shopDomain });
+    const response = await api.get(`/integrations/shopify/oauth/start?${params.toString()}`);
+    return response.data as { authorize: string };
+  },
+};
+
 export default api;
 

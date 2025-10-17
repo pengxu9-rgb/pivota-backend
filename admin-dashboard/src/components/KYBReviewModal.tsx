@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Merchant, merchantApi } from '../lib/api';
-import { X, CheckCircle, XCircle } from 'lucide-react';
+import { X, CheckCircle, XCircle, FileText } from 'lucide-react';
 
 interface KYBReviewModalProps {
   merchant: Merchant;
@@ -12,6 +12,24 @@ export default function KYBReviewModal({ merchant, open, onClose }: KYBReviewMod
   const [decision, setDecision] = useState<'approved' | 'rejected'>('approved');
   const [reason, setReason] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [docs, setDocs] = useState<any[]>(merchant.kyc_documents || []);
+  const [loadingDocs, setLoadingDocs] = useState(false);
+
+  // 当弹窗打开时，取最新的商户详情（包含 kyc_documents）
+  useEffect(() => {
+    const fetchDetails = async () => {
+      try {
+        setLoadingDocs(true);
+        const full = await merchantApi.getDetails(merchant.merchant_id);
+        setDocs(full.kyc_documents || []);
+      } catch (e) {
+        // 静默失败，保留已有元数据
+      } finally {
+        setLoadingDocs(false);
+      }
+    };
+    if (open) fetchDetails();
+  }, [open, merchant.merchant_id]);
 
   if (!open) return null;
 
@@ -50,6 +68,38 @@ export default function KYBReviewModal({ merchant, open, onClose }: KYBReviewMod
 
         {/* Content */}
         <div className="p-6 space-y-4">
+          {/* Uploaded Documents */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-sm font-medium text-slate-700">Uploaded Documents</label>
+              {loadingDocs && (
+                <span className="text-xs text-slate-500">Loading…</span>
+              )}
+            </div>
+            {(!docs || docs.length === 0) ? (
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-md text-sm text-slate-500">
+                No documents uploaded yet.
+              </div>
+            ) : (
+              <div className="max-h-48 overflow-auto border border-slate-200 rounded-md divide-y">
+                {docs.map((d, idx) => (
+                  <div key={idx} className="flex items-start gap-3 p-3">
+                    <div className="mt-0.5"><FileText className="w-4 h-4 text-slate-500" /></div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-slate-900 truncate">{d.name || 'Document'}</div>
+                      <div className="text-xs text-slate-500 mt-0.5">
+                        {d.document_type || 'unknown'} • {d.content_type || 'n/a'}
+                        {d.size ? ` • ${(d.size/1024).toFixed(1)} KB` : ''}
+                        {d.uploaded_at ? ` • ${new Date(d.uploaded_at).toLocaleString()}` : ''}
+                      </div>
+                    </div>
+                    {/* 如后端未来返回可访问链接，可在此放置预览/下载按钮 */}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* Auto-approval Info */}
           {merchant.auto_approved && (
             <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">

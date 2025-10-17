@@ -25,6 +25,7 @@ from db.merchant_onboarding import (
 from db.payment_router import register_merchant_psp_route
 from db.database import database
 from routes.auth_routes import get_current_user, require_admin
+from urllib.parse import urlparse
 
 router = APIRouter(prefix="/merchant/onboarding", tags=["merchant-onboarding"])
 
@@ -83,6 +84,19 @@ def validate_stripe_key_sync(api_key: str) -> bool:
     except Exception as e:
         print(f"❌ Stripe HTTP validation error: {type(e).__name__}: {str(e)[:200]}")
         return False
+
+
+def canonicalize_store_url(raw_url: str) -> str:
+    """Normalize store url for duplicate detection: lowercase, strip scheme and trailing slash."""
+    if not raw_url:
+        return ""
+    url = raw_url.strip()
+    # Ensure scheme to parse
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    parsed = urlparse(url)
+    host_path = (parsed.netloc + parsed.path).rstrip("/")
+    return host_path.lower()
 
 async def validate_stripe_key(api_key: str) -> bool:
     """Async wrapper for Stripe validation"""
@@ -177,6 +191,17 @@ async def register_merchant(
                 await database.disconnect()
                 await asyncio.sleep(0.5)
                 await database.connect()
+
+        # 0. 去重检查（基于标准化 store_url）
+        norm_url = canonicalize_store_url(merchant_data.store_url)
+        dup = await database.fetch_one(
+            merchant_onboarding.select().where(
+                (merchant_onboarding.c.store_url == merchant_data.store_url) |
+                (merchant_onboarding.c.store_url == norm_url)
+            )
+        )
+        if dup:
+            raise HTTPException(status_code=409, detail="Store URL already registered")
 
         # 1. 自动 KYB 预审批验证
         print("🔍 Starting auto-KYB pre-approval validation...")
@@ -469,6 +494,8 @@ async def list_all_onboardings(
                     "full_kyb_deadline": m.get("full_kyb_deadline").isoformat() if m.get("full_kyb_deadline") else None,
                     "psp_connected": m.get("psp_connected", False),
                     "psp_type": m.get("psp_type"),
+                    "mcp_connected": m.get("mcp_connected", False),
+                    "mcp_platform": m.get("mcp_platform"),
                     "created_at": m["created_at"].isoformat() if m["created_at"] else None,
                 }
                 for m in merchants

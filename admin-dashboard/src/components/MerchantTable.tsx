@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Merchant, merchantApi } from '../lib/api';
-import { Search, RefreshCw, Eye, FileCheck, Upload, Trash2, ExternalLink } from 'lucide-react';
+import { Merchant, merchantApi, integrationsApi } from '../lib/api';
+import { Search, RefreshCw, Eye, FileCheck, Upload, Trash2, ExternalLink, Link, Boxes } from 'lucide-react';
 import { formatDate } from '../lib/utils';
 import MerchantDetailsModal from './MerchantDetailsModal';
 import KYBReviewModal from './KYBReviewModal';
@@ -110,6 +110,12 @@ export default function MerchantTable({ merchants, loading, onRefresh }: Merchan
                 Status
               </th>
               <th className="px-4 py-3 text-left text-xs font-medium text-slate-600 uppercase">
+                PSP
+              </th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-slate-600 uppercase">
+                MCP
+              </th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-slate-600 uppercase">
                 Auto
               </th>
               <th className="px-4 py-3 text-left text-xs font-medium text-slate-600 uppercase">
@@ -163,7 +169,7 @@ export default function MerchantTable({ merchants, loading, onRefresh }: Merchan
                       <span className="text-sm text-slate-400">N/A</span>
                     )}
                   </td>
-                  <td className="px-4 py-3">
+                <td className="px-4 py-3">
                     <span
                       className={`inline-flex px-2 py-1 text-xs font-medium rounded-full ${getBadgeColor(
                         merchant.status
@@ -172,6 +178,24 @@ export default function MerchantTable({ merchants, loading, onRefresh }: Merchan
                       {merchant.status}
                     </span>
                   </td>
+                <td className="px-4 py-3 text-sm text-slate-700">
+                  {merchant.psp_connected ? (
+                    <span className="inline-flex items-center gap-1 text-green-700">
+                      ✓ {merchant.psp_type || 'PSP'}
+                    </span>
+                  ) : (
+                    <span className="text-slate-400">-</span>
+                  )}
+                </td>
+                <td className="px-4 py-3 text-sm text-slate-700">
+                  {merchant.mcp_connected ? (
+                    <span className="inline-flex items-center gap-1 text-green-700">
+                      ✓ {merchant.mcp_platform || 'MCP'}
+                    </span>
+                  ) : (
+                    <span className="text-slate-400">-</span>
+                  )}
+                </td>
                   <td className="px-4 py-3">
                     <span className="text-sm text-slate-700">
                       {merchant.auto_approved ? '✓' : '-'}
@@ -218,6 +242,36 @@ export default function MerchantTable({ merchants, loading, onRefresh }: Merchan
                         title="Upload Docs"
                       >
                         <Upload className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={async () => {
+                          try {
+                            await integrationsApi.connectShopify(merchant.merchant_id);
+                            alert('Shopify connected!');
+                            onRefresh();
+                          } catch (e: any) {
+                            alert('Connect failed: ' + (e.response?.data?.detail || e.message));
+                          }
+                        }}
+                        className="p-1.5 text-slate-600 hover:text-emerald-600 hover:bg-emerald-50 rounded"
+                        title="Connect Shopify"
+                      >
+                        <Link className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={async () => {
+                          try {
+                            const res = await integrationsApi.syncShopifyProducts(merchant.merchant_id, 20);
+                            console.log('Products:', res);
+                            alert('Sync started (see console for result)');
+                          } catch (e: any) {
+                            alert('Sync failed: ' + (e.response?.data?.detail || e.message));
+                          }
+                        }}
+                        className="p-1.5 text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 rounded"
+                        title="Sync Products"
+                      >
+                        <Boxes className="w-4 h-4" />
                       </button>
                       <button
                         onClick={() => handleDelete(merchant)}

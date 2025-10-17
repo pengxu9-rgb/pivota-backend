@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Loader, CheckCircle, AlertCircle, Upload, File, X } from 'lucide-react';
-import { onboardingApi } from '../lib/api';
+import { onboardingApi, integrationsApi } from '../lib/api';
 
 interface DocumentUploadStepProps {
   merchantId: string;
@@ -69,6 +69,40 @@ export default function DocumentUploadStep({ merchantId, onComplete, autoApprove
             'Upload your business verification documents'
           )}
         </p>
+      </div>
+
+      {/* Connect Shopify (OAuth) */}
+      <div className="mb-6 p-4 border border-emerald-200 bg-emerald-50 rounded-lg">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <div className="font-medium text-emerald-900">Connect your store (Shopify)</div>
+            <div className="text-sm text-emerald-700">Authorize access to sync products and orders</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              placeholder="yourshop.myshopify.com"
+              className="px-3 py-2 text-sm border border-emerald-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              onChange={(e) => (shopDomainRef = e.target.value)}
+            />
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  const res = await integrationsApi.startShopifyOAuth(merchantId, shopDomainRef || '');
+                  if (res.authorize) {
+                    window.location.href = res.authorize;
+                  }
+                } catch (e: any) {
+                  alert('Start OAuth failed: ' + (e.response?.data?.detail || e.message));
+                }
+              }}
+              className="px-4 py-2 text-sm font-medium text-white bg-emerald-600 rounded-md hover:bg-emerald-700"
+            >
+              Connect Shopify
+            </button>
+          </div>
+        </div>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-6">

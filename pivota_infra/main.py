@@ -33,6 +33,7 @@ from routes.auth_ws_routes import router as auth_ws_router
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
+from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 
 # Service routers (only include what exists)
@@ -84,6 +85,7 @@ app.include_router(auth_ws_router)  # Authenticated WebSocket
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
+app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
@@ -182,6 +184,27 @@ async def startup():
                 """)
                 col_exists = await database.fetch_one(check_col)
                 
+                if not col_exists:
+                    logger.info(f"📝 Adding {col_name} column to merchant_onboarding...")
+                    await database.execute(text(f"""
+                        ALTER TABLE merchant_onboarding 
+                        ADD COLUMN IF NOT EXISTS {col_name} {col_type};
+                    """))
+                    logger.info(f"✅ {col_name} column added successfully")
+
+            # Migration 3: MCP columns
+            mcp_columns = [
+                ("mcp_connected", "BOOLEAN DEFAULT FALSE"),
+                ("mcp_platform", "VARCHAR(50)")
+            ]
+            for col_name, col_type in mcp_columns:
+                check_col = text(f"""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='merchant_onboarding' 
+                    AND column_name='{col_name}';
+                """)
+                col_exists = await database.fetch_one(check_col)
                 if not col_exists:
                     logger.info(f"📝 Adding {col_name} column to merchant_onboarding...")
                     await database.execute(text(f"""

@@ -18,7 +18,7 @@ merchant_onboarding = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("merchant_id", String(50), unique=True, index=True),  # Auto-generated
     Column("business_name", String(255), nullable=False),
-    Column("store_url", String(500), nullable=False),  # Required for KYB and MCP
+    Column("store_url", String(500), nullable=False, index=True),  # Required for KYB and MCP
     Column("website", String(500)),  # Optional, for additional info
     Column("region", String(50)),  # e.g., US, EU, APAC
     Column("contact_email", String(255), nullable=False),
@@ -30,6 +30,11 @@ merchant_onboarding = Table(
     Column("psp_connected", Boolean, default=False),
     Column("psp_type", String(50), nullable=True),  # stripe, adyen, shoppay
     Column("psp_sandbox_key", Text, nullable=True),  # Encrypted API key
+    # MCP 集成标记
+    Column("mcp_connected", Boolean, default=False),
+    Column("mcp_platform", String(50), nullable=True),  # shopify/wix/woocommerce
+    Column("mcp_shop_domain", String(255), nullable=True),
+    Column("mcp_access_token", Text, nullable=True),
     Column("api_key", String(255), unique=True, nullable=True),  # Merchant's API key for /payment/execute
     Column("api_key_hash", String(255), nullable=True),  # Hashed version for verification
     Column("kyc_documents", JSON, nullable=True),  # JSON blob of uploaded docs
