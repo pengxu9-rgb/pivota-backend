@@ -188,15 +188,21 @@ async def startup():
         await database.execute("SELECT 1")
         logger.info("✅ Database connection test passed")
         
-        # Create merchant tables if they don't exist
+        # Create tables if they don't exist
         logger.info("📋 Creating tables...")
         from db.merchants import merchants, kyb_documents
         from db.merchant_onboarding import merchant_onboarding
         from db.payment_router import payment_router_config
-        from db.products import products, product_sync_history
+        from db.products import (
+            products_cache, api_call_events, order_events, merchant_analytics
+        )
         from db.database import metadata, engine
         metadata.create_all(engine)
-        logger.info("✅ Tables created (merchants, kyb_documents, merchant_onboarding, payment_router_config, products, product_sync_history)")
+        logger.info("✅ Tables created:")
+        logger.info("   - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config")
+        logger.info("   - Cache: products_cache")
+        logger.info("   - Events: api_call_events, order_events")
+        logger.info("   - Analytics: merchant_analytics")
         
         # Run migrations for merchant_onboarding table
         logger.info("🔄 Running database migrations...")
