@@ -26,6 +26,9 @@ from db.payment_router import register_merchant_psp_route
 from db.database import database
 from routes.auth_routes import get_current_user, require_admin
 from urllib.parse import urlparse
+from utils.r2_storage import upload_file_to_r2, get_presigned_url
+from fastapi.responses import StreamingResponse
+import io
 
 router = APIRouter(prefix="/merchant/onboarding", tags=["merchant-onboarding"])
 
@@ -710,33 +713,96 @@ async def upload_kyc_files(
     files: list[UploadFile] = File(...),
     document_type: str = Form("other")
 ):
-    """Multipart 多文件上传（商户门户使用，无需鉴权）。仅存元数据。"""
+    """Multipart 多文件上传（商户门户使用，无需鉴权）。上传到 R2 并存元数据。"""
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
     stored: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    
     for f in files:
-        meta = {
-            "name": f.filename,
-            "content_type": f.content_type,
-            "size": None,
-            "document_type": document_type,
-            "uploaded_at": datetime.now().isoformat()
-        }
         try:
+            # 读取文件内容
             content = await f.read()
-            meta["size"] = len(content)
-        except Exception:
-            meta["size"] = None
-        ok = await add_kyc_document(merchant_id, meta)
-        if ok:
-            stored.append(meta)
+            file_size = len(content)
+            
+            # 上传到 R2
+            success, file_key, error = await upload_file_to_r2(
+                file_content=content,
+                filename=f.filename,
+                merchant_id=merchant_id,
+                content_type=f.content_type or "application/octet-stream"
+            )
+            
+            if not success:
+                errors.append(f"{f.filename}: {error}")
+                continue
+            
+            # 存储元数据（包含 R2 文件键）
+            meta = {
+                "name": f.filename,
+                "content_type": f.content_type,
+                "size": file_size,
+                "document_type": document_type,
+                "uploaded_at": datetime.now().isoformat(),
+                "r2_key": file_key  # R2 中的文件键，用于下载
+            }
+            
+            ok = await add_kyc_document(merchant_id, meta)
+            if ok:
+                stored.append(meta)
+            else:
+                errors.append(f"{f.filename}: Failed to save metadata")
+                
+        except Exception as e:
+            errors.append(f"{f.filename}: {str(e)}")
 
     return {
-        "status": "success",
-        "message": f"Stored {len(stored)} document(s) metadata",
+        "status": "success" if stored else "error",
+        "message": f"Uploaded {len(stored)} file(s) to R2",
         "merchant_id": merchant_id,
-        "documents": stored
+        "documents": stored,
+        "errors": errors if errors else None
     }
+
+@router.get("/document/download/{merchant_id}/{document_index}")
+async def download_kyc_document(
+    merchant_id: str,
+    document_index: int,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    Admin: 下载/预览 KYC 文档
+    通过预签名 URL 重定向，有效期 1 小时
+    """
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    
+    docs = merchant.get("kyc_documents") or []
+    if document_index >= len(docs):
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    doc = docs[document_index]
+    r2_key = doc.get("r2_key")
+    
+    if not r2_key:
+        raise HTTPException(
+            status_code=404,
+            detail="File not stored in R2 (legacy metadata-only document)"
+        )
+    
+    # 生成预签名 URL（1 小时有效）
+    success, presigned_url, error = await get_presigned_url(r2_key, expiration=3600)
+    
+    if not success:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate download URL: {error}"
+        )
+    
+    # 重定向到预签名 URL
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=presigned_url)
 

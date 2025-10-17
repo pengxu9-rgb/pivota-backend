@@ -21,8 +21,13 @@ export default function KYBReviewModal({ merchant, open, onClose }: KYBReviewMod
       try {
         setLoadingDocs(true);
         const full = await merchantApi.getDetails(merchant.merchant_id);
+        console.log('🔍 KYB Modal - Fetched merchant details:', full);
+        console.log('🔍 KYB Modal - kyc_documents:', full.kyc_documents);
+        console.log('🔍 KYB Modal - kyc_documents type:', typeof full.kyc_documents);
+        console.log('🔍 KYB Modal - kyc_documents length:', full.kyc_documents?.length);
         setDocs(full.kyc_documents || []);
       } catch (e) {
+        console.error('❌ KYB Modal - Failed to fetch details:', e);
         // 静默失败，保留已有元数据
       } finally {
         setLoadingDocs(false);
@@ -78,7 +83,7 @@ export default function KYBReviewModal({ merchant, open, onClose }: KYBReviewMod
             </div>
             {(!docs || docs.length === 0) ? (
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-md text-sm text-slate-500">
-                No documents uploaded yet.
+                No documents uploaded yet. (Debug: docs={JSON.stringify(docs)})
               </div>
             ) : (
               <div className="max-h-48 overflow-auto border border-slate-200 rounded-md divide-y">

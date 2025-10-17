@@ -166,6 +166,15 @@ async def get_version():
 async def startup():
     """Initialize services on startup"""
     logger.info("🚀 Starting Pivota Infrastructure Dashboard...")
+    
+    # 初始化 R2 存储
+    try:
+        from utils.r2_storage import startup as r2_startup
+        r2_startup()
+        logger.info("✅ R2 storage client initialized")
+    except Exception as e:
+        logger.warning(f"⚠️ R2 storage initialization skipped: {e}")
+    
     try:
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")

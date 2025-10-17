@@ -110,3 +110,4 @@ export default function MerchantDetailsModal({ merchant, open, onClose }: Mercha
   );
 }
 
+

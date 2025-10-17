@@ -148,3 +148,4 @@ export default function UploadDocsModal({ merchant, open, onClose }: UploadDocsM
   );
 }
 
+

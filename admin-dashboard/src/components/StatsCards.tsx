@@ -76,3 +76,4 @@ export default function StatsCards({ merchants, loading }: StatsCardsProps) {
   );
 }
 
+
