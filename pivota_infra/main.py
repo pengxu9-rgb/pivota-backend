@@ -44,6 +44,8 @@ from routes.agent_api import router as agent_api_router
 from routes.agent_management import router as agent_management_router
 from routes.shopify_setup import router as shopify_setup_router
 from routes.shopify_manual import router as shopify_manual_router
+from routes.fulfillment_api import router as fulfillment_api_router
+from routes.refund_api import router as refund_api_router
 
 # Service routers (only include what exists)
 try:
@@ -101,6 +103,8 @@ app.include_router(order_router)  # Order processing
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
 app.include_router(agent_management_router)  # Agent management
+app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
+app.include_router(refund_api_router)  # Refund processing
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
 app.include_router(dashboard_router)  # Dashboard API
