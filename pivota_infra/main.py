@@ -30,8 +30,8 @@ from routes.payment_routes import router as payment_routes_router
 from routes.demo_data_routes import router as demo_data_router
 from routes.test_data_routes import router as test_data_router
 from routes.simple_ws_routes import router as simple_ws_router
-from routes.auth_routes import router as auth_router
-from routes.auth_ws_routes import router as auth_ws_router
+from routes.agent_metrics_routes import router as agent_metrics_router
+from routes.auth import router as auth_router  # New clean auth system
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
@@ -91,8 +91,7 @@ app.add_middleware(
 app.include_router(agent_router)
 app.include_router(psp_router)
 app.include_router(payment_router)
-app.include_router(auth_router)  # Authentication
-app.include_router(auth_ws_router)  # Authenticated WebSocket
+app.include_router(auth_router)  # New authentication system
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
@@ -113,6 +112,7 @@ app.include_router(payment_routes_router)  # Payment Processing API
 app.include_router(demo_data_router)  # Demo data management
 app.include_router(test_data_router)  # Test data for Lovable
 app.include_router(simple_ws_router)  # Simple WebSocket
+app.include_router(agent_metrics_router)  # Agent metrics API
 
 if SIMPLE_MAPPING_AVAILABLE:
     app.include_router(simple_mapping_router)
