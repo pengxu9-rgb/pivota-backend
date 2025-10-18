@@ -32,6 +32,7 @@ from routes.test_data_routes import router as test_data_router
 from routes.simple_ws_routes import router as simple_ws_router
 from routes.agent_metrics_routes import router as agent_metrics_router
 from routes.auth import router as auth_router  # New clean auth system
+from routes.debug_auth import router as debug_auth_router  # Temporary debug routes
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
@@ -92,6 +93,7 @@ app.include_router(agent_router)
 app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
+app.include_router(debug_auth_router)  # Debug routes (temporary)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
