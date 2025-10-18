@@ -5,6 +5,7 @@ import { ProtectedRoute } from './components/ProtectedRoute';
 import { Layout } from './components/Layout';
 import { LoginPage } from './pages/LoginPage';
 import { AdminDashboard } from './pages/AdminDashboard';
+import { EmployeeDashboard } from './pages/EmployeeDashboard';
 import { MerchantOnboardingDashboard } from './components/MerchantOnboardingDashboard';
 
 const AppRoutes: React.FC = () => {
@@ -27,30 +28,44 @@ const AppRoutes: React.FC = () => {
     );
   }
 
+  // Route based on user role
+  const defaultRoute = user?.role && ['employee', 'admin', 'super_admin'].includes(user.role) 
+    ? '/employee' 
+    : '/admin';
+
   return (
-    <Layout>
-      <Routes>
-        <Route path="/admin" element={
+    <Routes>
+      <Route path="/employee" element={
+        <ProtectedRoute requireAdmin={false}>
+          <EmployeeDashboard />
+        </ProtectedRoute>
+      } />
+      <Route path="/admin" element={
+        <Layout>
           <ProtectedRoute requireAdmin={true}>
             <AdminDashboard />
           </ProtectedRoute>
-        } />
-        <Route path="/admin/users" element={
+        </Layout>
+      } />
+      <Route path="/admin/users" element={
+        <Layout>
           <ProtectedRoute requireAdmin={true}>
             <AdminDashboard />
           </ProtectedRoute>
-        } />
-        <Route path="/admin/psp" element={
+        </Layout>
+      } />
+      <Route path="/admin/psp" element={
+        <Layout>
           <ProtectedRoute requireAdmin={true}>
             <AdminDashboard />
           </ProtectedRoute>
-        } />
-        <Route path="/merchant/onboarding" element={<MerchantOnboardingDashboard />} />
-        <Route path="/login" element={<Navigate to="/admin" replace />} />
-        <Route path="/" element={<Navigate to="/admin" replace />} />
-        <Route path="*" element={<Navigate to="/admin" replace />} />
-      </Routes>
-    </Layout>
+        </Layout>
+      } />
+      <Route path="/merchant/onboarding" element={<MerchantOnboardingDashboard />} />
+      <Route path="/login" element={<Navigate to={defaultRoute} replace />} />
+      <Route path="/" element={<Navigate to={defaultRoute} replace />} />
+      <Route path="*" element={<Navigate to={defaultRoute} replace />} />
+    </Routes>
   );
 };
 
