@@ -10,8 +10,8 @@ pydantic
 pydantic-settings
 alembic      # optional for migrations later
 # aiosqlite removed - PostgreSQL only
-PyJWT        # for JWT token handling
-bcrypt       # for password hashing
+PyJWT==2.8.0        # for JWT token handling
+bcrypt==4.1.2       # for password hashing
 jinja2       # for HTML templates
 websockets   # for WebSocket support
 aiohttp      # for async HTTP requests in admin routes
