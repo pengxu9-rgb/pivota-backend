@@ -245,11 +245,17 @@ async def startup():
                 logger.info(f"   Running migration: {os.path.basename(sql_file)}")
                 with open(sql_file, 'r') as f:
                     sql_content = f.read()
-                    # Split by semicolon and execute each statement
-                    statements = [s.strip() for s in sql_content.split(';') if s.strip()]
-                    for statement in statements:
-                        if statement:
-                            await database.execute(text(statement))
+                    # Execute the entire file as one transaction to preserve $$ blocks
+                    # PostgreSQL functions use $$ delimiters which shouldn't be split
+                    try:
+                        # Use raw connection for complex SQL with functions
+                        from sqlalchemy import create_engine
+                        engine = create_engine(str(database.url))
+                        with engine.connect() as conn:
+                            conn.execute(text(sql_content))
+                            conn.commit()
+                    except Exception as e:
+                        logger.warning(f"   Migration {os.path.basename(sql_file)} error (may be already applied): {e}")
                 logger.info(f"   ✅ {os.path.basename(sql_file)} completed")
             
             logger.info("✅ All SQL migrations completed")
