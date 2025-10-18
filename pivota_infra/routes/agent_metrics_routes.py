@@ -47,7 +47,8 @@ async def get_agent_dashboard(agent_id: str):
     """
     try:
         # Verify agent exists
-        agent = await get_agent_onboarding(agent_id)
+        query = agents.select().where(agents.c.agent_id == agent_id)
+        agent = await database.fetch_one(query)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
         
@@ -232,7 +233,8 @@ async def get_rate_limits(agent_id: str):
     """
     try:
         # Verify agent exists
-        agent = await get_agent_onboarding(agent_id)
+        query = agents.select().where(agents.c.agent_id == agent_id)
+        agent = await database.fetch_one(query)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
         
