@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 
 from db.database import database
-from db.agent_onboarding import get_agent_onboarding
+from db.agents import agents  # Use agents table instead
 from utils.logger import logger
 
 router = APIRouter(prefix="/api/agent-metrics", tags=["agent-metrics"])
