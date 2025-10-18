@@ -41,8 +41,8 @@ async def debug_users():
 async def test_password(email: str, password: str):
     """Test password verification"""
     try:
-        query = text("SELECT email, password_hash FROM users WHERE email = :email")
-        user = await database.fetch_one(query, values={"email": email})
+        query = "SELECT email, password_hash FROM users WHERE email = :email"
+        user = await database.fetch_one(query=query, values={"email": email})
         
         if not user:
             return {"error": "User not found"}
