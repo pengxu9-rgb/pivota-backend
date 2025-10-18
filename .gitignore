@@ -74,6 +74,9 @@ next-env.d.ts
 monitor_deploy.py
 test_*.py
 
-# Large project directories (already tracked separately)
+# Large project directories (already tracked separately or have their own Git repos)
 lovable-website/
 pivota-frontend/
+pivota-agents-portal/
+pivota-merchants-portal/
+pivota-employee-portal/
