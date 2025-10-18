@@ -231,8 +231,33 @@ async def startup():
         logger.info("   - Events: api_call_events, order_events")
         logger.info("   - Analytics: merchant_analytics")
         
-        # Run migrations for merchant_onboarding table
-        logger.info("🔄 Running database migrations...")
+        # Run SQL migration files
+        logger.info("🔄 Running SQL migration files...")
+        try:
+            from sqlalchemy import text
+            import glob
+            
+            # Run all SQL migration files in order
+            migration_dir = os.path.join(os.path.dirname(__file__), "db", "migrations")
+            sql_files = sorted(glob.glob(os.path.join(migration_dir, "*.sql")))
+            
+            for sql_file in sql_files:
+                logger.info(f"   Running migration: {os.path.basename(sql_file)}")
+                with open(sql_file, 'r') as f:
+                    sql_content = f.read()
+                    # Split by semicolon and execute each statement
+                    statements = [s.strip() for s in sql_content.split(';') if s.strip()]
+                    for statement in statements:
+                        if statement:
+                            await database.execute(text(statement))
+                logger.info(f"   ✅ {os.path.basename(sql_file)} completed")
+            
+            logger.info("✅ All SQL migrations completed")
+        except Exception as migration_err:
+            logger.warning(f"⚠️ SQL migration warning: {migration_err}")
+        
+        # Run inline migrations for merchant_onboarding table
+        logger.info("🔄 Running inline database migrations...")
         try:
             from sqlalchemy import text
             logger.info("   Checking for store_url column...")
