@@ -3,7 +3,7 @@ Manual Shopify order creation endpoint for debugging
 """
 from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, Any
-from routes.auth_routes import require_admin
+from utils.auth import require_admin
 from routes.order_routes import create_shopify_order
 from db.orders import get_order
 from db.merchant_onboarding import get_merchant_onboarding

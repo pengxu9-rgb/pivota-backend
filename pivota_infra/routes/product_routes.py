@@ -18,7 +18,7 @@ from db.products import (
     get_cached_products, upsert_product_cache, mark_cache_accessed,
     log_api_call, cleanup_expired_cache
 )
-from routes.auth_routes import require_admin
+from utils.auth import require_admin
 from config.settings import settings
 
 router = APIRouter(prefix="/products", tags=["products"])

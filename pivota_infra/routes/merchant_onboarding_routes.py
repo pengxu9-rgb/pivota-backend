@@ -24,7 +24,7 @@ from db.merchant_onboarding import (
 )
 from db.payment_router import register_merchant_psp_route
 from db.database import database
-from routes.auth_routes import get_current_user, require_admin
+from utils.auth import get_current_user, require_admin
 from urllib.parse import urlparse
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
 from fastapi.responses import StreamingResponse

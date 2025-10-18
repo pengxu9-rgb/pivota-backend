@@ -9,7 +9,7 @@ from db.merchant_onboarding import merchant_onboarding, get_merchant_onboarding
 from db.orders import orders
 from db.database import database
 from routes.order_routes import create_shopify_order
-from routes.auth_routes import require_admin
+from utils.auth import require_admin
 from utils.logger import logger
 
 router = APIRouter(prefix="/shopify-setup", tags=["Shopify Setup"])

@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from routes.auth_routes import require_admin
+from utils.auth import require_admin
 from utils.logger import logger
 
 

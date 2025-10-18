@@ -173,6 +173,9 @@ async def get_current_agent(current_user: Dict[str, Any] = Depends(get_current_u
     """Require agent role"""
     return await require_role("agent", current_user)
 
+# Alias for backward compatibility
+require_admin = get_current_admin
+
 
 # ==================== Backward Compatibility Functions ====================
 # These functions provide compatibility with the old auth system

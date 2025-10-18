@@ -22,7 +22,7 @@ from db.orders import (
 )
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
-from routes.auth_routes import require_admin
+from utils.auth import require_admin
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
 from utils.logger import logger

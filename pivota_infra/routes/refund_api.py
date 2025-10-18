@@ -12,7 +12,7 @@ from datetime import datetime
 from db.orders import get_order, update_order_status
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
-from routes.auth_routes import require_admin
+from utils.auth import require_admin
 from adapters.psp_adapter import get_psp_adapter
 from config.settings import settings
 from utils.logger import logger

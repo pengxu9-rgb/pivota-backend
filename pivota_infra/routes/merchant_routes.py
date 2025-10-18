@@ -6,7 +6,7 @@ Endpoints for merchant onboarding, KYB, and management
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
-from routes.auth_routes import get_current_user, require_admin
+from utils.auth import get_current_user, require_admin
 from db.merchants import (
     create_merchant, get_merchant, get_all_merchants,
     update_merchant_status, add_kyb_document, get_merchant_documents,
