@@ -172,3 +172,49 @@ async def get_current_merchant(current_user: Dict[str, Any] = Depends(get_curren
 async def get_current_agent(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """Require agent role"""
     return await require_role("agent", current_user)
+
+
+# ==================== Backward Compatibility Functions ====================
+# These functions provide compatibility with the old auth system
+
+def verify_jwt_token(token: str) -> Dict[str, Any]:
+    """
+    Verify JWT token and return payload (backward compatibility)
+    
+    Raises:
+        HTTPException: If token is invalid or expired
+    """
+    return decode_access_token(token)
+
+def create_jwt_token(
+    user_id: str,
+    role: str,
+    entity_id: Optional[str] = None,
+    expires_delta: Optional[timedelta] = None
+) -> str:
+    """
+    Create JWT token (backward compatibility)
+    
+    Args:
+        user_id: User ID
+        role: User role
+        entity_id: Entity ID (merchant_id, agent_id, etc.)
+        expires_delta: Token expiration time
+    
+    Returns:
+        Encoded JWT token
+    """
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "entity_id": entity_id,
+        "exp": expire,
+        "iat": datetime.utcnow()
+    }
+    
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
