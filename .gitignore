@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Testing
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Build artifacts
+dist/
+build/
+*.zip
+*.tar.gz
+
+# Temporary files
+temp/
+tmp/
+.tmp/
+*.tmp
+*.bak
+*.backup
+
+# Next.js
+.next/
+out/
+.cache/
+next-env.d.ts
+
+# Monitoring
+monitor_deploy.py
+test_*.py
+
+# Large project directories (already tracked separately)
+lovable-website/
+pivota-frontend/
