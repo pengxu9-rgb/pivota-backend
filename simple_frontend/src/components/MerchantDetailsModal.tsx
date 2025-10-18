@@ -214,7 +214,7 @@ export const MerchantDetailsModal: React.FC<MerchantDetailsModalProps> = ({
           )}
         </div>
 
-        <div className="sticky bottom-0 bg-gray-50 border-t border-gray-200 p-4">
+        <div className="bg-gray-50 border-t border-gray-200 p-4">
           <button onClick={onClose} className="btn btn-primary w-full">
             Close
           </button>

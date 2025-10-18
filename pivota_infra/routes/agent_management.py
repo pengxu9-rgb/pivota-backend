@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import require_admin
+from utils.auth import require_admin, get_current_employee
 from utils.logger import logger
 
 
@@ -58,7 +58,7 @@ class UpdateAgentRequest(BaseModel):
 @router.post("/create")
 async def create_new_agent(
     request: CreateAgentRequest,
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """
     创建新的 AI Agent
@@ -94,7 +94,7 @@ async def create_new_agent(
 @router.get("/{agent_id}")
 async def get_agent_details(
     agent_id: str,
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """获取 Agent 详情（不含 API Key）"""
     agent = await get_agent(agent_id)
@@ -111,7 +111,7 @@ async def get_agent_details(
 async def update_agent(
     agent_id: str,
     request: UpdateAgentRequest,
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """更新 Agent 配置"""
     try:
@@ -162,7 +162,7 @@ async def update_agent(
 @router.delete("/{agent_id}")
 async def deactivate_agent(
     agent_id: str,
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """停用 Agent（软删除）"""
     try:
@@ -203,7 +203,7 @@ async def list_agents(
     search: Optional[str] = None,
     limit: int = Query(default=50, le=100),
     offset: int = Query(default=0, ge=0),
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """
     列出所有 Agents
@@ -271,7 +271,7 @@ async def list_agents(
 async def get_agent_analytics_endpoint(
     agent_id: str,
     days: int = Query(default=30, le=365),
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """
     获取 Agent 分析数据
@@ -316,7 +316,7 @@ async def get_agent_usage(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     limit: int = Query(default=100, le=1000),
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """
     获取 Agent 使用日志
@@ -368,7 +368,7 @@ async def get_agent_usage(
 @router.post("/{agent_id}/reset-api-key")
 async def reset_agent_api_key(
     agent_id: str,
-    admin_user: dict = Depends(require_admin)
+    admin_user: dict = Depends(get_current_employee)
 ):
     """
     重置 Agent API Key

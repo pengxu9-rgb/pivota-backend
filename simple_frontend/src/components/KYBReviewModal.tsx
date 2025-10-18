@@ -265,7 +265,7 @@ export const KYBReviewModal: React.FC<KYBReviewModalProps> = ({
           )}
         </div>
 
-        <div className="sticky bottom-0 bg-gray-50 border-t border-gray-200 p-4">
+        <div className="bg-gray-50 border-t border-gray-200 p-4">
           <button onClick={onClose} className="btn btn-secondary w-full">
             Close
           </button>

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Merchant, merchantApi, integrationsApi } from '../lib/api';
-import { Search, RefreshCw, Eye, FileCheck, Upload, Trash2, ExternalLink, Link, Boxes } from 'lucide-react';
+import { Search, RefreshCw, Eye, FileCheck, Upload, Trash2, ExternalLink, Link, Boxes, MoreVertical } from 'lucide-react';
 import { formatDate } from '../lib/utils';
 import MerchantDetailsModal from './MerchantDetailsModal';
 import KYBReviewModal from './KYBReviewModal';
@@ -212,74 +212,34 @@ export default function MerchantTable({ merchants, loading, onRefresh }: Merchan
                     <span className="text-sm text-slate-700">{formatDate(merchant.created_at)}</span>
                   </td>
                   <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => {
-                          setSelectedMerchant(merchant);
-                          setShowDetailsModal(true);
-                        }}
-                        className="p-1.5 text-slate-600 hover:text-primary hover:bg-slate-100 rounded"
-                        title="View Details"
-                      >
-                        <Eye className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={() => {
-                          setSelectedMerchant(merchant);
-                          setShowKYBModal(true);
-                        }}
-                        className="p-1.5 text-slate-600 hover:text-blue-600 hover:bg-blue-50 rounded"
-                        title="Review KYB"
-                      >
-                        <FileCheck className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={() => {
-                          setSelectedMerchant(merchant);
-                          setShowUploadModal(true);
-                        }}
-                        className="p-1.5 text-slate-600 hover:text-green-600 hover:bg-green-50 rounded"
-                        title="Upload Docs"
-                      >
-                        <Upload className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={async () => {
-                          try {
-                            await integrationsApi.connectShopify(merchant.merchant_id);
-                            alert('Shopify connected!');
-                            onRefresh();
-                          } catch (e: any) {
-                            alert('Connect failed: ' + (e.response?.data?.detail || e.message));
-                          }
-                        }}
-                        className="p-1.5 text-slate-600 hover:text-emerald-600 hover:bg-emerald-50 rounded"
-                        title="Connect Shopify"
-                      >
-                        <Link className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={async () => {
-                          try {
-                            const res = await integrationsApi.syncShopifyProducts(merchant.merchant_id, 20);
-                            console.log('Products:', res);
-                            alert('Sync started (see console for result)');
-                          } catch (e: any) {
-                            alert('Sync failed: ' + (e.response?.data?.detail || e.message));
-                          }
-                        }}
-                        className="p-1.5 text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 rounded"
-                        title="Sync Products"
-                      >
-                        <Boxes className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(merchant)}
-                        className="p-1.5 text-slate-600 hover:text-red-600 hover:bg-red-50 rounded"
-                        title="Delete"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                    <div className="relative inline-block text-left">
+                      <details>
+                        <summary className="list-none p-1.5 rounded hover:bg-slate-100 cursor-pointer inline-flex items-center">
+                          <MoreVertical className="w-4 h-4 text-slate-600" />
+                        </summary>
+                        <div className="absolute right-0 mt-2 w-48 origin-top-right rounded-md bg-white shadow-lg ring-1 ring-black/5 focus:outline-none z-20">
+                          <div className="py-1">
+                            <button onClick={() => { setSelectedMerchant(merchant); setShowDetailsModal(true); }} className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2">
+                              <Eye className="w-4 h-4" /> View Details
+                            </button>
+                            <button onClick={() => { setSelectedMerchant(merchant); setShowKYBModal(true); }} className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2">
+                              <FileCheck className="w-4 h-4" /> Review KYB
+                            </button>
+                            <button onClick={() => { setSelectedMerchant(merchant); setShowUploadModal(true); }} className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2">
+                              <Upload className="w-4 h-4" /> Upload Docs
+                            </button>
+                            <button onClick={async () => { try { await integrationsApi.connectShopify(merchant.merchant_id); alert('Shopify connected!'); onRefresh(); } catch (e: any) { alert('Connect failed: ' + (e.response?.data?.detail || e.message)); } }} className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2">
+                              <Link className="w-4 h-4" /> Connect Shopify
+                            </button>
+                            <button onClick={async () => { try { const res = await integrationsApi.syncShopifyProducts(merchant.merchant_id, 20); console.log('Products:', res); alert('Sync started (see console for result)'); } catch (e: any) { alert('Sync failed: ' + (e.response?.data?.detail || e.message)); } }} className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2">
+                              <Boxes className="w-4 h-4" /> Sync Products
+                            </button>
+                            <button onClick={() => handleDelete(merchant)} className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2 text-red-600">
+                              <Trash2 className="w-4 h-4" /> Delete
+                            </button>
+                          </div>
+                        </div>
+                      </details>
                     </div>
                   </td>
                 </tr>
