@@ -218,3 +218,62 @@ def create_jwt_token(
     }
     
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def validate_entity_access(user_info: Dict[str, Any], entity_id: str, entity_type: str = "any") -> bool:
+    """
+    Validate if user has access to a specific entity (backward compatibility)
+    
+    Args:
+        user_info: User information from JWT token
+        entity_id: Entity ID to check access for
+        entity_type: Type of entity (merchant, agent, etc.)
+    
+    Returns:
+        True if user has access, False otherwise
+    """
+    role = user_info.get("role", "")
+    
+    # Admins and employees have access to everything
+    if role in ADMIN_ROLES or role in EMPLOYEE_ROLES:
+        return True
+    
+    # Check if user's entity_id matches
+    user_entity_id = user_info.get("entity_id")
+    if user_entity_id == entity_id:
+        return True
+    
+    return False
+
+def check_permission(user_info: Dict[str, Any], required_permission: str) -> bool:
+    """
+    Check if user has a specific permission (backward compatibility)
+    
+    Args:
+        user_info: User information from JWT token
+        required_permission: Permission string to check
+    
+    Returns:
+        True if user has permission, False otherwise
+    """
+    role = user_info.get("role", "")
+    
+    # Super admin has all permissions
+    if role == "super_admin":
+        return True
+    
+    # Admin has most permissions
+    if role == "admin":
+        # Admins can't modify super admin settings
+        if "super_admin" not in required_permission:
+            return True
+    
+    # Define permission mappings
+    permission_map = {
+        "employee": ["view_dashboard", "view_transactions", "view_merchants", "view_agents"],
+        "merchant": ["view_own_orders", "view_own_transactions", "manage_own_products"],
+        "agent": ["create_orders", "view_own_orders", "view_own_analytics"],
+        "outsourced": ["view_dashboard", "view_transactions"]
+    }
+    
+    allowed_permissions = permission_map.get(role, [])
+    return required_permission in allowed_permissions
