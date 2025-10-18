@@ -320,6 +320,34 @@ export const adminApi = {
   },
 };
 
+// Agent API
+export const agentApi = {
+  list: async () => {
+    const response = await api.get('/agents/');
+    return response.data.agents || [];
+  },
+  
+  getDetails: async (agentId: string) => {
+    const response = await api.get(`/agents/${agentId}`);
+    return response.data.agent;
+  },
+  
+  getAnalytics: async (agentId: string, days = 30) => {
+    const response = await api.get(`/agents/${agentId}/analytics`, { params: { days } });
+    return response.data;
+  },
+  
+  resetApiKey: async (agentId: string) => {
+    const response = await api.post(`/agents/${agentId}/reset-api-key`);
+    return response.data;
+  },
+  
+  deactivate: async (agentId: string) => {
+    const response = await api.delete(`/agents/${agentId}`);
+    return response.data;
+  }
+};
+
 // Better error message extractor
 export function getApiErrorMessage(err: any): string {
   return err?.response?.data?.detail || err?.message || err?.code || 'Unknown error';
