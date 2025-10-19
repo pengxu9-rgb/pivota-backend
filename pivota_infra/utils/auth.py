@@ -167,8 +167,17 @@ async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)
     return current_user
 
 
-# Alias for backward compatibility
-get_current_admin = require_admin
+async def get_current_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """
+    Alias for require_admin (backward compatibility)
+    Require admin or super_admin role
+    """
+    if current_user.get("role") not in ["admin", "super_admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
 
 
 async def get_current_employee(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
