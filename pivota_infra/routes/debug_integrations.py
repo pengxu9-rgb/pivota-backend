@@ -1,6 +1,6 @@
 """Debug endpoints for integration tables"""
 from fastapi import APIRouter, Depends
-from db import database
+from db.database import database
 from utils.auth import get_current_user
 
 router = APIRouter()
