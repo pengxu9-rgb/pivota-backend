@@ -22,7 +22,7 @@ from db.orders import (
 )
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
-from utils.auth import require_admin, verify_jwt_token
+from utils.auth import require_admin, get_current_user
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
 from utils.logger import logger
@@ -455,7 +455,7 @@ async def get_merchant_orders(
     status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    current_user: dict = Depends(verify_jwt_token)  # Allow authenticated users
+    current_user: dict = Depends(get_current_user)  # Allow authenticated users
 ):
     """获取商户的订单列表"""
     orders_list = await get_orders_by_merchant(merchant_id, status, limit, offset)
