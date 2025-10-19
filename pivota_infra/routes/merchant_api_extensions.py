@@ -211,27 +211,29 @@ async def connect_psp(
     }
     
     try:
-        query = """
-            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
-            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, :status, :connected_at)
-        """
-        await database.execute(query, {
-            "psp_id": psp_id,
-            "merchant_id": merchant_id,
-            "provider": provider,
-            "name": f"{provider.capitalize()} Account",
-            "api_key": api_key,
-            "account_id": account_id,
-            "capabilities": ','.join(capabilities),
-            "status": 'active',
-            "connected_at": datetime.now().isoformat()
-        })
-        print(f"✅ PSP saved to DB: {psp_id} for merchant {merchant_id}")
-        
-        # Verify the save
-        verify_query = "SELECT COUNT(*) as count FROM merchant_psps WHERE merchant_id = :merchant_id"
-        result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
-        print(f"✅ Total PSPs for merchant {merchant_id}: {result['count']}")
+        # Use transaction to ensure data is committed
+        async with database.transaction():
+            query = """
+                INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
+                VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, :status, :connected_at)
+            """
+            await database.execute(query, {
+                "psp_id": psp_id,
+                "merchant_id": merchant_id,
+                "provider": provider,
+                "name": f"{provider.capitalize()} Account",
+                "api_key": api_key,
+                "account_id": account_id,
+                "capabilities": ','.join(capabilities),
+                "status": 'active',
+                "connected_at": datetime.now().isoformat()
+            })
+            print(f"✅ PSP saved to DB: {psp_id} for merchant {merchant_id}")
+            
+            # Verify the save within transaction
+            verify_query = "SELECT COUNT(*) as count FROM merchant_psps WHERE merchant_id = :merchant_id"
+            result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
+            print(f"✅ Total PSPs for merchant {merchant_id} (in transaction): {result['count']}")
     except Exception as e:
         print(f"❌ PSP Database save error: {e}")
         import traceback
@@ -278,26 +280,28 @@ async def connect_store(
     }
     
     try:
-        query = """
-            INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, api_key, status, connected_at)
-            VALUES (:store_id, :merchant_id, :platform, :name, :domain, :api_key, :status, :connected_at)
-        """
-        await database.execute(query, {
-            "store_id": store_id,
-            "merchant_id": merchant_id,
-            "platform": platform,
-            "name": domain,
-            "domain": domain,
-            "api_key": api_key,
-            "status": 'connected',
-            "connected_at": datetime.now().isoformat()
-        })
-        print(f"✅ Store saved to DB: {store_id} for merchant {merchant_id}")
-        
-        # Verify the save
-        verify_query = "SELECT COUNT(*) as count FROM merchant_stores WHERE merchant_id = :merchant_id"
-        result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
-        print(f"✅ Total stores for merchant {merchant_id}: {result['count']}")
+        # Use transaction to ensure data is committed
+        async with database.transaction():
+            query = """
+                INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, api_key, status, connected_at)
+                VALUES (:store_id, :merchant_id, :platform, :name, :domain, :api_key, :status, :connected_at)
+            """
+            await database.execute(query, {
+                "store_id": store_id,
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "name": domain,
+                "domain": domain,
+                "api_key": api_key,
+                "status": 'connected',
+                "connected_at": datetime.now().isoformat()
+            })
+            print(f"✅ Store saved to DB: {store_id} for merchant {merchant_id}")
+            
+            # Verify the save within transaction
+            verify_query = "SELECT COUNT(*) as count FROM merchant_stores WHERE merchant_id = :merchant_id"
+            result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
+            print(f"✅ Total stores for merchant {merchant_id} (in transaction): {result['count']}")
     except Exception as e:
         print(f"❌ Store Database save error: {e}")
         import traceback
