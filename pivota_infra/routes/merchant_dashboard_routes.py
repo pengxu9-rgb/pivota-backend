@@ -151,6 +151,7 @@ async def get_merchant_stores(
     
     # Try to read from database
     try:
+        print(f"DEBUG get_merchant_stores: Querying for merchant_id: {merchant_id}")
         query = """
             SELECT store_id, platform, name, domain, status, connected_at, last_sync, product_count
             FROM merchant_stores
@@ -159,6 +160,7 @@ async def get_merchant_stores(
         """
         
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
+        print(f"DEBUG get_merchant_stores: Found {len(rows)} stores")
         for row in rows:
             stores.append({
                 "id": row["store_id"],
