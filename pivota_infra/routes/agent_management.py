@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import require_admin, get_current_employee, verify_jwt_token
+from utils.auth import require_admin, get_current_employee, get_current_user, verify_jwt_token
 from utils.logger import logger
 
 

@@ -11,7 +11,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from dashboard.core import dashboard_core, User, UserRole
-from utils.auth import verify_jwt_token
+from utils.auth import verify_jwt_token, get_current_user
 
 logger = logging.getLogger("dashboard_api")
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
