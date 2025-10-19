@@ -5,6 +5,11 @@ from datetime import datetime, timedelta
 import random
 import string
 from utils.auth import get_current_user
+try:
+    # Import in-memory data from extensions if available
+    from .merchant_api_extensions import merchant_stores_db, merchant_psps_db
+except Exception:
+    merchant_stores_db, merchant_psps_db = {}, {}
 
 router = APIRouter()
 
@@ -129,15 +134,11 @@ async def get_merchant_stores(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
-    if not merchant_data:
-        return {"status": "success", "data": {"stores": []}}
-    
-    return {
-        "status": "success",
-        "data": {
-            "stores": merchant_data["stores"]
-        }
-    }
+    demo_stores = merchant_data["stores"] if merchant_data else []
+    runtime_stores = merchant_stores_db.get(merchant_id, [])
+    stores = [*runtime_stores, *demo_stores]
+
+    return {"status": "success", "data": {"stores": stores}}
 
 @router.get("/merchant/{merchant_id}/psps")
 async def get_merchant_psps(
@@ -149,15 +150,11 @@ async def get_merchant_psps(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
-    if not merchant_data:
-        return {"status": "success", "data": {"psps": []}}
-    
-    return {
-        "status": "success",
-        "data": {
-            "psps": merchant_data["psps"]
-        }
-    }
+    demo_psps = merchant_data["psps"] if merchant_data else []
+    runtime_psps = merchant_psps_db.get(merchant_id, [])
+    psps = [*runtime_psps, *demo_psps]
+
+    return {"status": "success", "data": {"psps": psps}}
 
 @router.get("/merchant/{merchant_id}/orders")
 async def get_merchant_orders(

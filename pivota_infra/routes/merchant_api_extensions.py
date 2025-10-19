@@ -2,12 +2,17 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Dict, Any, Optional
 from utils.auth import get_current_user
+from datetime import datetime
 import httpx
 import os
 
 router = APIRouter()
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+# In-memory storage for merchant stores and PSPs
+merchant_stores_db = {}
+merchant_psps_db = {}
 
 async def get_merchant_id_from_user(current_user: dict) -> str:
     """Get merchant ID from current user"""
@@ -175,16 +180,30 @@ async def connect_psp(
     if not api_key or len(api_key) < 10:
         raise HTTPException(status_code=400, detail="Invalid API key")
     
-    # In real implementation, verify API key with PSP
-    # For now, accept and store
+    # Store PSP connection
+    if merchant_id not in merchant_psps_db:
+        merchant_psps_db[merchant_id] = []
+    
+    import random, string
+    psp_id = "psp_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    
+    new_psp = {
+        "id": psp_id,
+        "provider": provider,
+        "name": f"{provider.capitalize()} Account",
+        "status": "active",
+        "connected_at": datetime.now().isoformat() + "Z",
+        "account_id": "acct_" + ''.join(random.choices(string.digits, k=10)),
+        "capabilities": ["card", "bank_transfer"] if provider in ["stripe", "adyen"] else ["card"],
+        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****"
+    }
+    
+    merchant_psps_db[merchant_id].append(new_psp)
+    
     return {
         "status": "success",
         "message": f"{provider.capitalize()} connected successfully",
-        "data": {
-            "provider": provider,
-            "status": "active",
-            "connected_at": "2025-10-19T12:00:00Z"
-        }
+        "data": new_psp
     }
 
 @router.post("/merchant/integrations/store/connect")
@@ -204,16 +223,30 @@ async def connect_store(
     if not store_url or not api_key:
         raise HTTPException(status_code=400, detail="Store URL and API key required")
     
-    # In real implementation, verify credentials with platform
+    # Store connection in memory
+    if merchant_id not in merchant_stores_db:
+        merchant_stores_db[merchant_id] = []
+
+    import random, string
+    store_id = "store_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    domain = store_url.replace("https://", "").replace("http://", "").strip("/")
+
+    new_store = {
+        "id": store_id,
+        "platform": platform,
+        "name": domain,
+        "status": "connected",
+        "connected_at": datetime.now().isoformat() + "Z",
+        "domain": domain,
+        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****"
+    }
+
+    merchant_stores_db[merchant_id].append(new_store)
+
     return {
         "status": "success",
         "message": f"{platform.capitalize()} store connected successfully",
-        "data": {
-            "platform": platform,
-            "store_url": store_url,
-            "status": "connected",
-            "connected_at": "2025-10-19T12:00:00Z"
-        }
+        "data": new_store
     }
 
 @router.get("/merchant/orders/{order_id}")
