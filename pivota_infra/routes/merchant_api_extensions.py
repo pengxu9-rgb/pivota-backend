@@ -226,7 +226,7 @@ async def connect_psp(
                 "account_id": account_id,
                 "capabilities": ','.join(capabilities),
                 "status": 'active',
-                "connected_at": datetime.now().isoformat()
+                "connected_at": datetime.now()
             })
             print(f"✅ PSP saved to DB: {psp_id} for merchant {merchant_id}")
             
@@ -294,7 +294,7 @@ async def connect_store(
                 "domain": domain,
                 "api_key": api_key,
                 "status": 'connected',
-                "connected_at": datetime.now().isoformat()
+                "connected_at": datetime.now()
             })
             print(f"✅ Store saved to DB: {store_id} for merchant {merchant_id}")
             
