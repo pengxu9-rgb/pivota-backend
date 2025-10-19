@@ -233,10 +233,11 @@ async def connect_psp(
         result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
         print(f"✅ Total PSPs for merchant {merchant_id}: {result['count']}")
     except Exception as e:
-        print(f"❌ Database save error: {e}")
+        print(f"❌ PSP Database save error: {e}")
         import traceback
         traceback.print_exc()
-        # Continue even if database save fails
+        # Return error instead of success if save fails
+        raise HTTPException(status_code=500, detail=f"Failed to save PSP: {str(e)}")
     
     return {
         "status": "success",
@@ -298,10 +299,11 @@ async def connect_store(
         result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
         print(f"✅ Total stores for merchant {merchant_id}: {result['count']}")
     except Exception as e:
-        print(f"❌ Database save error: {e}")
+        print(f"❌ Store Database save error: {e}")
         import traceback
         traceback.print_exc()
-        # Continue even if database save fails
+        # Return error instead of success if save fails
+        raise HTTPException(status_code=500, detail=f"Failed to save store: {str(e)}")
     
     return {
         "status": "success",
