@@ -266,10 +266,6 @@ async def get_rate_limits(agent_id: str):
 
 
 
-
-API endpoints for tracking agent performance and API usage
-"""
-
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Query, Depends
