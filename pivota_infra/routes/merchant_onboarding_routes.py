@@ -24,7 +24,7 @@ from db.merchant_onboarding import (
 )
 from db.payment_router import register_merchant_psp_route
 from db.database import database
-from utils.auth import get_current_user, require_admin
+from utils.auth import get_current_user, require_admin, verify_jwt_token
 from urllib.parse import urlparse
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
 from fastapi.responses import StreamingResponse
@@ -482,7 +482,7 @@ async def get_onboarding_status(merchant_id: str):
 @router.get("/details/{merchant_id}", response_model=Dict[str, Any])
 async def get_onboarding_details(
     merchant_id: str,
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(verify_jwt_token)  # Allow all authenticated users
 ):
     """
     Get full onboarding merchant details including KYB documents
@@ -517,7 +517,7 @@ async def get_onboarding_details(
 async def list_all_onboardings(
     status: Optional[str] = None,
     include_deleted: bool = False,
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(verify_jwt_token)  # Allow authenticated users (employee/admin/agent)
 ):
     """
     Admin: List all merchant onboardings (filtered by status if provided)

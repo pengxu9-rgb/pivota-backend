@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import require_admin, get_current_employee
+from utils.auth import require_admin, get_current_employee, verify_jwt_token
 from utils.logger import logger
 
 
@@ -94,7 +94,7 @@ async def create_new_agent(
 @router.get("/{agent_id}")
 async def get_agent_details(
     agent_id: str,
-    admin_user: dict = Depends(get_current_employee)
+    admin_user: dict = Depends(verify_jwt_token)  # Allow authenticated users
 ):
     """获取 Agent 详情（不含 API Key）"""
     agent = await get_agent(agent_id)
@@ -203,7 +203,7 @@ async def list_agents(
     search: Optional[str] = None,
     limit: int = Query(default=50, le=100),
     offset: int = Query(default=0, ge=0),
-    admin_user: dict = Depends(get_current_employee)
+    admin_user: dict = Depends(verify_jwt_token)  # Allow authenticated users
 ):
     """
     列出所有 Agents
@@ -271,7 +271,7 @@ async def list_agents(
 async def get_agent_analytics_endpoint(
     agent_id: str,
     days: int = Query(default=30, le=365),
-    admin_user: dict = Depends(get_current_employee)
+    admin_user: dict = Depends(verify_jwt_token)  # Allow authenticated users
 ):
     """
     获取 Agent 分析数据

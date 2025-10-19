@@ -18,7 +18,7 @@ from db.products import (
     get_cached_products, upsert_product_cache, mark_cache_accessed,
     log_api_call, cleanup_expired_cache
 )
-from utils.auth import require_admin
+from utils.auth import require_admin, verify_jwt_token
 from config.settings import settings
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -30,7 +30,7 @@ async def get_merchant_products_realtime(
     background_tasks: BackgroundTasks,
     limit: int = Query(50, ge=1, le=250, description="返回产品数量"),
     force_refresh: bool = Query(False, description="强制刷新缓存"),
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(verify_jwt_token)  # Allow all authenticated users
 ):
     """
     **实时获取商户产品（标准格式）+ 智能缓存**
