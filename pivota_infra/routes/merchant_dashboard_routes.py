@@ -141,8 +141,20 @@ async def get_merchant_stores(
 
     # Enrich with product_count by querying products endpoint
     try:
+        # Get token from current user context
+        token = None
+        if hasattr(current_user, 'get'):
+            token = current_user.get('token')
+        
+        headers = {}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f"http://localhost:8000/products/{merchant_id}")
+            resp = await client.get(
+                f"http://localhost:8000/products/{merchant_id}",
+                headers=headers
+            )
             if resp.status_code == 200:
                 payload = resp.json()
                 products = payload.get("products", [])
