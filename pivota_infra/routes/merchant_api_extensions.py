@@ -5,19 +5,45 @@ from utils.auth import get_current_user
 from datetime import datetime
 import httpx
 import os
+import sqlite3
+import random
+import string
 
 router = APIRouter()
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+DB_PATH = "pivota.db"
 
-# In-memory storage for merchant stores and PSPs
-merchant_stores_db = {}
-merchant_psps_db = {}
+def get_db_connection():
+    """Get database connection"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 async def get_merchant_id_from_user(current_user: dict) -> str:
-    """Get merchant ID from current user"""
-    # For demo, use fixed merchant ID
-    return "merch_208139f7600dbf42"
+    """Get merchant ID from current user token"""
+    # Get merchant_id from JWT token
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        # Fallback: query database by email
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT merchant_id FROM merchant_onboarding 
+                WHERE contact_email = ?
+                LIMIT 1
+            """, (current_user.get("email"),))
+            row = cursor.fetchone()
+            if row:
+                merchant_id = row["merchant_id"]
+        finally:
+            conn.close()
+    
+    if not merchant_id:
+        raise HTTPException(status_code=404, detail="Merchant ID not found")
+    
+    return merchant_id
 
 @router.get("/merchant/dashboard/stats")
 async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
@@ -180,31 +206,49 @@ async def connect_psp(
     if not api_key or len(api_key) < 10:
         raise HTTPException(status_code=400, detail="Invalid API key")
     
-    # Store PSP connection
-    if merchant_id not in merchant_psps_db:
-        merchant_psps_db[merchant_id] = []
-    
-    import random, string
+    # Save to database
     psp_id = "psp_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    account_id = "acct_" + ''.join(random.choices(string.digits, k=10))
+    capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen"] else ["card"]
     
-    new_psp = {
-        "id": psp_id,
-        "provider": provider,
-        "name": f"{provider.capitalize()} Account",
-        "status": "active",
-        "connected_at": datetime.now().isoformat() + "Z",
-        "account_id": "acct_" + ''.join(random.choices(string.digits, k=10)),
-        "capabilities": ["card", "bank_transfer"] if provider in ["stripe", "adyen"] else ["card"],
-        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****"
-    }
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    merchant_psps_db[merchant_id].append(new_psp)
-    
-    return {
-        "status": "success",
-        "message": f"{provider.capitalize()} connected successfully",
-        "data": new_psp
-    }
+    try:
+        cursor.execute("""
+            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            psp_id,
+            merchant_id,
+            provider,
+            f"{provider.capitalize()} Account",
+            api_key,
+            account_id,
+            ','.join(capabilities),
+            'active',
+            datetime.now().isoformat()
+        ))
+        conn.commit()
+        
+        new_psp = {
+            "id": psp_id,
+            "provider": provider,
+            "name": f"{provider.capitalize()} Account",
+            "status": "active",
+            "connected_at": datetime.now().isoformat() + "Z",
+            "account_id": account_id,
+            "capabilities": capabilities,
+            "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****"
+        }
+        
+        return {
+            "status": "success",
+            "message": f"{provider.capitalize()} connected successfully",
+            "data": new_psp
+        }
+    finally:
+        conn.close()
 
 @router.post("/merchant/integrations/store/connect")
 async def connect_store(
@@ -223,31 +267,47 @@ async def connect_store(
     if not store_url or not api_key:
         raise HTTPException(status_code=400, detail="Store URL and API key required")
     
-    # Store connection in memory
-    if merchant_id not in merchant_stores_db:
-        merchant_stores_db[merchant_id] = []
-
-    import random, string
+    # Save to database
     store_id = "store_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
     domain = store_url.replace("https://", "").replace("http://", "").strip("/")
-
-    new_store = {
-        "id": store_id,
-        "platform": platform,
-        "name": domain,
-        "status": "connected",
-        "connected_at": datetime.now().isoformat() + "Z",
-        "domain": domain,
-        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****"
-    }
-
-    merchant_stores_db[merchant_id].append(new_store)
-
-    return {
-        "status": "success",
-        "message": f"{platform.capitalize()} store connected successfully",
-        "data": new_store
-    }
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, api_key, status, connected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            store_id,
+            merchant_id,
+            platform,
+            domain,
+            domain,
+            api_key,
+            'connected',
+            datetime.now().isoformat()
+        ))
+        conn.commit()
+        
+        new_store = {
+            "id": store_id,
+            "platform": platform,
+            "name": domain,
+            "status": "connected",
+            "connected_at": datetime.now().isoformat() + "Z",
+            "domain": domain,
+            "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****",
+            "product_count": 0
+        }
+        
+        return {
+            "status": "success",
+            "message": f"{platform.capitalize()} store connected successfully",
+            "data": new_store
+        }
+    finally:
+        conn.close()
 
 @router.get("/merchant/orders/{order_id}")
 async def get_order_detail(

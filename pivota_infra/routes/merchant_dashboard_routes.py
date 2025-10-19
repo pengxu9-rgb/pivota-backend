@@ -5,14 +5,20 @@ from datetime import datetime, timedelta
 import random
 import httpx
 import string
+import sqlite3
+import json
 from utils.auth import get_current_user
-try:
-    # Import in-memory data from extensions if available
-    from .merchant_api_extensions import merchant_stores_db, merchant_psps_db
-except Exception:
-    merchant_stores_db, merchant_psps_db = {}, {}
 
 router = APIRouter()
+
+# Database path
+DB_PATH = "pivota.db"
+
+def get_db_connection():
+    """Get database connection"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 # Demo data for merchant dashboard
 DEMO_MERCHANT_DATA = {
@@ -32,31 +38,47 @@ DEMO_MERCHANT_DATA = {
             "country": "US",
             "postal_code": "10001"
         },
-        "stores": [{
-            "id": "store_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12)),
-            "platform": "shopify",
-            "name": "chydantest.myshopify.com",
-            "status": "connected",
-            "connected_at": "2025-01-15T10:00:00Z",
-            "domain": "chydantest.myshopify.com",
-            "api_key": "shpat_xxxxxxxxxxxxx",
-            "last_sync": "2025-10-19T10:00:00Z"
-        }],
-        "psps": [{
-            "id": "psp_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12)),
-            "provider": "stripe",
-            "name": "Stripe Account",
-            "status": "active",
-            "connected_at": "2025-01-15T11:00:00Z",
-            "account_id": "acct_1234567890",
-            "capabilities": ["card", "bank_transfer", "alipay", "wechat_pay"],
-            "fees": {
-                "card": 2.9,
-                "bank_transfer": 1.5,
-                "alipay": 2.5,
-                "wechat_pay": 2.5
+        "stores": [
+            {
+                "id": "store_shopify_demo",
+                "platform": "shopify",
+                "name": "chydantest.myshopify.com",
+                "status": "connected",
+                "connected_at": "2025-01-15T10:00:00Z",
+                "domain": "chydantest.myshopify.com",
+                "api_key": "shpat_xxxxxxxxxxxxx",
+                "last_sync": "2025-10-19T10:00:00Z",
+                "product_count": 4
+            },
+            {
+                "id": "store_wix_demo",
+                "platform": "wix",
+                "name": "peng652.wixsite.com/aydan-1",
+                "status": "connected",
+                "connected_at": "2025-10-19T12:00:00Z",
+                "domain": "peng652.wixsite.com/aydan-1",
+                "api_key_last4": "****",
+                "last_sync": "2025-10-19T12:00:00Z",
+                "product_count": 0
             }
-        }],
+        ],
+        "psps": [
+            {
+                "id": "psp_stripe_demo",
+                "provider": "stripe",
+                "name": "Stripe Account",
+                "status": "active",
+                "connected_at": "2025-01-15T11:00:00Z",
+                "account_id": "acct_1234567890",
+                "capabilities": ["card", "bank_transfer", "alipay", "wechat_pay"],
+                "fees": {
+                    "card": 2.9,
+                    "bank_transfer": 1.5,
+                    "alipay": 2.5,
+                    "wechat_pay": 2.5
+                }
+            }
+        ],
         "webhooks": {
             "endpoint": "https://chydantest.myshopify.com/webhooks/pivota",
             "secret": "whsec_" + ''.join(random.choices(string.ascii_letters + string.digits, k=32)),
@@ -130,69 +152,81 @@ async def get_merchant_stores(
     merchant_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get merchant's connected stores"""
+    """Get merchant's connected stores from database"""
     if current_user["role"] not in ["merchant", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
-    demo_stores = merchant_data["stores"] if merchant_data else []
-    runtime_stores = merchant_stores_db.get(merchant_id, [])
-    stores = [*runtime_stores, *demo_stores]
-
-    # Enrich with product_count by querying products endpoint
+    # Read from database
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
     try:
-        # Get token from current user context
-        token = None
-        if hasattr(current_user, 'get'):
-            token = current_user.get('token')
+        cursor.execute("""
+            SELECT store_id, platform, name, domain, status, connected_at, last_sync, product_count
+            FROM merchant_stores
+            WHERE merchant_id = ?
+            ORDER BY connected_at DESC
+        """, (merchant_id,))
         
-        headers = {}
-        if token:
-            headers['Authorization'] = f'Bearer {token}'
+        rows = cursor.fetchall()
+        stores = []
+        for row in rows:
+            stores.append({
+                "id": row["store_id"],
+                "platform": row["platform"],
+                "name": row["name"],
+                "domain": row["domain"],
+                "status": row["status"],
+                "connected_at": row["connected_at"],
+                "last_sync": row["last_sync"],
+                "product_count": row["product_count"] or 0
+            })
         
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"http://localhost:8000/products/{merchant_id}",
-                headers=headers
-            )
-            if resp.status_code == 200:
-                payload = resp.json()
-                products = payload.get("products", [])
-                # Count by platform
-                platform_to_count = {}
-                for p in products:
-                    plat = (p.get("platform") or "").lower()
-                    platform_to_count[plat] = platform_to_count.get(plat, 0) + 1
-
-                # Attach counts; default 0
-                for s in stores:
-                    plat = (s.get("platform") or "").lower()
-                    s["product_count"] = platform_to_count.get(plat, s.get("product_count", 0))
-            else:
-                # If products API not available, ensure field exists
-                for s in stores:
-                    s.setdefault("product_count", s.get("product_count", 0))
-    except Exception:
-        for s in stores:
-            s.setdefault("product_count", s.get("product_count", 0))
-
-    return {"status": "success", "data": {"stores": stores}}
+        return {"status": "success", "data": {"stores": stores}}
+    finally:
+        conn.close()
 
 @router.get("/merchant/{merchant_id}/psps")
 async def get_merchant_psps(
     merchant_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get merchant's connected PSPs"""
+    """Get merchant's connected PSPs from database"""
     if current_user["role"] not in ["merchant", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
-    demo_psps = merchant_data["psps"] if merchant_data else []
-    runtime_psps = merchant_psps_db.get(merchant_id, [])
-    psps = [*runtime_psps, *demo_psps]
-
-    return {"status": "success", "data": {"psps": psps}}
+    # Read from database
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT psp_id, provider, name, account_id, status, connected_at, capabilities
+            FROM merchant_psps
+            WHERE merchant_id = ?
+            ORDER BY connected_at DESC
+        """, (merchant_id,))
+        
+        rows = cursor.fetchall()
+        psps = []
+        for row in rows:
+            capabilities = []
+            if row["capabilities"]:
+                capabilities = row["capabilities"].split(',')
+            
+            psps.append({
+                "id": row["psp_id"],
+                "provider": row["provider"],
+                "name": row["name"],
+                "account_id": row["account_id"],
+                "status": row["status"],
+                "connected_at": row["connected_at"],
+                "capabilities": capabilities
+            })
+        
+        return {"status": "success", "data": {"psps": psps}}
+    finally:
+        conn.close()
 
 @router.get("/merchant/{merchant_id}/orders")
 async def get_merchant_orders(

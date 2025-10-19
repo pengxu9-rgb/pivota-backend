@@ -170,7 +170,7 @@ async def signin(login_data: UserLogin):
     """User signin (in-memory, with built-in demo accounts)."""
     try:
         demo_accounts = {
-            "merchant@test.com": {"password": "Admin123!", "role": "merchant"},
+            "merchant@test.com": {"password": "Admin123!", "role": "merchant", "merchant_id": "merch_6b90dc9838d5fd9c"},
             "employee@pivota.com": {"password": "Admin123!", "role": "admin"},
             "agent@test.com": {"password": "Admin123!", "role": "agent"},
             "superadmin@pivota.com": {"password": "admin123", "role": "admin"},
@@ -193,12 +193,38 @@ async def signin(login_data: UserLogin):
         acct = demo_accounts.get(login_data.email)
         if not acct or acct["password"] != login_data.password:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-        token = create_jwt_token(login_data.email, acct["role"], login_data.email)
+        
+        # Create token with merchant_id if available
+        token_payload = {
+            "sub": login_data.email,
+            "user_id": login_data.email,
+            "email": login_data.email,
+            "role": acct["role"],
+            "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
+            "iat": datetime.utcnow()
+        }
+        
+        # Add merchant_id or agent_id if available
+        if acct["role"] == "merchant" and "merchant_id" in acct:
+            token_payload["merchant_id"] = acct["merchant_id"]
+        
+        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        
+        user_data = {
+            "id": login_data.email,
+            "email": login_data.email,
+            "full_name": login_data.email,
+            "role": acct["role"]
+        }
+        
+        if "merchant_id" in acct:
+            user_data["merchant_id"] = acct["merchant_id"]
+        
         return {
             "status": "success",
             "message": "Login successful",
             "token": token,
-            "user": {"id": login_data.email, "email": login_data.email, "full_name": login_data.email, "role": acct["role"]}
+            "user": user_data
         }
     except HTTPException:
         raise
