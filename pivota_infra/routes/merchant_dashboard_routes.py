@@ -151,17 +151,14 @@ async def get_merchant_stores(
     
     # Try to read from database
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
+        query = """
             SELECT store_id, platform, name, domain, status, connected_at, last_sync, product_count
             FROM merchant_stores
-            WHERE merchant_id = ?
+            WHERE merchant_id = :merchant_id
             ORDER BY connected_at DESC
-        """, (merchant_id,))
+        """
         
-        rows = cursor.fetchall()
+        rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         for row in rows:
             stores.append({
                 "id": row["store_id"],
@@ -173,8 +170,6 @@ async def get_merchant_stores(
                 "last_sync": row["last_sync"],
                 "product_count": row["product_count"] or 0
             })
-        
-        conn.close()
     except Exception as e:
         print(f"Database error: {e}")
         # Fallback: return demo data if database fails
@@ -197,17 +192,14 @@ async def get_merchant_psps(
     
     # Try to read from database
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT psp_id, provider, name, account_id, status, connected_at, capabilities
+        query = """
+            SELECT psp_id, provider, name, account_id, status, connected_at, capabilities, api_key
             FROM merchant_psps
-            WHERE merchant_id = ?
+            WHERE merchant_id = :merchant_id
             ORDER BY connected_at DESC
-        """, (merchant_id,))
+        """
         
-        rows = cursor.fetchall()
+        rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         for row in rows:
             capabilities = []
             if row["capabilities"]:
@@ -220,10 +212,9 @@ async def get_merchant_psps(
                 "account_id": row["account_id"],
                 "status": row["status"],
                 "connected_at": row["connected_at"],
-                "capabilities": capabilities
+                "capabilities": capabilities,
+                "api_key_last4": row["api_key"][-4:] if row["api_key"] and len(row["api_key"]) >= 4 else "****"
             })
-        
-        conn.close()
     except Exception as e:
         print(f"Database error: {e}")
         # Fallback: return demo data if database fails
