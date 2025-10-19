@@ -39,6 +39,7 @@ from routes.merchant_dashboard_routes import router as merchant_dashboard_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
 from routes.debug_integrations import router as debug_integrations_router
+from routes.direct_db_check import router as direct_db_check_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -103,6 +104,7 @@ app.include_router(merchant_dashboard_router)  # Merchant dashboard API
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
 app.include_router(payout_router)  # Payout management
 app.include_router(debug_integrations_router)  # Debug integrations
+app.include_router(direct_db_check_router)  # Direct DB check
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management

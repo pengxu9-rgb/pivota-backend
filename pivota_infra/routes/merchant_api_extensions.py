@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Dict, Any, Optional
 from utils.auth import get_current_user
 from datetime import datetime
-from db import database
+from db.database import database
 import httpx
 import os
 import random
