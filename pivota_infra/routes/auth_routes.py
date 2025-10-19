@@ -17,8 +17,9 @@ import os
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
 
-# JWT Configuration
-JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
+# JWT Configuration - Import from config for consistency
+from config.settings import settings
+JWT_SECRET = settings.jwt_secret_key
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
