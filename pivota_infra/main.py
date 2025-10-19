@@ -227,6 +227,47 @@ async def startup():
             products_cache, api_call_events, order_events, merchant_analytics
         )
         from db.orders import orders
+        
+        # Create integration tables
+        try:
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS merchant_stores (
+                    store_id VARCHAR(50) PRIMARY KEY,
+                    merchant_id VARCHAR(50) NOT NULL,
+                    platform VARCHAR(50) NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    domain VARCHAR(255),
+                    api_key TEXT,
+                    status VARCHAR(50) DEFAULT 'connected',
+                    connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_sync TIMESTAMP,
+                    product_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS merchant_psps (
+                    psp_id VARCHAR(50) PRIMARY KEY,
+                    merchant_id VARCHAR(50) NOT NULL,
+                    provider VARCHAR(50) NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    api_key TEXT,
+                    account_id VARCHAR(255),
+                    capabilities TEXT,
+                    status VARCHAR(50) DEFAULT 'active',
+                    connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create indexes
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_id ON merchant_stores(merchant_id)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_merchant_id ON merchant_psps(merchant_id)")
+            
+            logger.info("✅ Integration tables created/verified")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not create integration tables: {e}")
         from db.agents import agents, agent_usage_logs
         from db.database import metadata, engine
         metadata.create_all(engine)
