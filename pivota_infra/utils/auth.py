@@ -294,6 +294,29 @@ def can_access_agent(user_info: Dict[str, Any], agent_id: str) -> bool:
     return False
 
 
+def validate_entity_access(user_role: str, user_entity_id: str, requested_entity_id: str) -> bool:
+    """
+    Validate if user can access specific entity data
+    
+    Args:
+        user_role: User's role (admin, merchant, agent, etc.)
+        user_entity_id: User's entity ID (merchant_id or agent_id)
+        requested_entity_id: The entity ID being requested
+    
+    Returns:
+        True if user can access the entity
+    """
+    # Admins and employees have global access
+    if user_role in ["super_admin", "admin", "employee", "operator", "viewer"]:
+        return True
+    
+    # Merchants and agents can only access their own entity
+    if user_role in ["merchant", "agent"]:
+        return user_entity_id == requested_entity_id
+    
+    return False
+
+
 # ============================================================================
 # LEGACY COMPATIBILITY (for old code)
 # ============================================================================
