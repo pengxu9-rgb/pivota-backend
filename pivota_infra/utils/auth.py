@@ -280,3 +280,221 @@ def check_permission(user_info: Dict[str, Any], required_permission: str) -> boo
     
     allowed_permissions = permission_map.get(role, [])
     return required_permission in allowed_permissions
+
+    Raises:
+        HTTPException: If user doesn't have required role
+    """
+    if current_user["role"] != required_role:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied. Required role: {required_role}"
+        )
+    return current_user
+
+# Role constants
+EMPLOYEE_ROLES = ["super_admin", "admin", "employee", "outsourced"]
+ADMIN_ROLES = ["super_admin", "admin"]
+
+# Permission checking helpers
+def is_employee(role: str) -> bool:
+    """Check if role is any employee level"""
+    return role in EMPLOYEE_ROLES
+
+def is_admin(role: str) -> bool:
+    """Check if role has admin privileges"""
+    return role in ADMIN_ROLES
+
+def is_super_admin(role: str) -> bool:
+    """Check if role is super admin"""
+    return role == "super_admin"
+
+# Helper functions for specific roles
+async def get_current_employee(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Require any employee role (super_admin, admin, employee, outsourced)"""
+    if not is_employee(current_user["role"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Employee access required"
+        )
+    return current_user
+
+async def get_current_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Require admin role (super_admin or admin)"""
+    if not is_admin(current_user["role"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
+
+async def get_current_super_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Require super admin role"""
+    if not is_super_admin(current_user["role"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super admin access required"
+        )
+    return current_user
+
+async def get_current_merchant(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Require merchant role"""
+    return await require_role("merchant", current_user)
+
+async def get_current_agent(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Require agent role"""
+    return await require_role("agent", current_user)
+
+# Alias for backward compatibility
+require_admin = get_current_admin
+
+
+# ==================== Backward Compatibility Functions ====================
+# These functions provide compatibility with the old auth system
+
+def verify_jwt_token(token: str) -> Dict[str, Any]:
+    """
+    Verify JWT token and return payload (backward compatibility)
+    
+    Raises:
+        HTTPException: If token is invalid or expired
+    """
+    return decode_access_token(token)
+
+def create_jwt_token(
+    user_id: str,
+    role: str,
+    entity_id: Optional[str] = None,
+    expires_delta: Optional[timedelta] = None
+) -> str:
+    """
+    Create JWT token (backward compatibility)
+    
+    Args:
+        user_id: User ID
+        role: User role
+        entity_id: Entity ID (merchant_id, agent_id, etc.)
+        expires_delta: Token expiration time
+    
+    Returns:
+        Encoded JWT token
+    """
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "entity_id": entity_id,
+        "exp": expire,
+        "iat": datetime.utcnow()
+    }
+    
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def validate_entity_access(user_info: Dict[str, Any], entity_id: str, entity_type: str = "any") -> bool:
+    """
+    Validate if user has access to a specific entity (backward compatibility)
+    
+    Args:
+        user_info: User information from JWT token
+        entity_id: Entity ID to check access for
+        entity_type: Type of entity (merchant, agent, etc.)
+    
+    Returns:
+        True if user has access, False otherwise
+    """
+    role = user_info.get("role", "")
+    
+    # Admins and employees have access to everything
+    if role in ADMIN_ROLES or role in EMPLOYEE_ROLES:
+        return True
+    
+    # Check if user's entity_id matches
+    user_entity_id = user_info.get("entity_id")
+    if user_entity_id == entity_id:
+        return True
+    
+    return False
+
+def check_permission(user_info: Dict[str, Any], required_permission: str) -> bool:
+    """
+    Check if user has a specific permission (backward compatibility)
+    
+    Args:
+        user_info: User information from JWT token
+        required_permission: Permission string to check
+    
+    Returns:
+        True if user has permission, False otherwise
+    """
+    role = user_info.get("role", "")
+    
+    # Super admin has all permissions
+    if role == "super_admin":
+        return True
+    
+    # Admin has most permissions
+    if role == "admin":
+        # Admins can't modify super admin settings
+        if "super_admin" not in required_permission:
+            return True
+    
+    # Define permission mappings
+    permission_map = {
+        "employee": ["view_dashboard", "view_transactions", "view_merchants", "view_agents"],
+        "merchant": ["view_own_orders", "view_own_transactions", "manage_own_products"],
+        "agent": ["create_orders", "view_own_orders", "view_own_analytics"],
+        "outsourced": ["view_dashboard", "view_transactions"]
+    }
+    
+    allowed_permissions = permission_map.get(role, [])
+    return required_permission in allowed_permissions
+
+    """Verify and decode a JWT token"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
+def check_permission(user_role: str, required_permission: str) -> bool:
+    """Check if user role has required permission"""
+    if user_role not in ROLES:
+        return False
+    
+    user_permissions = ROLES[user_role]["permissions"]
+    return required_permission in user_permissions
+
+def get_role_permissions(role: str) -> list:
+    """Get permissions for a specific role"""
+    return ROLES.get(role, {}).get("permissions", [])
+
+def create_demo_tokens() -> Dict[str, str]:
+    """Create demo tokens for testing different roles"""
+    return {
+        "admin_token": create_jwt_token("admin_user", "admin"),
+        "operator_token": create_jwt_token("operator_user", "operator"),
+        "viewer_token": create_jwt_token("viewer_user", "viewer"),
+        "agent_token": create_jwt_token("agent_user", "agent", "AGENT_001"),
+        "merchant_token": create_jwt_token("merchant_user", "merchant", "MERCH_001")
+    }
+
+def validate_entity_access(user_role: str, user_entity_id: str, requested_entity_id: str) -> bool:
+    """Validate if user can access specific entity data"""
+    if user_role in ["admin", "operator", "viewer"]:
+        return True  # Global access
+    
+    if user_role in ["agent", "merchant"]:
+        return user_entity_id == requested_entity_id
+    
+    return False

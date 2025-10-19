@@ -1,157 +1,313 @@
-# 🚀 Deployment Status
+# Pivota Portals - Deployment Status & Features
 
-## ✅ Code Pushed to GitHub
-
-**Commit**: `93f07e8` - "Add complete merchant onboarding system with KYB flow"
-
-**Changes Deployed**:
-- ✅ Merchant database tables (`merchants`, `kyb_documents`)
-- ✅ Merchant API endpoints (`/merchants/*`)
-- ✅ Frontend modals (Onboarding, KYB Review, Details)
-- ✅ API integration with real backend calls
-- ✅ Fixed modal sizes (max 800px width, 85vh height)
-- ✅ Legal name now optional
-- ✅ Expected monthly volume field fixed
+**Last Updated:** 2025-10-19  
+**Status:** ✅ All 3 portals deployed to Vercel
 
 ---
 
-## 🔄 Render Deployment
+## 🏪 Merchant Portal (merchant.pivota.cc)
 
-### Check Deployment Status:
-1. Go to: https://dashboard.render.com
-2. Find your service: **pivota-dashboard**
-3. Check the "Events" tab for deployment progress
+### ✅ Deployed Features
+- **Login System**: Fixed to use `token` field from backend
+- **Real Data Loading**: 
+  - Loads merchant-specific data using `merchant_id`
+  - Connects to real Shopify stores (e.g., chydantest.myshopify.com)
+  - Real PSP connections (Stripe, Adyen, etc.)
+  - Real orders and products from backend API
 
-### Expected Timeline:
-- **Build**: ~2-3 minutes
-- **Deploy**: ~1-2 minutes
-- **Total**: ~5 minutes
+### 📊 Dashboard Tabs
 
-### What Render is Doing:
-1. ✅ Pulling latest code from GitHub
-2. 🔄 Installing Python dependencies
-3. 🔄 Creating database tables (merchants, kyb_documents)
-4. 🔄 Starting FastAPI server
-5. 🔄 Running health checks
+#### 1. Overview
+- Stats cards: Total Orders, Revenue, Customers, Products
+- Recent orders table
+- Growth metrics with real data
 
----
+#### 2. Orders
+- Full order list with filtering
+- Export to CSV
+- Order detail view (`/orders/[orderId]`)
+- Refund capability
 
-## 🧪 Test After Deployment
+#### 3. Products
+- Product grid display
+- Sync from Shopify
+- Add new products
+- Update stock levels
 
-### 1. Check Backend Health
-```bash
-curl https://pivota-dashboard.onrender.com/health
-```
+#### 4. Integration ⭐
+**Store Connections:**
+- Connect multiple Shopify stores (OAuth or manual)
+- Connect multiple Wix stores
+- WooCommerce (coming soon)
+- Display connected stores: chydantest.myshopify.com
+- Test store connections
+- Sync products from each store
+- Disconnect stores
 
-**Expected Response**:
-```json
-{
-  "status": "healthy",
-  "timestamp": ...,
-  "database": "connected",
-  "config_check": {
-    "stripe_secret_key": "✅ SET",
-    "adyen_api_key": "✅ SET",
-    ...
-  }
-}
-```
+**PSP Management:**
+- Connect YOUR OWN PSP accounts:
+  - Stripe (sk_test_... or sk_live_...)
+  - Adyen
+  - Mollie
+  - PayPal
+  - Checkout.com
+  - Square
+- Display connected PSPs with metrics
+- Test PSP connections
+- Disconnect PSPs
+- Webhook secret configuration
+- Sandbox mode toggle
 
-### 2. Test Merchant Onboarding (Frontend)
-1. Open http://localhost:3000
-2. Login as admin
-3. Go to **Merchants** tab
-4. Click **"Onboard Merchant"**
-5. Fill form:
-   - Business Name: "Test Store"
-   - Expected Monthly Volume: 50000
-   - (Legal Name can be left empty)
-6. Submit → Should get success with merchant ID
+**Routing Configuration:**
+- Display routing rules when multiple PSPs connected
+- Automatic fallback messaging
+- Success rate improvements
 
-### 3. Verify API Works
-```bash
-# Get your token first
-TOKEN="your_admin_token"
+**API & Webhooks:**
+- Merchant API key display/copy/regenerate
+- Webhook URL configuration
+- Webhook signing secret (display/rotate)
+- Event subscription selection:
+  - order.created
+  - order.updated
+  - payment.completed
+  - payment.failed
+  - product.out_of_stock
+- Send test webhook
+- Delivery logs with replay capability
+- Code examples (cURL, Express)
 
-# Test merchant onboarding
-curl -X POST https://pivota-dashboard.onrender.com/merchants/onboard \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "business_name": "API Test Store",
-    "platform": "shopify",
-    "store_url": "https://test.com",
-    "contact_email": "test@store.com",
-    "contact_phone": "+1234567890",
-    "business_type": "ecommerce",
-    "country": "US",
-    "expected_monthly_volume": 10000,
-    "description": "Test"
-  }'
-```
+#### 5. Settings
+- Business name, email, phone, store URL
+- Notification preferences
+- Save settings
 
----
-
-## ✅ Deployment Checklist
-
-After deployment completes (Render shows "Live"):
-
-- [ ] Backend health check passes
-- [ ] Database tables created successfully
-- [ ] Merchant onboarding endpoint works
-- [ ] Frontend can onboard merchants
-- [ ] Document upload endpoint exists
-- [ ] Approve/reject endpoints work
-- [ ] Modals display correctly (800px max, not too big)
-- [ ] Legal name is optional
-- [ ] Expected monthly volume field works (no 0 prefix)
+### 🔑 Test Account
+- Email: `merchant@test.com`
+- Password: `Admin123!`
+- Expected Data: Should show chydantest.myshopify.com connections
 
 ---
 
-## 🐛 If Deployment Fails
+## 👔 Employee Portal (employee.pivota.cc)
 
-### Check Render Logs:
-1. Go to Render dashboard
-2. Click on **pivota-dashboard** service
-3. Go to **Logs** tab
-4. Look for errors
+### ✅ Deployed Features
+- **Login System**: Fixed to use `token` field
+- **Comprehensive Merchant Management**
 
-### Common Issues:
+### 📊 Dashboard Features
 
-**Issue 1: Module Import Error**
-```
-ModuleNotFoundError: No module named 'db.merchants'
-```
-**Fix**: Check PYTHONPATH in start command
+#### Merchants Tab
+**Merchant Table with Actions:**
+- View Details
+- Review KYB (Know Your Business)
+- Upload Documents for KYB
+- **Connect Shopify** (on behalf of merchant)
+  - OAuth or manual
+  - Multiple stores support
+- **Connect Wix** (on behalf of merchant)
+  - API key + Site ID
+  - Multiple stores support
+- **Add Additional Store** (Shopify/Wix)
+- **Test Store Connection**
+- **Disconnect Store**
+- **Connect PSP** (on behalf of merchant)
+  - All PSP types: Stripe, Adyen, Mollie, PayPal, Checkout.com, Square
+  - Webhook secret (optional)
+  - Sandbox mode toggle
+- **Test PSP Connection**
+- **Delete Merchant**
 
-**Issue 2: Database Connection Error**
-```
-sqlalchemy.exc.OperationalError
-```
-**Fix**: Check DATABASE_URL environment variable
+**Filters & Search:**
+- Search by business name, email, merchant ID
+- Filter by status: all/active/pending/suspended
 
-**Issue 3: Table Creation Failed**
-```
-Error creating tables
-```
-**Fix**: Check if `metadata.create_all(engine)` runs in startup
+#### PSP Management Tab
+- View all PSPs
+- PSP metrics
+- Add new PSP
+- Test PSP connections
+
+#### Routing Rules Tab
+- Configure payment routing
+- Enable/disable rules
+- A/B testing
+
+#### Analytics Tab
+- Dashboard analytics
+- Revenue metrics
+- Success rates
+
+### 🔑 Test Account
+- Email: `employee@pivota.com`
+- Password: `Admin123!`
 
 ---
 
-## 📊 Current Deployment
+## 🤖 Agent Portal (agents.pivota.cc)
 
-**Status**: 🔄 Deploying...
+### ✅ Deployed Features
+- **Login System**: Fixed to use `token` field
+- **8-Step Onboarding Flow**
+- **Complete Settings Page** ⭐ NEW
 
-**Next Steps**:
-1. Wait for Render deployment to complete (~5 min)
-2. Check health endpoint
-3. Test merchant onboarding in frontend
-4. Test all API endpoints
-5. Verify database tables were created
+### 📊 Dashboard Features
+
+#### Main Dashboard
+- API call statistics
+- Order metrics
+- GMV tracking
+- Success rate
+- Recent activity log
+- Recent orders
+
+#### Quick Links
+- Integration guide
+- Analytics dashboard
+- **Settings** (fully functional)
+
+### ⚙️ Settings Page (NEW)
+
+**Profile Information:**
+- Agent name
+- Email
+- Company/Organization
+- Description
+
+**API Credentials:**
+- API Key (display/copy/regenerate)
+- Webhook URL configuration
+- Webhook signing secret (display/rotate)
+
+**Notification Preferences:**
+- Email on new order
+- Email on API errors
+- Webhook on new order
+- Webhook on payment
+- Daily summary report
+
+**Security:**
+- Two-Factor Authentication (enable option)
+- Change password
+- Delete account
+
+### 🎯 Onboarding Flow
+8 steps with graceful fallbacks:
+1. Basic Information
+2. API Connection Test
+3. Product Search Test
+4. Order Creation Test
+5. Payment Processing Test
+6. Webhook Setup
+7. Review Configuration
+8. Complete Setup
+
+Features:
+- Auto-save progress to localStorage
+- Resume from last step (with confirmation)
+- Reset progress button
+- Test each integration step
+
+### 🔑 Test Account
+- Email: `agent@test.com`
+- Password: `Admin123!`
 
 ---
 
-**Monitoring**: Check https://dashboard.render.com for real-time status
+## 🚀 Deployment Status
 
-**ETA**: ~5 minutes from now
+### Git Commits (Latest)
+- **Merchant Portal**: `407ca2f` - Trigger redeploy with latest features
+- **Employee Portal**: `1f90c02` - Trigger redeploy with all management features
+- **Agent Portal**: `2972a98` - Add comprehensive Settings page
+
+### Vercel Deployment
+All three portals are connected to GitHub and auto-deploy on push.
+**Deployment time:** ~2-3 minutes after push
+
+---
+
+## 🔧 Backend Integration
+
+### API Endpoints Used
+- `POST /api/auth/login` - Returns `{ success, token, user }`
+- `GET /api/merchants` - List all merchants
+- `GET /api/merchants/{id}` - Merchant details
+- `GET /api/analytics/dashboard` - Dashboard analytics
+- `GET /api/orders` - List orders
+- `GET /api/products` - List products
+- `GET /api/integrations/stores` - Connected stores
+- `POST /api/integrations/shopify/connect` - Connect Shopify
+- `POST /api/integrations/wix/connect` - Connect Wix
+- `GET /api/psp/list` - List PSPs
+- `POST /api/psp/setup` - Setup PSP
+- `GET /api/webhooks/config` - Webhook configuration
+- `POST /api/webhooks/test` - Test webhook
+
+### Authentication
+- Backend returns: `{ success: true, token: "JWT...", user: {...} }`
+- Frontend stores: `localStorage.setItem('merchant_token', data.token)`
+- Headers: `Authorization: Bearer ${token}`
+
+---
+
+## 📝 Known Issues & Next Steps
+
+### Merchant Portal
+- ✅ Login fixed (use `token` not `access_token`)
+- ✅ Real data loading implemented
+- ✅ Webhook configuration UI added
+- 🔄 **Pending**: Verify backend returns real Shopify store data for test merchant
+
+### Employee Portal
+- ✅ Login fixed
+- ✅ All merchant management features added
+- ✅ Multi-platform store connection support
+- ✅ PSP connection with webhook/sandbox options
+
+### Agent Portal
+- ✅ Login fixed
+- ✅ Settings page implemented
+- ✅ Onboarding with graceful fallbacks
+
+---
+
+## 🧪 Testing Checklist
+
+### For Merchant Portal (merchant@test.com)
+- [ ] Login successfully
+- [ ] See real data from chydantest.myshopify.com
+- [ ] View connected stores in Integration tab
+- [ ] View connected PSPs with real credentials
+- [ ] Copy API key
+- [ ] Configure webhook URL
+- [ ] Send test webhook
+
+### For Employee Portal (employee@pivota.com)
+- [ ] Login successfully
+- [ ] View merchant list
+- [ ] Open "More Actions" dropdown for a merchant
+- [ ] Connect Shopify store on behalf of merchant
+- [ ] Connect PSP with webhook secret
+- [ ] Test PSP connection
+- [ ] Review KYB documents
+
+### For Agent Portal (agent@test.com)
+- [ ] Login successfully
+- [ ] View dashboard with stats
+- [ ] Navigate to Settings
+- [ ] Copy API key
+- [ ] Configure webhook URL
+- [ ] Update profile information
+- [ ] Change notification preferences
+
+---
+
+## 📞 Support
+
+If Vercel deployment doesn't show latest features:
+1. Check Vercel dashboard for build status
+2. Verify GitHub integration is active
+3. Check build logs for errors
+4. Force redeploy with empty commit: `git commit --allow-empty -m "trigger deploy" && git push`
 

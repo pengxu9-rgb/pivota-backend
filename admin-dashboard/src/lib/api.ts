@@ -142,6 +142,48 @@ export const integrationsApi = {
 
 export default api;
 
+// ========================= Agents API =========================
+export interface AgentItem {
+  agent_id: string;
+  agent_name: string;
+  agent_type: string;
+  description?: string;
+  owner_email?: string;
+  is_active: boolean;
+  rate_limit?: number;
+  daily_quota?: number;
+  allowed_merchants?: string[] | null;
+  webhook_url?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export const agentApi = {
+  async list(): Promise<AgentItem[]> {
+    const res = await api.get('/agents');
+    return res.data.agents || [];
+  },
+  async details(agentId: string): Promise<AgentItem> {
+    const res = await api.get(`/agents/${agentId}`);
+    return res.data.agent;
+  },
+  async analytics(agentId: string, days = 30): Promise<any> {
+    const res = await api.get(`/agents/${agentId}/analytics`, { params: { days } });
+    return res.data;
+  },
+  async usage(agentId: string, limit = 100): Promise<any> {
+    const res = await api.get(`/agents/${agentId}/usage`, { params: { limit } });
+    return res.data;
+  },
+  async resetApiKey(agentId: string): Promise<{ new_api_key: string }> {
+    const res = await api.post(`/agents/${agentId}/reset-api-key`);
+    return res.data;
+  },
+  async deactivate(agentId: string): Promise<void> {
+    await api.delete(`/agents/${agentId}`);
+  },
+};
+
 
 // ========================= Agents API =========================
 export interface AgentItem {
@@ -184,4 +226,5 @@ export const agentApi = {
     await api.delete(`/agents/${agentId}`);
   },
 };
+
 

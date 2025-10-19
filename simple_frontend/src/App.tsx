@@ -82,3 +82,18 @@ const App: React.FC = () => {
 export default App;
 
 
+
+
+const App: React.FC = () => {
+  return (
+    <Router>
+      <AuthProvider>
+        <AppRoutes />
+      </AuthProvider>
+    </Router>
+  );
+};
+
+export default App;
+
+

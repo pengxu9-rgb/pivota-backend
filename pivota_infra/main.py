@@ -31,7 +31,7 @@ from routes.demo_data_routes import router as demo_data_router
 from routes.test_data_routes import router as test_data_router
 from routes.simple_ws_routes import router as simple_ws_router
 from routes.agent_metrics_routes import router as agent_metrics_router
-from routes.auth import router as auth_router  # New clean auth system
+from routes.auth_routes import router as auth_router
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router

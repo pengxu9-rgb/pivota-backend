@@ -23,3 +23,4 @@ python-multipart  # for form data handling
 cryptography  # for JWT and security
 requests  # for HTTP requests (backup to httpx)
 boto3  # for S3-compatible storage (Cloudflare R2)
+
