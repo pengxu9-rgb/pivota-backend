@@ -241,10 +241,10 @@ async def startup():
                     domain VARCHAR(255),
                     api_key TEXT,
                     status VARCHAR(50) DEFAULT 'connected',
-                    connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_sync TIMESTAMP,
+                    connected_at VARCHAR(50),
+                    last_sync VARCHAR(50),
                     product_count INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at VARCHAR(50)
                 )
             """)
             
@@ -258,8 +258,8 @@ async def startup():
                     account_id VARCHAR(255),
                     capabilities TEXT,
                     status VARCHAR(50) DEFAULT 'active',
-                    connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    connected_at VARCHAR(50),
+                    created_at VARCHAR(50)
                 )
             """)
             
