@@ -1,61 +1,78 @@
 """
-Authentication Utilities
-Simple JWT-based authentication for Pivota platform
+Authentication utilities for Pivota
+Handles JWT token creation, validation, and user authentication
 """
 
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import bcrypt
-import os
-from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
-from fastapi import HTTPException, status, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from config.settings import settings
 
 # JWT Configuration
-JWT_SECRET = os.getenv("JWT_SECRET", "pivota-secret-key-change-in-production-2024")
+JWT_SECRET = settings.jwt_secret_key
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_HOURS = 24
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
-# Security
+# Security scheme
 security = HTTPBearer()
+
+# ============================================================================
+# PASSWORD HASHING
+# ============================================================================
 
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt"""
-    salt = bcrypt.gensalt(rounds=12)
-    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
 
-def verify_password(password: str, hashed: str) -> bool:
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash"""
     try:
-        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+        return bcrypt.checkpw(
+            plain_password.encode('utf-8'),
+            hashed_password.encode('utf-8')
+        )
     except Exception:
         return False
 
-def create_access_token(user_id: str, email: str, role: str) -> str:
+
+# ============================================================================
+# JWT TOKEN MANAGEMENT
+# ============================================================================
+
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     """
     Create a JWT access token
     
     Args:
-        user_id: User's UUID
-        email: User's email
-        role: User's role (employee, merchant, agent)
+        data: Payload data to encode (should include sub, email, role)
+        expires_delta: Optional custom expiration time
     
     Returns:
-        JWT token string
+        Encoded JWT token string
     """
-    expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    to_encode = data.copy()
     
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "role": role,
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({
         "exp": expire,
         "iat": datetime.utcnow()
-    }
+    })
     
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
 
-def decode_access_token(token: str) -> Dict[str, Any]:
+
+def decode_token(token: str) -> Dict[str, Any]:
     """
     Decode and verify a JWT token
     
@@ -63,7 +80,7 @@ def decode_access_token(token: str) -> Dict[str, Any]:
         token: JWT token string
     
     Returns:
-        Decoded payload
+        Decoded payload dictionary
     
     Raises:
         HTTPException: If token is invalid or expired
@@ -82,174 +99,116 @@ def decode_access_token(token: str) -> Dict[str, Any]:
             detail="Invalid token"
         )
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+
+# ============================================================================
+# AUTHENTICATION DEPENDENCIES
+# ============================================================================
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> Dict[str, Any]:
     """
-    Get current user from JWT token
+    Get current authenticated user from JWT token in Authorization header
     
     Args:
-        credentials: HTTP Authorization credentials
+        credentials: HTTP Bearer token from request header
     
     Returns:
-        User payload from token
+        User information dictionary containing:
+        - sub: User ID
+        - email: User email
+        - role: User role
+        - merchant_id: (optional) For merchant users
+        - agent_id: (optional) For agent users
     
     Raises:
-        HTTPException: If token is invalid
+        HTTPException: If authentication fails
     """
-    token = credentials.credentials
-    payload = decode_access_token(token)
-    return payload
+    try:
+        token = credentials.credentials
+        payload = decode_token(token)
+        
+        # Validate required fields
+        if "sub" not in payload or "email" not in payload or "role" not in payload:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token payload"
+            )
+        
+        return payload
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentication failed: {str(e)}"
+        )
 
-async def require_role(required_role: str, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+
+async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """
-    Require a specific role for access
+    Require admin or super_admin role
     
     Args:
-        required_role: Required role (employee, merchant, agent)
-        current_user: Current user from token
+        current_user: Current authenticated user
     
     Returns:
-        Current user if role matches
+        User information if authorized
     
     Raises:
-        HTTPException: If user doesn't have required role
+        HTTPException: If user is not an admin
     """
-    if current_user["role"] != required_role:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Access denied. Required role: {required_role}"
-        )
-    return current_user
-
-# Role constants
-EMPLOYEE_ROLES = ["super_admin", "admin", "employee", "outsourced"]
-ADMIN_ROLES = ["super_admin", "admin"]
-
-# Permission checking helpers
-def is_employee(role: str) -> bool:
-    """Check if role is any employee level"""
-    return role in EMPLOYEE_ROLES
-
-def is_admin(role: str) -> bool:
-    """Check if role has admin privileges"""
-    return role in ADMIN_ROLES
-
-def is_super_admin(role: str) -> bool:
-    """Check if role is super admin"""
-    return role == "super_admin"
-
-# Helper functions for specific roles
-async def get_current_employee(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require any employee role (super_admin, admin, employee, outsourced)"""
-    if not is_employee(current_user["role"]):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Employee access required"
-        )
-    return current_user
-
-async def get_current_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require admin role (super_admin or admin)"""
-    if not is_admin(current_user["role"]):
+    if current_user.get("role") not in ["admin", "super_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
         )
     return current_user
 
-async def get_current_super_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require super admin role"""
-    if not is_super_admin(current_user["role"]):
+
+async def get_current_employee(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """
+    Require employee role (super_admin, admin, employee, or outsourced)
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        User information if authorized
+    
+    Raises:
+        HTTPException: If user is not an employee
+    """
+    if current_user.get("role") not in ["super_admin", "admin", "employee", "outsourced"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super admin access required"
+            detail="Employee access required"
         )
     return current_user
 
-async def get_current_merchant(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require merchant role"""
-    return await require_role("merchant", current_user)
 
-async def get_current_agent(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require agent role"""
-    return await require_role("agent", current_user)
+# ============================================================================
+# ROLE & PERMISSION CHECKING
+# ============================================================================
 
-# Alias for backward compatibility
-require_admin = get_current_admin
+EMPLOYEE_ROLES = ["super_admin", "admin", "employee", "outsourced"]
+ADMIN_ROLES = ["super_admin", "admin"]
 
 
-# ==================== Backward Compatibility Functions ====================
-# These functions provide compatibility with the old auth system
+def is_employee(role: str) -> bool:
+    """Check if role is an employee role"""
+    return role in EMPLOYEE_ROLES
 
-def verify_jwt_token(token: str) -> Dict[str, Any]:
-    """
-    Verify JWT token and return payload (backward compatibility)
-    
-    Raises:
-        HTTPException: If token is invalid or expired
-    """
-    return decode_access_token(token)
 
-def create_jwt_token(
-    user_id: str,
-    role: str,
-    entity_id: Optional[str] = None,
-    expires_delta: Optional[timedelta] = None
-) -> str:
-    """
-    Create JWT token (backward compatibility)
-    
-    Args:
-        user_id: User ID
-        role: User role
-        entity_id: Entity ID (merchant_id, agent_id, etc.)
-        expires_delta: Token expiration time
-    
-    Returns:
-        Encoded JWT token
-    """
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
-    
-    payload = {
-        "sub": user_id,
-        "role": role,
-        "entity_id": entity_id,
-        "exp": expire,
-        "iat": datetime.utcnow()
-    }
-    
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+def is_admin(role: str) -> bool:
+    """Check if role is an admin role"""
+    return role in ADMIN_ROLES
 
-def validate_entity_access(user_info: Dict[str, Any], entity_id: str, entity_type: str = "any") -> bool:
-    """
-    Validate if user has access to a specific entity (backward compatibility)
-    
-    Args:
-        user_info: User information from JWT token
-        entity_id: Entity ID to check access for
-        entity_type: Type of entity (merchant, agent, etc.)
-    
-    Returns:
-        True if user has access, False otherwise
-    """
-    role = user_info.get("role", "")
-    
-    # Admins and employees have access to everything
-    if role in ADMIN_ROLES or role in EMPLOYEE_ROLES:
-        return True
-    
-    # Check if user's entity_id matches
-    user_entity_id = user_info.get("entity_id")
-    if user_entity_id == entity_id:
-        return True
-    
-    return False
 
 def check_permission(user_info: Dict[str, Any], required_permission: str) -> bool:
     """
-    Check if user has a specific permission (backward compatibility)
+    Check if user has a specific permission
     
     Args:
         user_info: User information from JWT token
@@ -281,130 +240,85 @@ def check_permission(user_info: Dict[str, Any], required_permission: str) -> boo
     allowed_permissions = permission_map.get(role, [])
     return required_permission in allowed_permissions
 
-# Role constants
-EMPLOYEE_ROLES = ["super_admin", "admin", "employee", "outsourced"]
-ADMIN_ROLES = ["super_admin", "admin"]
 
-# Permission checking helpers
-def is_employee(role: str) -> bool:
-    """Check if role is any employee level"""
-    return role in EMPLOYEE_ROLES
-
-def is_admin(role: str) -> bool:
-    """Check if role has admin privileges"""
-    return role in ADMIN_ROLES
-
-def is_super_admin(role: str) -> bool:
-    """Check if role is super admin"""
-    return role == "super_admin"
-
-# Helper functions for specific roles
-async def get_current_employee(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require any employee role (super_admin, admin, employee, outsourced)"""
-    if not is_employee(current_user["role"]):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Employee access required"
-        )
-    return current_user
-
-async def get_current_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require admin role (super_admin or admin)"""
-    if not is_admin(current_user["role"]):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    return current_user
-
-async def get_current_super_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require super admin role"""
-    if not is_super_admin(current_user["role"]):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super admin access required"
-        )
-    return current_user
-
-async def get_current_merchant(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require merchant role"""
-    return await require_role("merchant", current_user)
-
-async def get_current_agent(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """Require agent role"""
-    return await require_role("agent", current_user)
-
-# Alias for backward compatibility
-require_admin = get_current_admin
-
-
-# ==================== Backward Compatibility Functions ====================
-# These functions provide compatibility with the old auth system
-
-def verify_jwt_token(token: str) -> Dict[str, Any]:
+def can_access_merchant(user_info: Dict[str, Any], merchant_id: str) -> bool:
     """
-    Verify JWT token and return payload (backward compatibility)
-    
-    Raises:
-        HTTPException: If token is invalid or expired
-    """
-    return decode_access_token(token)
-
-def create_jwt_token(
-    user_id: str,
-    role: str,
-    entity_id: Optional[str] = None,
-    expires_delta: Optional[timedelta] = None
-) -> str:
-    """
-    Create JWT token (backward compatibility)
-    
-    Args:
-        user_id: User ID
-        role: User role
-        entity_id: Entity ID (merchant_id, agent_id, etc.)
-        expires_delta: Token expiration time
-    
-    Returns:
-        Encoded JWT token
-    """
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
-    
-    payload = {
-        "sub": user_id,
-        "role": role,
-        "entity_id": entity_id,
-        "exp": expire,
-        "iat": datetime.utcnow()
-    }
-    
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def validate_entity_access(user_info: Dict[str, Any], entity_id: str, entity_type: str = "any") -> bool:
-    """
-    Validate if user has access to a specific entity (backward compatibility)
+    Check if user can access specific merchant data
     
     Args:
         user_info: User information from JWT token
-        entity_id: Entity ID to check access for
-        entity_type: Type of entity (merchant, agent, etc.)
+        merchant_id: Merchant ID to check access for
     
     Returns:
-        True if user has access, False otherwise
+        True if user can access merchant data
     """
     role = user_info.get("role", "")
     
-    # Admins and employees have access to everything
-    if role in ADMIN_ROLES or role in EMPLOYEE_ROLES:
+    # Employees can access all merchants
+    if role in EMPLOYEE_ROLES:
         return True
     
-    # Check if user's entity_id matches
-    user_entity_id = user_info.get("entity_id")
-    if user_entity_id == entity_id:
+    # Merchants can only access their own data
+    if role == "merchant":
+        return user_info.get("merchant_id") == merchant_id
+    
+    # Agents can access their assigned merchants
+    if role == "agent":
+        # TODO: Check agent-merchant assignment in database
         return True
     
     return False
 
+
+def can_access_agent(user_info: Dict[str, Any], agent_id: str) -> bool:
+    """
+    Check if user can access specific agent data
+    
+    Args:
+        user_info: User information from JWT token
+        agent_id: Agent ID to check access for
+    
+    Returns:
+        True if user can access agent data
+    """
+    role = user_info.get("role", "")
+    
+    # Employees can access all agents
+    if role in EMPLOYEE_ROLES:
+        return True
+    
+    # Agents can only access their own data
+    if role == "agent":
+        return user_info.get("agent_id") == agent_id
+    
+    return False
+
+
+# ============================================================================
+# LEGACY COMPATIBILITY (for old code)
+# ============================================================================
+
+def verify_jwt_token(token: str) -> Dict[str, Any]:
+    """
+    Legacy function for backward compatibility
+    Use get_current_user() instead for new code
+    """
+    return decode_token(token)
+
+
+def create_jwt_token(user_id: str, role: str, entity_id: Optional[str] = None) -> str:
+    """
+    Legacy function for backward compatibility
+    Use create_access_token() instead for new code
+    """
+    data = {
+        "sub": user_id,
+        "role": role
+    }
+    if entity_id:
+        if role == "merchant":
+            data["merchant_id"] = entity_id
+        elif role == "agent":
+            data["agent_id"] = entity_id
+    
+    return create_access_token(data)
