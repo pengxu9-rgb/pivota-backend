@@ -329,7 +329,6 @@ def validate_entity_access(user_role: str, user_entity_id: str, requested_entity
     
     return False
 
-
 # ============================================================================
 # LEGACY COMPATIBILITY (for old code)
 # ============================================================================
@@ -358,3 +357,5 @@ def create_jwt_token(user_id: str, role: str, entity_id: Optional[str] = None) -
             data["agent_id"] = entity_id
     
     return create_access_token(data)
+
+

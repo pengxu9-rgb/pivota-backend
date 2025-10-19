@@ -1,313 +1,150 @@
-# Pivota Portals - Deployment Status & Features
+# 部署状态和测试指南
 
-**Last Updated:** 2025-10-19  
-**Status:** ✅ All 3 portals deployed to Vercel
+## ✅ 已完成的修复
 
----
+### 1. 后端修复
+- ✅ 移除所有 Supabase 依赖
+- ✅ 使用内存存储 + JWT 认证
+- ✅ 添加商户仪表板 API 端点
+- ✅ 修复 JWT token 格式（添加 `sub` 和 `email` 字段）
+- ✅ 所有代码已推送到 GitHub (commit: befe3e75)
 
-## 🏪 Merchant Portal (merchant.pivota.cc)
+### 2. 前端修复  
+- ✅ 更新所有三个门户的登录 API 端点（从 `/api/auth/login` 改为 `/auth/signin`）
+- ✅ 修复响应格式检查（从 `response.success` 改为 `response.status === 'success'`）
+- ✅ 商户门户配置正确的 merchant_id
 
-### ✅ Deployed Features
-- **Login System**: Fixed to use `token` field from backend
-- **Real Data Loading**: 
-  - Loads merchant-specific data using `merchant_id`
-  - Connects to real Shopify stores (e.g., chydantest.myshopify.com)
-  - Real PSP connections (Stripe, Adyen, etc.)
-  - Real orders and products from backend API
+### 3. 本地测试验证
+- ✅ Token 创建逻辑正确（包含 sub, email, role）
+- ✅ Auth 工具函数正确验证 token
 
-### 📊 Dashboard Tabs
+## ⏳ 等待部署
 
-#### 1. Overview
-- Stats cards: Total Orders, Revenue, Customers, Products
-- Recent orders table
-- Growth metrics with real data
+### Railway 部署状态
+- 最新 commit: `befe3e75` - fix JWT token format
+- 状态：**等待 Railway 自动部署**
+- 预计时间：2-5 分钟
 
-#### 2. Orders
-- Full order list with filtering
-- Export to CSV
-- Order detail view (`/orders/[orderId]`)
-- Refund capability
+### 如何手动触发 Railway 部署
+1. 访问 Railway 项目面板
+2. 找到 backend 服务
+3. 点击 "Deployments" 标签
+4. 点击 "Deploy" 按钮手动触发
 
-#### 3. Products
-- Product grid display
-- Sync from Shopify
-- Add new products
-- Update stock levels
+## 🧪 测试步骤（部署完成后）
 
-#### 4. Integration ⭐
-**Store Connections:**
-- Connect multiple Shopify stores (OAuth or manual)
-- Connect multiple Wix stores
-- WooCommerce (coming soon)
-- Display connected stores: chydantest.myshopify.com
-- Test store connections
-- Sync products from each store
-- Disconnect stores
+### 步骤 1: 验证后端 API
 
-**PSP Management:**
-- Connect YOUR OWN PSP accounts:
-  - Stripe (sk_test_... or sk_live_...)
-  - Adyen
-  - Mollie
-  - PayPal
-  - Checkout.com
-  - Square
-- Display connected PSPs with metrics
-- Test PSP connections
-- Disconnect PSPs
-- Webhook secret configuration
-- Sandbox mode toggle
+```bash
+# 1. 测试登录并检查 token 格式
+RESPONSE=$(curl -s -X POST https://web-production-fedb.up.railway.app/auth/signin \
+  -H "Content-Type: application/json" \
+  -d '{"email":"merchant@test.com","password":"Admin123!"}')
 
-**Routing Configuration:**
-- Display routing rules when multiple PSPs connected
-- Automatic fallback messaging
-- Success rate improvements
+echo "$RESPONSE" | python3 -m json.tool
 
-**API & Webhooks:**
-- Merchant API key display/copy/regenerate
-- Webhook URL configuration
-- Webhook signing secret (display/rotate)
-- Event subscription selection:
-  - order.created
-  - order.updated
-  - payment.completed
-  - payment.failed
-  - product.out_of_stock
-- Send test webhook
-- Delivery logs with replay capability
-- Code examples (cURL, Express)
+# 2. 提取并解码 token
+TOKEN=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('token',''))")
 
-#### 5. Settings
-- Business name, email, phone, store URL
-- Notification preferences
-- Save settings
+python3 << EOF
+import base64, json
+payload = "$TOKEN".split('.')[1]
+padding = '=' * (4 - len(payload) % 4)
+decoded = base64.urlsafe_b64decode(payload + padding)
+data = json.loads(decoded)
+print(json.dumps(data, indent=2))
+print(f"\n✅ 'sub' 字段: {data.get('sub')}")
+print(f"✅ 'email' 字段: {data.get('email')}")
+print(f"✅ 'role' 字段: {data.get('role')}")
+EOF
 
-### 🔑 Test Account
+# 3. 测试商户 API 端点
+curl -s https://web-production-fedb.up.railway.app/merchant/profile \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+
+curl -s https://web-production-fedb.up.railway.app/merchant/merch_208139f7600dbf42/integrations \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+### 步骤 2: 测试前端登录
+
+#### 商户门户 (https://merchant.pivota.cc)
 - Email: `merchant@test.com`
 - Password: `Admin123!`
-- Expected Data: Should show chydantest.myshopify.com connections
+- 预期：成功登录并跳转到仪表板
+- 验证：能看到商店、PSP、订单数据
 
----
-
-## 👔 Employee Portal (employee.pivota.cc)
-
-### ✅ Deployed Features
-- **Login System**: Fixed to use `token` field
-- **Comprehensive Merchant Management**
-
-### 📊 Dashboard Features
-
-#### Merchants Tab
-**Merchant Table with Actions:**
-- View Details
-- Review KYB (Know Your Business)
-- Upload Documents for KYB
-- **Connect Shopify** (on behalf of merchant)
-  - OAuth or manual
-  - Multiple stores support
-- **Connect Wix** (on behalf of merchant)
-  - API key + Site ID
-  - Multiple stores support
-- **Add Additional Store** (Shopify/Wix)
-- **Test Store Connection**
-- **Disconnect Store**
-- **Connect PSP** (on behalf of merchant)
-  - All PSP types: Stripe, Adyen, Mollie, PayPal, Checkout.com, Square
-  - Webhook secret (optional)
-  - Sandbox mode toggle
-- **Test PSP Connection**
-- **Delete Merchant**
-
-**Filters & Search:**
-- Search by business name, email, merchant ID
-- Filter by status: all/active/pending/suspended
-
-#### PSP Management Tab
-- View all PSPs
-- PSP metrics
-- Add new PSP
-- Test PSP connections
-
-#### Routing Rules Tab
-- Configure payment routing
-- Enable/disable rules
-- A/B testing
-
-#### Analytics Tab
-- Dashboard analytics
-- Revenue metrics
-- Success rates
-
-### 🔑 Test Account
+#### 员工门户 (https://employee.pivota.cc)
 - Email: `employee@pivota.com`
 - Password: `Admin123!`
+- 预期：成功登录并跳转到仪表板
+- 验证：能看到所有商户、代理、订单数据
 
----
-
-## 🤖 Agent Portal (agents.pivota.cc)
-
-### ✅ Deployed Features
-- **Login System**: Fixed to use `token` field
-- **8-Step Onboarding Flow**
-- **Complete Settings Page** ⭐ NEW
-
-### 📊 Dashboard Features
-
-#### Main Dashboard
-- API call statistics
-- Order metrics
-- GMV tracking
-- Success rate
-- Recent activity log
-- Recent orders
-
-#### Quick Links
-- Integration guide
-- Analytics dashboard
-- **Settings** (fully functional)
-
-### ⚙️ Settings Page (NEW)
-
-**Profile Information:**
-- Agent name
-- Email
-- Company/Organization
-- Description
-
-**API Credentials:**
-- API Key (display/copy/regenerate)
-- Webhook URL configuration
-- Webhook signing secret (display/rotate)
-
-**Notification Preferences:**
-- Email on new order
-- Email on API errors
-- Webhook on new order
-- Webhook on payment
-- Daily summary report
-
-**Security:**
-- Two-Factor Authentication (enable option)
-- Change password
-- Delete account
-
-### 🎯 Onboarding Flow
-8 steps with graceful fallbacks:
-1. Basic Information
-2. API Connection Test
-3. Product Search Test
-4. Order Creation Test
-5. Payment Processing Test
-6. Webhook Setup
-7. Review Configuration
-8. Complete Setup
-
-Features:
-- Auto-save progress to localStorage
-- Resume from last step (with confirmation)
-- Reset progress button
-- Test each integration step
-
-### 🔑 Test Account
+#### 代理门户 (https://agent.pivota.cc)
 - Email: `agent@test.com`
 - Password: `Admin123!`
+- 预期：成功登录并跳转到仪表板
+- 验证：能看到订单和分析数据
+
+## 🔍 故障排查
+
+### 如果仍然返回 "Invalid token"
+
+1. **确认 Railway 部署已完成**
+   ```bash
+   # 检查部署的代码版本
+   curl -s https://web-production-fedb.up.railway.app/openapi.json | \
+     python3 -c "import sys, json; print('Merchant endpoints:', [p for p in json.load(sys.stdin).get('paths',{}).keys() if 'merchant/profile' in p])"
+   ```
+
+2. **验证 token 格式**
+   - Token 必须包含 `sub`, `email`, `role` 字段
+   - 如果缺少这些字段，说明部署未生效
+
+3. **检查环境变量**
+   - 确保 Railway 的 `JWT_SECRET_KEY` 与代码中的一致
+   - 默认值：`your-secret-key-change-in-production`
+
+### 如果前端显示 404
+
+1. **检查前端环境变量**
+   ```bash
+   # merchant-portal/.env.local
+   NEXT_PUBLIC_API_URL=https://web-production-fedb.up.railway.app
+   ```
+
+2. **重新部署前端**
+   - 前端代码已更新，需要重新部署到 Vercel
+   - 或者本地运行：`npm run dev`
+
+## 📊 期望的演示数据
+
+### 商户 (merchant@test.com)
+- **Merchant ID**: merch_208139f7600dbf42
+- **商店**: chydantest.myshopify.com (Shopify, 已连接)
+- **PSP**: Stripe Account (活跃状态)
+- **订单**: 10-50 个演示订单（随机生成）
+- **Webhook**: 已配置，事件包括 order.created, payment.completed 等
+
+### 员工 (employee@pivota.com)
+- **角色**: admin
+- **权限**: 访问所有商户、代理、订单数据
+- **功能**: KYB 审核、商户管理、代理管理
+
+### 代理 (agent@test.com)
+- **角色**: agent
+- **权限**: 访问分配的订单和分析数据
+- **功能**: 查看订单、查看佣金
+
+## 🚀 下一步
+
+1. **等待 Railway 部署完成**（2-5 分钟）
+2. **运行上面的测试命令验证后端**
+3. **测试所有三个前端门户登录**
+4. **如果遇到问题，提供错误信息**
 
 ---
 
-## 🚀 Deployment Status
-
-### Git Commits (Latest)
-- **Merchant Portal**: `407ca2f` - Trigger redeploy with latest features
-- **Employee Portal**: `1f90c02` - Trigger redeploy with all management features
-- **Agent Portal**: `2972a98` - Add comprehensive Settings page
-
-### Vercel Deployment
-All three portals are connected to GitHub and auto-deploy on push.
-**Deployment time:** ~2-3 minutes after push
-
----
-
-## 🔧 Backend Integration
-
-### API Endpoints Used
-- `POST /api/auth/login` - Returns `{ success, token, user }`
-- `GET /api/merchants` - List all merchants
-- `GET /api/merchants/{id}` - Merchant details
-- `GET /api/analytics/dashboard` - Dashboard analytics
-- `GET /api/orders` - List orders
-- `GET /api/products` - List products
-- `GET /api/integrations/stores` - Connected stores
-- `POST /api/integrations/shopify/connect` - Connect Shopify
-- `POST /api/integrations/wix/connect` - Connect Wix
-- `GET /api/psp/list` - List PSPs
-- `POST /api/psp/setup` - Setup PSP
-- `GET /api/webhooks/config` - Webhook configuration
-- `POST /api/webhooks/test` - Test webhook
-
-### Authentication
-- Backend returns: `{ success: true, token: "JWT...", user: {...} }`
-- Frontend stores: `localStorage.setItem('merchant_token', data.token)`
-- Headers: `Authorization: Bearer ${token}`
-
----
-
-## 📝 Known Issues & Next Steps
-
-### Merchant Portal
-- ✅ Login fixed (use `token` not `access_token`)
-- ✅ Real data loading implemented
-- ✅ Webhook configuration UI added
-- 🔄 **Pending**: Verify backend returns real Shopify store data for test merchant
-
-### Employee Portal
-- ✅ Login fixed
-- ✅ All merchant management features added
-- ✅ Multi-platform store connection support
-- ✅ PSP connection with webhook/sandbox options
-
-### Agent Portal
-- ✅ Login fixed
-- ✅ Settings page implemented
-- ✅ Onboarding with graceful fallbacks
-
----
-
-## 🧪 Testing Checklist
-
-### For Merchant Portal (merchant@test.com)
-- [ ] Login successfully
-- [ ] See real data from chydantest.myshopify.com
-- [ ] View connected stores in Integration tab
-- [ ] View connected PSPs with real credentials
-- [ ] Copy API key
-- [ ] Configure webhook URL
-- [ ] Send test webhook
-
-### For Employee Portal (employee@pivota.com)
-- [ ] Login successfully
-- [ ] View merchant list
-- [ ] Open "More Actions" dropdown for a merchant
-- [ ] Connect Shopify store on behalf of merchant
-- [ ] Connect PSP with webhook secret
-- [ ] Test PSP connection
-- [ ] Review KYB documents
-
-### For Agent Portal (agent@test.com)
-- [ ] Login successfully
-- [ ] View dashboard with stats
-- [ ] Navigate to Settings
-- [ ] Copy API key
-- [ ] Configure webhook URL
-- [ ] Update profile information
-- [ ] Change notification preferences
-
----
-
-## 📞 Support
-
-If Vercel deployment doesn't show latest features:
-1. Check Vercel dashboard for build status
-2. Verify GitHub integration is active
-3. Check build logs for errors
-4. Force redeploy with empty commit: `git commit --allow-empty -m "trigger deploy" && git push`
-
+**最后更新**: 2025-10-19 10:58 UTC
+**后端部署**: 等待中
+**前端部署**: 准备就绪

@@ -66,3 +66,5 @@ async def test_password(email: str, password: str):
             }
     except Exception as e:
         return {"error": str(e)}
+
+

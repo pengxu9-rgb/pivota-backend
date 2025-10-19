@@ -3,22 +3,15 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Dict, Any, Optional
 from utils.auth import get_current_user
 from datetime import datetime
+from db import database
 import httpx
 import os
-import sqlite3
 import random
 import string
 
 router = APIRouter()
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
-DB_PATH = "pivota.db"
-
-def get_db_connection():
-    """Get database connection"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 async def get_merchant_id_from_user(current_user: dict) -> str:
     """Get merchant ID from current user token"""
@@ -26,19 +19,14 @@ async def get_merchant_id_from_user(current_user: dict) -> str:
     merchant_id = current_user.get("merchant_id")
     if not merchant_id:
         # Fallback: query database by email
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("""
-                SELECT merchant_id FROM merchant_onboarding 
-                WHERE contact_email = ?
-                LIMIT 1
-            """, (current_user.get("email"),))
-            row = cursor.fetchone()
-            if row:
-                merchant_id = row["merchant_id"]
-        finally:
-            conn.close()
+        query = """
+            SELECT merchant_id FROM merchant_onboarding 
+            WHERE contact_email = :email
+            LIMIT 1
+        """
+        result = await database.fetch_one(query, {"email": current_user.get("email")})
+        if result:
+            merchant_id = result["merchant_id"]
     
     if not merchant_id:
         raise HTTPException(status_code=404, detail="Merchant ID not found")
@@ -223,25 +211,21 @@ async def connect_psp(
     }
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
+        query = """
             INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            psp_id,
-            merchant_id,
-            provider,
-            f"{provider.capitalize()} Account",
-            api_key,
-            account_id,
-            ','.join(capabilities),
-            'active',
-            datetime.now().isoformat()
-        ))
-        conn.commit()
-        conn.close()
+            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, :status, :connected_at)
+        """
+        await database.execute(query, {
+            "psp_id": psp_id,
+            "merchant_id": merchant_id,
+            "provider": provider,
+            "name": f"{provider.capitalize()} Account",
+            "api_key": api_key,
+            "account_id": account_id,
+            "capabilities": ','.join(capabilities),
+            "status": 'active',
+            "connected_at": datetime.now().isoformat()
+        })
     except Exception as e:
         print(f"Database save error: {e}")
         # Continue even if database save fails
@@ -285,24 +269,20 @@ async def connect_store(
     }
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
+        query = """
             INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, api_key, status, connected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            store_id,
-            merchant_id,
-            platform,
-            domain,
-            domain,
-            api_key,
-            'connected',
-            datetime.now().isoformat()
-        ))
-        conn.commit()
-        conn.close()
+            VALUES (:store_id, :merchant_id, :platform, :name, :domain, :api_key, :status, :connected_at)
+        """
+        await database.execute(query, {
+            "store_id": store_id,
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "name": domain,
+            "domain": domain,
+            "api_key": api_key,
+            "status": 'connected',
+            "connected_at": datetime.now().isoformat()
+        })
     except Exception as e:
         print(f"Database save error: {e}")
         # Continue even if database save fails

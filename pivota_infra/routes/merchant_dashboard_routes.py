@@ -5,20 +5,11 @@ from datetime import datetime, timedelta
 import random
 import httpx
 import string
-import sqlite3
 import json
 from utils.auth import get_current_user
+from db.database import database
 
 router = APIRouter()
-
-# Database path
-DB_PATH = "pivota.db"
-
-def get_db_connection():
-    """Get database connection"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 # Demo data for merchant dashboard
 DEMO_MERCHANT_DATA = {
