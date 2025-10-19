@@ -35,6 +35,7 @@ from routes.auth_routes import router as auth_router
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
+from routes.merchant_dashboard_routes import router as merchant_dashboard_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -95,6 +96,7 @@ app.include_router(auth_router)  # New authentication system
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
+app.include_router(merchant_dashboard_router)  # Merchant dashboard API
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
