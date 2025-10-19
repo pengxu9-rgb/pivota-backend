@@ -12,8 +12,7 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 import os
-from utils.supabase_client import supabase, create_user_in_supabase, get_user_role
-from utils.supabase_client import update_user_role as update_user_role_in_supabase
+# Supabase logic removed. Using in-memory store for development/testing.
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
@@ -135,206 +134,129 @@ def require_admin(current_user: dict = Depends(verify_jwt_token)):
 
 @router.post("/signup")
 async def signup(user_data: UserSignup):
-    """User signup with role selection"""
+    """User signup with role selection (in-memory, no Supabase)."""
     try:
-        # Create user in Supabase
-        supabase_result = await create_user_in_supabase(
-            email=user_data.email,
-            password=user_data.password,
-            role=user_data.role
-        )
-        
-        if not supabase_result["success"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to create user: {supabase_result['error']}"
-            )
-        
-        # Auto-approve admin users (for first admin setup)
-        approved = False
-        if user_data.role == UserRole.ADMIN:
-            # Auto-approve the first admin user
-            approval_result = await update_user_role_in_supabase(
-                user_id=supabase_result["user_id"],
-                role=user_data.role,
-                approved=True
-            )
-            if approval_result["success"]:
-                approved = True
-        
-        message = "Account created and approved!" if approved else "Account created successfully. Awaiting admin approval."
-        
+        if user_data.email in users_db:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists")
+        users_db[user_data.email] = {
+            "id": user_data.email,
+            "email": user_data.email,
+            "password_hash": hash_password(user_data.password),
+            "full_name": user_data.full_name or user_data.email,
+        }
+        user_roles_db[user_data.email] = {
+            "user_id": user_data.email,
+            "role": user_data.role.value,
+            "approved": True,
+            "created_at": datetime.utcnow().isoformat()
+        }
         return {
             "status": "success",
-            "message": message,
-            "user_id": supabase_result["user_id"],
-            "role": user_data.role,
-            "approved": approved
+            "message": "Account created",
+            "user_id": user_data.email,
+            "role": user_data.role.value,
+            "approved": True
         }
-        
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Signup failed: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Signup failed: {str(e)}")
 
 @router.post("/signin")
 async def signin(login_data: UserLogin):
-    """User signin"""
+    """User signin (in-memory, with built-in demo accounts)."""
     try:
-        # Authenticate with Supabase
-        if not supabase:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Supabase not configured"
-            )
-        
-        try:
-            # Sign in with Supabase Auth
-            auth_response = supabase.auth.sign_in_with_password({
-                "email": login_data.email,
-                "password": login_data.password
-            })
-            
-            if not auth_response.user:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid credentials"
-                )
-            
-            user_id = auth_response.user.id
-            user_email = auth_response.user.email
-            
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
-            )
-        
-        # Check if user has approved role using Supabase
-        user_role = await get_user_role(user_id)
-        
-        if not user_role or not user_role.get("approved", False):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Account pending admin approval"
-            )
-        
-        # Get primary role
-        primary_role = user_role["role"]
-        
-        # Create JWT token
-        token = create_jwt_token(user_id, primary_role)
-        
+        demo_accounts = {
+            "merchant@test.com": {"password": "Admin123!", "role": "merchant"},
+            "employee@pivota.com": {"password": "Admin123!", "role": "admin"},
+            "agent@test.com": {"password": "Admin123!", "role": "agent"},
+            "superadmin@pivota.com": {"password": "admin123", "role": "admin"},
+        }
+        # In-memory users
+        if login_data.email in users_db:
+            stored = users_db[login_data.email]
+            if not verify_password(login_data.password, stored["password_hash"]):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            role_info = user_roles_db.get(login_data.email, {"role": "employee", "approved": True})
+            primary_role = role_info["role"]
+            token = create_jwt_token(login_data.email, primary_role)
+            return {
+                "status": "success",
+                "message": "Login successful",
+                "token": token,
+                "user": {"id": login_data.email, "email": login_data.email, "full_name": stored.get("full_name", login_data.email), "role": primary_role}
+            }
+        # Demo accounts
+        acct = demo_accounts.get(login_data.email)
+        if not acct or acct["password"] != login_data.password:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        token = create_jwt_token(login_data.email, acct["role"])
         return {
             "status": "success",
             "message": "Login successful",
             "token": token,
-            "user": {
-                "id": user_id,
-                "email": user_email,
-                "full_name": user_email,  # Will be updated from profiles table
-                "role": primary_role
-            }
+            "user": {"id": login_data.email, "email": login_data.email, "full_name": login_data.email, "role": acct["role"]}
         }
-        
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Login failed: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Login failed: {str(e)}")
 
 @router.get("/me")
 async def get_current_user(current_user: dict = Depends(verify_jwt_token)):
-    """Get current user information"""
+    """Get current user information (from JWT / in-memory)."""
     try:
-        # Get user from Supabase
-        if not supabase:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Supabase not configured"
-            )
-        
-        try:
-            # Get user from Supabase profiles table
-            result = supabase.table("profiles").select("*").eq("id", current_user["user_id"]).execute()
-            
-            if not result.data:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found"
-                )
-            
-            user = result.data[0]
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to get user: {str(e)}"
-            )
-        
+        # If user exists in our memory store, provide richer info
+        stored = users_db.get(current_user["user_id"])
+        if stored:
+            return {
+                "status": "success",
+                "user": {
+                    "id": stored["id"],
+                    "email": stored["email"],
+                    "full_name": stored.get("full_name", stored["email"]),
+                    "role": user_roles_db.get(current_user["user_id"], {}).get("role", current_user["role"]),
+                    "created_at": user_roles_db.get(current_user["user_id"], {}).get("created_at", datetime.utcnow().isoformat()),
+                }
+            }
+        # Fallback to JWT-only info
         return {
             "status": "success",
             "user": {
-                "id": user["id"],
-                "email": user["email"],
-                "full_name": user["full_name"],
+                "id": current_user["user_id"],
+                "email": current_user["user_id"],
+                "full_name": current_user["user_id"],
                 "role": current_user["role"],
-                "created_at": user["created_at"]
+                "created_at": datetime.utcnow().isoformat()
             }
         }
-        
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get user info: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get user info: {str(e)}")
 
 @router.get("/admin/users")
 async def get_pending_users(admin_user: dict = Depends(require_admin)):
-    """Get all users for admin approval (admin only)"""
+    """Get all users for admin management (admin only, in-memory)."""
     try:
-        pending_users = []
-        
-        for role_id, role_data in user_roles_db.items():
-            # Find user data
-            user = None
-            for email, user_data in users_db.items():
-                if user_data["id"] == role_data["user_id"]:
-                    user = user_data
-                    break
-            
-            if user:
-                pending_users.append(PendingUser(
-                    id=role_id,
-                    user_id=role_data["user_id"],
-                    role=role_data["role"],
-                    approved=role_data["approved"],
-                    email=user["email"],
-                    full_name=user["full_name"],
-                    created_at=role_data["created_at"]
-                ))
-        
-        # Sort by creation date (newest first)
-        pending_users.sort(key=lambda x: x.created_at, reverse=True)
-        
-        return {
-            "status": "success",
-            "users": pending_users
-        }
-        
+        users_list: list[PendingUser] = []
+        for email, role_data in user_roles_db.items():
+            user = users_db.get(email, {"email": email, "full_name": email})
+            users_list.append(PendingUser(
+                id=email,
+                user_id=role_data["user_id"],
+                role=role_data["role"],
+                approved=role_data.get("approved", True),
+                email=user["email"],
+                full_name=user.get("full_name", user["email"]),
+                created_at=role_data.get("created_at", datetime.utcnow().isoformat())
+            ))
+        users_list.sort(key=lambda x: x.created_at, reverse=True)
+        return {"status": "success", "users": users_list}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get users: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get users: {str(e)}")
 
 @router.post("/admin/users/{user_id}/approve")
 async def approve_user(
@@ -342,44 +264,21 @@ async def approve_user(
     approval_data: ApprovalUpdate,
     admin_user: dict = Depends(require_admin)
 ):
-    """Approve or reject user (admin only)"""
+    """Approve or reject user (admin only, in-memory)."""
     try:
-        # Get current user role from Supabase
-        user_role_info = await get_user_role(user_id)
-        
-        if not user_role_info:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User role not found"
-            )
-        
-        # Update approval status in Supabase, keeping the existing role
-        result = await update_user_role_in_supabase(
-            user_id=user_id,
-            role=user_role_info.get("role", "employee"),
-            approved=approval_data.approved
-        )
-        
-        if not result["success"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to update approval: {result['error']}"
-            )
-        
+        if user_id not in user_roles_db:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User role not found")
+        user_roles_db[user_id]["approved"] = approval_data.approved
         return {
             "status": "success",
             "message": f"User {'approved' if approval_data.approved else 'rejected'}",
             "user_id": user_id,
             "approved": approval_data.approved
         }
-        
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update approval: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update approval: {str(e)}")
 
 @router.put("/admin/users/{user_id}/role")
 async def update_user_role(
@@ -387,38 +286,18 @@ async def update_user_role(
     role_data: RoleUpdate,
     admin_user: dict = Depends(require_admin)
 ):
-    """Update user role (admin only)"""
+    """Update user role (admin only, in-memory)."""
     try:
-        # Find user role
-        role_found = None
-        for role_id, role_info in user_roles_db.items():
-            if role_info["user_id"] == user_id:
-                role_found = role_info
-                break
-        
-        if not role_found:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User role not found"
-            )
-        
-        # Update role
-        role_found["role"] = role_data.role
-        
-        return {
-            "status": "success",
-            "message": f"Role updated to {role_data.role}",
-            "user_id": user_id,
-            "role": role_data.role
-        }
-        
+        if user_id not in user_roles_db:
+            # If not present, create default entry
+            user_roles_db[user_id] = {"user_id": user_id, "role": role_data.role.value if hasattr(role_data.role, 'value') else str(role_data.role), "approved": True, "created_at": datetime.utcnow().isoformat()}
+        else:
+            user_roles_db[user_id]["role"] = role_data.role.value if hasattr(role_data.role, 'value') else str(role_data.role)
+        return {"status": "success", "message": f"Role updated to {role_data.role}", "user_id": user_id, "role": role_data.role}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update role: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update role: {str(e)}")
 
 @router.post("/signout")
 async def signout(current_user: dict = Depends(verify_jwt_token)):
@@ -436,38 +315,7 @@ async def signout(current_user: dict = Depends(verify_jwt_token)):
             detail=f"Signout failed: {str(e)}"
         )
 
-@router.get("/test-supabase")
-async def test_supabase_connection():
-    """Test Supabase connection and configuration"""
-    try:
-        if not supabase:
-            return {
-                "status": "error",
-                "message": "Supabase not configured",
-                "supabase_url": os.getenv("SUPABASE_URL", "Not set"),
-                "supabase_service_role_key": "Not set" if not os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "Set"
-            }
-        
-        # Test Supabase connection by trying to query the profiles table
-        result = supabase.table("profiles").select("id").limit(1).execute()
-        
-        return {
-            "status": "success",
-            "message": "Supabase connection successful",
-            "supabase_url": os.getenv("SUPABASE_URL", "Not set"),
-            "supabase_service_role_key": "Set" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "Not set",
-            "database_accessible": True,
-            "test_query_result": result.data if result.data else []
-        }
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Supabase connection failed: {str(e)}",
-            "supabase_url": os.getenv("SUPABASE_URL", "Not set"),
-            "supabase_service_role_key": "Set" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "Not set",
-            "database_accessible": False
-        }
+# Supabase test endpoint removed.
 
 @router.get("/test-auth")
 async def test_auth_flow():
