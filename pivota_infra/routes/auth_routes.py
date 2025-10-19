@@ -87,10 +87,12 @@ def verify_password(password: str, hashed: str) -> bool:
     """Verify password against hash"""
     return hash_password(password) == hashed
 
-def create_jwt_token(user_id: str, role: str) -> str:
+def create_jwt_token(user_id: str, role: str, email: str = None) -> str:
     """Create JWT token for user"""
     payload = {
-        "user_id": user_id,
+        "sub": user_id,  # Standard JWT claim for subject
+        "user_id": user_id,  # For backward compatibility
+        "email": email or user_id,
         "role": role,
         "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
         "iat": datetime.utcnow()
@@ -179,7 +181,7 @@ async def signin(login_data: UserLogin):
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
             role_info = user_roles_db.get(login_data.email, {"role": "employee", "approved": True})
             primary_role = role_info["role"]
-            token = create_jwt_token(login_data.email, primary_role)
+            token = create_jwt_token(login_data.email, primary_role, login_data.email)
             return {
                 "status": "success",
                 "message": "Login successful",
@@ -190,7 +192,7 @@ async def signin(login_data: UserLogin):
         acct = demo_accounts.get(login_data.email)
         if not acct or acct["password"] != login_data.password:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-        token = create_jwt_token(login_data.email, acct["role"])
+        token = create_jwt_token(login_data.email, acct["role"], login_data.email)
         return {
             "status": "success",
             "message": "Login successful",
