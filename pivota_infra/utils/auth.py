@@ -167,6 +167,10 @@ async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)
     return current_user
 
 
+# Alias for backward compatibility
+get_current_admin = require_admin
+
+
 async def get_current_employee(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Require employee role (super_admin, admin, employee, or outsourced)
