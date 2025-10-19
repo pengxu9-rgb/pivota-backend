@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import random
+import httpx
 import string
 from utils.auth import get_current_user
 try:
@@ -137,6 +138,31 @@ async def get_merchant_stores(
     demo_stores = merchant_data["stores"] if merchant_data else []
     runtime_stores = merchant_stores_db.get(merchant_id, [])
     stores = [*runtime_stores, *demo_stores]
+
+    # Enrich with product_count by querying products endpoint
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"http://localhost:8000/products/{merchant_id}")
+            if resp.status_code == 200:
+                payload = resp.json()
+                products = payload.get("products", [])
+                # Count by platform
+                platform_to_count = {}
+                for p in products:
+                    plat = (p.get("platform") or "").lower()
+                    platform_to_count[plat] = platform_to_count.get(plat, 0) + 1
+
+                # Attach counts; default 0
+                for s in stores:
+                    plat = (s.get("platform") or "").lower()
+                    s["product_count"] = platform_to_count.get(plat, s.get("product_count", 0))
+            else:
+                # If products API not available, ensure field exists
+                for s in stores:
+                    s.setdefault("product_count", s.get("product_count", 0))
+    except Exception:
+        for s in stores:
+            s.setdefault("product_count", s.get("product_count", 0))
 
     return {"status": "success", "data": {"stores": stores}}
 
