@@ -226,8 +226,16 @@ async def connect_psp(
             "status": 'active',
             "connected_at": datetime.now().isoformat()
         })
+        print(f"✅ PSP saved to DB: {psp_id} for merchant {merchant_id}")
+        
+        # Verify the save
+        verify_query = "SELECT COUNT(*) as count FROM merchant_psps WHERE merchant_id = :merchant_id"
+        result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
+        print(f"✅ Total PSPs for merchant {merchant_id}: {result['count']}")
     except Exception as e:
-        print(f"Database save error: {e}")
+        print(f"❌ Database save error: {e}")
+        import traceback
+        traceback.print_exc()
         # Continue even if database save fails
     
     return {
@@ -283,8 +291,16 @@ async def connect_store(
             "status": 'connected',
             "connected_at": datetime.now().isoformat()
         })
+        print(f"✅ Store saved to DB: {store_id} for merchant {merchant_id}")
+        
+        # Verify the save
+        verify_query = "SELECT COUNT(*) as count FROM merchant_stores WHERE merchant_id = :merchant_id"
+        result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
+        print(f"✅ Total stores for merchant {merchant_id}: {result['count']}")
     except Exception as e:
-        print(f"Database save error: {e}")
+        print(f"❌ Database save error: {e}")
+        import traceback
+        traceback.print_exc()
         # Continue even if database save fails
     
     return {
