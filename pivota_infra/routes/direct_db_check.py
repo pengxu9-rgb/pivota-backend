@@ -1,8 +1,21 @@
 """Direct database check endpoint - bypass all business logic"""
 from fastapi import APIRouter
 from db.database import database
+import datetime
 
 router = APIRouter()
+
+@router.get("/version-check")
+async def version_check():
+    """Check deployed version and configuration"""
+    return {
+        "version": "v1.0.1-fixed-db-import",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "database_module": str(type(database)),
+        "has_execute": hasattr(database, 'execute'),
+        "has_fetch_all": hasattr(database, 'fetch_all'),
+        "has_fetch_one": hasattr(database, 'fetch_one')
+    }
 
 @router.get("/direct-db-check")
 async def direct_db_check():
