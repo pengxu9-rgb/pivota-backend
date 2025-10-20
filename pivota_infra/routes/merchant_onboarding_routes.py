@@ -799,3 +799,39 @@ async def download_kyc_document(
         detail="File download functionality not yet implemented (R2 storage pending)"
     )
 
+@router.get("/kyb/{merchant_id}/documents", response_model=Dict[str, Any])
+async def get_merchant_kyb_documents(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get KYB documents for a merchant"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        # Get merchant
+        merchant = await get_merchant_onboarding(merchant_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        # Get documents from kyc_documents JSON field
+        documents = merchant.get("kyc_documents", [])
+        if isinstance(documents, str):
+            import json
+            try:
+                documents = json.loads(documents)
+            except:
+                documents = []
+        
+        return {
+            "status": "success",
+            "kyb_status": merchant.get("status", "pending"),
+            "review_notes": merchant.get("rejection_reason"),
+            "documents": documents or []
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get documents: {str(e)}")
+
