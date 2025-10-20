@@ -57,6 +57,7 @@ from routes.employee_missing_endpoints import router as employee_missing_router
 from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
+from routes.fix_agents_table import router as fix_agents_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -139,6 +140,7 @@ app.include_router(employee_missing_router)  # Missing employee endpoints
 app.include_router(agent_sdk_router)  # SDK-ready agent endpoints
 app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
 app.include_router(emp_agent_mgmt_router)  # Employee agent management
+app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
