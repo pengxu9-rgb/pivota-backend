@@ -50,6 +50,7 @@ from routes.cleanup_all_duplicates import router as cleanup_all_duplicates_route
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.init_orders_table import router as init_orders_router
 from routes.employee_dashboard_routes import router as employee_dashboard_router
+from routes.employee_merchant_mgmt import router as employee_merchant_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -125,6 +126,7 @@ app.include_router(cleanup_all_duplicates_router)  # Cleanup all duplicates
 app.include_router(admin_cleanup_router)  # Admin cleanup (no auth)
 app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
+app.include_router(employee_merchant_router)  # Employee merchant management
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
@@ -228,7 +230,7 @@ async def startup():
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -538,8 +540,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
