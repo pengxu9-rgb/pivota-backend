@@ -23,6 +23,25 @@ router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
 
 
 # ============================================================================
+# Helper Functions
+# ============================================================================
+
+async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
+    """Verify merchant exists and is not deleted"""
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    
+    if merchant.get("status") == "deleted":
+        raise HTTPException(
+            status_code=403, 
+            detail="Merchant account has been deactivated"
+        )
+    
+    return merchant
+
+
+# ============================================================================
 # 产品搜索和浏览
 # ============================================================================
 
@@ -53,10 +72,8 @@ async def agent_search_products(
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
-        # 获取商户信息
-        merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found")
+        # 获取商户信息并验证状态（检查是否被软删除）
+        merchant = await verify_merchant_active(merchant_id)
         
         # 从缓存获取产品
         cached_products = await get_cached_products(merchant_id)
@@ -206,10 +223,8 @@ async def agent_validate_cart(
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
-        # 获取商户信息
-        merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found")
+        # 获取商户信息并验证状态（检查是否被软删除）
+        merchant = await verify_merchant_active(merchant_id)
         
         # 获取产品信息
         cached_products = await get_cached_products(merchant_id)

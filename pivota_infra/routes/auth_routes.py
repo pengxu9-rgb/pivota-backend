@@ -194,6 +194,22 @@ async def signin(login_data: UserLogin):
         if not acct or acct["password"] != login_data.password:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
         
+        # For merchant accounts, verify they are not soft-deleted
+        if acct["role"] == "merchant" and acct.get("merchant_id"):
+            try:
+                from db.merchant_onboarding import get_merchant_onboarding
+                merchant = await get_merchant_onboarding(acct["merchant_id"])
+                if merchant and merchant.get("status") == "deleted":
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN, 
+                        detail="Account has been deactivated. Please contact support."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                # If merchant not found in onboarding table, allow login (backward compatibility)
+                print(f"Warning: Could not verify merchant status: {e}")
+        
         # Create token with merchant_id if available
         token_payload = {
             "sub": login_data.email,
