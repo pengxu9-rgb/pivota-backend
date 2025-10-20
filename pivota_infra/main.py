@@ -46,6 +46,7 @@ from routes.manage_integrations import router as manage_integrations_router
 from routes.psp_metrics import router as psp_metrics_router
 from routes.wix_sync import router as wix_sync_router
 from routes.fix_duplicate_stores import router as fix_duplicate_stores_router
+from routes.cleanup_all_duplicates import router as cleanup_all_duplicates_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -117,6 +118,7 @@ app.include_router(manage_integrations_router)  # Manage integrations (delete/up
 app.include_router(psp_metrics_router)  # Real PSP metrics
 app.include_router(wix_sync_router)  # Wix product sync
 app.include_router(fix_duplicate_stores_router)  # Fix duplicate stores
+app.include_router(cleanup_all_duplicates_router)  # Cleanup all duplicates
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
