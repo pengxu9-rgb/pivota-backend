@@ -55,6 +55,8 @@ from routes.employees_security import router as employees_security_router
 from routes.mcp_mgmt import router as mcp_mgmt_router
 from routes.employee_missing_endpoints import router as employee_missing_router
 from routes.agent_sdk_ready import router as agent_sdk_router
+from routes.employee_store_psp_fixes import router as emp_store_psp_router
+from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -135,6 +137,8 @@ app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
 app.include_router(employee_missing_router)  # Missing employee endpoints
 app.include_router(agent_sdk_router)  # SDK-ready agent endpoints
+app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
+app.include_router(emp_agent_mgmt_router)  # Employee agent management
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
@@ -264,6 +268,37 @@ async def startup():
         
         # Create integration tables
         try:
+            # Create agents table if not exists
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS agents (
+                    agent_id VARCHAR(50) PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    company VARCHAR(255),
+                    use_case TEXT,
+                    api_key VARCHAR(255) UNIQUE,
+                    status VARCHAR(50) DEFAULT 'active',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    last_active TIMESTAMP WITH TIME ZONE,
+                    last_key_rotation TIMESTAMP WITH TIME ZONE,
+                    deactivated_at TIMESTAMP WITH TIME ZONE,
+                    request_count INTEGER DEFAULT 0,
+                    success_rate FLOAT DEFAULT 0,
+                    rate_limit INTEGER DEFAULT 1000
+                )
+            """)
+            
+            # Create agent_merchants table
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS agent_merchants (
+                    agent_id VARCHAR(50),
+                    merchant_id VARCHAR(50),
+                    connected_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    permissions TEXT,
+                    PRIMARY KEY (agent_id, merchant_id)
+                )
+            """)
+            
             await database.execute("""
                 CREATE TABLE IF NOT EXISTS merchant_stores (
                     store_id VARCHAR(50) PRIMARY KEY,
