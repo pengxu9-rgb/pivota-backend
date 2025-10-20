@@ -837,3 +837,46 @@ async def get_merchant_kyb_documents(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get documents: {str(e)}")
 
+@router.post("/restore/{merchant_id}", response_model=Dict[str, Any])
+async def restore_merchant(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Restore a soft-deleted merchant"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        # Get merchant
+        merchant = await get_merchant_onboarding(merchant_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        if merchant.get("status") != "deleted":
+            raise HTTPException(status_code=400, detail="Merchant is not deleted")
+        
+        # Restore merchant by setting status back to previous state (or 'pending')
+        # We'll set it to 'pending' and let employee re-approve if needed
+        from db.merchant_onboarding import merchant_onboarding
+        from db.database import database
+        
+        update_query = merchant_onboarding.update().where(
+            merchant_onboarding.c.merchant_id == merchant_id
+        ).values(
+            status="pending",
+            updated_at=datetime.now()
+        )
+        
+        await database.execute(update_query)
+        
+        return {
+            "status": "success",
+            "message": "Merchant restored successfully. Status set to 'pending' for review.",
+            "merchant_id": merchant_id
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to restore merchant: {str(e)}")
+
