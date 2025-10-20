@@ -204,32 +204,20 @@ async def get_merchant_psps(
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         print(f"DEBUG: Found {len(rows)} PSPs in database for merchant {merchant_id}")
         
-        # Calculate metrics from orders
+        # Calculate metrics from generated demo orders
         total_volume = 0
         success_rate = 98.5
         transaction_count = 0
         
-        try:
-            # Get all orders for this merchant
-            orders_query = """
-                SELECT COUNT(*) as total,
-                       SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as completed,
-                       COALESCE(SUM(amount), 0) as total_volume
-                FROM orders 
-                WHERE merchant_id = :merchant_id
-            """
-            orders_stat = await database.fetch_one(orders_query, {"merchant_id": merchant_id})
+        # Use generated demo orders for metrics
+        demo_orders = generate_demo_orders(merchant_id, limit=50)
+        if demo_orders:
+            transaction_count = len(demo_orders)
+            completed_orders = sum(1 for o in demo_orders if o['status'] in ['completed', 'delivered'])
+            total_volume = sum(o['amount'] for o in demo_orders)
             
-            if orders_stat:
-                total_orders = orders_stat["total"] or 0
-                completed_orders = orders_stat["completed"] or 0
-                total_volume = float(orders_stat["total_volume"] or 0)
-                
-                if total_orders > 0:
-                    success_rate = round((completed_orders / total_orders) * 100, 1)
-                    transaction_count = total_orders
-        except Exception as metrics_error:
-            print(f"Could not calculate metrics: {metrics_error}")
+            if transaction_count > 0:
+                success_rate = round((completed_orders / transaction_count) * 100, 1)
         
         # Distribute metrics across PSPs
         psp_count = len(rows)
