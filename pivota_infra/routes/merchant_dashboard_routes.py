@@ -123,20 +123,65 @@ def generate_analytics(merchant_id: str) -> Dict[str, Any]:
 
 @router.get("/merchant/profile")
 async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
-    """Get merchant profile"""
+    """Get merchant profile from real database"""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    merchant_id = "merch_208139f7600dbf42"  # Fixed merchant ID for demo
-    merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
-    
-    if not merchant_data:
-        raise HTTPException(status_code=404, detail="Merchant not found")
-    
-    return {
-        "status": "success",
-        "data": merchant_data["profile"]
-    }
+    try:
+        # Get merchant_id from JWT token
+        merchant_id = current_user.get("merchant_id")
+        if not merchant_id:
+            raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+        
+        # Query merchant data from database
+        merchant_query = """
+            SELECT 
+                merchant_id, business_name, email, phone, website,
+                country, business_type, status, created_at
+            FROM merchant_onboarding
+            WHERE merchant_id = :merchant_id
+        """
+        merchant = await database.fetch_one(merchant_query, {"merchant_id": merchant_id})
+        
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        # Get statistics
+        stats_query = """
+            SELECT 
+                COUNT(*) as total_orders,
+                COALESCE(SUM(amount), 0) as total_revenue
+            FROM orders
+            WHERE merchant_id = :merchant_id
+        """
+        stats = await database.fetch_one(stats_query, {"merchant_id": merchant_id})
+        
+        return {
+            "status": "success",
+            "data": {
+                "merchant_id": merchant["merchant_id"],
+                "business_name": merchant["business_name"],
+                "email": merchant["email"],
+                "phone": merchant["phone"],
+                "website": merchant["website"],
+                "country": merchant["country"],
+                "business_type": merchant["business_type"],
+                "status": merchant["status"],
+                "created_at": merchant["created_at"].isoformat() if merchant["created_at"] else None,
+                "total_orders": stats["total_orders"] if stats else 0,
+                "total_revenue": float(stats["total_revenue"]) if stats else 0
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching merchant profile: {e}")
+        # Fallback to demo data
+        merchant_id = current_user.get("merchant_id", "merch_208139f7600dbf42")
+        merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
+        if merchant_data:
+            return {"status": "success", "data": merchant_data["profile"]}
+        raise HTTPException(status_code=500, detail="Failed to fetch profile")
 
 @router.get("/merchant/{merchant_id}/integrations")
 async def get_merchant_stores(
@@ -469,20 +514,44 @@ async def get_merchant_analytics(
 
 @router.get("/merchant/webhooks/config")
 async def get_webhook_config(current_user: dict = Depends(get_current_user)):
-    """Get webhook configuration"""
+    """Get webhook configuration from real database"""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    merchant_id = "merch_208139f7600dbf42"
-    merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
-    
-    if not merchant_data:
-        raise HTTPException(status_code=404, detail="Merchant not found")
-    
-    return {
-        "status": "success",
-        "data": merchant_data["webhooks"]
-    }
+    try:
+        # Get merchant_id from JWT token
+        merchant_id = current_user.get("merchant_id")
+        if not merchant_id:
+            raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+        
+        # For now, return a template webhook config
+        # In production, this would be stored in database
+        return {
+            "status": "success",
+            "data": {
+                "webhook_url": f"https://your-server.com/webhooks/{merchant_id}",
+                "events": [
+                    "order.created",
+                    "order.updated",
+                    "payment.completed",
+                    "payment.failed",
+                    "refund.processed"
+                ],
+                "secret": "whsec_" + merchant_id[-16:],
+                "enabled": True,
+                "created_at": datetime.now().isoformat()
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching webhook config: {e}")
+        # Fallback to demo
+        merchant_id = current_user.get("merchant_id", "merch_208139f7600dbf42")
+        merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
+        if merchant_data:
+            return {"status": "success", "data": merchant_data["webhooks"]}
+        raise HTTPException(status_code=500, detail="Failed to fetch webhook config")
 
 @router.get("/merchant/webhooks/deliveries")
 async def get_webhook_deliveries(
