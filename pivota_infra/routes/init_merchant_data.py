@@ -1,29 +1,59 @@
 """Initialize merchant data for production"""
 from fastapi import APIRouter
 from db.database import database
+from datetime import datetime
 
 router = APIRouter()
 
 @router.post("/init-merchant-data")
+@router.get("/init-merchant-data")  # Also allow GET for easy testing
 async def init_merchant_data():
     """Initialize merchant data with real Shopify and PSP connections"""
     
     merchant_id = "merch_6b90dc9838d5fd9c"
     
     try:
-        # Update merchant_onboarding to connect Shopify
-        update_query = """
-            UPDATE merchant_onboarding 
-            SET 
-                store_url = 'https://chydantest.myshopify.com',
-                mcp_connected = true,
-                mcp_platform = 'shopify',
-                mcp_shop_domain = 'chydantest.myshopify.com',
-                psp_connected = true,
-                psp_type = 'stripe'
-            WHERE merchant_id = :merchant_id
-        """
-        await database.execute(update_query, {"merchant_id": merchant_id})
+        # Check if merchant exists
+        check_query = "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :merchant_id"
+        merchant_exists = await database.fetch_one(check_query, {"merchant_id": merchant_id})
+        
+        if not merchant_exists:
+            # Create merchant
+            await database.execute("""
+                INSERT INTO merchant_onboarding (merchant_id, business_name, contact_email, store_url, status, mcp_connected, mcp_platform, mcp_shop_domain, psp_connected, psp_type)
+                VALUES (:merchant_id, :business_name, :contact_email, :store_url, :status, :mcp_connected, :mcp_platform, :mcp_shop_domain, :psp_connected, :psp_type)
+            """, {
+                "merchant_id": merchant_id,
+                "business_name": "ChydanTest Store",
+                "contact_email": "merchant@test.com",
+                "store_url": "https://chydantest.myshopify.com",
+                "status": "approved",
+                "mcp_connected": True,
+                "mcp_platform": "shopify",
+                "mcp_shop_domain": "chydantest.myshopify.com",
+                "psp_connected": True,
+                "psp_type": "stripe"
+            })
+        else:
+            # Update merchant
+            await database.execute("""
+                UPDATE merchant_onboarding 
+                SET store_url = :store_url,
+                    mcp_connected = :mcp_connected,
+                    mcp_platform = :mcp_platform,
+                    mcp_shop_domain = :mcp_shop_domain,
+                    psp_connected = :psp_connected,
+                    psp_type = :psp_type
+                WHERE merchant_id = :merchant_id
+            """, {
+                "merchant_id": merchant_id,
+                "store_url": "https://chydantest.myshopify.com",
+                "mcp_connected": True,
+                "mcp_platform": "shopify",
+                "mcp_shop_domain": "chydantest.myshopify.com",
+                "psp_connected": True,
+                "psp_type": "stripe"
+            })
         
         # Insert Shopify store if not exists
         store_insert = """
