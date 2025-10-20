@@ -43,6 +43,7 @@ from routes.direct_db_check import router as direct_db_check_router
 from routes.init_merchant_data import router as init_merchant_data_router
 from routes.cleanup_test_data import router as cleanup_test_data_router
 from routes.manage_integrations import router as manage_integrations_router
+from routes.psp_metrics import router as psp_metrics_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -111,6 +112,7 @@ app.include_router(direct_db_check_router)  # Direct DB check
 app.include_router(init_merchant_data_router)  # Initialize merchant data
 app.include_router(cleanup_test_data_router)  # Cleanup test data
 app.include_router(manage_integrations_router)  # Manage integrations (delete/update)
+app.include_router(psp_metrics_router)  # Real PSP metrics
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management

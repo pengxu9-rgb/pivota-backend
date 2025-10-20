@@ -1,343 +1,159 @@
-# 🎊 Pivota 系统最终状态报告
+# 🎉 最终状态 - 集成问题已解决！
 
-**生成时间**: 2025-10-18  
-**Git 配置**: pengxu9-rgb <peng@chydan.com> ✅
-
----
-
-## ✅ 所有系统已部署
-
-### 🌐 **四个网站全部在线**
-
-| 域名 | GitHub 仓库 | Vercel 状态 | 用途 |
-|------|------------|------------|------|
-| **pivota.cc** | pivota-marketing | 🟢 已连接 | 宣传主页（Lovable 设计） |
-| **agents.pivota.cc** | pivota-agents-portal | 🟢 已连接 | Agent 门户 |
-| **merchants.pivota.cc** | pivota-merchants-portal | 🟢 已连接 | Merchant 门户 |
-| **employee.pivota.cc** | pivota-employee-portal | 🟢 已连接 | Employee 门户 |
-
-### ⚙️ **后端服务**
-
-| 服务 | URL | 状态 |
-|------|-----|------|
-| API 后端 | https://web-production-fedb.up.railway.app | 🟢 运行中 |
-| 版本 | 76d815ae | ✅ 最新 |
-| 数据库 | PostgreSQL on Railway | 🟢 已连接 |
-| MCP Server | 集成在后端 | 🟢 可用 |
+**更新时间**: 2025-10-20 01:53 UTC
 
 ---
 
-## 📦 **GitHub 仓库列表**
+## ✅ 后端（Railway）- 完全成功
 
-所有代码都在 GitHub，通过 Git 推送自动部署：
+### 关键修复
+1. ✅ 修复了数据库导入：`from db.database import database`
+2. ✅ 使用显式事务：`async with database.transaction()`
+3. ✅ 使用正确的datetime对象而不是字符串
+4. ✅ 表结构使用 `TIMESTAMP WITH TIME ZONE`
 
+### 测试结果
+```json
+商店列表：
+{
+  "stores": [
+    {
+      "id": "store_1bc0pdjcbnmp",
+      "platform": "wix",
+      "name": "success-wix.wixsite.com",
+      "status": "connected",
+      "product_count": 0
+    }
+  ]
+}
+
+PSP列表：
+{
+  "psps": [
+    {
+      "id": "psp_lxcjpn5lvqsg",
+      "provider": "adyen",
+      "name": "Adyen Account",
+      "status": "active",
+      "capabilities": ["card", "bank_transfer"]
+    },
+    {
+      "id": "psp_7y0e5u1h8q2h",
+      "provider": "adyen",
+      "name": "Adyen Account",
+      "status": "active"
+    }
+  ]
+}
 ```
-✅ https://github.com/pengxu9-rgb/pivota-marketing (主页)
-✅ https://github.com/pengxu9-rgb/pivota-agents-portal (Agent)
-✅ https://github.com/pengxu9-rgb/pivota-merchants-portal (Merchant)
-✅ https://github.com/pengxu9-rgb/pivota-employee-portal (Employee)
-✅ https://github.com/pengxu9-rgb/pivota-dashboard-1760371224 (后端)
-```
+
+### 功能状态
+- ✅ Wix商店连接 - 工作正常
+- ✅ Adyen PSP连接 - 工作正常
+- ✅ 数据持久化 - PostgreSQL存储成功
+- ✅ 数据检索 - 能正确返回已连接的商店和PSP
+- ✅ merchant@test.com - 映射到真实merchant_id (merch_6b90dc9838d5fd9c)
 
 ---
 
-## 🔐 **测试账号**
+## ⚠️ 前端（Vercel）- 部署失败
 
-### Agent Portal
-```
-Email: agent@test.com
-Password: Admin123!
-```
+### 问题
+最后一次Vercel部署失败
 
-### Merchant Portal
-```
-Email: merchant@test.com
-Password: Admin123!
-```
+### 解决方案
+1. 检查Vercel部署日志查看具体错误
+2. 可能需要：
+   - 修复TypeScript错误
+   - 更新依赖
+   - 或者简单地重新触发部署
 
-### Employee Portal
-```
-Email: employee@pivota.com
-Password: Admin123!
-
-或:
-Email: admin@pivota.com
-Password: Admin123!
-```
+### 前端代码状态
+- ✅ API端点已更新为匹配后端
+- ✅ 数据格式化已修复
+- ✅ 所有更改已提交到Git
 
 ---
 
-## 🎯 **核心功能确认**
+## 🧪 测试步骤
 
-### ✅ Agent Portal (agents.pivota.cc)
-- [x] 独立登录/注册页面
-- [x] Dashboard 显示统计（API 调用、订单、GMV、成功率）
-- [x] MCP/API Integration 页面（真实可用）
-  - API Key 管理
-  - Python/cURL 代码示例
-  - 完整 API 端点文档
-  - SDK 下载链接
-- [x] 角色验证（只允许 Agent 登录）
+### 1. 等待Vercel重新部署成功
 
-### ✅ Merchant Portal (merchants.pivota.cc)
-- [x] 独立登录/注册页面
-- [x] 完整 Onboarding 流程（4 步）
-  - 商业信息注册
-  - PSP 配置（Stripe/Adyen）
-  - KYB 文档上传
-  - API 密钥获取
-- [x] 角色验证（只允许 Merchant 登录）
+在Vercel Dashboard中：
+1. 找到 `pivota-merchants-portal` 项目
+2. 查看部署失败的原因
+3. 点击 "Redeploy" 重新部署
 
-### ✅ Employee Portal (employee.pivota.cc)
-- [x] 员工登录页面
-- [x] 完整的 MerchantTable 组件
-  - 搜索和过滤功能
-  - 9 列详细数据（Merchant, Store URL, Status, PSP, MCP, Auto, Confidence, Created, Actions）
-  - 三点菜单操作：
-    - View Details（查看详情模态框）
-    - Review KYB（审核模态框）
-    - Upload Docs（上传文档模态框）
-    - Connect Shopify（连接店铺）
-    - Sync Products（同步产品）
-    - Delete（删除商户）
-- [x] StatsCards 统计卡片
-- [x] 角色验证（只允许员工登录）
+### 2. 测试完整流程
 
-### ✅ Marketing Site (pivota.cc)
-- [x] Lovable 精美设计（完整复制）
-- [x] Header 两个登录按钮
-  - "Agent Login" → agents.pivota.cc/login
-  - "Merchant Login" → merchants.pivota.cc/login
-- [x] HeroSection 两个入口卡片
-  - "For AI Agents" → agents.pivota.cc/signup
-  - "For Merchants" → merchants.pivota.cc/signup
-- [x] 所有 Section 保留
-  - Features
-  - Workflow
-  - Partners
-  - Testimonials
-  - Demo
-  - Footer
+访问：https://merchant.pivota.cc
+
+登录账号：
+- Email: `merchant@test.com`
+- Password: `Admin123!`
+
+测试集成页面：
+1. **查看现有集成** - 应该能看到已连接的Wix商店和Adyen PSP
+2. **添加新的Wix商店** - 输入信息后应该立即显示在列表中
+3. **添加新的PSP** - 选择Adyen或其他，输入API key后应该立即显示
 
 ---
 
-## 🚀 **自动部署工作流**
+## 📊 后端API端点总结
 
-现在 Git email 已修复，所有项目都通过 GitHub 自动部署：
+### 认证
+- `POST /auth/signin` - 登录（返回包含merchant_id的token）
+- `GET /auth/me` - 获取当前用户信息
 
-```
-本地修改代码
-    ↓
-git commit (使用 peng@chydan.com)
-    ↓
-git push
-    ↓
-Vercel 自动检测并部署 ✅
-    ↓
-1-2 分钟后网站自动更新
-```
+### 商店集成
+- `GET /merchant/{merchant_id}/integrations` - 获取已连接的商店列表
+- `POST /merchant/integrations/store/connect` - 连接新商店
+  - 参数：`platform`, `store_url`, `api_key`, `store_name`（可选）
+  - 支持的平台：shopify, wix, woocommerce等
 
----
+### PSP集成
+- `GET /merchant/{merchant_id}/psps` - 获取已连接的PSP列表
+- `POST /merchant/integrations/psp/connect` - 连接新PSP
+  - 参数：`provider`, `api_key`, `test_mode`（可选）
+  - 支持的提供商：stripe, adyen, paypal等
 
-## ✅ **待验证清单**
-
-部署完成后测试：
-
-- [ ] https://pivota.cc - 显示 Lovable 设计 + 两个登录按钮
-- [ ] https://agents.pivota.cc/login - Agent 登录页
-- [ ] https://agents.pivota.cc/integration - MCP/API 文档
-- [ ] https://merchants.pivota.cc/signup - Onboarding 流程
-- [ ] https://employee.pivota.cc/login - Employee 登录
-- [ ] https://employee.pivota.cc/dashboard - 完整商户管理表格
+### 调试端点
+- `GET /direct-db-check` - 直接检查数据库内容（无需认证）
+- `GET /debug/integrations/tables` - 检查集成表状态
+- `POST /debug/integrations/test-insert` - 测试插入数据
 
 ---
 
-## 🎉 **系统已完全就绪**
+## 🎯 下一步行动
 
-所有代码已推送，所有配置已完成：
+1. **修复Vercel部署** ⏳
+   - 查看部署日志
+   - 修复任何TypeScript或构建错误
+   - 重新部署
 
-- ✅ 4 个前端项目（Next.js + Lovable 设计）
-- ✅ 1 个后端 API（FastAPI + PostgreSQL）
-- ✅ 所有 DNS 配置正确
-- ✅ Git 自动部署设置
-- ✅ 测试账号已准备
-- ✅ MCP/API 真实可用
+2. **测试前端集成页面** ⏳
+   - 确认Wix和Adyen显示正确
+   - 测试添加新的商店和PSP
+   - 验证列表实时更新
 
-**可以开始推广和获取真实用户了！** 🚀
-
----
-
-**最后更新**: 2025-10-18  
-**所有服务状态**: 🟢 正常运行
-**生成时间**: 2025-10-18  
-**Git 配置**: pengxu9-rgb <peng@chydan.com> ✅
+3. **清理调试代码** ⏳（生产环境前）
+   - 移除debug端点
+   - 移除console.log和print语句
+   - 优化错误处理
 
 ---
 
-## ✅ 所有系统已部署
+## 🔧 已修复的关键问题
 
-### 🌐 **四个网站全部在线**
-
-| 域名 | GitHub 仓库 | Vercel 状态 | 用途 |
-|------|------------|------------|------|
-| **pivota.cc** | pivota-marketing | 🟢 已连接 | 宣传主页（Lovable 设计） |
-| **agents.pivota.cc** | pivota-agents-portal | 🟢 已连接 | Agent 门户 |
-| **merchants.pivota.cc** | pivota-merchants-portal | 🟢 已连接 | Merchant 门户 |
-| **employee.pivota.cc** | pivota-employee-portal | 🟢 已连接 | Employee 门户 |
-
-### ⚙️ **后端服务**
-
-| 服务 | URL | 状态 |
-|------|-----|------|
-| API 后端 | https://web-production-fedb.up.railway.app | 🟢 运行中 |
-| 版本 | 76d815ae | ✅ 最新 |
-| 数据库 | PostgreSQL on Railway | 🟢 已连接 |
-| MCP Server | 集成在后端 | 🟢 可用 |
+| 问题 | 解决方案 | 状态 |
+|------|---------|------|
+| 商店/PSP不显示 | 修复数据库导入和事务 | ✅ |
+| 数据不持久化 | 使用PostgreSQL + 显式事务 | ✅ |
+| Datetime类型错误 | 使用datetime对象而非字符串 | ✅ |
+| merchant_id不正确 | Token包含真实merchant_id | ✅ |
+| 表不存在 | 启动时创建表 | ✅ |
 
 ---
 
-## 📦 **GitHub 仓库列表**
-
-所有代码都在 GitHub，通过 Git 推送自动部署：
-
-```
-✅ https://github.com/pengxu9-rgb/pivota-marketing (主页)
-✅ https://github.com/pengxu9-rgb/pivota-agents-portal (Agent)
-✅ https://github.com/pengxu9-rgb/pivota-merchants-portal (Merchant)
-✅ https://github.com/pengxu9-rgb/pivota-employee-portal (Employee)
-✅ https://github.com/pengxu9-rgb/pivota-dashboard-1760371224 (后端)
-```
-
----
-
-## 🔐 **测试账号**
-
-### Agent Portal
-```
-Email: agent@test.com
-Password: Admin123!
-```
-
-### Merchant Portal
-```
-Email: merchant@test.com
-Password: Admin123!
-```
-
-### Employee Portal
-```
-Email: employee@pivota.com
-Password: Admin123!
-
-或:
-Email: admin@pivota.com
-Password: Admin123!
-```
-
----
-
-## 🎯 **核心功能确认**
-
-### ✅ Agent Portal (agents.pivota.cc)
-- [x] 独立登录/注册页面
-- [x] Dashboard 显示统计（API 调用、订单、GMV、成功率）
-- [x] MCP/API Integration 页面（真实可用）
-  - API Key 管理
-  - Python/cURL 代码示例
-  - 完整 API 端点文档
-  - SDK 下载链接
-- [x] 角色验证（只允许 Agent 登录）
-
-### ✅ Merchant Portal (merchants.pivota.cc)
-- [x] 独立登录/注册页面
-- [x] 完整 Onboarding 流程（4 步）
-  - 商业信息注册
-  - PSP 配置（Stripe/Adyen）
-  - KYB 文档上传
-  - API 密钥获取
-- [x] 角色验证（只允许 Merchant 登录）
-
-### ✅ Employee Portal (employee.pivota.cc)
-- [x] 员工登录页面
-- [x] 完整的 MerchantTable 组件
-  - 搜索和过滤功能
-  - 9 列详细数据（Merchant, Store URL, Status, PSP, MCP, Auto, Confidence, Created, Actions）
-  - 三点菜单操作：
-    - View Details（查看详情模态框）
-    - Review KYB（审核模态框）
-    - Upload Docs（上传文档模态框）
-    - Connect Shopify（连接店铺）
-    - Sync Products（同步产品）
-    - Delete（删除商户）
-- [x] StatsCards 统计卡片
-- [x] 角色验证（只允许员工登录）
-
-### ✅ Marketing Site (pivota.cc)
-- [x] Lovable 精美设计（完整复制）
-- [x] Header 两个登录按钮
-  - "Agent Login" → agents.pivota.cc/login
-  - "Merchant Login" → merchants.pivota.cc/login
-- [x] HeroSection 两个入口卡片
-  - "For AI Agents" → agents.pivota.cc/signup
-  - "For Merchants" → merchants.pivota.cc/signup
-- [x] 所有 Section 保留
-  - Features
-  - Workflow
-  - Partners
-  - Testimonials
-  - Demo
-  - Footer
-
----
-
-## 🚀 **自动部署工作流**
-
-现在 Git email 已修复，所有项目都通过 GitHub 自动部署：
-
-```
-本地修改代码
-    ↓
-git commit (使用 peng@chydan.com)
-    ↓
-git push
-    ↓
-Vercel 自动检测并部署 ✅
-    ↓
-1-2 分钟后网站自动更新
-```
-
----
-
-## ✅ **待验证清单**
-
-部署完成后测试：
-
-- [ ] https://pivota.cc - 显示 Lovable 设计 + 两个登录按钮
-- [ ] https://agents.pivota.cc/login - Agent 登录页
-- [ ] https://agents.pivota.cc/integration - MCP/API 文档
-- [ ] https://merchants.pivota.cc/signup - Onboarding 流程
-- [ ] https://employee.pivota.cc/login - Employee 登录
-- [ ] https://employee.pivota.cc/dashboard - 完整商户管理表格
-
----
-
-## 🎉 **系统已完全就绪**
-
-所有代码已推送，所有配置已完成：
-
-- ✅ 4 个前端项目（Next.js + Lovable 设计）
-- ✅ 1 个后端 API（FastAPI + PostgreSQL）
-- ✅ 所有 DNS 配置正确
-- ✅ Git 自动部署设置
-- ✅ 测试账号已准备
-- ✅ MCP/API 真实可用
-
-**可以开始推广和获取真实用户了！** 🚀
-
----
-
-**最后更新**: 2025-10-18  
-**所有服务状态**: 🟢 正常运行
-
-
+**总结：后端功能完全正常！现在只需要修复Vercel前端部署即可。**
 
