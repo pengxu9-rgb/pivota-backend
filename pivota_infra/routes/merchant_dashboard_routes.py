@@ -202,32 +202,7 @@ async def get_merchant_psps(
         """
         
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
-        
-        # Get orders to calculate metrics (if orders table doesn't exist, use defaults)
-        from datetime import datetime, timedelta
-        today = datetime.now().date()
-        try:
-            orders_query = """
-                SELECT COUNT(*) as total,
-                       SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as completed,
-                       SUM(CASE WHEN created_at >= :today THEN total_amount ELSE 0 END) as volume_today
-                FROM orders 
-                WHERE merchant_id = :merchant_id
-            """
-            orders_stat = await database.fetch_one(orders_query, {"merchant_id": merchant_id, "today": str(today)})
-        except:
-            # If orders table query fails, use defaults
-            orders_stat = {"total": 0, "completed": 0, "volume_today": 0}
-        
-        total_orders = orders_stat["total"] if orders_stat else 0
-        completed_orders = orders_stat["completed"] if orders_stat else 0
-        volume_today = float(orders_stat["volume_today"] or 0) if orders_stat else 0
-        
-        # Calculate metrics per PSP
-        psp_count = len(rows)
-        success_rate = (completed_orders / total_orders * 100) if total_orders > 0 else 98.5
-        volume_per_psp = volume_today / psp_count if psp_count > 0 else 0
-        transactions_per_psp = total_orders // psp_count if psp_count > 0 else 0
+        print(f"DEBUG: Found {len(rows)} PSPs in database for merchant {merchant_id}")
         
         for row in rows:
             capabilities = []
@@ -243,13 +218,16 @@ async def get_merchant_psps(
                 "connected_at": row["connected_at"],
                 "capabilities": capabilities,
                 "api_key_last4": row["api_key"][-4:] if row["api_key"] and len(row["api_key"]) >= 4 else "****",
-                "success_rate": round(success_rate, 1),
-                "volume_today": round(volume_per_psp, 2),
-                "transaction_count": transactions_per_psp,
+                "success_rate": 98.5,  # Default for now
+                "volume_today": 0,  # Default for now
+                "transaction_count": 0,  # Default for now
                 "is_active": row["status"] == "active"
             })
+            print(f"DEBUG: Added PSP {row['psp_id']} to response")
     except Exception as e:
-        print(f"Database error: {e}")
+        print(f"Database error in get_merchant_psps: {e}")
+        import traceback
+        traceback.print_exc()
         # Fallback: return demo data if database fails
         merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
         if merchant_data:
