@@ -485,7 +485,7 @@ async def get_onboarding_details(
     current_user: dict = Depends(get_current_user)  # Allow all authenticated users
 ):
     """
-    Get full onboarding merchant details including KYB documents
+    Get full onboarding merchant details including KYB documents, stores, and PSPs
     """
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
@@ -498,10 +498,49 @@ async def get_onboarding_details(
     print(f"   kyc_documents value: {kyc_docs}")
     print(f"   kyc_documents length: {len(kyc_docs) if kyc_docs else 0}")
     
+    # Fetch connected stores
+    stores = []
+    try:
+        stores_query = """SELECT store_id, platform, name, domain, status, connected_at, product_count
+                          FROM merchant_stores 
+                          WHERE merchant_id = :merchant_id
+                          ORDER BY connected_at DESC"""
+        stores_rows = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
+        stores = [dict(row) for row in stores_rows]
+    except Exception as e:
+        print(f"Error fetching stores: {e}")
+    
+    # Fetch connected PSPs
+    psps = []
+    try:
+        psps_query = """SELECT psp_id, provider, name, account_id, status, connected_at, capabilities
+                        FROM merchant_psps 
+                        WHERE merchant_id = :merchant_id
+                        ORDER BY connected_at DESC"""
+        psps_rows = await database.fetch_all(psps_query, {"merchant_id": merchant_id})
+        psps = [dict(row) for row in psps_rows]
+    except Exception as e:
+        print(f"Error fetching PSPs: {e}")
+    
+    # Fetch transaction stats
+    stats = {"total_transactions": 0, "total_revenue": 0, "unique_customers": 0}
+    try:
+        stats_query = """SELECT COUNT(*) as total_transactions, 
+                         COALESCE(SUM(amount), 0) as total_revenue,
+                         COUNT(DISTINCT customer_email) as unique_customers
+                         FROM orders WHERE merchant_id = :merchant_id"""
+        stats_row = await database.fetch_one(stats_query, {"merchant_id": merchant_id})
+        if stats_row:
+            stats = dict(stats_row)
+    except Exception as e:
+        print(f"Error fetching stats: {e}")
+    
     # Normalize response for frontend expectations
     result = {
         "merchant_id": merchant["merchant_id"],
         "business_name": merchant["business_name"],
+        "email": merchant.get("contact_email"),
+        "phone": merchant.get("contact_phone"),
         "store_url": merchant.get("store_url"),
         "website": merchant.get("website"),
         "platform": merchant.get("region"),  # reuse region as platform label
@@ -510,6 +549,9 @@ async def get_onboarding_details(
         "psp_connected": merchant.get("psp_connected", False),
         "psp_type": merchant.get("psp_type"),
         "created_at": merchant.get("created_at").isoformat() if merchant.get("created_at") else None,
+        "stores": stores,
+        "psps": psps,
+        "stats": stats
     }
     return {"status": "success", "merchant": result}
 
