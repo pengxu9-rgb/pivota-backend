@@ -283,10 +283,10 @@ async def sync_merchant_products(
     try:
         # Get the store for this merchant and platform
         store = await database.fetch_one(
-            """SELECT store_id, store_name, api_key 
+            """SELECT store_id, name as store_name, api_key 
                FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = :platform 
-               AND status = 'connected'
+               AND status IN ('connected', 'active')
                ORDER BY connected_at DESC LIMIT 1""",
             {"merchant_id": request.merchant_id, "platform": platform}
         )
@@ -370,3 +370,4 @@ async def test_store_connection(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Connection test failed: {str(e)}")
+

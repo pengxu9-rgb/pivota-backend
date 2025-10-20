@@ -372,3 +372,4 @@ async def update_security_settings(
             "max_login_attempts": max_login_attempts
         }
     }
+

@@ -300,3 +300,4 @@ async def update_agent(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update agent: {str(e)}")
+
