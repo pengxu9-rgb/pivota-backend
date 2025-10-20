@@ -167,3 +167,8 @@ pivota-employee-portal/
 
 
 
+# Guard: do not commit portal apps into backend repo
+pivota-agents-portal
+pivota-employee-portal
+pivota-merchants-portal
+merchant-portal
