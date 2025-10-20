@@ -814,7 +814,7 @@ async def get_merchant_kyb_documents(
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
         
-        # Get documents from kyc_documents JSON field
+        # Get documents from kyc_documents JSON field  
         documents = merchant.get("kyc_documents", [])
         if isinstance(documents, str):
             import json
@@ -822,12 +822,14 @@ async def get_merchant_kyb_documents(
                 documents = json.loads(documents)
             except:
                 documents = []
+        elif documents is None:
+            documents = []
         
         return {
             "status": "success",
             "kyb_status": merchant.get("status", "pending"),
             "review_notes": merchant.get("rejection_reason"),
-            "documents": documents or []
+            "documents": documents
         }
     
     except HTTPException:
