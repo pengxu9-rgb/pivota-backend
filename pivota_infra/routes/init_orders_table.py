@@ -61,11 +61,13 @@ async def init_orders_table():
             stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
             store_ids = [s["store_id"] for s in stores] if stores else ["store_shopify_main", "store_wix_main"]
             
-            # Only Stripe is actually used for transactions, Adyen is connected but not used yet
-            psps_query = "SELECT psp_id, provider FROM merchant_psps WHERE merchant_id = :merchant_id AND provider = 'stripe'"
-            psps = await database.fetch_all(psps_query, {"merchant_id": merchant_id})
-            # If no Stripe found, use default
-            psp_ids = [p["psp_id"] for p in psps] if psps else ["psp_stripe_main"]
+            # Only use the main Stripe PSP for all transactions
+            # This ensures all orders are assigned to a single, existing Stripe PSP
+            psps_query = "SELECT psp_id, provider FROM merchant_psps WHERE merchant_id = :merchant_id AND provider = 'stripe' ORDER BY psp_id LIMIT 1"
+            psp_result = await database.fetch_one(psps_query, {"merchant_id": merchant_id})
+            # Use the first Stripe PSP found, or default
+            psp_id_to_use = psp_result["psp_id"] if psp_result else "psp_stripe_main"
+            psp_ids = [psp_id_to_use]  # Only use one PSP for all orders
             
             # Generate 100 orders over the past 30 days
             orders_to_insert = []
