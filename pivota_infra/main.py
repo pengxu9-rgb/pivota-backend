@@ -40,6 +40,7 @@ from routes.merchant_api_extensions import router as merchant_api_extensions_rou
 from routes.payout_routes import router as payout_router
 from routes.debug_integrations import router as debug_integrations_router
 from routes.direct_db_check import router as direct_db_check_router
+from routes.init_merchant_data import router as init_merchant_data_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -105,6 +106,7 @@ app.include_router(merchant_api_extensions_router)  # Extended merchant API feat
 app.include_router(payout_router)  # Payout management
 app.include_router(debug_integrations_router)  # Debug integrations
 app.include_router(direct_db_check_router)  # Direct DB check
+app.include_router(init_merchant_data_router)  # Initialize merchant data
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
@@ -270,6 +272,89 @@ async def startup():
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_merchant_id ON merchant_psps(merchant_id)")
             
             logger.info("✅ Integration tables created/verified")
+            
+            # Initialize merchant data for merch_6b90dc9838d5fd9c
+            try:
+                merchant_id = "merch_6b90dc9838d5fd9c"
+                
+                # Check if merchant exists
+                check_merchant = "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :merchant_id"
+                merchant_exists = await database.fetch_one(check_merchant, {"merchant_id": merchant_id})
+                
+                if not merchant_exists:
+                    # Create merchant if doesn't exist
+                    await database.execute("""
+                        INSERT INTO merchant_onboarding (merchant_id, business_name, contact_email, store_url, status, mcp_connected, mcp_platform, mcp_shop_domain, psp_connected, psp_type)
+                        VALUES (:merchant_id, :business_name, :contact_email, :store_url, :status, :mcp_connected, :mcp_platform, :mcp_shop_domain, :psp_connected, :psp_type)
+                    """, {
+                        "merchant_id": merchant_id,
+                        "business_name": "ChydanTest Store",
+                        "contact_email": "merchant@test.com",
+                        "store_url": "https://chydantest.myshopify.com",
+                        "status": "approved",
+                        "mcp_connected": True,
+                        "mcp_platform": "shopify",
+                        "mcp_shop_domain": "chydantest.myshopify.com",
+                        "psp_connected": True,
+                        "psp_type": "stripe"
+                    })
+                    logger.info(f"✅ Created merchant {merchant_id}")
+                else:
+                    # Update existing merchant to ensure it has MCP connection
+                    await database.execute("""
+                        UPDATE merchant_onboarding 
+                        SET store_url = :store_url,
+                            mcp_connected = :mcp_connected,
+                            mcp_platform = :mcp_platform,
+                            mcp_shop_domain = :mcp_shop_domain,
+                            psp_connected = :psp_connected,
+                            psp_type = :psp_type
+                        WHERE merchant_id = :merchant_id
+                    """, {
+                        "merchant_id": merchant_id,
+                        "store_url": "https://chydantest.myshopify.com",
+                        "mcp_connected": True,
+                        "mcp_platform": "shopify",
+                        "mcp_shop_domain": "chydantest.myshopify.com",
+                        "psp_connected": True,
+                        "psp_type": "stripe"
+                    })
+                    logger.info(f"✅ Updated merchant {merchant_id} with Shopify connection")
+                
+                # Insert Shopify store
+                await database.execute("""
+                    INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, status, product_count, connected_at)
+                    VALUES (:store_id, :merchant_id, :platform, :name, :domain, :status, :product_count, NOW())
+                    ON CONFLICT (store_id) DO NOTHING
+                """, {
+                    "store_id": "store_shopify_chydantest",
+                    "merchant_id": merchant_id,
+                    "platform": "shopify",
+                    "name": "chydantest.myshopify.com",
+                    "domain": "chydantest.myshopify.com",
+                    "status": "connected",
+                    "product_count": 4
+                })
+                
+                # Insert Stripe PSP
+                await database.execute("""
+                    INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, account_id, capabilities, status, connected_at)
+                    VALUES (:psp_id, :merchant_id, :provider, :name, :account_id, :capabilities, :status, NOW())
+                    ON CONFLICT (psp_id) DO NOTHING
+                """, {
+                    "psp_id": "psp_stripe_chydantest",
+                    "merchant_id": merchant_id,
+                    "provider": "stripe",
+                    "name": "Stripe Account",
+                    "account_id": "acct_real_stripe",
+                    "capabilities": "card,bank_transfer,alipay,wechat_pay",
+                    "status": "active"
+                })
+                
+                logger.info(f"✅ Initialized real integrations for merchant {merchant_id}")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Could not initialize merchant data: {e}")
         except Exception as e:
             logger.warning(f"⚠️ Could not create integration tables: {e}")
         from db.agents import agents, agent_usage_logs
