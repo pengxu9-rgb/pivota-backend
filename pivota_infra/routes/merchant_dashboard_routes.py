@@ -203,17 +203,21 @@ async def get_merchant_psps(
         
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         
-        # Get orders to calculate metrics
+        # Get orders to calculate metrics (if orders table doesn't exist, use defaults)
         from datetime import datetime, timedelta
         today = datetime.now().date()
-        orders_query = """
-            SELECT COUNT(*) as total,
-                   SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as completed,
-                   SUM(CASE WHEN created_at >= :today THEN total_amount ELSE 0 END) as volume_today
-            FROM orders 
-            WHERE merchant_id = :merchant_id
-        """
-        orders_stat = await database.fetch_one(orders_query, {"merchant_id": merchant_id, "today": str(today)})
+        try:
+            orders_query = """
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as completed,
+                       SUM(CASE WHEN created_at >= :today THEN total_amount ELSE 0 END) as volume_today
+                FROM orders 
+                WHERE merchant_id = :merchant_id
+            """
+            orders_stat = await database.fetch_one(orders_query, {"merchant_id": merchant_id, "today": str(today)})
+        except:
+            # If orders table query fails, use defaults
+            orders_stat = {"total": 0, "completed": 0, "volume_today": 0}
         
         total_orders = orders_stat["total"] if orders_stat else 0
         completed_orders = orders_stat["completed"] if orders_stat else 0
