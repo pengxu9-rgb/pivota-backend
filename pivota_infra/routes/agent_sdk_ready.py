@@ -4,6 +4,7 @@ Provides standardized endpoints for Agent SDK integration
 Follows ChatGPT schema best practices with rate limiting
 """
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from utils.auth import get_current_user
@@ -65,16 +66,20 @@ async def health_check():
         "uptime": "99.9%"
     }
 
-@router.post("/auth")
-async def generate_api_key(
-    agent_name: str,
-    agent_email: str,
+class AgentAuthRequest(BaseModel):
+    agent_name: str
+    agent_email: str
     description: Optional[str] = None
-):
+
+@router.post("/auth")
+async def generate_api_key(request: AgentAuthRequest):
     """
     Generate or validate agent API key
     Rate limited to prevent abuse
     """
+    agent_name = request.agent_name
+    agent_email = request.agent_email
+    description = request.description
     try:
         # Create agents table if not exists
         create_table = """
