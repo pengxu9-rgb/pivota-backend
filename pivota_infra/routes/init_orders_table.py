@@ -9,6 +9,11 @@ import uuid
 
 router = APIRouter()
 
+@router.post("/reinit-orders-table")
+async def reinit_orders_table():
+    """Reinitialize orders table with Stripe-only transactions"""
+    return await init_orders_table()
+
 @router.post("/init-orders-table")
 async def init_orders_table():
     """Create and populate orders table with initial data"""
@@ -52,13 +57,15 @@ async def init_orders_table():
             payment_methods = ['credit_card', 'debit_card', 'paypal', 'apple_pay', 'google_pay', 'bank_transfer', 'alipay', 'wechat_pay']
             
             # Get connected stores and PSPs
-            stores_query = "SELECT store_id FROM merchant_stores WHERE merchant_id = :merchant_id"
+            stores_query = "SELECT store_id, platform FROM merchant_stores WHERE merchant_id = :merchant_id"
             stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
             store_ids = [s["store_id"] for s in stores] if stores else ["store_shopify_main", "store_wix_main"]
             
-            psps_query = "SELECT psp_id FROM merchant_psps WHERE merchant_id = :merchant_id"
+            # Only Stripe is actually used for transactions, Adyen is connected but not used yet
+            psps_query = "SELECT psp_id, provider FROM merchant_psps WHERE merchant_id = :merchant_id AND provider = 'stripe'"
             psps = await database.fetch_all(psps_query, {"merchant_id": merchant_id})
-            psp_ids = [p["psp_id"] for p in psps] if psps else ["psp_stripe_main", "psp_adyen_main"]
+            # If no Stripe found, use default
+            psp_ids = [p["psp_id"] for p in psps] if psps else ["psp_stripe_main"]
             
             # Generate 100 orders over the past 30 days
             orders_to_insert = []

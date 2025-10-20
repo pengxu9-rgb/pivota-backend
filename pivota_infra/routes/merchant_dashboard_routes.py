@@ -210,40 +210,48 @@ async def get_merchant_psps(
         transaction_count = 0
         
         try:
-            # Get metrics from real orders
+            # Get metrics from real orders - grouped by PSP
             metrics_query = """
                 SELECT 
+                    psp_id,
                     COUNT(*) as total_orders,
                     SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_orders,
                     COALESCE(SUM(amount), 0) as total_volume
                 FROM orders
-                WHERE merchant_id = :merchant_id
+                WHERE merchant_id = :merchant_id AND psp_id IS NOT NULL
+                GROUP BY psp_id
             """
-            metrics = await database.fetch_one(metrics_query, {"merchant_id": merchant_id})
+            psp_metrics = await database.fetch_all(metrics_query, {"merchant_id": merchant_id})
             
-            if metrics:
-                transaction_count = metrics["total_orders"] or 0
-                successful_orders = metrics["successful_orders"] or 0
-                total_volume = float(metrics["total_volume"] or 0)
-                
-                if transaction_count > 0:
-                    success_rate = round((successful_orders / transaction_count) * 100, 1)
+            # Create a map of PSP metrics
+            psp_stats = {}
+            for metric in psp_metrics:
+                psp_stats[metric["psp_id"]] = {
+                    "total_orders": metric["total_orders"] or 0,
+                    "successful_orders": metric["successful_orders"] or 0,
+                    "total_volume": float(metric["total_volume"] or 0),
+                    "success_rate": round((metric["successful_orders"] / metric["total_orders"] * 100), 1) if metric["total_orders"] > 0 else 0
+                }
         except Exception as e:
             print(f"Could not fetch order metrics: {e}")
-            # Use default values if orders table doesn't exist
-        
-        # Distribute metrics across PSPs
-        psp_count = len(rows)
-        volume_per_psp = total_volume / psp_count if psp_count > 0 else 0
-        transactions_per_psp = transaction_count // psp_count if psp_count > 0 else 0
+            psp_stats = {}  # Use empty dict if orders table doesn't exist
         
         for row in rows:
             capabilities = []
             if row["capabilities"]:
                 capabilities = row["capabilities"].split(',')
             
+            # Get specific stats for this PSP, or use 0 if no transactions
+            psp_id = row["psp_id"]
+            stats = psp_stats.get(psp_id, {
+                "total_orders": 0,
+                "successful_orders": 0,
+                "total_volume": 0,
+                "success_rate": 0
+            })
+            
             psps.append({
-                "id": row["psp_id"],
+                "id": psp_id,
                 "provider": row["provider"],
                 "name": row["name"],
                 "account_id": row["account_id"],
@@ -251,12 +259,12 @@ async def get_merchant_psps(
                 "connected_at": row["connected_at"],
                 "capabilities": capabilities,
                 "api_key_last4": row["api_key"][-4:] if row["api_key"] and len(row["api_key"]) >= 4 else "****",
-                "success_rate": success_rate,
-                "volume_today": round(volume_per_psp, 2),
-                "transaction_count": transactions_per_psp,
+                "success_rate": stats["success_rate"],
+                "volume_today": round(stats["total_volume"], 2),  # Now showing actual volume for this PSP
+                "transaction_count": stats["total_orders"],
                 "is_active": row["status"] == "active"
             })
-            print(f"DEBUG: Added PSP {row['psp_id']} with volume ${round(volume_per_psp, 2)}")
+            print(f"DEBUG: PSP {psp_id} - Volume: ${stats['total_volume']:.2f}, Transactions: {stats['total_orders']}")
     except Exception as e:
         print(f"Database error in get_merchant_psps: {e}")
         import traceback
