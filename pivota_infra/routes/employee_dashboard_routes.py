@@ -5,7 +5,7 @@ Provides analytics and management endpoints for employee portal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from auth.jwt_handler import get_current_user
+from utils.auth import get_current_user
 from db.database import database
 import random
 
