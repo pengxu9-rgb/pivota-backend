@@ -81,20 +81,11 @@ async def generate_api_key(request: AgentAuthRequest):
     agent_email = request.agent_email
     description = request.description
     try:
-        # Create agents table if not exists
-        create_table = """
-            CREATE TABLE IF NOT EXISTS agents (
-                agent_id VARCHAR(50) PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                email VARCHAR(100) UNIQUE NOT NULL,
-                api_key VARCHAR(100) UNIQUE,
-                status VARCHAR(20) DEFAULT 'active',
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                last_active TIMESTAMP WITH TIME ZONE,
-                rate_limit_tier VARCHAR(20) DEFAULT 'standard'
-            )
-        """
-        await database.execute(create_table)
+        # Note: agents table is created in main.py startup
+        # Table structure matches main.py:
+        # agent_id, name, email, company, use_case, api_key, status, 
+        # created_at, last_active, last_key_rotation, deactivated_at,
+        # request_count, success_rate, rate_limit
         
         # Check if agent exists
         check_query = "SELECT agent_id, api_key FROM agents WHERE email = :email"
@@ -107,27 +98,39 @@ async def generate_api_key(request: AgentAuthRequest):
                 "agent_id": existing["agent_id"],
                 "api_key": existing["api_key"],
                 "rate_limit": {
-                    "requests_per_minute": 100,
+                    "requests_per_minute": 1000,
                     "tier": "standard"
                 }
             }
         
         # Generate new agent and API key
         agent_id = f"agent_{secrets.token_hex(8)}"
-        api_key = f"ak_{secrets.token_urlsafe(32)}"
+        api_key = f"ak_live_{secrets.token_hex(32)}"
         
+        # Use the full table structure from main.py
         insert_query = """
-            INSERT INTO agents (agent_id, name, email, api_key, status, created_at)
-            VALUES (:agent_id, :name, :email, :api_key, :status, :created_at)
+            INSERT INTO agents (
+                agent_id, name, email, company, use_case, api_key, 
+                status, created_at, request_count, success_rate, rate_limit
+            )
+            VALUES (
+                :agent_id, :name, :email, :company, :use_case, :api_key,
+                :status, :created_at, :request_count, :success_rate, :rate_limit
+            )
         """
         
         await database.execute(insert_query, {
             "agent_id": agent_id,
             "name": agent_name,
             "email": agent_email,
+            "company": "Independent",  # Default company
+            "use_case": description or "General API access",
             "api_key": api_key,
             "status": "active",
-            "created_at": datetime.now()
+            "created_at": datetime.now(),
+            "request_count": 0,
+            "success_rate": 0,
+            "rate_limit": 1000
         })
         
         return {
