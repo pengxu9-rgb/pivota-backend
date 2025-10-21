@@ -4,6 +4,7 @@ Agent 认证中间件
 """
 
 from fastapi import HTTPException, Security, Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.security import APIKeyHeader
 from typing import Optional, Dict, Any
 import time
@@ -21,6 +22,7 @@ from utils.logger import logger
 
 # API Key Header
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 class AgentContext:
@@ -48,7 +50,8 @@ class AgentContext:
 
 async def get_agent_context(
     request: Request,
-    api_key: Optional[str] = Security(api_key_header)
+    api_key: Optional[str] = Security(api_key_header),
+    bearer: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme)
 ) -> AgentContext:
     """
     验证 Agent API Key 并返回上下文
@@ -56,7 +59,10 @@ async def get_agent_context(
     这是主要的认证函数，所有 Agent API 都应该使用这个依赖
     """
     
-    # 1. 验证 API Key 存在
+    # 1. 从 X-API-Key 或 Authorization: Bearer 中提取 API Key
+    if not api_key and bearer and bearer.scheme.lower() == "bearer":
+        api_key = bearer.credentials
+
     if not api_key:
         raise HTTPException(
             status_code=401,
