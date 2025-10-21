@@ -64,11 +64,9 @@ async def get_agent_context(
         )
     
     # 2. 验证 API Key 格式（支持 ak_live_ 前缀）
-    # Accepted formats:
-    # - ak_live_<64hex> (len ~ 3 + 6 + 1 + 64 = 74)
-    # - ak_<64hex> (legacy) (len = 67)
-    valid_prefix = api_key.startswith("ak_") and (len(api_key) in (67, 74))
-    if not valid_prefix:
+    # 严格校验：ak_<64hex> 或 ak_live_<64hex>
+    import re
+    if not re.match(r"^ak_(live_)?[0-9a-f]{64}$", api_key):
         raise HTTPException(
             status_code=401,
             detail="Invalid API Key format"
