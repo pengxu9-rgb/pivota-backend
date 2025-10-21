@@ -47,7 +47,8 @@ async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
 
 @router.get("/products/search")
 async def agent_search_products(
-    merchant_id: str,
+    merchant_id: Optional[str] = None,  # Now optional for cross-merchant search
+    merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
     query: Optional[str] = None,
     category: Optional[str] = None,
     min_price: Optional[float] = None,
@@ -59,81 +60,151 @@ async def agent_search_products(
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
-    智能产品搜索
+    智能产品搜索 - Cross-Merchant Support
     
     特点：
+    - ✨ NEW: Cross-merchant search (omit merchant_id to search all)
     - 支持自然语言查询
     - 自动过滤库存
     - 价格区间筛选
     - 分页支持
+    - 相关度评分
     """
     try:
-        # 验证商户访问权限
-        if not context.can_access_merchant(merchant_id):
-            raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+        # Determine which merchants to search
+        merchants_to_search = []
         
-        # 获取商户信息并验证状态（检查是否被软删除）
-        merchant = await verify_merchant_active(merchant_id)
+        if merchant_id:
+            # Single merchant search (backward compatible)
+            if not context.can_access_merchant(merchant_id):
+                raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+            merchants_to_search = [merchant_id]
+        elif merchant_ids:
+            # Multiple specific merchants
+            for mid in merchant_ids:
+                if not context.can_access_merchant(mid):
+                    raise HTTPException(status_code=403, detail=f"Not authorized for merchant {mid}")
+            merchants_to_search = merchant_ids
+        else:
+            # Search ALL merchants (cross-merchant search)
+            # Get all active merchants from database
+            query_merchants = """
+                SELECT merchant_id, business_name FROM merchant_onboarding 
+                WHERE status NOT IN ('deleted', 'rejected') 
+                AND psp_connected = true
+                LIMIT 100
+            """
+            merchant_rows = await database.fetch_all(query_merchants)
+            merchants_to_search = [row["merchant_id"] for row in merchant_rows]
         
-        # 从缓存获取产品
-        cached_products = await get_cached_products(merchant_id)
+        # Collect products from all target merchants
+        all_products = []
         
-        products = []
-        if cached_products and cached_products.get("products"):
-            all_products = cached_products["products"]
+        for mid in merchants_to_search:
+            try:
+                # Verify merchant is active
+                merchant = await verify_merchant_active(mid)
+                
+                # Get cached products
+                cached_products = await get_cached_products(mid)
+                
+                if cached_products and cached_products.get("products"):
+                    # Add merchant info to each product
+                    for product in cached_products["products"]:
+                        product["merchant_id"] = mid
+                        product["merchant_name"] = merchant.get("business_name", "Unknown")
+                        all_products.append(product)
+            except Exception as e:
+                # Log but continue with other merchants
+                logger.warning(f"Failed to get products from {mid}: {e}")
+                continue
+        
+        # Apply filters and calculate relevance scores
+        filtered_products = []
+        
+        for product in all_products:
+            # 库存过滤
+            if in_stock_only and not product.get("in_stock", True):
+                continue
             
-            # 应用过滤器
-            for product in all_products:
-                # 库存过滤
-                if in_stock_only and not product.get("in_stock", True):
+            # 价格过滤
+            price = float(product.get("price", 0))
+            if min_price and price < min_price:
+                continue
+            if max_price and price > max_price:
+                continue
+            
+            # 类别过滤
+            if category:
+                product_category = product.get("category", "").lower()
+                if category.lower() not in product_category:
                     continue
+            
+            # 搜索查询 + 相关度评分
+            relevance_score = 1.0
+            if query:
+                query_lower = query.lower()
+                title = product.get("title", "").lower()
+                description = product.get("description", "").lower()
                 
-                # 价格过滤
-                price = float(product.get("price", 0))
-                if min_price and price < min_price:
-                    continue
-                if max_price and price > max_price:
-                    continue
+                # Calculate relevance
+                if query_lower in title:
+                    # Exact match in title = high score
+                    relevance_score = 1.0 if query_lower == title else 0.9
+                elif query_lower in description:
+                    relevance_score = 0.7
+                else:
+                    # Check for partial word matches
+                    query_words = query_lower.split()
+                    matches = sum(1 for word in query_words if word in title or word in description)
+                    if matches > 0:
+                        relevance_score = 0.5 + (matches / len(query_words)) * 0.3
+                    else:
+                        continue  # No match, skip product
                 
-                # 类别过滤
-                if category:
-                    product_category = product.get("category", "").lower()
-                    if category.lower() not in product_category:
-                        continue
-                
-                # 搜索查询（简单的关键词匹配）
-                if query:
-                    query_lower = query.lower()
-                    title = product.get("title", "").lower()
-                    description = product.get("description", "").lower()
-                    if query_lower not in title and query_lower not in description:
-                        continue
-                
-                products.append(product)
+                product["relevance_score"] = relevance_score
+            else:
+                product["relevance_score"] = 1.0
+            
+            filtered_products.append(product)
         
-        # 分页
-        total = len(products)
-        products = products[offset:offset + limit]
+        # Sort by relevance score (highest first)
+        filtered_products.sort(key=lambda p: p.get("relevance_score", 0), reverse=True)
         
-        # 记录请求
+        # Pagination
+        total = len(filtered_products)
+        paginated_products = filtered_products[offset:offset + limit]
+        
+        # Record request
         background_tasks.add_task(
             log_agent_request,
             context=context,
             status_code=200,
-            merchant_id=merchant_id
+            merchant_id=merchant_id or "cross_merchant_search"
         )
         
         return {
             "status": "success",
-            "merchant_id": merchant_id,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "products": products,
+            "products": paginated_products,
+            "pagination": {
+                "total_count": total,
+                "limit": limit,
+                "offset": offset,
+                "page": (offset // limit) + 1 if limit > 0 else 1,
+                "total_pages": (total + limit - 1) // limit if limit > 0 else 1,
+                "has_more": offset + limit < total
+            },
+            "search_context": {
+                "merchant_id": merchant_id,
+                "merchant_ids": merchant_ids,
+                "merchants_searched": len(merchants_to_search),
+                "cross_merchant_search": merchant_id is None and not merchant_ids
+            },
             "filters_applied": {
                 "query": query,
                 "category": category,
-                "price_range": f"{min_price or 0}-{max_price or 'unlimited'}",
+                "min_price": min_price,
+                "max_price": max_price,
                 "in_stock_only": in_stock_only
             }
         }
