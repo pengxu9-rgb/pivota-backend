@@ -165,16 +165,23 @@ async def get_agent_by_key(api_key: str) -> Optional[Dict[str, Any]]:
 
 async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
     """获取 Agent 信息（不含 API Key）"""
-    query = agents.select().where(agents.c.agent_id == agent_id)
-    result = await database.fetch_one(query)
-    
-    if result:
-        agent = dict(result)
-        # 移除敏感信息
-        agent.pop("api_key", None)
-        agent.pop("api_key_hash", None)
-        return agent
-    return None
+    try:
+        # Use raw SQL to avoid schema conflicts (table doesn't have 'id' column)
+        result = await database.fetch_one(
+            "SELECT * FROM agents WHERE agent_id = :agent_id LIMIT 1",
+            {"agent_id": agent_id}
+        )
+        
+        if result:
+            agent = dict(result)
+            # 移除敏感信息
+            agent.pop("api_key", None)
+            agent.pop("api_key_hash", None)
+            return agent
+        return None
+    except Exception as e:
+        print(f"Error in get_agent: {e}")
+        return None
 
 
 async def update_agent_stats(
