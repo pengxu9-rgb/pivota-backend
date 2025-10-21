@@ -177,16 +177,17 @@ async def list_merchants(
         where_clause = " AND ".join(where_clauses)
         
         # Get merchants (only select columns that exist)
-        query = f"""
+        # Don't use f-string for the full query, only for WHERE clause
+        base_query = """
             SELECT 
                 merchant_id, business_name, status
             FROM merchant_onboarding
-            WHERE {where_clause}
+            WHERE """ + where_clause + """
             ORDER BY business_name
             LIMIT :limit OFFSET :offset
         """
         
-        merchants = await database.fetch_all(query, params)
+        merchants = await database.fetch_all(base_query, params)
         
         # Get total count
         count_query = f"""
