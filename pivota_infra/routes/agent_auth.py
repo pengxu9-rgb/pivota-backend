@@ -30,7 +30,8 @@ class AgentContext:
     def __init__(self, agent: Dict[str, Any], request: Request):
         self.agent = agent
         self.agent_id = agent["agent_id"]
-        self.agent_name = agent["agent_name"]
+        # Fallback: use 'name' if 'agent_name' is NULL
+        self.agent_name = agent.get("agent_name") or agent.get("name") or "Unknown"
         self.allowed_merchants = agent.get("allowed_merchants")
         self.request = request
         self.start_time = time.time()
@@ -87,8 +88,14 @@ async def get_agent_context(
             detail="Invalid API Key"
         )
     
-    # 4. 检查是否激活
-    if not agent.get("is_active", True):
+    # 4. 检查是否激活 (support both is_active and status fields)
+    is_active = agent.get("is_active")
+    if is_active is None:
+        # Fallback to status field
+        status = agent.get("status")
+        is_active = (str(status).lower() == "active") if status else True
+    
+    if not is_active:
         raise HTTPException(
             status_code=403,
             detail="Agent is deactivated"
