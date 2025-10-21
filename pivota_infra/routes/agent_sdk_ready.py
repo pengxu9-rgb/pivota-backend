@@ -176,11 +176,10 @@ async def list_merchants(
         
         where_clause = " AND ".join(where_clauses)
         
-        # Get merchants
+        # Get merchants (only select columns that exist)
         query = f"""
             SELECT 
-                merchant_id, business_name, business_type, country,
-                website, created_at
+                merchant_id, business_name, status
             FROM merchant_onboarding
             WHERE {where_clause}
             ORDER BY business_name
@@ -203,10 +202,7 @@ async def list_merchants(
                 {
                     "merchant_id": m["merchant_id"],
                     "business_name": m["business_name"],
-                    "category": m["business_type"],
-                    "country": m["country"],
-                    "website": m["website"],
-                    "joined_at": m["created_at"].isoformat() if m["created_at"] else None
+                    "status": m["status"]
                 }
                 for m in merchants
             ],
