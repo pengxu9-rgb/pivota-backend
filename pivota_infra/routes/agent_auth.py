@@ -63,8 +63,12 @@ async def get_agent_context(
             detail="Missing API Key. Please provide X-API-Key header"
         )
     
-    # 2. 验证 API Key 格式
-    if not api_key.startswith("ak_") or len(api_key) != 67:  # ak_ + 64 chars
+    # 2. 验证 API Key 格式（支持 ak_live_ 前缀）
+    # Accepted formats:
+    # - ak_live_<64hex> (len ~ 3 + 6 + 1 + 64 = 74)
+    # - ak_<64hex> (legacy) (len = 67)
+    valid_prefix = api_key.startswith("ak_") and (len(api_key) in (67, 74))
+    if not valid_prefix:
         raise HTTPException(
             status_code=401,
             detail="Invalid API Key format"
