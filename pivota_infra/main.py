@@ -10,6 +10,7 @@ import time
 import uvicorn
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
+from middleware.rate_limiter import RateLimitMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
@@ -55,6 +56,7 @@ from routes.employees_security import router as employees_security_router
 from routes.mcp_mgmt import router as mcp_mgmt_router
 from routes.employee_missing_endpoints import router as employee_missing_router
 from routes.agent_sdk_ready import router as agent_sdk_router
+from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
 from routes.fix_agents_table import router as fix_agents_router
@@ -112,6 +114,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add rate limiting middleware for agent API
+app.add_middleware(RateLimitMiddleware, requests_per_minute=1000)
+
 # Include available routers
 app.include_router(agent_router)
 app.include_router(psp_router)
@@ -139,7 +144,8 @@ app.include_router(agents_router)  # Agents management
 app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
 app.include_router(employee_missing_router)  # Missing employee endpoints
-app.include_router(agent_sdk_router)  # SDK-ready agent endpoints
+# app.include_router(agent_sdk_router)  # Replaced with fixed version
+app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
 app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
 app.include_router(emp_agent_mgmt_router)  # Employee agent management
 app.include_router(fix_agents_router)  # Fix agents table schema
