@@ -135,22 +135,32 @@ async def create_agent(
 
 async def get_agent_by_key(api_key: str) -> Optional[Dict[str, Any]]:
     """通过 API Key 获取 Agent（用于认证）"""
-    # Use raw SQL to be resilient to schema differences between historical and current definitions
-    result = await database.fetch_one("SELECT * FROM agents WHERE api_key = :api_key LIMIT 1", {"api_key": api_key})
-    if not result:
+    try:
+        # Use raw SQL to be resilient to schema differences
+        result = await database.fetch_one("SELECT * FROM agents WHERE api_key = :api_key LIMIT 1", {"api_key": api_key})
+        if not result:
+            return None
+        agent = dict(result)
+        
+        # Normalize field names across schemas
+        # Map name -> agent_name if needed
+        if "agent_name" not in agent and "name" in agent:
+            agent["agent_name"] = agent["name"]
+        
+        # Derive is_active from status if not present
+        if "is_active" not in agent:
+            status = agent.get("status")
+            agent["is_active"] = (str(status).lower() == "active") if status is not None else True
+        
+        # Ensure allowed_merchants exists (can be None)
+        if "allowed_merchants" not in agent:
+            agent["allowed_merchants"] = None
+        
+        return agent
+    except Exception as e:
+        # Log and return None if any DB/schema issue
+        print(f"Error in get_agent_by_key: {e}")
         return None
-    agent = dict(result)
-    # Normalize field names across schemas
-    # Map name -> agent_name if needed
-    if "agent_name" not in agent and "name" in agent:
-        agent["agent_name"] = agent["name"]
-    # Derive is_active from status if not present
-    if "is_active" not in agent:
-        status = agent.get("status")
-        agent["is_active"] = (str(status).lower() == "active") if status is not None else True
-    # Ensure allowed_merchants exists (can be None)
-    agent.setdefault("allowed_merchants", agent.get("allowed_merchants"))
-    return agent
 
 
 async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
