@@ -246,7 +246,7 @@ async def startup():
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -307,6 +307,26 @@ async def startup():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                     updated_at TIMESTAMP WITH TIME ZONE,
                     metadata JSONB
+                )
+            """)
+
+            # Create agent usage logs table (for rate limit & analytics)
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS agent_usage_logs (
+                    id SERIAL PRIMARY KEY,
+                    agent_id VARCHAR(50) NOT NULL,
+                    endpoint VARCHAR(255) NOT NULL,
+                    method VARCHAR(10) NOT NULL,
+                    merchant_id VARCHAR(50),
+                    request_id VARCHAR(100) UNIQUE,
+                    ip_address VARCHAR(50),
+                    user_agent TEXT,
+                    status_code INTEGER,
+                    response_time_ms INTEGER,
+                    error_message TEXT,
+                    order_id VARCHAR(50),
+                    order_amount NUMERIC(10,2),
+                    timestamp TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
             
@@ -605,8 +625,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
