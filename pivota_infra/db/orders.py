@@ -82,8 +82,36 @@ async def create_order(order_data: Dict[str, Any]) -> str:
     order_data["is_deleted"] = False  # Explicitly set for PostgreSQL
     
     query = orders.insert().values(**order_data)
-    await database.execute(query)
-    return order_id
+    try:
+        await database.execute(query)
+        return order_id
+    except Exception as e:
+        # Auto-migrate missing columns on production DBs, then retry once
+        err = str(e)
+        try:
+            from sqlalchemy import text
+            if "column \"shipping_address\" of relation \"orders\" does not exist" in err or "shipping_address" in err:
+                # Add missing columns defensively
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS shipping_address JSONB;
+                """))
+            if "column \"items\" of relation \"orders\" does not exist" in err or " column \"items\"" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS items JSONB;
+                """))
+            if "column \"client_secret\" of relation \"orders\" does not exist" in err or "client_secret" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS client_secret VARCHAR(500);
+                """))
+            # Retry the insert once after migration
+            await database.execute(query)
+            return order_id
+        except Exception as mig_err:
+            # Surface original error if migration fails
+            raise mig_err
 
 
 async def get_order(order_id: str) -> Optional[Dict[str, Any]]:
