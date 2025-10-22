@@ -209,9 +209,14 @@ async def create_new_order(
             "shipping_fee": float(shipping_fee),
             "tax": float(tax),
             "total": float(total),
+            "amount": float(total),  # Legacy field, same as total
             "currency": order_request.currency,
             "agent_session_id": order_request.agent_session_id,
-            "metadata": order_request.metadata or {}
+            "metadata": order_request.metadata or {},
+            # Legacy fields (optional, can be null)
+            "store_id": None,
+            "psp_id": None,
+            "payment_method": None
         }
         order_id = await create_order(order_data)
 
