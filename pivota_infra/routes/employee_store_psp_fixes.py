@@ -63,8 +63,8 @@ async def connect_shopify_store(
         existing = await database.fetch_one(
             """SELECT store_id FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'shopify' 
-               AND store_url = :store_url""",
-            {"merchant_id": request.merchant_id, "store_url": request.shop_domain}
+               AND domain = :domain""",
+            {"merchant_id": request.merchant_id, "domain": request.shop_domain}
         )
         
         if existing:
@@ -86,20 +86,37 @@ async def connect_shopify_store(
             
             await database.execute(
                 """INSERT INTO merchant_stores 
-                   (store_id, merchant_id, platform, store_name, store_url, status, product_count, api_key, connected_at)
-                   VALUES (:store_id, :merchant_id, :platform, :store_name, :store_url, :status, :product_count, :api_key, :connected_at)""",
+                   (store_id, merchant_id, platform, name, domain, status, product_count, api_key, connected_at)
+                   VALUES (:store_id, :merchant_id, :platform, :name, :domain, :status, :product_count, :api_key, :connected_at)""",
                 {
                     "store_id": store_id,
                     "merchant_id": request.merchant_id,
                     "platform": "shopify",
-                    "store_name": request.store_name or request.shop_domain,
-                    "store_url": request.shop_domain,
+                    "name": request.store_name or request.shop_domain,
+                    "domain": request.shop_domain,
                     "status": "connected",
                     "product_count": 0,
                     "api_key": request.access_token,
                     "connected_at": datetime.now()
                 }
             )
+        
+        # Also update merchant_onboarding MCP fields for backward compatibility
+        await database.execute(
+            """UPDATE merchant_onboarding 
+               SET mcp_connected = true,
+                   mcp_platform = 'shopify',
+                   mcp_shop_domain = :shop_domain,
+                   mcp_access_token = :access_token,
+                   updated_at = :updated_at
+               WHERE merchant_id = :merchant_id""",
+            {
+                "shop_domain": request.shop_domain,
+                "access_token": request.access_token,
+                "updated_at": datetime.now(),
+                "merchant_id": request.merchant_id
+            }
+        )
         
         return {
             "status": "success",
@@ -135,8 +152,8 @@ async def connect_wix_store(
         existing = await database.fetch_one(
             """SELECT store_id FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'wix' 
-               AND store_url = :store_url""",
-            {"merchant_id": request.merchant_id, "store_url": request.site_id}
+               AND domain = :domain""",
+            {"merchant_id": request.merchant_id, "domain": request.site_id}
         )
         
         if existing:
@@ -158,14 +175,14 @@ async def connect_wix_store(
             
             await database.execute(
                 """INSERT INTO merchant_stores 
-                   (store_id, merchant_id, platform, store_name, store_url, status, product_count, api_key, connected_at)
-                   VALUES (:store_id, :merchant_id, :platform, :store_name, :store_url, :status, :product_count, :api_key, :connected_at)""",
+                   (store_id, merchant_id, platform, name, domain, status, product_count, api_key, connected_at)
+                   VALUES (:store_id, :merchant_id, :platform, :name, :domain, :status, :product_count, :api_key, :connected_at)""",
                 {
                     "store_id": store_id,
                     "merchant_id": request.merchant_id,
                     "platform": "wix",
-                    "store_name": request.store_name or f"Wix Store {request.site_id[:8]}",
-                    "store_url": request.site_id,
+                    "name": request.store_name or f"Wix Store {request.site_id[:8]}",
+                    "domain": request.site_id,
                     "status": "connected",
                     "product_count": 0,
                     "api_key": request.api_key,
@@ -335,8 +352,7 @@ async def sync_merchant_products(
             await database.execute(
                 """UPDATE merchant_stores 
                    SET product_count = :product_count, 
-                       last_sync = :last_sync,
-                       sync_status = 'completed'
+                       last_sync = :last_sync
                    WHERE store_id = :store_id""",
                 {
                     "product_count": sync_result.products_synced,
@@ -373,7 +389,7 @@ async def test_store_connection(
     
     try:
         store = await database.fetch_one(
-            """SELECT store_id, api_key, store_url 
+            """SELECT store_id, api_key, domain, name 
                FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = :platform
                ORDER BY connected_at DESC LIMIT 1""",
