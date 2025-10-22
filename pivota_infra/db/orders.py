@@ -136,6 +136,16 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS agent_id VARCHAR(50);
                 """))
+            if "column \"agent_session_id\" of relation \"orders\" does not exist" in err or "agent_session_id" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS agent_session_id VARCHAR(100);
+                """))
+            if "column \"is_deleted\" of relation \"orders\" does not exist" in err or "is_deleted" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
+                """))
             # Retry the insert once after migration
             await database.execute(query)
             return order_id
