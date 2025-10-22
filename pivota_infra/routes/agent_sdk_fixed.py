@@ -229,38 +229,45 @@ async def search_products(
             params["merchant_id"] = merchant_id
         
         if query:
-            where_clauses.append("(LOWER(name) LIKE :query OR LOWER(description) LIKE :query)")
+            # Search in JSON fields using PostgreSQL JSON operators
+            where_clauses.append("(LOWER(p.product_data->>'name') LIKE :query OR LOWER(p.product_data->>'description') LIKE :query)")
             params["query"] = f"%{query.lower()}%"
         
         if category:
-            where_clauses.append("LOWER(category) = :category")
+            where_clauses.append("LOWER(p.product_data->>'category') = :category")
             params["category"] = category.lower()
         
         if min_price is not None:
-            where_clauses.append("price >= :min_price")
+            where_clauses.append("(p.product_data->>'price')::numeric >= :min_price")
             params["min_price"] = min_price
         
         if max_price is not None:
-            where_clauses.append("price <= :max_price")
+            where_clauses.append("(p.product_data->>'price')::numeric <= :max_price")
             params["max_price"] = max_price
         
         if in_stock is not None:
-            where_clauses.append("in_stock = :in_stock")
+            where_clauses.append("(p.product_data->>'in_stock')::boolean = :in_stock")
             params["in_stock"] = in_stock
         
         # Build query
         where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
         
-        # Get products
+        # Get products from cache
         query_str = f"""
             SELECT 
-                p.*,
+                p.id,
+                p.merchant_id,
+                p.platform,
+                p.platform_product_id,
+                p.product_data,
+                p.cached_at,
                 m.business_name as merchant_name
             FROM products_cache p
             JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
             WHERE {where_clause}
             AND m.status != 'deleted'
-            ORDER BY p.created_at DESC
+            AND p.cache_status != 'expired'
+            ORDER BY p.cached_at DESC
             LIMIT :limit OFFSET :offset
         """
         
@@ -279,16 +286,34 @@ async def search_products(
         count_params = {k: v for k, v in params.items() if k not in ['limit', 'offset']}
         total_result = await database.fetch_one(count_query, count_params)
         
-        # Calculate relevance scores if query provided
+        # Extract product data from JSON and calculate relevance scores
         product_list = []
         for p in products:
-            product_dict = dict(p)
+            # Extract product data from JSON column
+            product_info = p.get("product_data", {})
+            
+            # Build response object
+            product_dict = {
+                "id": p.get("platform_product_id"),
+                "merchant_id": p.get("merchant_id"),
+                "merchant_name": p.get("merchant_name"),
+                "platform": p.get("platform"),
+                "name": product_info.get("name", ""),
+                "description": product_info.get("description", ""),
+                "price": product_info.get("price", 0),
+                "currency": product_info.get("currency", "USD"),
+                "category": product_info.get("category", ""),
+                "in_stock": product_info.get("in_stock", True),
+                "image_url": product_info.get("image_url", ""),
+                "url": product_info.get("url", ""),
+                "cached_at": p.get("cached_at").isoformat() if p.get("cached_at") else None
+            }
             
             # Add relevance score
             if query:
                 score = 0
-                name_lower = (p.get("name") or "").lower()
-                desc_lower = (p.get("description") or "").lower()
+                name_lower = product_dict["name"].lower()
+                desc_lower = product_dict["description"].lower()
                 query_lower = query.lower()
                 
                 if query_lower in name_lower:
