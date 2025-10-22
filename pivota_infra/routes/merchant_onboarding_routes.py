@@ -579,8 +579,25 @@ async def list_all_onboardings(
         
         where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
         
-        # Optimized query: get merchants with PSP and product info in one go
+        # Optimized query using CTEs (compatible with older PostgreSQL versions)
         query = f"""
+            WITH psp_latest AS (
+                SELECT DISTINCT ON (merchant_id) 
+                    merchant_id, 
+                    provider
+                FROM merchant_psps
+                WHERE status = 'active'
+                ORDER BY merchant_id, connected_at DESC
+            ),
+            product_stats AS (
+                SELECT 
+                    merchant_id,
+                    COUNT(*) as product_count,
+                    MAX(cached_at) as last_synced,
+                    COUNT(CASE WHEN expires_at < NOW() THEN 1 END) as expired_count
+                FROM products_cache
+                GROUP BY merchant_id
+            )
             SELECT 
                 mo.merchant_id,
                 mo.business_name,
@@ -594,29 +611,14 @@ async def list_all_onboardings(
                 mo.mcp_connected,
                 mo.mcp_platform,
                 mo.created_at,
-                -- PSP info (using DISTINCT ON to get latest active PSP)
                 COALESCE(mo.psp_connected, CASE WHEN psp.provider IS NOT NULL THEN true ELSE false END) as psp_connected,
                 COALESCE(mo.psp_type, psp.provider) as psp_type,
-                -- Product cache info (aggregated)
                 COALESCE(pc.product_count, 0) as product_count,
                 pc.last_synced,
                 COALESCE(pc.expired_count, 0) as expired_count
             FROM merchant_onboarding mo
-            LEFT JOIN LATERAL (
-                SELECT provider
-                FROM merchant_psps
-                WHERE merchant_id = mo.merchant_id AND status = 'active'
-                ORDER BY connected_at DESC
-                LIMIT 1
-            ) psp ON true
-            LEFT JOIN LATERAL (
-                SELECT 
-                    COUNT(*) as product_count,
-                    MAX(cached_at) as last_synced,
-                    COUNT(CASE WHEN expires_at < NOW() THEN 1 END) as expired_count
-                FROM products_cache
-                WHERE merchant_id = mo.merchant_id
-            ) pc ON true
+            LEFT JOIN psp_latest psp ON mo.merchant_id = psp.merchant_id
+            LEFT JOIN product_stats pc ON mo.merchant_id = pc.merchant_id
             WHERE {where_clause}
             ORDER BY mo.business_name
         """
