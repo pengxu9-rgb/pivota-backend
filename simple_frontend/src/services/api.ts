@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { User, PSP, RoutingRule, Merchant, SystemLog, ApiKey, Analytics } from '../types';
 
-const API_BASE_URL = 'https://pivota-dashboard.onrender.com';
+const API_BASE_URL = 'https://web-production-fedb.up.railway.app';
 
 // Create axios instance
 const api = axios.create({

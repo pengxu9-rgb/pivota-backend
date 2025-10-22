@@ -1,7 +1,7 @@
 // Alternative API service using native fetch instead of axios
 // Use this if axios has timeout issues
 
-const API_BASE_URL = 'https://pivota-dashboard.onrender.com';
+const API_BASE_URL = 'https://web-production-fedb.up.railway.app';
 
 // Helper function to make fetch requests with timeout
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout: number = 30000) {
