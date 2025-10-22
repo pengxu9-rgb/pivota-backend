@@ -22,6 +22,7 @@ from db.orders import (
 )
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
+from db.database import database
 from utils.auth import require_admin, get_current_user
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
@@ -156,10 +157,27 @@ async def create_new_order(
         raise HTTPException(status_code=404, detail="Merchant not found")
     
     if not merchant.get("psp_connected"):
-        raise HTTPException(
-            status_code=400, 
-            detail="Merchant has not connected PSP. Cannot process payments."
-        )
+        # Fallback: derive PSP from merchant_psps table to avoid stale flags
+        try:
+            psp_row = await database.fetch_one(
+                """
+                SELECT provider FROM merchant_psps
+                WHERE merchant_id = :merchant_id AND status = 'active'
+                ORDER BY connected_at DESC
+                LIMIT 1
+                """,
+                {"merchant_id": order_request.merchant_id}
+            )
+        except Exception:
+            psp_row = None
+        if psp_row:
+            merchant["psp_connected"] = True
+            merchant["psp_type"] = psp_row["provider"]
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail="Merchant has not connected PSP. Cannot process payments."
+            )
     
     # 2. 检查库存（如果商户连接了 Shopify）
     has_inventory, inventory_info = await check_inventory_availability(
@@ -325,12 +343,46 @@ async def confirm_payment(
     
     # 获取商户信息
     merchant = await get_merchant_onboarding(order["merchant_id"])
+    # 如果标志未更新，尝试从 merchant_psps 推断
+    if not merchant.get("psp_connected") or not merchant.get("psp_type"):
+        try:
+            psp_row = await database.fetch_one(
+                """
+                SELECT provider FROM merchant_psps
+                WHERE merchant_id = :merchant_id AND status = 'active'
+                ORDER BY connected_at DESC
+                LIMIT 1
+                """,
+                {"merchant_id": order["merchant_id"]}
+            )
+            if psp_row:
+                merchant["psp_connected"] = True
+                merchant["psp_type"] = merchant.get("psp_type") or psp_row["provider"]
+        except Exception:
+            pass
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
     try:
-        # 获取商户的 PSP 类型和密钥
-        psp_type = merchant.get("psp_type", "stripe")
+        # 获取商户的 PSP 类型和密钥（带 fallback）
+        psp_type = merchant.get("psp_type")
+        if not psp_type:
+            try:
+                psp_row = await database.fetch_one(
+                    """
+                    SELECT provider FROM merchant_psps
+                    WHERE merchant_id = :merchant_id AND status = 'active'
+                    ORDER BY connected_at DESC
+                    LIMIT 1
+                    """,
+                    {"merchant_id": order_request.merchant_id}
+                )
+                if psp_row:
+                    psp_type = psp_row["provider"]
+            except Exception:
+                psp_type = None
+        if not psp_type:
+            psp_type = "stripe"
         # 尝试获取 psp_sandbox_key 或 psp_key (same logic as create_new_order)
         psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
         
