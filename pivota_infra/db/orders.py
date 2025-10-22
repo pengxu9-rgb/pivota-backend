@@ -19,8 +19,7 @@ from db.database import metadata, database
 orders = Table(
     "orders",
     metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("order_id", String(50), unique=True, index=True, nullable=False),  # 订单唯一ID
+    Column("order_id", String(50), primary_key=True),  # 订单唯一ID（主键）
     Column("merchant_id", String(50), index=True, nullable=False),
     
     # 客户信息
