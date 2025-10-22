@@ -162,7 +162,7 @@ async def create_new_order(
             psp_row = await database.fetch_one(
                 """
                 SELECT provider FROM merchant_psps
-                WHERE merchant_id = :merchant_id AND status = 'active'
+                WHERE merchant_id = :merchant_id
                 ORDER BY connected_at DESC
                 LIMIT 1
                 """,
@@ -222,8 +222,25 @@ async def create_new_order(
     async def create_payment_intent_task():
         """后台创建支付意图（支持多 PSP）"""
         try:
-            # 获取商户的 PSP 类型和密钥
-            psp_type = merchant.get("psp_type", "stripe")
+        # 获取商户的 PSP 类型和密钥（带 fallback）
+        psp_type = merchant.get("psp_type")
+        if not psp_type:
+            try:
+                psp_row = await database.fetch_one(
+                    """
+                    SELECT provider FROM merchant_psps
+                    WHERE merchant_id = :merchant_id
+                    ORDER BY connected_at DESC
+                    LIMIT 1
+                    """,
+                    {"merchant_id": order_request.merchant_id}
+                )
+                if psp_row:
+                    psp_type = psp_row["provider"]
+            except Exception:
+                psp_type = None
+        if not psp_type:
+            psp_type = "stripe"
             # 尝试获取 psp_sandbox_key 或 psp_key
             psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
             
@@ -349,7 +366,7 @@ async def confirm_payment(
             psp_row = await database.fetch_one(
                 """
                 SELECT provider FROM merchant_psps
-                WHERE merchant_id = :merchant_id AND status = 'active'
+                WHERE merchant_id = :merchant_id
                 ORDER BY connected_at DESC
                 LIMIT 1
                 """,
@@ -371,7 +388,7 @@ async def confirm_payment(
                 psp_row = await database.fetch_one(
                     """
                     SELECT provider FROM merchant_psps
-                    WHERE merchant_id = :merchant_id AND status = 'active'
+                    WHERE merchant_id = :merchant_id
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
