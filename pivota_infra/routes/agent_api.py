@@ -482,7 +482,7 @@ async def agent_create_order(
             merchant_id=order_request.merchant_id,
             error_message=str(e)
         )
-        raise HTTPException(status_code=500, detail="Order creation failed")
+        raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
 
 
 @router.get("/orders/{order_id}")
