@@ -567,28 +567,39 @@ async def list_all_onboardings(
     try:
         merchants = await get_all_merchant_onboardings(status, include_deleted=include_deleted)
         
+        # Get product counts for all merchants
+        merchant_list = []
+        for m in merchants:
+            # Get product count from cache
+            product_count_result = await database.fetch_one(
+                """SELECT COUNT(*) as count FROM products_cache 
+                   WHERE merchant_id = :merchant_id AND cache_status != 'expired'""",
+                {"merchant_id": m["merchant_id"]}
+            )
+            product_count = product_count_result["count"] if product_count_result else 0
+            
+            merchant_list.append({
+                "merchant_id": m["merchant_id"],
+                "business_name": m["business_name"],
+                "store_url": m.get("store_url") or "N/A",
+                "region": m.get("region") or "Unknown",
+                "contact_email": m.get("contact_email"),
+                "status": m["status"],
+                "auto_approved": m.get("auto_approved", False),
+                "approval_confidence": m.get("approval_confidence"),
+                "full_kyb_deadline": m.get("full_kyb_deadline").isoformat() if m.get("full_kyb_deadline") else None,
+                "psp_connected": m.get("psp_connected", False),
+                "psp_type": m.get("psp_type"),
+                "mcp_connected": m.get("mcp_connected", False),
+                "mcp_platform": m.get("mcp_platform"),
+                "product_count": product_count,
+                "created_at": m["created_at"].isoformat() if m["created_at"] else None,
+            })
+        
         return {
             "status": "success",
-            "count": len(merchants),
-            "merchants": [
-                {
-                    "merchant_id": m["merchant_id"],
-                    "business_name": m["business_name"],
-                    "store_url": m.get("store_url") or "N/A",
-                    "region": m.get("region") or "Unknown",
-                    "contact_email": m.get("contact_email"),
-                    "status": m["status"],
-                    "auto_approved": m.get("auto_approved", False),
-                    "approval_confidence": m.get("approval_confidence"),
-                    "full_kyb_deadline": m.get("full_kyb_deadline").isoformat() if m.get("full_kyb_deadline") else None,
-                    "psp_connected": m.get("psp_connected", False),
-                    "psp_type": m.get("psp_type"),
-                    "mcp_connected": m.get("mcp_connected", False),
-                    "mcp_platform": m.get("mcp_platform"),
-                    "created_at": m["created_at"].isoformat() if m["created_at"] else None,
-                }
-                for m in merchants
-            ]
+            "count": len(merchant_list),
+            "merchants": merchant_list
         }
     except Exception as e:
         print(f"❌ Error listing merchant onboardings: {e}")
