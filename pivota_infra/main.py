@@ -608,6 +608,29 @@ async def startup():
                         ADD COLUMN IF NOT EXISTS {col_name} {col_type};
                     """))
                     logger.info(f"✅ {col_name} column added successfully")
+
+            # Migration 4: Ensure critical columns exist on orders table
+            logger.info("   Checking orders table columns...")
+            orders_columns = [
+                ("shipping_address", "JSONB"),
+                ("items", "JSONB"),
+                ("client_secret", "VARCHAR(500)")
+            ]
+            for col_name, col_type in orders_columns:
+                check_col = text(f"""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='orders' 
+                    AND column_name='{col_name}';
+                """)
+                col_exists = await database.fetch_one(check_col)
+                if not col_exists:
+                    logger.info(f"📝 Adding {col_name} column to orders...")
+                    await database.execute(text(f"""
+                        ALTER TABLE orders 
+                        ADD COLUMN IF NOT EXISTS {col_name} {col_type};
+                    """))
+                    logger.info(f"✅ {col_name} column added to orders")
             
         except Exception as migration_err:
             logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")
