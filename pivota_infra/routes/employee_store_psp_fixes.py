@@ -281,7 +281,7 @@ async def sync_merchant_products(
         raise HTTPException(status_code=400, detail="Invalid platform")
     
     try:
-        # Get the store for this merchant and platform
+        # Try to get store from merchant_stores table first
         store = await database.fetch_one(
             """SELECT store_id, name as store_name, api_key 
                FROM merchant_stores 
@@ -291,42 +291,67 @@ async def sync_merchant_products(
             {"merchant_id": request.merchant_id, "platform": platform}
         )
         
+        # Fallback: check merchant_onboarding mcp_* fields
         if not store:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"No connected {platform} store found for merchant"
-            )
+            from db.merchant_onboarding import get_merchant_onboarding
+            merchant = await get_merchant_onboarding(request.merchant_id)
+            
+            if not merchant:
+                raise HTTPException(status_code=404, detail="Merchant not found")
+            
+            # Check if merchant has MCP connected
+            if merchant.get("mcp_connected") and merchant.get("mcp_platform") == platform:
+                # Use merchant_onboarding data as a virtual "store"
+                store = {
+                    "store_id": f"mcp_{request.merchant_id}",
+                    "store_name": merchant.get("business_name"),
+                    "api_key": None  # Not needed for sync
+                }
+            else:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"No connected {platform} store found for merchant"
+                )
         
-        # Simulate product sync (in real implementation, would call actual API)
-        if platform == "shopify":
-            # Simulate Shopify product sync
-            product_count = 42  # Demo count
-            sync_status = "completed"
-        else:  # wix
-            # Simulate Wix product sync
-            product_count = 28  # Demo count
-            sync_status = "completed"
+        # Call the real product sync endpoint
+        from routes.product_sync import sync_products, SyncRequest
+        from fastapi import BackgroundTasks
         
-        # Update store with sync results
-        await database.execute(
-            """UPDATE merchant_stores 
-               SET product_count = :product_count, 
-                   last_sync = :last_sync,
-                   sync_status = :sync_status
-               WHERE store_id = :store_id""",
-            {
-                "product_count": product_count,
-                "last_sync": datetime.now(),
-                "sync_status": sync_status,
-                "store_id": store["store_id"]
-            }
+        sync_request = SyncRequest(
+            merchant_id=request.merchant_id,
+            force_refresh=False,
+            limit=250
         )
+        
+        # Call real sync
+        sync_result = await sync_products(
+            request=sync_request,
+            background_tasks=BackgroundTasks(),
+            current_user=current_user
+        )
+        
+        # Update store table if it exists
+        if store.get("store_id") and not store["store_id"].startswith("mcp_"):
+            await database.execute(
+                """UPDATE merchant_stores 
+                   SET product_count = :product_count, 
+                       last_sync = :last_sync,
+                       sync_status = 'completed'
+                   WHERE store_id = :store_id""",
+                {
+                    "product_count": sync_result.products_synced,
+                    "last_sync": datetime.now(),
+                    "store_id": store["store_id"]
+                }
+            )
         
         return {
             "status": "success",
-            "message": f"Products synced successfully for {store['store_name']}",
-            "product_count": product_count,
-            "store_id": store["store_id"]
+            "message": sync_result.message,
+            "product_count": sync_result.products_synced,
+            "platform": sync_result.platform,
+            "store_id": store.get("store_id"),
+            "store_name": store.get("store_name")
         }
     
     except HTTPException:
