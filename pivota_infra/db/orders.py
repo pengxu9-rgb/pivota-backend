@@ -22,7 +22,13 @@ orders = Table(
     Column("order_id", String(50), primary_key=True),  # 订单唯一ID（主键）
     Column("merchant_id", String(50), index=True, nullable=False),
     
+    # Legacy fields (for backward compatibility with existing DB)
+    Column("store_id", String(50), nullable=True),
+    Column("psp_id", String(50), nullable=True),
+    Column("amount", Numeric(10, 2), nullable=True),  # Legacy, same as total
+    
     # 客户信息
+    Column("customer_name", String(255), nullable=True),
     Column("customer_email", String(255), nullable=False),
     Column("shipping_address", JSON, nullable=False),  # ShippingAddress JSON
     
@@ -39,6 +45,7 @@ orders = Table(
     # 状态机
     Column("status", String(50), default="pending", index=True),  # 订单状态
     Column("payment_status", String(50), default="unpaid", index=True),  # 支付状态
+    Column("payment_method", String(50), nullable=True),  # Legacy payment method field
     Column("fulfillment_status", String(50), nullable=True),  # 履约状态
     
     # 支付集成（Stripe）
