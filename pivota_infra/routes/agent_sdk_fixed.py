@@ -289,45 +289,41 @@ async def search_products(
         # Extract product data from JSON and calculate relevance scores
         product_list = []
         for p in products:
-            # Convert Row to dict
-            p_dict = dict(p)
-            # Extract product data from JSON column
-            product_info = p_dict.get("product_data", {})
-            
-            # Build response object
-            product_dict = {
-                "id": p_dict.get("platform_product_id"),
-                "merchant_id": p_dict.get("merchant_id"),
-                "merchant_name": p_dict.get("merchant_name"),
-                "platform": p_dict.get("platform"),
-                "name": product_info.get("name", ""),
-                "description": product_info.get("description", ""),
-                "price": product_info.get("price", 0),
-                "currency": product_info.get("currency", "USD"),
-                "category": product_info.get("category", ""),
-                "in_stock": product_info.get("in_stock", True),
-                "image_url": product_info.get("image_url", ""),
-                "url": product_info.get("url", ""),
-                "cached_at": p_dict.get("cached_at").isoformat() if p_dict.get("cached_at") else None
-            }
-            
-            # Add relevance score
-            if query:
-                score = 0
-                name_lower = product_dict["name"].lower()
-                desc_lower = product_dict["description"].lower()
-                query_lower = query.lower()
+            try:
+                # Convert Row to dict safely
+                p_dict = dict(p)
+                # Extract product data from JSON column
+                product_info = p_dict.get("product_data") or {}
                 
-                if query_lower in name_lower:
-                    score += 10
-                if name_lower.startswith(query_lower):
-                    score += 5
-                if query_lower in desc_lower:
-                    score += 3
+                # Build response object - merge product_info with metadata
+                product_dict = {
+                    **product_info,  # Spread all product fields
+                    "merchant_id": p_dict["merchant_id"],
+                    "merchant_name": p_dict.get("merchant_name"),
+                    "platform": p_dict["platform"],
+                    "cached_at": p_dict["cached_at"].isoformat() if p_dict.get("cached_at") else None
+                }
                 
-                product_dict["relevance_score"] = score
-            
-            product_list.append(product_dict)
+                # Add relevance score
+                if query:
+                    score = 0
+                    name_lower = str(product_dict.get("name", "")).lower()
+                    desc_lower = str(product_dict.get("description", "")).lower()
+                    query_lower = query.lower()
+                    
+                    if query_lower in name_lower:
+                        score += 10
+                    if name_lower.startswith(query_lower):
+                        score += 5
+                    if query_lower in desc_lower:
+                        score += 3
+                    
+                    product_dict["relevance_score"] = score
+                
+                product_list.append(product_dict)
+            except Exception as e:
+                logger.error(f"Error processing product: {e}")
+                continue
         
         # Sort by relevance if query provided
         if query:
