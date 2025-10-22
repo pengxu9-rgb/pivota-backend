@@ -146,6 +146,11 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
                 """))
+            if "column \"metadata\" of relation \"orders\" does not exist" in err or "metadata" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS metadata JSONB;
+                """))
             # Retry the insert once after migration
             await database.execute(query)
             return order_id
