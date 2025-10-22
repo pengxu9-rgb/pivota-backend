@@ -150,7 +150,6 @@ async def create_new_order(
     - 金额使用 Decimal 精确计算
     - 支付信息与订单解耦，失败不影响订单创建
     """
-    
     try:
         # 1. 验证商户
         merchant = await get_merchant_onboarding(order_request.merchant_id)
@@ -158,7 +157,7 @@ async def create_new_order(
             raise HTTPException(status_code=404, detail="Merchant not found")
         
         if not merchant.get("psp_connected"):
-            # Fallback: derive PSP from merchant_psps table to avoid stale flags
+            # 从 merchant_psps 回退推断 PSP 连接
             try:
                 psp_row = await database.fetch_one(
                     """
@@ -176,144 +175,127 @@ async def create_new_order(
                 merchant["psp_type"] = psp_row["provider"]
             else:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail="Merchant has not connected PSP. Cannot process payments."
                 )
-    
-    # 2. 检查库存（如果商户连接了 Shopify）
-    has_inventory, inventory_info = await check_inventory_availability(
-        order_request.merchant_id,
-        order_request.items
-    )
-    
-    if not has_inventory:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Insufficient inventory",
-                "items": inventory_info.get("items", [])
-            }
+
+        # 2. 检查库存（如果商户连接了 Shopify）
+        has_inventory, inventory_info = await check_inventory_availability(
+            order_request.merchant_id,
+            order_request.items
         )
-    
-    # 3. 计算订单金额
-    subtotal = sum(item.subtotal for item in order_request.items)
-    shipping_fee = Decimal("0")  # TODO: 动态计算运费
-    tax = Decimal("0")  # TODO: 动态计算税费
-    total = subtotal + shipping_fee + tax
-    
-    # 4. 创建订单
-    # 使用 json.loads(x.json()) 确保 Decimal 被序列化为字符串
-    order_data = {
-        "merchant_id": order_request.merchant_id,
-        "customer_email": order_request.customer_email,
-        "items": [json.loads(item.json()) for item in order_request.items],
-        "shipping_address": json.loads(order_request.shipping_address.json()),
-        "subtotal": float(subtotal),
-        "shipping_fee": float(shipping_fee),
-        "tax": float(tax),
-        "total": float(total),
-        "currency": order_request.currency,
-        "agent_session_id": order_request.agent_session_id,
-        "metadata": order_request.metadata or {}
-    }
-    
-        order_id = await create_order(order_data)
-    
-    # 5. 创建 Payment Intent（后台任务，不阻塞）
-    async def create_payment_intent_task():
-        """后台创建支付意图（支持多 PSP）"""
-        try:
-        # 获取商户的 PSP 类型和密钥（带 fallback）
-        psp_type = merchant.get("psp_type")
-        if not psp_type:
-            try:
-                psp_row = await database.fetch_one(
-                    """
-                    SELECT provider FROM merchant_psps
-                    WHERE merchant_id = :merchant_id
-                    ORDER BY connected_at DESC
-                    LIMIT 1
-                    """,
-                    {"merchant_id": order_request.merchant_id}
-                )
-                if psp_row:
-                    psp_type = psp_row["provider"]
-            except Exception:
-                psp_type = None
-        if not psp_type:
-            psp_type = "stripe"
-            # 尝试获取 psp_sandbox_key 或 psp_key
-            psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-            
-            # 如果商户没有配置密钥，使用系统默认（开发环境）
-            if not psp_key:
-                if psp_type == "stripe":
-                    psp_key = getattr(settings, "stripe_secret_key", None)
-                else:
-                    psp_key = getattr(settings, "adyen_api_key", None)
-            
-            if not psp_key:
-                raise ValueError(f"No PSP key found for merchant {merchant['merchant_id']}")
-            
-            # 创建 PSP 适配器
-            psp_adapter = get_psp_adapter(psp_type, psp_key)
-            
-            # 创建支付意图
-            success, payment_intent, error = await psp_adapter.create_payment_intent(
-                amount=total,
-                currency=order_request.currency,
-                metadata={
-                    "order_id": order_id,
-                    "merchant_id": order_request.merchant_id,
-                    "customer_email": order_request.customer_email
+        if not has_inventory:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Insufficient inventory",
+                    "items": inventory_info.get("items", [])
                 }
             )
-            
-            if success and payment_intent:
-                # 更新订单支付信息
-                await update_payment_info(
-                    order_id=order_id,
-                    payment_intent_id=payment_intent.id,
-                    client_secret=payment_intent.client_secret,
-                    payment_status="awaiting_payment"
-                )
-                
-                # 记录订单创建事件
-                await log_order_event(
-                    event_type="order_created",
-                    order_id=order_id,
-                    merchant_id=order_request.merchant_id,
+
+        # 3. 计算订单金额
+        subtotal = sum(item.subtotal for item in order_request.items)
+        shipping_fee = Decimal("0")
+        tax = Decimal("0")
+        total = subtotal + shipping_fee + tax
+
+        # 4. 创建订单
+        order_data = {
+            "merchant_id": order_request.merchant_id,
+            "customer_email": order_request.customer_email,
+            "items": [json.loads(item.json()) for item in order_request.items],
+            "shipping_address": json.loads(order_request.shipping_address.json()),
+            "subtotal": float(subtotal),
+            "shipping_fee": float(shipping_fee),
+            "tax": float(tax),
+            "total": float(total),
+            "currency": order_request.currency,
+            "agent_session_id": order_request.agent_session_id,
+            "metadata": order_request.metadata or {}
+        }
+        order_id = await create_order(order_data)
+
+        # 5. 后台创建 Payment Intent（不阻塞）
+        async def create_payment_intent_task():
+            try:
+                # PSP 类型回退
+                psp_type = merchant.get("psp_type")
+                if not psp_type:
+                    try:
+                        psp_row = await database.fetch_one(
+                            """
+                            SELECT provider FROM merchant_psps
+                            WHERE merchant_id = :merchant_id
+                            ORDER BY connected_at DESC
+                            LIMIT 1
+                            """,
+                            {"merchant_id": order_request.merchant_id}
+                        )
+                        if psp_row:
+                            psp_type = psp_row["provider"]
+                    except Exception:
+                        psp_type = None
+                if not psp_type:
+                    psp_type = "stripe"
+
+                # PSP 密钥回退
+                psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
+                if not psp_key:
+                    if psp_type == "stripe":
+                        psp_key = getattr(settings, "stripe_secret_key", None)
+                    else:
+                        psp_key = getattr(settings, "adyen_api_key", None)
+                if not psp_key:
+                    raise ValueError(f"No PSP key found for merchant {merchant['merchant_id']}")
+
+                # 创建支付意图
+                psp_adapter = get_psp_adapter(psp_type, psp_key)
+                success, payment_intent, error = await psp_adapter.create_payment_intent(
+                    amount=total,
+                    currency=order_request.currency,
                     metadata={
-                        "total": float(total),
-                        "currency": order_request.currency,
-                        "items_count": len(order_request.items),
-                        "payment_intent_id": payment_intent.id,
-                        "psp_type": psp_type
+                        "order_id": order_id,
+                        "merchant_id": order_request.merchant_id,
+                        "customer_email": order_request.customer_email
                     }
                 )
-            else:
-                # 支付创建失败，记录错误但不影响订单
+                if success and payment_intent:
+                    await update_payment_info(
+                        order_id=order_id,
+                        payment_intent_id=payment_intent.id,
+                        client_secret=payment_intent.client_secret,
+                        payment_status="awaiting_payment"
+                    )
+                    await log_order_event(
+                        event_type="order_created",
+                        order_id=order_id,
+                        merchant_id=order_request.merchant_id,
+                        metadata={
+                            "total": float(total),
+                            "currency": order_request.currency,
+                            "items_count": len(order_request.items),
+                            "payment_intent_id": payment_intent.id,
+                            "psp_type": psp_type
+                        }
+                    )
+                else:
+                    await log_order_event(
+                        event_type="payment_intent_failed",
+                        order_id=order_id,
+                        merchant_id=order_request.merchant_id,
+                        metadata={"error": error, "psp_type": psp_type}
+                    )
+            except Exception as e:
                 await log_order_event(
-                    event_type="payment_intent_failed",
+                    event_type="payment_intent_error",
                     order_id=order_id,
                     merchant_id=order_request.merchant_id,
-                    metadata={"error": error, "psp_type": psp_type}
+                    metadata={"error": str(e)}
                 )
-            
-        except Exception as e:
-            # 捕获所有异常
-            await log_order_event(
-                event_type="payment_intent_error",
-                order_id=order_id,
-                merchant_id=order_request.merchant_id,
-                metadata={"error": str(e)}
-            )
-    
+
         background_tasks.add_task(create_payment_intent_task)
-    
-    # 6. 返回订单信息
-    # Note: Order was just created, construct response from known data
-    # This avoids potential race conditions with database transactions
+
+        # 6. 返回订单信息
         return OrderResponse(
             order_id=order_id,
             merchant_id=order_request.merchant_id,
