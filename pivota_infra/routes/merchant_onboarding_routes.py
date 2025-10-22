@@ -656,13 +656,11 @@ async def list_all_onboardings(
         print(f"❌ Error listing merchant onboardings: {e}")
         import traceback
         traceback.print_exc()
-        # Return empty list instead of error to prevent frontend crash
-        return {
-            "status": "success",
-            "count": 0,
-            "merchants": [],
-            "note": "Database may be initializing. Try registering a merchant first."
-        }
+        # Return error details for debugging
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to list merchants: {str(e)}"
+        )
 
 @router.post("/approve/{merchant_id}", response_model=Dict[str, Any])
 async def manual_approve_kyc(
