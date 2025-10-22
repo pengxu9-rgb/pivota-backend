@@ -567,16 +567,23 @@ async def list_all_onboardings(
     try:
         merchants = await get_all_merchant_onboardings(status, include_deleted=include_deleted)
         
-        # Get product counts for all merchants
+        # Get product counts and sync info for all merchants
         merchant_list = []
         for m in merchants:
-            # Get product count from cache
-            product_count_result = await database.fetch_one(
-                """SELECT COUNT(*) as count FROM products_cache 
-                   WHERE merchant_id = :merchant_id AND cache_status != 'expired'""",
+            # Get product count and last sync time from cache
+            product_info = await database.fetch_one(
+                """SELECT 
+                       COUNT(*) as count,
+                       MAX(cached_at) as last_synced,
+                       COUNT(CASE WHEN expires_at < NOW() THEN 1 END) as expired_count
+                   FROM products_cache 
+                   WHERE merchant_id = :merchant_id""",
                 {"merchant_id": m["merchant_id"]}
             )
-            product_count = product_count_result["count"] if product_count_result else 0
+            product_count = product_info["count"] if product_info else 0
+            last_synced = product_info["last_synced"] if product_info else None
+            expired_count = product_info["expired_count"] if product_info else 0
+            has_expired = expired_count > 0
             
             merchant_list.append({
                 "merchant_id": m["merchant_id"],
@@ -593,6 +600,9 @@ async def list_all_onboardings(
                 "mcp_connected": m.get("mcp_connected", False),
                 "mcp_platform": m.get("mcp_platform"),
                 "product_count": product_count,
+                "last_synced": last_synced.isoformat() if last_synced else None,
+                "products_expired": has_expired,
+                "expired_count": expired_count,
                 "created_at": m["created_at"].isoformat() if m["created_at"] else None,
             })
         
