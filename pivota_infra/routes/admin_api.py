@@ -471,29 +471,35 @@ async def get_analytics(days: int = 30, current_user: dict = Depends(require_adm
     psps = get_configured_psps()
     stores = get_configured_stores()
     
-    # Get PSP performance
+    # OPTIMIZED: Get PSP performance with single GROUP BY query
     psp_performance = {}
-    for psp_id, psp_info in psps.items():
-        try:
-            psp_query = select(
-                func.count().label("count"),
-                func.sum(transactions.c.amount).label("volume")
-            ).select_from(transactions).where(
-                and_(
-                    transactions.c.psp == psp_id,
-                    transactions.c.status == "completed"
-                )
-            )
-            result = await database.fetch_one(psp_query)
+    try:
+        # Get all PSP stats in one query
+        psp_stats_query = select(
+            transactions.c.psp,
+            func.count().label("count"),
+            func.sum(transactions.c.amount).label("volume")
+        ).select_from(transactions).where(
+            transactions.c.status == "completed"
+        ).group_by(transactions.c.psp)
+        
+        psp_stats_results = await database.fetch_all(psp_stats_query)
+        psp_stats_map = {row["psp"]: row for row in psp_stats_results}
+        
+        # Build performance dict for each configured PSP
+        for psp_id, psp_info in psps.items():
+            stats = psp_stats_map.get(psp_id)
             psp_performance[psp_id] = {
                 "status": "active",
                 "connection_health": "healthy",
                 "api_response_time": 150,
-                "transactions": result["count"] or 0,
-                "volume": float(result["volume"] or 0.0)
+                "transactions": stats["count"] if stats else 0,
+                "volume": float(stats["volume"] or 0.0) if stats else 0.0
             }
-        except Exception as e:
-            print(f"Error fetching PSP stats for {psp_id}: {e}")
+    except Exception as e:
+        print(f"Error fetching PSP stats: {e}")
+        # Fallback: empty stats for all PSPs
+        for psp_id, psp_info in psps.items():
             psp_performance[psp_id] = {
                 "status": "active",
                 "connection_health": "healthy",
