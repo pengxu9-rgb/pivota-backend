@@ -212,8 +212,48 @@ async def connect_wix_store(
         if not request.api_key or not request.api_key.strip():
             raise HTTPException(status_code=400, detail="Wix API Key is required")
         
-        logger.info(f"✅ Wix credentials validated for site {request.site_id}")
-        # Note: Wix API validation can be added here when we have Wix integration
+        # Test Wix API connection
+        import httpx
+        # Wix Stores API endpoint for getting site info
+        # https://dev.wix.com/api/rest/wix-stores/catalog/products/query-products
+        test_url = f"https://www.wixapis.com/stores/v1/products/query"
+        headers = {
+            "Authorization": request.api_key,
+            "wix-site-id": request.site_id
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Try to query products with limit 1 just to test connection
+                test_response = await client.post(
+                    test_url, 
+                    headers=headers,
+                    json={"query": {"limit": 1}}
+                )
+            
+            if test_response.status_code == 200:
+                logger.info(f"✅ Wix credentials verified for site {request.site_id}")
+            elif test_response.status_code == 401:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Invalid Wix API Key - authentication failed"
+                )
+            elif test_response.status_code == 403:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Wix API Key does not have permission to access this site"
+                )
+            else:
+                # Non-critical error, log but allow connection
+                logger.warning(f"⚠️ Wix API test returned {test_response.status_code}, but proceeding with connection")
+                
+        except httpx.RequestError as e:
+            # Network error - log but don't block connection
+            logger.warning(f"⚠️ Could not test Wix API (network error), but proceeding: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"⚠️ Wix API test error, but proceeding: {str(e)}")
         
         # Check if store already exists
         existing = await database.fetch_one(
@@ -256,6 +296,23 @@ async def connect_wix_store(
                     "connected_at": datetime.now()
                 }
             )
+        
+        # Also update merchant_onboarding MCP fields for backward compatibility
+        await database.execute(
+            """UPDATE merchant_onboarding 
+               SET mcp_connected = true,
+                   mcp_platform = 'wix',
+                   mcp_shop_domain = :site_id,
+                   mcp_access_token = :api_key,
+                   updated_at = :updated_at
+               WHERE merchant_id = :merchant_id""",
+            {
+                "site_id": request.site_id,
+                "api_key": request.api_key,
+                "updated_at": datetime.now(),
+                "merchant_id": request.merchant_id
+            }
+        )
         
         return {
             "status": "success",
