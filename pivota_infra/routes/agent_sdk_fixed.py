@@ -10,6 +10,7 @@ from db.database import database
 from routes.agent_auth import AgentContext, get_agent_context
 from utils.logger import logger
 import secrets
+import json
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
@@ -292,8 +293,14 @@ async def search_products(
             try:
                 # Convert Row to dict safely
                 p_dict = dict(p)
-                # Extract product data from JSON column
-                product_info = p_dict.get("product_data") or {}
+                # Extract product data from JSON column (might be string or dict)
+                product_data_raw = p_dict.get("product_data")
+                if isinstance(product_data_raw, str):
+                    product_info = json.loads(product_data_raw)
+                elif isinstance(product_data_raw, dict):
+                    product_info = product_data_raw
+                else:
+                    product_info = {}
                 
                 # Build response object - merge product_info with metadata
                 product_dict = {
