@@ -289,15 +289,17 @@ async def search_products(
         # Extract product data from JSON and calculate relevance scores
         product_list = []
         for p in products:
+            # Convert Row to dict
+            p_dict = dict(p)
             # Extract product data from JSON column
-            product_info = p.get("product_data", {})
+            product_info = p_dict.get("product_data", {})
             
             # Build response object
             product_dict = {
-                "id": p.get("platform_product_id"),
-                "merchant_id": p.get("merchant_id"),
-                "merchant_name": p.get("merchant_name"),
-                "platform": p.get("platform"),
+                "id": p_dict.get("platform_product_id"),
+                "merchant_id": p_dict.get("merchant_id"),
+                "merchant_name": p_dict.get("merchant_name"),
+                "platform": p_dict.get("platform"),
                 "name": product_info.get("name", ""),
                 "description": product_info.get("description", ""),
                 "price": product_info.get("price", 0),
@@ -306,7 +308,7 @@ async def search_products(
                 "in_stock": product_info.get("in_stock", True),
                 "image_url": product_info.get("image_url", ""),
                 "url": product_info.get("url", ""),
-                "cached_at": p.get("cached_at").isoformat() if p.get("cached_at") else None
+                "cached_at": p_dict.get("cached_at").isoformat() if p_dict.get("cached_at") else None
             }
             
             # Add relevance score
