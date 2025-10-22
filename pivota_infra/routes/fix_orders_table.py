@@ -117,6 +117,19 @@ async def fix_orders_table_columns():
             else:
                 logger.warning(f"Could not add agent_id: {e}")
         
+        # shipping_fee column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN shipping_fee NUMERIC(10,2)
+            """))
+            fixes_applied.append("Added shipping_fee column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("shipping_fee column already exists")
+            else:
+                logger.warning(f"Could not add shipping_fee: {e}")
+        
         # Verify columns exist
         columns = await database.fetch_all(text("""
             SELECT column_name 
@@ -138,7 +151,8 @@ async def fix_orders_table_columns():
             "has_tax": "tax" in column_names,
             "has_total": "total" in column_names,
             "has_payment_status": "payment_status" in column_names,
-            "has_agent_id": "agent_id" in column_names
+            "has_agent_id": "agent_id" in column_names,
+            "has_shipping_fee": "shipping_fee" in column_names
         }
         
     except Exception as e:
