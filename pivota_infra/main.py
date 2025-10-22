@@ -62,6 +62,7 @@ from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_debug import router as agent_debug_router
+from routes.debug_products import router as debug_products_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -151,6 +152,7 @@ app.include_router(emp_agent_mgmt_router)  # Employee agent management
 app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
+app.include_router(debug_products_router)  # Debug products endpoints
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
