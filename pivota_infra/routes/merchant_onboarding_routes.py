@@ -570,6 +570,24 @@ async def list_all_onboardings(
         # Get product counts and sync info for all merchants
         merchant_list = []
         for m in merchants:
+            # Derive PSP status from merchant_psps as fallback (ensures dashboard reflects connections)
+            psp_row = None
+            try:
+                psp_row = await database.fetch_one(
+                    """
+                    SELECT provider
+                    FROM merchant_psps
+                    WHERE merchant_id = :merchant_id AND status = 'active'
+                    ORDER BY connected_at DESC
+                    LIMIT 1
+                    """,
+                    {"merchant_id": m["merchant_id"]}
+                )
+            except Exception:
+                psp_row = None
+
+            psp_connected = m.get("psp_connected", False) or bool(psp_row)
+            psp_type = m.get("psp_type") or (psp_row["provider"] if psp_row else None)
             # Get product count and last sync time from cache
             product_info = await database.fetch_one(
                 """SELECT 
@@ -595,8 +613,8 @@ async def list_all_onboardings(
                 "auto_approved": m.get("auto_approved", False),
                 "approval_confidence": m.get("approval_confidence"),
                 "full_kyb_deadline": m.get("full_kyb_deadline").isoformat() if m.get("full_kyb_deadline") else None,
-                "psp_connected": m.get("psp_connected", False),
-                "psp_type": m.get("psp_type"),
+                "psp_connected": psp_connected,
+                "psp_type": psp_type,
                 "mcp_connected": m.get("mcp_connected", False),
                 "mcp_platform": m.get("mcp_platform"),
                 "product_count": product_count,
