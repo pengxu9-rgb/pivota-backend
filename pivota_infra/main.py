@@ -11,6 +11,7 @@ import uvicorn
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
+from middleware.structured_logging import StructuredLoggingMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
@@ -119,6 +120,9 @@ app.add_middleware(
 
 # Add rate limiting middleware for agent API
 app.add_middleware(RateLimitMiddleware, requests_per_minute=1000)
+
+# Add structured logging middleware (logs all requests in JSON format)
+app.add_middleware(StructuredLoggingMiddleware)
 
 # Include available routers
 app.include_router(agent_router)
@@ -247,6 +251,13 @@ async def get_version():
 async def startup():
     """Initialize services on startup"""
     logger.info("🚀 Starting Pivota Infrastructure Dashboard...")
+    
+    # Initialize Sentry error tracking (optional)
+    try:
+        from config.sentry_config import init_sentry
+        init_sentry()
+    except Exception as e:
+        logger.warning(f"⚠️ Sentry initialization skipped: {e}")
     
     # 初始化 R2 存储 - 功能推迟实现
     # try:
@@ -726,5 +737,5 @@ async def config_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-# Deploy trigger: 1761041007
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
+
