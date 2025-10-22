@@ -130,6 +130,45 @@ async def fix_orders_table_columns():
             else:
                 logger.warning(f"Could not add shipping_fee: {e}")
         
+        # agent_session_id column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN agent_session_id VARCHAR(100)
+            """))
+            fixes_applied.append("Added agent_session_id column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("agent_session_id column already exists")
+            else:
+                logger.warning(f"Could not add agent_session_id: {e}")
+        
+        # is_deleted column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE
+            """))
+            fixes_applied.append("Added is_deleted column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("is_deleted column already exists")
+            else:
+                logger.warning(f"Could not add is_deleted: {e}")
+        
+        # metadata column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN metadata JSONB
+            """))
+            fixes_applied.append("Added metadata column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("metadata column already exists")
+            else:
+                logger.warning(f"Could not add metadata: {e}")
+        
         # Verify columns exist
         columns = await database.fetch_all(text("""
             SELECT column_name 
