@@ -649,12 +649,13 @@ async def list_all_onboardings(
         }
     except Exception as e:
         print(f"❌ Error listing merchant onboardings: {e}")
+        print(f"❌ Error type: {type(e).__name__}")
         import traceback
         traceback.print_exc()
-        # Return error details for debugging
+        # Return detailed error for debugging
         raise HTTPException(
             status_code=500, 
-            detail=f"Failed to list merchants: {str(e)}"
+            detail=f"Failed to list merchants: {type(e).__name__}: {str(e)}"
         )
 
 @router.post("/approve/{merchant_id}", response_model=Dict[str, Any])
