@@ -50,14 +50,64 @@ async def connect_shopify_store(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Check if merchant exists
+        # Check if merchant exists and is in valid status
         merchant_check = await database.fetch_one(
-            "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+            "SELECT merchant_id, status FROM merchant_onboarding WHERE merchant_id = :merchant_id",
             {"merchant_id": request.merchant_id}
         )
         
         if not merchant_check:
             raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        # Don't allow connecting stores for rejected/deleted merchants
+        if merchant_check["status"] in ["rejected", "deleted"]:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Cannot connect store for {merchant_check['status']} merchant. Please approve merchant first."
+            )
+        
+        # Validate shop domain format
+        if not request.shop_domain or not request.shop_domain.strip():
+            raise HTTPException(status_code=400, detail="Shop domain is required")
+        
+        # Validate access token
+        if not request.access_token or not request.access_token.strip():
+            raise HTTPException(status_code=400, detail="Access token is required")
+        
+        # Test Shopify API connection
+        import httpx
+        test_url = f"https://{request.shop_domain}/admin/api/2024-07/shop.json"
+        headers = {"X-Shopify-Access-Token": request.access_token}
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                test_response = await client.get(test_url, headers=headers)
+            
+            if test_response.status_code != 200:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Invalid Shopify credentials. API returned: {test_response.status_code}"
+                )
+            
+            # Verify shop data
+            shop_data = test_response.json()
+            if not shop_data.get("shop"):
+                raise HTTPException(status_code=400, detail="Invalid Shopify response - no shop data")
+            
+            logger.info(f"✅ Shopify credentials verified for {request.shop_domain}")
+            
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Cannot connect to Shopify. Please check shop domain: {str(e)}"
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to verify Shopify credentials: {str(e)}"
+            )
         
         # Check if store already exists
         existing = await database.fetch_one(
