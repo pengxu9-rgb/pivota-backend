@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Railway API Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #0f0; }
+        button { margin: 10px 0; padding: 10px; cursor: pointer; }
+        #output { white-space: pre-wrap; background: #000; padding: 10px; border: 1px solid #0f0; }
+    </style>
+</head>
+<body>
+    <h2>Railway API Test</h2>
+    
+    <button onclick="testHealth()">Test Health</button>
+    <button onclick="testProductsCache()">Check Products Cache</button>
+    <button onclick="testAgentAPI()">Test Agent API</button>
+    
+    <div id="output"></div>
+    
+    <script>
+        const API_URL = 'https://web-production-fedb.up.railway.app';
+        const output = document.getElementById('output');
+        
+        async function testHealth() {
+            try {
+                output.textContent = 'Testing health...';
+                const res = await fetch(`${API_URL}/health`);
+                const data = await res.json();
+                output.textContent = JSON.stringify(data, null, 2);
+            } catch (e) {
+                output.textContent = 'Error: ' + e.message;
+            }
+        }
+        
+        async function testProductsCache() {
+            try {
+                output.textContent = 'Checking products cache...';
+                const res = await fetch(`${API_URL}/test/check-products-cache`);
+                const data = await res.json();
+                output.textContent = JSON.stringify(data, null, 2);
+            } catch (e) {
+                output.textContent = 'Error: ' + e.message;
+            }
+        }
+        
+        async function testAgentAPI() {
+            try {
+                output.textContent = 'Testing Agent API...';
+                const res = await fetch(`${API_URL}/agent/v1/health`);
+                const data = await res.json();
+                output.textContent = JSON.stringify(data, null, 2);
+            } catch (e) {
+                output.textContent = 'Error: ' + e.message;
+            }
+        }
+    </script>
+</body>
+</html>
+
