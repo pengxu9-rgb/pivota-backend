@@ -131,23 +131,30 @@ async def list_merchants(
         else:
             db_status = status
         
-        # Query only existing columns
+        # Query merchants and derive PSP status from merchant_psps as fallback
         query = """
             SELECT 
-                merchant_id, 
-                business_name, 
-                status,
-                store_url,
-                website,
-                region,
-                contact_email,
-                psp_connected,
-                psp_type,
-                created_at
-            FROM merchant_onboarding
-            WHERE status = :status
-            AND status != 'deleted'
-            ORDER BY business_name
+                mo.merchant_id, 
+                mo.business_name, 
+                mo.status,
+                mo.store_url,
+                mo.website,
+                mo.region,
+                mo.contact_email,
+                COALESCE(mo.psp_connected, CASE WHEN EXISTS (
+                    SELECT 1 FROM merchant_psps mp 
+                    WHERE mp.merchant_id = mo.merchant_id AND mp.status = 'active'
+                ) THEN true ELSE false END) AS psp_connected,
+                COALESCE(mo.psp_type, (
+                    SELECT mp.provider FROM merchant_psps mp 
+                    WHERE mp.merchant_id = mo.merchant_id AND mp.status = 'active'
+                    ORDER BY mp.connected_at DESC LIMIT 1
+                )) AS psp_type,
+                mo.created_at
+            FROM merchant_onboarding mo
+            WHERE mo.status = :status
+            AND mo.status != 'deleted'
+            ORDER BY mo.business_name
             LIMIT :limit OFFSET :offset
         """
         
@@ -226,7 +233,8 @@ async def search_products(
             if not merchant_check:
                 raise HTTPException(status_code=404, detail="Merchant not found")
             
-            where_clauses.append("merchant_id = :merchant_id")
+            # Qualify to avoid ambiguity between products_cache p and merchant_onboarding m
+            where_clauses.append("p.merchant_id = :merchant_id")
             params["merchant_id"] = merchant_id
         
         if query:

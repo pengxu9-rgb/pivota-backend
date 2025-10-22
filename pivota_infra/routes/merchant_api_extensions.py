@@ -234,6 +234,22 @@ async def connect_psp(
             verify_query = "SELECT COUNT(*) as count FROM merchant_psps WHERE merchant_id = :merchant_id"
             result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
             print(f"✅ Total PSPs for merchant {merchant_id} (in transaction): {result['count']}")
+
+            # Also set flags on merchant_onboarding for dashboard compatibility
+            await database.execute(
+                """
+                UPDATE merchant_onboarding
+                SET psp_connected = true,
+                    psp_type = :psp_type,
+                    updated_at = :updated_at
+                WHERE merchant_id = :merchant_id
+                """,
+                {
+                    "psp_type": provider,
+                    "updated_at": datetime.now(),
+                    "merchant_id": merchant_id,
+                }
+            )
     except Exception as e:
         print(f"❌ PSP Database save error: {e}")
         import traceback
