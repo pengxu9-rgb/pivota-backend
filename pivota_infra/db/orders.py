@@ -106,6 +106,21 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS client_secret VARCHAR(500);
                 """))
+            if "column \"subtotal\" of relation \"orders\" does not exist" in err or "subtotal" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS subtotal NUMERIC(10,2);
+                """))
+            if "column \"tax\" of relation \"orders\" does not exist" in err or "tax" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS tax NUMERIC(10,2);
+                """))
+            if "column \"total\" of relation \"orders\" does not exist" in err or "total" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS total NUMERIC(10,2);
+                """))
             # Retry the insert once after migration
             await database.execute(query)
             return order_id
