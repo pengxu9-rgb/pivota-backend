@@ -151,33 +151,34 @@ async def create_new_order(
     - 支付信息与订单解耦，失败不影响订单创建
     """
     
-    # 1. 验证商户
-    merchant = await get_merchant_onboarding(order_request.merchant_id)
-    if not merchant:
-        raise HTTPException(status_code=404, detail="Merchant not found")
-    
-    if not merchant.get("psp_connected"):
-        # Fallback: derive PSP from merchant_psps table to avoid stale flags
-        try:
-            psp_row = await database.fetch_one(
-                """
-                SELECT provider FROM merchant_psps
-                WHERE merchant_id = :merchant_id
-                ORDER BY connected_at DESC
-                LIMIT 1
-                """,
-                {"merchant_id": order_request.merchant_id}
-            )
-        except Exception:
-            psp_row = None
-        if psp_row:
-            merchant["psp_connected"] = True
-            merchant["psp_type"] = psp_row["provider"]
-        else:
-            raise HTTPException(
-                status_code=400, 
-                detail="Merchant has not connected PSP. Cannot process payments."
-            )
+    try:
+        # 1. 验证商户
+        merchant = await get_merchant_onboarding(order_request.merchant_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        if not merchant.get("psp_connected"):
+            # Fallback: derive PSP from merchant_psps table to avoid stale flags
+            try:
+                psp_row = await database.fetch_one(
+                    """
+                    SELECT provider FROM merchant_psps
+                    WHERE merchant_id = :merchant_id
+                    ORDER BY connected_at DESC
+                    LIMIT 1
+                    """,
+                    {"merchant_id": order_request.merchant_id}
+                )
+            except Exception:
+                psp_row = None
+            if psp_row:
+                merchant["psp_connected"] = True
+                merchant["psp_type"] = psp_row["provider"]
+            else:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Merchant has not connected PSP. Cannot process payments."
+                )
     
     # 2. 检查库存（如果商户连接了 Shopify）
     has_inventory, inventory_info = await check_inventory_availability(
@@ -216,7 +217,7 @@ async def create_new_order(
         "metadata": order_request.metadata or {}
     }
     
-    order_id = await create_order(order_data)
+        order_id = await create_order(order_data)
     
     # 5. 创建 Payment Intent（后台任务，不阻塞）
     async def create_payment_intent_task():
@@ -308,27 +309,32 @@ async def create_new_order(
                 metadata={"error": str(e)}
             )
     
-    background_tasks.add_task(create_payment_intent_task)
+        background_tasks.add_task(create_payment_intent_task)
     
     # 6. 返回订单信息
     # Note: Order was just created, construct response from known data
     # This avoids potential race conditions with database transactions
-    return OrderResponse(
-        order_id=order_id,
-        merchant_id=order_request.merchant_id,
-        customer_email=order_request.customer_email,
-        items=order_request.items,
-        shipping_address=order_request.shipping_address,
-        subtotal=float(subtotal),
-        shipping_fee=float(shipping_fee),
-        tax=float(tax),
-        total=float(total),
-        currency=order_request.currency,
-        status="pending",
-        payment_status="pending",
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
-    )
+        return OrderResponse(
+            order_id=order_id,
+            merchant_id=order_request.merchant_id,
+            customer_email=order_request.customer_email,
+            items=order_request.items,
+            shipping_address=order_request.shipping_address,
+            subtotal=float(subtotal),
+            shipping_fee=float(shipping_fee),
+            tax=float(tax),
+            total=float(total),
+            currency=order_request.currency,
+            status="pending",
+            payment_status="pending",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Order creation internal error: {e}")
+        raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
 
 
 # ============================================================================
