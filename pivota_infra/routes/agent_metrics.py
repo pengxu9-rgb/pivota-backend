@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
 from db.database import database
-from middleware.auth import require_admin
+from utils.auth import require_admin
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
 
