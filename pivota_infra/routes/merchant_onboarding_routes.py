@@ -563,73 +563,66 @@ async def list_all_onboardings(
 ):
     """
     Admin: List all merchant onboardings (filtered by status if provided)
-    OPTIMIZED: Single query with JOINs to avoid N+1 problem
+    SAFE VERSION: Revert to working code temporarily
     """
     try:
-        # Build single optimized query with LEFT JOINs
-        where_clauses = []
-        params = {}
+        # Use original function to get merchants
+        merchants = await get_all_merchant_onboardings(status, include_deleted=include_deleted)
         
-        if status:
-            where_clauses.append("mo.status = :status")
-            params["status"] = status
+        # Get PSP and product stats in batch (2 queries total instead of 2N)
+        merchant_ids = [m["merchant_id"] for m in merchants]
         
-        if not include_deleted:
-            where_clauses.append("mo.status != 'deleted'")
-        
-        where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
-        
-        # Optimized query using CTEs (compatible with older PostgreSQL versions)
-        query = f"""
-            WITH psp_latest AS (
+        # Batch query 1: Get all PSPs
+        psp_map = {}
+        if merchant_ids:
+            psp_query = """
                 SELECT DISTINCT ON (merchant_id) 
-                    merchant_id, 
-                    provider
+                    merchant_id, provider
                 FROM merchant_psps
-                WHERE status = 'active'
+                WHERE merchant_id = ANY(:merchant_ids) AND status = 'active'
                 ORDER BY merchant_id, connected_at DESC
-            ),
-            product_stats AS (
+            """
+            psp_rows = await database.fetch_all(psp_query, {"merchant_ids": merchant_ids})
+            psp_map = {row["merchant_id"]: row["provider"] for row in psp_rows}
+        
+        # Batch query 2: Get all product stats
+        product_map = {}
+        if merchant_ids:
+            product_query = """
                 SELECT 
                     merchant_id,
                     COUNT(*) as product_count,
                     MAX(cached_at) as last_synced,
                     COUNT(CASE WHEN expires_at < NOW() THEN 1 END) as expired_count
                 FROM products_cache
+                WHERE merchant_id = ANY(:merchant_ids)
                 GROUP BY merchant_id
-            )
-            SELECT 
-                mo.merchant_id,
-                mo.business_name,
-                mo.store_url,
-                mo.region,
-                mo.contact_email,
-                mo.status,
-                mo.auto_approved,
-                mo.approval_confidence,
-                mo.full_kyb_deadline,
-                mo.mcp_connected,
-                mo.mcp_platform,
-                mo.created_at,
-                COALESCE(mo.psp_connected, CASE WHEN psp.provider IS NOT NULL THEN true ELSE false END) as psp_connected,
-                COALESCE(mo.psp_type, psp.provider) as psp_type,
-                COALESCE(pc.product_count, 0) as product_count,
-                pc.last_synced,
-                COALESCE(pc.expired_count, 0) as expired_count
-            FROM merchant_onboarding mo
-            LEFT JOIN psp_latest psp ON mo.merchant_id = psp.merchant_id
-            LEFT JOIN product_stats pc ON mo.merchant_id = pc.merchant_id
-            WHERE {where_clause}
-            ORDER BY mo.business_name
-        """
+            """
+            product_rows = await database.fetch_all(product_query, {"merchant_ids": merchant_ids})
+            product_map = {row["merchant_id"]: row for row in product_rows}
         
-        merchants = await database.fetch_all(query, params)
-        
-        # Transform results
+        # Build result
         merchant_list = []
         for m in merchants:
+            mid = m["merchant_id"]
+            psp_provider = psp_map.get(mid)
+            product_info = product_map.get(mid)
+            
+            # Safely extract product info
+            product_count = 0
+            last_synced = None
+            expired_count = 0
+            products_expired = False
+            
+            if product_info:
+                product_count = product_info.get("product_count", 0)
+                last_synced_raw = product_info.get("last_synced")
+                last_synced = last_synced_raw.isoformat() if last_synced_raw else None
+                expired_count = product_info.get("expired_count", 0)
+                products_expired = expired_count > 0
+            
             merchant_list.append({
-                "merchant_id": m["merchant_id"],
+                "merchant_id": mid,
                 "business_name": m["business_name"],
                 "store_url": m.get("store_url") or "N/A",
                 "region": m.get("region") or "Unknown",
@@ -638,14 +631,14 @@ async def list_all_onboardings(
                 "auto_approved": m.get("auto_approved", False),
                 "approval_confidence": m.get("approval_confidence"),
                 "full_kyb_deadline": m.get("full_kyb_deadline").isoformat() if m.get("full_kyb_deadline") else None,
-                "psp_connected": m.get("psp_connected", False),
-                "psp_type": m.get("psp_type"),
+                "psp_connected": m.get("psp_connected", False) or bool(psp_provider),
+                "psp_type": m.get("psp_type") or psp_provider,
                 "mcp_connected": m.get("mcp_connected", False),
                 "mcp_platform": m.get("mcp_platform"),
-                "product_count": m.get("product_count", 0),
-                "last_synced": m["last_synced"].isoformat() if m.get("last_synced") else None,
-                "products_expired": m.get("expired_count", 0) > 0,
-                "expired_count": m.get("expired_count", 0),
+                "product_count": product_count,
+                "last_synced": last_synced,
+                "products_expired": products_expired,
+                "expired_count": expired_count,
                 "created_at": m["created_at"].isoformat() if m["created_at"] else None,
             })
         
