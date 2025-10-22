@@ -52,6 +52,71 @@ async def fix_orders_table_columns():
             else:
                 logger.warning(f"Could not add client_secret: {e}")
         
+        # subtotal column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN subtotal NUMERIC(10,2)
+            """))
+            fixes_applied.append("Added subtotal column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("subtotal column already exists")
+            else:
+                logger.warning(f"Could not add subtotal: {e}")
+        
+        # tax column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN tax NUMERIC(10,2)
+            """))
+            fixes_applied.append("Added tax column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("tax column already exists")
+            else:
+                logger.warning(f"Could not add tax: {e}")
+        
+        # total column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN total NUMERIC(10,2)
+            """))
+            fixes_applied.append("Added total column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("total column already exists")
+            else:
+                logger.warning(f"Could not add total: {e}")
+        
+        # payment_status column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN payment_status VARCHAR(50)
+            """))
+            fixes_applied.append("Added payment_status column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("payment_status column already exists")
+            else:
+                logger.warning(f"Could not add payment_status: {e}")
+        
+        # agent_id column
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders 
+                ADD COLUMN agent_id VARCHAR(50)
+            """))
+            fixes_applied.append("Added agent_id column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                fixes_applied.append("agent_id column already exists")
+            else:
+                logger.warning(f"Could not add agent_id: {e}")
+        
         # Verify columns exist
         columns = await database.fetch_all(text("""
             SELECT column_name 
@@ -68,7 +133,12 @@ async def fix_orders_table_columns():
             "current_columns": column_names,
             "has_shipping_address": "shipping_address" in column_names,
             "has_items": "items" in column_names,
-            "has_client_secret": "client_secret" in column_names
+            "has_client_secret": "client_secret" in column_names,
+            "has_subtotal": "subtotal" in column_names,
+            "has_tax": "tax" in column_names,
+            "has_total": "total" in column_names,
+            "has_payment_status": "payment_status" in column_names,
+            "has_agent_id": "agent_id" in column_names
         }
         
     except Exception as e:
