@@ -189,14 +189,31 @@ async def connect_wix_store(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Check if merchant exists
+        # Check if merchant exists and is in valid status
         merchant_check = await database.fetch_one(
-            "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+            "SELECT merchant_id, status FROM merchant_onboarding WHERE merchant_id = :merchant_id",
             {"merchant_id": request.merchant_id}
         )
         
         if not merchant_check:
             raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        # Don't allow connecting stores for rejected/deleted merchants
+        if merchant_check["status"] in ["rejected", "deleted"]:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Cannot connect store for {merchant_check['status']} merchant. Please approve merchant first."
+            )
+        
+        # Validate inputs
+        if not request.site_id or not request.site_id.strip():
+            raise HTTPException(status_code=400, detail="Wix Site ID is required")
+        
+        if not request.api_key or not request.api_key.strip():
+            raise HTTPException(status_code=400, detail="Wix API Key is required")
+        
+        logger.info(f"✅ Wix credentials validated for site {request.site_id}")
+        # Note: Wix API validation can be added here when we have Wix integration
         
         # Check if store already exists
         existing = await database.fetch_one(
