@@ -85,35 +85,37 @@ async def get_all_psp_metrics(current_user: dict = Depends(get_current_user)):
     merchant_id = current_user.get("merchant_id", "merch_6b90dc9838d5fd9c")
     
     try:
-        # OPTIMIZED: Get PSPs and their metrics in fewer queries
+        # Get all PSPs
         psps_query = "SELECT psp_id, provider FROM merchant_psps WHERE merchant_id = :merchant_id"
         psps = await database.fetch_all(psps_query, {"merchant_id": merchant_id})
         
-        # Get order stats once for all PSPs (PSP-specific tracking not implemented yet)
-        today = datetime.now().date()
-        orders_query = """
-            SELECT COUNT(*) as count, 
-                   SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as completed
-            FROM orders 
-            WHERE merchant_id = :merchant_id 
-            AND created_at >= :today
-        """
-        orders_stat = await database.fetch_one(orders_query, {
-            "merchant_id": merchant_id,
-            "today": str(today)
-        })
-        
-        total_orders = orders_stat["count"] if orders_stat else 0
-        completed_orders = orders_stat["completed"] if orders_stat else 0
-        success_rate = (completed_orders / total_orders * 100) if total_orders > 0 else 98.5
-        
-        # Build metrics for each PSP (currently all PSPs share the same stats)
         metrics = {}
         for psp in psps:
-            metrics[psp["psp_id"]] = {
-                "provider": psp["provider"],
+            psp_id = psp["psp_id"]
+            provider = psp["provider"]
+            
+            # Per-PSP orders stats (simple and stable)
+            today = datetime.now().date()
+            orders_query = """
+                SELECT COUNT(*) as count, 
+                       SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as completed
+                FROM orders 
+                WHERE merchant_id = :merchant_id 
+                AND created_at >= :today
+            """
+            orders_stat = await database.fetch_one(orders_query, {
+                "merchant_id": merchant_id,
+                "today": str(today)
+            })
+            
+            total_orders = orders_stat["count"] if orders_stat else 0
+            completed_orders = orders_stat["completed"] if orders_stat else 0
+            success_rate = (completed_orders / total_orders * 100) if total_orders > 0 else 98.5
+            
+            metrics[psp_id] = {
+                "provider": provider,
                 "success_rate": round(success_rate, 1),
-                "volume_today": 0,  # Would need transaction tracking
+                "volume_today": 0,
                 "transaction_count": total_orders
             }
         
