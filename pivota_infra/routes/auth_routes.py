@@ -224,6 +224,39 @@ async def signin(login_data: UserLogin):
         if acct["role"] == "merchant" and "merchant_id" in acct:
             token_payload["merchant_id"] = acct["merchant_id"]
         
+        # For agent accounts, ensure agent record exists in agents table
+        if acct["role"] == "agent":
+            try:
+                # Check if agent exists
+                existing_agent = await database.fetch_one(
+                    "SELECT agent_id FROM agents WHERE email = :email",
+                    {"email": login_data.email}
+                )
+                
+                if not existing_agent:
+                    # Create agent record with initial API key
+                    import secrets
+                    api_key = f"pk_live_{secrets.token_urlsafe(32)[:32]}"
+                    await database.execute(
+                        """
+                        INSERT INTO agents (agent_id, name, email, company, api_key, status)
+                        VALUES (:agent_id, :name, :email, :company, :api_key, :status)
+                        ON CONFLICT (email) DO NOTHING
+                        """,
+                        {
+                            "agent_id": login_data.email,
+                            "name": login_data.email.split('@')[0].title() + " Agent",
+                            "email": login_data.email,
+                            "company": "Agent Company",
+                            "api_key": api_key,
+                            "status": "active"
+                        }
+                    )
+                    print(f"✅ Auto-created agent record for {login_data.email}")
+            except Exception as e:
+                # Don't fail login if agent creation fails
+                print(f"⚠️ Could not create agent record: {e}")
+        
         token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
         
         user_data = {
