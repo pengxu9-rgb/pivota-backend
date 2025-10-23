@@ -19,42 +19,8 @@ async def create_test_agent_account():
         email = "testuser@pivota.cc"
         password = "Test123!"
         
-        # Hash password
-        hashed_pw = hash_password(password)
-        
         # Generate API key
         api_key = f"pk_live_{secrets.token_urlsafe(32)[:32]}"
-        
-        # Check if user already exists in users table
-        existing_user = await database.fetch_one(
-            "SELECT email FROM users WHERE email = :email",
-            {"email": email}
-        )
-        
-        if existing_user:
-            # Update password
-            await database.execute(
-                """
-                UPDATE users 
-                SET password = :password
-                WHERE email = :email
-                """,
-                {"password": hashed_pw, "email": email}
-            )
-        else:
-            # Create user
-            await database.execute(
-                """
-                INSERT INTO users (email, password, role, name)
-                VALUES (:email, :password, :role, :name)
-                """,
-                {
-                    "email": email,
-                    "password": hashed_pw,
-                    "role": "agent",
-                    "name": "Test Agent User"
-                }
-            )
         
         # Check if agent exists in agents table
         existing_agent = await database.fetch_one(
@@ -98,17 +64,16 @@ async def create_test_agent_account():
         
         return {
             "status": "success",
-            "message": "Test agent account created/updated",
+            "message": "Test agent created in agents table (for API key display)",
             "credentials": {
                 "email": email,
-                "password": password,
-                "login_url": "https://agents.pivota.cc/login"
+                "note": "Use agent@test.com / Agent123! to login (auth is separate)"
             },
             "agent_details": {
                 "agent_id": agent_id,
                 "api_key": api_key
             },
-            "note": "Please login with these credentials and check API keys"
+            "instructions": "Login as agent@test.com, then check Manage API Keys"
         }
         
     except Exception as e:
