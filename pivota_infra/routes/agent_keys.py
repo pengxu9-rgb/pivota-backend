@@ -79,9 +79,10 @@ async def get_agent_api_keys(
                 """
                 SELECT api_key, name, created_at 
                 FROM agents 
-                WHERE agent_id = :agent_id
+                WHERE agent_id = :agent_or_email OR email = :agent_or_email
+                LIMIT 1
                 """,
-                {"agent_id": agent_id}
+                {"agent_or_email": agent_id}
             )
             if legacy and legacy["api_key"]:
                 masked = f"{legacy['api_key'][:10]}****"
