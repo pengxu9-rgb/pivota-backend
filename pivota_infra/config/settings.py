@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     # PostgreSQL only - no SQLite fallback
     database_url: str = os.getenv("DATABASE_URL", "")
     
+    # Redis (optional, for shared rate limiting)
+    redis_url: Optional[str] = os.getenv("REDIS_URL")
+    
     # API Keys
     stripe_secret_key: Optional[str] = os.getenv("STRIPE_SECRET_KEY")
     stripe_webhook_secret: Optional[str] = os.getenv("STRIPE_WEBHOOK_SECRET")

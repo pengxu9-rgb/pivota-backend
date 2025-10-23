@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import time
 import asyncio
 from collections import defaultdict
+from utils.redis_client import get_redis_client
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
@@ -30,6 +31,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.request_store: Dict[str, List[float]] = defaultdict(list)
         # Lock for thread safety
         self.lock = asyncio.Lock()
+        # Optional Redis client for shared rate limiting
+        self.redis = get_redis_client()
     
     async def dispatch(self, request: Request, call_next):
         # Only apply to agent API endpoints
@@ -52,51 +55,76 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not api_key:
             return await call_next(request)
         
-        # Check rate limit
-        async with self.lock:
-            now = time.time()
-            
-            # Clean old requests
-            self.request_store[api_key] = [
-                ts for ts in self.request_store[api_key]
-                if now - ts < self.window_seconds
-            ]
-            
-            # Check if over limit
-            request_count = len(self.request_store[api_key])
-            
-            if request_count >= self.requests_per_minute:
-                # Calculate when oldest request expires
-                oldest_request = min(self.request_store[api_key])
-                reset_in = int(self.window_seconds - (now - oldest_request))
-                
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "error": "rate_limit_exceeded",
-                        "message": f"Rate limit of {self.requests_per_minute} requests per minute exceeded",
-                        "retry_after": reset_in
-                    },
-                    headers={
-                        "X-RateLimit-Limit": str(self.requests_per_minute),
-                        "X-RateLimit-Remaining": "0",
-                        "X-RateLimit-Reset": str(int(now + reset_in)),
-                        "Retry-After": str(reset_in)
-                    }
-                )
-            
-            # Add current request
-            self.request_store[api_key].append(now)
-            remaining = self.requests_per_minute - request_count - 1
+        now = time.time()
+        reset_at = int((int(now // 60) + 1) * 60)
+
+        # Prefer Redis if available for shared limits across instances
+        if self.redis is not None:
+            minute_bucket = int(now // 60)
+            key = f"rate_limit:{api_key}:{minute_bucket}"
+            try:
+                current = await self.redis.incr(key)
+                # Ensure TTL is set; subsequent calls keep it
+                await self.redis.expire(key, self.window_seconds)
+                if current > self.requests_per_minute:
+                    reset_in = max(0, int(reset_at - now))
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "error": "rate_limit_exceeded",
+                            "message": f"Rate limit of {self.requests_per_minute} requests per minute exceeded",
+                            "retry_after": reset_in
+                        },
+                        headers={
+                            "X-RateLimit-Limit": str(self.requests_per_minute),
+                            "X-RateLimit-Remaining": "0",
+                            "X-RateLimit-Reset": str(reset_at),
+                            "Retry-After": str(reset_in)
+                        }
+                    )
+                remaining = max(0, self.requests_per_minute - int(current))
+            except Exception:
+                # On Redis error, gracefully fall back to in-memory
+                self.redis = None
+                remaining = None  # will be set in fallback branch
         
+        if self.redis is None:
+            # In-memory fallback
+            async with self.lock:
+                # Clean old requests
+                self.request_store[api_key] = [
+                    ts for ts in self.request_store[api_key]
+                    if now - ts < self.window_seconds
+                ]
+                request_count = len(self.request_store[api_key])
+                if request_count >= self.requests_per_minute:
+                    oldest_request = min(self.request_store[api_key]) if self.request_store[api_key] else now
+                    reset_in = int(self.window_seconds - (now - oldest_request))
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "error": "rate_limit_exceeded",
+                            "message": f"Rate limit of {self.requests_per_minute} requests per minute exceeded",
+                            "retry_after": max(0, reset_in)
+                        },
+                        headers={
+                            "X-RateLimit-Limit": str(self.requests_per_minute),
+                            "X-RateLimit-Remaining": "0",
+                            "X-RateLimit-Reset": str(int(now + max(0, reset_in))),
+                            "Retry-After": str(max(0, reset_in))
+                        }
+                    )
+                self.request_store[api_key].append(now)
+                remaining = self.requests_per_minute - request_count - 1
+
         # Process request
         response = await call_next(request)
-        
+
         # Add rate limit headers
         response.headers["X-RateLimit-Limit"] = str(self.requests_per_minute)
         response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
-        response.headers["X-RateLimit-Reset"] = str(int(now + self.window_seconds))
-        
+        response.headers["X-RateLimit-Reset"] = str(reset_at)
+
         return response
 
 class AdvancedRateLimiter:
@@ -161,3 +189,4 @@ class AdvancedRateLimiter:
         }
         
         return allowed, metadata
+
