@@ -80,6 +80,7 @@ from routes.refund_api import router as refund_api_router
 from routes.agent_docs import router as agent_docs_router
 from routes.fix_orders_table import router as fix_orders_table_router
 from routes.agent_metrics import router as agent_metrics_router
+from routes.agent_keys import router as agent_keys_router
 
 # Service routers (only include what exists)
 try:
@@ -177,6 +178,7 @@ app.include_router(refund_api_router)  # Refund processing
 app.include_router(agent_docs_router)  # Agent developer docs
 app.include_router(fix_orders_table_router)  # Fix orders table structure
 app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
+app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
 app.include_router(dashboard_router)  # Dashboard API
@@ -278,7 +280,7 @@ async def startup():
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -680,8 +682,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
