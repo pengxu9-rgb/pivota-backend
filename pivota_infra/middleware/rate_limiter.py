@@ -11,6 +11,7 @@ import time
 import asyncio
 from collections import defaultdict
 from utils.redis_client import get_redis_client
+from config.settings import settings
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
@@ -25,8 +26,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     
     def __init__(self, app, requests_per_minute: int = 100):
         super().__init__(app)
-        self.requests_per_minute = requests_per_minute
-        self.window_seconds = 60
+        # Prefer env-driven config but allow explicit override for tests
+        self.requests_per_minute = settings.rate_limit_rpm if requests_per_minute == 100 else requests_per_minute
+        self.window_seconds = settings.rate_limit_window_seconds
         # Store: api_key -> list of request timestamps
         self.request_store: Dict[str, List[float]] = defaultdict(list)
         # Lock for thread safety

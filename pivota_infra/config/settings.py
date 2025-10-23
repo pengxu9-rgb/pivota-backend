@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     
     # Redis (optional, for shared rate limiting)
     redis_url: Optional[str] = os.getenv("REDIS_URL")
+
+    # Rate limiting
+    rate_limit_rpm: int = int(os.getenv("RATE_LIMIT_RPM", "1000"))
+    rate_limit_window_seconds: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
     
     # API Keys
     stripe_secret_key: Optional[str] = os.getenv("STRIPE_SECRET_KEY")
