@@ -108,6 +108,7 @@ except ImportError:
 
 # Utils
 from utils.logger import logger
+from config.settings import settings
 
 app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
 
@@ -121,8 +122,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add rate limiting middleware for agent API
-app.add_middleware(RateLimitMiddleware, requests_per_minute=1000)
+# Add rate limiting middleware for agent API (env-configurable)
+app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_rpm)
 
 # Add structured logging middleware (logs all requests in JSON format)
 app.add_middleware(StructuredLoggingMiddleware)
