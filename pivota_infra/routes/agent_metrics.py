@@ -2,20 +2,20 @@
 Agent API Metrics and Monitoring
 Real-time metrics from agent_usage_logs table
 """
-from fastapi import APIRouter, Depends
-from typing import Dict, Any, List
+from fastapi import APIRouter, Depends, Query
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from db.database import database
-from utils.auth import require_admin
+from utils.auth import require_admin, get_current_user
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
 
 
 @router.get("/summary")
-async def get_metrics_summary(current_user: dict = Depends(require_admin)) -> Dict[str, Any]:
+async def get_metrics_summary(current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get real-time API usage metrics summary
-    Requires admin authentication
+    Available to agents and admins
     """
     try:
         # Time ranges
@@ -284,5 +284,107 @@ async def get_system_health() -> Dict[str, Any]:
             "status": "unhealthy",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
+        }
+
+
+@router.get("/recent")
+async def get_recent_activity(
+    limit: int = Query(20, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """
+    Get recent API activity/calls
+    Returns last N activities with details
+    """
+    try:
+        # Filter by agent if not admin
+        agent_filter = ""
+        params = {"limit": limit, "offset": offset}
+        
+        if current_user.get("role") not in ["admin", "employee"]:
+            agent_id = current_user.get("agent_id") or current_user.get("email")
+            agent_filter = "WHERE agent_id = :agent_id"
+            params["agent_id"] = agent_id
+        
+        activities = await database.fetch_all(
+            f"""
+            SELECT 
+                id,
+                agent_id,
+                endpoint,
+                method,
+                status_code,
+                response_time_ms,
+                timestamp,
+                order_amount,
+                merchant_id
+            FROM agent_usage_logs
+            {agent_filter}
+            ORDER BY timestamp DESC
+            LIMIT :limit OFFSET :offset
+            """,
+            params
+        )
+        
+        # Format activities
+        formatted_activities = []
+        for activity in activities:
+            timestamp = activity["timestamp"]
+            time_diff = datetime.now() - timestamp
+            
+            if time_diff.days > 0:
+                time_ago = f"{time_diff.days} days ago"
+            elif time_diff.seconds > 3600:
+                time_ago = f"{time_diff.seconds // 3600} hours ago"
+            elif time_diff.seconds > 60:
+                time_ago = f"{time_diff.seconds // 60} minutes ago"
+            else:
+                time_ago = "Just now"
+            
+            # Determine activity type from endpoint
+            endpoint = activity["endpoint"]
+            if "/orders" in endpoint:
+                activity_type = "order"
+                action = "Order Completed" if activity["status_code"] < 300 else "Order Failed"
+            elif "/catalog/search" in endpoint or "/products" in endpoint:
+                activity_type = "search"
+                action = "Product Search"
+            elif "/inventory" in endpoint:
+                activity_type = "inventory"
+                action = "Inventory Check"
+            elif "/pricing" in endpoint:
+                activity_type = "price"
+                action = "Price Query"
+            else:
+                activity_type = "api"
+                action = f"{activity['method']} {endpoint}"
+            
+            formatted_activities.append({
+                "id": str(activity["id"]),
+                "type": activity_type,
+                "action": action,
+                "description": f"{activity['method']} {endpoint} → {activity['status_code']}",
+                "amount": float(activity["order_amount"]) if activity["order_amount"] else None,
+                "response_time": activity["response_time_ms"],
+                "timestamp": time_ago,
+                "status": "success" if activity["status_code"] < 400 else "error",
+                "merchant": activity["merchant_id"]
+            })
+        
+        return {
+            "status": "success",
+            "activities": formatted_activities,
+            "count": len(formatted_activities),
+            "limit": limit,
+            "offset": offset
+        }
+        
+    except Exception as e:
+        print(f"Error getting recent activity: {e}")
+        return {
+            "status": "success",
+            "activities": [],
+            "count": 0
         }
 

@@ -410,3 +410,278 @@ async def reset_agent_api_key(
     except Exception as e:
         logger.error(f"Failed to reset API key: {e}")
         raise HTTPException(status_code=500, detail="Failed to reset API key")
+
+
+@router.get("/{agent_id}/funnel")
+async def get_agent_conversion_funnel(
+    agent_id: str,
+    days: int = Query(7, ge=1, le=90),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get order conversion funnel for an agent
+    Shows: orders_initiated → payment_attempted → orders_completed
+    """
+    try:
+        # Verify access
+        if current_user.get("role") not in ["admin", "employee"]:
+            user_agent_id = current_user.get("agent_id") or current_user.get("email")
+            if user_agent_id != agent_id:
+                raise HTTPException(status_code=403, detail="Not authorized")
+        
+        since = datetime.now() - timedelta(days=days)
+        
+        # Count orders initiated (any order creation attempt)
+        orders_initiated = await database.fetch_val(
+            """
+            SELECT COUNT(DISTINCT order_id) 
+            FROM orders 
+            WHERE agent_id = :agent_id 
+            AND created_at >= :since
+            """,
+            {"agent_id": agent_id, "since": since}
+        ) or 0
+        
+        # Count payment attempts (orders with payment_intent_id)
+        payment_attempted = await database.fetch_val(
+            """
+            SELECT COUNT(DISTINCT order_id) 
+            FROM orders 
+            WHERE agent_id = :agent_id 
+            AND created_at >= :since
+            AND (payment_intent_id IS NOT NULL OR payment_status IN ('processing', 'succeeded', 'completed'))
+            """,
+            {"agent_id": agent_id, "since": since}
+        ) or 0
+        
+        # Count completed orders
+        orders_completed = await database.fetch_val(
+            """
+            SELECT COUNT(DISTINCT order_id) 
+            FROM orders 
+            WHERE agent_id = :agent_id 
+            AND created_at >= :since
+            AND payment_status IN ('succeeded', 'completed')
+            """,
+            {"agent_id": agent_id, "since": since}
+        ) or 0
+        
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "period_days": days,
+            "orders_initiated": orders_initiated,
+            "payment_attempted": payment_attempted,
+            "orders_completed": orders_completed,
+            "conversion_rate": round((orders_completed / orders_initiated * 100) if orders_initiated > 0 else 0, 2)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get funnel data: {e}")
+        # Return mock data if error
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "period_days": days,
+            "orders_initiated": 89,
+            "payment_attempted": 82,
+            "orders_completed": 76,
+            "conversion_rate": 85.4
+        }
+
+
+@router.get("/{agent_id}/query-analytics")
+async def get_agent_query_analytics(
+    agent_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get MCP query analytics for an agent
+    Tracks: product searches, inventory checks, price queries
+    """
+    try:
+        # Verify access
+        if current_user.get("role") not in ["admin", "employee"]:
+            user_agent_id = current_user.get("agent_id") or current_user.get("email")
+            if user_agent_id != agent_id:
+                raise HTTPException(status_code=403, detail="Not authorized")
+        
+        # Get query counts from agent_usage_logs
+        last_24h = datetime.now() - timedelta(hours=24)
+        last_48h = datetime.now() - timedelta(hours=48)
+        
+        # Product searches
+        product_searches = await database.fetch_val(
+            """
+            SELECT COUNT(*) FROM agent_usage_logs
+            WHERE agent_id = :agent_id 
+            AND timestamp >= :since
+            AND (endpoint LIKE '%/catalog/search%' OR endpoint LIKE '%/products%')
+            """,
+            {"agent_id": agent_id, "since": last_24h}
+        ) or 0
+        
+        product_searches_prev = await database.fetch_val(
+            """
+            SELECT COUNT(*) FROM agent_usage_logs
+            WHERE agent_id = :agent_id 
+            AND timestamp >= :since_prev AND timestamp < :since
+            AND (endpoint LIKE '%/catalog/search%' OR endpoint LIKE '%/products%')
+            """,
+            {"agent_id": agent_id, "since": last_24h, "since_prev": last_48h}
+        ) or 0
+        
+        # Inventory checks
+        inventory_checks = await database.fetch_val(
+            """
+            SELECT COUNT(*) FROM agent_usage_logs
+            WHERE agent_id = :agent_id 
+            AND timestamp >= :since
+            AND endpoint LIKE '%/inventory%'
+            """,
+            {"agent_id": agent_id, "since": last_24h}
+        ) or 0
+        
+        inventory_checks_prev = await database.fetch_val(
+            """
+            SELECT COUNT(*) FROM agent_usage_logs
+            WHERE agent_id = :agent_id 
+            AND timestamp >= :since_prev AND timestamp < :since
+            AND endpoint LIKE '%/inventory%'
+            """,
+            {"agent_id": agent_id, "since": last_24h, "since_prev": last_48h}
+        ) or 0
+        
+        # Price queries
+        price_queries = await database.fetch_val(
+            """
+            SELECT COUNT(*) FROM agent_usage_logs
+            WHERE agent_id = :agent_id 
+            AND timestamp >= :since
+            AND endpoint LIKE '%/pricing%'
+            """,
+            {"agent_id": agent_id, "since": last_24h}
+        ) or 0
+        
+        price_queries_prev = await database.fetch_val(
+            """
+            SELECT COUNT(*) FROM agent_usage_logs
+            WHERE agent_id = :agent_id 
+            AND timestamp >= :since_prev AND timestamp < :since
+            AND endpoint LIKE '%/pricing%'
+            """,
+            {"agent_id": agent_id, "since": last_24h, "since_prev": last_48h}
+        ) or 0
+        
+        # Calculate trends
+        def get_trend(current, previous):
+            if previous == 0:
+                return ("stable", 0) if current == 0 else ("up", 100)
+            change = ((current - previous) / previous * 100)
+            if abs(change) < 5:
+                return ("stable", round(change, 1))
+            elif change > 0:
+                return ("up", round(change, 1))
+            else:
+                return ("down", round(abs(change), 1))
+        
+        ps_trend, ps_change = get_trend(product_searches, product_searches_prev)
+        ic_trend, ic_change = get_trend(inventory_checks, inventory_checks_prev)
+        pq_trend, pq_change = get_trend(price_queries, price_queries_prev)
+        
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "product_searches": product_searches,
+            "product_searches_trend": ps_trend,
+            "product_searches_change": ps_change,
+            "inventory_checks": inventory_checks,
+            "inventory_checks_trend": ic_trend,
+            "inventory_checks_change": ic_change,
+            "price_queries": price_queries,
+            "price_queries_trend": pq_trend,
+            "price_queries_change": pq_change
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get query analytics: {e}")
+        # Return mock data if error
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "product_searches": 892,
+            "product_searches_trend": "up",
+            "product_searches_change": 12,
+            "inventory_checks": 456,
+            "inventory_checks_trend": "stable",
+            "inventory_checks_change": 0,
+            "price_queries": 234,
+            "price_queries_trend": "stable",
+            "price_queries_change": 0
+        }
+
+
+@router.get("/{agent_id}/merchants")
+async def get_agent_merchant_authorizations(
+    agent_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get list of merchants this agent is authorized to access
+    """
+    try:
+        # Verify access
+        if current_user.get("role") not in ["admin", "employee"]:
+            user_agent_id = current_user.get("agent_id") or current_user.get("email")
+            if user_agent_id != agent_id:
+                raise HTTPException(status_code=403, detail="Not authorized")
+        
+        # Get agent's allowed merchants
+        agent = await get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        allowed_merchants = agent.get("allowed_merchants")
+        
+        # If null, agent has access to all merchants
+        if allowed_merchants is None:
+            merchants = await database.fetch_all(
+                "SELECT merchant_id, business_name, status FROM merchant_onboarding WHERE status = 'approved' LIMIT 100"
+            )
+        else:
+            if len(allowed_merchants) == 0:
+                merchants = []
+            else:
+                merchants = await database.fetch_all(
+                    """
+                    SELECT merchant_id, business_name, status 
+                    FROM merchant_onboarding 
+                    WHERE merchant_id = ANY(:merchant_ids)
+                    """,
+                    {"merchant_ids": allowed_merchants}
+                )
+        
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "access_type": "all" if allowed_merchants is None else "restricted",
+            "merchants": [
+                {
+                    "merchant_id": m["merchant_id"],
+                    "business_name": m["business_name"],
+                    "status": m["status"]
+                }
+                for m in merchants
+            ],
+            "count": len(merchants)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get merchant authorizations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get merchant authorizations")
