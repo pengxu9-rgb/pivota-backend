@@ -72,8 +72,29 @@ async def get_agent_api_keys(
             {"agent_id": agent_id}
         )
         
-        # Format response
+        # Legacy fallback: if no api_keys rows, surface agents.api_key (masked)
         formatted_keys = []
+        if not keys:
+            legacy = await database.fetch_one(
+                """
+                SELECT api_key, name, created_at 
+                FROM agents 
+                WHERE agent_id = :agent_id
+                """,
+                {"agent_id": agent_id}
+            )
+            if legacy and legacy["api_key"]:
+                masked = f"{legacy['api_key'][:10]}****"
+                formatted_keys.append({
+                    "id": "legacy",
+                    "name": legacy.get("name") or "Primary Key",
+                    "key": masked,
+                    "created_at": (legacy.get("created_at") or datetime.utcnow()).isoformat(),
+                    "last_used": None,
+                    "status": "active",
+                    "usage_count": 0,
+                })
+
         for key in keys:
             last_used = None
             if key["last_used"]:
