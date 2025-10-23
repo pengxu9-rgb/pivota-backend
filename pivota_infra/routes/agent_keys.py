@@ -10,7 +10,7 @@ import hashlib
 from pydantic import BaseModel
 
 from db.database import database
-from utils.auth import get_current_user, require_agent
+from utils.auth import get_current_user
 
 router = APIRouter(prefix="/agents", tags=["agent-keys"])
 
@@ -29,12 +29,13 @@ class ApiKeyResponse(BaseModel):
 @router.get("/{agent_id}/api-keys")
 async def get_agent_api_keys(
     agent_id: str,
-    current_user: dict = Depends(require_agent)
+    current_user: dict = Depends(get_current_user)
 ):
     """Get all API keys for an agent"""
     try:
-        # Verify the agent owns this resource
-        if current_user.get("agent_id") != agent_id and current_user.get("role") != "admin":
+        # Verify the agent owns this resource or is admin
+        user_agent_id = current_user.get("agent_id") or current_user.get("email")
+        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
             raise HTTPException(status_code=403, detail="Not authorized to view these API keys")
         
         # Check if api_keys table exists, if not create it
@@ -114,12 +115,13 @@ async def get_agent_api_keys(
 async def create_agent_api_key(
     agent_id: str,
     request: CreateApiKeyRequest,
-    current_user: dict = Depends(require_agent)
+    current_user: dict = Depends(get_current_user)
 ):
     """Create a new API key for an agent"""
     try:
-        # Verify the agent owns this resource
-        if current_user.get("agent_id") != agent_id and current_user.get("role") != "admin":
+        # Verify the agent owns this resource or is admin
+        user_agent_id = current_user.get("agent_id") or current_user.get("email")
+        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
             raise HTTPException(status_code=403, detail="Not authorized to create API keys for this agent")
         
         # Ensure table exists
@@ -177,12 +179,13 @@ async def create_agent_api_key(
 async def revoke_agent_api_key(
     agent_id: str,
     key_id: str,
-    current_user: dict = Depends(require_agent)
+    current_user: dict = Depends(get_current_user)
 ):
     """Revoke an API key"""
     try:
-        # Verify the agent owns this resource
-        if current_user.get("agent_id") != agent_id and current_user.get("role") != "admin":
+        # Verify the agent owns this resource or is admin
+        user_agent_id = current_user.get("agent_id") or current_user.get("email")
+        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
             raise HTTPException(status_code=403, detail="Not authorized to revoke this API key")
         
         # Update key status
@@ -212,12 +215,13 @@ async def revoke_agent_api_key(
 @router.post("/{agent_id}/reset-api-key")
 async def reset_agent_api_key(
     agent_id: str,
-    current_user: dict = Depends(require_agent)
+    current_user: dict = Depends(get_current_user)
 ):
     """Reset the main API key for an agent (legacy endpoint)"""
     try:
-        # Verify the agent owns this resource
-        if current_user.get("agent_id") != agent_id and current_user.get("role") != "admin":
+        # Verify the agent owns this resource or is admin
+        user_agent_id = current_user.get("agent_id") or current_user.get("email")
+        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
             raise HTTPException(status_code=403, detail="Not authorized to reset this API key")
         
         # Generate new API key
