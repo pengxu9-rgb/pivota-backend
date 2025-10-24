@@ -88,6 +88,7 @@ from routes.debug_agent_key import router as debug_agent_key_router
 from routes.debug_agents_table import router as debug_agents_table_router
 from routes.performance_optimization import router as performance_optimization_router
 from routes.debug_usage_logs import router as debug_usage_logs_router
+from routes.debug_query_analytics import router as debug_query_analytics_router
 from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 
@@ -198,6 +199,7 @@ app.include_router(debug_agents_table_router)  # Debug agents table
 app.include_router(performance_optimization_router)  # Performance optimization
 app.include_router(quick_index_setup_router)  # Quick setup (no auth)
 app.include_router(debug_usage_logs_router)  # Debug usage logs
+app.include_router(debug_query_analytics_router)  # Debug query analytics
 app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
