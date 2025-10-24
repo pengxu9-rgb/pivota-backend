@@ -13,3 +13,6 @@ curl -X POST "https://web-production-fedb.up.railway.app/admin/fix/agents-table"
 echo ""
 echo "✅ Done! You can now try agent registration again."
 
+
+
+

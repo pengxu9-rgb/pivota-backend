@@ -55,3 +55,6 @@ echo "============================================"
 echo "💡 To verify a specific merchant:"
 echo "Check Employee Portal → Merchants page → Products column"
 
+
+
+

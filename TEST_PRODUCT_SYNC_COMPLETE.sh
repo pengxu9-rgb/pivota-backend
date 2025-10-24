@@ -103,3 +103,6 @@ echo "💡 提示: 确保Railway和Vercel都已部署完成"
 echo "   Railway: commit b05923cc + 3939f666 + 8b481d65"
 echo "   Vercel: commit bfa8779"
 
+
+
+

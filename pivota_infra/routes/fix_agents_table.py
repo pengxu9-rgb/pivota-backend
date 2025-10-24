@@ -44,3 +44,6 @@ async def fix_agents_table():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fix agents table: {str(e)}")
 
+
+
+

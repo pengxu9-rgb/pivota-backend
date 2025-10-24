@@ -154,3 +154,6 @@ def capture_message(message: str, level: str = "info", context: dict = None):
         if context:
             logger.info(f"Context: {context}")
 
+
+
+

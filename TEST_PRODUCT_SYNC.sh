@@ -72,3 +72,6 @@ echo "=========================="
 echo -e "${GREEN}✅ Basic tests passed!${NC}"
 echo "Ready to sync products from Shopify!"
 
+
+
+

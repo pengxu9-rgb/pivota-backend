@@ -23,6 +23,5 @@ python-multipart  # for form data handling
 cryptography  # for JWT and security
 requests  # for HTTP requests (backup to httpx)
 boto3  # for S3-compatible storage (Cloudflare R2)
-
 sentry-sdk==1.40.0
 redis>=5.0.0

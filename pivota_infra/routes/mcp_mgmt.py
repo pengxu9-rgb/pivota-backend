@@ -338,3 +338,6 @@ async def get_mcp_logs(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get MCP logs: {str(e)}")
 
+
+
+

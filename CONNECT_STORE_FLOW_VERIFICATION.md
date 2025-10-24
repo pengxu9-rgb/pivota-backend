@@ -175,3 +175,6 @@ logger.info("Wix credentials validated")
 
 **等待Railway部署后，rejected merchant将无法连接store！** 🔒
 
+
+
+

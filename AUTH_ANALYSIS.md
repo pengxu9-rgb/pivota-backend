@@ -184,3 +184,6 @@ async def reset_merchant_password(
 **Bottom Line:** 
 The authentication infrastructure exists, but the **credential creation during onboarding** is missing. This needs to be added before merchants/agents can actually log in after signing up.
 
+
+
+
