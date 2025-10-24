@@ -49,16 +49,13 @@ async def simulate_payments_for_agent(agent_id: str, percentage: int = 80):
                 UPDATE orders
                 SET 
                     payment_status = 'succeeded',
-                    payment_intent_id = :payment_intent_id,
-                    paid_at = :paid_at,
-                    updated_at = :updated_at
+                    status = 'completed',
+                    paid_at = NOW(),
+                    updated_at = NOW()
                 WHERE order_id = :order_id
                 """,
                 {
-                    "order_id": order_id,
-                    "payment_intent_id": f"pi_simulated_{order_id[:16]}",
-                    "paid_at": datetime.now(),
-                    "updated_at": datetime.now()
+                    "order_id": order_id
                 }
             )
             updated += 1
@@ -109,7 +106,7 @@ async def simulate_all_payments(percentage: int = 70):
                 UPDATE orders
                 SET 
                     payment_status = 'succeeded',
-                    payment_intent_id = CONCAT('pi_sim_', order_id),
+                    status = 'completed',
                     paid_at = NOW(),
                     updated_at = NOW()
                 WHERE order_id IN (
