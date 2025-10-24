@@ -83,6 +83,7 @@ from routes.agent_metrics import router as agent_metrics_router
 from routes.agent_keys import router as agent_keys_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.create_test_agent import router as create_test_agent_router
+from routes.debug_agent_key import router as debug_agent_key_router
 
 # Service routers (only include what exists)
 try:
@@ -183,6 +184,7 @@ app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(create_test_agent_router)  # Create test agent account
+app.include_router(debug_agent_key_router)  # Debug agent key
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
 app.include_router(dashboard_router)  # Dashboard API
@@ -284,7 +286,7 @@ async def startup():
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -686,8 +688,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
