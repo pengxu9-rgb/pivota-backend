@@ -384,8 +384,8 @@ async def reset_agent_api_key(
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
         
-        # 生成新的 API Key
-        new_api_key = f"ak_{secrets.token_hex(32)}"
+        # 生成新的 API Key (ak_live_ format)
+        new_api_key = f"ak_live_{secrets.token_hex(32)}"
         new_api_key_hash = hashlib.sha256(new_api_key.encode()).hexdigest()
         
         # 更新数据库
