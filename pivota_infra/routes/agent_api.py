@@ -665,15 +665,36 @@ async def agent_cancel_order(
     order_id: str,
     context: AgentContext = Depends(get_agent_context)
 ):
-    """Proxy cancel to admin cancel API, but enforce agent ownership."""
+    """Cancel an order owned by the agent (defensive - no optional columns)."""
     try:
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         if order.get("agent_id") != context.agent_id:
             raise HTTPException(status_code=403, detail="Not authorized for this order")
-        result = await admin_cancel_order(order_id, reason="Agent requested cancel", current_user={"role": "admin"})
-        return {"status": "success", "order_id": order_id, "result": result}
+
+        # Block cancel if clearly paid/succeeded
+        paid_status = str(order.get("payment_status") or "").lower()
+        if paid_status in ("paid", "succeeded", "completed"):
+            raise HTTPException(status_code=400, detail="Cannot cancel a paid/completed order. Please refund instead.")
+
+        # Defensive update: only set status to avoid missing columns like cancelled_at
+        from db.database import database
+        updated = await database.execute(
+            """
+            UPDATE orders
+            SET status = 'cancelled'
+            WHERE order_id = :order_id
+            """,
+            {"order_id": order_id}
+        )
+
+        # Some DB drivers return rowcount via different means; fetch again to verify
+        after = await get_order(order_id)
+        if not after or str(after.get("status")) != "cancelled":
+            raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+        return {"status": "success", "order_id": order_id}
     except HTTPException:
         raise
     except Exception as e:
