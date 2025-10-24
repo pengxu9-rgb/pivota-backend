@@ -4,6 +4,7 @@ Agent 专用 API 路由
 """
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
@@ -680,14 +681,18 @@ async def agent_cancel_order(
 
         # Defensive update: only set status to avoid missing columns like cancelled_at
         from db.database import database
-        updated = await database.execute(
-            """
-            UPDATE orders
-            SET status = 'cancelled'
-            WHERE order_id = :order_id
-            """,
-            {"order_id": order_id}
-        )
+        try:
+            await database.execute(
+                """
+                UPDATE orders
+                SET status = 'cancelled'
+                WHERE order_id = :order_id
+                """,
+                {"order_id": order_id}
+            )
+        except Exception as e:
+            logger.error(f"Cancel update error: {e}")
+            raise HTTPException(status_code=500, detail="Cancel update failed")
 
         # Some DB drivers return rowcount via different means; fetch again to verify
         after = await get_order(order_id)
