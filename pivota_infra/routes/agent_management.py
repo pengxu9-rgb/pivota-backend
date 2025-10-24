@@ -441,26 +441,27 @@ async def get_agent_conversion_funnel(
             {"agent_id": agent_id, "since": since}
         ) or 0
         
-        # Count payment attempts (orders with payment status not 'unpaid')
+        # Count payment attempts (orders with status not 'pending' or orders that have been processed)
+        # For now, count all successfully created orders as "attempted"
         payment_attempted = await database.fetch_val(
             """
             SELECT COUNT(DISTINCT order_id) 
             FROM orders 
             WHERE agent_id = :agent_id 
             AND created_at >= :since
-            AND (payment_status IS NOT NULL AND payment_status != 'unpaid')
+            AND status != 'cancelled'
             """,
             {"agent_id": agent_id, "since": since}
         ) or 0
         
-        # Count completed orders
+        # Count completed orders (payment successful)
         orders_completed = await database.fetch_val(
             """
             SELECT COUNT(DISTINCT order_id) 
             FROM orders 
             WHERE agent_id = :agent_id 
             AND created_at >= :since
-            AND payment_status IN ('succeeded', 'completed')
+            AND (payment_status IN ('succeeded', 'completed', 'paid') OR status = 'completed')
             """,
             {"agent_id": agent_id, "since": since}
         ) or 0
