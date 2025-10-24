@@ -90,6 +90,7 @@ from routes.performance_optimization import router as performance_optimization_r
 from routes.debug_usage_logs import router as debug_usage_logs_router
 from routes.debug_query_analytics import router as debug_query_analytics_router
 from routes.debug_orders_agent import router as debug_orders_agent_router
+from routes.simulate_payments import router as simulate_payments_router
 from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 
@@ -202,6 +203,7 @@ app.include_router(quick_index_setup_router)  # Quick setup (no auth)
 app.include_router(debug_usage_logs_router)  # Debug usage logs
 app.include_router(debug_query_analytics_router)  # Debug query analytics
 app.include_router(debug_orders_agent_router)  # Debug orders by agent
+app.include_router(simulate_payments_router)  # Simulate payments for testing
 app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
