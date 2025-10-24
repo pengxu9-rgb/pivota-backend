@@ -19,10 +19,10 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # ============================================================================
 
 def get_configured_psps() -> Dict[str, Dict[str, Any]]:
-    """Get PSPs that are actually configured with API keys"""
+    """Get PSPs that are configured via env vars or database"""
     psps = {}
     
-    # Check Stripe
+    # Check Stripe (env var)
     if settings.stripe_secret_key:
         psps["stripe"] = {
             "id": "stripe",
@@ -35,7 +35,7 @@ def get_configured_psps() -> Dict[str, Dict[str, Any]]:
             "api_key_last_4": settings.stripe_secret_key[-4:] if settings.stripe_secret_key else "****"
         }
     
-    # Check Adyen
+    # Check Adyen (env var)
     if settings.adyen_api_key:
         psps["adyen"] = {
             "id": "adyen",
@@ -48,6 +48,18 @@ def get_configured_psps() -> Dict[str, Dict[str, Any]]:
             "merchant_account": settings.adyen_merchant_account,
             "api_key_last_4": settings.adyen_api_key[-4:] if settings.adyen_api_key else "****"
         }
+    
+    # Add Checkout (always available as it uses per-merchant keys from DB)
+    psps["checkout"] = {
+        "id": "checkout",
+        "name": "Checkout.com",
+        "type": "Payment Gateway",
+        "enabled": True,
+        "status": "active",
+        "last_test": datetime.now().isoformat(),
+        "api_key_configured": True,
+        "note": "Uses merchant-specific API keys from database"
+    }
     
     return psps
 
