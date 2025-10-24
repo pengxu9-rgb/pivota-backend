@@ -63,14 +63,14 @@ async def get_admin_psp_status(
         
         psp_stats = await database.fetch_all(stats_query)
         
-        # Get transaction stats by PSP
+        # Get transaction stats by PSP (join on merchant_id since orders.psp_id may not exist)
         trans_query = """
             SELECT 
                 p.provider,
                 COUNT(o.order_id) as transactions,
-                COALESCE(SUM(o.amount), 0) as volume
+                COALESCE(SUM(o.total), 0) as volume
             FROM merchant_psps p
-            LEFT JOIN orders o ON p.psp_id = o.psp_id
+            LEFT JOIN orders o ON p.merchant_id = o.merchant_id AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
             GROUP BY p.provider
         """
         

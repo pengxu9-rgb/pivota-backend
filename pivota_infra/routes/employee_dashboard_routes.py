@@ -321,10 +321,10 @@ async def get_all_psps(
                 p.connected_at, p.capabilities,
                 m.business_name as merchant_name,
                 COUNT(o.order_id) as transaction_count,
-                COALESCE(SUM(o.amount), 0) as total_volume
+                COALESCE(SUM(o.total), 0) as total_volume
             FROM merchant_psps p
             LEFT JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
-            LEFT JOIN orders o ON p.psp_id = o.psp_id
+            LEFT JOIN orders o ON p.merchant_id = o.merchant_id AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
             GROUP BY p.psp_id, p.provider, p.name, p.status, p.merchant_id, 
                      p.connected_at, p.capabilities, m.business_name
             ORDER BY p.connected_at DESC
