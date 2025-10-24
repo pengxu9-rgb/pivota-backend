@@ -689,8 +689,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-    await database.disconnect()
-    logger.info("Database disconnected")
+        await database.disconnect()
+        logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
