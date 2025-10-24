@@ -479,15 +479,18 @@ async def get_agent_conversion_funnel(
         raise
     except Exception as e:
         logger.error(f"Failed to get funnel data: {e}")
-        # Return mock data if error
+        import traceback
+        traceback.print_exc()
+        # Return zeros if error (no mock data)
         return {
-            "status": "success",
+            "status": "error",
             "agent_id": agent_id,
             "period_days": days,
-            "orders_initiated": 89,
-            "payment_attempted": 82,
-            "orders_completed": 76,
-            "conversion_rate": 85.4
+            "orders_initiated": 0,
+            "payment_attempted": 0,
+            "orders_completed": 0,
+            "conversion_rate": 0,
+            "error": str(e)
         }
 
 
