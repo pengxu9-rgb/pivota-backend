@@ -4,7 +4,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="pivota-agent-sdk",
+    name="pivota-agent",
     version="1.0.0",
     author="Pivota",
     author_email="support@pivota.com",
@@ -44,4 +44,7 @@ setup(
     },
     keywords="pivota agent ecommerce api sdk payments",
 )
+
+
+
 
