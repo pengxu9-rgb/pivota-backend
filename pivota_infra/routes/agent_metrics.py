@@ -91,10 +91,10 @@ async def get_metrics_summary(current_user: dict = Depends(get_current_user)) ->
             {"since": last_24h}
         ) or 0
         
-        # Revenue (last 24h) - sum of order amounts
+        # Revenue (last 24h) - derive from orders table to avoid dependency on logs columns
         revenue = await database.fetch_val(
-            """SELECT COALESCE(SUM(order_amount), 0) FROM agent_usage_logs 
-               WHERE timestamp >= :since AND order_amount IS NOT NULL""",
+            """SELECT COALESCE(SUM(total), 0) FROM orders 
+               WHERE created_at >= :since AND (is_deleted IS NULL OR is_deleted = FALSE)""",
             {"since": last_24h}
         ) or 0
         
@@ -316,9 +316,7 @@ async def get_recent_activity(
                 method,
                 status_code,
                 response_time_ms,
-                timestamp,
-                order_amount,
-                merchant_id
+                timestamp
             FROM agent_usage_logs
             {agent_filter}
             ORDER BY timestamp DESC
@@ -365,11 +363,9 @@ async def get_recent_activity(
                 "type": activity_type,
                 "action": action,
                 "description": f"{activity['method']} {endpoint} → {activity['status_code']}",
-                "amount": float(activity["order_amount"]) if activity["order_amount"] else None,
                 "response_time": activity["response_time_ms"],
                 "timestamp": time_ago,
-                "status": "success" if activity["status_code"] < 400 else "error",
-                "merchant": activity["merchant_id"]
+                "status": "success" if activity["status_code"] < 400 else "error"
             })
         
         return {
