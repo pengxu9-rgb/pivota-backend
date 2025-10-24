@@ -67,6 +67,7 @@ orders = Table(
     Column("cancelled_at", DateTime(timezone=True), nullable=True),
     
     # 元数据
+    Column("agent_id", String(255), nullable=True, index=True),  # Agent who created this order
     Column("agent_session_id", String(255), nullable=True, index=True),
     Column("metadata", JSON, nullable=True),
     
