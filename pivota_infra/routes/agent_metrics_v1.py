@@ -162,4 +162,38 @@ async def get_recent_activity_v1(
     except Exception as e:
         return {"status": "success", "activities": [], "count": 0, "note": str(e)}
 
+@router.get("/timeline")
+async def get_metrics_timeline_v1(hours: int = 24) -> Dict[str, Any]:
+    try:
+        since = datetime.now() - timedelta(hours=hours)
+        timeline = await database.fetch_all(
+            """
+            SELECT 
+                DATE_TRUNC('hour', timestamp) as hour,
+                COUNT(*) as total_requests,
+                SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) as successful_requests,
+                AVG(response_time_ms) as avg_response_time
+            FROM agent_usage_logs
+            WHERE timestamp >= :since
+            GROUP BY DATE_TRUNC('hour', timestamp)
+            ORDER BY hour DESC
+            """,
+            {"since": since}
+        )
+        return {
+            "timeline": [
+                {
+                    "hour": row["hour"].isoformat(),
+                    "total_requests": row["total_requests"],
+                    "successful_requests": row["successful_requests"],
+                    "avg_response_time_ms": round(float(row["avg_response_time"] or 0), 2),
+                }
+                for row in timeline
+            ],
+            "period_hours": hours,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 
