@@ -49,9 +49,7 @@ async def simulate_payments_for_agent(agent_id: str, percentage: int = 80):
                 UPDATE orders
                 SET 
                     payment_status = 'succeeded',
-                    status = 'completed',
-                    paid_at = NOW(),
-                    updated_at = NOW()
+                    status = 'completed'
                 WHERE order_id = :order_id
                 """,
                 {
@@ -106,9 +104,7 @@ async def simulate_all_payments(percentage: int = 70):
                 UPDATE orders
                 SET 
                     payment_status = 'succeeded',
-                    status = 'completed',
-                    paid_at = NOW(),
-                    updated_at = NOW()
+                    status = 'completed'
                 WHERE order_id IN (
                     SELECT order_id
                     FROM orders
