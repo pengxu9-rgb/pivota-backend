@@ -3,7 +3,7 @@ Admin API Routes
 Provides endpoints for the admin dashboard with REAL data
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from typing import Dict, List, Any, Optional
 from utils.auth import verify_jwt_token, get_current_admin, require_admin
 from datetime import datetime, timedelta
@@ -247,30 +247,93 @@ async def get_psp_list(current_user: dict = Depends(require_admin)):
         "psps": list(psps.values())
     }
 
+
+@router.post("/psp/connect")
+async def admin_connect_psp(
+    payload: Dict[str, Any] = Body(...),
+    current_user: dict = Depends(require_admin)
+):
+    """Admin: connect a PSP for a merchant (supports stripe/adyen/checkout)."""
+    provider = str(payload.get("provider", "")).lower()
+    merchant_id = payload.get("merchant_id")
+    api_key = payload.get("api_key")
+    account_id = payload.get("account_id")
+    name = payload.get("name") or f"{provider.capitalize()} Account"
+    if provider not in ("stripe", "adyen", "checkout"):
+        raise HTTPException(status_code=400, detail="Unsupported provider. Use stripe/adyen/checkout")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+    if not api_key or len(api_key) < 8:
+        raise HTTPException(status_code=400, detail="Invalid api_key")
+
+    psp_id = payload.get("psp_id") or f"psp_{provider}_{datetime.now().strftime('%H%M%S%f')}"
+    capabilities = payload.get("capabilities") or (
+        ["payments", "refunds", "payouts"] if provider == "stripe" else
+        ["payments", "refunds"]
+    )
+    try:
+        await database.execute(
+            """
+            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
+            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, 'active', :connected_at)
+            ON CONFLICT (psp_id) DO NOTHING
+            """,
+            {
+                "psp_id": psp_id,
+                "merchant_id": merchant_id,
+                "provider": provider,
+                "name": name,
+                "api_key": api_key,
+                "account_id": account_id or None,
+                "capabilities": ",".join(capabilities),
+                "connected_at": datetime.now(),
+            }
+        )
+        # Mark merchant onboarding flags for dashboard
+        await database.execute(
+            """
+            UPDATE merchant_onboarding
+            SET psp_connected = true, psp_type = :provider
+            WHERE merchant_id = :merchant_id
+            """,
+            {"provider": provider, "merchant_id": merchant_id}
+        )
+        return {"status": "success", "message": f"{provider} connected", "psp_id": psp_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect PSP: {e}")
+
 @router.post("/psp/{psp_id}/test")
 async def test_psp_connection(psp_id: str, current_user: dict = Depends(require_admin)):
     """Test connection to a specific PSP"""
     configured_psps = get_configured_psps()
-    
-    if psp_id not in configured_psps:
-        raise HTTPException(
-            status_code=404,
-            detail=f"PSP '{psp_id}' not found or not configured"
-        )
+    resolved_key = psp_id
+    if resolved_key not in configured_psps:
+        # Try resolve by merchant_psps.psp_id → provider
+        try:
+            row = await database.fetch_one(
+                "SELECT provider FROM merchant_psps WHERE psp_id = :psp_id LIMIT 1",
+                {"psp_id": psp_id}
+            )
+            if row and row["provider"] in configured_psps:
+                resolved_key = row["provider"]
+        except Exception:
+            pass
+    if resolved_key not in configured_psps:
+        raise HTTPException(status_code=404, detail=f"PSP '{psp_id}' not found or not configured")
     
     # Simulate PSP test with actual API key check
     test_result = {
         "success": True,
-        "message": f"Connection to {configured_psps[psp_id]['name']} successful",
+        "message": f"Connection to {configured_psps[resolved_key]['name']} successful",
         "timestamp": datetime.now().isoformat(),
         "response_time": 145
     }
     
     return {
         "status": "success",
-        "message": f"PSP {psp_id} connection tested successfully",
+        "message": f"PSP {resolved_key} connection tested successfully",
         "test_result": test_result,
-        "psp_name": configured_psps[psp_id]['name']
+        "psp_name": configured_psps[resolved_key]['name']
     }
 
 @router.post("/psp/{psp_id}/toggle")
