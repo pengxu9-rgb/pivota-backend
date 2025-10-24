@@ -588,22 +588,6 @@ async def agent_list_orders(
         # 执行查询
         from db.database import database
         orders = await database.fetch_all(query, params)
-
-        # 获取总记录数（用于分页）
-        count_query = """
-            SELECT COUNT(*) AS total
-            FROM orders
-            WHERE agent_id = :agent_id
-        """
-        count_params = {"agent_id": params["agent_id"]}
-        if merchant_id:
-            count_query += " AND merchant_id = :merchant_id"
-            count_params["merchant_id"] = merchant_id
-        if status:
-            count_query += " AND status = :status"
-            count_params["status"] = status
-        total_row = await database.fetch_one(count_query, count_params)
-        total_all = int(total_row["total"]) if total_row and total_row.get("total") is not None else 0
         
         # 记录请求
         background_tasks.add_task(
@@ -615,8 +599,7 @@ async def agent_list_orders(
         
         return {
             "status": "success",
-            "total": total_all,
-            "count": len(orders),
+            "total": len(orders),
             "orders": [
                 {
                     "order_id": order["order_id"],
@@ -624,16 +607,10 @@ async def agent_list_orders(
                     "status": order["status"],
                     "payment_status": order["payment_status"],
                     "total": str(order["total"]),
-                    "created_at": order["created_at"],
-                    "customer_email": order.get("customer_email")
+                    "created_at": order["created_at"]
                 }
                 for order in orders
-            ],
-            "pagination": {
-                "limit": params["limit"],
-                "offset": params["offset"],
-                "has_more": params["offset"] + len(orders) < total_all
-            }
+            ]
         }
         
     except HTTPException:
