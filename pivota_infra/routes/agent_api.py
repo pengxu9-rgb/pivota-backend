@@ -14,6 +14,9 @@ from models.standard_product import StandardProduct
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import get_cached_products
 from db.orders import get_order, get_orders_by_merchant
+from routes.refund_api import process_refund
+from routes.order_routes import cancel_order as admin_cancel_order
+from routes.fulfillment_api import track_order_fulfillment
 from routes.order_routes import create_new_order
 from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from utils.logger import logger
@@ -620,6 +623,83 @@ async def agent_list_orders(
             error_message=str(e)
         )
         raise HTTPException(status_code=500, detail="Failed to list orders")
+
+
+# ----------------------------------------------------------------------------
+# Order actions for Agents (refund, cancel, track)
+# ----------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/refund")
+async def agent_refund_order(
+    order_id: str,
+    background_tasks: BackgroundTasks,
+    context: AgentContext = Depends(get_agent_context)
+):
+    """Proxy refund to admin refund API, but enforce agent ownership."""
+    try:
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order.get("agent_id") != context.agent_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # Build refund request (full refund)
+        class _Req(BaseModel):
+            order_id: str
+            amount: Optional[float] = None
+            reason: Optional[str] = None
+            restore_inventory: bool = True
+
+        req = _Req(order_id=order_id, amount=None, reason="Agent requested refund", restore_inventory=True)
+        result = await process_refund(order_id, req, background_tasks, current_user={"role": "admin"})
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent refund error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to refund order")
+
+
+@router.post("/orders/{order_id}/cancel")
+async def agent_cancel_order(
+    order_id: str,
+    context: AgentContext = Depends(get_agent_context)
+):
+    """Proxy cancel to admin cancel API, but enforce agent ownership."""
+    try:
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order.get("agent_id") != context.agent_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        result = await admin_cancel_order(order_id, reason="Agent requested cancel", current_user={"role": "admin"})
+        return {"status": "success", "order_id": order_id, "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent cancel error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+
+@router.get("/orders/{order_id}/track")
+async def agent_track_order(
+    order_id: str,
+    context: AgentContext = Depends(get_agent_context)
+):
+    """Return fulfillment tracking info for the order if owned by agent."""
+    try:
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order.get("agent_id") != context.agent_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        tracking = await track_order_fulfillment(order_id, context)
+        return tracking
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent track error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get tracking info")
 
 
 # ============================================================================
