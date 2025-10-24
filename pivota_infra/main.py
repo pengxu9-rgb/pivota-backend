@@ -63,9 +63,13 @@ from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.agent_payment_sdk import router as agent_payment_router
-from routes.agent_debug import router as agent_debug_router
-from routes.admin_debug_products import router as debug_products_router
-from routes.admin_populate_products import router as test_populate_router
+# Debug routers - only import if DEBUG_MODE is enabled
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+if DEBUG_MODE:
+    from routes.agent_debug import router as agent_debug_router
+    from routes.admin_debug_products import router as debug_products_router
+    from routes.admin_populate_products import router as test_populate_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -83,13 +87,15 @@ from routes.fix_orders_table import router as fix_orders_table_router
 from routes.agent_metrics import router as agent_metrics_router
 from routes.agent_keys import router as agent_keys_router
 from routes.init_agent_key import router as init_agent_key_router
-from routes.create_test_agent import router as create_test_agent_router
-from routes.debug_agent_key import router as debug_agent_key_router
-from routes.debug_agents_table import router as debug_agents_table_router
+if DEBUG_MODE:
+    from routes.create_test_agent import router as create_test_agent_router
+    from routes.debug_agent_key import router as debug_agent_key_router
+    from routes.debug_agents_table import router as debug_agents_table_router
 from routes.performance_optimization import router as performance_optimization_router
-from routes.debug_usage_logs import router as debug_usage_logs_router
-from routes.debug_query_analytics import router as debug_query_analytics_router
-from routes.debug_orders_agent import router as debug_orders_agent_router
+if DEBUG_MODE:
+    from routes.debug_usage_logs import router as debug_usage_logs_router
+    from routes.debug_query_analytics import router as debug_query_analytics_router
+    from routes.debug_orders_agent import router as debug_orders_agent_router
 from routes.simulate_payments import router as simulate_payments_router
 from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
@@ -177,9 +183,11 @@ app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
 app.include_router(emp_agent_mgmt_router)  # Employee agent management
 app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(agent_payment_router)  # Agent payment SDK endpoints
-app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
-app.include_router(debug_products_router)  # Debug products endpoints
-app.include_router(test_populate_router)  # Test data population
+if DEBUG_MODE:
+    app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
+    app.include_router(debug_products_router)  # Debug products endpoints
+    app.include_router(test_populate_router)  # Test data population
+    logger.warning("⚠️ DEBUG MODE ENABLED - Debug endpoints are accessible!")
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
@@ -195,14 +203,16 @@ app.include_router(fix_orders_table_router)  # Fix orders table structure
 app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(init_agent_key_router)  # Initialize test agent key
-app.include_router(create_test_agent_router)  # Create test agent account
-app.include_router(debug_agent_key_router)  # Debug agent key
-app.include_router(debug_agents_table_router)  # Debug agents table
+if DEBUG_MODE:
+    app.include_router(create_test_agent_router)  # Create test agent account
+    app.include_router(debug_agent_key_router)  # Debug agent key
+    app.include_router(debug_agents_table_router)  # Debug agents table
 app.include_router(performance_optimization_router)  # Performance optimization
 app.include_router(quick_index_setup_router)  # Quick setup (no auth)
-app.include_router(debug_usage_logs_router)  # Debug usage logs
-app.include_router(debug_query_analytics_router)  # Debug query analytics
-app.include_router(debug_orders_agent_router)  # Debug orders by agent
+if DEBUG_MODE:
+    app.include_router(debug_usage_logs_router)  # Debug usage logs
+    app.include_router(debug_query_analytics_router)  # Debug query analytics
+    app.include_router(debug_orders_agent_router)  # Debug orders by agent
 app.include_router(simulate_payments_router)  # Simulate payments for testing
 app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
@@ -307,7 +317,7 @@ async def startup():
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -709,8 +719,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")

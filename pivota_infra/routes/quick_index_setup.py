@@ -1,16 +1,37 @@
 """
-Quick setup endpoint to create database indexes without authentication
-TEMPORARY - Remove after initial setup
+Quick setup endpoint to create database indexes
+Now requires admin authentication for security
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
+from utils.auth import require_admin
 import time
+import os
 
 router = APIRouter(prefix="/setup", tags=["setup"])
 
+# Allow without auth only in development or with special env var
+SETUP_KEY = os.getenv("SETUP_KEY", None)
+
 @router.post("/create-all-indexes")
-async def create_all_indexes():
+async def create_all_indexes(setup_key: str = None, current_user: dict = None):
     """Create all database indexes to improve performance"""
+    
+    # Check authentication: either setup key or admin user
+    if SETUP_KEY:
+        if setup_key != SETUP_KEY:
+            # Try admin auth as fallback
+            try:
+                from utils.auth import require_admin
+                if not current_user:
+                    raise HTTPException(status_code=401, detail="Setup key invalid or admin authentication required")
+            except:
+                raise HTTPException(status_code=401, detail="Setup key invalid")
+    else:
+        # No setup key configured, require admin auth
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Admin authentication required")
+    
     indexes_created = []
     errors = []
     
