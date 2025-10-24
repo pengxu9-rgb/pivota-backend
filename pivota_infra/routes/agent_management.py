@@ -652,7 +652,25 @@ async def get_agent_merchant_authorizations(
         # If null, agent has access to all merchants
         if allowed_merchants is None:
             merchants = await database.fetch_all(
-                "SELECT merchant_id, business_name, status FROM merchant_onboarding WHERE status = 'approved' LIMIT 100"
+                """
+                SELECT 
+                    m.merchant_id, 
+                    m.business_name, 
+                    m.status,
+                    m.contact_email,
+                    m.store_url,
+                    m.region,
+                    COUNT(DISTINCT o.order_id) as total_orders,
+                    COALESCE(SUM(o.total), 0) as total_gmv
+                FROM merchant_onboarding m
+                LEFT JOIN orders o ON m.merchant_id = o.merchant_id 
+                    AND o.agent_id = :agent_id
+                    AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+                WHERE m.status = 'approved'
+                GROUP BY m.merchant_id, m.business_name, m.status, m.contact_email, m.store_url, m.region
+                LIMIT 100
+                """,
+                {"agent_id": agent_id}
             )
         else:
             if len(allowed_merchants) == 0:
@@ -660,11 +678,23 @@ async def get_agent_merchant_authorizations(
             else:
                 merchants = await database.fetch_all(
                     """
-                    SELECT merchant_id, business_name, status 
-                    FROM merchant_onboarding 
-                    WHERE merchant_id = ANY(:merchant_ids)
+                    SELECT 
+                        m.merchant_id, 
+                        m.business_name, 
+                        m.status,
+                        m.contact_email,
+                        m.store_url,
+                        m.region,
+                        COUNT(DISTINCT o.order_id) as total_orders,
+                        COALESCE(SUM(o.total), 0) as total_gmv
+                    FROM merchant_onboarding m
+                    LEFT JOIN orders o ON m.merchant_id = o.merchant_id 
+                        AND o.agent_id = :agent_id
+                        AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+                    WHERE m.merchant_id = ANY(:merchant_ids)
+                    GROUP BY m.merchant_id, m.business_name, m.status, m.contact_email, m.store_url, m.region
                     """,
-                    {"merchant_ids": allowed_merchants}
+                    {"merchant_ids": allowed_merchants, "agent_id": agent_id}
                 )
         
         return {
@@ -675,7 +705,12 @@ async def get_agent_merchant_authorizations(
                 {
                     "merchant_id": m["merchant_id"],
                     "business_name": m["business_name"],
-                    "status": m["status"]
+                    "status": m["status"],
+                    "contact_email": m["contact_email"],
+                    "store_url": m["store_url"],
+                    "region": m["region"],
+                    "total_orders": m["total_orders"],
+                    "total_gmv": float(m["total_gmv"])
                 }
                 for m in merchants
             ],
