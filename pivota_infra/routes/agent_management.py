@@ -520,7 +520,7 @@ async def get_agent_query_analytics(
             SELECT COUNT(*) FROM agent_usage_logs
             WHERE agent_id = :agent_id 
             AND timestamp >= :since
-            AND (endpoint LIKE '%/catalog/search%' OR endpoint LIKE '%/products%')
+            AND (endpoint LIKE '%/products/search%' OR endpoint LIKE '%/catalog/search%' OR endpoint LIKE '%/products%')
             """,
             {"agent_id": agent_id, "since": last_24h}
         ) or 0
@@ -530,7 +530,7 @@ async def get_agent_query_analytics(
             SELECT COUNT(*) FROM agent_usage_logs
             WHERE agent_id = :agent_id 
             AND timestamp >= :since_prev AND timestamp < :since
-            AND (endpoint LIKE '%/catalog/search%' OR endpoint LIKE '%/products%')
+            AND (endpoint LIKE '%/products/search%' OR endpoint LIKE '%/catalog/search%' OR endpoint LIKE '%/products%')
             """,
             {"agent_id": agent_id, "since": last_24h, "since_prev": last_48h}
         ) or 0
