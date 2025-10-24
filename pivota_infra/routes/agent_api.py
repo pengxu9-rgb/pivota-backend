@@ -679,6 +679,11 @@ async def agent_cancel_order(
         if paid_status in ("paid", "succeeded", "completed"):
             raise HTTPException(status_code=400, detail="Cannot cancel a paid/completed order. Please refund instead.")
 
+        # If already cancelled, treat as idempotent success
+        current_status = str(order.get("status") or "")
+        if current_status.lower() == "cancelled":
+            return {"status": "success", "order_id": order_id, "message": "Order already cancelled"}
+
         # Defensive update: only set status to avoid missing columns like cancelled_at
         from db.database import database
         try:
@@ -696,7 +701,9 @@ async def agent_cancel_order(
 
         # Some DB drivers return rowcount via different means; fetch again to verify
         after = await get_order(order_id)
-        if not after or str(after.get("status")) != "cancelled":
+        if not after:
+            raise HTTPException(status_code=500, detail="Cancel verification failed")
+        if str(after.get("status") or "").lower() != "cancelled":
             raise HTTPException(status_code=500, detail="Failed to cancel order")
 
         return {"status": "success", "order_id": order_id}
