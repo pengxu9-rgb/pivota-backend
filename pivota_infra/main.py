@@ -286,6 +286,7 @@ async def startup():
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
+        # Establish DB connection
     await database.connect()
         logger.info("✅ Database connected successfully")
         
