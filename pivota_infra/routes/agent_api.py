@@ -617,8 +617,6 @@ async def agent_list_orders(
             "status": "success",
             "total": total_all,
             "count": len(orders),
-            "limit": params["limit"],
-            "offset": params["offset"],
             "orders": [
                 {
                     "order_id": order["order_id"],
@@ -626,10 +624,16 @@ async def agent_list_orders(
                     "status": order["status"],
                     "payment_status": order["payment_status"],
                     "total": str(order["total"]),
-                    "created_at": order["created_at"]
+                    "created_at": order["created_at"],
+                    "customer_email": order.get("customer_email")
                 }
                 for order in orders
-            ]
+            ],
+            "pagination": {
+                "limit": params["limit"],
+                "offset": params["offset"],
+                "has_more": params["offset"] + len(orders) < total_all
+            }
         }
         
     except HTTPException:
