@@ -200,6 +200,11 @@ async def create_new_order(
         total = subtotal + shipping_fee + tax
 
         # 4. 创建订单
+        # Extract agent_id from metadata if present
+        agent_id = None
+        if order_request.metadata:
+            agent_id = order_request.metadata.get("agent_id")
+        
         order_data = {
             "merchant_id": order_request.merchant_id,
             "customer_email": order_request.customer_email,
@@ -211,6 +216,7 @@ async def create_new_order(
             "total": float(total),
             "amount": float(total),  # Legacy field, same as total
             "currency": order_request.currency,
+            "agent_id": agent_id,  # Extract from metadata
             "agent_session_id": order_request.agent_session_id,
             "metadata": order_request.metadata or {},
             # Legacy fields (optional, can be null)
