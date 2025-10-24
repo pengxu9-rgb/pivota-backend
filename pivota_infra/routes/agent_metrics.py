@@ -2,7 +2,7 @@
 Agent API Metrics and Monitoring
 Real-time metrics from agent_usage_logs table
 """
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from db.database import database
@@ -12,7 +12,7 @@ router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
 
 
 @router.get("/summary")
-async def get_metrics_summary(current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+async def get_metrics_summary(request: Request) -> Dict[str, Any]:
     """
     Get real-time API usage metrics summary
     Available to agents and admins
@@ -291,7 +291,8 @@ async def get_system_health() -> Dict[str, Any]:
 async def get_recent_activity(
     limit: int = Query(20, le=100),
     offset: int = Query(0, ge=0),
-    current_user: dict = Depends(get_current_user)
+    agent_id: Optional[str] = None,
+    request: Request = None
 ) -> Dict[str, Any]:
     """
     Get recent API activity/calls
@@ -301,11 +302,26 @@ async def get_recent_activity(
         # Filter by agent if not admin
         agent_filter = ""
         params = {"limit": limit, "offset": offset}
-        
-        if current_user.get("role") not in ["admin", "employee"]:
-            agent_id = current_user.get("agent_id") or current_user.get("email")
+
+        # Optional filtering by agent
+        resolved_agent_id = agent_id
+        if not resolved_agent_id:
+            # Try to resolve from x-api-key header
+            api_key = request.headers.get("x-api-key") if request else None
+            if api_key:
+                try:
+                    row = await database.fetch_one(
+                        "SELECT agent_id FROM agents WHERE api_key = :k LIMIT 1",
+                        {"k": api_key}
+                    )
+                    if row:
+                        resolved_agent_id = row["agent_id"]
+                except Exception:
+                    pass
+
+        if resolved_agent_id:
             agent_filter = "WHERE agent_id = :agent_id"
-            params["agent_id"] = agent_id
+            params["agent_id"] = resolved_agent_id
         
         activities = await database.fetch_all(
             f"""
