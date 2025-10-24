@@ -19,8 +19,8 @@ async def create_test_agent_account():
         email = "testuser@pivota.cc"
         password = "Test123!"
         
-        # Generate API key
-        api_key = f"pk_live_{secrets.token_urlsafe(32)[:32]}"
+        # Generate API key (ak_live_ format with 64 hex chars)
+        api_key = f"ak_live_{secrets.token_hex(32)}"
         
         # Check if agent exists in agents table
         existing_agent = await database.fetch_one(

@@ -236,7 +236,7 @@ async def signin(login_data: UserLogin):
                 if not existing_agent:
                     # Create agent record with initial API key
                     import secrets
-                    api_key = f"pk_live_{secrets.token_urlsafe(32)[:32]}"
+                    api_key = f"ak_live_{secrets.token_hex(32)}"  # 64 hex chars
                     await database.execute(
                         """
                         INSERT INTO agents (agent_id, name, email, company, api_key, status)

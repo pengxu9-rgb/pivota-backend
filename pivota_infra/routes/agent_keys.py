@@ -162,10 +162,9 @@ async def create_agent_api_key(
             )
         """)
         
-        # Generate a new API key
-        key_prefix = "pk_live_" if "production" in request.name.lower() else "pk_test_"
-        random_part = secrets.token_urlsafe(32)[:32]  # 32 chars
-        full_key = f"{key_prefix}{random_part}"
+        # Generate a new API key (ak_live_ format with 64 hex chars)
+        key_prefix = "ak_live_" if "production" in request.name.lower() or "live" in request.name.lower() else "ak_test_"
+        full_key = f"{key_prefix}{secrets.token_hex(32)}"  # 64 hex chars
         
         # Hash the key for storage
         key_hash = hashlib.sha256(full_key.encode()).hexdigest()

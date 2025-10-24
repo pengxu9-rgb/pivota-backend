@@ -16,8 +16,8 @@ async def initialize_agent_test_key():
     Public endpoint (temporary)
     """
     try:
-        # Generate API key
-        api_key = f"pk_live_{secrets.token_urlsafe(32)[:32]}"
+        # Generate API key (ak_live_ format with 64 hex chars)
+        api_key = f"ak_live_{secrets.token_hex(32)}"
         
         # Check if agent exists
         agent = await database.fetch_one(
