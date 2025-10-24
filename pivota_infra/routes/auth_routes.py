@@ -225,11 +225,12 @@ async def signin(login_data: UserLogin):
             token_payload["merchant_id"] = acct["merchant_id"]
         
         # For agent accounts, ensure agent record exists in agents table
+        agent_api_key = None
         if acct["role"] == "agent":
             try:
                 # Check if agent exists
                 existing_agent = await database.fetch_one(
-                    "SELECT agent_id FROM agents WHERE email = :email",
+                    "SELECT agent_id, api_key FROM agents WHERE email = :email",
                     {"email": login_data.email}
                 )
                 
@@ -252,7 +253,11 @@ async def signin(login_data: UserLogin):
                             "status": "active"
                         }
                     )
+                    agent_api_key = api_key
                     print(f"✅ Auto-created agent record for {login_data.email}")
+                else:
+                    # Return existing API key
+                    agent_api_key = existing_agent["api_key"]
             except Exception as e:
                 # Don't fail login if agent creation fails
                 print(f"⚠️ Could not create agent record: {e}")
@@ -269,12 +274,18 @@ async def signin(login_data: UserLogin):
         if "merchant_id" in acct:
             user_data["merchant_id"] = acct["merchant_id"]
         
-        return {
+        # Include agent_api_key in response for agents (only on login)
+        response_data = {
             "status": "success",
             "message": "Login successful",
             "token": token,
             "user": user_data
         }
+        
+        if agent_api_key:
+            response_data["agent_api_key"] = agent_api_key
+        
+        return response_data
     except HTTPException:
         raise
     except Exception as e:
