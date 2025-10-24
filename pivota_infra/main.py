@@ -84,6 +84,7 @@ from routes.agent_keys import router as agent_keys_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.create_test_agent import router as create_test_agent_router
 from routes.debug_agent_key import router as debug_agent_key_router
+from routes.debug_agents_table import router as debug_agents_table_router
 
 # Service routers (only include what exists)
 try:
@@ -185,6 +186,7 @@ app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(create_test_agent_router)  # Create test agent account
 app.include_router(debug_agent_key_router)  # Debug agent key
+app.include_router(debug_agents_table_router)  # Debug agents table
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
 app.include_router(dashboard_router)  # Dashboard API
