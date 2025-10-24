@@ -411,7 +411,6 @@ async def reset_agent_api_key(
         logger.error(f"Failed to reset API key: {e}")
         raise HTTPException(status_code=500, detail="Failed to reset API key")
 
-
 @router.get("/{agent_id}/funnel")
 async def get_agent_conversion_funnel(
     agent_id: str,
@@ -423,7 +422,7 @@ async def get_agent_conversion_funnel(
     Shows: orders_initiated → payment_attempted → orders_completed
     """
     try:
-        # Verify access
+        # Verify access (allow agent via agent_id/email fallback)
         if current_user.get("role") not in ["admin", "employee"]:
             user_agent_id = current_user.get("agent_id") or current_user.get("email")
             if user_agent_id != agent_id:
@@ -685,3 +684,4 @@ async def get_agent_merchant_authorizations(
     except Exception as e:
         logger.error(f"Failed to get merchant authorizations: {e}")
         raise HTTPException(status_code=500, detail="Failed to get merchant authorizations")
+
