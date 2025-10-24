@@ -11,6 +11,7 @@ import uvicorn
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
+from middleware.usage_logger import UsageLoggerMiddleware
 from middleware.structured_logging import StructuredLoggingMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -127,6 +128,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add usage logging middleware (tracks Agent API calls)
+app.add_middleware(UsageLoggerMiddleware)
 
 # Add rate limiting middleware for agent API (env-configurable)
 app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_rpm)
