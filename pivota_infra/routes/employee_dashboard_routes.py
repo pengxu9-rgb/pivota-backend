@@ -321,7 +321,10 @@ async def get_all_psps(
                 p.connected_at, p.capabilities,
                 m.business_name as merchant_name,
                 COUNT(o.order_id) as transaction_count,
-                COALESCE(SUM(o.total), 0) as total_volume
+                COALESCE(SUM(o.total), 0) as total_volume,
+                SUM(CASE WHEN LOWER(COALESCE(o.payment_status,'')) IN ('paid','succeeded','completed') 
+                         OR LOWER(COALESCE(o.status,'')) IN ('completed','delivered') 
+                    THEN 1 ELSE 0 END) as successful_count
             FROM merchant_psps p
             LEFT JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
             LEFT JOIN orders o ON p.merchant_id = o.merchant_id AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
@@ -338,6 +341,10 @@ async def get_all_psps(
             if row["capabilities"]:
                 capabilities = row["capabilities"].split(',')
             
+            transaction_count = row["transaction_count"] or 0
+            successful_count = row["successful_count"] or 0
+            success_rate = round((successful_count / transaction_count * 100), 1) if transaction_count > 0 else 0
+            
             psps.append({
                 "psp_id": row["psp_id"],
                 "provider": row["provider"],
@@ -347,7 +354,9 @@ async def get_all_psps(
                 "merchant_name": row["merchant_name"] or "Unknown Merchant",
                 "connected_at": row["connected_at"].isoformat() if row["connected_at"] else None,
                 "capabilities": capabilities,
-                "transaction_count": row["transaction_count"],
+                "transaction_count": transaction_count,
+                "successful_count": successful_count,
+                "success_rate": success_rate,
                 "total_volume": float(row["total_volume"]),
                 "is_active": row["status"] == "active"
             })

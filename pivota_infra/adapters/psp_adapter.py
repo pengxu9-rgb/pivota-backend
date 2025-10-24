@@ -327,7 +327,7 @@ def get_psp_adapter(psp_type: str, api_key: str, **kwargs) -> PSPAdapter:
     获取 PSP 适配器
     
     Args:
-        psp_type: PSP 类型 ("stripe" 或 "adyen")
+        psp_type: PSP 类型 ("stripe", "adyen", "checkout")
         api_key: API 密钥
         **kwargs: 其他 PSP 特定参数
     
@@ -344,6 +344,10 @@ def get_psp_adapter(psp_type: str, api_key: str, **kwargs) -> PSPAdapter:
     elif psp_type == "adyen":
         merchant_account = kwargs.get("merchant_account", "PivotaTestMerchant")
         return AdyenAdapter(api_key, merchant_account)
+    elif psp_type == "checkout":
+        from adapters.checkout_adapter import CheckoutAdapter
+        public_key = kwargs.get("public_key")
+        return CheckoutAdapter(api_key, public_key)
     else:
         raise ValueError(f"Unsupported PSP type: {psp_type}")
 

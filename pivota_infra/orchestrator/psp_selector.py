@@ -22,13 +22,16 @@ async def select_psp_for_agent_pay(req: AgentPayRequest) -> List[str]:
         # Adyen is preferred for EUR transactions
         psps.append("adyen")
         psps.append("stripe")  # fallback
+        psps.append("checkout")  # fallback 2
     elif currency in ["usd", "gbp", "cad", "aud"]:
         # Stripe is preferred for major English-speaking countries
         psps.append("stripe")
-        psps.append("adyen")  # fallback
+        psps.append("checkout")  # fallback
+        psps.append("adyen")  # fallback 2
     else:
-        # Default: try Stripe first, then Adyen
+        # Default: try Stripe first, then Checkout, then Adyen
         psps.append("stripe")
+        psps.append("checkout")
         psps.append("adyen")
     
     # TODO: Add historical success rate weighting
