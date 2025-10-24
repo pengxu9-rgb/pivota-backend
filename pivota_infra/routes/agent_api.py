@@ -563,10 +563,10 @@ async def agent_list_orders(
         if merchant_id and not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
-        # 构建查询
+        # 构建查询 - use agent_id column directly
         query = f"""
             SELECT * FROM orders 
-            WHERE metadata->>'agent_id' = :agent_id
+            WHERE agent_id = :agent_id
         """
         params = {"agent_id": context.agent_id}
         
