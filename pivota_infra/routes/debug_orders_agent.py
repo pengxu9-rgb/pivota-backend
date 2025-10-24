@@ -16,7 +16,7 @@ async def debug_orders_by_agent(agent_id: str, days: int = 7):
         # Get all orders for this agent
         orders = await database.fetch_all(
             """
-            SELECT order_id, agent_id, payment_status, status, created_at, total
+            SELECT order_id, agent_id, merchant_id, payment_status, status, created_at, total
             FROM orders
             WHERE agent_id = :agent_id 
             AND created_at >= :since
@@ -59,6 +59,7 @@ async def debug_orders_by_agent(agent_id: str, days: int = 7):
                 {
                     "order_id": order["order_id"],
                     "agent_id": order["agent_id"],
+                    "merchant_id": order["merchant_id"],
                     "payment_status": order["payment_status"],
                     "status": order["status"],
                     "total": float(order["total"]) if order["total"] else 0,
