@@ -134,16 +134,44 @@ async def create_agent(
 
 
 async def get_agent_by_key(api_key: str) -> Optional[Dict[str, Any]]:
-    """通过 API Key 获取 Agent（用于认证）"""
+    """通过 API Key 获取 Agent（用于认证）
+
+    支持两种来源：
+    1) agents.api_key （旧/兼容）
+    2) api_keys.key_hash（新，多密钥），仅匹配 status='active' 的密钥
+    """
     try:
-        # Use raw SQL to be resilient to schema differences
-        result = await database.fetch_one("SELECT * FROM agents WHERE api_key = :api_key LIMIT 1", {"api_key": api_key})
+        # 1) Try direct match on legacy agents.api_key
+        result = await database.fetch_one(
+            "SELECT * FROM agents WHERE api_key = :api_key LIMIT 1",
+            {"api_key": api_key}
+        )
+        
+        # 2) If not found, try hashed match in api_keys table
+        if not result:
+            try:
+                import hashlib
+                key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+                result = await database.fetch_one(
+                    """
+                    SELECT a.*
+                    FROM agents a
+                    JOIN api_keys k ON k.agent_id = a.agent_id
+                    WHERE k.key_hash = :key_hash AND k.status = 'active'
+                    LIMIT 1
+                    """,
+                    {"key_hash": key_hash}
+                )
+            except Exception as _e:
+                # api_keys table may not exist in some environments
+                result = None
+
         if not result:
             return None
+
         agent = dict(result)
         
         # Normalize field names across schemas
-        # Map name -> agent_name if needed
         if "agent_name" not in agent and "name" in agent:
             agent["agent_name"] = agent["name"]
         
