@@ -630,10 +630,12 @@ async def get_agent_query_analytics(
 @router.get("/{agent_id}/merchants")
 async def get_agent_merchant_authorizations(
     agent_id: str,
+    include_stats: bool = False,  # Only calculate stats when explicitly requested
     current_user: dict = Depends(get_current_user)
 ):
     """
     Get list of merchants this agent is authorized to access
+    Set include_stats=true to get order statistics (slower)
     """
     try:
         # Verify access
@@ -651,31 +653,8 @@ async def get_agent_merchant_authorizations(
         
         # If null, agent has access to all merchants
         if allowed_merchants is None:
-            merchants = await database.fetch_all(
-                """
-                SELECT 
-                    m.merchant_id, 
-                    m.business_name, 
-                    m.status,
-                    m.contact_email,
-                    m.store_url,
-                    m.region,
-                    COUNT(DISTINCT o.order_id) as total_orders,
-                    COALESCE(SUM(o.total), 0) as total_gmv
-                FROM merchant_onboarding m
-                LEFT JOIN orders o ON m.merchant_id = o.merchant_id 
-                    AND o.agent_id = :agent_id
-                    AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
-                WHERE m.status = 'approved'
-                GROUP BY m.merchant_id, m.business_name, m.status, m.contact_email, m.store_url, m.region
-                LIMIT 100
-                """,
-                {"agent_id": agent_id}
-            )
-        else:
-            if len(allowed_merchants) == 0:
-                merchants = []
-            else:
+            if include_stats:
+                # Slower query with statistics
                 merchants = await database.fetch_all(
                     """
                     SELECT 
@@ -691,30 +670,94 @@ async def get_agent_merchant_authorizations(
                     LEFT JOIN orders o ON m.merchant_id = o.merchant_id 
                         AND o.agent_id = :agent_id
                         AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
-                    WHERE m.merchant_id = ANY(:merchant_ids)
+                    WHERE m.status = 'approved'
                     GROUP BY m.merchant_id, m.business_name, m.status, m.contact_email, m.store_url, m.region
+                    LIMIT 100
                     """,
-                    {"merchant_ids": allowed_merchants, "agent_id": agent_id}
+                    {"agent_id": agent_id}
                 )
+            else:
+                # Fast query without statistics
+                merchants = await database.fetch_all(
+                    """
+                    SELECT 
+                        merchant_id, 
+                        business_name, 
+                        status,
+                        contact_email,
+                        store_url,
+                        region
+                    FROM merchant_onboarding
+                    WHERE status = 'approved'
+                    LIMIT 100
+                    """
+                )
+        else:
+            if len(allowed_merchants) == 0:
+                merchants = []
+            else:
+                if include_stats:
+                    # Slower query with statistics
+                    merchants = await database.fetch_all(
+                        """
+                        SELECT 
+                            m.merchant_id, 
+                            m.business_name, 
+                            m.status,
+                            m.contact_email,
+                            m.store_url,
+                            m.region,
+                            COUNT(DISTINCT o.order_id) as total_orders,
+                            COALESCE(SUM(o.total), 0) as total_gmv
+                        FROM merchant_onboarding m
+                        LEFT JOIN orders o ON m.merchant_id = o.merchant_id 
+                            AND o.agent_id = :agent_id
+                            AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+                        WHERE m.merchant_id = ANY(:merchant_ids)
+                        GROUP BY m.merchant_id, m.business_name, m.status, m.contact_email, m.store_url, m.region
+                        """,
+                        {"merchant_ids": allowed_merchants, "agent_id": agent_id}
+                    )
+                else:
+                    # Fast query without statistics
+                    merchants = await database.fetch_all(
+                        """
+                        SELECT 
+                            merchant_id, 
+                            business_name, 
+                            status,
+                            contact_email,
+                            store_url,
+                            region
+                        FROM merchant_onboarding
+                        WHERE merchant_id = ANY(:merchant_ids)
+                        """,
+                        {"merchant_ids": allowed_merchants}
+                    )
+        
+        # Build merchant list
+        merchant_list = []
+        for m in merchants:
+            merchant_dict = {
+                "merchant_id": m["merchant_id"],
+                "business_name": m["business_name"],
+                "status": m["status"],
+                "contact_email": m.get("contact_email"),
+                "store_url": m.get("store_url"),
+                "region": m.get("region")
+            }
+            # Only include stats if they were requested
+            if include_stats:
+                merchant_dict["total_orders"] = m.get("total_orders", 0)
+                merchant_dict["total_gmv"] = float(m.get("total_gmv", 0))
+            merchant_list.append(merchant_dict)
         
         return {
             "status": "success",
             "agent_id": agent_id,
             "access_type": "all" if allowed_merchants is None else "restricted",
-            "merchants": [
-                {
-                    "merchant_id": m["merchant_id"],
-                    "business_name": m["business_name"],
-                    "status": m["status"],
-                    "contact_email": m["contact_email"],
-                    "store_url": m["store_url"],
-                    "region": m["region"],
-                    "total_orders": m["total_orders"],
-                    "total_gmv": float(m["total_gmv"])
-                }
-                for m in merchants
-            ],
-            "count": len(merchants)
+            "merchants": merchant_list,
+            "count": len(merchant_list)
         }
         
     except HTTPException:
