@@ -37,22 +37,23 @@ class CheckoutAdapter(PSPAdapter):
                 "Content-Type": "application/json"
             }
             
-            # For testing: use Checkout test card
-            # In production, this would be a real payment token from the frontend
+            # For Checkout.com, we'll create a payment intent that frontend can complete
+            # Using a simple approach that works without processing_channel_id
             payload = {
-                "source": {
-                    "type": "card",
-                    "number": "4242424242424242",  # Checkout test card
-                    "expiry_month": 12,
-                    "expiry_year": 2025,
-                    "cvv": "100"
-                },
                 "amount": int(amount * 100),  # Checkout uses minor units (cents)
                 "currency": currency.upper(),
                 "reference": metadata.get("order_id", "ORDER"),
                 "metadata": metadata,
-                "capture": True,  # Auto-capture on authorization
+                "customer": {
+                    "email": metadata.get("customer_email", "customer@example.com")
+                },
+                "payment_type": "Regular",
+                "capture": True
             }
+            
+            # Add processing channel if available (from account_id or public_key)
+            if self.public_key:
+                payload["processing_channel_id"] = self.public_key
             
             print(f"   Payload: amount={payload['amount']}, currency={payload['currency']}")
             

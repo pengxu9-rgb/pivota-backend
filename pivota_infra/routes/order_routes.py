@@ -236,31 +236,32 @@ async def create_new_order(
             if not psp_type:
                 psp_type = merchant.get("psp_type")
             if not psp_type:
-                    try:
-                        psp_row = await database.fetch_one(
-                            """
-                            SELECT provider FROM merchant_psps
-                            WHERE merchant_id = :merchant_id
-                            ORDER BY connected_at DESC
-                            LIMIT 1
-                            """,
-                            {"merchant_id": order_request.merchant_id}
-                        )
-                        if psp_row:
-                            psp_type = psp_row["provider"]
-                    except Exception:
-                        psp_type = None
+                try:
+                    psp_row = await database.fetch_one(
+                        """
+                        SELECT provider FROM merchant_psps
+                        WHERE merchant_id = :merchant_id
+                        ORDER BY connected_at DESC
+                        LIMIT 1
+                        """,
+                        {"merchant_id": order_request.merchant_id}
+                    )
+                    if psp_row:
+                        psp_type = psp_row["provider"]
+                except Exception:
+                    psp_type = None
             if not psp_type:
-                    psp_type = "stripe"
+                psp_type = "stripe"
 
             # PSP 密钥查找：优先从 merchant_psps 表
             psp_key = None
+            psp_account_id = None
             
-            # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key
+            # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key 和 account_id
             try:
                 psp_row = await database.fetch_one(
                     """
-                    SELECT api_key FROM merchant_psps
+                    SELECT api_key, account_id FROM merchant_psps
                     WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
                     ORDER BY connected_at DESC
                     LIMIT 1
@@ -269,6 +270,7 @@ async def create_new_order(
                 )
                 if psp_row and psp_row["api_key"]:
                     psp_key = psp_row["api_key"]
+                    psp_account_id = psp_row.get("account_id")
                     logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
             except Exception as e:
                 logger.warning(f"DB PSP key lookup failed: {e}")
@@ -296,7 +298,12 @@ async def create_new_order(
                 # Don't fail order creation, just skip payment intent
             else:
                 # 创建支付意图
-                psp_adapter = get_psp_adapter(psp_type, psp_key)
+                # Pass additional parameters for specific PSPs
+                adapter_kwargs = {}
+                if psp_type == "checkout" and psp_account_id:
+                    adapter_kwargs["public_key"] = psp_account_id
+                
+                psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
                 success, payment_intent, error = await psp_adapter.create_payment_intent(
                     amount=total,
                     currency=order_request.currency,
