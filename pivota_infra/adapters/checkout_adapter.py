@@ -27,20 +27,29 @@ class CheckoutAdapter(PSPAdapter):
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str]]:
         """Create a Checkout.com payment session"""
         try:
+            # Log for debugging
+            print(f"🔍 Checkout: Creating payment intent for {amount} {currency}")
+            print(f"   API Key: {self.api_key[:20]}... (len={len(self.api_key)})")
+            print(f"   Base URL: {self.base_url}")
+            
             headers = {
                 "Authorization": self.api_key,
                 "Content-Type": "application/json"
             }
             
             payload = {
+                "source": {
+                    "type": "token",
+                    "token": "tok_test"  # For testing, use test token
+                },
                 "amount": int(amount * 100),  # Checkout uses minor units (cents)
                 "currency": currency.upper(),
                 "reference": metadata.get("order_id", "ORDER"),
                 "metadata": metadata,
                 "capture": True,  # Auto-capture on authorization
-                "success_url": "https://your-site.com/payment/success",
-                "failure_url": "https://your-site.com/payment/failure",
             }
+            
+            print(f"   Payload: amount={payload['amount']}, currency={payload['currency']}")
             
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -50,14 +59,17 @@ class CheckoutAdapter(PSPAdapter):
                     timeout=10.0
                 )
                 
+                print(f"   Response: {response.status_code}")
+                
                 if response.status_code in [200, 201, 202]:
                     data = response.json()
+                    print(f"   ✅ Checkout payment created: {data.get('id', 'unknown')[:30]}")
                     
                     return (
                         True,
                         PaymentIntent(
                             id=data.get("id", ""),
-                            client_secret=data.get("_links", {}).get("redirect", {}).get("href", ""),
+                            client_secret=data.get("_links", {}).get("redirect", {}).get("href", "") or f"checkout_{data.get('id','')}",
                             amount=int(amount * 100),
                             currency=currency,
                             status=data.get("status", "pending").lower(),
@@ -68,11 +80,15 @@ class CheckoutAdapter(PSPAdapter):
                     )
                 else:
                     error_data = response.json() if response.text else {}
-                    return False, None, f"Checkout API error: {response.status_code} - {error_data.get('error_type', response.text)}"
+                    error_msg = f"Checkout API error: {response.status_code} - {error_data.get('error_type', '')} {error_data.get('error_codes', '')} {response.text[:200]}"
+                    print(f"   ❌ {error_msg}")
+                    return False, None, error_msg
                     
         except httpx.TimeoutException:
+            print("   ❌ Checkout API timeout")
             return False, None, "Checkout API timeout"
         except Exception as e:
+            print(f"   ❌ Checkout error: {e}")
             return False, None, f"Checkout error: {str(e)}"
     
     async def confirm_payment(
