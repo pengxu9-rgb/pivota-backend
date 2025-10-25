@@ -320,6 +320,7 @@ async def get_all_psps(
             SELECT 
                 p.psp_id, p.provider, p.name, p.status, p.merchant_id,
                 p.connected_at, p.capabilities,
+                p.api_key, p.account_id,
                 m.business_name as merchant_name
             FROM merchant_psps p
             LEFT JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
@@ -364,6 +365,8 @@ async def get_all_psps(
                 "merchant_name": row["merchant_name"] or "Unknown Merchant",
                 "connected_at": row["connected_at"].isoformat() if row["connected_at"] else None,
                 "capabilities": capabilities,
+                "api_key": row["api_key"],  # Include for Configure form
+                "account_id": row["account_id"],  # Include for Configure form
                 "transaction_count": transaction_count,
                 "successful_count": successful_count,
                 "success_rate": success_rate,
