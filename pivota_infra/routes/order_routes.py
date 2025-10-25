@@ -316,6 +316,7 @@ async def create_new_order(
                 if success and payment_intent:
                     payment_intent_id = payment_intent.id
                     client_secret = payment_intent.client_secret
+                    logger.info(f"✅ Payment intent created: {payment_intent_id}")
                     
                     await update_payment_info(
                         order_id=order_id,
