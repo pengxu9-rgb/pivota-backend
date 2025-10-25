@@ -251,33 +251,43 @@ async def create_new_order(
                 if not psp_type:
                     psp_type = "stripe"
 
-                # PSP 密钥回退：先查数据库，再查环境变量
-                psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-                if not psp_key:
-                    # Try merchant_psps table
-                    try:
-                        psp_row = await database.fetch_one(
-                            """
-                            SELECT api_key FROM merchant_psps
-                            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
-                            ORDER BY connected_at DESC
-                            LIMIT 1
-                            """,
-                            {"merchant_id": order_request.merchant_id, "provider": psp_type}
-                        )
-                        if psp_row and psp_row["api_key"]:
-                            psp_key = psp_row["api_key"]
-                            logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
-                    except Exception as e:
-                        logger.warning(f"DB PSP key lookup failed: {e}")
+                # PSP 密钥查找：优先从 merchant_psps 表
+                psp_key = None
                 
+                # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key
+                try:
+                    psp_row = await database.fetch_one(
+                        """
+                        SELECT api_key FROM merchant_psps
+                        WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+                        ORDER BY connected_at DESC
+                        LIMIT 1
+                        """,
+                        {"merchant_id": order_request.merchant_id, "provider": psp_type}
+                    )
+                    if psp_row and psp_row["api_key"]:
+                        psp_key = psp_row["api_key"]
+                        logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
+                except Exception as e:
+                    logger.warning(f"DB PSP key lookup failed: {e}")
+                
+                # 2. 如果数据库没有，且是 Stripe，尝试从 merchant 表获取（兼容旧数据）
+                if not psp_key and psp_type == "stripe":
+                    psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
+                    if psp_key:
+                        logger.info(f"Using legacy Stripe key from merchant table")
+                
+                # 3. 最后回退到环境变量（仅 Stripe 和 Adyen）
                 if not psp_key:
-                    # Fallback to environment variables (not for Checkout)
                     if psp_type == "stripe":
                         psp_key = getattr(settings, "stripe_secret_key", None)
+                        if psp_key:
+                            logger.info(f"Using Stripe key from environment")
                     elif psp_type == "adyen":
                         psp_key = getattr(settings, "adyen_api_key", None)
-                    # Note: Checkout must use DB key, no env var fallback
+                        if psp_key:
+                            logger.info(f"Using Adyen key from environment")
+                    # Note: Checkout MUST use DB key, no env var fallback
                 
                 if not psp_key:
                     raise ValueError(f"No {psp_type} API key found for merchant {merchant['merchant_id']}")
