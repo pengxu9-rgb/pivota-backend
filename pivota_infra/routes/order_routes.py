@@ -166,7 +166,7 @@ async def create_new_order(
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
-                    {"merchant_id": order_request.merchant_id}
+                {"merchant_id": order_request.merchant_id}
                 )
             except Exception:
                 psp_row = None
@@ -270,7 +270,10 @@ async def create_new_order(
                 )
                 if psp_row and psp_row["api_key"]:
                     psp_key = psp_row["api_key"]
-                    psp_account_id = psp_row.get("account_id")
+                    try:
+                        psp_account_id = psp_row["account_id"]
+                    except Exception:
+                        psp_account_id = None
                     logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
             except Exception as e:
                 logger.warning(f"DB PSP key lookup failed: {e}")
@@ -440,7 +443,7 @@ async def confirm_payment(
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
-                    {"merchant_id": order_request.merchant_id}
+                    {"merchant_id": order["merchant_id"]}
                 )
                 if psp_row:
                     psp_type = psp_row["provider"]
