@@ -265,30 +265,54 @@ async def admin_connect_psp(
     payload: Dict[str, Any] = Body(...),
     current_user: dict = Depends(require_admin)
 ):
-    """Admin: connect a PSP for a merchant (supports stripe/adyen/checkout)."""
+    """Admin: connect/update a PSP for a merchant (supports stripe/adyen/checkout)."""
     provider = str(payload.get("provider", "")).lower()
     merchant_id = payload.get("merchant_id")
     api_key = payload.get("api_key")
     account_id = payload.get("account_id")
+    psp_id = payload.get("psp_id")
     name = payload.get("name") or f"{provider.capitalize()} Account"
+    
     if provider not in ("stripe", "adyen", "checkout"):
         raise HTTPException(status_code=400, detail="Unsupported provider. Use stripe/adyen/checkout")
-    if not merchant_id:
-        raise HTTPException(status_code=400, detail="merchant_id is required")
     if not api_key or len(api_key) < 8:
         raise HTTPException(status_code=400, detail="Invalid api_key")
 
-    psp_id = payload.get("psp_id") or f"psp_{provider}_{datetime.now().strftime('%H%M%S%f')}"
+    # If updating existing PSP (has psp_id but no merchant_id)
+    if psp_id and not merchant_id:
+        # Fetch merchant_id from existing record
+        existing = await database.fetch_one(
+            "SELECT merchant_id, provider FROM merchant_psps WHERE psp_id = :psp_id",
+            {"psp_id": psp_id}
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="PSP not found")
+        merchant_id = existing["merchant_id"]
+        provider = existing["provider"]  # Keep original provider
+    
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+
+    # Generate psp_id if creating new
+    if not psp_id:
+        psp_id = f"psp_{provider}_{datetime.now().strftime('%H%M%S%f')}"
+    
     capabilities = payload.get("capabilities") or (
         ["payments", "refunds", "payouts"] if provider == "stripe" else
         ["payments", "refunds"]
     )
+    
     try:
+        # Use UPSERT to update if exists, insert if not
         await database.execute(
             """
-            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
-            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, 'active', :connected_at)
-            ON CONFLICT (psp_id) DO NOTHING
+            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at, updated_at)
+            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, 'active', :connected_at, :updated_at)
+            ON CONFLICT (psp_id) DO UPDATE SET
+                api_key = EXCLUDED.api_key,
+                account_id = EXCLUDED.account_id,
+                name = EXCLUDED.name,
+                updated_at = EXCLUDED.updated_at
             """,
             {
                 "psp_id": psp_id,
@@ -299,6 +323,7 @@ async def admin_connect_psp(
                 "account_id": account_id or None,
                 "capabilities": ",".join(capabilities),
                 "connected_at": datetime.now(),
+                "updated_at": datetime.now(),
             }
         )
         # Mark merchant onboarding flags for dashboard
@@ -310,7 +335,7 @@ async def admin_connect_psp(
             """,
             {"provider": provider, "merchant_id": merchant_id}
         )
-        return {"status": "success", "message": f"{provider} connected", "psp_id": psp_id}
+        return {"status": "success", "message": f"{provider} connected/updated", "psp_id": psp_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to connect PSP: {e}")
 
