@@ -275,6 +275,7 @@ async def create_new_order(
                     except Exception:
                         psp_account_id = None
                     logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
+                    logger.info(f"  API Key length: {len(psp_key)}, Account ID: {psp_account_id}")
             except Exception as e:
                 logger.warning(f"DB PSP key lookup failed: {e}")
             
@@ -309,7 +310,9 @@ async def create_new_order(
                 adapter_kwargs = {}
                 if psp_type == "checkout" and psp_account_id:
                     adapter_kwargs["public_key"] = psp_account_id
-                    
+                    logger.info(f"🔧 Creating Checkout adapter with processing_channel_id: {psp_account_id}")
+                
+                logger.info(f"📡 Creating {psp_type} payment intent for ${total} {order_request.currency}")
                 psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
                 success, payment_intent, error = await psp_adapter.create_payment_intent(
                     amount=total,
