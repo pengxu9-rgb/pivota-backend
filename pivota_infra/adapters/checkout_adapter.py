@@ -65,10 +65,14 @@ class CheckoutAdapter(PSPAdapter):
                             f"{self.base_url}/hosted-payments", json=payload, headers=headers, timeout=15.0
                         )
                     print(f"   Response: {resp.status_code}")
+                    print(f"   Response Body: {resp.text[:500]}")
+                    
                     if resp.status_code in (200, 201):
                         data = resp.json()
                         session_id = data.get("id") or data.get("reference") or metadata.get("order_id")
                         redirect_url = data.get("_links", {}).get("redirect", {}).get("href")
+                        print(f"   ✅ Payment session created: {session_id}")
+                        print(f"   🔗 Redirect URL: {redirect_url}")
                         # Use redirect_url as client_secret surrogate for now
                         return (
                             True,
@@ -86,9 +90,11 @@ class CheckoutAdapter(PSPAdapter):
                     else:
                         err = resp.text[:400]
                         print(f"   ❌ Hosted payments error: {resp.status_code} - {err}")
-                        # Fall back to mock if real fails
+                        # Don't fall back to mock - return the error
+                        return False, None, f"Checkout API error {resp.status_code}: {err}"
                 except Exception as e:
                     print(f"   ❌ Hosted payments exception: {e}")
+                    return False, None, f"Checkout exception: {str(e)}"
 
             # Default mock flow
             mock_payment_id = f"pay_checkout_{metadata.get('order_id', 'test')}"
