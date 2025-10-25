@@ -306,13 +306,12 @@ async def admin_connect_psp(
         # Use UPSERT to update if exists, insert if not
         await database.execute(
             """
-            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at, updated_at)
-            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, 'active', :connected_at, :updated_at)
+            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
+            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, 'active', :connected_at)
             ON CONFLICT (psp_id) DO UPDATE SET
                 api_key = EXCLUDED.api_key,
                 account_id = EXCLUDED.account_id,
-                name = EXCLUDED.name,
-                updated_at = EXCLUDED.updated_at
+                name = EXCLUDED.name
             """,
             {
                 "psp_id": psp_id,
@@ -323,7 +322,6 @@ async def admin_connect_psp(
                 "account_id": account_id or None,
                 "capabilities": ",".join(capabilities),
                 "connected_at": datetime.now(),
-                "updated_at": datetime.now(),
             }
         )
         # Mark merchant onboarding flags for dashboard
