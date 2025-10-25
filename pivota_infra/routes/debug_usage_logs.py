@@ -64,3 +64,4 @@ async def usage_logs_recent(limit: int = 25) -> Dict[str, Any]:
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
+

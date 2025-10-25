@@ -24,3 +24,4 @@ echo "If payment_intent is NULL, check Railway logs for:"
 echo "1. 'No stripe API key found'"
 echo "2. 'Payment intent creation failed'"
 echo "3. Any error messages"
+

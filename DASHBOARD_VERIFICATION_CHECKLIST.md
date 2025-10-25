@@ -176,3 +176,4 @@ WHERE created_at >= NOW() - INTERVAL '7 days';
 如果 Dashboard 显示的数字接近这些，说明映射正确！
 
 
+

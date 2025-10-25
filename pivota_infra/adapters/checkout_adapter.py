@@ -40,7 +40,10 @@ class CheckoutAdapter(PSPAdapter):
             
             print(f"   Payload: amount={int(amount * 100)}, currency={currency.upper()}")
 
-            if settings.checkout_mode.lower() == "real":
+            # Use real mode when we have a real API key (not mock)
+            use_real_mode = settings.checkout_mode.lower() == "real" or (self.api_key and not self.api_key.startswith("sk_mock"))
+            
+            if use_real_mode:
                 # Create Hosted Payment Page session
                 payload = {
                     "amount": int(amount * 100),

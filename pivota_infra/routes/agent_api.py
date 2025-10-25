@@ -440,25 +440,6 @@ async def agent_create_order(
         # 调用标准订单创建
         from routes.order_routes import create_new_order
         order_response = await create_new_order(order_request, background_tasks)
-
-        # Checkout fallback: ensure mock payment intent exists for testing
-        try:
-            if (order_request.preferred_psp and order_request.preferred_psp.lower() == "checkout") \
-               and not order_response.payment_intent_id:
-                mock_id = f"pay_checkout_{order_response.order_id}"
-                mock_cs = f"checkout_cs_{mock_id}"
-                await update_payment_info(
-                    order_id=order_response.order_id,
-                    payment_intent_id=mock_id,
-                    client_secret=mock_cs,
-                    payment_status="awaiting_payment"
-                )
-                # Reflect in response object
-                order_response.payment_intent_id = mock_id
-                order_response.client_secret = mock_cs
-                logger.info(f"✅ Agent fallback set mock Checkout intent: {mock_id}")
-        except Exception as e:
-            logger.warning(f"Checkout fallback failed: {e}")
         
         # 计算订单总额
         order_amount = float(order_response.total)

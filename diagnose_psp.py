@@ -35,3 +35,4 @@ print("2. API key invalid → 401 error")
 print("3. Payload incorrect → 422 error")
 print("4. Code exception → no API call at all")
 
+
