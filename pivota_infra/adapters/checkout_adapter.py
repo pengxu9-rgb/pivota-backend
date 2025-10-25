@@ -49,11 +49,16 @@ class CheckoutAdapter(PSPAdapter):
                     "amount": int(amount * 100),
                     "currency": currency.upper(),
                     "reference": metadata.get("order_id", "ORDER"),
-                    "success_url": settings.checkout_success_url,
-                    "cancel_url": settings.checkout_cancel_url,
+                    "success_url": f"{settings.checkout_success_url}?order_id={metadata.get('order_id', '')}",
+                    "cancel_url": f"{settings.checkout_cancel_url}?order_id={metadata.get('order_id', '')}",
                     "customer": {"email": metadata.get("customer_email")},
                     "metadata": metadata,
                 }
+                
+                # Add processing_channel_id if available (stored in public_key/account_id)
+                if self.public_key:
+                    payload["processing_channel_id"] = self.public_key
+                    print(f"   Using processing_channel_id: {self.public_key}")
                 try:
                     async with httpx.AsyncClient() as client:
                         resp = await client.post(
