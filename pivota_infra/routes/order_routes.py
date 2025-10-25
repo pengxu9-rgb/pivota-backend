@@ -226,14 +226,16 @@ async def create_new_order(
         }
         order_id = await create_order(order_data)
 
-        # 5. 后台创建 Payment Intent（不阻塞）
-        async def create_payment_intent_task():
-            try:
-                # PSP 类型选择：优先使用 preferred_psp，否则回退
-                psp_type = order_request.preferred_psp
-                if not psp_type:
-                    psp_type = merchant.get("psp_type")
-                if not psp_type:
+        # 5. 同步创建 Payment Intent（立即返回结果）
+        payment_intent_id = None
+        client_secret = None
+        
+        try:
+            # PSP 类型选择：优先使用 preferred_psp，否则回退
+            psp_type = order_request.preferred_psp
+            if not psp_type:
+                psp_type = merchant.get("psp_type")
+            if not psp_type:
                     try:
                         psp_row = await database.fetch_one(
                             """
@@ -248,15 +250,15 @@ async def create_new_order(
                             psp_type = psp_row["provider"]
                     except Exception:
                         psp_type = None
-                if not psp_type:
+            if not psp_type:
                     psp_type = "stripe"
 
-                # PSP 密钥查找：优先从 merchant_psps 表
-                psp_key = None
-                
-                # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key
-                try:
-                    psp_row = await database.fetch_one(
+            # PSP 密钥查找：优先从 merchant_psps 表
+            psp_key = None
+            
+            # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key
+            try:
+                psp_row = await database.fetch_one(
                         """
                         SELECT api_key FROM merchant_psps
                         WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
@@ -268,16 +270,16 @@ async def create_new_order(
                     if psp_row and psp_row["api_key"]:
                         psp_key = psp_row["api_key"]
                         logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
-                except Exception as e:
-                    logger.warning(f"DB PSP key lookup failed: {e}")
+            except Exception as e:
+                logger.warning(f"DB PSP key lookup failed: {e}")
                 
-                # 2. 如果数据库没有，且是 Stripe，尝试从 merchant 表获取（兼容旧数据）
-                if not psp_key and psp_type == "stripe":
+            # 2. 如果数据库没有，且是 Stripe，尝试从 merchant 表获取（兼容旧数据）
+            if not psp_key and psp_type == "stripe":
                     psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
                     if psp_key:
                         logger.info(f"Using legacy Stripe key from merchant table")
                 
-                # 3. 最后回退到环境变量（仅 Stripe 和 Adyen）
+            # 3. 最后回退到环境变量（仅 Stripe 和 Adyen）
                 if not psp_key:
                     if psp_type == "stripe":
                         psp_key = getattr(settings, "stripe_secret_key", None)
@@ -287,10 +289,12 @@ async def create_new_order(
                         psp_key = getattr(settings, "adyen_api_key", None)
                         if psp_key:
                             logger.info(f"Using Adyen key from environment")
-                    # Note: Checkout MUST use DB key, no env var fallback
+                # Note: Checkout MUST use DB key, no env var fallback
                 
-                if not psp_key:
-                    raise ValueError(f"No {psp_type} API key found for merchant {merchant['merchant_id']}")
+            if not psp_key:
+                logger.error(f"No {psp_type} API key found for merchant {merchant['merchant_id']}"
+                # Don't fail order creation, just skip payment intent
+            else:(f"No {psp_type} API key found for merchant {merchant['merchant_id']}")
 
                 # 创建支付意图
                 psp_adapter = get_psp_adapter(psp_type, psp_key)
@@ -304,10 +308,13 @@ async def create_new_order(
                     }
                 )
                 if success and payment_intent:
+                    payment_intent_id = payment_intent.id
+                    client_secret = payment_intent.client_secret
+                    
                     await update_payment_info(
                         order_id=order_id,
-                        payment_intent_id=payment_intent.id,
-                        client_secret=payment_intent.client_secret,
+                        payment_intent_id=payment_intent_id,
+                        client_secret=client_secret,
                         payment_status="awaiting_payment"
                     )
                     await log_order_event(
@@ -318,28 +325,28 @@ async def create_new_order(
                             "total": float(total),
                             "currency": order_request.currency,
                             "items_count": len(order_request.items),
-                            "payment_intent_id": payment_intent.id,
+                            "payment_intent_id": payment_intent_id,
                             "psp_type": psp_type
                         }
                     )
                 else:
+                    logger.error(f"Payment intent creation failed: {error}")
                     await log_order_event(
                         event_type="payment_intent_failed",
                         order_id=order_id,
                         merchant_id=order_request.merchant_id,
                         metadata={"error": error, "psp_type": psp_type}
                     )
-            except Exception as e:
-                await log_order_event(
+        except Exception as e:
+            logger.error(f"Payment intent creation error: {e}")
+            await log_order_event(
                     event_type="payment_intent_error",
                     order_id=order_id,
                     merchant_id=order_request.merchant_id,
                     metadata={"error": str(e)}
                 )
 
-        background_tasks.add_task(create_payment_intent_task)
-
-        # 6. 返回订单信息
+        # 6. 返回订单信息（支付已同步创建）
         return OrderResponse(
             order_id=order_id,
             merchant_id=order_request.merchant_id,
@@ -352,7 +359,9 @@ async def create_new_order(
             total=float(total),
             currency=order_request.currency,
             status="pending",
-            payment_status="pending",
+            payment_status="awaiting_payment" if payment_intent_id else "pending",
+            payment_intent_id=payment_intent_id,
+            client_secret=client_secret,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
