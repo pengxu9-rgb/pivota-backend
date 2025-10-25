@@ -113,42 +113,7 @@ class CheckoutAdapter(PSPAdapter):
                 ),
                 None,
             )
-            
-            # Old API call code (keeping for reference)
-            """
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.base_url}/payments",
-                    json=payload,
-                    headers=headers,
-                    timeout=10.0
-                )
-                
-                print(f"   Response: {response.status_code}")
-                
-                if response.status_code in [200, 201, 202]:
-                    data = response.json()
-                    print(f"   ✅ Checkout payment created: {data.get('id', 'unknown')[:30]}")
-                    
-                    return (
-                        True,
-                        PaymentIntent(
-                            id=data.get("id", ""),
-                            client_secret=data.get("_links", {}).get("redirect", {}).get("href", "") or f"checkout_{data.get('id','')}",
-                            amount=int(amount * 100),
-                            currency=currency,
-                            status=data.get("status", "pending").lower(),
-                            psp_type="checkout",
-                            raw_response=data
-                        ),
-                        None
-                    )
-                else:
-                    error_data = response.json() if response.text else {}
-                    error_msg = f"Checkout API error: {response.status_code} - {error_data.get('error_type', '')} {error_data.get('error_codes', '')} {response.text[:200]}"
-                    print(f"   ❌ {error_msg}")
-                    return False, None, error_msg
-                    
+        
         except httpx.TimeoutException:
             print("   ❌ Checkout API timeout")
             return False, None, "Checkout API timeout"
