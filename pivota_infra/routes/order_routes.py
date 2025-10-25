@@ -262,7 +262,7 @@ async def create_new_order(
                 psp_row = await database.fetch_one(
                     """
                     SELECT api_key, account_id FROM merchant_psps
-                    WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+                    WHERE merchant_id = :merchant_id AND provider = :provider
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
