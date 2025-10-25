@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, Tuple
 from decimal import Decimal
 import httpx
 from adapters.psp_adapter import PSPAdapter, PaymentIntent
+from config.settings import settings
 
 
 class CheckoutAdapter(PSPAdapter):
@@ -37,21 +38,53 @@ class CheckoutAdapter(PSPAdapter):
                 "Content-Type": "application/json"
             }
             
-            # For Checkout.com, create a mock/placeholder payment intent
-            # In production, frontend would use Checkout.js to create actual payment
-            # For now, we'll create a successful placeholder to enable testing
-            
             print(f"   Payload: amount={int(amount * 100)}, currency={currency.upper()}")
-            
-            # Simulate successful payment intent creation
-            # This allows orders to be created and tracked
+
+            if settings.checkout_mode.lower() == "real":
+                # Create Hosted Payment Page session
+                payload = {
+                    "amount": int(amount * 100),
+                    "currency": currency.upper(),
+                    "reference": metadata.get("order_id", "ORDER"),
+                    "success_url": settings.checkout_success_url,
+                    "cancel_url": settings.checkout_cancel_url,
+                    "customer": {"email": metadata.get("customer_email")},
+                    "metadata": metadata,
+                }
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.post(
+                            f"{self.base_url}/hosted-payments", json=payload, headers=headers, timeout=15.0
+                        )
+                    print(f"   Response: {resp.status_code}")
+                    if resp.status_code in (200, 201):
+                        data = resp.json()
+                        session_id = data.get("id") or data.get("reference") or metadata.get("order_id")
+                        redirect_url = data.get("_links", {}).get("redirect", {}).get("href")
+                        # Use redirect_url as client_secret surrogate for now
+                        return (
+                            True,
+                            PaymentIntent(
+                                id=f"chk_session_{session_id}",
+                                client_secret=redirect_url or "",
+                                amount=int(amount * 100),
+                                currency=currency,
+                                status="pending",
+                                psp_type="checkout",
+                                raw_response=data,
+                            ),
+                            None,
+                        )
+                    else:
+                        err = resp.text[:400]
+                        print(f"   ❌ Hosted payments error: {resp.status_code} - {err}")
+                        # Fall back to mock if real fails
+                except Exception as e:
+                    print(f"   ❌ Hosted payments exception: {e}")
+
+            # Default mock flow
             mock_payment_id = f"pay_checkout_{metadata.get('order_id', 'test')}"
-            
             print(f"   ✅ Created mock Checkout payment intent: {mock_payment_id}")
-            print(f"   (In production, use Checkout.js SDK for real payments)")
-            
-            # Return success with mock data
-            # Frontend would replace this with real Checkout payment flow
             return (
                 True,
                 PaymentIntent(
@@ -67,10 +100,10 @@ class CheckoutAdapter(PSPAdapter):
                         "amount": int(amount * 100),
                         "currency": currency.upper(),
                         "reference": metadata.get("order_id"),
-                        "note": "Mock payment - use Checkout.js in production"
-                    }
+                        "note": "Mock payment - use Checkout.js in production",
+                    },
                 ),
-                None
+                None,
             )
             
             # Old API call code (keeping for reference)

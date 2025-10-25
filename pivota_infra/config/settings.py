@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # Wix
     wix_api_key: Optional[str] = os.getenv("WIX_API_KEY")
     wix_store_url: Optional[str] = os.getenv("WIX_STORE_URL")
+
+    # Checkout.com
+    checkout_mode: str = os.getenv("CHECKOUT_MODE", "mock")  # mock | real
+    checkout_success_url: str = os.getenv("CHECKOUT_SUCCESS_URL", "https://agents.pivota.cc/checkout/success")
+    checkout_cancel_url: str = os.getenv("CHECKOUT_CANCEL_URL", "https://agents.pivota.cc/checkout/cancel")
     
     # JWT
     jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "your-super-secret-key")
