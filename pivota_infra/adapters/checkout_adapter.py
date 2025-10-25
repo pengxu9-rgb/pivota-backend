@@ -73,16 +73,20 @@ class CheckoutAdapter(PSPAdapter):
                     
                     if resp.status_code in (200, 201):
                         data = resp.json()
-                        session_id = data.get("id") or data.get("reference") or metadata.get("order_id")
-                        redirect_url = data.get("_links", {}).get("redirect", {}).get("href")
+                        session_id = data.get("id") or metadata.get("order_id")
+                        payment_session_token = data.get("payment_session_token", "")
+                        
                         print(f"   ✅ Payment session created: {session_id}")
-                        print(f"   🔗 Redirect URL: {redirect_url}")
-                        # Use redirect_url as client_secret surrogate for now
+                        print(f"   🎫 Payment session token: {payment_session_token[:50]}...")
+                        
+                        # For Checkout payment sessions, we return the token
+                        # Frontend would use Checkout.js Frames to complete payment
+                        # For testing, we'll return the session ID as payment_intent_id
                         return (
                             True,
                             PaymentIntent(
                                 id=f"chk_session_{session_id}",
-                                client_secret=redirect_url or "",
+                                client_secret=payment_session_token,  # Use token as client_secret
                                 amount=int(amount * 100),
                                 currency=currency,
                                 status="pending",
