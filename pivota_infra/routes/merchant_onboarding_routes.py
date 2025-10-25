@@ -43,6 +43,7 @@ class MerchantRegisterRequest(BaseModel):
     contact_email: EmailStr
     contact_phone: Optional[str] = None
     website: Optional[str] = None  # Optional, for backward compatibility
+    password: Optional[str] = None  # Password for merchant login (auto-generated if not provided)
 
 class KYCUploadRequest(BaseModel):
     merchant_id: str
@@ -258,6 +259,44 @@ async def register_merchant(
         merchant_id = await create_merchant_onboarding(merchant_dict)
         print(f"✅ Merchant created: {merchant_id}")
         
+        # 2.5 创建用户登录账户
+        try:
+            from utils.auth import hash_password
+            import secrets
+            
+            # Generate password if not provided
+            password = merchant_data.password if merchant_data.password else secrets.token_urlsafe(12)
+            password_hash = hash_password(password)
+            
+            # Check if user already exists
+            existing_user = await database.fetch_one(
+                "SELECT user_id FROM users WHERE email = :email",
+                {"email": merchant_data.contact_email}
+            )
+            
+            if not existing_user:
+                await database.execute(
+                    """
+                    INSERT INTO users (email, password_hash, full_name, role, active)
+                    VALUES (:email, :password_hash, :full_name, :role, :active)
+                    """,
+                    {
+                        "email": merchant_data.contact_email,
+                        "password_hash": password_hash,
+                        "full_name": merchant_data.business_name,
+                        "role": "merchant",
+                        "active": True
+                    }
+                )
+                print(f"✅ User account created for {merchant_data.contact_email}")
+                
+                # Store password in response if auto-generated
+                if not merchant_data.password:
+                    print(f"🔑 Auto-generated password: {password}")
+        except Exception as user_err:
+            print(f"⚠️ Failed to create user account: {user_err}")
+            # Don't fail the whole registration if user creation fails
+        
         # 3. 如果自动批准，立即更新状态为 approved
         if validation_result["approved"]:
             print(f"🎉 Auto-approving merchant {merchant_id}...")
@@ -273,7 +312,8 @@ async def register_merchant(
             await database.execute(query)
             print(f"✅ Merchant {merchant_id} auto-approved successfully")
         
-        return {
+        # Build response
+        response_data = {
             "status": "success",
             "message": (
                 "✅ Registration approved! You can now connect your PSP and start processing payments.\n"
@@ -286,8 +326,16 @@ async def register_merchant(
             "confidence_score": validation_result["confidence_score"],
             "validation_details": validation_result["validation_results"],
             "full_kyb_deadline": validation_result.get("full_kyb_deadline"),
-            "next_step": "Connect PSP" if validation_result["approved"] else "Wait for admin approval"
+            "next_step": "Connect PSP" if validation_result["approved"] else "Wait for admin approval",
+            "login_email": merchant_data.contact_email
         }
+        
+        # Include password if auto-generated
+        if not merchant_data.password and 'password' in locals():
+            response_data["temporary_password"] = password
+            response_data["message"] += f"\n\n🔑 Your login credentials:\nEmail: {merchant_data.contact_email}\nPassword: {password}\n(Please change this password after first login)"
+        
+        return response_data
     except Exception as e:
         error_msg = str(e)
         

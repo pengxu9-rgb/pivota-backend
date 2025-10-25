@@ -35,6 +35,7 @@ from routes.test_data_routes import router as test_data_router
 from routes.simple_ws_routes import router as simple_ws_router
 from routes.agent_metrics_routes import router as agent_metrics_router
 from routes.auth_routes import router as auth_router
+from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
@@ -155,6 +156,7 @@ app.include_router(agent_router)
 app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
+app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
@@ -317,7 +319,7 @@ async def startup():
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -719,8 +721,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")

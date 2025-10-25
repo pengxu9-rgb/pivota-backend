@@ -515,8 +515,8 @@ async def get_merchant_analytics(
 @router.get("/merchant/webhooks/config")
 async def get_webhook_config(current_user: dict = Depends(get_current_user)):
     """Get webhook configuration from real database"""
-    if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user["role"] not in ["merchant", "admin", "employee"]:
+        raise HTTPException(status_code=403, detail=f"Not authorized - role: {current_user.get('role', 'unknown')}")
     
     try:
         # Get merchant_id from JWT token
