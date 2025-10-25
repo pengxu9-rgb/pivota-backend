@@ -315,21 +315,14 @@ async def get_all_psps(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
+        # Get PSP connections (without aggregating orders here)
         psps_query = """
             SELECT 
                 p.psp_id, p.provider, p.name, p.status, p.merchant_id,
                 p.connected_at, p.capabilities,
-                m.business_name as merchant_name,
-                COUNT(o.order_id) as transaction_count,
-                COALESCE(SUM(o.total), 0) as total_volume,
-                SUM(CASE WHEN LOWER(COALESCE(o.payment_status,'')) IN ('paid','succeeded','completed') 
-                         OR LOWER(COALESCE(o.status,'')) IN ('completed','delivered') 
-                    THEN 1 ELSE 0 END) as successful_count
+                m.business_name as merchant_name
             FROM merchant_psps p
             LEFT JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
-            LEFT JOIN orders o ON p.merchant_id = o.merchant_id AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
-            GROUP BY p.psp_id, p.provider, p.name, p.status, p.merchant_id, 
-                     p.connected_at, p.capabilities, m.business_name
             ORDER BY p.connected_at DESC
         """
         
@@ -341,9 +334,26 @@ async def get_all_psps(
             if row["capabilities"]:
                 capabilities = row["capabilities"].split(',')
             
-            transaction_count = row["transaction_count"] or 0
-            successful_count = row["successful_count"] or 0
+            # Get transaction stats for THIS specific PSP's merchant only
+            stats = await database.fetch_one(
+                """
+                SELECT 
+                    COUNT(order_id) as transaction_count,
+                    COALESCE(SUM(total), 0) as total_volume,
+                    SUM(CASE WHEN LOWER(COALESCE(payment_status,'')) IN ('paid','succeeded','completed') 
+                             OR LOWER(COALESCE(status,'')) IN ('completed','delivered') 
+                        THEN 1 ELSE 0 END) as successful_count
+                FROM orders
+                WHERE merchant_id = :merchant_id
+                AND (is_deleted IS NULL OR is_deleted = FALSE)
+                """,
+                {"merchant_id": row["merchant_id"]}
+            )
+            
+            transaction_count = stats["transaction_count"] if stats else 0
+            successful_count = stats["successful_count"] if stats else 0
             success_rate = round((successful_count / transaction_count * 100), 1) if transaction_count > 0 else 0
+            total_volume = float(stats["total_volume"]) if stats else 0
             
             psps.append({
                 "psp_id": row["psp_id"],
@@ -357,7 +367,7 @@ async def get_all_psps(
                 "transaction_count": transaction_count,
                 "successful_count": successful_count,
                 "success_rate": success_rate,
-                "total_volume": float(row["total_volume"]),
+                "total_volume": total_volume,
                 "is_active": row["status"] == "active"
             })
         
