@@ -267,17 +267,17 @@ async def create_new_order(
                         )
                         if psp_row and psp_row["api_key"]:
                             psp_key = psp_row["api_key"]
+                            logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
                     except Exception as e:
                         logger.warning(f"DB PSP key lookup failed: {e}")
                 
                 if not psp_key:
-                    # Fallback to environment variables
+                    # Fallback to environment variables (not for Checkout)
                     if psp_type == "stripe":
                         psp_key = getattr(settings, "stripe_secret_key", None)
                     elif psp_type == "adyen":
                         psp_key = getattr(settings, "adyen_api_key", None)
-                    elif psp_type == "checkout":
-                        psp_key = None  # Checkout must use DB key
+                    # Note: Checkout must use DB key, no env var fallback
                 
                 if not psp_key:
                     raise ValueError(f"No {psp_type} API key found for merchant {merchant['merchant_id']}")

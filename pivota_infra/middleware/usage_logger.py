@@ -64,3 +64,4 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
                 print(f"Failed to log usage: {e}")
         
         return response
+

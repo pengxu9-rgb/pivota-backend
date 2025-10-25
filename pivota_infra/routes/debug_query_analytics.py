@@ -59,3 +59,4 @@ async def debug_query_analytics(agent_id: str):
             "error": str(e),
             "traceback": traceback.format_exc()
         }
+

@@ -79,9 +79,9 @@ def get_agent_api_key(jwt_token):
             print(f"✅ Got API key: {api_key[:15]}...")
             return api_key
     
-    # Fallback: try to get from the init endpoint
+    # Fallback: use the known good key
     print("⚠️  Using default API key")
-    return "pk_live_TUacTm2vXpE0mSXd-Q6s4XwRayNQbj-z"
+    return "ak_live_d2b8ab4084582406a671cfa87f357325b3638003df499b3595d1254b119d03ca"
 
 def get_merchants(api_key):
     """Get list of available merchants"""

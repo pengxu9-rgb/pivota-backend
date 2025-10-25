@@ -1,0 +1,181 @@
+{
+  "summary": {
+    "total_files": 78,
+    "in_use": 71,
+    "unused": 7,
+    "debug": 11,
+    "temp": 10
+  },
+  "categories": {
+    "core": [
+      "fulfillment_api.py",
+      "simulate_payments.py",
+      "mcp_routes.py",
+      "payout_routes.py",
+      "merchant_dashboard_routes.py",
+      "psp_routes.py",
+      "agents_mgmt.py",
+      "shopify_routes.py",
+      "webhook_routes.py",
+      "merchant_routes.py",
+      "mcp_mgmt.py",
+      "merchant_api_extensions.py",
+      "performance_optimization.py",
+      "product_routes.py",
+      "payment_routes.py",
+      "admin_api.py",
+      "employee_agent_mgmt.py",
+      "quick_index_setup.py",
+      "direct_db_check.py",
+      "employees_security.py",
+      "agent_payment_sdk.py",
+      "agent_docs.py",
+      "refund_api.py",
+      "shopify_setup.py",
+      "operations_routes.py",
+      "merchant_onboarding_routes.py",
+      "agent_keys.py",
+      "demo_data_routes.py",
+      "payment_execution_routes.py",
+      "agent_api.py",
+      "agent_management.py",
+      "manage_integrations.py",
+      "psp_metrics.py",
+      "admin_populate_products.py",
+      "shopify_manual.py",
+      "employee_dashboard_routes.py",
+      "agent_routes.py",
+      "product_sync.py",
+      "simple_ws_routes.py",
+      "employee_missing_endpoints.py",
+      "order_routes.py",
+      "wix_sync.py"
+    ],
+    "debug": [
+      "agent_debug.py",
+      "debug_agents_table.py",
+      "debug_agent_key.py",
+      "debug_orders_agent.py",
+      "cleanup_test_data.py",
+      "debug_query_analytics.py",
+      "debug_integrations.py",
+      "test_data_routes.py",
+      "admin_debug_products.py",
+      "debug_usage_logs.py",
+      "create_test_agent.py"
+    ],
+    "temp": [
+      "fix_agents_table.py",
+      "init_orders_table.py",
+      "cleanup_all_duplicates.py",
+      "init_agent_key.py",
+      "fix_orders_table.py",
+      "fix_duplicate_stores.py",
+      "agent_sdk_fixed.py",
+      "init_merchant_data.py",
+      "employee_store_psp_fixes.py",
+      "admin_cleanup.py"
+    ],
+    "duplicate": [
+      "auth.py",
+      "dashboard_routes.py",
+      "agent_metrics_routes.py",
+      "agent_sdk_ready.py",
+      "agent_metrics.py",
+      "auth_routes.py",
+      "dashboard_api.py",
+      "agent_metrics_v1.py"
+    ],
+    "unused": [
+      "auth_ws_routes.py",
+      "psp_metrics_routes.py",
+      "enhanced_agent_routes.py",
+      "queue_routes.py",
+      "debug_auth.py",
+      "fix_passwords.py",
+      "agent_auth.py"
+    ],
+    "consolidate": []
+  },
+  "recommendations": [
+    {
+      "action": "SAFE_TO_DELETE",
+      "files": [
+        "auth_ws_routes.py",
+        "psp_metrics_routes.py",
+        "enhanced_agent_routes.py",
+        "queue_routes.py",
+        "debug_auth.py",
+        "fix_passwords.py",
+        "agent_auth.py"
+      ],
+      "reason": "Not referenced in main.py",
+      "risk": "LOW"
+    },
+    {
+      "action": "MOVE_TO_DEBUG_MODE",
+      "files": [
+        "agent_debug.py",
+        "debug_agents_table.py",
+        "debug_agent_key.py",
+        "debug_orders_agent.py",
+        "cleanup_test_data.py",
+        "debug_query_analytics.py",
+        "debug_integrations.py",
+        "test_data_routes.py",
+        "admin_debug_products.py",
+        "debug_usage_logs.py",
+        "create_test_agent.py"
+      ],
+      "reason": "Debug endpoints should be conditional",
+      "risk": "MEDIUM",
+      "suggestion": "Wrap in DEBUG_MODE check in main.py"
+    },
+    {
+      "action": "ADD_AUTHENTICATION",
+      "files": [
+        "fix_agents_table.py",
+        "init_orders_table.py",
+        "cleanup_all_duplicates.py",
+        "init_agent_key.py",
+        "fix_orders_table.py",
+        "init_merchant_data.py",
+        "admin_cleanup.py"
+      ],
+      "reason": "Temporary endpoints need authentication",
+      "risk": "HIGH",
+      "suggestion": "Add require_admin dependency"
+    },
+    {
+      "action": "MERGE_DUPLICATES",
+      "keep": "auth_routes.py",
+      "merge": [
+        "auth.py"
+      ],
+      "reason": "Duplicate auth functionality",
+      "risk": "MEDIUM",
+      "endpoints_to_migrate": 5
+    },
+    {
+      "action": "MERGE_DUPLICATES",
+      "keep": "dashboard_api.py",
+      "merge": [
+        "dashboard_routes.py"
+      ],
+      "reason": "Duplicate dashboard functionality",
+      "risk": "MEDIUM",
+      "endpoints_to_migrate": 4
+    },
+    {
+      "action": "MERGE_DUPLICATES",
+      "keep": "agent_metrics_routes.py",
+      "merge": [
+        "agent_metrics.py",
+        "agent_metrics_v1.py"
+      ],
+      "reason": "Duplicate agent_metrics functionality",
+      "risk": "MEDIUM",
+      "endpoints_to_migrate": 8
+    }
+  ]
+}
