@@ -229,8 +229,10 @@ async def create_new_order(
         # 5. 后台创建 Payment Intent（不阻塞）
         async def create_payment_intent_task():
             try:
-                # PSP 类型回退
-                psp_type = merchant.get("psp_type")
+                # PSP 类型选择：优先使用 preferred_psp，否则回退
+                psp_type = order_request.preferred_psp
+                if not psp_type:
+                    psp_type = merchant.get("psp_type")
                 if not psp_type:
                     try:
                         psp_row = await database.fetch_one(
@@ -249,15 +251,36 @@ async def create_new_order(
                 if not psp_type:
                     psp_type = "stripe"
 
-                # PSP 密钥回退
+                # PSP 密钥回退：先查数据库，再查环境变量
                 psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
                 if not psp_key:
+                    # Try merchant_psps table
+                    try:
+                        psp_row = await database.fetch_one(
+                            """
+                            SELECT api_key FROM merchant_psps
+                            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+                            ORDER BY connected_at DESC
+                            LIMIT 1
+                            """,
+                            {"merchant_id": order_request.merchant_id, "provider": psp_type}
+                        )
+                        if psp_row and psp_row["api_key"]:
+                            psp_key = psp_row["api_key"]
+                    except Exception as e:
+                        logger.warning(f"DB PSP key lookup failed: {e}")
+                
+                if not psp_key:
+                    # Fallback to environment variables
                     if psp_type == "stripe":
                         psp_key = getattr(settings, "stripe_secret_key", None)
-                    else:
+                    elif psp_type == "adyen":
                         psp_key = getattr(settings, "adyen_api_key", None)
+                    elif psp_type == "checkout":
+                        psp_key = None  # Checkout must use DB key
+                
                 if not psp_key:
-                    raise ValueError(f"No PSP key found for merchant {merchant['merchant_id']}")
+                    raise ValueError(f"No {psp_type} API key found for merchant {merchant['merchant_id']}")
 
                 # 创建支付意图
                 psp_adapter = get_psp_adapter(psp_type, psp_key)
