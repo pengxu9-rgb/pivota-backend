@@ -33,10 +33,12 @@ class CheckoutAdapter(PSPAdapter):
             print(f"   API Key: {self.api_key[:20]}... (len={len(self.api_key)})")
             print(f"   Base URL: {self.base_url}")
             
+            # Checkout.com uses the secret key directly (no Bearer prefix for secret keys)
             headers = {
                 "Authorization": self.api_key,
                 "Content-Type": "application/json"
             }
+            print(f"   Auth: {self.api_key[:15]}...")
             
             print(f"   Payload: amount={int(amount * 100)}, currency={currency.upper()}")
 
@@ -44,25 +46,27 @@ class CheckoutAdapter(PSPAdapter):
             use_real_mode = settings.checkout_mode.lower() == "real" or (self.api_key and not self.api_key.startswith("sk_mock"))
             
             if use_real_mode:
-                # Create Hosted Payment Page session
+                # Create Payment Session (works better than hosted-payments for programmatic access)
                 payload = {
                     "amount": int(amount * 100),
                     "currency": currency.upper(),
+                    "processing_channel_id": self.public_key if self.public_key else PROCESSING_CHANNEL,
                     "reference": metadata.get("order_id", "ORDER"),
+                    "customer": {"email": metadata.get("customer_email", "customer@example.com")},
+                    "billing": {
+                        "address": {
+                            "country": "GB"
+                        }
+                    },
                     "success_url": f"{settings.checkout_success_url}?order_id={metadata.get('order_id', '')}",
-                    "cancel_url": f"{settings.checkout_cancel_url}?order_id={metadata.get('order_id', '')}",
-                    "customer": {"email": metadata.get("customer_email")},
-                    "metadata": metadata,
+                    "failure_url": f"{settings.checkout_cancel_url}?order_id={metadata.get('order_id', '')}",
                 }
                 
-                # Add processing_channel_id if available (stored in public_key/account_id)
-                if self.public_key:
-                    payload["processing_channel_id"] = self.public_key
-                    print(f"   Using processing_channel_id: {self.public_key}")
+                print(f"   Using processing_channel_id: {payload['processing_channel_id']}")
                 try:
                     async with httpx.AsyncClient() as client:
                         resp = await client.post(
-                            f"{self.base_url}/hosted-payments", json=payload, headers=headers, timeout=15.0
+                            f"{self.base_url}/payment-sessions", json=payload, headers=headers, timeout=15.0
                         )
                     print(f"   Response: {resp.status_code}")
                     print(f"   Response Body: {resp.text[:500]}")
