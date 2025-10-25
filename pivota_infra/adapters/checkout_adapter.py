@@ -37,10 +37,15 @@ class CheckoutAdapter(PSPAdapter):
                 "Content-Type": "application/json"
             }
             
+            # For testing: use Checkout test card
+            # In production, this would be a real payment token from the frontend
             payload = {
                 "source": {
-                    "type": "token",
-                    "token": "tok_test"  # For testing, use test token
+                    "type": "card",
+                    "number": "4242424242424242",  # Checkout test card
+                    "expiry_month": 12,
+                    "expiry_year": 2025,
+                    "cvv": "100"
                 },
                 "amount": int(amount * 100),  # Checkout uses minor units (cents)
                 "currency": currency.upper(),
