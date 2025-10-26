@@ -168,11 +168,12 @@ async def login(data: LoginRequest):
         )
         
         # Create JWT token
-        token = create_access_token(
-            user_id=str(user['id']),
-            email=user['email'],
-            role=user['role']
-        )
+        token = create_access_token({
+            "sub": user['email'],
+            "user_id": str(user['id']),
+            "email": user['email'],
+            "role": user['role']
+        })
         
         return LoginResponse(
             success=True,
