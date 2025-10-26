@@ -33,6 +33,7 @@ class ConnectPSPRequest(BaseModel):
     api_key: str
     test_mode: bool = True
     account_id: Optional[str] = None
+    secret_key: Optional[str] = None  # For PayPal Client Secret
 
 class SyncProductsRequest(BaseModel):
     merchant_id: str
@@ -355,16 +356,22 @@ async def setup_merchant_psp(
         
         if existing:
             # Update existing PSP
-            await database.execute(
-                """UPDATE merchant_psps 
-                   SET api_key = :api_key, status = 'active', connected_at = :connected_at
-                   WHERE psp_id = :psp_id""",
-                {
-                    "api_key": request.api_key,
-                    "connected_at": datetime.now(),
-                    "psp_id": existing["psp_id"]
-                }
-            )
+            update_query = """UPDATE merchant_psps 
+                   SET api_key = :api_key, status = 'active', connected_at = :connected_at"""
+            params = {
+                "api_key": request.api_key,
+                "connected_at": datetime.now(),
+                "psp_id": existing["psp_id"]
+            }
+            
+            # Add secret_key for PayPal
+            if request.secret_key:
+                update_query += ", secret_key = :secret_key"
+                params["secret_key"] = request.secret_key
+                
+            update_query += " WHERE psp_id = :psp_id"
+            
+            await database.execute(update_query, params)
             psp_id = existing["psp_id"]
         else:
             # Create new PSP connection
@@ -378,21 +385,32 @@ async def setup_merchant_psp(
                 "square": ["payments", "refunds", "inventory"]
             }.get(request.psp_type, ["payments"])
             
+            # Build insert query and params
+            insert_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
+            insert_values = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
+            params = {
+                "psp_id": psp_id,
+                "merchant_id": request.merchant_id,
+                "provider": request.psp_type,
+                "name": f"{request.psp_type.capitalize()} Account",
+                "api_key": request.api_key,
+                "account_id": request.account_id or f"acct_{uuid.uuid4().hex[:12]}",
+                "capabilities": ",".join(capabilities),
+                "status": "active",
+                "connected_at": datetime.now()
+            }
+            
+            # Add secret_key for PayPal
+            if request.secret_key:
+                insert_cols.append("secret_key")
+                insert_values.append(":secret_key")
+                params["secret_key"] = request.secret_key
+            
             await database.execute(
-                """INSERT INTO merchant_psps 
-                   (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
-                   VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, :status, :connected_at)""",
-                {
-                    "psp_id": psp_id,
-                    "merchant_id": request.merchant_id,
-                    "provider": request.psp_type,
-                    "name": f"{request.psp_type.capitalize()} Account",
-                    "api_key": request.api_key,
-                    "account_id": request.account_id or f"acct_{uuid.uuid4().hex[:12]}",
-                    "capabilities": ",".join(capabilities),
-                    "status": "active",
-                    "connected_at": datetime.now()
-                }
+                f"""INSERT INTO merchant_psps 
+                   ({', '.join(insert_cols)})
+                   VALUES ({', '.join(insert_values)})""",
+                params
             )
         
         return {

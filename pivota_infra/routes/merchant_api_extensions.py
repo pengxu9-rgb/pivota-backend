@@ -195,6 +195,11 @@ async def connect_psp(
     if not api_key or len(api_key) < 10:
         raise HTTPException(status_code=400, detail="Invalid API key")
     
+    # Get secret key for PayPal
+    secret_key = psp_data.get("secret_key", "")
+    if provider == "paypal" and (not secret_key or len(secret_key) < 10):
+        raise HTTPException(status_code=400, detail="PayPal requires both Client ID and Client Secret")
+    
     # Save to database
     psp_id = "psp_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
     account_id = "acct_" + ''.join(random.choices(string.digits, k=10))
@@ -214,11 +219,10 @@ async def connect_psp(
     try:
         # Use transaction to ensure data is committed
         async with database.transaction():
-            query = """
-                INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
-                VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, :status, :connected_at)
-            """
-            await database.execute(query, {
+            # Build query dynamically based on whether secret_key is provided
+            base_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
+            base_vals = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
+            params = {
                 "psp_id": psp_id,
                 "merchant_id": merchant_id,
                 "provider": provider,
@@ -228,7 +232,19 @@ async def connect_psp(
                 "capabilities": ','.join(capabilities),
                 "status": 'active',
                 "connected_at": datetime.now()
-            })
+            }
+            
+            # Add secret_key for PayPal
+            if secret_key:
+                base_cols.append("secret_key")
+                base_vals.append(":secret_key")
+                params["secret_key"] = secret_key
+            
+            query = f"""
+                INSERT INTO merchant_psps ({', '.join(base_cols)})
+                VALUES ({', '.join(base_vals)})
+            """
+            await database.execute(query, params)
             print(f"✅ PSP saved to DB: {psp_id} for merchant {merchant_id}")
             
             # Verify the save within transaction

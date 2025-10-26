@@ -271,12 +271,17 @@ async def admin_connect_psp(
     api_key = payload.get("api_key")
     account_id = payload.get("account_id")
     psp_id = payload.get("psp_id")
+    secret_key = payload.get("secret_key")
     name = payload.get("name") or f"{provider.capitalize()} Account"
     
-    if provider not in ("stripe", "adyen", "checkout"):
-        raise HTTPException(status_code=400, detail="Unsupported provider. Use stripe/adyen/checkout")
+    if provider not in ("stripe", "adyen", "checkout", "paypal"):
+        raise HTTPException(status_code=400, detail="Unsupported provider. Use stripe/adyen/checkout/paypal")
     if not api_key or len(api_key) < 8:
         raise HTTPException(status_code=400, detail="Invalid api_key")
+    
+    # Validate PayPal requires client_secret
+    if provider == "paypal" and (not secret_key or len(secret_key) < 8):
+        raise HTTPException(status_code=400, detail="PayPal requires both Client ID and Client Secret")
 
     # If updating existing PSP (has psp_id but no merchant_id)
     if psp_id and not merchant_id:
@@ -303,26 +308,40 @@ async def admin_connect_psp(
     )
     
     try:
+        # Build dynamic query to handle secret_key
+        base_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
+        params = {
+            "psp_id": psp_id,
+            "merchant_id": merchant_id,
+            "provider": provider,
+            "name": name,
+            "api_key": api_key,
+            "account_id": account_id or None,
+            "capabilities": ",".join(capabilities),
+            "connected_at": datetime.now(),
+        }
+        
+        update_set_parts = [
+            "api_key = EXCLUDED.api_key",
+            "account_id = EXCLUDED.account_id",
+            "name = EXCLUDED.name"
+        ]
+        
+        # Add secret_key if provided
+        if secret_key:
+            base_cols.append("secret_key")
+            params["secret_key"] = secret_key
+            update_set_parts.append("secret_key = EXCLUDED.secret_key")
+        
         # Use UPSERT to update if exists, insert if not
         await database.execute(
-            """
-            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, api_key, account_id, capabilities, status, connected_at)
-            VALUES (:psp_id, :merchant_id, :provider, :name, :api_key, :account_id, :capabilities, 'active', :connected_at)
+            f"""
+            INSERT INTO merchant_psps ({', '.join(base_cols)})
+            VALUES ({', '.join(':' + col if col != 'status' else "'active'" for col in base_cols)})
             ON CONFLICT (psp_id) DO UPDATE SET
-                api_key = EXCLUDED.api_key,
-                account_id = EXCLUDED.account_id,
-                name = EXCLUDED.name
+                {', '.join(update_set_parts)}
             """,
-            {
-                "psp_id": psp_id,
-                "merchant_id": merchant_id,
-                "provider": provider,
-                "name": name,
-                "api_key": api_key,
-                "account_id": account_id or None,
-                "capabilities": ",".join(capabilities),
-                "connected_at": datetime.now(),
-            }
+            params
         )
         # Mark merchant onboarding flags for dashboard
         await database.execute(
