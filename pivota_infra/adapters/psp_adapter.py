@@ -180,35 +180,7 @@ class AdyenAdapter(PSPAdapter):
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str]]:
         """创建 Adyen Payment"""
         try:
-            # Check if using mock mode
-            is_mock = self.api_key and self.api_key.startswith("sk_mock")
-            
-            if is_mock:
-                # Mock mode - return simulated payment intent
-                mock_payment_id = f"adyen_mock_{metadata.get('order_id', 'test')}"
-                print(f"🔍 Adyen: Using MOCK mode for {amount} {currency}")
-                print(f"   ✅ Created mock Adyen payment intent: {mock_payment_id}")
-                
-                return (
-                    True,
-                    PaymentIntent(
-                        id=mock_payment_id,
-                        client_secret=f"adyen_session_{mock_payment_id}",
-                        amount=int(amount * 100),
-                        currency=currency,
-                        status="pending",
-                        psp_type="adyen",
-                        raw_response={
-                            "pspReference": mock_payment_id,
-                            "resultCode": "Pending",
-                            "note": "Mock payment - use Adyen Drop-in in production"
-                        }
-                    ),
-                    None
-                )
-            
-            # Real API mode
-            print(f"🔍 Adyen: Creating real payment for {amount} {currency}")
+            print(f"🔍 Adyen: Creating payment for {amount} {currency}")
             headers = {
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json"

@@ -45,95 +45,61 @@ class CheckoutAdapter(PSPAdapter):
             
             print(f"   Payload: amount={int(amount * 100)}, currency={currency.upper()}")
 
-            # Use real mode when we have a real API key (not mock)
-            is_mock_key = self.api_key and self.api_key.startswith("sk_mock")
-            checkout_mode = getattr(settings, "checkout_mode", "mock")
-            use_real_mode = checkout_mode.lower() == "real" and not is_mock_key
+            # Always use real API (sandbox or production based on API key)
+            # Checkout.com provides sandbox keys for testing
             
-            print(f"   Mode: {'REAL' if use_real_mode else 'MOCK'} (is_mock_key={is_mock_key}, checkout_mode={checkout_mode})")
+            # Create Payment Session (works better than hosted-payments for programmatic access)
+            payload = {
+                "amount": int(amount * 100),
+                "currency": currency.upper(),
+                "processing_channel_id": self.public_key if self.public_key else PROCESSING_CHANNEL,
+                "reference": metadata.get("order_id", "ORDER"),
+                "customer": {"email": metadata.get("customer_email", "customer@example.com")},
+                "billing": {
+                    "address": {
+                        "country": "GB"
+                    }
+                },
+                "success_url": f"{settings.checkout_success_url}?order_id={metadata.get('order_id', '')}",
+                "failure_url": f"{settings.checkout_cancel_url}?order_id={metadata.get('order_id', '')}",
+            }
             
-            if use_real_mode:
-                # Create Payment Session (works better than hosted-payments for programmatic access)
-                payload = {
-                    "amount": int(amount * 100),
-                    "currency": currency.upper(),
-                    "processing_channel_id": self.public_key if self.public_key else PROCESSING_CHANNEL,
-                    "reference": metadata.get("order_id", "ORDER"),
-                    "customer": {"email": metadata.get("customer_email", "customer@example.com")},
-                    "billing": {
-                        "address": {
-                            "country": "GB"
-                        }
-                    },
-                    "success_url": f"{settings.checkout_success_url}?order_id={metadata.get('order_id', '')}",
-                    "failure_url": f"{settings.checkout_cancel_url}?order_id={metadata.get('order_id', '')}",
-                }
+            print(f"   Using processing_channel_id: {payload['processing_channel_id']}")
+            
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.base_url}/payment-sessions", json=payload, headers=headers, timeout=15.0
+                )
+            print(f"   Response: {resp.status_code}")
+            print(f"   Response Body: {resp.text[:500]}")
+            
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                session_id = data.get("id") or metadata.get("order_id")
+                payment_session_token = data.get("payment_session_token", "")
                 
-                print(f"   Using processing_channel_id: {payload['processing_channel_id']}")
-                try:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.post(
-                            f"{self.base_url}/payment-sessions", json=payload, headers=headers, timeout=15.0
-                        )
-                    print(f"   Response: {resp.status_code}")
-                    print(f"   Response Body: {resp.text[:500]}")
-                    
-                    if resp.status_code in (200, 201):
-                        data = resp.json()
-                        session_id = data.get("id") or metadata.get("order_id")
-                        payment_session_token = data.get("payment_session_token", "")
-                        
-                        print(f"   ✅ Payment session created: {session_id}")
-                        print(f"   🎫 Payment session token: {payment_session_token[:50]}...")
-                        
-                        # For Checkout payment sessions, we return the token
-                        # Frontend would use Checkout.js Frames to complete payment
-                        # For testing, we'll return the session ID as payment_intent_id
-                        return (
-                            True,
-                            PaymentIntent(
-                                id=f"chk_session_{session_id}",
-                                client_secret=payment_session_token,  # Use token as client_secret
-                                amount=int(amount * 100),
-                                currency=currency,
-                                status="pending",
-                                psp_type="checkout",
-                                raw_response=data,
-                            ),
-                            None,
-                        )
-                    else:
-                        err = resp.text[:400]
-                        print(f"   ❌ Hosted payments error: {resp.status_code} - {err}")
-                        # Don't fall back to mock - return the error
-                        return False, None, f"Checkout API error {resp.status_code}: {err}"
-                except Exception as e:
-                    print(f"   ❌ Hosted payments exception: {e}")
-                    return False, None, f"Checkout exception: {str(e)}"
-
-            # Default mock flow
-            mock_payment_id = f"pay_checkout_{metadata.get('order_id', 'test')}"
-            print(f"   ✅ Created mock Checkout payment intent: {mock_payment_id}")
-            return (
-                True,
-                PaymentIntent(
-                    id=mock_payment_id,
-                    client_secret=f"checkout_cs_{mock_payment_id}",
-                    amount=int(amount * 100),
-                    currency=currency,
-                    status="pending",
-                    psp_type="checkout",
-                    raw_response={
-                        "id": mock_payment_id,
-                        "status": "pending",
-                        "amount": int(amount * 100),
-                        "currency": currency.upper(),
-                        "reference": metadata.get("order_id"),
-                        "note": "Mock payment - use Checkout.js in production",
-                    },
-                ),
-                None,
-            )
+                print(f"   ✅ Payment session created: {session_id}")
+                print(f"   🎫 Payment session token: {payment_session_token[:50]}...")
+                
+                # For Checkout payment sessions, we return the token
+                # Frontend would use Checkout.js Frames to complete payment
+                return (
+                    True,
+                    PaymentIntent(
+                        id=f"chk_session_{session_id}",
+                        client_secret=payment_session_token,  # Use token as client_secret
+                        amount=int(amount * 100),
+                        currency=currency,
+                        status="pending",
+                        psp_type="checkout",
+                        raw_response=data,
+                    ),
+                    None,
+                )
+            else:
+                err = resp.text[:400]
+                print(f"   ❌ Payment session creation failed: {resp.status_code} - {err}")
+                return False, None, f"Checkout API error {resp.status_code}: {err}"
         
         except httpx.TimeoutException:
             print("   ❌ Checkout API timeout")
