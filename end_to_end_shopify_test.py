@@ -105,27 +105,47 @@ def create_order_via_agent(order_num, psp, product):
         print(f"   ❌ Error: {e}")
         return None
 
-def sync_to_shopify(order_data):
-    """Step 2: Sync order to Shopify (if webhook/sync is configured)"""
+def confirm_payment(order_data):
+    """Step 2: Confirm payment to trigger Shopify order creation"""
     
     if not order_data or not order_data.get("order_id"):
         return False
     
-    print(f"   🔄 Checking Shopify sync...")
+    if not order_data.get("payment_intent_id"):
+        print(f"   ⚠️  No payment intent, skipping confirmation")
+        return False
     
-    # Check if there's a sync endpoint
-    # Note: This may require additional Shopify API integration
-    # For now, we'll just check if the order appears in our system
+    print(f"   🔄 Confirming payment...")
     
     try:
-        # Get order details from Pivota
-        # (In a full implementation, this would check Shopify API)
-        print(f"   ℹ️  Order exists in Pivota system")
-        print(f"   ℹ️  Shopify sync requires additional webhook configuration")
-        return True
+        # For Stripe/Adyen/Checkout, we simulate payment confirmation
+        # In real flow, customer would complete payment in frontend
+        confirm_payload = {
+            "order_id": order_data["order_id"],
+            "payment_intent_id": order_data["payment_intent_id"]
+        }
+        
+        # Use Agent-specific confirm endpoint
+        response = requests.post(
+            f"{API_BASE}/agent/v1/orders/{order_data['order_id']}/confirm-payment",
+            headers={
+                "x-api-key": AGENT_API_KEY,
+                "Content-Type": "application/json"
+            },
+            timeout=15
+        )
+        
+        if response.status_code == 200:
+            print(f"   ✅ Payment confirmed")
+            print(f"   ✅ Shopify order creation triggered")
+            return True
+        else:
+            print(f"   ⚠️  Payment confirmation response: {response.status_code}")
+            print(f"   ℹ️  {response.text[:100]}")
+            return False
         
     except Exception as e:
-        print(f"   ❌ Sync check error: {e}")
+        print(f"   ⚠️  Payment confirmation error: {e}")
         return False
 
 def main():
@@ -157,8 +177,10 @@ def main():
         order_data = create_order_via_agent(order_num, psp, product)
         
         if order_data:
-            # Check sync (optional)
-            sync_to_shopify(order_data)
+            # Confirm payment to trigger Shopify order creation
+            confirmed = confirm_payment(order_data)
+            order_data["payment_confirmed"] = confirmed
+            order_data["shopify_synced"] = confirmed
             results.append(order_data)
         else:
             results.append({

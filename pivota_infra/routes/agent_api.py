@@ -489,6 +489,91 @@ async def agent_create_order(
         raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
 
 
+@router.post("/orders/{order_id}/confirm-payment")
+async def agent_confirm_payment(
+    order_id: str,
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """确认支付并触发 Shopify 订单创建（Agent 调用）"""
+    try:
+        from routes.order_routes import mark_order_paid, create_shopify_order, log_order_event, get_order
+        from routes.merchant_onboarding_routes import get_merchant_onboarding
+        
+        # 获取订单
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        # 验证访问权限
+        if not context.can_access_merchant(order["merchant_id"]):
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        
+        # 检查是否已支付
+        if order.get("payment_status") == "paid":
+            return {"status": "success", "message": "Order already paid"}
+        
+        # 标记订单已支付
+        await mark_order_paid(order_id)
+        
+        # 记录支付成功事件
+        await log_order_event(
+            event_type="payment_succeeded",
+            order_id=order_id,
+            merchant_id=order["merchant_id"],
+            metadata={
+                "payment_intent_id": order.get("payment_intent_id"),
+                "amount": float(order["total"]),
+                "currency": order["currency"],
+                "confirmed_by": "agent"
+            }
+        )
+        
+        # 获取商户信息用于 Shopify 同步
+        merchant = await get_merchant_onboarding(order["merchant_id"])
+        
+        # 后台任务：创建 Shopify 订单
+        async def create_shopify_order_task():
+            """创建 Shopify 订单通知商户发货"""
+            try:
+                if merchant and merchant.get("mcp_connected") and merchant.get("mcp_platform") == "shopify":
+                    logger.info(f"Creating Shopify order for {order_id}")
+                    success = await create_shopify_order(order_id)
+                    if success:
+                        logger.info(f"✅ Shopify order created successfully for {order_id}")
+                    else:
+                        logger.error(f"❌ Failed to create Shopify order for {order_id}")
+                else:
+                    logger.info(f"ℹ️  Merchant not connected to Shopify, skipping order sync")
+            except Exception as e:
+                logger.error(f"Error in Shopify order creation task: {e}")
+        
+        background_tasks.add_task(create_shopify_order_task)
+        
+        # 记录请求
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=order["merchant_id"],
+            order_id=order_id
+        )
+        
+        return {
+            "status": "success",
+            "message": "Payment confirmed, Shopify order creation initiated",
+            "order_id": order_id,
+            "payment_intent_id": order.get("payment_intent_id"),
+            "shopify_sync": "initiated" if merchant and merchant.get("mcp_connected") else "not_configured"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent payment confirmation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Payment confirmation failed: {str(e)}")
+
+
 @router.get("/orders/{order_id}")
 async def agent_get_order(
     order_id: str,

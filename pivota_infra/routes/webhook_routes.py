@@ -75,11 +75,13 @@ async def handle_stripe_webhook(
             
             if result:
                 order_id = result["order_id"]
+                merchant_id = result["merchant_id"]
+                
                 await mark_order_paid(order_id)
                 await log_order_event(
                     event_type="payment_confirmed_webhook",
                     order_id=order_id,
-                    merchant_id=result["merchant_id"],
+                    merchant_id=merchant_id,
                     metadata={
                         "payment_intent_id": payment_intent_id,
                         "amount": data.get("amount"),
@@ -87,6 +89,22 @@ async def handle_stripe_webhook(
                     }
                 )
                 logger.info(f"Order {order_id} marked as paid via webhook")
+                
+                # 触发 Shopify 订单创建
+                from routes.merchant_onboarding_routes import get_merchant_onboarding
+                from routes.order_routes import create_shopify_order
+                
+                merchant = await get_merchant_onboarding(merchant_id)
+                if merchant and merchant.get("mcp_connected") and merchant.get("mcp_platform") == "shopify":
+                    logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
+                    try:
+                        success = await create_shopify_order(order_id)
+                        if success:
+                            logger.info(f"✅ Shopify order created via webhook for {order_id}")
+                        else:
+                            logger.error(f"❌ Shopify order creation failed for {order_id}")
+                    except Exception as shop_err:
+                        logger.error(f"❌ Shopify order creation error: {shop_err}")
                 
         elif event_type == "payment_intent.payment_failed":
             # 支付失败
