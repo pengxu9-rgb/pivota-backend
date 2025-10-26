@@ -35,89 +35,110 @@ async def get_merchant_id_from_user(current_user: dict) -> str:
 
 @router.get("/merchant/dashboard/stats")
 async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
-    """Get real dashboard statistics from orders and products"""
+    """Get real dashboard statistics from database"""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_id = await get_merchant_id_from_user(current_user)
     
     try:
-        async with httpx.AsyncClient() as client:
-            # Get orders
-            orders_response = await client.get(
-                f"{BACKEND_URL}/merchant/{merchant_id}/orders?limit=1000",
-                headers={"Authorization": f"Bearer {current_user.get('token', '')}"},
-                timeout=10.0
-            )
-            orders_data = orders_response.json()
-            orders = orders_data.get("data", {}).get("orders", [])
-            
-            # Get products
-            products_response = await client.get(
-                f"{BACKEND_URL}/products/{merchant_id}",
-                timeout=10.0
-            )
-            products_data = products_response.json()
-            products = products_data.get("products", [])
-            
-            # Calculate statistics
-            total_orders = len(orders)
-            total_revenue = sum(order.get("amount", 0) for order in orders)
-            completed_orders = [o for o in orders if o.get("status") == "completed"]
-            
-            # Get unique customers
-            customers = set()
-            for order in orders:
-                customer = order.get("customer", {})
-                if customer.get("email"):
-                    customers.add(customer["email"])
-            
-            # Calculate top products from orders (simplified)
-            product_sales = {}
-            for order in orders:
-                items = order.get("items", [])
+        # Query orders directly from database
+        orders_query = """
+        SELECT 
+            order_id,
+            total_amount as amount,
+            payment_status as status,
+            customer_email,
+            items,
+            created_at
+        FROM orders
+        WHERE merchant_id = :merchant_id
+        ORDER BY created_at DESC
+        LIMIT 1000
+        """
+        orders = await database.fetch_all(orders_query, {"merchant_id": merchant_id})
+        
+        # Get PSP count
+        psp_query = """
+        SELECT COUNT(*) as count
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id AND status = 'active'
+        """
+        psp_result = await database.fetch_one(psp_query, {"merchant_id": merchant_id})
+        psp_count = psp_result["count"] if psp_result else 0
+        
+        # Calculate statistics
+        total_orders = len(orders)
+        total_revenue = sum(float(order["amount"]) for order in orders)
+        paid_orders = [o for o in orders if o["status"] == "paid"]
+        
+        # Get unique customers
+        customers = set()
+        for order in orders:
+            if order.get("customer_email"):
+                customers.add(order["customer_email"])
+        
+        # Parse items and calculate top products
+        import json
+        product_sales = {}
+        for order in orders:
+            try:
+                items = json.loads(order["items"]) if isinstance(order["items"], str) else order["items"]
                 for item in items:
                     product_id = item.get("product_id")
                     if product_id:
                         if product_id not in product_sales:
                             product_sales[product_id] = {
                                 "id": product_id,
-                                "name": item.get("name", "Unknown Product"),
+                                "name": item.get("product_title", "Unknown Product"),
                                 "sales": 0,
                                 "revenue": 0
                             }
-                        product_sales[product_id]["sales"] += item.get("quantity", 1)
-                        product_sales[product_id]["revenue"] += item.get("price", 0) * item.get("quantity", 1)
-            
-            top_products = sorted(
-                product_sales.values(),
-                key=lambda x: x["revenue"],
-                reverse=True
-            )[:5]
-            
-            # Recent orders (last 5)
-            recent_orders = sorted(
-                orders,
-                key=lambda x: x.get("created_at", ""),
-                reverse=True
-            )[:5]
-            
-            return {
-                "status": "success",
-                "data": {
-                    "total_orders": total_orders,
-                    "total_revenue": round(total_revenue, 2),
-                    "total_customers": len(customers),
-                    "total_products": len(products),
-                    "average_order_value": round(total_revenue / total_orders, 2) if total_orders > 0 else 0,
-                    "conversion_rate": round(len(completed_orders) / total_orders * 100, 2) if total_orders > 0 else 0,
-                    "top_products": top_products,
-                    "recent_orders": recent_orders
-                }
+                        quantity = item.get("quantity", 1)
+                        price = float(item.get("unit_price", 0))
+                        product_sales[product_id]["sales"] += quantity
+                        product_sales[product_id]["revenue"] += price * quantity
+            except:
+                pass
+        
+        top_products = sorted(
+            product_sales.values(),
+            key=lambda x: x["revenue"],
+            reverse=True
+        )[:5]
+        
+        # Format recent orders
+        recent_orders = []
+        for order in orders[:5]:
+            recent_orders.append({
+                "order_id": order["order_id"],
+                "amount": float(order["amount"]),
+                "status": order["status"],
+                "customer": {
+                    "email": order.get("customer_email", "")
+                },
+                "created_at": order["created_at"].isoformat() if order.get("created_at") else None
+            })
+        
+        return {
+            "status": "success",
+            "data": {
+                "total_orders": total_orders,
+                "total_revenue": round(total_revenue, 2),
+                "total_customers": len(customers),
+                "total_products": psp_count,  # Using PSP count for now
+                "average_order_value": round(total_revenue / total_orders, 2) if total_orders > 0 else 0,
+                "conversion_rate": round(len(paid_orders) / total_orders * 100, 2) if total_orders > 0 else 0,
+                "top_products": top_products,
+                "recent_orders": recent_orders,
+                "psp_count": psp_count  # Add real PSP count
             }
+        }
     except Exception as e:
+        import traceback
+        print(f"❌ Dashboard stats error: {e}")
+        traceback.print_exc()
         # Return empty data for new merchants instead of demo data
-        logger.error(f"Failed to get dashboard stats for merchant {merchant_id}: {e}")
         return {
             "status": "success",
             "data": {
@@ -128,7 +149,8 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
                 "average_order_value": 0,
                 "conversion_rate": 0,
                 "top_products": [],
-                "recent_orders": []
+                "recent_orders": [],
+                "psp_count": 0
             }
         }
 
