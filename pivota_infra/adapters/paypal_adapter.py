@@ -283,6 +283,15 @@ class PayPalAdapter(PSPAdapter):
             logger.error(f"PayPal refund failed: {str(e)}")
             return (False, None, str(e))
     
+    async def refund_payment(
+        self,
+        payment_intent_id: str,
+        amount: Optional[int] = None,
+        reason: Optional[str] = None
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Alias for create_refund to match PSPAdapter interface"""
+        return await self.create_refund(payment_intent_id, amount, reason)
+    
     async def get_payment_status(self, payment_intent_id: str) -> str:
         """
         Get the status of a PayPal order
