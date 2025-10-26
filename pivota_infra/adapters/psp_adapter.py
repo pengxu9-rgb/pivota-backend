@@ -180,6 +180,35 @@ class AdyenAdapter(PSPAdapter):
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str]]:
         """创建 Adyen Payment"""
         try:
+            # Check if using mock mode
+            is_mock = self.api_key and self.api_key.startswith("sk_mock")
+            
+            if is_mock:
+                # Mock mode - return simulated payment intent
+                mock_payment_id = f"adyen_mock_{metadata.get('order_id', 'test')}"
+                print(f"🔍 Adyen: Using MOCK mode for {amount} {currency}")
+                print(f"   ✅ Created mock Adyen payment intent: {mock_payment_id}")
+                
+                return (
+                    True,
+                    PaymentIntent(
+                        id=mock_payment_id,
+                        client_secret=f"adyen_session_{mock_payment_id}",
+                        amount=int(amount * 100),
+                        currency=currency,
+                        status="pending",
+                        psp_type="adyen",
+                        raw_response={
+                            "pspReference": mock_payment_id,
+                            "resultCode": "Pending",
+                            "note": "Mock payment - use Adyen Drop-in in production"
+                        }
+                    ),
+                    None
+                )
+            
+            # Real API mode
+            print(f"🔍 Adyen: Creating real payment for {amount} {currency}")
             headers = {
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json"
@@ -204,8 +233,11 @@ class AdyenAdapter(PSPAdapter):
                     timeout=10.0
                 )
                 
+                print(f"   Response: {response.status_code}")
+                
                 if response.status_code == 200:
                     data = response.json()
+                    print(f"   ✅ Adyen payment created: {data.get('pspReference', 'N/A')}")
                     return (
                         True,
                         PaymentIntent(
@@ -220,8 +252,10 @@ class AdyenAdapter(PSPAdapter):
                         None
                     )
                 else:
+                    print(f"   ❌ Adyen API error: {response.status_code}")
                     return False, None, f"Adyen API error: {response.status_code} - {response.text}"
         except Exception as e:
+            print(f"   ❌ Adyen exception: {e}")
             return False, None, str(e)
     
     async def confirm_payment(

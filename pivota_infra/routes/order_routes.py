@@ -300,11 +300,16 @@ async def create_new_order(
                         logger.info(f"Using Adyen key from environment")
                 # Note: Checkout MUST use DB key, no env var fallback
                 
+            # 4. If still no key, use mock key for Checkout and Adyen
             if not psp_key:
                 if psp_type == "checkout":
                     # Allow mock Checkout flow without a real key
                     logger.warning(f"No Checkout API key for merchant {merchant['merchant_id']}, proceeding with mock checkout")
                     psp_key = "sk_mock_checkout"
+                elif psp_type == "adyen":
+                    # Allow mock Adyen flow without a real key
+                    logger.warning(f"No Adyen API key for merchant {merchant['merchant_id']}, proceeding with mock adyen")
+                    psp_key = "sk_mock_adyen"
                 else:
                     logger.error(f"No {psp_type} API key found for merchant {merchant['merchant_id']}")
                     # Don't fail order creation, just skip payment intent

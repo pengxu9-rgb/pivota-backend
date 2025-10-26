@@ -9,6 +9,9 @@ import httpx
 from adapters.psp_adapter import PSPAdapter, PaymentIntent
 from config.settings import settings
 
+# Default processing channel ID (fallback if not provided)
+PROCESSING_CHANNEL = "pc_default_channel"
+
 
 class CheckoutAdapter(PSPAdapter):
     """Checkout.com payment adapter"""
@@ -43,7 +46,10 @@ class CheckoutAdapter(PSPAdapter):
             print(f"   Payload: amount={int(amount * 100)}, currency={currency.upper()}")
 
             # Use real mode when we have a real API key (not mock)
-            use_real_mode = settings.checkout_mode.lower() == "real" or (self.api_key and not self.api_key.startswith("sk_mock"))
+            is_mock_key = self.api_key and self.api_key.startswith("sk_mock")
+            use_real_mode = settings.checkout_mode.lower() == "real" and not is_mock_key
+            
+            print(f"   Mode: {'REAL' if use_real_mode else 'MOCK'} (is_mock_key={is_mock_key}, checkout_mode={settings.checkout_mode})")
             
             if use_real_mode:
                 # Create Payment Session (works better than hosted-payments for programmatic access)
