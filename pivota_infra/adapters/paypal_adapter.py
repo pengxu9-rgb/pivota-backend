@@ -10,8 +10,7 @@ from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 import logging
 
-from models.schemas import PaymentIntent, RefundRequest, RefundResponse
-from adapters.psp_adapter import PSPAdapter
+from adapters.psp_adapter import PSPAdapter, PaymentIntent
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
