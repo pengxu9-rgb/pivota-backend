@@ -47,9 +47,10 @@ class CheckoutAdapter(PSPAdapter):
 
             # Use real mode when we have a real API key (not mock)
             is_mock_key = self.api_key and self.api_key.startswith("sk_mock")
-            use_real_mode = settings.checkout_mode.lower() == "real" and not is_mock_key
+            checkout_mode = getattr(settings, "checkout_mode", "mock")
+            use_real_mode = checkout_mode.lower() == "real" and not is_mock_key
             
-            print(f"   Mode: {'REAL' if use_real_mode else 'MOCK'} (is_mock_key={is_mock_key}, checkout_mode={settings.checkout_mode})")
+            print(f"   Mode: {'REAL' if use_real_mode else 'MOCK'} (is_mock_key={is_mock_key}, checkout_mode={checkout_mode})")
             
             if use_real_mode:
                 # Create Payment Session (works better than hosted-payments for programmatic access)
