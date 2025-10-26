@@ -271,3 +271,4 @@ async def get_agent_profile(current_user: dict = Depends(lambda: {})):
         "agent": dict(agent)
     }
 
+

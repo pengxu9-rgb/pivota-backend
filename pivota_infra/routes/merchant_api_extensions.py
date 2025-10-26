@@ -116,16 +116,17 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
                 }
             }
     except Exception as e:
-        # Fallback to demo data if API fails
+        # Return empty data for new merchants instead of demo data
+        logger.error(f"Failed to get dashboard stats for merchant {merchant_id}: {e}")
         return {
             "status": "success",
             "data": {
-                "total_orders": 152,
-                "total_revenue": 16725.65,
-                "total_customers": 87,
-                "total_products": 4,
-                "average_order_value": 110.04,
-                "conversion_rate": 2.34,
+                "total_orders": 0,
+                "total_revenue": 0,
+                "total_customers": 0,
+                "total_products": 0,
+                "average_order_value": 0,
+                "conversion_rate": 0,
                 "top_products": [],
                 "recent_orders": []
             }

@@ -47,8 +47,14 @@ async def get_payouts(
     if current_user["role"] not in ["merchant", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    merchant_id = "merch_208139f7600dbf42"  # Demo merchant ID
-    payouts = generate_demo_payouts(merchant_id, limit=50)
+    # Get actual merchant_id from JWT token
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found")
+    
+    # For new merchants, return empty payouts instead of demo data
+    # In production, this should query real payout data from database
+    payouts = []
     
     # Filter by status if provided
     if status:
@@ -74,8 +80,13 @@ async def get_payout_stats(current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in ["merchant", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    merchant_id = "merch_208139f7600dbf42"
-    payouts = generate_demo_payouts(merchant_id, limit=100)
+    # Get actual merchant_id from JWT token
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found")
+    
+    # For new merchants, return empty stats
+    payouts = []
     
     # Calculate statistics
     total_paid = sum(p["amount"] for p in payouts if p["status"] == "completed")
