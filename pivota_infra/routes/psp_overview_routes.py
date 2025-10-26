@@ -43,11 +43,11 @@ async def get_psp_overview(
                 mp.provider as psp_name,
                 mp.status,
                 COUNT(DISTINCT mp.merchant_id) as merchant_count,
-                COUNT(o.order_id) as transaction_count,
-                COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END) as success_count,
-                SUM(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE 0 END) as total_volume,
-                AVG(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE NULL END) as avg_transaction_size,
-                COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refund_count,
+                COALESCE(COUNT(o.order_id), 0) as transaction_count,
+                COALESCE(COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END), 0) as success_count,
+                COALESCE(SUM(CASE WHEN o.payment_status = 'paid' THEN CAST(CAST(o.total_amount AS DECIMAL) AS DECIMAL) ELSE 0 END), 0) as total_volume,
+                AVG(CASE WHEN o.payment_status = 'paid' THEN CAST(CAST(o.total_amount AS DECIMAL) AS DECIMAL) ELSE NULL END) as avg_transaction_size,
+                COALESCE(COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END), 0) as refund_count,
                 MAX(o.created_at) as last_transaction
             FROM merchant_psps mp
             LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
@@ -213,10 +213,10 @@ async def get_psp_detail(
             COUNT(CASE WHEN o.payment_status = 'failed' THEN 1 END) as failed_transactions,
             COUNT(CASE WHEN o.payment_status = 'pending' THEN 1 END) as pending_transactions,
             COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refunded_transactions,
-            SUM(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE 0 END) as total_volume,
-            AVG(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE NULL END) as avg_transaction_size,
-            MIN(o.total_amount) as min_transaction_size,
-            MAX(o.total_amount) as max_transaction_size
+            SUM(CASE WHEN o.payment_status = 'paid' THEN CAST(o.total_amount AS DECIMAL) ELSE 0 END) as total_volume,
+            AVG(CASE WHEN o.payment_status = 'paid' THEN CAST(o.total_amount AS DECIMAL) ELSE NULL END) as avg_transaction_size,
+            MIN(CAST(o.total_amount AS DECIMAL)) as min_transaction_size,
+            MAX(CAST(o.total_amount AS DECIMAL)) as max_transaction_size
         FROM orders o
         JOIN merchant_psps mp ON o.merchant_id = mp.merchant_id
         WHERE mp.provider = :psp_id 
@@ -237,7 +237,7 @@ async def get_psp_detail(
             COUNT(o.order_id) as transaction_count,
             COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END) as success_count,
             COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refund_count,
-            SUM(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE 0 END) as volume,
+            SUM(CASE WHEN o.payment_status = 'paid' THEN CAST(o.total_amount AS DECIMAL) ELSE 0 END) as volume,
             MAX(o.created_at) as last_transaction
         FROM merchant_onboarding m
         JOIN merchant_psps mp ON m.merchant_id = mp.merchant_id
@@ -260,7 +260,7 @@ async def get_psp_detail(
             DATE_TRUNC('hour', o.created_at) as hour,
             COUNT(o.order_id) as transactions,
             COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END) as successful,
-            SUM(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE 0 END) as volume
+            SUM(CASE WHEN o.payment_status = 'paid' THEN CAST(o.total_amount AS DECIMAL) ELSE 0 END) as volume
         FROM orders o
         JOIN merchant_psps mp ON o.merchant_id = mp.merchant_id
         WHERE mp.provider = :psp_id 
