@@ -167,23 +167,41 @@ async def login(data: LoginRequest):
             values={"last_login": datetime.utcnow(), "user_id": user['id']}
         )
         
+        # For merchants, get their merchant_id from merchant_onboarding
+        merchant_id = None
+        if user['role'] == 'merchant':
+            merchant_record = await database.fetch_one(
+                "SELECT merchant_id FROM merchant_onboarding WHERE contact_email = :email",
+                {"email": user['email']}
+            )
+            if merchant_record:
+                merchant_id = merchant_record['merchant_id']
+        
         # Create JWT token
-        token = create_access_token({
+        token_data = {
             "sub": user['email'],
             "user_id": str(user['id']),
             "email": user['email'],
             "role": user['role']
-        })
+        }
+        if merchant_id:
+            token_data["merchant_id"] = merchant_id
+        
+        token = create_access_token(token_data)
+        
+        user_response = {
+            "id": str(user['id']),
+            "email": user['email'],
+            "full_name": user['full_name'],
+            "role": user['role']
+        }
+        if merchant_id:
+            user_response["merchant_id"] = merchant_id
         
         return LoginResponse(
             success=True,
             token=token,
-            user={
-                "id": str(user['id']),
-                "email": user['email'],
-                "full_name": user['full_name'],
-                "role": user['role']
-            }
+            user=user_response
         )
         
     except HTTPException:
