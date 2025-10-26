@@ -154,7 +154,7 @@ async def login_agent(data: AgentLoginRequest):
     try:
         # 1. Find user
         user = await database.fetch_one(
-            "SELECT user_id, email, password_hash, full_name, role, active FROM users WHERE email = :email",
+            "SELECT id, email, password_hash, full_name, role, active FROM users WHERE email = :email",
             {"email": data.email}
         )
         
@@ -192,7 +192,7 @@ async def login_agent(data: AgentLoginRequest):
         # 6. Create JWT token
         token = create_access_token({
             "sub": user["email"],
-            "user_id": str(user["user_id"]),
+            "user_id": str(user["id"]),
             "role": "agent",
             "agent_id": agent["agent_id"]
         })
