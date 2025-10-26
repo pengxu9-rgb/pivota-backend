@@ -69,6 +69,7 @@ from routes.debug_psp_validation import router as debug_psp_validation_router
 from routes.admin_migrations import router as admin_migrations_router
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
+from routes.psp_overview_routes import router as psp_overview_router
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -195,6 +196,7 @@ app.include_router(emp_agent_mgmt_router)  # Employee agent management
 app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing
+app.include_router(psp_overview_router)  # PSP overview and metrics
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
