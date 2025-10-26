@@ -11,6 +11,9 @@ from config.settings import settings
 from db.database import database, transactions
 from sqlalchemy import func, select, desc, and_
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -282,6 +285,10 @@ async def admin_connect_psp(
     # Validate PayPal requires client_secret
     if provider == "paypal" and (not secret_key or len(secret_key) < 8):
         raise HTTPException(status_code=400, detail="PayPal requires both Client ID and Client Secret")
+    
+    # Validate Checkout requires processing_channel_id
+    if provider == "checkout" and not account_id:
+        raise HTTPException(status_code=400, detail="Checkout.com requires processing_channel_id in account_id field")
 
     # If updating existing PSP (has psp_id but no merchant_id)
     if psp_id and not merchant_id:
@@ -302,10 +309,15 @@ async def admin_connect_psp(
     if not psp_id:
         psp_id = f"psp_{provider}_{datetime.now().strftime('%H%M%S%f')}"
     
-    capabilities = payload.get("capabilities") or (
-        ["payments", "refunds", "payouts"] if provider == "stripe" else
-        ["payments", "refunds"]
-    )
+    # Define default capabilities per PSP
+    DEFAULT_CAPABILITIES = {
+        "stripe": ["payments", "refunds", "payouts", "subscriptions"],
+        "adyen": ["payments", "refunds", "payouts"],
+        "checkout": ["payments", "refunds"],
+        "paypal": ["payments", "refunds", "payouts"]
+    }
+    
+    capabilities = payload.get("capabilities") or DEFAULT_CAPABILITIES.get(provider, ["payments"])
     
     try:
         logger.info(f"💾 Saving {provider} PSP for merchant {merchant_id}")
