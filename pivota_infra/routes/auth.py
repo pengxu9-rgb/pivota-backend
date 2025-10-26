@@ -303,3 +303,211 @@ async def test_auth():
         }
     }
 
+
+# ============================================================================
+# Password Management
+# ============================================================================
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+    
+    @validator('new_password')
+    def validate_new_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters long')
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not any(c.islower() for c in v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain at least one digit')
+        return v
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+    
+    @validator('new_password')
+    def validate_new_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters long')
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not any(c.islower() for c in v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain at least one digit')
+        return v
+
+
+@router.post("/change-password", response_model=MessageResponse)
+async def change_password(
+    data: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Change password for authenticated user
+    Requires current password for verification
+    """
+    try:
+        # Get user from database
+        user = await database.fetch_one(
+            "SELECT user_id, email, password_hash FROM users WHERE email = :email",
+            {"email": current_user["email"]}
+        )
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Verify current password
+        if not verify_password(data.current_password, user["password_hash"]):
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        
+        # Hash new password
+        new_password_hash = hash_password(data.new_password)
+        
+        # Update password
+        await database.execute(
+            "UPDATE users SET password_hash = :password_hash WHERE email = :email",
+            {"password_hash": new_password_hash, "email": current_user["email"]}
+        )
+        
+        return MessageResponse(
+            success=True,
+            message="Password changed successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to change password: {str(e)}"
+        )
+
+
+@router.post("/forgot-password", response_model=MessageResponse)
+async def forgot_password(data: ForgotPasswordRequest):
+    """
+    Request password reset
+    Generates a reset token and stores it in database
+    """
+    try:
+        import secrets
+        from datetime import timedelta
+        
+        # Check if user exists
+        user = await database.fetch_one(
+            "SELECT user_id, email FROM users WHERE email = :email",
+            {"email": data.email}
+        )
+        
+        if not user:
+            # Don't reveal if email exists or not (security best practice)
+            return MessageResponse(
+                success=True,
+                message="If the email exists, a password reset link has been sent"
+            )
+        
+        # Generate reset token (valid for 1 hour)
+        reset_token = secrets.token_urlsafe(32)
+        expires_at = datetime.utcnow() + timedelta(hours=1)
+        
+        # Store reset token in database
+        # First, create password_reset_tokens table if needed
+        try:
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    token VARCHAR(255) PRIMARY KEY,
+                    user_email VARCHAR(255) NOT NULL,
+                    expires_at TIMESTAMP NOT NULL,
+                    used BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except:
+            pass  # Table might already exist
+        
+        await database.execute(
+            """
+            INSERT INTO password_reset_tokens (token, user_email, expires_at)
+            VALUES (:token, :email, :expires_at)
+            """,
+            {"token": reset_token, "email": data.email, "expires_at": expires_at}
+        )
+        
+        # TODO: Send email with reset link
+        # For now, just log the token (in production, send via email)
+        reset_link = f"https://merchants.pivota.cc/reset-password?token={reset_token}"
+        print(f"🔑 Password reset link for {data.email}: {reset_link}")
+        print(f"   (Valid for 1 hour)")
+        
+        return MessageResponse(
+            success=True,
+            message="If the email exists, a password reset link has been sent"
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process password reset: {str(e)}"
+        )
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+async def reset_password(data: ResetPasswordRequest):
+    """
+    Reset password using token from forgot-password flow
+    """
+    try:
+        # Verify token exists and is valid
+        token_record = await database.fetch_one(
+            """
+            SELECT token, user_email, expires_at, used 
+            FROM password_reset_tokens 
+            WHERE token = :token
+            """,
+            {"token": data.token}
+        )
+        
+        if not token_record:
+            raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+        
+        if token_record["used"]:
+            raise HTTPException(status_code=400, detail="Reset token has already been used")
+        
+        if datetime.utcnow() > token_record["expires_at"]:
+            raise HTTPException(status_code=400, detail="Reset token has expired")
+        
+        # Hash new password
+        new_password_hash = hash_password(data.new_password)
+        
+        # Update user password
+        await database.execute(
+            "UPDATE users SET password_hash = :password_hash WHERE email = :email",
+            {"password_hash": new_password_hash, "email": token_record["user_email"]}
+        )
+        
+        # Mark token as used
+        await database.execute(
+            "UPDATE password_reset_tokens SET used = TRUE WHERE token = :token",
+            {"token": data.token}
+        )
+        
+        return MessageResponse(
+            success=True,
+            message="Password reset successfully. You can now login with your new password."
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reset password: {str(e)}"
+        )
+
