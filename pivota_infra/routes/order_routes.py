@@ -256,12 +256,13 @@ async def create_new_order(
             # PSP 密钥查找：优先从 merchant_psps 表
             psp_key = None
             psp_account_id = None
+            psp_secret = None  # For PayPal client_secret
             
             # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key 和 account_id
             try:
                 psp_row = await database.fetch_one(
                     """
-                    SELECT api_key, account_id FROM merchant_psps
+                    SELECT api_key, account_id, secret_key FROM merchant_psps
                     WHERE merchant_id = :merchant_id AND provider = :provider
                     ORDER BY connected_at DESC
                     LIMIT 1
@@ -272,8 +273,10 @@ async def create_new_order(
                     psp_key = psp_row["api_key"]
                     try:
                         psp_account_id = psp_row["account_id"]
+                        psp_secret = psp_row.get("secret_key")  # For PayPal
                     except Exception:
                         psp_account_id = None
+                        psp_secret = None
                     logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
                     logger.info(f"  API Key length: {len(psp_key)}, Account ID: {psp_account_id}")
             except Exception as e:
@@ -311,6 +314,10 @@ async def create_new_order(
                 if psp_type == "checkout" and psp_account_id:
                     adapter_kwargs["public_key"] = psp_account_id
                     logger.info(f"🔧 Creating Checkout adapter with processing_channel_id: {psp_account_id}")
+                elif psp_type == "paypal" and psp_secret:
+                    adapter_kwargs["client_secret"] = psp_secret
+                    adapter_kwargs["is_sandbox"] = True  # Use sandbox for now
+                    logger.info(f"🔧 Creating PayPal adapter with client_secret")
                 
                 logger.info(f"📡 Creating {psp_type} payment intent for ${total} {order_request.currency}")
                 psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
@@ -328,9 +335,9 @@ async def create_new_order(
                     client_secret = payment_intent.client_secret
                     logger.info(f"✅ Payment intent created: {payment_intent_id}")
                     
-                    # For Checkout real mode, client_secret contains the redirect URL
-                    if psp_type == "checkout" and client_secret and client_secret.startswith("http"):
-                        logger.info(f"🔗 Checkout redirect URL: {client_secret}")
+                    # For Checkout and PayPal, client_secret contains the redirect URL
+                    if psp_type in ["checkout", "paypal"] and client_secret and client_secret.startswith("http"):
+                        logger.info(f"🔗 {psp_type.capitalize()} redirect URL: {client_secret}")
                         
                     await update_payment_info(
                         order_id=order_id,

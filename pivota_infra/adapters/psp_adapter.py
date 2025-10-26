@@ -327,7 +327,7 @@ def get_psp_adapter(psp_type: str, api_key: str, **kwargs) -> PSPAdapter:
     获取 PSP 适配器
     
     Args:
-        psp_type: PSP 类型 ("stripe", "adyen", "checkout")
+        psp_type: PSP 类型 ("stripe", "adyen", "checkout", "paypal")
         api_key: API 密钥
         **kwargs: 其他 PSP 特定参数
     
@@ -348,6 +348,11 @@ def get_psp_adapter(psp_type: str, api_key: str, **kwargs) -> PSPAdapter:
         from adapters.checkout_adapter import CheckoutAdapter
         public_key = kwargs.get("public_key")
         return CheckoutAdapter(api_key, public_key)
+    elif psp_type == "paypal":
+        from adapters.paypal_adapter import PayPalAdapter
+        client_secret = kwargs.get("client_secret", api_key)  # PayPal uses client_id as api_key
+        is_sandbox = kwargs.get("is_sandbox", True)
+        return PayPalAdapter(api_key, client_secret, is_sandbox)
     else:
         raise ValueError(f"Unsupported PSP type: {psp_type}")
 
