@@ -20,19 +20,23 @@ export default function LoginPage() {
     try {
       const response = await apiClient.login(email, password);
       
-      if (response.status === 'success') {
+      // New API returns success: true instead of status: 'success'
+      if (response.success === true || response.status === 'success') {
         console.log('✅ Login successful, redirecting to dashboard...');
         // Store merchant_id from response if available
         try {
           if (response.user?.merchant_id) {
             localStorage.setItem('merchant_id', response.user.merchant_id);
+          } else if (response.user?.id) {
+            // Fallback: use user.id as merchant_id
+            localStorage.setItem('merchant_id', response.user.id);
           }
         } catch (e) {
           // no-op
         }
         router.push('/dashboard');
       } else {
-        setError(response.message || 'Login failed');
+        setError(response.message || response.detail || 'Login failed');
       }
     } catch (err: any) {
       console.error('❌ Login error:', err);
