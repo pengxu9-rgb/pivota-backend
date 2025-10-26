@@ -308,8 +308,14 @@ async def admin_connect_psp(
     )
     
     try:
+        logger.info(f"💾 Saving {provider} PSP for merchant {merchant_id}")
+        logger.info(f"   API Key length: {len(api_key)}")
+        logger.info(f"   Account ID: {account_id}")
+        logger.info(f"   Has secret_key: {bool(secret_key)}")
+        
         # Build dynamic query to handle secret_key
         base_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
+        base_vals = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
         params = {
             "psp_id": psp_id,
             "merchant_id": merchant_id,
@@ -318,31 +324,46 @@ async def admin_connect_psp(
             "api_key": api_key,
             "account_id": account_id or None,
             "capabilities": ",".join(capabilities),
+            "status": "active",
             "connected_at": datetime.now(),
         }
         
         update_set_parts = [
             "api_key = EXCLUDED.api_key",
             "account_id = EXCLUDED.account_id",
-            "name = EXCLUDED.name"
+            "name = EXCLUDED.name",
+            "status = EXCLUDED.status"
         ]
         
         # Add secret_key if provided
         if secret_key:
             base_cols.append("secret_key")
+            base_vals.append(":secret_key")
             params["secret_key"] = secret_key
             update_set_parts.append("secret_key = EXCLUDED.secret_key")
+            logger.info(f"   Including secret_key in database insert")
         
-        # Use UPSERT to update if exists, insert if not
-        await database.execute(
-            f"""
+        query_str = f"""
             INSERT INTO merchant_psps ({', '.join(base_cols)})
-            VALUES ({', '.join(':' + col if col != 'status' else "'active'" for col in base_cols)})
+            VALUES ({', '.join(base_vals)})
             ON CONFLICT (psp_id) DO UPDATE SET
                 {', '.join(update_set_parts)}
-            """,
-            params
+        """
+        
+        logger.info(f"   Executing UPSERT query...")
+        await database.execute(query_str, params)
+        logger.info(f"✅ PSP saved successfully: {psp_id}")
+        
+        # Verify the save
+        verify = await database.fetch_one(
+            "SELECT provider, api_key, account_id, secret_key FROM merchant_psps WHERE psp_id = :psp_id",
+            {"psp_id": psp_id}
         )
+        if verify:
+            logger.info(f"✅ Verified in DB: provider={verify['provider']}, api_key_len={len(verify['api_key']) if verify['api_key'] else 0}, has_secret={bool(verify.get('secret_key'))}")
+        else:
+            logger.error(f"❌ Failed to verify PSP in database!")
+        
         # Mark merchant onboarding flags for dashboard
         await database.execute(
             """
