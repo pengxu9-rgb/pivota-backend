@@ -358,9 +358,13 @@ async def get_all_psps(
             
             # Mask secret_key for security (show last 4 chars only)
             secret_key_masked = None
-            if row.get("secret_key"):
-                secret_key = row["secret_key"]
-                secret_key_masked = '*' * (len(secret_key) - 4) + secret_key[-4:] if len(secret_key) > 4 else '****'
+            try:
+                row_dict = dict(row)
+                if row_dict.get("secret_key"):
+                    secret_key = row_dict["secret_key"]
+                    secret_key_masked = '*' * (len(secret_key) - 4) + secret_key[-4:] if len(secret_key) > 4 else '****'
+            except Exception:
+                secret_key_masked = None
             
             psps.append({
                 "psp_id": row["psp_id"],
