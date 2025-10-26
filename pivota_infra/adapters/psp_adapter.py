@@ -189,26 +189,26 @@ class AdyenAdapter(PSPAdapter):
                 "Content-Type": "application/json"
             }
             
+            # Use sessions API for redirect flow (like Stripe)
             payload = {
                 "amount": {
-                    "value": int(amount * 100),  # Adyen 也使用分为单位
+                    "value": int(amount * 100),
                     "currency": currency
                 },
                 "reference": metadata.get("order_id", "ORDER"),
                 "merchantAccount": self.merchant_account,
                 "returnUrl": "https://merchant.pivota.cc/payment/success",
-                "paymentMethod": {
-                    "type": "scheme"  # Credit card payment
-                },
-                "channel": "Web",
-                "shopperInteraction": "Ecommerce"
+                "countryCode": "US",
+                "shopperLocale": "en_US",
+                "channel": "Web"
             }
             
             print(f"   Payload merchantAccount: {payload['merchantAccount']}")
             
             async with httpx.AsyncClient() as client:
+                # Use /sessions endpoint for redirect flow
                 response = await client.post(
-                    f"{self.base_url}/payments",
+                    f"{self.base_url}/sessions",
                     json=payload,
                     headers=headers,
                     timeout=10.0
@@ -216,17 +216,22 @@ class AdyenAdapter(PSPAdapter):
                 
                 print(f"   Response: {response.status_code}")
                 
-                if response.status_code == 200:
+                if response.status_code in [200, 201]:
                     data = response.json()
-                    print(f"   ✅ Adyen payment created: {data.get('pspReference', 'N/A')}")
+                    session_id = data.get("id", "")
+                    session_data = data.get("sessionData", "")
+                    
+                    print(f"   ✅ Adyen session created: {session_id}")
+                    print(f"   🔗 Session data available: {'YES' if session_data else 'NO'}")
+                    
                     return (
                         True,
                         PaymentIntent(
-                            id=data.get("pspReference", ""),
-                            client_secret=data.get("sessionData", ""),  # Adyen 的客户端密钥
+                            id=f"adyen_session_{session_id}",
+                            client_secret=session_data,  # Adyen session data for frontend
                             amount=int(amount * 100),
                             currency=currency,
-                            status=data.get("resultCode", "pending").lower(),
+                            status="requires_action",
                             psp_type="adyen",
                             raw_response=data
                         ),
