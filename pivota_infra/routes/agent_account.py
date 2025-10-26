@@ -96,27 +96,32 @@ async def register_agent(data: AgentRegisterRequest):
         # Hash the API key for storage (store hash, not plaintext)
         api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
         
-        # 4. Create agent record
+        # 4. Create agent record using the actual table structure
         await database.execute(
             """
             INSERT INTO agents (
-                agent_id, name, email, company, api_key_hash, 
-                status, tier, rate_limit_rpm, daily_quota, created_at
+                agent_id, agent_name, agent_type, description,
+                api_key, api_key_hash, is_active,
+                owner_email, rate_limit, daily_quota,
+                created_at
             )
             VALUES (
-                :agent_id, :name, :email, :company, :api_key_hash,
-                :status, :tier, :rate_limit_rpm, :daily_quota, :created_at
+                :agent_id, :agent_name, :agent_type, :description,
+                :api_key, :api_key_hash, :is_active,
+                :owner_email, :rate_limit, :daily_quota,
+                :created_at
             )
             """,
             {
                 "agent_id": agent_id,
-                "name": data.agent_name,
-                "email": data.email,
-                "company": data.company,
+                "agent_name": data.agent_name,
+                "agent_type": "custom",
+                "description": data.description,
+                "api_key": api_key,
                 "api_key_hash": api_key_hash,
-                "status": "active",
-                "tier": "free",  # Default tier
-                "rate_limit_rpm": 60,  # 60 requests per minute
+                "is_active": True,
+                "owner_email": data.email,
+                "rate_limit": 60,  # 60 requests per minute
                 "daily_quota": 1000,  # 1000 requests per day
                 "created_at": datetime.utcnow()
             }
@@ -166,42 +171,17 @@ async def login_agent(data: AgentLoginRequest):
         if not verify_password(data.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         
-        # 3. Get agent record
+        # 3. Get agent record using actual column names
         agent = await database.fetch_one(
-            "SELECT agent_id, name, email, company, status, tier, allowed_merchants FROM agents WHERE email = :email",
+            "SELECT agent_id, agent_name, owner_email, description, is_active, allowed_merchants, api_key FROM agents WHERE owner_email = :email",
             {"email": data.email}
         )
         
         if not agent:
             raise HTTPException(status_code=404, detail="Agent record not found. Please contact support.")
         
-        # 4. Get or generate API key
-        api_key_record = await database.fetch_one(
-            "SELECT api_key FROM agent_api_keys WHERE agent_id = :agent_id AND is_active = TRUE LIMIT 1",
-            {"agent_id": agent["agent_id"]}
-        )
-        
-        if api_key_record:
-            api_key = api_key_record["api_key"]
-        else:
-            # Generate new API key if none exists
-            api_key_raw = secrets.token_bytes(32)
-            api_key = f"ak_live_{api_key_raw.hex()}"
-            api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-            
-            await database.execute(
-                """
-                INSERT INTO agent_api_keys (agent_id, api_key, api_key_hash, is_active, created_at)
-                VALUES (:agent_id, :api_key, :api_key_hash, :is_active, :created_at)
-                """,
-                {
-                    "agent_id": agent["agent_id"],
-                    "api_key": api_key,
-                    "api_key_hash": api_key_hash,
-                    "is_active": True,
-                    "created_at": datetime.utcnow()
-                }
-            )
+        # 4. Use the API key from agents table (already stored there)
+        api_key = agent["api_key"]
         
         # 5. Update last login
         await database.execute(
@@ -222,11 +202,11 @@ async def login_agent(data: AgentLoginRequest):
             token=token,
             agent={
                 "agent_id": agent["agent_id"],
-                "name": agent["name"],
-                "email": agent["email"],
-                "company": agent["company"],
-                "tier": agent["tier"],
-                "allowed_merchants": agent["allowed_merchants"]
+                "agent_name": agent["agent_name"],
+                "email": agent["owner_email"],
+                "company": "",  # Not stored in agent table
+                "description": agent.get("description", ""),
+                "status": "active" if agent["is_active"] else "inactive"
             },
             api_key=api_key
         )
