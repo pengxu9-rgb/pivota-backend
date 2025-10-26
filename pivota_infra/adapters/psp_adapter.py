@@ -181,6 +181,9 @@ class AdyenAdapter(PSPAdapter):
         """创建 Adyen Payment"""
         try:
             print(f"🔍 Adyen: Creating payment for {amount} {currency}")
+            print(f"   Merchant Account: {self.merchant_account}")
+            print(f"   API Key: {self.api_key[:15]}... (len={len(self.api_key)})")
+            
             headers = {
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json"
@@ -200,6 +203,8 @@ class AdyenAdapter(PSPAdapter):
                 "channel": "Web",
                 "shopperInteraction": "Ecommerce"
             }
+            
+            print(f"   Payload merchantAccount: {payload['merchantAccount']}")
             
             async with httpx.AsyncClient() as client:
                 response = await client.post(

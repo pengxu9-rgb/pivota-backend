@@ -1,0 +1,160 @@
+{
+  "test_time": "2025-10-26T21:05:57.499298",
+  "merchant_id": "merch_208139f7600dbf42",
+  "total_orders": 10,
+  "successful": 8,
+  "failed": 2,
+  "success_rate": 80.0,
+  "by_psp": {
+    "stripe": {
+      "total": 3,
+      "success": 3,
+      "failed": 0,
+      "orders": [
+        1,
+        5,
+        9
+      ]
+    },
+    "checkout": {
+      "total": 3,
+      "success": 3,
+      "failed": 0,
+      "orders": [
+        2,
+        6,
+        10
+      ]
+    },
+    "paypal": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "orders": [
+        3,
+        7
+      ]
+    },
+    "adyen": {
+      "total": 2,
+      "success": 0,
+      "failed": 2,
+      "orders": [
+        4,
+        8
+      ]
+    }
+  },
+  "orders": [
+    {
+      "order_num": 1,
+      "order_id": "ORD_4EDCF32B1118A67D",
+      "psp": "stripe",
+      "product": "Premium Headphones",
+      "price": 99.99,
+      "payment_intent_id": "pi_3SMTceGeIEg0wZyU1h6WrSRr",
+      "client_secret": "pi_3SMTceGeIEg0wZyU1h6WrSRr_secret_7usLeO2osrK5CwhP82VsXMVAp",
+      "has_payment": true,
+      "status": "success"
+    },
+    {
+      "order_num": 2,
+      "order_id": "ORD_CF92B83B49F54360",
+      "psp": "checkout",
+      "product": "Wireless Mouse",
+      "price": 29.99,
+      "payment_intent_id": "chk_session_ps_34bYlCLPAVJfgyYf4lPUYWY007O",
+      "client_secret": "YmFzZTY0:eyJpZCI6InBzXzM0YllsQ0xQQVZKZmd5WWY0bFBVWVdZMDA3TyIsImVudGl0eV9pZCI6ImVudF91eTVyeWlub2J6N2oydmdmcjY2czVndDZjaSIsImV4cGVyaW1lbnRzIjp7fSwicHJvY2Vzc2luZ19jaGFubmVsX2lkIjoicGNfb3l3anU0NTR0am1lZGZsZ3RvaXVoNWZyaXkiLCJhbW91bnQiOjI5OTksImxvY2FsZSI6ImVuLUdCIiwiY3VycmVuY3kiOiJVU0QiLCJwYXltZW50X21ldGhvZHMiOlt7InR5cGUiOiJjYXJkIiwiY2FyZF9zY2hlbWVzIjpbIlZpc2EiLCJNYXN0ZXJjYXJkIiwiQW1leCJdLCJzY2hlbWVfY2hvaWNlX2VuYWJsZWQiOmZhbHNlLCJzdG9yZV9wYXltZW50X2RldGFpbHMiOiJkaXNhYmxlZCIsImJpbGxpbmdfYWRkcmVzcyI6eyJjb3VudHJ5IjoiR0IifX0seyJ0eXBlIjoiYXBwbGVwYXkiLCJkaXNwbGF5X25hbWUiOiJXb29wYXkiLCJjb3VudHJ5X2NvZGUiOiJHQiIsImN1cnJlbmN5X2NvZGUiOiJVU0QiLCJtZXJjaGFudF9jYXBhYmlsaXRpZXMiOlsic3VwcG9ydHMzRFMiXSwic3VwcG9ydGVkX25ldHdvcmtzIjpbInZpc2EiLCJtYXN0ZXJDYXJkIiwiYW1leCJdLCJ0b3RhbCI6eyJsYWJlbCI6Ildvb3BheSIsInR5cGUiOiJmaW5hbCIsImFtb3VudCI6IjI5Ljk5In19LHsidHlwZSI6Imdvb2dsZXBheSIsIm1lcmNoYW50Ijp7ImlkIjoiMDgxMTMwODkzODYyNjg4NDk5ODIiLCJuYW1lIjoiV29vcGF5Iiwib3JpZ2luIjoiaHR0cHM6Ly9hZ2VudHMucGl2b3RhLmNjIn0sInRyYW5zYWN0aW9uX2luZm8iOnsidG90YWxfcHJpY2Vfc3RhdHVzIjoiRklOQUwiLCJ0b3RhbF9wcmljZSI6IjI5Ljk5IiwiY291bnRyeV9jb2RlIjoiR0IiLCJjdXJyZW5jeV9jb2RlIjoiVVNEIn0sImNhcmRfcGFyYW1ldGVycyI6eyJhbGxvd2VkX2F1dGhfbWV0aG9kcyI6WyJQQU5fT05MWSIsIkNSWVBUT0dSQU1fM0RTIl0sImFsbG93ZWRfY2FyZF9uZXR3b3JrcyI6WyJWSVNBIiwiTUFTVEVSQ0FSRCIsIkFNRVgiXX19XSwiZmVhdHVyZV9mbGFncyI6WyJhbmFseXRpY3Nfb2JzZXJ2YWJpbGl0eV9lbmFibGVkIiwiY2FyZF9maWVsZHNfZW5hYmxlZCIsImdldF93aXRoX3B1YmxpY19rZXlfZW5hYmxlZCIsImxvZ3Nfb2JzZXJ2YWJpbGl0eV9lbmFibGVkIiwicmlza19qc19lbmFibGVkIiwidXNlX25vbl9iaWNfaWRlYWxfaW50ZWdyYXRpb24iXSwicmlzayI6eyJlbmFibGVkIjpmYWxzZX0sIm1lcmNoYW50X25hbWUiOiJXb29wYXkiLCJwYXltZW50X3Nlc3Npb25fc2VjcmV0IjoicHNzXzk4YjJlNTU1LThmMzYtNDhmYi05YTUxLWI5MTI1MTgyYWY5NSIsImludGVncmF0aW9uX2RvbWFpbiI6ImFwaS5zYW5kYm94LmNoZWNrb3V0LmNvbSJ9",
+      "has_payment": true,
+      "status": "success"
+    },
+    {
+      "order_num": 3,
+      "order_id": "ORD_FD38E92D5A811EAF",
+      "psp": "paypal",
+      "product": "USB-C Cable",
+      "price": 12.99,
+      "payment_intent_id": "1D5005802U555841Y",
+      "client_secret": "https://www.sandbox.paypal.com/checkoutnow?token=1D5005802U555841Y",
+      "has_payment": true,
+      "status": "success"
+    },
+    {
+      "order_num": 4,
+      "order_id": "ORD_7F5279E0A9AC9DAD",
+      "psp": "adyen",
+      "product": "Phone Case",
+      "price": 19.99,
+      "payment_intent_id": null,
+      "client_secret": null,
+      "has_payment": false,
+      "status": "success"
+    },
+    {
+      "order_num": 5,
+      "order_id": "ORD_22284651C97B6F2A",
+      "psp": "stripe",
+      "product": "Screen Protector",
+      "price": 9.99,
+      "payment_intent_id": "pi_3SMTdEGeIEg0wZyU1yYIRg4R",
+      "client_secret": "pi_3SMTdEGeIEg0wZyU1yYIRg4R_secret_NLRVALeo5OkFnNk1EsngctYr4",
+      "has_payment": true,
+      "status": "success"
+    },
+    {
+      "order_num": 6,
+      "order_id": "ORD_19D4298C17C353B8",
+      "psp": "checkout",
+      "product": "Laptop Stand",
+      "price": 39.99,
+      "payment_intent_id": "chk_session_ps_34bYpRM6aWQgIsUGbsqKYuRCzpp",
+      "client_secret": "YmFzZTY0:eyJpZCI6InBzXzM0YllwUk02YVdRZ0lzVUdic3FLWXVSQ3pwcCIsImVudGl0eV9pZCI6ImVudF91eTVyeWlub2J6N2oydmdmcjY2czVndDZjaSIsImV4cGVyaW1lbnRzIjp7fSwicHJvY2Vzc2luZ19jaGFubmVsX2lkIjoicGNfb3l3anU0NTR0am1lZGZsZ3RvaXVoNWZyaXkiLCJhbW91bnQiOjM5OTksImxvY2FsZSI6ImVuLUdCIiwiY3VycmVuY3kiOiJVU0QiLCJwYXltZW50X21ldGhvZHMiOlt7InR5cGUiOiJjYXJkIiwiY2FyZF9zY2hlbWVzIjpbIlZpc2EiLCJNYXN0ZXJjYXJkIiwiQW1leCJdLCJzY2hlbWVfY2hvaWNlX2VuYWJsZWQiOmZhbHNlLCJzdG9yZV9wYXltZW50X2RldGFpbHMiOiJkaXNhYmxlZCIsImJpbGxpbmdfYWRkcmVzcyI6eyJjb3VudHJ5IjoiR0IifX0seyJ0eXBlIjoiYXBwbGVwYXkiLCJkaXNwbGF5X25hbWUiOiJXb29wYXkiLCJjb3VudHJ5X2NvZGUiOiJHQiIsImN1cnJlbmN5X2NvZGUiOiJVU0QiLCJtZXJjaGFudF9jYXBhYmlsaXRpZXMiOlsic3VwcG9ydHMzRFMiXSwic3VwcG9ydGVkX25ldHdvcmtzIjpbInZpc2EiLCJtYXN0ZXJDYXJkIiwiYW1leCJdLCJ0b3RhbCI6eyJsYWJlbCI6Ildvb3BheSIsInR5cGUiOiJmaW5hbCIsImFtb3VudCI6IjM5Ljk5In19LHsidHlwZSI6Imdvb2dsZXBheSIsIm1lcmNoYW50Ijp7ImlkIjoiMDgxMTMwODkzODYyNjg4NDk5ODIiLCJuYW1lIjoiV29vcGF5Iiwib3JpZ2luIjoiaHR0cHM6Ly9hZ2VudHMucGl2b3RhLmNjIn0sInRyYW5zYWN0aW9uX2luZm8iOnsidG90YWxfcHJpY2Vfc3RhdHVzIjoiRklOQUwiLCJ0b3RhbF9wcmljZSI6IjM5Ljk5IiwiY291bnRyeV9jb2RlIjoiR0IiLCJjdXJyZW5jeV9jb2RlIjoiVVNEIn0sImNhcmRfcGFyYW1ldGVycyI6eyJhbGxvd2VkX2F1dGhfbWV0aG9kcyI6WyJQQU5fT05MWSIsIkNSWVBUT0dSQU1fM0RTIl0sImFsbG93ZWRfY2FyZF9uZXR3b3JrcyI6WyJWSVNBIiwiTUFTVEVSQ0FSRCIsIkFNRVgiXX19XSwiZmVhdHVyZV9mbGFncyI6WyJhbmFseXRpY3Nfb2JzZXJ2YWJpbGl0eV9lbmFibGVkIiwiY2FyZF9maWVsZHNfZW5hYmxlZCIsImdldF93aXRoX3B1YmxpY19rZXlfZW5hYmxlZCIsImxvZ3Nfb2JzZXJ2YWJpbGl0eV9lbmFibGVkIiwicmlza19qc19lbmFibGVkIiwidXNlX25vbl9iaWNfaWRlYWxfaW50ZWdyYXRpb24iXSwicmlzayI6eyJlbmFibGVkIjpmYWxzZX0sIm1lcmNoYW50X25hbWUiOiJXb29wYXkiLCJwYXltZW50X3Nlc3Npb25fc2VjcmV0IjoicHNzXzAxZWVjZGI3LTJlYzktNDhkYS1iMWEzLTY3YmEwZTMwYWU2ZSIsImludGVncmF0aW9uX2RvbWFpbiI6ImFwaS5zYW5kYm94LmNoZWNrb3V0LmNvbSJ9",
+      "has_payment": true,
+      "status": "success"
+    },
+    {
+      "order_num": 7,
+      "order_id": "ORD_73246F55F9924A84",
+      "psp": "paypal",
+      "product": "Keyboard",
+      "price": 79.99,
+      "payment_intent_id": "6YD49783DB161993C",
+      "client_secret": "https://www.sandbox.paypal.com/checkoutnow?token=6YD49783DB161993C",
+      "has_payment": true,
+      "status": "success"
+    },
+    {
+      "order_num": 8,
+      "order_id": "ORD_5D54E167C5A5720D",
+      "psp": "adyen",
+      "product": "Monitor",
+      "price": 199.99,
+      "payment_intent_id": null,
+      "client_secret": null,
+      "has_payment": false,
+      "status": "success"
+    },
+    {
+      "order_num": 9,
+      "order_id": "ORD_BD13C804EBBECA2F",
+      "psp": "stripe",
+      "product": "Webcam",
+      "price": 59.99,
+      "payment_intent_id": "pi_3SMTdmGeIEg0wZyU0aoMeelF",
+      "client_secret": "pi_3SMTdmGeIEg0wZyU0aoMeelF_secret_J3fXtXcwKN77MwrCMVov1JZVQ",
+      "has_payment": true,
+      "status": "success"
+    },
+    {
+      "order_num": 10,
+      "order_id": "ORD_BC29D5DF37D172BA",
+      "psp": "checkout",
+      "product": "Microphone",
+      "price": 89.99,
+      "payment_intent_id": "chk_session_ps_34bYtsaSRpLPicSQ4YJgIyt5cfC",
+      "client_secret": "YmFzZTY0:eyJpZCI6InBzXzM0Yll0c2FTUnBMUGljU1E0WUpnSXl0NWNmQyIsImVudGl0eV9pZCI6ImVudF91eTVyeWlub2J6N2oydmdmcjY2czVndDZjaSIsImV4cGVyaW1lbnRzIjp7fSwicHJvY2Vzc2luZ19jaGFubmVsX2lkIjoicGNfb3l3anU0NTR0am1lZGZsZ3RvaXVoNWZyaXkiLCJhbW91bnQiOjg5OTksImxvY2FsZSI6ImVuLUdCIiwiY3VycmVuY3kiOiJVU0QiLCJwYXltZW50X21ldGhvZHMiOlt7InR5cGUiOiJjYXJkIiwiY2FyZF9zY2hlbWVzIjpbIlZpc2EiLCJNYXN0ZXJjYXJkIiwiQW1leCJdLCJzY2hlbWVfY2hvaWNlX2VuYWJsZWQiOmZhbHNlLCJzdG9yZV9wYXltZW50X2RldGFpbHMiOiJkaXNhYmxlZCIsImJpbGxpbmdfYWRkcmVzcyI6eyJjb3VudHJ5IjoiR0IifX0seyJ0eXBlIjoiYXBwbGVwYXkiLCJkaXNwbGF5X25hbWUiOiJXb29wYXkiLCJjb3VudHJ5X2NvZGUiOiJHQiIsImN1cnJlbmN5X2NvZGUiOiJVU0QiLCJtZXJjaGFudF9jYXBhYmlsaXRpZXMiOlsic3VwcG9ydHMzRFMiXSwic3VwcG9ydGVkX25ldHdvcmtzIjpbInZpc2EiLCJtYXN0ZXJDYXJkIiwiYW1leCJdLCJ0b3RhbCI6eyJsYWJlbCI6Ildvb3BheSIsInR5cGUiOiJmaW5hbCIsImFtb3VudCI6Ijg5Ljk5In19LHsidHlwZSI6Imdvb2dsZXBheSIsIm1lcmNoYW50Ijp7ImlkIjoiMDgxMTMwODkzODYyNjg4NDk5ODIiLCJuYW1lIjoiV29vcGF5Iiwib3JpZ2luIjoiaHR0cHM6Ly9hZ2VudHMucGl2b3RhLmNjIn0sInRyYW5zYWN0aW9uX2luZm8iOnsidG90YWxfcHJpY2Vfc3RhdHVzIjoiRklOQUwiLCJ0b3RhbF9wcmljZSI6Ijg5Ljk5IiwiY291bnRyeV9jb2RlIjoiR0IiLCJjdXJyZW5jeV9jb2RlIjoiVVNEIn0sImNhcmRfcGFyYW1ldGVycyI6eyJhbGxvd2VkX2F1dGhfbWV0aG9kcyI6WyJQQU5fT05MWSIsIkNSWVBUT0dSQU1fM0RTIl0sImFsbG93ZWRfY2FyZF9uZXR3b3JrcyI6WyJWSVNBIiwiTUFTVEVSQ0FSRCIsIkFNRVgiXX19XSwiZmVhdHVyZV9mbGFncyI6WyJhbmFseXRpY3Nfb2JzZXJ2YWJpbGl0eV9lbmFibGVkIiwiY2FyZF9maWVsZHNfZW5hYmxlZCIsImdldF93aXRoX3B1YmxpY19rZXlfZW5hYmxlZCIsImxvZ3Nfb2JzZXJ2YWJpbGl0eV9lbmFibGVkIiwicmlza19qc19lbmFibGVkIiwidXNlX25vbl9iaWNfaWRlYWxfaW50ZWdyYXRpb24iXSwicmlzayI6eyJlbmFibGVkIjpmYWxzZX0sIm1lcmNoYW50X25hbWUiOiJXb29wYXkiLCJwYXltZW50X3Nlc3Npb25fc2VjcmV0IjoicHNzXzM1NjE2NWFjLTFiYzQtNDdmZS04YTFhLTI0OWJjMWMyNzkyYiIsImludGVncmF0aW9uX2RvbWFpbiI6ImFwaS5zYW5kYm94LmNoZWNrb3V0LmNvbSJ9",
+      "has_payment": true,
+      "status": "success"
+    }
+  ]
+}
