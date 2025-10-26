@@ -148,8 +148,8 @@ class PayPalAdapter(PSPAdapter):
                     currency=currency,
                     status="requires_action",  # User needs to approve
                     client_secret=approve_url,  # Return the approval URL
-                    created_at=datetime.now().isoformat(),
-                    metadata=metadata
+                    psp_type="paypal",
+                    raw_response=order
                 )
                 
                 return True, payment_intent, None
