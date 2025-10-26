@@ -325,69 +325,74 @@ async def admin_connect_psp(
         logger.info(f"   Account ID: {account_id}")
         logger.info(f"   Has secret_key: {bool(secret_key)}")
         
-        # Build dynamic query to handle secret_key
-        base_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
-        base_vals = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
-        params = {
-            "psp_id": psp_id,
-            "merchant_id": merchant_id,
-            "provider": provider,
-            "name": name,
-            "api_key": api_key,
-            "account_id": account_id or None,
-            "capabilities": ",".join(capabilities),
-            "status": "active",
-            "connected_at": datetime.now(),
-        }
-        
-        update_set_parts = [
-            "api_key = EXCLUDED.api_key",
-            "account_id = EXCLUDED.account_id",
-            "name = EXCLUDED.name",
-            "status = EXCLUDED.status"
-        ]
-        
-        # Add secret_key if provided
-        if secret_key:
-            base_cols.append("secret_key")
-            base_vals.append(":secret_key")
-            params["secret_key"] = secret_key
-            update_set_parts.append("secret_key = EXCLUDED.secret_key")
-            logger.info(f"   Including secret_key in database insert")
-        
-        query_str = f"""
-            INSERT INTO merchant_psps ({', '.join(base_cols)})
-            VALUES ({', '.join(base_vals)})
-            ON CONFLICT (psp_id) DO UPDATE SET
-                {', '.join(update_set_parts)}
-        """
-        
-        logger.info(f"   Executing UPSERT query...")
-        await database.execute(query_str, params)
-        logger.info(f"✅ PSP saved successfully: {psp_id}")
-        
-        # Verify the save
-        verify = await database.fetch_one(
-            "SELECT provider, api_key, account_id, secret_key FROM merchant_psps WHERE psp_id = :psp_id",
-            {"psp_id": psp_id}
-        )
-        if verify:
-            # Convert Row to dict for safe access
-            verify_dict = dict(verify)
-            has_secret = verify_dict.get('secret_key') is not None
-            logger.info(f"✅ Verified in DB: provider={verify_dict['provider']}, api_key_len={len(verify_dict['api_key']) if verify_dict['api_key'] else 0}, has_secret={has_secret}")
-        else:
-            logger.error(f"❌ Failed to verify PSP in database!")
-        
-        # Mark merchant onboarding flags for dashboard
-        await database.execute(
+        # Use transaction to ensure data is committed
+        async with database.transaction():
+            # Build dynamic query to handle secret_key
+            base_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
+            base_vals = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
+            params = {
+                "psp_id": psp_id,
+                "merchant_id": merchant_id,
+                "provider": provider,
+                "name": name,
+                "api_key": api_key,
+                "account_id": account_id or None,
+                "capabilities": ",".join(capabilities),
+                "status": "active",
+                "connected_at": datetime.now(),
+            }
+            
+            update_set_parts = [
+                "api_key = EXCLUDED.api_key",
+                "account_id = EXCLUDED.account_id",
+                "name = EXCLUDED.name",
+                "status = EXCLUDED.status"
+            ]
+            
+            # Add secret_key if provided
+            if secret_key:
+                base_cols.append("secret_key")
+                base_vals.append(":secret_key")
+                params["secret_key"] = secret_key
+                update_set_parts.append("secret_key = EXCLUDED.secret_key")
+                logger.info(f"   Including secret_key in database insert")
+            
+            query_str = f"""
+                INSERT INTO merchant_psps ({', '.join(base_cols)})
+                VALUES ({', '.join(base_vals)})
+                ON CONFLICT (psp_id) DO UPDATE SET
+                    {', '.join(update_set_parts)}
             """
-            UPDATE merchant_onboarding
-            SET psp_connected = true, psp_type = :provider
-            WHERE merchant_id = :merchant_id
-            """,
-            {"provider": provider, "merchant_id": merchant_id}
-        )
+            
+            logger.info(f"   Executing UPSERT query in transaction...")
+            await database.execute(query_str, params)
+            logger.info(f"✅ PSP UPSERT executed: {psp_id}")
+            
+            # Verify the save within the same transaction
+            verify = await database.fetch_one(
+                "SELECT provider, api_key, account_id, secret_key FROM merchant_psps WHERE psp_id = :psp_id",
+                {"psp_id": psp_id}
+            )
+            if verify:
+                # Convert Row to dict for safe access
+                verify_dict = dict(verify)
+                has_secret = verify_dict.get('secret_key') is not None
+                logger.info(f"✅ Verified in DB (in transaction): provider={verify_dict['provider']}, api_key_len={len(verify_dict['api_key']) if verify_dict['api_key'] else 0}, has_secret={has_secret}")
+            else:
+                logger.error(f"❌ Failed to verify PSP in database!")
+                raise Exception("PSP not found after insert")
+            
+            # Mark merchant onboarding flags for dashboard
+            await database.execute(
+                """
+                UPDATE merchant_onboarding
+                SET psp_connected = true, psp_type = :provider
+                WHERE merchant_id = :merchant_id
+                """,
+                {"provider": provider, "merchant_id": merchant_id}
+            )
+            logger.info(f"✅ Transaction committed for {provider}")
+        
         return {"status": "success", "message": f"{provider} connected/updated", "psp_id": psp_id}
     except Exception as e:
         logger.error(f"❌ Failed to save PSP: {e}", exc_info=True)
