@@ -684,24 +684,38 @@ async def create_shopify_order(order_id: str) -> bool:
         
         logger.info(f"Using Shopify store: {shop_domain}")
         
-        # 构造 Shopify 订单数据 - use title-based line items instead of variant_id
+        # 构造 Shopify 订单数据
+        # Priority: Use variant_id if available (from real Shopify products)
+        # Fallback: Use title-based custom line items (for testing/manual orders)
         line_items = []
         for item in order["items"]:
-            line_item = {
-                "title": item.get("product_title", "Product"),
-                "quantity": item["quantity"],
-                "price": str(item["unit_price"])
-            }
-            # Only add variant_id if it's valid
+            # Check if item has a real Shopify variant_id
+            has_variant = False
             if item.get("variant_id"):
                 try:
                     variant_id = int(item["variant_id"])
-                    # Only use variant_id if it's reasonable (not our test ID)
-                    if variant_id < 1000000000000:
-                        line_item["variant_id"] = variant_id
+                    # Real Shopify variant IDs are typically > 10000000000
+                    # Use variant_id for proper inventory management
+                    line_item = {
+                        "variant_id": variant_id,
+                        "quantity": item["quantity"]
+                    }
+                    line_items.append(line_item)
+                    has_variant = True
+                    logger.info(f"Using variant_id {variant_id} for {item.get('product_title')}")
                 except (ValueError, TypeError):
-                    pass
-            line_items.append(line_item)
+                    logger.warning(f"Invalid variant_id: {item.get('variant_id')}")
+            
+            # Fallback to custom line item if no variant_id
+            if not has_variant:
+                line_item = {
+                    "title": item.get("product_title", "Product"),
+                    "quantity": item["quantity"],
+                    "price": str(item["unit_price"]),
+                    "taxable": False  # Custom items, tax already calculated
+                }
+                line_items.append(line_item)
+                logger.info(f"Using custom line item for {item.get('product_title')}")
         
         shopify_order_data = {
             "order": {
