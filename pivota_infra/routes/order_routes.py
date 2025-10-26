@@ -318,6 +318,9 @@ async def create_new_order(
                 if psp_type == "checkout" and psp_account_id:
                     adapter_kwargs["public_key"] = psp_account_id
                     logger.info(f"🔧 Creating Checkout adapter with processing_channel_id: {psp_account_id}")
+                elif psp_type == "adyen" and psp_account_id:
+                    adapter_kwargs["merchant_account"] = psp_account_id
+                    logger.info(f"🔧 Creating Adyen adapter with merchant_account: {psp_account_id}")
                 elif psp_type == "paypal" and psp_secret:
                     adapter_kwargs["client_secret"] = psp_secret
                     adapter_kwargs["is_sandbox"] = True  # Use sandbox for now
