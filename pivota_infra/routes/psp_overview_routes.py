@@ -43,7 +43,7 @@ async def get_psp_overview(
                 mp.provider as psp_name,
                 mp.status,
                 COUNT(DISTINCT mp.merchant_id) as merchant_count,
-                COUNT(o.id) as transaction_count,
+                COUNT(o.order_id) as transaction_count,
                 COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END) as success_count,
                 SUM(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE 0 END) as total_volume,
                 AVG(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE NULL END) as avg_transaction_size,
@@ -208,7 +208,7 @@ async def get_psp_detail(
         # Note: Using merchant_id to link orders to PSP, not psp_type
         metrics_query = """
         SELECT 
-            COUNT(o.id) as total_transactions,
+            COUNT(o.order_id) as total_transactions,
             COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END) as successful_transactions,
             COUNT(CASE WHEN o.payment_status = 'failed' THEN 1 END) as failed_transactions,
             COUNT(CASE WHEN o.payment_status = 'pending' THEN 1 END) as pending_transactions,
@@ -234,7 +234,7 @@ async def get_psp_detail(
         SELECT 
             m.merchant_id,
             m.business_name as merchant_name,
-            COUNT(o.id) as transaction_count,
+            COUNT(o.order_id) as transaction_count,
             COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END) as success_count,
             COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refund_count,
             SUM(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE 0 END) as volume,
@@ -258,7 +258,7 @@ async def get_psp_detail(
         trend_query = """
         SELECT 
             DATE_TRUNC('hour', o.created_at) as hour,
-            COUNT(o.id) as transactions,
+            COUNT(o.order_id) as transactions,
             COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END) as successful,
             SUM(CASE WHEN o.payment_status = 'paid' THEN o.total_amount ELSE 0 END) as volume
         FROM orders o
