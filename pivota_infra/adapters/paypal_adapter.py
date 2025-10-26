@@ -202,7 +202,7 @@ class PayPalAdapter(PSPAdapter):
         payment_intent_id: str,
         amount: Optional[int] = None,
         reason: Optional[str] = None
-    ) -> RefundResponse:
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Refund a PayPal payment
         
@@ -273,19 +273,15 @@ class PayPalAdapter(PSPAdapter):
                 
                 refund = refund_response.json()
                 
-                return RefundResponse(
-                    id=refund["id"],
-                    payment_intent_id=payment_intent_id,
-                    amount=int(float(refund["amount"]["value"]) * 100),  # Convert to cents
-                    currency=refund["amount"]["currency_code"],
-                    status="succeeded" if refund["status"] == "COMPLETED" else "pending",
-                    reason=reason,
-                    created_at=datetime.now().isoformat()
+                return (
+                    True,
+                    refund["id"],
+                    None
                 )
                 
         except Exception as e:
             logger.error(f"PayPal refund failed: {str(e)}")
-            raise
+            return (False, None, str(e))
     
     async def get_payment_status(self, payment_intent_id: str) -> str:
         """

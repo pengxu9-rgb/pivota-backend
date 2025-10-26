@@ -5,7 +5,8 @@ Debug script to validate PSP API keys and find configuration issues
 
 from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
-from routes.auth import get_current_user, require_admin
+from routes.auth import get_current_user
+from routes.auth_routes import require_admin
 import httpx
 import stripe
 import logging
