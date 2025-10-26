@@ -106,8 +106,8 @@ class PayPalAdapter(PSPAdapter):
                 }],
                 "application_context": {
                     "brand_name": "Pivota Commerce",
-                    "return_url": metadata.get("return_url", f"{settings.FRONTEND_URL}/payment/success") if metadata else f"{settings.FRONTEND_URL}/payment/success",
-                    "cancel_url": metadata.get("cancel_url", f"{settings.FRONTEND_URL}/payment/cancel") if metadata else f"{settings.FRONTEND_URL}/payment/cancel",
+                    "return_url": metadata.get("return_url", "https://merchant.pivota.cc/payment/success") if metadata else "https://merchant.pivota.cc/payment/success",
+                    "cancel_url": metadata.get("cancel_url", "https://merchant.pivota.cc/payment/cancel") if metadata else "https://merchant.pivota.cc/payment/cancel",
                     "user_action": "PAY_NOW"
                 }
             }
