@@ -193,8 +193,12 @@ class AdyenAdapter(PSPAdapter):
                 },
                 "reference": metadata.get("order_id", "ORDER"),
                 "merchantAccount": self.merchant_account,
-                "returnUrl": "https://your-company.com/checkout/complete",
-                "metadata": metadata
+                "returnUrl": "https://merchant.pivota.cc/payment/success",
+                "paymentMethod": {
+                    "type": "scheme"  # Credit card payment
+                },
+                "channel": "Web",
+                "shopperInteraction": "Ecommerce"
             }
             
             async with httpx.AsyncClient() as client:
