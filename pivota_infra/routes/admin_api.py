@@ -372,7 +372,10 @@ async def admin_connect_psp(
             {"psp_id": psp_id}
         )
         if verify:
-            logger.info(f"✅ Verified in DB: provider={verify['provider']}, api_key_len={len(verify['api_key']) if verify['api_key'] else 0}, has_secret={bool(verify.get('secret_key'))}")
+            # Convert Row to dict for safe access
+            verify_dict = dict(verify)
+            has_secret = verify_dict.get('secret_key') is not None
+            logger.info(f"✅ Verified in DB: provider={verify_dict['provider']}, api_key_len={len(verify_dict['api_key']) if verify_dict['api_key'] else 0}, has_secret={has_secret}")
         else:
             logger.error(f"❌ Failed to verify PSP in database!")
         
@@ -387,7 +390,12 @@ async def admin_connect_psp(
         )
         return {"status": "success", "message": f"{provider} connected/updated", "psp_id": psp_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to connect PSP: {e}")
+        logger.error(f"❌ Failed to save PSP: {e}", exc_info=True)
+        # Return detailed error message
+        error_message = str(e)
+        if "get" in error_message and len(error_message) < 10:
+            error_message = "Database error accessing PSP data. Please check logs for details."
+        raise HTTPException(status_code=500, detail=f"Failed to connect PSP: {error_message}")
 
 @router.post("/psp/{psp_id}/test")
 async def test_psp_connection(psp_id: str, current_user: dict = Depends(require_admin)):
