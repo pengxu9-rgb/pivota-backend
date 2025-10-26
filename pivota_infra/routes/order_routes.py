@@ -259,11 +259,12 @@ async def create_new_order(
             psp_secret = None  # For PayPal client_secret
             
             # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key 和 account_id
+            # 数据库配置优先于环境变量！
             try:
                 psp_row = await database.fetch_one(
                     """
                     SELECT api_key, account_id, secret_key FROM merchant_psps
-                    WHERE merchant_id = :merchant_id AND provider = :provider
+                    WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
@@ -273,12 +274,14 @@ async def create_new_order(
                     psp_key = psp_row["api_key"]
                     try:
                         psp_account_id = psp_row["account_id"]
-                        psp_secret = psp_row.get("secret_key")  # For PayPal
+                        psp_secret = psp_row.get("secret_key") if hasattr(psp_row, 'get') else psp_row["secret_key"]
                     except Exception:
                         psp_account_id = None
                         psp_secret = None
-                    logger.info(f"Found {psp_type} key in DB for merchant {order_request.merchant_id}")
-                    logger.info(f"  API Key length: {len(psp_key)}, Account ID: {psp_account_id}")
+                    logger.info(f"✅ Found {psp_type} key in DB for merchant {order_request.merchant_id}")
+                    logger.info(f"   API Key length: {len(psp_key)}, Account ID: {psp_account_id}, Has secret: {bool(psp_secret)}")
+                else:
+                    logger.info(f"⚠️  No {psp_type} config in DB for merchant {order_request.merchant_id}")
             except Exception as e:
                 logger.warning(f"DB PSP key lookup failed: {e}")
             
@@ -288,19 +291,16 @@ async def create_new_order(
                 if psp_key:
                     logger.info(f"Using legacy Stripe key from merchant table")
             
-            # 3. 最后回退到环境变量（仅 Stripe 和 Adyen）
+            # 3. 最后回退到环境变量（仅作为开发/测试的备选）
+            # 注意：数据库配置优先！环境变量只用于没有数据库配置的情况
             if not psp_key:
                 if psp_type == "stripe":
                     env_key = getattr(settings, "stripe_secret_key", None)
                     if env_key and len(env_key) > 10:  # Validate key is not empty
                         psp_key = env_key
-                        logger.info(f"Using Stripe key from environment")
-                elif psp_type == "adyen":
-                    env_key = getattr(settings, "adyen_api_key", None)
-                    if env_key and len(env_key) > 10:  # Validate key is not empty
-                        psp_key = env_key
-                        logger.info(f"Using Adyen key from environment")
-                # Note: Checkout MUST use DB key, no env var fallback
+                        logger.info(f"Using Stripe key from environment (fallback)")
+                # 移除 Adyen 环境变量回退 - 强制使用数据库配置
+                # Checkout 和 PayPal 已经只使用数据库配置
                 
             # 4. If still no key, fail with clear error message
             if not psp_key:
