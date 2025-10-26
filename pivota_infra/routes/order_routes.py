@@ -304,15 +304,19 @@ async def create_new_order(
             if not psp_key:
                 if psp_type == "checkout":
                     # Allow mock Checkout flow without a real key
-                    logger.warning(f"No Checkout API key for merchant {merchant['merchant_id']}, proceeding with mock checkout")
+                    logger.warning(f"⚠️  No Checkout API key for merchant {merchant['merchant_id']}, proceeding with MOCK checkout")
                     psp_key = "sk_mock_checkout"
+                    logger.info(f"   Assigned mock key: {psp_key}")
                 elif psp_type == "adyen":
                     # Allow mock Adyen flow without a real key
-                    logger.warning(f"No Adyen API key for merchant {merchant['merchant_id']}, proceeding with mock adyen")
+                    logger.warning(f"⚠️  No Adyen API key for merchant {merchant['merchant_id']}, proceeding with MOCK adyen")
                     psp_key = "sk_mock_adyen"
+                    logger.info(f"   Assigned mock key: {psp_key}")
                 else:
-                    logger.error(f"No {psp_type} API key found for merchant {merchant['merchant_id']}")
+                    logger.error(f"❌ No {psp_type} API key found for merchant {merchant['merchant_id']}")
                     # Don't fail order creation, just skip payment intent
+            else:
+                logger.info(f"✅ Using PSP key from database/environment for {psp_type}")
             if psp_key:
                 # 创建支付意图（所有 PSP 统一处理）
                 adapter_kwargs = {}
@@ -325,6 +329,7 @@ async def create_new_order(
                     logger.info(f"🔧 Creating PayPal adapter with client_secret")
                 
                 logger.info(f"📡 Creating {psp_type} payment intent for ${total} {order_request.currency}")
+                logger.info(f"   Using PSP key: {psp_key[:15]}... (mock={psp_key.startswith('sk_mock') if psp_key else False})")
                 psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
                 success, payment_intent, error = await psp_adapter.create_payment_intent(
                     amount=total,
@@ -335,7 +340,9 @@ async def create_new_order(
                         "customer_email": order_request.customer_email
                     }
                 )
+                logger.info(f"   Payment intent result: success={success}, has_intent={payment_intent is not None}, error={error}")
                 if success and payment_intent:
+                    logger.info(f"   Intent ID: {payment_intent.id}, Secret: {payment_intent.client_secret[:20] if payment_intent.client_secret else 'None'}...")
                     payment_intent_id = payment_intent.id
                     client_secret = payment_intent.client_secret
                     logger.info(f"✅ Payment intent created: {payment_intent_id}")
