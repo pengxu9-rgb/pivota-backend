@@ -12,7 +12,8 @@ ALTER_SQL = [
     ADD COLUMN IF NOT EXISTS payment_intent_id VARCHAR(255),
     ADD COLUMN IF NOT EXISTS client_secret TEXT,
     ADD COLUMN IF NOT EXISTS fulfillment_status VARCHAR(50) DEFAULT 'pending',
-    ADD COLUMN IF NOT EXISTS shopify_order_id VARCHAR(255);
+    ADD COLUMN IF NOT EXISTS shopify_order_id VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS payment_method_id VARCHAR(255);
     """,
     """
     ALTER TABLE agents
