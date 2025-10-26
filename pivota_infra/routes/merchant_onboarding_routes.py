@@ -277,18 +277,19 @@ async def register_merchant(
             if not existing_user:
                 await database.execute(
                     """
-                    INSERT INTO users (email, password_hash, full_name, role, active)
-                    VALUES (:email, :password_hash, :full_name, :role, :active)
+                    INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
+                    VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
                     """,
                     {
                         "email": merchant_data.contact_email,
                         "password_hash": password_hash,
                         "full_name": merchant_data.business_name,
                         "role": "merchant",
-                        "active": True
+                        "active": True,
+                        "merchant_id": merchant_id
                     }
                 )
-                print(f"✅ User account created for {merchant_data.contact_email}")
+                print(f"✅ User account created for {merchant_data.contact_email} with merchant_id {merchant_id}")
                 
                 # Store password in response if auto-generated
                 if not merchant_data.password:
