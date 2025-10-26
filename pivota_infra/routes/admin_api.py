@@ -282,9 +282,9 @@ async def admin_connect_psp(
     if not api_key or len(api_key) < 8:
         raise HTTPException(status_code=400, detail="Invalid api_key")
     
-    # Validate PayPal requires client_secret
-    if provider == "paypal" and (not secret_key or len(secret_key) < 8):
-        raise HTTPException(status_code=400, detail="PayPal requires both Client ID and Client Secret")
+    # Validate PayPal requires client_secret (only for new connections, not updates)
+    if provider == "paypal" and not psp_id and (not secret_key or len(secret_key) < 8):
+        raise HTTPException(status_code=400, detail="PayPal requires both Client ID and Client Secret for new connections")
     
     # Validate Checkout requires processing_channel_id
     if provider == "checkout" and not account_id:

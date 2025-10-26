@@ -320,7 +320,7 @@ async def get_all_psps(
             SELECT 
                 p.psp_id, p.provider, p.name, p.status, p.merchant_id,
                 p.connected_at, p.capabilities,
-                p.api_key, p.account_id,
+                p.api_key, p.account_id, p.secret_key,
                 m.business_name as merchant_name
             FROM merchant_psps p
             LEFT JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
@@ -356,6 +356,12 @@ async def get_all_psps(
             success_rate = round((successful_count / transaction_count * 100), 1) if transaction_count > 0 else 0
             total_volume = float(stats["total_volume"]) if stats else 0
             
+            # Mask secret_key for security (show last 4 chars only)
+            secret_key_masked = None
+            if row.get("secret_key"):
+                secret_key = row["secret_key"]
+                secret_key_masked = '*' * (len(secret_key) - 4) + secret_key[-4:] if len(secret_key) > 4 else '****'
+            
             psps.append({
                 "psp_id": row["psp_id"],
                 "provider": row["provider"],
@@ -367,6 +373,7 @@ async def get_all_psps(
                 "capabilities": capabilities,
                 "api_key": row["api_key"],  # Include for Configure form
                 "account_id": row["account_id"],  # Include for Configure form
+                "secret_key": secret_key_masked,  # Masked for security
                 "transaction_count": transaction_count,
                 "successful_count": successful_count,
                 "success_rate": success_rate,
