@@ -64,6 +64,8 @@ from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
 from routes.fix_agents_table import router as fix_agents_router
+from routes.debug_psp_insert import router as debug_psp_router
+from routes.debug_psp_validation import router as debug_psp_validation_router
 from routes.agent_payment_sdk import router as agent_payment_router
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -158,6 +160,8 @@ app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
+app.include_router(debug_psp_router)  # Debug PSP insert
+app.include_router(debug_psp_validation_router)  # Debug PSP validation
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(merchant_router)  # Merchant management endpoints
