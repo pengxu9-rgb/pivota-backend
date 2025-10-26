@@ -291,12 +291,14 @@ async def create_new_order(
             # 3. 最后回退到环境变量（仅 Stripe 和 Adyen）
             if not psp_key:
                 if psp_type == "stripe":
-                    psp_key = getattr(settings, "stripe_secret_key", None)
-                    if psp_key:
+                    env_key = getattr(settings, "stripe_secret_key", None)
+                    if env_key and len(env_key) > 10:  # Validate key is not empty
+                        psp_key = env_key
                         logger.info(f"Using Stripe key from environment")
                 elif psp_type == "adyen":
-                    psp_key = getattr(settings, "adyen_api_key", None)
-                    if psp_key:
+                    env_key = getattr(settings, "adyen_api_key", None)
+                    if env_key and len(env_key) > 10:  # Validate key is not empty
+                        psp_key = env_key
                         logger.info(f"Using Adyen key from environment")
                 # Note: Checkout MUST use DB key, no env var fallback
                 
