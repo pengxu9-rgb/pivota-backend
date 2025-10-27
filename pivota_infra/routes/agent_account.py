@@ -207,11 +207,23 @@ async def login_agent(data: AgentLoginRequest):
         if not verify_password(data.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         
-        # 3. Get agent record using actual column names
-        agent = await database.fetch_one(
-            "SELECT agent_id, agent_name, owner_email, description, is_active, allowed_merchants, api_key FROM agents WHERE owner_email = :email",
-            {"email": data.email}
-        )
+        # 3. Get agent record - try different column names
+        agent = None
+        # Try with agent_name first
+        try:
+            agent = await database.fetch_one(
+                "SELECT agent_id, agent_name as name, owner_email, is_active, api_key FROM agents WHERE owner_email = :email",
+                {"email": data.email}
+            )
+        except:
+            # Fallback to name column
+            try:
+                agent = await database.fetch_one(
+                    "SELECT agent_id, name, owner_email, is_active, api_key FROM agents WHERE owner_email = :email",
+                    {"email": data.email}
+                )
+            except:
+                pass
         
         if not agent:
             raise HTTPException(status_code=404, detail="Agent record not found. Please contact support.")
@@ -238,11 +250,11 @@ async def login_agent(data: AgentLoginRequest):
             token=token,
             agent={
                 "agent_id": agent["agent_id"],
-                "agent_name": agent["agent_name"],
-                "email": agent["owner_email"],
+                "agent_name": agent.get("name") or agent.get("agent_name") or "Agent",
+                "email": agent.get("owner_email") or user["email"],
                 "company": "",  # Not stored in agent table
                 "description": agent.get("description", ""),
-                "status": "active" if agent["is_active"] else "inactive"
+                "status": "active" if agent.get("is_active", True) else "inactive"
             },
             api_key=api_key
         )
