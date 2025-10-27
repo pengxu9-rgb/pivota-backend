@@ -158,6 +158,11 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS metadata JSONB;
                 """))
+            if "column \"psp_used\" of relation \"orders\" does not exist" in err or "psp_used" in err or "Unconsumed column names: psp_used" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS psp_used VARCHAR(50);
+                """))
             # Retry the insert once after migration
             await database.execute(query)
             return order_id
