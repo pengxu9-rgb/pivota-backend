@@ -25,6 +25,8 @@ class AgentRegisterRequest(BaseModel):
     password: str
     agent_name: str
     company: Optional[str] = None
+    description: Optional[str] = None
+    phone: Optional[str] = None
     
     @validator('password')
     def validate_password(cls, v):
