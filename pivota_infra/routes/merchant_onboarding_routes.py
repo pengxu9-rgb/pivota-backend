@@ -286,8 +286,8 @@ async def register_merchant(
             else:
                 result = await database.execute(
                     """
-                    INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
-                    VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
+                    INSERT INTO users (id, email, password_hash, full_name, role, active, merchant_id)
+                    VALUES (gen_random_uuid(), :email, :password_hash, :full_name, :role, :active, :merchant_id)
                     """,
                     {
                         "email": merchant_data.contact_email,
