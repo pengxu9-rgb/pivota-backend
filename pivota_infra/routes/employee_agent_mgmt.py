@@ -66,9 +66,9 @@ async def get_all_agents(
                 "status": agent.get("status", "active"),
                 "is_active": agent.get("status", "active") == "active",  # Frontend expects is_active boolean
                 "created_at": agent.get("created_at"),
-                "last_active": agent.get("last_active") or datetime.now() - timedelta(hours=random.randint(1, 48)),
-                "request_count": agent.get("request_count", random.randint(100, 5000)),
-                "success_rate": agent.get("success_rate", round(random.uniform(95, 99.9), 1)),
+                "last_active": agent.get("last_active"),
+                "request_count": agent.get("request_count", 0),
+                "success_rate": agent.get("success_rate", 0),
                 "rate_limit": agent.get("rate_limit", 1000)
             })
         
