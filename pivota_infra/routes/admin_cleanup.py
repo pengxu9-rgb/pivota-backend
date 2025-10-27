@@ -55,52 +55,35 @@ async def remove_other_merchants(
             merchant_ids_to_delete = [m["merchant_id"] for m in merchants_to_delete]
             
             # Delete in order (respecting foreign keys)
+            # PostgreSQL doesn't support = ANY() with list in asyncpg, use IN instead
+            
             # 1. Delete orders
-            orders_deleted = await database.execute(
-                """
-                DELETE FROM orders 
-                WHERE merchant_id = ANY(:merchant_ids)
-                """,
-                {"merchant_ids": merchant_ids_to_delete}
+            placeholders = ','.join([f"'{mid}'" for mid in merchant_ids_to_delete])
+            orders_result = await database.execute(
+                f"DELETE FROM orders WHERE merchant_id IN ({placeholders})"
             )
             
             # 2. Delete PSP configs
-            psps_deleted = await database.execute(
-                """
-                DELETE FROM merchant_psps 
-                WHERE merchant_id = ANY(:merchant_ids)
-                """,
-                {"merchant_ids": merchant_ids_to_delete}
+            psps_result = await database.execute(
+                f"DELETE FROM merchant_psps WHERE merchant_id IN ({placeholders})"
             )
             
             # 3. Delete merchant_stores if exists
             try:
                 await database.execute(
-                    """
-                    DELETE FROM merchant_stores 
-                    WHERE merchant_id = ANY(:merchant_ids)
-                    """,
-                    {"merchant_ids": merchant_ids_to_delete}
+                    f"DELETE FROM merchant_stores WHERE merchant_id IN ({placeholders})"
                 )
             except:
                 pass  # Table may not exist
             
             # 4. Delete users for these merchants
-            users_deleted = await database.execute(
-                """
-                DELETE FROM users 
-                WHERE merchant_id = ANY(:merchant_ids)
-                """,
-                {"merchant_ids": merchant_ids_to_delete}
+            users_result = await database.execute(
+                f"DELETE FROM users WHERE merchant_id IN ({placeholders})"
             )
             
             # 5. Delete merchant_onboarding records
-            merchants_deleted = await database.execute(
-                """
-                DELETE FROM merchant_onboarding 
-                WHERE merchant_id = ANY(:merchant_ids)
-                """,
-                {"merchant_ids": merchant_ids_to_delete}
+            merchants_result = await database.execute(
+                f"DELETE FROM merchant_onboarding WHERE merchant_id IN ({placeholders})"
             )
             
             # 6. Make sure kept merchant has correct contact_email
@@ -129,9 +112,9 @@ async def remove_other_merchants(
                 ],
                 "stats": {
                     "merchants_deleted": len(merchants_to_delete),
-                    "orders_deleted": orders_deleted,
-                    "psps_deleted": psps_deleted,
-                    "users_deleted": users_deleted
+                    "orders_deleted": "deleted",
+                    "psps_deleted": "deleted",
+                    "users_deleted": "deleted"
                 }
             }
         
