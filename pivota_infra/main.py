@@ -202,6 +202,7 @@ app.include_router(agent_products_router)  # Agent product browsing
 app.include_router(psp_overview_router)  # PSP overview and metrics
 app.include_router(admin_fix_router)  # Admin fix utilities
 app.include_router(admin_cleanup_router)  # Admin cleanup utilities
+app.include_router(admin_simple_fix_router)  # Admin simple fix
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
