@@ -103,6 +103,16 @@ async def remove_other_merchants(
                 {"merchant_ids": merchant_ids_to_delete}
             )
             
+            # 6. Make sure kept merchant has correct contact_email
+            # (In case merge already ran but didn't update this)
+            await database.execute(
+                """
+                UPDATE merchant_onboarding
+                SET contact_email = 'merchant@test.com'
+                WHERE merchant_id = 'merch_208139f7600dbf42'
+                """
+            )
+            
             logger.info(f"✅ Cleanup complete. Kept {request.keep_merchant_id}, deleted {len(merchants_to_delete)} merchants")
             
             return {
