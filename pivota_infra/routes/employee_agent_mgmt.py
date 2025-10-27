@@ -12,7 +12,7 @@ import uuid
 import secrets
 import random
 
-router = APIRouter()
+router = APIRouter(prefix="/employee", tags=["employee-agents"])
 
 # ============== Models ==============
 
