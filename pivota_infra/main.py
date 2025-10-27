@@ -74,6 +74,7 @@ from routes.admin_fix_merchant import router as admin_fix_router
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.admin_simple_fix import router as admin_simple_fix_router
 from routes.admin_cleanup_rebuild import router as admin_cleanup_rebuild_router
+from routes.admin_sql_quick import router as admin_sql_router
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -205,6 +206,7 @@ app.include_router(admin_fix_router)  # Admin fix utilities
 app.include_router(admin_cleanup_router)  # Admin cleanup utilities
 app.include_router(admin_simple_fix_router)  # Admin simple fix
 app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
+app.include_router(admin_sql_router)  # Admin SQL
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
