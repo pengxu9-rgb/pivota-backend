@@ -7,7 +7,7 @@ from typing import Optional
 import logging
 from datetime import datetime
 
-from config.database import database
+from db.database import database
 from routes.auth_routes import require_admin
 
 router = APIRouter(prefix="/admin/cleanup", tags=["admin-cleanup"])
