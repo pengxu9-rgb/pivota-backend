@@ -62,7 +62,7 @@ async def register_agent(data: AgentRegisterRequest):
     try:
         # 1. Check if user already exists
         existing_user = await database.fetch_one(
-            "SELECT user_id FROM users WHERE email = :email",
+            "SELECT id FROM users WHERE email = :email",
             {"email": data.email}
         )
         
