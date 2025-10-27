@@ -114,39 +114,41 @@ async def get_query_analytics(
         last_24h = datetime.now() - timedelta(hours=24)
         last_48h = datetime.now() - timedelta(hours=48)
         
-        # Product searches (last 24h)
-        product_searches = await database.fetch_val(
+        # Orders created (last 24h)
+        orders_created = await database.fetch_val(
             """SELECT COUNT(*) FROM agent_usage_logs 
                WHERE agent_id = :agent_id 
                AND timestamp >= :since 
-               AND endpoint LIKE '%/products%'""",
+               AND endpoint LIKE '%/orders/create%'""",
             {"agent_id": agent_id, "since": last_24h}
         ) or 0
         
         # Previous 24h for trend
-        product_searches_prev = await database.fetch_val(
+        orders_created_prev = await database.fetch_val(
             """SELECT COUNT(*) FROM agent_usage_logs 
                WHERE agent_id = :agent_id 
                AND timestamp >= :since2 AND timestamp < :since1
-               AND endpoint LIKE '%/products%'""",
+               AND endpoint LIKE '%/orders/create%'""",
             {"agent_id": agent_id, "since1": last_24h, "since2": last_48h}
         ) or 0
         
-        # Inventory checks
-        inventory_checks = await database.fetch_val(
+        # Order views/queries (GET /orders/*)
+        order_queries = await database.fetch_val(
             """SELECT COUNT(*) FROM agent_usage_logs 
                WHERE agent_id = :agent_id 
                AND timestamp >= :since 
-               AND endpoint LIKE '%/inventory%'""",
+               AND endpoint LIKE '%/orders/%'
+               AND endpoint NOT LIKE '%/orders/create%'
+               AND endpoint NOT LIKE '%/confirm-payment%'""",
             {"agent_id": agent_id, "since": last_24h}
         ) or 0
         
-        # Price queries
-        price_queries = await database.fetch_val(
+        # Payment confirmations
+        payment_confirmations = await database.fetch_val(
             """SELECT COUNT(*) FROM agent_usage_logs 
                WHERE agent_id = :agent_id 
                AND timestamp >= :since 
-               AND endpoint LIKE '%/pricing%'""",
+               AND endpoint LIKE '%/confirm-payment%'""",
             {"agent_id": agent_id, "since": last_24h}
         ) or 0
         
@@ -162,16 +164,16 @@ async def get_query_analytics(
             else:
                 return "stable", 0
         
-        ps_trend, ps_change = get_trend(product_searches, product_searches_prev)
+        orders_trend, orders_change = get_trend(orders_created, orders_created_prev)
         
         return {
             "status": "success",
-            "product_searches": product_searches,
-            "product_searches_trend": ps_trend,
-            "product_searches_change": ps_change,
-            "inventory_checks": inventory_checks,
+            "product_searches": orders_created,  # Map to "Orders Created" instead of product searches
+            "product_searches_trend": orders_trend,
+            "product_searches_change": orders_change,
+            "inventory_checks": order_queries,  # Map to "Order Queries" instead of inventory
             "inventory_checks_trend": "stable",
-            "price_queries": price_queries,
+            "price_queries": payment_confirmations,  # Map to "Payment Confirmations" instead of price queries
             "price_queries_trend": "stable"
         }
     except HTTPException:
