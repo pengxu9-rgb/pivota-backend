@@ -727,4 +727,3 @@ async def test_psp_connection(
                 "error": str(e)
             }
         }
-    }
