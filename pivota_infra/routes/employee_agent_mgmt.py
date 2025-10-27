@@ -56,20 +56,22 @@ async def get_all_agents(
         # Format response - match frontend expectations
         formatted_agents = []
         for agent in agents:
+            # Handle both dict and Row objects
+            agent_dict = dict(agent) if hasattr(agent, 'keys') else agent
             formatted_agents.append({
-                "agent_id": agent.get("agent_id"),
-                "agent_name": agent.get("name", "Unknown Agent"),  # Frontend expects agent_name
-                "owner_email": agent.get("email"),  # Frontend expects owner_email
-                "agent_type": agent.get("agent_type", "Generic"),  # Add agent_type field
-                "company": agent.get("company"),
-                "api_key_prefix": agent.get("api_key", "")[:10] + "..." if agent.get("api_key") else None,
-                "status": agent.get("status", "active"),
-                "is_active": agent.get("status", "active") == "active",  # Frontend expects is_active boolean
-                "created_at": agent.get("created_at"),
-                "last_active": agent.get("last_active"),
-                "request_count": agent.get("request_count", 0),
-                "success_rate": agent.get("success_rate", 0),
-                "rate_limit": agent.get("rate_limit", 1000)
+                "agent_id": agent_dict.get("agent_id"),
+                "agent_name": agent_dict.get("name", "Unknown Agent"),  # Frontend expects agent_name
+                "owner_email": agent_dict.get("email"),  # Frontend expects owner_email
+                "agent_type": agent_dict.get("agent_type", "Generic"),  # Add agent_type field
+                "company": agent_dict.get("company"),
+                "api_key_prefix": agent_dict.get("api_key", "")[:10] + "..." if agent_dict.get("api_key") else None,
+                "status": agent_dict.get("status", "active"),
+                "is_active": agent_dict.get("status", "active") == "active",  # Frontend expects is_active boolean
+                "created_at": str(agent_dict.get("created_at")) if agent_dict.get("created_at") else None,
+                "last_active": str(agent_dict.get("last_active")) if agent_dict.get("last_active") else None,
+                "request_count": agent_dict.get("request_count", 0),
+                "success_rate": agent_dict.get("success_rate", 0),
+                "rate_limit": agent_dict.get("rate_limit", 1000)
             })
         
         return {
