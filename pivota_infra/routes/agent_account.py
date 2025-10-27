@@ -98,73 +98,59 @@ async def register_agent(data: AgentRegisterRequest):
         # Hash the API key for storage (store hash, not plaintext)
         api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
         
-        # 4. Create agent record using the actual table structure
+        # 4. Create agent record - try minimal columns first
         try:
+            # Try the simplest insert with only required fields
             await database.execute(
                 """
                 INSERT INTO agents (
-                    agent_id, agent_name, agent_type, description,
-                    api_key, api_key_hash, is_active,
-                    owner_email, rate_limit, daily_quota,
-                    created_at
+                    agent_id, name, api_key, api_key_hash, 
+                    owner_email, is_active
                 )
                 VALUES (
-                    :agent_id, :agent_name, :agent_type, :description,
-                    :api_key, :api_key_hash, :is_active,
-                    :owner_email, :rate_limit, :daily_quota,
-                    :created_at
+                    :agent_id, :name, :api_key, :api_key_hash,
+                    :owner_email, :is_active
                 )
                 """,
-            {
-                "agent_id": agent_id,
-                "agent_name": data.agent_name,
-                "agent_type": "custom",
-                "description": data.description,
-                "api_key": api_key,
-                "api_key_hash": api_key_hash,
-                "is_active": True,
-                "owner_email": data.email,
-                "rate_limit": 60,  # 60 requests per minute
-                "daily_quota": 1000,  # 1000 requests per day
-                "created_at": datetime.utcnow()
-            }
-        )
-        except Exception as insert_error:
-            # Handle missing column errors with auto-migration
-            error_msg = str(insert_error)
-            if "agent_name" in error_msg and "does not exist" in error_msg:
-                # agents table might be using 'name' instead of 'agent_name'
-                print(f"⚠️ Trying with 'name' column instead of 'agent_name'...")
+                {
+                    "agent_id": agent_id,
+                    "name": data.agent_name,
+                    "api_key": api_key,
+                    "api_key_hash": api_key_hash,
+                    "owner_email": data.email,
+                    "is_active": True
+                }
+            )
+            print(f"✅ Agent created with minimal fields (name column)")
+        except Exception as minimal_error:
+            # If that fails, try with agent_name column
+            minimal_msg = str(minimal_error)
+            if "name" in minimal_msg and "does not exist" in minimal_msg:
+                print(f"⚠️ Trying with agent_name column...")
                 await database.execute(
                     """
                     INSERT INTO agents (
-                        agent_id, name, agent_type, description,
-                        api_key, api_key_hash, is_active,
-                        owner_email, rate_limit, daily_quota,
-                        created_at
+                        agent_id, agent_name, api_key, api_key_hash,
+                        owner_email, is_active
                     )
                     VALUES (
-                        :agent_id, :name, :agent_type, :description,
-                        :api_key, :api_key_hash, :is_active,
-                        :owner_email, :rate_limit, :daily_quota,
-                        :created_at
+                        :agent_id, :agent_name, :api_key, :api_key_hash,
+                        :owner_email, :is_active
                     )
                     """,
                     {
                         "agent_id": agent_id,
-                        "name": data.agent_name,
-                        "agent_type": "custom",
-                        "description": data.description,
+                        "agent_name": data.agent_name,
                         "api_key": api_key,
                         "api_key_hash": api_key_hash,
-                        "is_active": True,
                         "owner_email": data.email,
-                        "rate_limit": 60,
-                        "daily_quota": 1000,
-                        "created_at": datetime.utcnow()
+                        "is_active": True
                     }
                 )
+                print(f"✅ Agent created with agent_name column")
             else:
+                # If both fail, log the error and raise
+                print(f"❌ Both insert attempts failed. Error: {minimal_msg}")
                 raise
         
         return {
@@ -179,6 +165,16 @@ async def register_agent(data: AgentRegisterRequest):
     except HTTPException:
         raise
     except Exception as e:
+        # If agent creation failed, clean up the user account to allow retry
+        try:
+            await database.execute(
+                "DELETE FROM users WHERE email = :email AND role = 'agent'",
+                {"email": data.email}
+            )
+            print(f"🧹 Cleaned up user account for {data.email} after agent creation failure")
+        except:
+            pass
+        
         raise HTTPException(
             status_code=500,
             detail=f"Registration failed: {str(e)}"
