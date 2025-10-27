@@ -192,7 +192,7 @@ async def login_agent(data: AgentLoginRequest):
             token=token,
             agent={
                 "agent_id": agent["agent_id"],
-                "agent_name": agent.get("name") or user["full_name"] or "Agent",
+                "agent_name": agent["name"] if agent.get("name") else (user["full_name"] or "Agent"),
                 "email": agent["email"],
                 "company": "",
                 "description": "",
