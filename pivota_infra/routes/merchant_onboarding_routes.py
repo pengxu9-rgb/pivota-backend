@@ -272,7 +272,7 @@ async def register_merchant(
             
             # Check if user already exists
             existing_user = await database.fetch_one(
-                "SELECT id FROM users WHERE email = :email",
+                "SELECT user_id FROM users WHERE email = :email",
                 {"email": merchant_data.contact_email}
             )
             
