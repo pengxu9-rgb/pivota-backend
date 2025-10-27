@@ -1,6 +1,6 @@
 """
-Agent Account Management
-Registration and login system for AI Agents
+Agent Account Management - REBUILT from scratch
+Simplified and adapted to actual database schema
 """
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -11,13 +11,12 @@ import secrets
 import hashlib
 
 from db.database import database
-from utils.auth import hash_password, verify_password, create_access_token
+from utils.auth import hash_password, verify_password, create_access_token, get_current_user
 
 router = APIRouter(prefix="/agent/account", tags=["agent-account"])
 
-
 # ============================================================================
-# Request/Response Models
+# Models
 # ============================================================================
 
 class AgentRegisterRequest(BaseModel):
@@ -32,24 +31,25 @@ class AgentRegisterRequest(BaseModel):
     def validate_password(cls, v):
         if len(v) < 8:
             raise ValueError('Password must be at least 8 characters long')
-        if not any(c.isupper() for c in v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not any(c.islower() for c in v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not any(c.isdigit() for c in v):
-            raise ValueError('Password must contain at least one digit')
         return v
 
 class AgentLoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class AgentInfo(BaseModel):
+    agent_id: str
+    agent_name: str
+    email: str
+    company: str
+    description: str
+    status: str
+
 class AgentLoginResponse(BaseModel):
     success: bool
     token: str
-    agent: dict
+    agent: AgentInfo
     api_key: str
-
 
 # ============================================================================
 # Endpoints
@@ -58,8 +58,8 @@ class AgentLoginResponse(BaseModel):
 @router.post("/register")
 async def register_agent(data: AgentRegisterRequest):
     """
-    Register a new AI Agent account
-    Creates both user account and agent record with API key
+    Register a new AI Agent
+    Simplified to work with actual database schema
     """
     try:
         # 1. Check if user already exists
@@ -76,8 +76,8 @@ async def register_agent(data: AgentRegisterRequest):
         
         await database.execute(
             """
-            INSERT INTO users (email, password_hash, full_name, role, active)
-            VALUES (:email, :password_hash, :full_name, :role, :active)
+            INSERT INTO users (id, email, password_hash, full_name, role, active)
+            VALUES (gen_random_uuid(), :email, :password_hash, :full_name, :role, :active)
             """,
             {
                 "email": data.email,
@@ -90,74 +90,30 @@ async def register_agent(data: AgentRegisterRequest):
         
         # 3. Generate agent_id and API key
         agent_id = f"agent_{secrets.token_hex(8)}"
-        
-        # Generate API key: ak_live_<64 hex chars>
         api_key_raw = secrets.token_bytes(32)
         api_key = f"ak_live_{api_key_raw.hex()}"
         
-        # Hash the API key for storage (store hash, not plaintext)
-        api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-        
-        # 4. Create agent record - use absolute minimal approach
-        # Try different column combinations based on what exists
-        insert_attempts = [
-            # Attempt 1: Minimal with just API key (no hash)
+        # 4. Create agent record - using ONLY the columns we know exist
+        # Based on error message: agents table has 'email' column (NOT NULL)
+        await database.execute(
+            """
+            INSERT INTO agents (agent_id, email, api_key)
+            VALUES (:agent_id, :email, :api_key)
+            """,
             {
-                "sql": "INSERT INTO agents (agent_id, name, api_key, owner_email) VALUES (:agent_id, :name, :api_key, :owner_email)",
-                "params": {
-                    "agent_id": agent_id,
-                    "name": data.agent_name,
-                    "api_key": api_key,
-                    "owner_email": data.email
-                },
-                "description": "minimal (name, no hash)"
-            },
-            # Attempt 2: With agent_name instead of name
-            {
-                "sql": "INSERT INTO agents (agent_id, agent_name, api_key, owner_email) VALUES (:agent_id, :agent_name, :api_key, :owner_email)",
-                "params": {
-                    "agent_id": agent_id,
-                    "agent_name": data.agent_name,
-                    "api_key": api_key,
-                    "owner_email": data.email
-                },
-                "description": "agent_name column"
-            },
-            # Attempt 3: Without owner_email
-            {
-                "sql": "INSERT INTO agents (agent_id, name, api_key) VALUES (:agent_id, :name, :api_key)",
-                "params": {
-                    "agent_id": agent_id,
-                    "name": data.agent_name,
-                    "api_key": api_key
-                },
-                "description": "bare minimum (just agent_id, name, api_key)"
+                "agent_id": agent_id,
+                "email": data.email,
+                "api_key": api_key
             }
-        ]
+        )
         
-        agent_created = False
-        last_error = None
-        
-        for attempt in insert_attempts:
-            try:
-                await database.execute(attempt["sql"], attempt["params"])
-                print(f"✅ Agent created using: {attempt['description']}")
-                agent_created = True
-                break
-            except Exception as e:
-                last_error = str(e)
-                print(f"⚠️ Attempt '{attempt['description']}' failed: {e}")
-                continue
-        
-        if not agent_created:
-            print(f"❌ All insert attempts failed. Last error: {last_error}")
-            raise Exception(f"Failed to create agent record. Database schema mismatch: {last_error}")
+        print(f"✅ Agent created: {agent_id} for {data.email}")
         
         return {
             "success": True,
             "message": "Agent account created successfully",
             "agent_id": agent_id,
-            "api_key": api_key,  # Return only once - save this!
+            "api_key": api_key,
             "email": data.email,
             "important": "Save your API key now! It won't be shown again."
         }
@@ -165,16 +121,19 @@ async def register_agent(data: AgentRegisterRequest):
     except HTTPException:
         raise
     except Exception as e:
-        # If agent creation failed, clean up the user account to allow retry
+        # If agent creation failed, clean up user account
         try:
             await database.execute(
                 "DELETE FROM users WHERE email = :email AND role = 'agent'",
                 {"email": data.email}
             )
-            print(f"🧹 Cleaned up user account for {data.email} after agent creation failure")
+            print(f"🧹 Cleaned up user account after failure")
         except:
             pass
         
+        import traceback
+        print(f"❌ Agent registration error: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(
             status_code=500,
             detail=f"Registration failed: {str(e)}"
@@ -183,10 +142,7 @@ async def register_agent(data: AgentRegisterRequest):
 
 @router.post("/login", response_model=AgentLoginResponse)
 async def login_agent(data: AgentLoginRequest):
-    """
-    Login for AI Agent
-    Returns JWT token and API key
-    """
+    """Agent login"""
     try:
         # 1. Find user
         user = await database.fetch_one(
@@ -207,37 +163,22 @@ async def login_agent(data: AgentLoginRequest):
         if not verify_password(data.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         
-        # 3. Get agent record - try different column names
-        agent = None
-        # Try with agent_name first
-        try:
-            agent = await database.fetch_one(
-                "SELECT agent_id, agent_name as name, owner_email, is_active, api_key FROM agents WHERE owner_email = :email",
-                {"email": data.email}
-            )
-        except:
-            # Fallback to name column
-            try:
-                agent = await database.fetch_one(
-                    "SELECT agent_id, name, owner_email, is_active, api_key FROM agents WHERE owner_email = :email",
-                    {"email": data.email}
-                )
-            except:
-                pass
+        # 3. Get agent record
+        agent = await database.fetch_one(
+            "SELECT agent_id, email, api_key FROM agents WHERE email = :email",
+            {"email": data.email}
+        )
         
         if not agent:
-            raise HTTPException(status_code=404, detail="Agent record not found. Please contact support.")
+            raise HTTPException(status_code=404, detail="Agent record not found")
         
-        # 4. Use the API key from agents table (already stored there)
-        api_key = agent["api_key"]
-        
-        # 5. Update last login
+        # 4. Update last login
         await database.execute(
             "UPDATE users SET last_login = :last_login WHERE email = :email",
             {"last_login": datetime.utcnow(), "email": data.email}
         )
         
-        # 6. Create JWT token
+        # 5. Create JWT token
         token = create_access_token({
             "sub": user["email"],
             "user_id": str(user["id"]),
@@ -250,13 +191,13 @@ async def login_agent(data: AgentLoginRequest):
             token=token,
             agent={
                 "agent_id": agent["agent_id"],
-                "agent_name": agent.get("name") or agent.get("agent_name") or "Agent",
-                "email": agent.get("owner_email") or user["email"],
-                "company": "",  # Not stored in agent table
-                "description": agent.get("description", ""),
-                "status": "active" if agent.get("is_active", True) else "inactive"
+                "agent_name": user["full_name"] or "Agent",
+                "email": agent["email"],
+                "company": "",
+                "description": "",
+                "status": "active"
             },
-            api_key=api_key
+            api_key=agent["api_key"]
         )
         
     except HTTPException:
@@ -266,37 +207,4 @@ async def login_agent(data: AgentLoginRequest):
             status_code=500,
             detail=f"Login failed: {str(e)}"
         )
-
-
-@router.get("/me")
-async def get_agent_profile(current_user: dict = Depends(lambda: {})):
-    """
-    Get current agent profile
-    Requires authentication token
-    """
-    from utils.auth import get_current_user
-    user = await get_current_user()
-    
-    if user["role"] != "agent":
-        raise HTTPException(status_code=403, detail="Not an agent account")
-    
-    # Get agent details
-    agent = await database.fetch_one(
-        """
-        SELECT agent_id, name, email, company, status, tier, 
-               rate_limit_rpm, daily_quota, total_orders, total_gmv
-        FROM agents 
-        WHERE email = :email
-        """,
-        {"email": user["email"]}
-    )
-    
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent record not found")
-    
-    return {
-        "success": True,
-        "agent": dict(agent)
-    }
-
 
