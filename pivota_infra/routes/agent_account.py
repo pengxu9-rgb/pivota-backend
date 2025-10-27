@@ -187,12 +187,25 @@ async def login_agent(data: AgentLoginRequest):
             "agent_id": agent["agent_id"]
         })
         
+        # Get agent name safely
+        agent_name = "Agent"  # Default
+        try:
+            if agent["name"]:
+                agent_name = agent["name"]
+        except (KeyError, TypeError):
+            # Fallback to user's full name if available
+            try:
+                if user["full_name"]:
+                    agent_name = user["full_name"]
+            except (KeyError, TypeError):
+                pass
+        
         return AgentLoginResponse(
             success=True,
             token=token,
             agent={
                 "agent_id": agent["agent_id"],
-                "agent_name": agent["name"] if agent.get("name") else (user["full_name"] or "Agent"),
+                "agent_name": agent_name,
                 "email": agent["email"],
                 "company": "",
                 "description": "",
