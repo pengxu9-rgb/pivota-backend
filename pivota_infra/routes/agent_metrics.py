@@ -115,10 +115,10 @@ async def get_metrics_summary(
             "status": "healthy",
             "timestamp": now.isoformat(),
             "overview": {
-                "total_requests": 0,
-                "requests_last_hour": 0,
-                "requests_last_24h": 0,
-                "requests_last_7d": 0,
+                "total_requests": total_requests,
+                "requests_last_hour": hour_requests,
+                "requests_last_24h": day_requests,
+                "requests_last_7d": 0,  # Can add if needed
             },
             "performance": {
                 "success_rate_24h": round(success_rate, 2),
