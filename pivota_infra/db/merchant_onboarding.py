@@ -175,18 +175,58 @@ async def get_all_merchant_onboardings(status: Optional[str] = None, include_del
     return [dict(row) for row in results]
 
 async def soft_delete_merchant_onboarding(merchant_id: str) -> bool:
-    """Soft delete onboarding merchant by setting status='deleted'"""
+    """Soft delete onboarding merchant by setting status='deleted' and removing user account"""
+    # 1. Soft delete merchant onboarding record
     query = merchant_onboarding.update().where(
         merchant_onboarding.c.merchant_id == merchant_id
     ).values(status="deleted", updated_at=datetime.now())
     await database.execute(query)
+    
+    # 2. Also delete the user account to allow re-registration with same email
+    try:
+        # Get merchant's email first
+        merchant = await database.fetch_one(
+            "SELECT contact_email FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+            {"merchant_id": merchant_id}
+        )
+        
+        if merchant and merchant["contact_email"]:
+            # Delete user account
+            await database.execute(
+                "DELETE FROM users WHERE email = :email AND merchant_id = :merchant_id",
+                {"email": merchant["contact_email"], "merchant_id": merchant_id}
+            )
+            print(f"✅ Deleted user account for {merchant['contact_email']}")
+    except Exception as e:
+        print(f"⚠️ Failed to delete user account: {e}")
+        # Don't fail the whole delete operation
+    
     return True
 
 async def hard_delete_merchant_onboarding(merchant_id: str) -> bool:
-    """Hard delete onboarding merchant (permanent)"""
+    """Hard delete onboarding merchant (permanent) and associated user account"""
+    # 1. Get merchant email first (before deleting the record)
+    merchant = await database.fetch_one(
+        "SELECT contact_email FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+        {"merchant_id": merchant_id}
+    )
+    
+    # 2. Delete merchant onboarding record
     delete_q = merchant_onboarding.delete().where(
         merchant_onboarding.c.merchant_id == merchant_id
     )
     await database.execute(delete_q)
+    
+    # 3. Delete user account
+    if merchant and merchant["contact_email"]:
+        try:
+            await database.execute(
+                "DELETE FROM users WHERE email = :email AND merchant_id = :merchant_id",
+                {"email": merchant["contact_email"], "merchant_id": merchant_id}
+            )
+            print(f"✅ Deleted user account for {merchant['contact_email']}")
+        except Exception as e:
+            print(f"⚠️ Failed to delete user account: {e}")
+    
     return True
 
