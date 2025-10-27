@@ -46,9 +46,7 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         orders_query = """
         SELECT 
             order_id,
-            COALESCE(total, amount, 0) as amount,
-            COALESCE(total, amount, 0) as total,
-            COALESCE(total, amount, 0) as total_amount,
+            total,
             payment_status as status,
             customer_email,
             items,
@@ -71,7 +69,7 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         
         # Calculate statistics
         total_orders = len(orders)
-        total_revenue = sum(float(order["amount"]) for order in orders if order["amount"])
+        total_revenue = sum(float(order["total"]) for order in orders if order["total"])
         paid_orders = [o for o in orders if o["status"] == "paid"]
         
         # Get unique customers

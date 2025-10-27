@@ -8,6 +8,7 @@ import string
 import json
 from utils.auth import get_current_user
 from db.database import database
+from models.order_response import format_order_for_response
 
 router = APIRouter()
 
@@ -351,8 +352,7 @@ async def get_merchant_orders(
         orders_query = f"""
             SELECT 
                 order_id, merchant_id, store_id, psp_id,
-                COALESCE(total, amount, 0) as amount,
-                COALESCE(total, amount, 0) as total_amount,
+                total,
                 currency, status, payment_status, payment_method,
                 customer_name, customer_email,
                 created_at, updated_at
@@ -367,22 +367,18 @@ async def get_merchant_orders(
         
         rows = await database.fetch_all(orders_query, params)
         
-        # Format orders
+        # Format orders using standardized format
         orders = []
         for row in rows:
-            orders.append({
+            # Convert row to dict
+            order_dict = dict(row)
+            # Use standardized formatting
+            formatted_order = format_order_for_response(order_dict)
+            # Add additional fields needed by frontend
+            formatted_order.update({
                 "id": row["order_id"],
-                "order_id": row["order_id"],
                 "order_number": row["order_id"],
                 "merchant_id": row["merchant_id"],
-                "total": row["amount"],
-                "total_amount": row["amount"],
-                "amount": float(row["amount"]) if row["amount"] else 0,
-                "currency": row["currency"],
-                "status": row["status"],
-                "payment_status": row["payment_status"],
-                "payment_method": row["payment_method"],
-                "customer_email": row["customer_email"],
                 "customer_name": row["customer_name"],
                 "customer": {
                     "name": row["customer_name"],
@@ -391,6 +387,7 @@ async def get_merchant_orders(
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None
             })
+            orders.append(formatted_order)
         
         return {
             "status": "success",

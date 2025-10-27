@@ -25,7 +25,7 @@ orders = Table(
     # Legacy fields (for backward compatibility with existing DB)
     Column("store_id", String(50), nullable=True),
     Column("psp_id", String(50), nullable=True),
-    Column("amount", Numeric(10, 2), nullable=True),  # Legacy, same as total
+    # Column("amount", Numeric(10, 2), nullable=True),  # REMOVED - use "total" instead
     
     # 客户信息
     Column("customer_name", String(255), nullable=True),
