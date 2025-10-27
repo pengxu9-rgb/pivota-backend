@@ -99,21 +99,22 @@ async def register_agent(data: AgentRegisterRequest):
         api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
         
         # 4. Create agent record using the actual table structure
-        await database.execute(
-            """
-            INSERT INTO agents (
-                agent_id, agent_name, agent_type, description,
-                api_key, api_key_hash, is_active,
-                owner_email, rate_limit, daily_quota,
-                created_at
-            )
-            VALUES (
-                :agent_id, :agent_name, :agent_type, :description,
-                :api_key, :api_key_hash, :is_active,
-                :owner_email, :rate_limit, :daily_quota,
-                :created_at
-            )
-            """,
+        try:
+            await database.execute(
+                """
+                INSERT INTO agents (
+                    agent_id, agent_name, agent_type, description,
+                    api_key, api_key_hash, is_active,
+                    owner_email, rate_limit, daily_quota,
+                    created_at
+                )
+                VALUES (
+                    :agent_id, :agent_name, :agent_type, :description,
+                    :api_key, :api_key_hash, :is_active,
+                    :owner_email, :rate_limit, :daily_quota,
+                    :created_at
+                )
+                """,
             {
                 "agent_id": agent_id,
                 "agent_name": data.agent_name,
@@ -128,6 +129,43 @@ async def register_agent(data: AgentRegisterRequest):
                 "created_at": datetime.utcnow()
             }
         )
+        except Exception as insert_error:
+            # Handle missing column errors with auto-migration
+            error_msg = str(insert_error)
+            if "agent_name" in error_msg and "does not exist" in error_msg:
+                # agents table might be using 'name' instead of 'agent_name'
+                print(f"⚠️ Trying with 'name' column instead of 'agent_name'...")
+                await database.execute(
+                    """
+                    INSERT INTO agents (
+                        agent_id, name, agent_type, description,
+                        api_key, api_key_hash, is_active,
+                        owner_email, rate_limit, daily_quota,
+                        created_at
+                    )
+                    VALUES (
+                        :agent_id, :name, :agent_type, :description,
+                        :api_key, :api_key_hash, :is_active,
+                        :owner_email, :rate_limit, :daily_quota,
+                        :created_at
+                    )
+                    """,
+                    {
+                        "agent_id": agent_id,
+                        "name": data.agent_name,
+                        "agent_type": "custom",
+                        "description": data.description,
+                        "api_key": api_key,
+                        "api_key_hash": api_key_hash,
+                        "is_active": True,
+                        "owner_email": data.email,
+                        "rate_limit": 60,
+                        "daily_quota": 1000,
+                        "created_at": datetime.utcnow()
+                    }
+                )
+            else:
+                raise
         
         return {
             "success": True,
