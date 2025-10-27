@@ -351,7 +351,9 @@ async def get_merchant_orders(
         orders_query = f"""
             SELECT 
                 order_id, merchant_id, store_id, psp_id,
-                amount, currency, status, payment_method,
+                COALESCE(total, amount, 0) as amount,
+                COALESCE(total, amount, 0) as total_amount,
+                currency, status, payment_status, payment_method,
                 customer_name, customer_email,
                 created_at, updated_at
             FROM orders
@@ -369,12 +371,19 @@ async def get_merchant_orders(
         orders = []
         for row in rows:
             orders.append({
+                "id": row["order_id"],
                 "order_id": row["order_id"],
+                "order_number": row["order_id"],
                 "merchant_id": row["merchant_id"],
-                "amount": float(row["amount"]),
+                "total": row["amount"],
+                "total_amount": row["amount"],
+                "amount": float(row["amount"]) if row["amount"] else 0,
                 "currency": row["currency"],
                 "status": row["status"],
+                "payment_status": row["payment_status"],
                 "payment_method": row["payment_method"],
+                "customer_email": row["customer_email"],
+                "customer_name": row["customer_name"],
                 "customer": {
                     "name": row["customer_name"],
                     "email": row["customer_email"]

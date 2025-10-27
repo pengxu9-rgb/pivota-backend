@@ -234,7 +234,7 @@ async def create_new_order(
             "shipping_fee": float(shipping_fee),
             "tax": float(tax),
             "total": float(total),
-            "amount": float(total),  # Legacy field, same as total
+            "amount": float(total),  # ALWAYS keep amount = total for compatibility
             "currency": order_request.currency,
             "agent_id": agent_id,  # Extract from metadata
             "agent_session_id": order_request.agent_session_id,
