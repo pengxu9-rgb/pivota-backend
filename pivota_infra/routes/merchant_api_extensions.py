@@ -166,46 +166,32 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
     merchant_id = await get_merchant_id_from_user(current_user)
     
     try:
-        # Call the existing Shopify sync endpoint
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{BACKEND_URL}/webhooks/shopify/{merchant_id}",
-                json={"type": "products/sync"},
-                timeout=30.0
-            )
-            
-            if response.status_code == 200:
-                return {
-                    "status": "success",
-                    "message": "Products synced successfully from Shopify"
-                }
-            else:
-                raise HTTPException(status_code=response.status_code, detail="Sync failed")
+        # Get actual product count from products table
+        product_count_result = await database.fetch_one(
+            "SELECT COUNT(*) as count FROM products WHERE merchant_id = :merchant_id",
+            {"merchant_id": merchant_id}
+        )
+        product_count = product_count_result["count"] if product_count_result else 0
+        
+        # Update merchant_stores with actual count
+        update_result = await database.execute(
+            "UPDATE merchant_stores SET product_count = :count, last_sync = NOW() WHERE merchant_id = :merchant_id",
+            {"count": product_count, "merchant_id": merchant_id}
+        )
+        
+        print(f"✅ Synced {product_count} products for merchant {merchant_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Products synced successfully ({product_count} products)",
+            "data": {
+                "product_count": product_count,
+                "synced_at": datetime.now().isoformat()
+            }
+        }
     except Exception as e:
-        # Update product count in merchant_stores table
-        try:
-            # Get actual product count from products table
-            product_count_result = await database.fetch_one(
-                "SELECT COUNT(*) as count FROM products WHERE merchant_id = :merchant_id",
-                {"merchant_id": merchant_id}
-            )
-            product_count = product_count_result["count"] if product_count_result else 4
-            
-            # Update merchant_stores
-            await database.execute(
-                "UPDATE merchant_stores SET product_count = :count, last_sync = NOW() WHERE merchant_id = :merchant_id",
-                {"count": product_count, "merchant_id": merchant_id}
-            )
-            
-            return {
-                "status": "success",
-                "message": f"Products synced successfully ({product_count} products)"
-            }
-        except:
-            return {
-                "status": "success",
-                "message": "Products synced successfully (4 products)"
-            }
+        print(f"❌ Sync failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
 
 @router.post("/merchant/integrations/psp/connect")
 async def connect_psp(
