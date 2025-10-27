@@ -205,6 +205,26 @@ async def create_new_order(
         if order_request.metadata:
             agent_id = order_request.metadata.get("agent_id")
         
+        # Determine PSP first (before creating order)
+        psp_type = order_request.preferred_psp
+        if not psp_type:
+            psp_type = merchant.get("psp_type")
+        if not psp_type:
+            try:
+                psp_row = await database.fetch_one(
+                    """
+                    SELECT provider FROM merchant_psps
+                    WHERE merchant_id = :merchant_id
+                    ORDER BY connected_at DESC
+                    LIMIT 1
+                    """,
+                    {"merchant_id": order_request.merchant_id}
+                )
+                if psp_row:
+                    psp_type = psp_row["provider"]
+            except:
+                pass
+        
         order_data = {
             "merchant_id": order_request.merchant_id,
             "customer_email": order_request.customer_email,
@@ -219,6 +239,7 @@ async def create_new_order(
             "agent_id": agent_id,  # Extract from metadata
             "agent_session_id": order_request.agent_session_id,
             "metadata": order_request.metadata or {},
+            "psp_used": psp_type,  # NEW: Record which PSP is used
             # Legacy fields (optional, can be null)
             "store_id": None,
             "psp_id": None,
@@ -231,27 +252,9 @@ async def create_new_order(
         client_secret = None
         
         try:
-            # PSP 类型选择：优先使用 preferred_psp，否则回退
-            psp_type = order_request.preferred_psp
+            # PSP type already determined above when creating order_data
             if not psp_type:
-                psp_type = merchant.get("psp_type")
-            if not psp_type:
-                try:
-                    psp_row = await database.fetch_one(
-                        """
-                        SELECT provider FROM merchant_psps
-                        WHERE merchant_id = :merchant_id
-                        ORDER BY connected_at DESC
-                        LIMIT 1
-                        """,
-                        {"merchant_id": order_request.merchant_id}
-                    )
-                    if psp_row:
-                        psp_type = psp_row["provider"]
-                except Exception:
-                    psp_type = None
-            if not psp_type:
-                psp_type = "stripe"
+                psp_type = "stripe"  # Final fallback
 
             # PSP 密钥查找：优先从 merchant_psps 表
             psp_key = None

@@ -32,8 +32,7 @@ async def fix_merchant_id(
         # Update the target merchant's contact_email
         merchant_query = """
         UPDATE merchant_onboarding
-        SET contact_email = :email,
-            email = :email
+        SET contact_email = :email
         WHERE merchant_id = :merchant_id
         RETURNING merchant_id, business_name, contact_email, mcp_shop_domain
         """
@@ -120,7 +119,7 @@ async def merge_merchants(
             
             # Update kept merchant's contact_email
             await database.execute(
-                "UPDATE merchant_onboarding SET contact_email = :email, email = :email WHERE merchant_id = :keep",
+                "UPDATE merchant_onboarding SET contact_email = :email WHERE merchant_id = :keep",
                 {"email": request.user_email, "keep": request.keep_merchant_id}
             )
         
