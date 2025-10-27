@@ -98,60 +98,60 @@ async def register_agent(data: AgentRegisterRequest):
         # Hash the API key for storage (store hash, not plaintext)
         api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
         
-        # 4. Create agent record - try minimal columns first
-        try:
-            # Try the simplest insert with only required fields
-            await database.execute(
-                """
-                INSERT INTO agents (
-                    agent_id, name, api_key, api_key_hash, 
-                    owner_email, is_active
-                )
-                VALUES (
-                    :agent_id, :name, :api_key, :api_key_hash,
-                    :owner_email, :is_active
-                )
-                """,
-                {
+        # 4. Create agent record - use absolute minimal approach
+        # Try different column combinations based on what exists
+        insert_attempts = [
+            # Attempt 1: Minimal with just API key (no hash)
+            {
+                "sql": "INSERT INTO agents (agent_id, name, api_key, owner_email) VALUES (:agent_id, :name, :api_key, :owner_email)",
+                "params": {
                     "agent_id": agent_id,
                     "name": data.agent_name,
                     "api_key": api_key,
-                    "api_key_hash": api_key_hash,
-                    "owner_email": data.email,
-                    "is_active": True
-                }
-            )
-            print(f"✅ Agent created with minimal fields (name column)")
-        except Exception as minimal_error:
-            # If that fails, try with agent_name column
-            minimal_msg = str(minimal_error)
-            if "name" in minimal_msg and "does not exist" in minimal_msg:
-                print(f"⚠️ Trying with agent_name column...")
-                await database.execute(
-                    """
-                    INSERT INTO agents (
-                        agent_id, agent_name, api_key, api_key_hash,
-                        owner_email, is_active
-                    )
-                    VALUES (
-                        :agent_id, :agent_name, :api_key, :api_key_hash,
-                        :owner_email, :is_active
-                    )
-                    """,
-                    {
-                        "agent_id": agent_id,
-                        "agent_name": data.agent_name,
-                        "api_key": api_key,
-                        "api_key_hash": api_key_hash,
-                        "owner_email": data.email,
-                        "is_active": True
-                    }
-                )
-                print(f"✅ Agent created with agent_name column")
-            else:
-                # If both fail, log the error and raise
-                print(f"❌ Both insert attempts failed. Error: {minimal_msg}")
-                raise
+                    "owner_email": data.email
+                },
+                "description": "minimal (name, no hash)"
+            },
+            # Attempt 2: With agent_name instead of name
+            {
+                "sql": "INSERT INTO agents (agent_id, agent_name, api_key, owner_email) VALUES (:agent_id, :agent_name, :api_key, :owner_email)",
+                "params": {
+                    "agent_id": agent_id,
+                    "agent_name": data.agent_name,
+                    "api_key": api_key,
+                    "owner_email": data.email
+                },
+                "description": "agent_name column"
+            },
+            # Attempt 3: Without owner_email
+            {
+                "sql": "INSERT INTO agents (agent_id, name, api_key) VALUES (:agent_id, :name, :api_key)",
+                "params": {
+                    "agent_id": agent_id,
+                    "name": data.agent_name,
+                    "api_key": api_key
+                },
+                "description": "bare minimum (just agent_id, name, api_key)"
+            }
+        ]
+        
+        agent_created = False
+        last_error = None
+        
+        for attempt in insert_attempts:
+            try:
+                await database.execute(attempt["sql"], attempt["params"])
+                print(f"✅ Agent created using: {attempt['description']}")
+                agent_created = True
+                break
+            except Exception as e:
+                last_error = str(e)
+                print(f"⚠️ Attempt '{attempt['description']}' failed: {e}")
+                continue
+        
+        if not agent_created:
+            print(f"❌ All insert attempts failed. Last error: {last_error}")
+            raise Exception(f"Failed to create agent record. Database schema mismatch: {last_error}")
         
         return {
             "success": True,
