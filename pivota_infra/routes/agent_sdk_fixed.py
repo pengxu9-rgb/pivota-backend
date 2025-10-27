@@ -376,8 +376,9 @@ async def list_orders(
     """List orders"""
     try:
         # Build WHERE clauses
-        where_clauses = []
-        params = {"limit": limit, "offset": offset}
+        # Always scope to current agent
+        where_clauses = ["o.agent_id = :agent_id"]
+        params = {"limit": limit, "offset": offset, "agent_id": context.agent_id}
         
         if merchant_id:
             where_clauses.append("o.merchant_id = :merchant_id")
