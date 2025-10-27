@@ -140,7 +140,7 @@ async def get_psp_overview(
                 "total_volume": float(row["total_volume"]) if row["total_volume"] else 0,
                 "avg_transaction_size": float(row["avg_transaction_size"]) if row["avg_transaction_size"] else 0,
                 "refund_count": row["refund_count"],
-                "refund_rate": round(row["refund_count"] / row["transaction_count"] * 100, 2) if row["transaction_count"] > 0 else 0,
+                "refund_rate": round(row["refund_count"] / row["transactions_today"] * 100, 2) if row["transactions_today"] > 0 else 0,
                 "avg_fee": float(row["avg_fee_rate"]) if row["avg_fee_rate"] else 2.5,
                 "last_synced": row["last_transaction"].isoformat() if row["last_transaction"] else None,
                 "activity_status": row["activity_status"]

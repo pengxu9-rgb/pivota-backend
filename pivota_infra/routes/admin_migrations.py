@@ -28,6 +28,10 @@ ALTER_SQL = [
     ALTER TABLE agents
     ADD COLUMN IF NOT EXISTS total_requests INTEGER DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_orders INTEGER DEFAULT 0;
+    """,
+    """
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS merchant_id VARCHAR(255);
     """
 ]
 
