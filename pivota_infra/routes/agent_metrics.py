@@ -93,7 +93,7 @@ async def get_metrics_summary(
         active_agents = 1
         errors = []
         # Orders created (last 24h) for this agent
-        orders_count = await database.fetch_val(
+        orders_count_24h = await database.fetch_val(
             """SELECT COUNT(*) FROM orders 
                WHERE created_at >= :since 
                  AND (is_deleted IS NULL OR is_deleted = FALSE)
@@ -102,13 +102,47 @@ async def get_metrics_summary(
         ) or 0
         
         # Revenue (last 24h) for this agent (paid only)
-        revenue = await database.fetch_val(
+        revenue_24h = await database.fetch_val(
             """SELECT COALESCE(SUM(total), 0) FROM orders 
                WHERE created_at >= :since 
                  AND (is_deleted IS NULL OR is_deleted = FALSE)
                  AND payment_status = 'paid'
                  AND agent_id = :agent_id""",
             {"since": last_24h, "agent_id": agent_id}
+        ) or 0
+        
+        # Total orders (all time) for this agent
+        total_orders = await database.fetch_val(
+            """SELECT COUNT(*) FROM orders 
+               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND agent_id = :agent_id""",
+            {"agent_id": agent_id}
+        ) or 0
+        
+        # Total paid orders (all time)
+        total_paid_orders = await database.fetch_val(
+            """SELECT COUNT(*) FROM orders 
+               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND payment_status = 'paid'
+                 AND agent_id = :agent_id""",
+            {"agent_id": agent_id}
+        ) or 0
+        
+        # Total revenue (all time, paid only) for this agent
+        total_revenue = await database.fetch_val(
+            """SELECT COALESCE(SUM(total), 0) FROM orders 
+               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND payment_status = 'paid'
+                 AND agent_id = :agent_id""",
+            {"agent_id": agent_id}
+        ) or 0
+        
+        # Count unique merchants for this agent
+        merchant_count = await database.fetch_val(
+            """SELECT COUNT(DISTINCT merchant_id) FROM orders 
+               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND agent_id = :agent_id""",
+            {"agent_id": agent_id}
         ) or 0
         
         return {
@@ -128,8 +162,16 @@ async def get_metrics_summary(
                 "active_last_24h": active_agents,
             },
             "orders": {
-                "count_last_24h": orders_count,
-                "revenue_last_24h": float(revenue),
+                # Last 24h metrics
+                "count_last_24h": orders_count_24h,
+                "revenue_last_24h": float(revenue_24h),
+                # All-time metrics (for dashboard calculations)
+                "total_orders": total_orders,
+                "total_paid_orders": total_paid_orders,
+                "total_revenue": float(total_revenue),
+            },
+            "merchants": {
+                "total_count": merchant_count,
             },
             "top_endpoints": [
                 {"endpoint": row["endpoint"], "count": row["count"]} 
