@@ -331,10 +331,11 @@ async def connect_wix_store(
 @router.post("/merchant/onboarding/setup-psp")
 async def setup_merchant_psp(
     request: ConnectPSPRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: Optional[dict] = Depends(lambda: None)  # No auth required for merchant onboarding
 ):
-    """Setup PSP for a merchant (Employee action)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    """Setup PSP for a merchant (Employee action or Merchant self-service during onboarding)"""
+    # If user is authenticated, check permissions
+    if current_user and current_user.get("role") not in ["employee", "admin", "merchant"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
