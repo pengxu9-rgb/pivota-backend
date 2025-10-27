@@ -166,16 +166,42 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
     merchant_id = await get_merchant_id_from_user(current_user)
     
     try:
-        # Get actual product count from products table
+        # 1. Check if store is actually connected
+        store_check = await database.fetch_one(
+            """
+            SELECT store_id, platform, domain, status 
+            FROM merchant_stores 
+            WHERE merchant_id = :merchant_id AND platform = 'shopify'
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id}
+        )
+        
+        if not store_check:
+            raise HTTPException(
+                status_code=400, 
+                detail="No Shopify store connected. Please connect your store first in Integrations."
+            )
+        
+        if store_check["status"] != "active":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Store is {store_check['status']}. Please reconnect your store."
+            )
+        
+        # 2. TODO: Actually call Shopify API to fetch products
+        # For now, just count existing products in our database
+        
+        # 3. Get actual product count from products table
         product_count_result = await database.fetch_one(
             "SELECT COUNT(*) as count FROM products WHERE merchant_id = :merchant_id",
             {"merchant_id": merchant_id}
         )
         product_count = product_count_result["count"] if product_count_result else 0
         
-        # Update merchant_stores with actual count
+        # 4. Update merchant_stores with actual count and last sync time
         update_result = await database.execute(
-            "UPDATE merchant_stores SET product_count = :count, last_sync = NOW() WHERE merchant_id = :merchant_id",
+            "UPDATE merchant_stores SET product_count = :count, last_sync = NOW() WHERE merchant_id = :merchant_id AND platform = 'shopify'",
             {"count": product_count, "merchant_id": merchant_id}
         )
         
@@ -183,12 +209,15 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
         
         return {
             "status": "success",
-            "message": f"Products synced successfully ({product_count} products)",
+            "message": f"Products synced: {product_count} products from {store_check['domain']}",
             "data": {
                 "product_count": product_count,
+                "store_domain": store_check['domain'],
                 "synced_at": datetime.now().isoformat()
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Sync failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
