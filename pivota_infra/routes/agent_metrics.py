@@ -308,12 +308,32 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
 @router.get("/timeline")
 async def get_metrics_timeline(
     hours: int = 24,
-    current_user: dict = Depends(require_admin)
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
 ) -> Dict[str, Any]:
     """
-    Get hourly request timeline for the last N hours
+    Get hourly request timeline for the last N hours (agent-scoped)
     """
     try:
+        # Resolve agent_id from JWT or X-API-Key
+        agent_id = None
+        if authorization and authorization.startswith("Bearer "):
+            try:
+                payload = decode_token(authorization.split(" ")[1])
+                agent_id = payload.get("agent_id")
+            except:
+                pass
+        if not agent_id and x_api_key:
+            agent_row = await database.fetch_one(
+                "SELECT agent_id FROM agents WHERE api_key = :key LIMIT 1",
+                {"key": x_api_key}
+            )
+            if agent_row:
+                agent_id = agent_row["agent_id"]
+        
+        if not agent_id:
+            raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
+        
         since = datetime.now() - timedelta(hours=hours)
         
         timeline = await database.fetch_all(
@@ -324,11 +344,11 @@ async def get_metrics_timeline(
                 SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) as successful_requests,
                 AVG(response_time_ms) as avg_response_time
             FROM agent_usage_logs
-            WHERE timestamp >= :since
+            WHERE timestamp >= :since AND agent_id = :agent_id
             GROUP BY DATE_TRUNC('hour', timestamp)
             ORDER BY hour DESC
             """,
-            {"since": since}
+            {"since": since, "agent_id": agent_id}
         )
         
         return {
