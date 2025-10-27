@@ -104,6 +104,41 @@ async def get_metrics_summary(request: Request) -> Dict[str, Any]:
         }
 
 
+@router.get("/recent")
+async def get_recent_activity(request: Request, limit: int = Query(5, ge=1, le=50)) -> Dict[str, Any]:
+    """
+    Get recent agent activity - returns mock data for now
+    """
+    try:
+        # Return mock recent activities
+        recent_activities = []
+        for i in range(limit):
+            activity_type = ["order_created", "product_search", "merchant_connected"][i % 3]
+            recent_activities.append({
+                "id": f"act_{i}",
+                "type": activity_type,
+                "timestamp": (datetime.now() - timedelta(minutes=i*10)).isoformat(),
+                "details": {
+                    "order_id": f"order_{1000+i}" if activity_type == "order_created" else None,
+                    "query": f"search query {i}" if activity_type == "product_search" else None,
+                    "merchant": f"merchant_{i}" if activity_type == "merchant_connected" else None,
+                    "status": "success"
+                }
+            })
+        
+        return {
+            "status": "success",
+            "activities": recent_activities,
+            "total": len(recent_activities)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "activities": []
+        }
+
+
 @router.get("/agents")
 async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict[str, Any]:
     """

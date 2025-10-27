@@ -76,6 +76,7 @@ from routes.admin_simple_fix import router as admin_simple_fix_router
 from routes.admin_cleanup_rebuild import router as admin_cleanup_rebuild_router
 from routes.admin_sql_quick import router as admin_sql_router
 from routes.admin_agents_debug import router as admin_agents_debug_router
+from routes.agent_health import router as agent_health_router
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -209,6 +210,7 @@ app.include_router(admin_simple_fix_router)  # Admin simple fix
 app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_sql_router)  # Admin SQL
 app.include_router(admin_agents_debug_router)  # Admin agents debug
+app.include_router(agent_health_router)  # Agent health check
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
