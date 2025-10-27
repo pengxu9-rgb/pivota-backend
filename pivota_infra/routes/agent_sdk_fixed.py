@@ -131,9 +131,10 @@ async def list_merchants(
         else:
             db_status = status
         
-        # Query merchants and derive PSP status from merchant_psps as fallback
+        # Query merchants this agent has interacted with (via orders)
+        # Only show merchants where agent has created orders
         query = """
-            SELECT 
+            SELECT DISTINCT
                 mo.merchant_id, 
                 mo.business_name, 
                 mo.status,
@@ -150,28 +151,43 @@ async def list_merchants(
                     WHERE mp.merchant_id = mo.merchant_id AND mp.status = 'active'
                     ORDER BY mp.connected_at DESC LIMIT 1
                 )) AS psp_type,
-                mo.created_at
+                mo.created_at,
+                COUNT(o.order_id) as total_orders,
+                SUM(CASE WHEN o.payment_status = 'paid' THEN o.total ELSE 0 END) as total_gmv
             FROM merchant_onboarding mo
+            INNER JOIN orders o ON o.merchant_id = mo.merchant_id
             WHERE mo.status = :status
             AND mo.status != 'deleted'
-            ORDER BY mo.business_name
+            AND o.agent_id = :agent_id
+            AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+            GROUP BY mo.merchant_id, mo.business_name, mo.status, mo.store_url, 
+                     mo.website, mo.region, mo.contact_email, mo.psp_connected, 
+                     mo.psp_type, mo.created_at
+            ORDER BY total_orders DESC, mo.business_name
             LIMIT :limit OFFSET :offset
         """
         
         merchants = await database.fetch_all(query, {
             "status": db_status,
+            "agent_id": context.agent_id,
             "limit": limit,
             "offset": offset
         })
         
-        # Get total count
+        # Get total count (only merchants this agent has ordered from)
         count_query = """
-            SELECT COUNT(*) as total
-            FROM merchant_onboarding
-            WHERE status = :status
-            AND status != 'deleted'
+            SELECT COUNT(DISTINCT mo.merchant_id) as total
+            FROM merchant_onboarding mo
+            INNER JOIN orders o ON o.merchant_id = mo.merchant_id
+            WHERE mo.status = :status
+            AND mo.status != 'deleted'
+            AND o.agent_id = :agent_id
+            AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
         """
-        total_result = await database.fetch_one(count_query, {"status": db_status})
+        total_result = await database.fetch_one(count_query, {
+            "status": db_status,
+            "agent_id": context.agent_id
+        })
         
         return {
             "status": "success",
@@ -186,7 +202,9 @@ async def list_merchants(
                     "contact_email": m["contact_email"],
                     "psp_connected": m["psp_connected"],
                     "psp_type": m["psp_type"],
-                    "created_at": m["created_at"].isoformat() if m["created_at"] else None
+                    "created_at": m["created_at"].isoformat() if m["created_at"] else None,
+                    "total_orders": m["total_orders"],
+                    "total_gmv": float(m["total_gmv"]) if m["total_gmv"] else 0
                 }
                 for m in merchants
             ],
