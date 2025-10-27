@@ -363,46 +363,59 @@ async def get_order_detail(
     current_user: dict = Depends(get_current_user)
 ):
     """Get order details"""
-    if current_user["role"] != "merchant":
+    if current_user["role"] not in ["merchant", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_id = await get_merchant_id_from_user(current_user)
     
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{BACKEND_URL}/orders/{order_id}",
-                timeout=10.0
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                raise HTTPException(status_code=404, detail="Order not found")
-    except:
-        # Return demo data
+        # Query directly from database
+        query = """
+            SELECT 
+                order_id, merchant_id, store_id, psp_id,
+                total, currency, status, payment_status, payment_method,
+                customer_name, customer_email, shipping_address,
+                items, subtotal, shipping_fee, tax,
+                created_at, updated_at
+            FROM orders
+            WHERE order_id = :order_id AND merchant_id = :merchant_id
+        """
+        
+        order = await database.fetch_one(query, {"order_id": order_id, "merchant_id": merchant_id})
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
         return {
             "status": "success",
             "data": {
-                "order_id": order_id,
-                "amount": 99.99,
-                "currency": "USD",
-                "status": "completed",
+                "order_id": order["order_id"],
+                "amount": float(order["total"]) if order["total"] else 0,
+                "total": float(order["total"]) if order["total"] else 0,
+                "subtotal": float(order["subtotal"]) if order["subtotal"] else 0,
+                "shipping_fee": float(order["shipping_fee"]) if order["shipping_fee"] else 0,
+                "tax": float(order["tax"]) if order["tax"] else 0,
+                "currency": order["currency"],
+                "status": order["status"],
+                "payment_status": order["payment_status"],
+                "payment_method": order["payment_method"],
                 "customer": {
-                    "name": "John Doe",
-                    "email": "john@example.com"
+                    "name": order["customer_name"],
+                    "email": order["customer_email"]
                 },
-                "items": [
-                    {
-                        "product_id": "1",
-                        "name": "Test Product",
-                        "quantity": 1,
-                        "price": 99.99
-                    }
-                ],
-                "created_at": "2025-10-19T12:00:00Z"
+                "shipping_address": order["shipping_address"] or {},
+                "items": order["items"] or [],
+                "created_at": order["created_at"].isoformat() if order["created_at"] else None,
+                "updated_at": order["updated_at"].isoformat() if order["updated_at"] else None,
+                "psp_id": order["psp_id"],
+                "store_id": order["store_id"]
             }
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching order details: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch order details")
 
 @router.post("/merchant/orders/export")
 async def export_orders(current_user: dict = Depends(get_current_user)):
