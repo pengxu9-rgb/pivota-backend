@@ -36,19 +36,52 @@ async def get_psp_overview(
             start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
         
         # Get PSP configurations and their stats
-        # Note: orders table doesn't have psp_type, so we count all orders for each merchant
+        # Infer PSP from payment_intent_id prefix since orders table doesn't have psp_type
         query = """
         WITH psp_stats AS (
             SELECT 
                 mp.provider as psp_name,
                 mp.status,
                 COUNT(DISTINCT mp.merchant_id) as merchant_count,
-                COALESCE(COUNT(o.order_id), 0) as transaction_count,
-                COALESCE(COUNT(CASE WHEN o.payment_status = 'paid' THEN 1 END), 0) as success_count,
-                COALESCE(SUM(CASE WHEN o.payment_status = 'paid' THEN o.total ELSE 0 END), 0) as total_volume,
-                AVG(CASE WHEN o.payment_status = 'paid' THEN o.total ELSE NULL END) as avg_transaction_size,
+                COALESCE(COUNT(CASE 
+                    WHEN mp.provider = 'stripe' AND o.payment_intent_id LIKE 'pi_%' THEN o.order_id
+                    WHEN mp.provider = 'paypal' AND o.payment_intent_id ~ '^[A-Z0-9]+$' AND o.payment_intent_id NOT LIKE 'pi_%' AND o.payment_intent_id NOT LIKE 'chk_%' THEN o.order_id
+                    WHEN mp.provider = 'checkout' AND o.payment_intent_id LIKE 'chk_%' THEN o.order_id
+                    WHEN mp.provider = 'adyen' AND o.payment_intent_id IS NULL AND o.payment_status = 'paid' THEN o.order_id
+                END), 0) as transaction_count,
+                COALESCE(COUNT(CASE 
+                    WHEN o.payment_status = 'paid' AND (
+                        (mp.provider = 'stripe' AND o.payment_intent_id LIKE 'pi_%') OR
+                        (mp.provider = 'paypal' AND o.payment_intent_id ~ '^[A-Z0-9]+$' AND o.payment_intent_id NOT LIKE 'pi_%') OR
+                        (mp.provider = 'checkout' AND o.payment_intent_id LIKE 'chk_%') OR
+                        (mp.provider = 'adyen' AND o.payment_intent_id IS NULL)
+                    ) THEN 1
+                END), 0) as success_count,
+                COALESCE(SUM(CASE 
+                    WHEN o.payment_status = 'paid' AND (
+                        (mp.provider = 'stripe' AND o.payment_intent_id LIKE 'pi_%') OR
+                        (mp.provider = 'paypal' AND o.payment_intent_id ~ '^[A-Z0-9]+$' AND o.payment_intent_id NOT LIKE 'pi_%') OR
+                        (mp.provider = 'checkout' AND o.payment_intent_id LIKE 'chk_%') OR
+                        (mp.provider = 'adyen' AND o.payment_intent_id IS NULL)
+                    ) THEN o.total ELSE 0
+                END), 0) as total_volume,
+                AVG(CASE 
+                    WHEN o.payment_status = 'paid' AND (
+                        (mp.provider = 'stripe' AND o.payment_intent_id LIKE 'pi_%') OR
+                        (mp.provider = 'paypal' AND o.payment_intent_id ~ '^[A-Z0-9]+$' AND o.payment_intent_id NOT LIKE 'pi_%') OR
+                        (mp.provider = 'checkout' AND o.payment_intent_id LIKE 'chk_%') OR
+                        (mp.provider = 'adyen' AND o.payment_intent_id IS NULL)
+                    ) THEN o.total ELSE NULL
+                END) as avg_transaction_size,
                 COALESCE(COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END), 0) as refund_count,
-                MAX(o.created_at) as last_transaction
+                MAX(CASE 
+                    WHEN (
+                        (mp.provider = 'stripe' AND o.payment_intent_id LIKE 'pi_%') OR
+                        (mp.provider = 'paypal' AND o.payment_intent_id ~ '^[A-Z0-9]+$' AND o.payment_intent_id NOT LIKE 'pi_%') OR
+                        (mp.provider = 'checkout' AND o.payment_intent_id LIKE 'chk_%') OR
+                        (mp.provider = 'adyen' AND o.payment_intent_id IS NULL)
+                    ) THEN o.created_at ELSE NULL
+                END) as last_transaction
             FROM merchant_psps mp
             LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
                 AND o.created_at >= :start_time
