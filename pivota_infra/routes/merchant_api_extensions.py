@@ -136,23 +136,10 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         import traceback
-        print(f"❌ Dashboard stats error: {e}")
+        logger.error(f"❌ Dashboard stats error for merchant {merchant_id}: {e}")
         traceback.print_exc()
-        # Return empty data for new merchants instead of demo data
-        return {
-            "status": "success",
-            "data": {
-                "total_orders": 0,
-                "total_revenue": 0,
-                "total_customers": 0,
-                "total_products": 0,
-                "average_order_value": 0,
-                "conversion_rate": 0,
-                "top_products": [],
-                "recent_orders": [],
-                "psp_count": 0
-            }
-        }
+        # DON'T catch errors silently - raise them so we can see what's wrong
+        raise HTTPException(status_code=500, detail=f"Dashboard stats failed: {str(e)}")
 
 @router.put("/merchant/profile")
 async def update_merchant_profile(
