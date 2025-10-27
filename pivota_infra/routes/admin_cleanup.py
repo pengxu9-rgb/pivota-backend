@@ -140,14 +140,13 @@ async def list_all_merchants(current_user: dict = Depends(require_admin)):
                 m.business_name,
                 m.contact_email,
                 m.mcp_shop_domain,
-                m.kyb_status,
                 COUNT(DISTINCT o.order_id) as order_count,
                 COUNT(DISTINCT mp.psp_id) as psp_count,
                 COALESCE(SUM(o.total), 0) as total_revenue
             FROM merchant_onboarding m
             LEFT JOIN orders o ON o.merchant_id = m.merchant_id
             LEFT JOIN merchant_psps mp ON mp.merchant_id = m.merchant_id AND mp.status = 'active'
-            GROUP BY m.merchant_id, m.business_name, m.contact_email, m.mcp_shop_domain, m.kyb_status
+            GROUP BY m.merchant_id, m.business_name, m.contact_email, m.mcp_shop_domain
             ORDER BY order_count DESC
             """
         )
@@ -161,7 +160,6 @@ async def list_all_merchants(current_user: dict = Depends(require_admin)):
                     "business_name": m["business_name"],
                     "email": m["contact_email"],
                     "shop_domain": m["mcp_shop_domain"],
-                    "kyb_status": m["kyb_status"],
                     "order_count": m["order_count"],
                     "psp_count": m["psp_count"],
                     "total_revenue": float(m["total_revenue"]) if m["total_revenue"] else 0
