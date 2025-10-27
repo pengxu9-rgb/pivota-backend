@@ -2,17 +2,21 @@
 Agent API Metrics and Monitoring
 Real-time metrics from agent_usage_logs table
 """
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from db.database import database
-from utils.auth import require_admin, get_current_user
+from utils.auth import require_admin, decode_token
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
 
 
 @router.get("/summary")
-async def get_metrics_summary(request: Request, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+async def get_metrics_summary(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
+) -> Dict[str, Any]:
     """
     Get real-time API usage metrics summary
     Available to agents and admins
@@ -27,29 +31,33 @@ async def get_metrics_summary(request: Request, current_user: dict = Depends(get
         last_24h = now - timedelta(hours=24)
         last_7d = now - timedelta(days=7)
         
+        # Resolve agent_id from JWT or X-API-Key
+        agent_id = None
+        if authorization and authorization.startswith("Bearer "):
+            try:
+                payload = decode_token(authorization.split(" ")[1])
+                agent_id = payload.get("agent_id")
+            except:
+                pass
+        if not agent_id and x_api_key:
+            agent_row = await database.fetch_one(
+                "SELECT agent_id FROM agents WHERE api_key = :key LIMIT 1",
+                {"key": x_api_key}
+            )
+            if agent_row:
+                agent_id = agent_row["agent_id"]
+        if not agent_id:
+            raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
+        
         # Mock data for now
-        total_requests = 1234
-        hour_requests = 45
-        day_requests = 567
-        success_rate = 98.5
-        
-        # Mock average response time
-        avg_response_time = 250
-        
-        # Mock top endpoints
-        top_endpoints = [
-            {"endpoint": "/agent/v1/orders/create", "count": 234},
-            {"endpoint": "/agent/v1/products/search", "count": 189},
-            {"endpoint": "/agent/metrics/summary", "count": 156}
-        ]
-        
-        # Mock active agents
-        active_agents = 3
-        
-        # Mock errors
+        total_requests = 0
+        hour_requests = 0
+        day_requests = 0
+        success_rate = 100.0
+        avg_response_time = 0
+        top_endpoints = []
+        active_agents = 1
         errors = []
-        
-        agent_id = current_user.get("agent_id")
         # Orders created (last 24h) for this agent
         orders_count = await database.fetch_val(
             """SELECT COUNT(*) FROM orders 
@@ -108,13 +116,33 @@ async def get_metrics_summary(request: Request, current_user: dict = Depends(get
 
 
 @router.get("/recent")
-async def get_recent_activity(request: Request, limit: int = Query(5, ge=1, le=50), current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+async def get_recent_activity(
+    request: Request,
+    limit: int = Query(5, ge=1, le=50),
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
+) -> Dict[str, Any]:
     """
     Get recent agent activity - returns mock data for now
     """
     try:
-        # Pull from agent_usage_logs for this agent
-        agent_id = current_user.get("agent_id")
+        # Resolve agent_id from JWT or X-API-Key
+        agent_id = None
+        if authorization and authorization.startswith("Bearer "):
+            try:
+                payload = decode_token(authorization.split(" ")[1])
+                agent_id = payload.get("agent_id")
+            except:
+                pass
+        if not agent_id and x_api_key:
+            agent_row = await database.fetch_one(
+                "SELECT agent_id FROM agents WHERE api_key = :key LIMIT 1",
+                {"key": x_api_key}
+            )
+            if agent_row:
+                agent_id = agent_row["agent_id"]
+        if not agent_id:
+            raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
         rows = await database.fetch_all(
             """
             SELECT id, endpoint, method, status_code, response_time_ms, timestamp
