@@ -49,13 +49,47 @@ async def get_metrics_summary(
         if not agent_id:
             raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
         
-        # Mock data for now
-        total_requests = 0
-        hour_requests = 0
-        day_requests = 0
-        success_rate = 100.0
-        avg_response_time = 0
-        top_endpoints = []
+        # Query real data from agent_usage_logs for this agent
+        total_requests = await database.fetch_val(
+            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id",
+            {"agent_id": agent_id}
+        ) or 0
+        
+        hour_requests = await database.fetch_val(
+            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since",
+            {"agent_id": agent_id, "since": last_hour}
+        ) or 0
+        
+        day_requests = await database.fetch_val(
+            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since",
+            {"agent_id": agent_id, "since": last_24h}
+        ) or 0
+        
+        # Success rate (last 24h)
+        success_count = await database.fetch_val(
+            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since AND status_code < 400",
+            {"agent_id": agent_id, "since": last_24h}
+        ) or 0
+        success_rate = (success_count / day_requests * 100) if day_requests > 0 else 100.0
+        
+        # Average response time (last 24h)
+        avg_response_time = await database.fetch_val(
+            "SELECT AVG(response_time_ms) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since AND response_time_ms IS NOT NULL",
+            {"agent_id": agent_id, "since": last_24h}
+        ) or 0
+        
+        # Top endpoints (last 24h)
+        top_endpoint_rows = await database.fetch_all(
+            """SELECT endpoint, COUNT(*) as count 
+               FROM agent_usage_logs 
+               WHERE agent_id = :agent_id AND timestamp >= :since 
+               GROUP BY endpoint 
+               ORDER BY count DESC 
+               LIMIT 5""",
+            {"agent_id": agent_id, "since": last_24h}
+        )
+        top_endpoints = [{"endpoint": row["endpoint"], "count": row["count"]} for row in top_endpoint_rows]
+        
         active_agents = 1
         errors = []
         # Orders created (last 24h) for this agent
