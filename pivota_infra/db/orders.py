@@ -164,6 +164,12 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS psp_used VARCHAR(50);
                 """))
+            if "null value in column \"amount\"" in err or "amount" in err:
+                # Drop NOT NULL constraint on amount column (we use total instead)
+                await database.execute(text("""
+                    ALTER TABLE orders 
+                    ALTER COLUMN amount DROP NOT NULL;
+                """))
             # Retry the insert once after migration
             await database.execute(query)
             return order_id
