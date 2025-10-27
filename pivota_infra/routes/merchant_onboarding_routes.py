@@ -262,6 +262,7 @@ async def register_merchant(
         print(f"✅ Merchant created: {merchant_id}")
         
         # 2.5 创建用户登录账户
+        user_created = False
         try:
             from utils.auth import hash_password
             import secrets
@@ -270,14 +271,20 @@ async def register_merchant(
             password = merchant_data.password if merchant_data.password else secrets.token_urlsafe(12)
             password_hash = hash_password(password)
             
+            print(f"🔐 Creating user account for {merchant_data.contact_email}")
+            print(f"Password provided: {bool(merchant_data.password)}, Hash length: {len(password_hash)}")
+            
             # Check if user already exists
             existing_user = await database.fetch_one(
-                "SELECT user_id FROM users WHERE email = :email",
+                "SELECT id FROM users WHERE email = :email",
                 {"email": merchant_data.contact_email}
             )
             
-            if not existing_user:
-                await database.execute(
+            if existing_user:
+                print(f"⚠️ User already exists for {merchant_data.contact_email}, skipping user creation")
+                user_created = True  # Already exists
+            else:
+                result = await database.execute(
                     """
                     INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
                     VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
@@ -292,13 +299,21 @@ async def register_merchant(
                     }
                 )
                 print(f"✅ User account created for {merchant_data.contact_email} with merchant_id {merchant_id}")
+                print(f"Insert result: {result}")
+                user_created = True
                 
                 # Store password in response if auto-generated
                 if not merchant_data.password:
                     print(f"🔑 Auto-generated password: {password}")
         except Exception as user_err:
-            print(f"⚠️ Failed to create user account: {user_err}")
-            # Don't fail the whole registration if user creation fails
+            import traceback
+            print(f"❌ Failed to create user account: {user_err}")
+            print(f"Full traceback: {traceback.format_exc()}")
+            # IMPORTANT: Fail registration if user creation fails
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create user account: {str(user_err)}"
+            )
         
         # 3. 如果自动批准，立即更新状态为 approved
         if validation_result["approved"]:
