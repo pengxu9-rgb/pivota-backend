@@ -67,5 +67,6 @@ def format_order_for_response(order_data: dict) -> dict:
         "items": order_data.get('items', []),
         "shipping_address": order_data.get('shipping_address', {}),
         "psp_used": order_data.get('psp_used'),
+        "psp_id": order_data.get('psp_id'),  # Include psp_id for PSP metrics
         "payment_method": order_data.get('payment_method'),
     }

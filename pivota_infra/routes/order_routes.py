@@ -209,12 +209,14 @@ async def create_new_order(
         psp_type = order_request.preferred_psp
         if not psp_type:
             psp_type = merchant.get("psp_type")
+        # Also get psp_id for PSP metrics tracking
+        psp_id_value = None
         if not psp_type:
             try:
                 psp_row = await database.fetch_one(
                     """
-                    SELECT provider FROM merchant_psps
-                    WHERE merchant_id = :merchant_id
+                    SELECT provider, psp_id FROM merchant_psps
+                    WHERE merchant_id = :merchant_id AND status = 'active'
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
@@ -222,6 +224,7 @@ async def create_new_order(
                 )
                 if psp_row:
                     psp_type = psp_row["provider"]
+                    psp_id_value = psp_row["psp_id"]
             except:
                 pass
         
@@ -239,10 +242,10 @@ async def create_new_order(
             "agent_id": agent_id,  # Extract from metadata
             "agent_session_id": order_request.agent_session_id,
             "metadata": order_request.metadata or {},
-            "psp_used": psp_type,  # NEW: Record which PSP is used
+            "psp_used": psp_type,  # Record which PSP provider is used
             # Legacy fields (optional, can be null)
             "store_id": None,
-            "psp_id": None,
+            "psp_id": psp_id_value,  # Include actual PSP ID for metrics tracking
             "payment_method": None
         }
         order_id = await create_order(order_data)
