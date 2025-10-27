@@ -12,41 +12,30 @@ class FixMerchantIDRequest(BaseModel):
     email: str
     correct_merchant_id: str
 
+class MergeMerchantsRequest(BaseModel):
+    keep_merchant_id: str
+    remove_merchant_id: str
+    user_email: str
+
 @router.post("/merchant-id")
 async def fix_merchant_id(
     request: FixMerchantIDRequest,
     current_user: dict = Depends(require_admin)
 ):
     """
-    Fix merchant_id for a user account
+    Fix merchant linkage by updating merchant_onboarding
     
-    This updates both users table and merchant_onboarding table
-    to ensure the email is linked to the correct merchant_id
+    Since login queries merchant_onboarding by contact_email,
+    we need to update the correct merchant record's contact_email
     """
     try:
-        # Step 1: Update users table
-        users_query = """
-        UPDATE users
-        SET merchant_id = :new_merchant_id
-        WHERE email = :email
-        RETURNING id, email, merchant_id, role
-        """
-        
-        user_result = await database.fetch_one(users_query, {
-            "email": request.email,
-            "new_merchant_id": request.correct_merchant_id
-        })
-        
-        if not user_result:
-            raise HTTPException(status_code=404, detail=f"User {request.email} not found")
-        
-        # Step 2: Update merchant_onboarding table contact_email
-        # This is critical because login API queries merchant_onboarding by contact_email
+        # Update the target merchant's contact_email
         merchant_query = """
         UPDATE merchant_onboarding
-        SET contact_email = :email
+        SET contact_email = :email,
+            email = :email
         WHERE merchant_id = :merchant_id
-        RETURNING merchant_id, business_name, contact_email
+        RETURNING merchant_id, business_name, contact_email, mcp_shop_domain
         """
         
         merchant_result = await database.fetch_one(merchant_query, {
@@ -54,24 +43,38 @@ async def fix_merchant_id(
             "merchant_id": request.correct_merchant_id
         })
         
-        logger.info(f"✅ Updated user {request.email} to merchant_id {request.correct_merchant_id}")
-        if merchant_result:
-            logger.info(f"✅ Updated merchant_onboarding contact_email for {request.correct_merchant_id}")
+        if not merchant_result:
+            raise HTTPException(status_code=404, detail=f"Merchant {request.correct_merchant_id} not found")
+        
+        # Also update users table if merchant_id column exists
+        try:
+            users_query = """
+            UPDATE users
+            SET merchant_id = :new_merchant_id
+            WHERE email = :email
+            RETURNING id, email, merchant_id, role
+            """
+            
+            user_result = await database.fetch_one(users_query, {
+                "email": request.email,
+                "new_merchant_id": request.correct_merchant_id
+            })
+        except Exception as e:
+            logger.warning(f"Failed to update users.merchant_id (column may not exist yet): {e}")
+            user_result = None
+        
+        logger.info(f"✅ Updated merchant {request.correct_merchant_id} contact_email to {request.email}")
         
         return {
             "status": "success",
             "message": f"Updated merchant linkage for {request.email}",
-            "user": {
-                "id": user_result["id"],
-                "email": user_result["email"],
-                "merchant_id": user_result["merchant_id"],
-                "role": user_result["role"]
-            },
             "merchant": {
-                "merchant_id": merchant_result["merchant_id"] if merchant_result else None,
-                "business_name": merchant_result["business_name"] if merchant_result else None,
-                "contact_email": merchant_result["contact_email"] if merchant_result else None
-            } if merchant_result else None
+                "merchant_id": merchant_result["merchant_id"],
+                "business_name": merchant_result["business_name"],
+                "contact_email": merchant_result["contact_email"],
+                "shop_domain": merchant_result["mcp_shop_domain"]
+            },
+            "user_updated": user_result is not None
         }
         
     except HTTPException:
@@ -80,3 +83,54 @@ async def fix_merchant_id(
         logger.error(f"Failed to fix merchant_id: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to update merchant_id: {str(e)}")
 
+@router.post("/merge-merchants")
+async def merge_merchants(
+    request: MergeMerchantsRequest,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    Merge two merchant records - keep one, delete the other
+    Transfer all data to the kept merchant
+    """
+    try:
+        async with database.transaction():
+            # Update orders
+            await database.execute(
+                "UPDATE orders SET merchant_id = :keep WHERE merchant_id = :remove",
+                {"keep": request.keep_merchant_id, "remove": request.remove_merchant_id}
+            )
+            
+            # Update PSPs
+            await database.execute(
+                "UPDATE merchant_psps SET merchant_id = :keep WHERE merchant_id = :remove",
+                {"keep": request.keep_merchant_id, "remove": request.remove_merchant_id}
+            )
+            
+            # Update user
+            await database.execute(
+                "UPDATE users SET merchant_id = :keep WHERE email = :email",
+                {"keep": request.keep_merchant_id, "email": request.user_email}
+            )
+            
+            # Delete old merchant record
+            await database.execute(
+                "DELETE FROM merchant_onboarding WHERE merchant_id = :remove",
+                {"remove": request.remove_merchant_id}
+            )
+            
+            # Update kept merchant's contact_email
+            await database.execute(
+                "UPDATE merchant_onboarding SET contact_email = :email, email = :email WHERE merchant_id = :keep",
+                {"email": request.user_email, "keep": request.keep_merchant_id}
+            )
+        
+        return {
+            "status": "success",
+            "message": f"Merged {request.remove_merchant_id} into {request.keep_merchant_id}",
+            "kept_merchant": request.keep_merchant_id,
+            "removed_merchant": request.remove_merchant_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to merge merchants: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to merge: {str(e)}")
