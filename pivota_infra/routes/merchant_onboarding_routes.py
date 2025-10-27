@@ -272,7 +272,7 @@ async def register_merchant(
             
             # Check if user already exists
             existing_user = await database.fetch_one(
-                "SELECT user_id FROM users WHERE email = :email",
+                "SELECT id FROM users WHERE email = :email",
                 {"email": merchant_data.contact_email}
             )
             
@@ -340,7 +340,10 @@ async def register_merchant(
         
         return response_data
     except Exception as e:
+        import traceback
         error_msg = str(e)
+        print(f"❌ Registration error: {error_msg}")
+        print(f"Full traceback: {traceback.format_exc()}")
         
         # Handle database transaction errors
         if "transaction is aborted" in error_msg.lower():
