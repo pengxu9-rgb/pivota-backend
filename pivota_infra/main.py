@@ -72,6 +72,7 @@ from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
 from routes.admin_fix_merchant import router as admin_fix_router
 from routes.admin_cleanup import router as admin_cleanup_router
+from routes.admin_simple_fix import router as admin_simple_fix_router
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -335,7 +336,7 @@ async def startup():
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -737,8 +738,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
