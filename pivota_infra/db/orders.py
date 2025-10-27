@@ -52,6 +52,7 @@ orders = Table(
     Column("payment_intent_id", String(255), nullable=True, unique=True),
     Column("payment_method_id", String(255), nullable=True),
     Column("client_secret", String(500), nullable=True),  # Stripe 前端支付用
+    Column("psp_used", String(50), nullable=True),  # Which PSP was actually used for this order
     
     # 履约集成（Shopify/Wix）
     Column("shopify_order_id", String(255), nullable=True, unique=True),
