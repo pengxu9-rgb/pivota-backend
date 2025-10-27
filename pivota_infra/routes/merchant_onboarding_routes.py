@@ -256,6 +256,8 @@ async def register_merchant(
         
         # 2. 创建商户记录
         merchant_dict = merchant_data.dict()
+        # Remove password field as it's not in the merchant_onboarding table
+        merchant_dict.pop('password', None)
         merchant_id = await create_merchant_onboarding(merchant_dict)
         print(f"✅ Merchant created: {merchant_id}")
         
