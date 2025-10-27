@@ -1,77 +1,175 @@
-"""Admin cleanup - no auth required for quick fixes"""
-from fastapi import APIRouter
+"""Admin endpoint to cleanup test data and reset system"""
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from db.database import database
+from routes.auth_routes import require_admin
+import logging
 
-router = APIRouter()
+router = APIRouter(prefix="/admin/cleanup", tags=["Admin Cleanup"])
+logger = logging.getLogger(__name__)
 
-@router.get("/admin/cleanup-duplicates")
-async def admin_cleanup_duplicates():
-    """Admin endpoint to cleanup duplicates - no auth required for emergency fixes"""
+class CleanupRequest(BaseModel):
+    keep_merchant_id: str
+    confirm: bool = False
+
+@router.post("/remove-other-merchants")
+async def remove_other_merchants(
+    request: CleanupRequest,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    Remove all merchants except the specified one
     
-    merchant_id = "merch_6b90dc9838d5fd9c"
+    This cleans up test/mock data and keeps only the real merchant account
+    
+    Args:
+        keep_merchant_id: The merchant to keep (e.g., merch_208139f7600dbf42)
+        confirm: Must be true to execute
+    """
+    if not request.confirm:
+        return {
+            "status": "warning",
+            "message": "Set confirm=true to execute cleanup",
+            "would_delete": "All merchants except " + request.keep_merchant_id
+        }
     
     try:
-        # Get all current data first
-        all_stores_before = await database.fetch_all("SELECT store_id FROM merchant_stores WHERE merchant_id = :m", {"m": merchant_id})
-        all_psps_before = await database.fetch_all("SELECT psp_id FROM merchant_psps WHERE merchant_id = :m", {"m": merchant_id})
+        async with database.transaction():
+            # Get list of merchants to delete
+            merchants_to_delete = await database.fetch_all(
+                """
+                SELECT merchant_id, business_name, contact_email 
+                FROM merchant_onboarding 
+                WHERE merchant_id != :keep_id
+                """,
+                {"keep_id": request.keep_merchant_id}
+            )
+            
+            if not merchants_to_delete:
+                return {
+                    "status": "success",
+                    "message": "No other merchants to delete",
+                    "kept_merchant": request.keep_merchant_id
+                }
+            
+            merchant_ids_to_delete = [m["merchant_id"] for m in merchants_to_delete]
+            
+            # Delete in order (respecting foreign keys)
+            # 1. Delete orders
+            orders_deleted = await database.execute(
+                """
+                DELETE FROM orders 
+                WHERE merchant_id = ANY(:merchant_ids)
+                """,
+                {"merchant_ids": merchant_ids_to_delete}
+            )
+            
+            # 2. Delete PSP configs
+            psps_deleted = await database.execute(
+                """
+                DELETE FROM merchant_psps 
+                WHERE merchant_id = ANY(:merchant_ids)
+                """,
+                {"merchant_ids": merchant_ids_to_delete}
+            )
+            
+            # 3. Delete merchant_stores if exists
+            try:
+                await database.execute(
+                    """
+                    DELETE FROM merchant_stores 
+                    WHERE merchant_id = ANY(:merchant_ids)
+                    """,
+                    {"merchant_ids": merchant_ids_to_delete}
+                )
+            except:
+                pass  # Table may not exist
+            
+            # 4. Delete users for these merchants
+            users_deleted = await database.execute(
+                """
+                DELETE FROM users 
+                WHERE merchant_id = ANY(:merchant_ids)
+                """,
+                {"merchant_ids": merchant_ids_to_delete}
+            )
+            
+            # 5. Delete merchant_onboarding records
+            merchants_deleted = await database.execute(
+                """
+                DELETE FROM merchant_onboarding 
+                WHERE merchant_id = ANY(:merchant_ids)
+                """,
+                {"merchant_ids": merchant_ids_to_delete}
+            )
+            
+            logger.info(f"✅ Cleanup complete. Kept {request.keep_merchant_id}, deleted {len(merchants_to_delete)} merchants")
+            
+            return {
+                "status": "success",
+                "message": f"Cleanup complete. Deleted {len(merchants_to_delete)} merchants",
+                "kept_merchant": request.keep_merchant_id,
+                "deleted_merchants": [
+                    {
+                        "merchant_id": m["merchant_id"],
+                        "business_name": m["business_name"],
+                        "email": m["contact_email"]
+                    }
+                    for m in merchants_to_delete
+                ],
+                "stats": {
+                    "merchants_deleted": len(merchants_to_delete),
+                    "orders_deleted": orders_deleted,
+                    "psps_deleted": psps_deleted,
+                    "users_deleted": users_deleted
+                }
+            }
         
-        # Delete ALL stores
-        await database.execute("DELETE FROM merchant_stores WHERE merchant_id = :m", {"m": merchant_id})
-        
-        # Delete ALL PSPs  
-        await database.execute("DELETE FROM merchant_psps WHERE merchant_id = :m", {"m": merchant_id})
-        
-        # Insert clean data - Shopify
-        await database.execute("""
-            INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, status, product_count, connected_at)
-            VALUES ('store_shopify_main', :m, 'shopify', 'chydantest.myshopify.com', 'chydantest.myshopify.com', 'connected', 4, NOW())
-        """, {"m": merchant_id})
-        
-        # Insert clean data - Wix
-        await database.execute("""
-            INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, status, product_count, connected_at)
-            VALUES ('store_wix_main', :m, 'wix', 'peng652.wixsite.com/aydan-1', 'peng652.wixsite.com/aydan-1', 'connected', 0, NOW())
-        """, {"m": merchant_id})
-        
-        # Insert clean data - Stripe
-        await database.execute("""
-            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, account_id, capabilities, status, connected_at)
-            VALUES ('psp_stripe_main', :m, 'stripe', 'Stripe Account', 'acct_real', 'card,bank_transfer,alipay,wechat_pay', 'active', NOW())
-        """, {"m": merchant_id})
-        
-        # Insert clean data - Adyen
-        await database.execute("""
-            INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, account_id, capabilities, status, connected_at)
-            VALUES ('psp_adyen_main', :m, 'adyen', 'Adyen Account', 'acct_adyen', 'card,bank_transfer', 'active', NOW())
-        """, {"m": merchant_id})
-        
-        # Verify final state
-        stores_after = await database.fetch_all("SELECT store_id, platform, name FROM merchant_stores WHERE merchant_id = :m", {"m": merchant_id})
-        psps_after = await database.fetch_all("SELECT psp_id, provider, name FROM merchant_psps WHERE merchant_id = :m", {"m": merchant_id})
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+@router.get("/list-merchants")
+async def list_all_merchants(current_user: dict = Depends(require_admin)):
+    """List all merchants in the system"""
+    try:
+        merchants = await database.fetch_all(
+            """
+            SELECT 
+                m.merchant_id,
+                m.business_name,
+                m.contact_email,
+                m.mcp_shop_domain,
+                m.kyb_status,
+                COUNT(DISTINCT o.order_id) as order_count,
+                COUNT(DISTINCT mp.psp_id) as psp_count,
+                COALESCE(SUM(o.total), 0) as total_revenue
+            FROM merchant_onboarding m
+            LEFT JOIN orders o ON o.merchant_id = m.merchant_id
+            LEFT JOIN merchant_psps mp ON mp.merchant_id = m.merchant_id AND mp.status = 'active'
+            GROUP BY m.merchant_id, m.business_name, m.contact_email, m.mcp_shop_domain, m.kyb_status
+            ORDER BY order_count DESC
+            """
+        )
         
         return {
             "status": "success",
-            "message": "Cleanup completed",
-            "before": {
-                "stores": len(all_stores_before),
-                "psps": len(all_psps_before)
-            },
-            "after": {
-                "stores": [{"id": s["store_id"], "platform": s["platform"], "name": s["name"]} for s in stores_after],
-                "psps": [{"id": p["psp_id"], "provider": p["provider"], "name": p["name"]} for p in psps_after]
-            }
+            "total_merchants": len(merchants),
+            "merchants": [
+                {
+                    "merchant_id": m["merchant_id"],
+                    "business_name": m["business_name"],
+                    "email": m["contact_email"],
+                    "shop_domain": m["mcp_shop_domain"],
+                    "kyb_status": m["kyb_status"],
+                    "order_count": m["order_count"],
+                    "psp_count": m["psp_count"],
+                    "total_revenue": float(m["total_revenue"]) if m["total_revenue"] else 0
+                }
+                for m in merchants
+            ]
         }
+        
     except Exception as e:
-        import traceback
-        return {
-            "status": "error",
-            "message": str(e),
-            "traceback": traceback.format_exc()
-        }
-
-
-
-
-
-
-
+        logger.error(f"Failed to list merchants: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list merchants: {str(e)}")

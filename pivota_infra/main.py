@@ -71,6 +71,7 @@ from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
 from routes.admin_fix_merchant import router as admin_fix_router
+from routes.admin_cleanup import router as admin_cleanup_router
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -199,6 +200,7 @@ app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing
 app.include_router(psp_overview_router)  # PSP overview and metrics
 app.include_router(admin_fix_router)  # Admin fix utilities
+app.include_router(admin_cleanup_router)  # Admin cleanup utilities
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
