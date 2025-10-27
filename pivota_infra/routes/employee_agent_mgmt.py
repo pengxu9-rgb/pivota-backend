@@ -53,34 +53,18 @@ async def get_all_agents(
         
         agents = await database.fetch_all(query, params)
         
-        # If no agents in DB, return demo data
-        if not agents:
-            agents = [
-                {
-                    "agent_id": "agent_demo_001",
-                    "name": "Demo Agent",
-                    "email": "demo@agent.com",
-                    "company": "Demo Company",
-                    "api_key": "ak_demo_" + secrets.token_hex(16),
-                    "status": "active",
-                    "created_at": datetime.now() - timedelta(days=30),
-                    "last_active": datetime.now() - timedelta(hours=2),
-                    "request_count": 1250,
-                    "success_rate": 98.5,
-                    "rate_limit": 1000
-                }
-            ]
-        
-        # Format response
+        # Format response - match frontend expectations
         formatted_agents = []
         for agent in agents:
             formatted_agents.append({
                 "agent_id": agent.get("agent_id"),
-                "name": agent.get("name"),
-                "email": agent.get("email"),
+                "agent_name": agent.get("name", "Unknown Agent"),  # Frontend expects agent_name
+                "owner_email": agent.get("email"),  # Frontend expects owner_email
+                "agent_type": agent.get("agent_type", "Generic"),  # Add agent_type field
                 "company": agent.get("company"),
                 "api_key_prefix": agent.get("api_key", "")[:10] + "..." if agent.get("api_key") else None,
                 "status": agent.get("status", "active"),
+                "is_active": agent.get("status", "active") == "active",  # Frontend expects is_active boolean
                 "created_at": agent.get("created_at"),
                 "last_active": agent.get("last_active") or datetime.now() - timedelta(hours=random.randint(1, 48)),
                 "request_count": agent.get("request_count", random.randint(100, 5000)),
@@ -113,25 +97,7 @@ async def get_agent_details(
         )
         
         if not agent:
-            # Return demo agent if not found
-            if agent_id == "agent_demo_001":
-                agent = {
-                    "agent_id": "agent_demo_001",
-                    "name": "Demo Agent",
-                    "email": "demo@agent.com",
-                    "company": "Demo Company",
-                    "use_case": "E-commerce integration",
-                    "api_key": "ak_demo_" + secrets.token_hex(16),
-                    "status": "active",
-                    "created_at": datetime.now() - timedelta(days=30),
-                    "last_active": datetime.now() - timedelta(hours=2),
-                    "request_count": 1250,
-                    "success_rate": 98.5,
-                    "rate_limit": 1000,
-                    "allowed_merchants": []
-                }
-            else:
-                raise HTTPException(status_code=404, detail="Agent not found")
+            raise HTTPException(status_code=404, detail="Agent not found")
         
         # Get agent's merchant connections
         merchant_connections = await database.fetch_all(
