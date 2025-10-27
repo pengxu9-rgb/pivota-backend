@@ -39,12 +39,12 @@ ALTER_SQL = [
     UPDATE orders
     SET psp_used = CASE
         WHEN payment_intent_id LIKE 'pi_%' THEN 'stripe'
-        WHEN payment_intent_id LIKE 'chk_%' THEN 'checkout'
+        WHEN payment_intent_id LIKE 'chk_%' THEN 'checkout'  
         WHEN payment_intent_id ~ '^[A-Z0-9]+$' AND payment_intent_id NOT LIKE 'pi_%' AND payment_intent_id NOT LIKE 'chk_%' THEN 'paypal'
-        WHEN payment_status = 'paid' AND payment_intent_id IS NULL THEN 'adyen'
-        ELSE NULL
+        WHEN payment_intent_id IS NULL OR payment_intent_id = '' THEN 'adyen'
+        ELSE 'unknown'
     END
-    WHERE psp_used IS NULL AND payment_intent_id IS NOT NULL;
+    WHERE psp_used IS NULL;
     """
 ]
 
