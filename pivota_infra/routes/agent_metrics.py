@@ -12,7 +12,7 @@ router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
 
 
 @router.get("/summary")
-async def get_metrics_summary(request: Request) -> Dict[str, Any]:
+async def get_metrics_summary(request: Request, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get real-time API usage metrics summary
     Available to agents and admins
@@ -49,31 +49,34 @@ async def get_metrics_summary(request: Request) -> Dict[str, Any]:
         # Mock errors
         errors = []
         
-        # Orders created (last 24h)
+        agent_id = current_user.get("agent_id")
+        # Orders created (last 24h) for this agent
         orders_count = await database.fetch_val(
-            """SELECT COUNT(*) FROM agent_usage_logs 
-               WHERE timestamp >= :since AND endpoint LIKE '%/orders%' AND status_code < 300""",
-            {"since": last_24h}
+            """SELECT COUNT(*) FROM orders 
+               WHERE created_at >= :since 
+                 AND (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND agent_id = :agent_id""",
+            {"since": last_24h, "agent_id": agent_id}
         ) or 0
         
-        # Revenue (last 24h) - derive from orders table to avoid dependency on logs columns
+        # Revenue (last 24h) for this agent (paid only)
         revenue = await database.fetch_val(
             """SELECT COALESCE(SUM(total), 0) FROM orders 
-               WHERE created_at >= :since AND (is_deleted IS NULL OR is_deleted = FALSE)""",
-            {"since": last_24h}
+               WHERE created_at >= :since 
+                 AND (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND payment_status = 'paid'
+                 AND agent_id = :agent_id""",
+            {"since": last_24h, "agent_id": agent_id}
         ) or 0
         
         return {
             "status": "healthy",
             "timestamp": now.isoformat(),
             "overview": {
-                "total_requests": total_requests,
-                "requests_last_hour": hour_requests,
-                "requests_last_24h": day_requests,
-                "requests_last_7d": await database.fetch_val(
-                    "SELECT COUNT(*) FROM agent_usage_logs WHERE timestamp >= :since",
-                    {"since": last_7d}
-                ) or 0,
+                "total_requests": 0,
+                "requests_last_hour": 0,
+                "requests_last_24h": 0,
+                "requests_last_7d": 0,
             },
             "performance": {
                 "success_rate_24h": round(success_rate, 2),
@@ -105,32 +108,35 @@ async def get_metrics_summary(request: Request) -> Dict[str, Any]:
 
 
 @router.get("/recent")
-async def get_recent_activity(request: Request, limit: int = Query(5, ge=1, le=50)) -> Dict[str, Any]:
+async def get_recent_activity(request: Request, limit: int = Query(5, ge=1, le=50), current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get recent agent activity - returns mock data for now
     """
     try:
-        # Return mock recent activities
-        recent_activities = []
-        for i in range(limit):
-            activity_type = ["order_created", "product_search", "merchant_connected"][i % 3]
-            recent_activities.append({
-                "id": f"act_{i}",
-                "type": activity_type,
-                "timestamp": (datetime.now() - timedelta(minutes=i*10)).isoformat(),
-                "details": {
-                    "order_id": f"order_{1000+i}" if activity_type == "order_created" else None,
-                    "query": f"search query {i}" if activity_type == "product_search" else None,
-                    "merchant": f"merchant_{i}" if activity_type == "merchant_connected" else None,
-                    "status": "success"
-                }
-            })
-        
-        return {
-            "status": "success",
-            "activities": recent_activities,
-            "total": len(recent_activities)
-        }
+        # Pull from agent_usage_logs for this agent
+        agent_id = current_user.get("agent_id")
+        rows = await database.fetch_all(
+            """
+            SELECT id, endpoint, method, status_code, response_time_ms, timestamp
+            FROM agent_usage_logs
+            WHERE agent_id = :agent_id
+            ORDER BY timestamp DESC
+            LIMIT :limit
+            """,
+            {"agent_id": agent_id, "limit": limit}
+        )
+        activities = [
+            {
+                "id": str(r["id"]),
+                "method": r["method"],
+                "endpoint": r["endpoint"],
+                "status_code": r["status_code"],
+                "response_time_ms": r["response_time_ms"],
+                "timestamp": r["timestamp"].isoformat() if r["timestamp"] else None,
+            }
+            for r in rows
+        ]
+        return {"status": "success", "activities": activities, "total": len(activities)}
     except Exception as e:
         return {
             "status": "error",
