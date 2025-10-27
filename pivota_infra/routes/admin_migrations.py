@@ -36,15 +36,16 @@ ALTER_SQL = [
     """,
     """
     -- Backfill psp_used from payment_intent_id for existing orders
+    -- Force update all orders that don't have psp_used set
     UPDATE orders
     SET psp_used = CASE
         WHEN payment_intent_id LIKE 'pi_%' THEN 'stripe'
         WHEN payment_intent_id LIKE 'chk_%' THEN 'checkout'  
-        WHEN payment_intent_id ~ '^[A-Z0-9]+$' AND payment_intent_id NOT LIKE 'pi_%' AND payment_intent_id NOT LIKE 'chk_%' THEN 'paypal'
+        WHEN payment_intent_id ~ '^[A-Z0-9]+$' AND LENGTH(payment_intent_id) > 10 AND payment_intent_id NOT LIKE 'pi_%' AND payment_intent_id NOT LIKE 'chk_%' THEN 'paypal'
         WHEN payment_intent_id IS NULL OR payment_intent_id = '' THEN 'adyen'
-        ELSE 'unknown'
+        ELSE 'adyen'
     END
-    WHERE psp_used IS NULL;
+    WHERE psp_used IS NULL OR psp_used = '';
     """
 ]
 
