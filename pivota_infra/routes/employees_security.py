@@ -2,6 +2,7 @@
 Employees Management and Security Routes
 """
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
 from utils.auth import get_current_user
@@ -83,12 +84,15 @@ async def get_all_employees(
         print(f"Error getting employees: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get employees: {str(e)}")
 
+class CreateEmployeeRequest(BaseModel):
+    name: str
+    email: str
+    role: str
+    department: Optional[str] = None
+
 @router.post("/employees/create")
 async def create_employee(
-    name: str,
-    email: str,
-    role: str,
-    department: Optional[str] = None,
+    request: CreateEmployeeRequest,
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new employee"""
@@ -97,13 +101,13 @@ async def create_employee(
     
     try:
         # Validate role
-        valid_roles = ["employee", "admin", "manager"]
-        if role not in valid_roles:
+        valid_roles = ["employee", "admin", "manager", "super_admin", "outsourced"]
+        if request.role not in valid_roles:
             raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}")
         
         # Check if employee exists
         check_query = "SELECT employee_id FROM employees WHERE email = :email"
-        existing = await database.fetch_one(check_query, {"email": email})
+        existing = await database.fetch_one(check_query, {"email": request.email})
         
         if existing:
             raise HTTPException(status_code=400, detail="Employee with this email already exists")
@@ -122,10 +126,10 @@ async def create_employee(
         
         await database.execute(insert_query, {
             "employee_id": employee_id,
-            "name": name,
-            "email": email,
-            "role": role,
-            "department": department,
+            "name": request.name,
+            "email": request.email,
+            "role": request.role,
+            "department": request.department,
             "status": "active",
             "created_at": datetime.now()
         })
