@@ -9,8 +9,22 @@ from utils.auth import get_current_user
 from db.database import database
 import uuid
 import secrets
+import hashlib
+import string
+import random
 
 router = APIRouter()
+
+# Helper functions for password management
+def generate_temp_password(length: int = 12) -> str:
+    """Generate a secure temporary password"""
+    chars = string.ascii_letters + string.digits + "!@#$%"
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def hash_password(password: str) -> str:
+    """Hash password using SHA256"""
+    salt = "pivota_employee_salt_v1"
+    return hashlib.sha256(f"{password}{salt}".encode()).hexdigest()
 
 # ============== Employees Management ==============
 
@@ -29,6 +43,7 @@ async def get_all_employees(
                 employee_id VARCHAR(50) PRIMARY KEY,
                 name VARCHAR(100) NOT NULL,
                 email VARCHAR(100) UNIQUE NOT NULL,
+                password VARCHAR(255),
                 role VARCHAR(50) NOT NULL,
                 department VARCHAR(100),
                 status VARCHAR(20) DEFAULT 'active',
@@ -112,15 +127,17 @@ async def create_employee(
         if existing:
             raise HTTPException(status_code=400, detail="Employee with this email already exists")
         
-        # Generate employee ID
+        # Generate employee ID and temporary password
         employee_id = f"emp_{uuid.uuid4().hex[:8]}"
+        temp_password = generate_temp_password()
+        hashed_password = hash_password(temp_password)
         
-        # Insert employee
+        # Insert employee with password
         insert_query = """
             INSERT INTO employees (
-                employee_id, name, email, role, department, status, created_at
+                employee_id, name, email, password, role, department, status, created_at
             ) VALUES (
-                :employee_id, :name, :email, :role, :department, :status, :created_at
+                :employee_id, :name, :email, :password, :role, :department, :status, :created_at
             )
         """
         
@@ -128,6 +145,7 @@ async def create_employee(
             "employee_id": employee_id,
             "name": request.name,
             "email": request.email,
+            "password": hashed_password,
             "role": request.role,
             "department": request.department,
             "status": "active",
@@ -137,7 +155,9 @@ async def create_employee(
         return {
             "status": "success",
             "message": "Employee created successfully",
-            "employee_id": employee_id
+            "employee_id": employee_id,
+            "temporary_password": temp_password,
+            "note": "Please share this temporary password with the employee. They should change it on first login."
         }
     
     except HTTPException:
