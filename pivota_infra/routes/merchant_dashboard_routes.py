@@ -256,18 +256,13 @@ async def get_merchant_psps(
         transaction_count = 0
         
         try:
-            # Get metrics from real orders - grouped by PSP (all time, merchant-scoped, paid only, exclude deleted, net of refunds)
+            # Get metrics from real orders - grouped by PSP (simplified: just filter deleted, keep original payment_status logic)
             metrics_query = """
                 SELECT 
                     psp_id,
                     COUNT(*) as total_orders,
-                    SUM(CASE WHEN payment_status IN ('paid', 'captured', 'succeeded') THEN 1 ELSE 0 END) as successful_orders,
-                    COALESCE(SUM(CASE 
-                        WHEN payment_status IN ('paid', 'captured', 'succeeded') 
-                        THEN total ELSE 0 END), 0) as total_volume,
-                    COALESCE(SUM(CASE 
-                        WHEN payment_status IN ('paid', 'captured', 'succeeded') 
-                        THEN COALESCE(refund_total, 0) ELSE 0 END), 0) as total_refunds
+                    SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) as successful_orders,
+                    COALESCE(SUM(total), 0) as total_volume
                 FROM orders
                 WHERE merchant_id = :merchant_id 
                 AND psp_id IS NOT NULL
@@ -281,11 +276,10 @@ async def get_merchant_psps(
             # Create a map of PSP metrics
             psp_stats = {}
             for metric in psp_metrics:
-                net_volume = float(metric["total_volume"] or 0) - float(metric["total_refunds"] or 0)
                 psp_stats[metric["psp_id"]] = {
                     "total_orders": metric["total_orders"] or 0,
                     "successful_orders": metric["successful_orders"] or 0,
-                    "total_volume": net_volume,
+                    "total_volume": float(metric["total_volume"] or 0),
                     "success_rate": round((metric["successful_orders"] / metric["total_orders"] * 100), 1) if metric["total_orders"] > 0 else 0
                 }
         except Exception as e:
