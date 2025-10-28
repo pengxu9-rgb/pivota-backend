@@ -81,6 +81,7 @@ from routes.admin_cleanup_stores import router as admin_cleanup_stores_router
 from routes.admin_create_test_orders import router as admin_create_test_orders_router
 from routes.debug_current_user import router as debug_current_user_router
 from routes.admin_bind_wix import router as admin_bind_wix_router
+from routes.public_test_orders import router as public_test_orders_router
 from routes.admin_sql_quick import router as admin_sql_router
 from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
@@ -224,6 +225,7 @@ app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
 app.include_router(admin_create_test_orders_router)  # Admin create test orders
 app.include_router(debug_current_user_router)  # Debug current user info
 app.include_router(admin_bind_wix_router)  # Admin bind Wix store
+app.include_router(public_test_orders_router)  # Public test orders generation
 app.include_router(admin_sql_router)  # Admin SQL
 app.include_router(admin_agents_debug_router)  # Admin agents debug
 app.include_router(agent_health_router)  # Agent health check
