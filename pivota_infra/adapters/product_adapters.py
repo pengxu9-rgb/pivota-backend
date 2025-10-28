@@ -232,24 +232,44 @@ class WixProductAdapter:
                 
                 standard_products = []
                 for wp in wix_products:
-                    price_data = wp.get("priceData", {})
-                    media = wp.get("media", {}).get("items", [])
-                    
-                    standard_products.append(StandardProduct(
-                        id=wp.get("id", ""),
-                        title=wp.get("name", "Unnamed Product"),
-                        description=wp.get("description", ""),
-                        price=float(price_data.get("price", 0)),
-                        currency=price_data.get("currency", "USD"),
-                        inventory_quantity=wp.get("stock", {}).get("quantity", 0) or 0,
-                        sku=wp.get("sku", ""),
-                        image_url=media[0].get("image", {}).get("url") if media else None,
-                        platform="wix",
-                        merchant_id=merchant_id,
-                        status=ProductStatus.ACTIVE,
-                        created_at=wp.get("dateCreated"),
-                        updated_at=wp.get("lastUpdated")
-                    ))
+                    try:
+                        price_data = wp.get("priceData") if wp else {}
+                        if not price_data:
+                            price_data = {}
+                        
+                        media_items = []
+                        if wp and wp.get("media"):
+                            media_items = wp.get("media", {}).get("items", [])
+                        
+                        image_url = None
+                        if media_items and len(media_items) > 0:
+                            image_obj = media_items[0].get("image") if media_items[0] else None
+                            if image_obj:
+                                image_url = image_obj.get("url")
+                        
+                        stock_data = wp.get("stock") if wp else {}
+                        inventory = 0
+                        if stock_data:
+                            inventory = stock_data.get("quantity", 0) or 0
+                        
+                        standard_products.append(StandardProduct(
+                            id=str(wp.get("id", "")),
+                            title=str(wp.get("name", "Unnamed Product")),
+                            description=str(wp.get("description", "")),
+                            price=float(price_data.get("price", 0)),
+                            currency=str(price_data.get("currency", "USD")),
+                            inventory_quantity=int(inventory),
+                            sku=str(wp.get("sku", "")),
+                            image_url=image_url,
+                            platform="wix",
+                            merchant_id=merchant_id,
+                            status=ProductStatus.ACTIVE,
+                            created_at=wp.get("dateCreated"),
+                            updated_at=wp.get("lastUpdated")
+                        ))
+                    except Exception as product_error:
+                        logger.error(f"Error converting Wix product: {product_error}")
+                        continue
                 
                 return standard_products, None, None
                 

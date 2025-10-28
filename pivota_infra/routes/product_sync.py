@@ -113,18 +113,29 @@ async def sync_products(
         
         elif platform == "wix":
             # Get Wix credentials from merchant_stores
-            if not store or not store.get("api_key") or not store.get("domain"):
+            if not store:
                 raise HTTPException(
                     status_code=400,
-                    detail="Wix credentials not found. Please reconnect Wix."
+                    detail="Wix store not found in merchant_stores. Please reconnect Wix."
+                )
+            
+            api_key = store.get("api_key")
+            domain = store.get("domain")
+            
+            logger.info(f"🔍 Wix store data: domain={domain}, has_api_key={bool(api_key)}")
+            
+            if not api_key or not domain:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Wix credentials incomplete. api_key={bool(api_key)}, domain={bool(domain)}"
                 )
             
             credentials = {
-                "site_id": store["domain"],  # domain stores the Wix site_id
-                "api_key": store["api_key"]
+                "site_id": domain,
+                "api_key": api_key
             }
             
-            logger.info(f"product_sync wix merchant_id={request.merchant_id} site_id={store['domain']} has_key={bool(store.get('api_key'))}")
+            logger.info(f"product_sync wix merchant_id={request.merchant_id} site_id={domain}")
         
         elif platform == "woocommerce":
             raise HTTPException(status_code=501, detail="WooCommerce sync not yet implemented")
