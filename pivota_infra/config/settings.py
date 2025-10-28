@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # Shopify
     shopify_access_token: Optional[str] = os.getenv("SHOPIFY_ACCESS_TOKEN")
     shopify_store_url: Optional[str] = os.getenv("SHOPIFY_STORE_URL")
+    shopify_client_id: Optional[str] = os.getenv("SHOPIFY_CLIENT_ID")
+    shopify_client_secret: Optional[str] = os.getenv("SHOPIFY_CLIENT_SECRET")
+    shopify_redirect_uri: Optional[str] = os.getenv("SHOPIFY_REDIRECT_URI")
+    shopify_scopes: str = os.getenv("SHOPIFY_SCOPES", "read_products")
     
     # Wix
     wix_api_key: Optional[str] = os.getenv("WIX_API_KEY")
@@ -41,6 +45,12 @@ class Settings(BaseSettings):
     checkout_mode: str = os.getenv("CHECKOUT_MODE", "mock")  # mock | real
     checkout_success_url: str = os.getenv("CHECKOUT_SUCCESS_URL", "https://agents.pivota.cc/checkout/success")
     checkout_cancel_url: str = os.getenv("CHECKOUT_CANCEL_URL", "https://agents.pivota.cc/checkout/cancel")
+    
+    # Metrics feature flag
+    metrics_query_version: str = os.getenv("METRICS_QUERY_VERSION", "legacy")  # legacy | new
+
+    # Nightly backfill guard
+    enable_nightly_psp_id_backfill: bool = os.getenv("ENABLE_NIGHTLY_PSP_ID_BACKFILL", "false").lower() == "true"
     
     # JWT
     jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "your-super-secret-key")

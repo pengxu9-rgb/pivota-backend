@@ -7,17 +7,21 @@ Note: This is a minimal viable integration using PAT (Admin API access token).
 In production prefer OAuth per merchant and encrypt credentials.
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import httpx
 import os
 from datetime import datetime
 import logging
+import hmac
+import hashlib
+from urllib.parse import urlencode, quote, urlparse, parse_qsl
 
 from db.merchant_onboarding import merchant_onboarding
 from db.database import database
 from config.settings import settings
+from utils.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +37,12 @@ class ShopifyConnectRequest(BaseModel):
     access_token: Optional[str] = None  # optional, fallback to env
 
 
-@router.post("/connect")
-async def connect_shopify(req: ShopifyConnectRequest) -> Dict[str, Any]:
+@router.post("/connect-legacy")
+async def connect_shopify_legacy(req: ShopifyConnectRequest) -> Dict[str, Any]:
+    """
+    DEPRECATED: Use /integrations/shopify/connect from merchant_store_connections.py instead.
+    This endpoint is kept for backwards compatibility but should not be used.
+    """
     # Resolve credentials
     # Accept multiple env var names for flexibility
     shop_domain = (
@@ -100,24 +108,77 @@ async def connect_shopify(req: ShopifyConnectRequest) -> Dict[str, Any]:
 # 请使用 GET /products/{merchant_id} 实时获取产品（带缓存）
 
 
-# -------- OAuth (minimal) --------
-from urllib.parse import urlencode
+def _generate_state(merchant_id: str) -> str:
+    """Generate HMAC-signed state token merchant_id:ts:signature"""
+    ts = str(int(datetime.utcnow().timestamp()))
+    secret = (settings.shopify_client_secret or os.getenv("SHOPIFY_CLIENT_SECRET") or "").encode()
+    base = f"{merchant_id}:{ts}".encode()
+    sig = hmac.new(secret, base, hashlib.sha256).hexdigest()
+    return f"{merchant_id}:{ts}:{sig}"
+
+
+def _verify_state(state: str, max_age_seconds: int = 600) -> Optional[str]:
+    try:
+        merchant_id, ts_str, sig = state.split(":", 2)
+        secret = (settings.shopify_client_secret or os.getenv("SHOPIFY_CLIENT_SECRET") or "").encode()
+        base = f"{merchant_id}:{ts_str}".encode()
+        expected = hmac.new(secret, base, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return None
+        ts = int(ts_str)
+        now = int(datetime.utcnow().timestamp())
+        if now - ts > max_age_seconds:
+            return None
+        return merchant_id
+    except Exception:
+        return None
+
+
+def _verify_shopify_hmac(query_string: str) -> bool:
+    """
+    Verify Shopify callback HMAC per docs.
+    Expects raw query string; removes hmac param; sorts key=value; join with '&'; HMAC-SHA256 with client secret.
+    """
+    try:
+        params = dict(parse_qsl(query_string, keep_blank_values=True))
+        hmac_param = params.pop("hmac", None)
+        if not hmac_param:
+            return False
+        # Build message
+        message = "&".join(
+            f"{k}={v}" for k, v in sorted(params.items(), key=lambda i: i[0])
+        )
+        secret = (settings.shopify_client_secret or os.getenv("SHOPIFY_CLIENT_SECRET") or "").encode()
+        digest = hmac.new(secret, message.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(digest, hmac_param)
+    except Exception:
+        return False
+
 
 @router.get("/oauth/start")
-async def oauth_start(merchant_id: str, shop: str) -> Dict[str, Any]:
-    client_id = os.getenv("SHOPIFY_CLIENT_ID") or getattr(settings, "shopify_client_id", None)
-    redirect_uri = os.getenv("SHOPIFY_REDIRECT_URI") or getattr(settings, "shopify_redirect_uri", None)
+async def oauth_start(merchant_id: str, shop: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    # RBAC: allow merchant/employee/admin; if merchant, must match merchant_id
+    if current_user["role"] not in ["merchant", "employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user["role"] == "merchant" and current_user.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=403, detail="Can only initiate OAuth for your own merchant_id")
+
+    client_id = settings.shopify_client_id or os.getenv("SHOPIFY_CLIENT_ID")
+    redirect_uri = settings.shopify_redirect_uri or os.getenv("SHOPIFY_REDIRECT_URI")
     if not client_id or not redirect_uri:
         raise HTTPException(status_code=400, detail="Missing SHOPIFY_CLIENT_ID/SHOPIFY_REDIRECT_URI")
-    scopes = os.getenv("SHOPIFY_SCOPES", "read_products,write_products,read_orders,write_orders,write_webhooks")
+    scopes = settings.shopify_scopes or os.getenv("SHOPIFY_SCOPES", "read_products")
+
+    state = _generate_state(merchant_id)
     params = {
         "client_id": client_id,
         "scope": scopes,
         "redirect_uri": redirect_uri,
-        "state": merchant_id,
+        "state": state,
     }
     auth_url = f"https://{shop}/admin/oauth/authorize?{urlencode(params)}"
-    return {"authorize": auth_url}
+    logger.info(f"shopify_oauth_start merchant_id={merchant_id} shop={shop} scopes={scopes}")
+    return {"authorize": auth_url, "state": state}
 
 
 @router.get("/oauth/callback")
@@ -131,10 +192,18 @@ async def oauth_callback(request: Request) -> Dict[str, Any]:
     if not (shop and code and state and hmac_val):
         raise HTTPException(status_code=400, detail="Missing shop/code/state/hmac")
 
-    # TODO: verify HMAC (requires app secret)
-    client_id = os.getenv("SHOPIFY_CLIENT_ID") or getattr(settings, "shopify_client_id", None)
-    client_secret = os.getenv("SHOPIFY_CLIENT_SECRET") or getattr(settings, "shopify_client_secret", None)
-    redirect_uri = os.getenv("SHOPIFY_REDIRECT_URI") or getattr(settings, "shopify_redirect_uri", None)
+    # Verify HMAC and state
+    raw_qs = urlparse(str(request.url)).query
+    if not _verify_shopify_hmac(raw_qs):
+        raise HTTPException(status_code=400, detail="Invalid HMAC")
+
+    merchant_id_from_state = _verify_state(state)
+    if not merchant_id_from_state:
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
+
+    client_id = settings.shopify_client_id or os.getenv("SHOPIFY_CLIENT_ID")
+    client_secret = settings.shopify_client_secret or os.getenv("SHOPIFY_CLIENT_SECRET")
+    redirect_uri = settings.shopify_redirect_uri or os.getenv("SHOPIFY_REDIRECT_URI")
     if not (client_id and client_secret and redirect_uri):
         raise HTTPException(status_code=400, detail="Missing client credentials")
 
@@ -155,11 +224,12 @@ async def oauth_callback(request: Request) -> Dict[str, Any]:
     # Persist to merchant
     upd = (
         merchant_onboarding.update()
-        .where(merchant_onboarding.c.merchant_id == state)
+        .where(merchant_onboarding.c.merchant_id == merchant_id_from_state)
         .values(mcp_connected=True, mcp_platform="shopify", mcp_shop_domain=shop, mcp_access_token=access_token)
     )
     await database.execute(upd)
 
-    return {"status": "success", "merchant_id": state, "shop": shop}
+    logger.info(f"shopify_oauth_success merchant_id={merchant_id_from_state} shop={shop}")
+    return {"status": "success", "merchant_id": merchant_id_from_state, "shop": shop}
 
 

@@ -41,11 +41,12 @@ class SyncProductsRequest(BaseModel):
 
 # ============== Store Connections ==============
 
-@router.post("/integrations/shopify/connect")
-async def connect_shopify_store(
+@router.post("/integrations/shopify/connect-employee")
+async def connect_shopify_store_employee(
     request: ConnectShopifyRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    """Employee-only version. Merchants should use /integrations/shopify/connect from merchant_store_connections.py"""
     """Connect Shopify store for a merchant (Employee action)"""
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -180,11 +181,12 @@ async def connect_shopify_store(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to connect Shopify: {str(e)}")
 
-@router.post("/integrations/wix/connect")
-async def connect_wix_store(
+@router.post("/integrations/wix/connect-employee")
+async def connect_wix_store_employee(
     request: ConnectWixRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    """Employee-only version. Merchants should use /integrations/wix/connect from merchant_store_connections.py"""
     """Connect Wix store for a merchant (Employee action)"""
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")

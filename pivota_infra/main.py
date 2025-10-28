@@ -63,6 +63,7 @@ from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
+from routes.merchant_integrations import router as merchant_integrations_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.debug_psp_insert import router as debug_psp_router
 from routes.debug_psp_validation import router as debug_psp_validation_router
@@ -837,10 +838,15 @@ async def config_check():
             "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
             "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
             "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
+            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
+            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
+            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
             "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
             "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
+            "metrics_query_version": settings.metrics_query_version,
+            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
         },
-        "instructions": "If any values show '❌ NOT SET', add them in Render Environment Variables and redeploy"
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
     }
 
 if __name__ == "__main__":

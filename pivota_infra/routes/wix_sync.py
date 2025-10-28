@@ -95,8 +95,8 @@ async def sync_wix_products(
         print(f"Error syncing Wix products: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
 
-@router.post("/integrations/wix/connect")
-async def connect_wix_store(
+@router.post("/integrations/wix/connect-sync")
+async def connect_wix_store_sync(
     merchant_id: str,
     api_key: str,
     site_id: str,
