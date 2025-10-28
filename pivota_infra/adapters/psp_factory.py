@@ -5,7 +5,7 @@ Creates appropriate payment adapter based on PSP type
 import logging
 from typing import Dict, Any, Optional
 from .base_psp_adapter import BasePSPAdapter
-from .stripe_adapter import StripeAdapter
+# Don't import stripe_adapter - it uses different structure
 from .square_adapter import SquareAdapter
 from .mollie_adapter import MollieAdapter
 from .braintree_adapter import BraintreeAdapter
@@ -16,9 +16,8 @@ logger = logging.getLogger(__name__)
 class PSPFactory:
     """Factory for creating PSP adapters"""
     
-    # Supported PSP types
+    # Supported PSP types (only new ones, not touching existing Stripe/Adyen/PayPal/Checkout)
     PSP_ADAPTERS = {
-        'stripe': StripeAdapter,
         'square': SquareAdapter,
         'mollie': MollieAdapter,
         'braintree': BraintreeAdapter
