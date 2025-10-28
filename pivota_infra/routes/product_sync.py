@@ -56,25 +56,47 @@ async def sync_products(
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
         
-        # 2. Check if merchant has MCP connected
-        if not merchant.get("mcp_connected"):
+        # 2. Check merchant_stores table first (new way)
+        store_query = """
+            SELECT platform, domain, api_key, status 
+            FROM merchant_stores 
+            WHERE merchant_id = :merchant_id AND status = 'active'
+            ORDER BY connected_at DESC
+            LIMIT 1
+        """
+        store = await database.fetch_one(store_query, {"merchant_id": request.merchant_id})
+        
+        # 3. Determine platform and credentials
+        if store:
+            # Use merchant_stores (new way - supports Wix, Shopify, etc.)
+            platform = store["platform"]
+            logger.info(f"🔄 Found store in merchant_stores: platform={platform}")
+        elif merchant.get("mcp_connected"):
+            # Fallback to merchant_onboarding (old way - legacy Shopify only)
+            platform = merchant.get("mcp_platform")
+            logger.info(f"🔄 Using legacy MCP: platform={platform}")
+        else:
             raise HTTPException(
                 status_code=400,
-                detail="Merchant has not connected to any e-commerce platform. Please connect first."
+                detail="No store connected. Please connect your store first in Integrations."
             )
         
-        platform = merchant.get("mcp_platform")
         if not platform:
-            raise HTTPException(status_code=400, detail="MCP platform not specified")
+            raise HTTPException(status_code=400, detail="Platform not specified")
         
         logger.info(f"🔄 Starting product sync for merchant {request.merchant_id} on platform {platform}")
         
-        # 3. Get platform credentials
+        # 4. Get platform credentials
         credentials = {}
         
         if platform == "shopify":
-            shop_domain = merchant.get("mcp_shop_domain")
-            access_token = merchant.get("mcp_access_token")
+            # Try merchant_stores first, then fallback to merchant_onboarding
+            if store:
+                shop_domain = store["domain"]
+                access_token = store["api_key"]
+            else:
+                shop_domain = merchant.get("mcp_shop_domain")
+                access_token = merchant.get("mcp_access_token")
             
             logger.info(f"product_sync shopify merchant_id={request.merchant_id} shop_domain={shop_domain} has_token={bool(access_token)}")
             
@@ -90,7 +112,19 @@ async def sync_products(
             }
         
         elif platform == "wix":
-            raise HTTPException(status_code=501, detail="Wix sync not yet implemented")
+            # Get Wix credentials from merchant_stores
+            if not store or not store.get("api_key") or not store.get("domain"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Wix credentials not found. Please reconnect Wix."
+                )
+            
+            credentials = {
+                "site_id": store["domain"],  # domain stores the Wix site_id
+                "api_key": store["api_key"]
+            }
+            
+            logger.info(f"product_sync wix merchant_id={request.merchant_id} site_id={store['domain']} has_key={bool(store.get('api_key'))}")
         
         elif platform == "woocommerce":
             raise HTTPException(status_code=501, detail="WooCommerce sync not yet implemented")
