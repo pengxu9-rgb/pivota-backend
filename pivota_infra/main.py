@@ -63,7 +63,6 @@ from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
-from routes.merchant_integrations import router as merchant_integrations_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.debug_psp_insert import router as debug_psp_router
 from routes.debug_psp_validation import router as debug_psp_validation_router
