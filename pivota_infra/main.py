@@ -63,6 +63,7 @@ from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
+from routes.merchant_integrations import router as merchant_integrations_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.debug_psp_insert import router as debug_psp_router
 from routes.debug_psp_validation import router as debug_psp_validation_router
@@ -71,6 +72,7 @@ from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
 from routes.admin_fix_merchant import router as admin_fix_router
+from routes.admin_fix_psp_id import router as admin_fix_psp_id_router
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.admin_simple_fix import router as admin_simple_fix_router
 from routes.admin_cleanup_rebuild import router as admin_cleanup_rebuild_router
@@ -202,10 +204,12 @@ app.include_router(employee_missing_router)  # Missing employee endpoints
 app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
 app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
 app.include_router(emp_agent_mgmt_router)  # Employee agent management
+app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing
 app.include_router(psp_overview_router)  # PSP overview and metrics
 app.include_router(admin_fix_router)  # Admin fix utilities
+app.include_router(admin_fix_psp_id_router)  # Admin fix PSP ID
 app.include_router(admin_cleanup_router)  # Admin cleanup utilities
 app.include_router(admin_simple_fix_router)  # Admin simple fix
 app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
