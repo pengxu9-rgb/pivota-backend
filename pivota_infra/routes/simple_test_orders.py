@@ -25,10 +25,10 @@ async def create_simple_test_orders(merchant_id: str, count: int = 5):
             await database.execute(
                 """INSERT INTO orders (
                     order_id, merchant_id, customer_name, customer_email,
-                    total, currency, payment_status, psp_id, psp_used,
+                    total, currency, payment_status, psp_id, psp_used, status,
                     created_at, updated_at, is_deleted
                 ) VALUES (
-                    :oid, :mid, :name, :email, :total, 'USD', :status, :psp, :psp,
+                    :oid, :mid, :name, :email, :total, 'USD', :pstatus, :psp, :psp, 'completed',
                     :created, :created, FALSE
                 )""",
                 {
@@ -37,7 +37,7 @@ async def create_simple_test_orders(merchant_id: str, count: int = 5):
                     "name": f"Customer {i+1}",
                     "email": f"customer{i+1}@example.com",
                     "total": total,
-                    "status": status,
+                    "pstatus": status,
                     "psp": psp,
                     "created": order_date
                 }
