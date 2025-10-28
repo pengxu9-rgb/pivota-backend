@@ -379,6 +379,17 @@ async def startup():
         await database.execute("SELECT 1")
         logger.info("✅ Database connection test passed")
         
+        # Run automatic migrations
+        try:
+            # Add password column to employees table if not exists
+            await database.execute("""
+                ALTER TABLE employees 
+                ADD COLUMN IF NOT EXISTS password VARCHAR(255)
+            """)
+            logger.info("✅ Migration: password column added to employees table")
+        except Exception as migration_error:
+            logger.warning(f"Migration warning: {migration_error}")
+        
         # Create tables if they don't exist
         logger.info("📋 Creating tables...")
         from db.merchants import merchants, kyb_documents
