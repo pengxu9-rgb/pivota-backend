@@ -78,6 +78,7 @@ from routes.admin_cleanup import router as admin_cleanup_router
 from routes.admin_simple_fix import router as admin_simple_fix_router
 from routes.admin_cleanup_rebuild import router as admin_cleanup_rebuild_router
 from routes.admin_cleanup_stores import router as admin_cleanup_stores_router
+from routes.admin_create_test_orders import router as admin_create_test_orders_router
 from routes.admin_sql_quick import router as admin_sql_router
 from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
@@ -218,6 +219,7 @@ app.include_router(admin_cleanup_router)  # Admin cleanup utilities
 app.include_router(admin_simple_fix_router)  # Admin simple fix
 app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
+app.include_router(admin_create_test_orders_router)  # Admin create test orders
 app.include_router(admin_sql_router)  # Admin SQL
 app.include_router(admin_agents_debug_router)  # Admin agents debug
 app.include_router(agent_health_router)  # Agent health check
@@ -357,7 +359,7 @@ async def startup():
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -759,8 +761,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
