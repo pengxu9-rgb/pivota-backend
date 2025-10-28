@@ -441,23 +441,23 @@ async def get_merchant_analytics(
         analytics_query = """
             SELECT 
                 COUNT(*) as total_orders,
-                COALESCE(SUM(amount), 0) as total_revenue,
-                COALESCE(AVG(amount), 0) as avg_order_value,
+                COALESCE(SUM(total), 0) as total_revenue,
+                COALESCE(AVG(total), 0) as avg_order_value,
                 COUNT(DISTINCT customer_email) as total_customers,
-                SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_orders,
+                SUM(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 ELSE 0 END) as successful_orders,
                 SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
-                SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN amount ELSE 0 END) as revenue_last_30_days
+                SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END) as revenue_last_30_days
             FROM orders
-            WHERE merchant_id = :merchant_id
+            WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
         """
         
         analytics = await database.fetch_one(analytics_query, {"merchant_id": merchant_id})
         
         # Get recent orders
         recent_orders_query = """
-            SELECT order_id, amount, status, customer_name, created_at
+            SELECT order_id, total as amount, status, customer_name, created_at
             FROM orders
-            WHERE merchant_id = :merchant_id
+            WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
             ORDER BY created_at DESC
             LIMIT 5
         """
@@ -479,9 +479,9 @@ async def get_merchant_analytics(
                 COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days' 
                           AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as orders_prev_30,
                 SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days' 
-                        AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN amount ELSE 0 END) as revenue_prev_30
+                        AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END) as revenue_prev_30
             FROM orders
-            WHERE merchant_id = :merchant_id
+            WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
         """
         growth = await database.fetch_one(growth_query, {"merchant_id": merchant_id})
         
@@ -506,10 +506,10 @@ async def get_merchant_analytics(
             "conversion_rate": round((analytics["successful_orders"] / analytics["total_orders"] * 100), 1) if analytics and analytics["total_orders"] > 0 else 0
         }
         
-        # Get connected stores count
-        stores_query = "SELECT COUNT(*) as count FROM merchant_stores WHERE merchant_id = :merchant_id"
-        stores_count = await database.fetch_one(stores_query, {"merchant_id": merchant_id})
-        data["total_products"] = (stores_count["count"] * 25) if stores_count else 0  # Estimate 25 products per store
+        # Get actual product count from products_cache
+        products_query = "SELECT COUNT(*) as count FROM products_cache WHERE merchant_id = :merchant_id"
+        products_count = await database.fetch_one(products_query, {"merchant_id": merchant_id})
+        data["total_products"] = products_count["count"] if products_count else 0
         
         return {
             "status": "success",
