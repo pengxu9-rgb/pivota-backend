@@ -194,7 +194,7 @@ class ShopifyProductAdapter:
 
 
 class WixProductAdapter:
-    """Wix 产品适配器：Wix API → StandardProduct（待实现）"""
+    """Wix 产品适配器：Wix API → StandardProduct"""
     
     @staticmethod
     async def fetch_products(
@@ -204,9 +204,59 @@ class WixProductAdapter:
         limit: int = 50
     ) -> Tuple[List[StandardProduct], Optional[str], Optional[str]]:
         """实时从 Wix 拉取产品"""
-        # TODO: 实现 Wix API 调用
-        logger.warning("Wix adapter not yet implemented")
-        return [], None, "Wix adapter not yet implemented"
+        import httpx
+        
+        try:
+            logger.info(f"🔄 Fetching Wix products: site_id={site_id}")
+            
+            url = "https://www.wixapis.com/stores/v1/products/query"
+            headers = {
+                "Authorization": api_key,
+                "wix-site-id": site_id,
+                "Content-Type": "application/json"
+            }
+            
+            payload = {"query": {"paging": {"limit": min(limit, 100)}}}
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, json=payload, headers=headers)
+                
+                if response.status_code != 200:
+                    error_msg = f"Wix API error: {response.status_code}"
+                    logger.error(error_msg)
+                    return [], None, error_msg
+                
+                data = response.json()
+                wix_products = data.get("products", [])
+                logger.info(f"✅ Fetched {len(wix_products)} products from Wix")
+                
+                standard_products = []
+                for wp in wix_products:
+                    price_data = wp.get("priceData", {})
+                    media = wp.get("media", {}).get("items", [])
+                    
+                    standard_products.append(StandardProduct(
+                        id=wp.get("id", ""),
+                        title=wp.get("name", "Unnamed Product"),
+                        description=wp.get("description", ""),
+                        price=float(price_data.get("price", 0)),
+                        currency=price_data.get("currency", "USD"),
+                        inventory_quantity=wp.get("stock", {}).get("quantity", 0) or 0,
+                        sku=wp.get("sku", ""),
+                        image_url=media[0].get("image", {}).get("url") if media else None,
+                        platform="wix",
+                        merchant_id=merchant_id,
+                        status=ProductStatus.ACTIVE,
+                        created_at=wp.get("dateCreated"),
+                        updated_at=wp.get("lastUpdated")
+                    ))
+                
+                return standard_products, None, None
+                
+        except Exception as e:
+            error_msg = f"Error fetching Wix products: {str(e)}"
+            logger.error(error_msg)
+            return [], None, error_msg
 
 
 class WooCommerceProductAdapter:
