@@ -427,6 +427,19 @@ async def get_merchant_orders(
             }
         }
 
+@router.get("/merchant/dashboard/stats")
+async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
+    """Get dashboard stats for current merchant"""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+    
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found")
+    
+    # Call the existing analytics endpoint
+    return await get_merchant_analytics(merchant_id, current_user)
+
 @router.get("/merchant/{merchant_id}/analytics")
 async def get_merchant_analytics(
     merchant_id: str,
