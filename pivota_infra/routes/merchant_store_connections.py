@@ -207,23 +207,37 @@ async def merchant_connect_wix(
         
         logger.info(f"✅ Wix credentials verified for site {request.site_id}")
         
-        # Store in merchant_stores table
-        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
-        
-        await database.execute(
-            """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
-               VALUES (:store_id, :merchant_id, 'wix', :site_id, :name, :token, 'active', CURRENT_TIMESTAMP)
-               ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
-            {
-                "store_id": store_id,
-                "merchant_id": request.merchant_id,
-                "site_id": request.site_id,
-                "name": request.store_name or f"Wix Store {request.site_id[:8]}",
-                "token": request.api_key
-            }
+        # Check if store already exists
+        existing_store = await database.fetch_one(
+            """SELECT store_id FROM merchant_stores 
+               WHERE merchant_id = :merchant_id AND platform = 'wix' AND domain = :site_id""",
+            {"merchant_id": request.merchant_id, "site_id": request.site_id}
         )
+        
+        if existing_store:
+            # Update existing store
+            await database.execute(
+                """UPDATE merchant_stores 
+                   SET api_key = :token, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   WHERE store_id = :store_id""",
+                {"store_id": existing_store["store_id"], "token": request.api_key}
+            )
+            store_id = existing_store["store_id"]
+        else:
+            # Insert new store
+            store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+            await database.execute(
+                """INSERT INTO merchant_stores 
+                   (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+                   VALUES (:store_id, :merchant_id, 'wix', :site_id, :name, :token, 'active', CURRENT_TIMESTAMP)""",
+                {
+                    "store_id": store_id,
+                    "merchant_id": request.merchant_id,
+                    "site_id": request.site_id,
+                    "name": request.store_name or f"Wix Store {request.site_id[:8]}",
+                    "token": request.api_key
+                }
+            )
         
         return {
             "status": "success",
@@ -278,23 +292,37 @@ async def merchant_connect_woocommerce(
         
         logger.info(f"✅ WooCommerce credentials verified for {request.store_url}")
         
-        # Store in merchant_stores table
-        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
-        
-        await database.execute(
-            """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
-               VALUES (:store_id, :merchant_id, 'woocommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
-               ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
-            {
-                "store_id": store_id,
-                "merchant_id": request.merchant_id,
-                "domain": request.store_url,
-                "name": test_result.get('store_name', f"WooCommerce Store"),
-                "api_key": f"{request.consumer_key}:{request.consumer_secret}"  # Store both
-            }
+        # Check if store already exists
+        existing_store = await database.fetch_one(
+            """SELECT store_id FROM merchant_stores 
+               WHERE merchant_id = :merchant_id AND platform = 'woocommerce' AND domain = :domain""",
+            {"merchant_id": request.merchant_id, "domain": request.store_url}
         )
+        
+        if existing_store:
+            # Update existing store
+            await database.execute(
+                """UPDATE merchant_stores 
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   WHERE store_id = :store_id""",
+                {"store_id": existing_store["store_id"], "api_key": f"{request.consumer_key}:{request.consumer_secret}"}
+            )
+            store_id = existing_store["store_id"]
+        else:
+            # Insert new store
+            store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+            await database.execute(
+                """INSERT INTO merchant_stores 
+                   (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+                   VALUES (:store_id, :merchant_id, 'woocommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)""",
+                {
+                    "store_id": store_id,
+                    "merchant_id": request.merchant_id,
+                    "domain": request.store_url,
+                    "name": test_result.get('store_name', f"WooCommerce Store"),
+                    "api_key": f"{request.consumer_key}:{request.consumer_secret}"  # Store both
+                }
+            )
         
         return {
             "status": "success",
@@ -349,24 +377,38 @@ async def merchant_connect_bigcommerce(
         
         logger.info(f"✅ BigCommerce credentials verified for {request.store_hash}")
         
-        # Store in merchant_stores table
-        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+        # Check if store already exists
         store_domain = f"{request.store_hash}.mybigcommerce.com"
-        
-        await database.execute(
-            """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
-               VALUES (:store_id, :merchant_id, 'bigcommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
-               ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
-            {
-                "store_id": store_id,
-                "merchant_id": request.merchant_id,
-                "domain": store_domain,
-                "name": test_result.get('store_name', f"BigCommerce Store"),
-                "api_key": request.access_token
-            }
+        existing_store = await database.fetch_one(
+            """SELECT store_id FROM merchant_stores 
+               WHERE merchant_id = :merchant_id AND platform = 'bigcommerce' AND domain = :domain""",
+            {"merchant_id": request.merchant_id, "domain": store_domain}
         )
+        
+        if existing_store:
+            # Update existing store
+            await database.execute(
+                """UPDATE merchant_stores 
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   WHERE store_id = :store_id""",
+                {"store_id": existing_store["store_id"], "api_key": request.access_token}
+            )
+            store_id = existing_store["store_id"]
+        else:
+            # Insert new store
+            store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+            await database.execute(
+                """INSERT INTO merchant_stores 
+                   (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+                   VALUES (:store_id, :merchant_id, 'bigcommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)""",
+                {
+                    "store_id": store_id,
+                    "merchant_id": request.merchant_id,
+                    "domain": store_domain,
+                    "name": test_result.get('store_name', f"BigCommerce Store"),
+                    "api_key": request.access_token
+                }
+            )
         
         return {
             "status": "success",
@@ -420,23 +462,37 @@ async def merchant_connect_prestashop(
         
         logger.info(f"✅ PrestaShop credentials verified for {request.store_url}")
         
-        # Store in merchant_stores table
-        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
-        
-        await database.execute(
-            """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
-               VALUES (:store_id, :merchant_id, 'prestashop', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
-               ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
-            {
-                "store_id": store_id,
-                "merchant_id": request.merchant_id,
-                "domain": request.store_url,
-                "name": test_result.get('store_name', f"PrestaShop Store"),
-                "api_key": request.api_key
-            }
+        # Check if store already exists
+        existing_store = await database.fetch_one(
+            """SELECT store_id FROM merchant_stores 
+               WHERE merchant_id = :merchant_id AND platform = 'prestashop' AND domain = :domain""",
+            {"merchant_id": request.merchant_id, "domain": request.store_url}
         )
+        
+        if existing_store:
+            # Update existing store
+            await database.execute(
+                """UPDATE merchant_stores 
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   WHERE store_id = :store_id""",
+                {"store_id": existing_store["store_id"], "api_key": request.api_key}
+            )
+            store_id = existing_store["store_id"]
+        else:
+            # Insert new store
+            store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+            await database.execute(
+                """INSERT INTO merchant_stores 
+                   (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+                   VALUES (:store_id, :merchant_id, 'prestashop', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)""",
+                {
+                    "store_id": store_id,
+                    "merchant_id": request.merchant_id,
+                    "domain": request.store_url,
+                    "name": test_result.get('store_name', f"PrestaShop Store"),
+                    "api_key": request.api_key
+                }
+            )
         
         return {
             "status": "success",
