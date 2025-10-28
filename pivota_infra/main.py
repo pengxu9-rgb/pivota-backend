@@ -77,6 +77,7 @@ from routes.merchant_store_connections import router as merchant_store_connectio
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.admin_simple_fix import router as admin_simple_fix_router
 from routes.admin_cleanup_rebuild import router as admin_cleanup_rebuild_router
+from routes.admin_cleanup_stores import router as admin_cleanup_stores_router
 from routes.admin_sql_quick import router as admin_sql_router
 from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
@@ -216,6 +217,7 @@ app.include_router(merchant_store_connections_router)  # Merchant store connecti
 app.include_router(admin_cleanup_router)  # Admin cleanup utilities
 app.include_router(admin_simple_fix_router)  # Admin simple fix
 app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
+app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
 app.include_router(admin_sql_router)  # Admin SQL
 app.include_router(admin_agents_debug_router)  # Admin agents debug
 app.include_router(agent_health_router)  # Agent health check
