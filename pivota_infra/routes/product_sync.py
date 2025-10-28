@@ -76,6 +76,8 @@ async def sync_products(
             shop_domain = merchant.get("mcp_shop_domain")
             access_token = merchant.get("mcp_access_token")
             
+            logger.info(f"product_sync shopify merchant_id={request.merchant_id} shop_domain={shop_domain} has_token={bool(access_token)}")
+            
             if not shop_domain or not access_token:
                 raise HTTPException(
                     status_code=400,
@@ -104,10 +106,14 @@ async def sync_products(
             limit=request.limit
         )
         
+        logger.info(f"product_sync_result products_count={len(products_obj) if products_obj else 0} error={error}")
+        
         if error:
+            logger.error(f"product_sync_error merchant_id={request.merchant_id} platform={platform} error={error}")
             raise HTTPException(status_code=500, detail=f"Failed to fetch products: {error}")
         
         if not products_obj:
+            logger.warning(f"product_sync_empty merchant_id={request.merchant_id} platform={platform}")
             return SyncResponse(
                 status="success",
                 message="No products found on platform",
