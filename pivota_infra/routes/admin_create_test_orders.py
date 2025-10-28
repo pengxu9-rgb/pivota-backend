@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
-from utils.auth_utils import get_current_user
+from utils.auth import get_current_user
 import random
 from datetime import datetime, timedelta
 import uuid

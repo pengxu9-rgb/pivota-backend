@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional, List
 from db.database import database
-from utils.auth_utils import get_current_user
+from utils.auth import get_current_user
 import logging
 
 router = APIRouter(prefix="/admin/cleanup", tags=["admin-cleanup"])
