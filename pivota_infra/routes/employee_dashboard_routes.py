@@ -251,9 +251,9 @@ async def get_all_transactions(
         # Get transactions
         transactions_query = f"""
             SELECT 
-                o.order_id, o.merchant_id, o.amount, o.currency, 
-                o.status, o.payment_method, o.customer_name, o.customer_email,
-                o.created_at, o.psp_id,
+                o.order_id, o.merchant_id, o.total as amount, o.currency, 
+                o.status, o.payment_status, o.payment_method, o.customer_name, o.customer_email,
+                o.created_at, o.psp_id, o.psp_used,
                 m.business_name as merchant_name
             FROM orders o
             LEFT JOIN merchant_onboarding m ON o.merchant_id = m.merchant_id
