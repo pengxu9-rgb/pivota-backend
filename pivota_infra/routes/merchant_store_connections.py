@@ -108,7 +108,7 @@ async def merchant_connect_shopify(
                 """UPDATE merchant_stores 
                    SET api_key = :token, 
                        status = 'active',
-                       updated_at = CURRENT_TIMESTAMP
+                       last_sync = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"token": request.access_token, "store_id": existing["store_id"]}
             )
@@ -136,7 +136,7 @@ async def merchant_connect_shopify(
                    mcp_platform = 'shopify',
                    mcp_shop_domain = :domain,
                    mcp_access_token = :token,
-                   updated_at = CURRENT_TIMESTAMP
+                   last_sync = CURRENT_TIMESTAMP
                WHERE merchant_id = :merchant_id""",
             {
                 "merchant_id": request.merchant_id,
@@ -215,7 +215,7 @@ async def merchant_connect_wix(
                (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
                VALUES (:store_id, :merchant_id, 'wix', :site_id, :name, :token, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
+               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
@@ -286,7 +286,7 @@ async def merchant_connect_woocommerce(
                (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
                VALUES (:store_id, :merchant_id, 'woocommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
+               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
@@ -358,7 +358,7 @@ async def merchant_connect_bigcommerce(
                (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
                VALUES (:store_id, :merchant_id, 'bigcommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
+               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
@@ -428,7 +428,7 @@ async def merchant_connect_prestashop(
                (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
                VALUES (:store_id, :merchant_id, 'prestashop', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
+               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', last_sync = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
