@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from databases import Database
-from config.database import get_database
+from db.database import database
 from utils.auth_utils import get_current_user
 import random
 from datetime import datetime, timedelta
@@ -14,8 +13,7 @@ logger = logging.getLogger(__name__)
 async def create_test_orders(
     merchant_id: str,
     count: int = 5,
-    current_user: dict = Depends(get_current_user),
-    database: Database = Depends(get_database)
+    current_user: dict = Depends(get_current_user)
 ):
     """Create test orders for a merchant (admin only)"""
     if current_user["role"] != "admin":

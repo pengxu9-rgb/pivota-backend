@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional, List
-from databases import Database
-from config.database import get_database
+from db.database import database
 from utils.auth_utils import get_current_user
 import logging
 
@@ -10,8 +9,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/stores/wix")
 async def list_wix_stores(
-    current_user: dict = Depends(get_current_user),
-    database: Database = Depends(get_database)
+    current_user: dict = Depends(get_current_user)
 ):
     """List all Wix store connections (admin only)"""
     if current_user["role"] != "admin":
@@ -47,8 +45,7 @@ async def list_wix_stores(
 @router.delete("/stores/wix/{store_id}")
 async def delete_wix_store(
     store_id: str,
-    current_user: dict = Depends(get_current_user),
-    database: Database = Depends(get_database)
+    current_user: dict = Depends(get_current_user)
 ):
     """Delete a specific Wix store connection (admin only)"""
     if current_user["role"] != "admin":
@@ -82,8 +79,7 @@ async def delete_wix_store(
 @router.delete("/stores/wix")
 async def delete_all_wix_stores(
     confirm: bool = Query(False, description="Set to true to confirm deletion"),
-    current_user: dict = Depends(get_current_user),
-    database: Database = Depends(get_database)
+    current_user: dict = Depends(get_current_user)
 ):
     """Delete ALL Wix store connections (admin only, requires confirmation)"""
     if current_user["role"] != "admin":
@@ -128,8 +124,7 @@ async def delete_all_wix_stores(
 async def delete_store_by_domain(
     platform: str = Query(..., description="Platform (wix, shopify, etc)"),
     domain: str = Query(..., description="Store domain or site ID"),
-    current_user: dict = Depends(get_current_user),
-    database: Database = Depends(get_database)
+    current_user: dict = Depends(get_current_user)
 ):
     """Delete store by platform and domain (admin only)"""
     if current_user["role"] != "admin":
