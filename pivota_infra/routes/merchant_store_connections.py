@@ -106,7 +106,7 @@ async def merchant_connect_shopify(
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET access_token = :token, 
+                   SET api_key = :token, 
                        status = 'active',
                        updated_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
@@ -118,13 +118,13 @@ async def merchant_connect_shopify(
             store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
             await database.execute(
                 """INSERT INTO merchant_stores 
-                   (store_id, merchant_id, platform, domain, store_name, access_token, status, created_at)
-                   VALUES (:store_id, :merchant_id, 'shopify', :domain, :store_name, :token, 'active', CURRENT_TIMESTAMP)""",
+                   (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+                   VALUES (:store_id, :merchant_id, 'shopify', :domain, :name, :token, 'active', CURRENT_TIMESTAMP)""",
                 {
                     "store_id": store_id,
                     "merchant_id": request.merchant_id,
                     "domain": request.shop_domain,
-                    "store_name": shop_info.get("name", request.shop_domain),
+                    "name": shop_info.get("name", request.shop_domain),
                     "token": request.access_token
                 }
             )
@@ -212,15 +212,15 @@ async def merchant_connect_wix(
         
         await database.execute(
             """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, store_name, access_token, status, created_at)
-               VALUES (:store_id, :merchant_id, 'wix', :site_id, :store_name, :token, 'active', CURRENT_TIMESTAMP)
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'wix', :site_id, :name, :token, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
-               DO UPDATE SET access_token = EXCLUDED.access_token, status = 'active', updated_at = CURRENT_TIMESTAMP""",
+               DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
                 "site_id": request.site_id,
-                "store_name": request.store_name or f"Wix Store {request.site_id[:8]}",
+                "name": request.store_name or f"Wix Store {request.site_id[:8]}",
                 "token": request.api_key
             }
         )
@@ -283,15 +283,15 @@ async def merchant_connect_woocommerce(
         
         await database.execute(
             """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, store_name, api_key, status, created_at)
-               VALUES (:store_id, :merchant_id, 'woocommerce', :domain, :store_name, :api_key, 'active', CURRENT_TIMESTAMP)
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'woocommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
                DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
                 "domain": request.store_url,
-                "store_name": test_result.get('store_name', f"WooCommerce Store"),
+                "name": test_result.get('store_name', f"WooCommerce Store"),
                 "api_key": f"{request.consumer_key}:{request.consumer_secret}"  # Store both
             }
         )
@@ -355,15 +355,15 @@ async def merchant_connect_bigcommerce(
         
         await database.execute(
             """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, store_name, api_key, status, created_at)
-               VALUES (:store_id, :merchant_id, 'bigcommerce', :domain, :store_name, :api_key, 'active', CURRENT_TIMESTAMP)
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'bigcommerce', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
                DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
                 "domain": store_domain,
-                "store_name": test_result.get('store_name', f"BigCommerce Store"),
+                "name": test_result.get('store_name', f"BigCommerce Store"),
                 "api_key": request.access_token
             }
         )
@@ -425,15 +425,15 @@ async def merchant_connect_prestashop(
         
         await database.execute(
             """INSERT INTO merchant_stores 
-               (store_id, merchant_id, platform, domain, store_name, api_key, status, created_at)
-               VALUES (:store_id, :merchant_id, 'prestashop', :domain, :store_name, :api_key, 'active', CURRENT_TIMESTAMP)
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'prestashop', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT (merchant_id, platform, domain) 
                DO UPDATE SET api_key = EXCLUDED.api_key, status = 'active', updated_at = CURRENT_TIMESTAMP""",
             {
                 "store_id": store_id,
                 "merchant_id": request.merchant_id,
                 "domain": request.store_url,
-                "store_name": test_result.get('store_name', f"PrestaShop Store"),
+                "name": test_result.get('store_name', f"PrestaShop Store"),
                 "api_key": request.api_key
             }
         )
