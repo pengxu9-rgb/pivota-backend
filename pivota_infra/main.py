@@ -101,7 +101,7 @@ from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
 from routes.product_sync import router as product_sync_router
-from routes.wix_sync_fix import router as wix_sync_fix_router
+from routes.universal_product_sync import router as universal_sync_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -296,8 +296,8 @@ if DEBUG_MODE:
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(product_router)  # Product management
-app.include_router(product_sync_router)  # Product sync from platforms
-app.include_router(wix_sync_fix_router)  # Fixed Wix sync endpoint
+app.include_router(product_sync_router)  # Product sync from platforms (legacy)
+app.include_router(universal_sync_router)  # Universal product sync (new)
 app.include_router(order_router)  # Order processing
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
