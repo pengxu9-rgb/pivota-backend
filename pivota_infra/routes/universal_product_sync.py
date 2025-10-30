@@ -213,19 +213,91 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
             }
     
     elif platform == "woocommerce":
-        # Add WooCommerce credential handling
+        # WooCommerce needs both consumer key and secret
         store_url = store_info.get("domain")
-        consumer_key = store_info.get("api_key")
-        consumer_secret = store_info.get("api_secret")
+        api_key_data = store_info.get("api_key")
         
-        if store_url and consumer_key:
-            return {
-                "store_url": store_url,
-                "consumer_key": consumer_key,
-                "consumer_secret": consumer_secret or ""
-            }
+        if store_url and api_key_data:
+            # Check if api_key contains JSON with both keys
+            try:
+                if api_key_data.startswith("{"):
+                    credentials = json.loads(api_key_data)
+                    return {
+                        "store_url": store_url,
+                        "consumer_key": credentials.get("consumer_key", ""),
+                        "consumer_secret": credentials.get("consumer_secret", "")
+                    }
+                else:
+                    # Legacy format - just consumer key
+                    return {
+                        "store_url": store_url,
+                        "consumer_key": api_key_data,
+                        "consumer_secret": ""
+                    }
+            except json.JSONDecodeError:
+                # Fallback to treating it as consumer key only
+                return {
+                    "store_url": store_url,
+                    "consumer_key": api_key_data,
+                    "consumer_secret": ""
+                }
+    
+    elif platform == "square":
+        # Square uses location ID and access token
+        location_id = store_info.get("domain")
+        api_key_data = store_info.get("api_key")
+        
+        if location_id and api_key_data:
+            try:
+                if api_key_data.startswith("{"):
+                    credentials = json.loads(api_key_data)
+                    return {
+                        "location_id": location_id,
+                        "access_token": credentials.get("access_token", ""),
+                        "application_id": credentials.get("application_id", "")
+                    }
+                else:
+                    return {
+                        "location_id": location_id,
+                        "access_token": api_key_data,
+                        "application_id": ""
+                    }
+            except json.JSONDecodeError:
+                return {
+                    "location_id": location_id,
+                    "access_token": api_key_data,
+                    "application_id": ""
+                }
+    
+    elif platform == "bigcommerce":
+        # BigCommerce uses store hash and access token
+        store_hash = store_info.get("domain")
+        api_key_data = store_info.get("api_key")
+        
+        if store_hash and api_key_data:
+            try:
+                if api_key_data.startswith("{"):
+                    credentials = json.loads(api_key_data)
+                    return {
+                        "store_hash": store_hash,
+                        "access_token": credentials.get("access_token", ""),
+                        "client_id": credentials.get("client_id", "")
+                    }
+                else:
+                    return {
+                        "store_hash": store_hash,
+                        "access_token": api_key_data,
+                        "client_id": ""
+                    }
+            except json.JSONDecodeError:
+                return {
+                    "store_hash": store_hash,
+                    "access_token": api_key_data,
+                    "client_id": ""
+                }
     
     # Add more platforms as needed
+    logger.warning(f"Platform {platform} not yet implemented in credential preparation")
     return None
 
 
