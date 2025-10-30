@@ -5,6 +5,7 @@ from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from datetime import datetime
 import time
+import secrets
 from db.database import database
 
 class UsageLoggerMiddleware(BaseHTTPMiddleware):
@@ -43,6 +44,11 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
         # Log to database (fire and forget - don't block response)
         if agent_id:
             try:
+                # Generate a unique request_id if not provided
+                request_id = request.headers.get("x-request-id")
+                if not request_id:
+                    request_id = f"req_{secrets.token_hex(16)}"
+                
                 await database.execute(
                     """
                     INSERT INTO agent_usage_logs 
@@ -56,7 +62,7 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
                         "status_code": response.status_code,
                         "response_time": response_time_ms,
                         "timestamp": datetime.now(),
-                        "request_id": request.headers.get("x-request-id", "")
+                        "request_id": request_id
                     }
                 )
             except Exception as e:
@@ -64,7 +70,3 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
                 print(f"Failed to log usage: {e}")
         
         return response
-
-
-
-
