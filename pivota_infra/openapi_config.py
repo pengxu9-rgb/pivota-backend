@@ -170,7 +170,7 @@ The token expires after 24 hours and should be included in the Authorization hea
                                         "$ref": "#/components/schemas/LoginResponse"
                                     },
                                     "example": {
-                                        "success": true,
+                                        "success": True,
                                         "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
                                         "user": {
                                             "id": "user_123456",
@@ -215,7 +215,7 @@ The system automatically selects the optimal PSP or may split the payment across
                     "operationId": "createPayment",
                     "security": [{"bearerAuth": []}],
                     "requestBody": {
-                        "required": true,
+                        "required": True,
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -256,7 +256,7 @@ The system automatically selects the optimal PSP or may split the payment across
                                         "$ref": "#/components/schemas/PaymentResponse"
                                     },
                                     "example": {
-                                        "success": true,
+                                        "success": True,
                                         "payment_id": "pay_xyz789",
                                         "order_id": "order_123456",
                                         "status": "pending",
@@ -297,7 +297,7 @@ Features:
                     "operationId": "agentCreateOrder",
                     "security": [{"apiKeyAuth": []}],
                     "requestBody": {
-                        "required": true,
+                        "required": True,
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -353,7 +353,7 @@ The process typically takes 24-48 hours for full approval.
                     """,
                     "operationId": "merchantOnboard",
                     "requestBody": {
-                        "required": true,
+                        "required": True,
                         "content": {
                             "application/json": {
                                 "schema": {
