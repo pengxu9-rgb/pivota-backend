@@ -66,7 +66,19 @@ async def get_merchant_products_realtime(
         # 从缓存获取产品
         cached = await get_cached_products(merchant_id, platform)
         products = [c["product_data"] for c in cached[:limit]]
-
+    except Exception as e:
+        # Handle errors when getting stores
+        logger.error(f"Error getting stores for merchant {merchant_id}: {str(e)}")
+        return ProductListResponse(
+            status="success",
+            merchant_id=merchant_id,
+            platform="unknown",
+            total=0,
+            products=[],
+            next_page_token=None,
+            fetched_at=datetime.now()
+        )
+    
     # 3. 尝试从缓存读取（除非强制刷新）
     if not force_refresh:
         cached = await get_cached_products(merchant_id, platform, include_expired=False)
