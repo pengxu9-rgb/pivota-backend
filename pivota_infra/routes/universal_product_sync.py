@@ -162,8 +162,7 @@ async def find_connected_store(merchant_id: str, merchant: Dict) -> Optional[Dic
     
     # Check merchant_stores table first (preferred)
     store_query = """
-        SELECT store_id, platform, name, domain, api_key, status, 
-               shopify_domain, shopify_token, wix_site_id, wix_api_key
+        SELECT store_id, platform, name, domain, api_key, status
         FROM merchant_stores 
         WHERE merchant_id = :merchant_id 
         AND status IN ('active', 'connected')
@@ -192,8 +191,9 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
     """Prepare credentials based on platform requirements"""
     
     if platform == "shopify":
-        domain = store_info.get("domain") or store_info.get("shopify_domain")
-        token = store_info.get("api_key") or store_info.get("shopify_token")
+        # For Shopify, domain is the shop domain and api_key is the access token
+        domain = store_info.get("domain")
+        token = store_info.get("api_key")
         
         if domain and token:
             return {
@@ -202,8 +202,9 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
             }
     
     elif platform == "wix":
-        site_id = store_info.get("domain") or store_info.get("wix_site_id")
-        api_key = store_info.get("api_key") or store_info.get("wix_api_key")
+        # For Wix, domain is the site_id and api_key is the API key
+        site_id = store_info.get("domain")
+        api_key = store_info.get("api_key")
         
         if site_id and api_key:
             return {
