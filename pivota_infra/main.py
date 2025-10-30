@@ -483,6 +483,25 @@ async def startup():
                 )
             """)
             
+            # Fix missing columns in agents table (2024-10-30)
+            logger.info("🔧 Applying database fixes for agents table...")
+            try:
+                await database.execute("""
+                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_gmv NUMERIC(12,2) DEFAULT 0
+                """)
+                await database.execute("""
+                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_requests INTEGER DEFAULT 0
+                """)
+                await database.execute("""
+                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_orders INTEGER DEFAULT 0
+                """)
+                await database.execute("""
+                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP WITH TIME ZONE
+                """)
+                logger.info("✅ Added missing columns to agents table")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not add columns to agents table: {e}")
+            
             # Create payments table
             await database.execute("""
                 CREATE TABLE IF NOT EXISTS payments (
@@ -520,6 +539,29 @@ async def startup():
                     timestamp TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
+            
+            # Fix request_id constraint issue (2024-10-30)
+            logger.info("🔧 Fixing agent_usage_logs request_id constraint...")
+            try:
+                # Drop existing constraint
+                await database.execute("""
+                    ALTER TABLE agent_usage_logs DROP CONSTRAINT IF EXISTS agent_usage_logs_request_id_key
+                """)
+                # Clean up empty request_ids
+                await database.execute("""
+                    UPDATE agent_usage_logs SET request_id = NULL WHERE request_id = ''
+                """)
+                # Allow NULLs for request_id
+                await database.execute("""
+                    ALTER TABLE agent_usage_logs ALTER COLUMN request_id DROP NOT NULL
+                """)
+                # Re-add unique constraint (NULLs allowed)
+                await database.execute("""
+                    ALTER TABLE agent_usage_logs ADD CONSTRAINT agent_usage_logs_request_id_key UNIQUE (request_id)
+                """)
+                logger.info("✅ Fixed request_id constraint in agent_usage_logs")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fix request_id constraint: {e}")
             
             # Create agent_merchants table
             await database.execute("""
@@ -566,6 +608,10 @@ async def startup():
             # Create indexes
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_id ON merchant_stores(merchant_id)")
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_merchant_id ON merchant_psps(merchant_id)")
+            
+            # Create performance indexes for agent tables
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_agent_id_timestamp ON agent_usage_logs(agent_id, timestamp DESC)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agents_agent_id ON agents(agent_id)")
             
             logger.info("✅ Integration tables created/verified")
             
@@ -947,6 +993,54 @@ async def operations_dashboard():
         with open("templates/operations_dashboard.html", "r") as f:
             return HTMLResponse(content=f.read())
     except FileNotFoundError:
+        return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    from config.settings import settings
+    
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "database": "connected",
+        "config_check": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+        }
+    }
+
+@app.get("/config-check")
+async def config_check():
+    """Public endpoint to check environment variable configuration (no auth required)"""
+    from config.settings import settings
+    
+    return {
+        "status": "success",
+        "message": "Environment variable configuration check",
+        "config": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
+            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
+            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
+            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
+            "metrics_query_version": settings.metrics_query_version,
+            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+        },
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
+
+
         return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
 
 @app.get("/health")
