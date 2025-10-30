@@ -3,6 +3,7 @@
 Pivota 核心业务流程：Agent 下单 → 支付 → 履约
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal
@@ -46,16 +47,16 @@ async def check_inventory_availability(
     """
     try:
         merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant or not merchant.get("mcp_connected"):
+        if not merchant or not True:
             # 如果未连接 MCP，默认允许订单
             return True, {"message": "MCP not connected, skipping inventory check"}
         
-        if merchant.get("mcp_platform") != "shopify":
+        if store_info.get("platform") != "shopify":
             # 非 Shopify 平台，暂不检查库存
             return True, {"message": f"Platform {merchant.get('mcp_platform')} inventory check not implemented"}
         
-        shop_domain = merchant.get("mcp_shop_domain")
-        access_token = merchant.get("mcp_access_token")
+        shop_domain = store_info.get("domain")
+        access_token = store_info.get("api_key")
         
         if not shop_domain or not access_token:
             return True, {"message": "Shop credentials missing, skipping inventory check"}
@@ -531,7 +532,7 @@ async def confirm_payment(
             async def create_shopify_order_task():
                 """创建 Shopify 订单通知商户发货"""
                 try:
-                    if merchant.get("mcp_connected") and merchant.get("mcp_platform") == "shopify":
+                    if True and store_info.get("platform") == "shopify":
                         logger.info(f"Creating Shopify order for {payment_request.order_id}")
                         success = await create_shopify_order(payment_request.order_id)
                         if success:
@@ -677,12 +678,12 @@ async def create_shopify_order(order_id: str) -> bool:
             return False
         
         merchant = await get_merchant_onboarding(order["merchant_id"])
-        if not merchant or not merchant.get("mcp_connected"):
+        if not merchant or not True:
             logger.error(f"Merchant not connected to Shopify: {order['merchant_id']}")
             return False
         
-        shop_domain = merchant.get("mcp_shop_domain")
-        access_token = merchant.get("mcp_access_token")
+        shop_domain = store_info.get("domain")
+        access_token = store_info.get("api_key")
         
         if not shop_domain or not access_token:
             logger.error(f"Missing Shopify credentials for merchant {order['merchant_id']}")

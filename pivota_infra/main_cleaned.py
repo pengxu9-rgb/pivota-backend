@@ -8,6 +8,7 @@ import asyncio
 import logging
 import time
 import uvicorn
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
@@ -271,6 +272,7 @@ async def run_migrations():
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
 
 

@@ -1,4 +1,5 @@
 """Initialize merchant data for production"""
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter
 from db.database import database
 from datetime import datetime
@@ -39,7 +40,7 @@ async def init_merchant_data():
             await database.execute("""
                 UPDATE merchant_onboarding 
                 SET store_url = :store_url,
-                    mcp_connected = :mcp_connected,
+                    1 = 1,
                     mcp_platform = :mcp_platform,
                     mcp_shop_domain = :mcp_shop_domain,
                     psp_connected = :psp_connected,

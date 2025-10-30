@@ -64,3 +64,4 @@ async def update_contact_email(current_user: dict = Depends(require_admin)):
         logger.error(f"Fix failed: {e}")
         raise HTTPException(status_code=500, detail=f"Fix failed: {str(e)}")
 
+

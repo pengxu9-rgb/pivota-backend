@@ -14,3 +14,4 @@ async def whoami(current_user: dict = Depends(get_current_user)):
         "email": current_user.get("email"),
         "note": "This is your current login session info"
     }
+

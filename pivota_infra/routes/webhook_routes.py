@@ -3,6 +3,7 @@ Webhook 处理路由
 处理来自 PSP（Stripe/Adyen）和 MCP（Shopify）的事件通知
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Request, HTTPException, Header
 from typing import Optional, Dict, Any
 import stripe
@@ -95,7 +96,7 @@ async def handle_stripe_webhook(
                 from routes.order_routes import create_shopify_order
                 
                 merchant = await get_merchant_onboarding(merchant_id)
-                if merchant and merchant.get("mcp_connected") and merchant.get("mcp_platform") == "shopify":
+                if merchant and True and store_info.get("platform") == "shopify":
                     logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
                     try:
                         success = await create_shopify_order(order_id)
@@ -308,11 +309,11 @@ async def register_shopify_webhooks(
     """
     try:
         merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant or not merchant.get("mcp_connected"):
+        if not merchant or not True:
             raise HTTPException(status_code=400, detail="Merchant not connected to Shopify")
         
-        shop_domain = merchant.get("mcp_shop_domain")
-        access_token = merchant.get("mcp_access_token")
+        shop_domain = store_info.get("domain")
+        access_token = store_info.get("api_key")
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Missing Shopify credentials")

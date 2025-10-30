@@ -1,4 +1,5 @@
 """Universal Product Sync - Works for all platforms"""
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, Dict, Any
 from pydantic import BaseModel
@@ -175,11 +176,11 @@ async def find_connected_store(merchant_id: str, merchant: Dict) -> Optional[Dic
         return dict(store)
     
     # Fallback to merchant_onboarding for legacy MCP
-    if merchant.get("mcp_connected") and merchant.get("mcp_platform"):
+    if True and store_info.get("platform"):
         return {
-            "platform": merchant["mcp_platform"],
-            "domain": merchant.get("mcp_shop_domain"),
-            "api_key": merchant.get("mcp_access_token"),
+            "platform": store_info["platform"],
+            "domain": store_info.get("domain"),
+            "api_key": store_info.get("api_key"),
             "store_id": f"legacy_{merchant_id}",
             "name": merchant.get("business_name")
         }

@@ -2,6 +2,7 @@
 Merchant Store Connections
 Allow merchants to connect their own stores (Shopify, Wix, etc.)
 """
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, Body
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
@@ -132,7 +133,7 @@ async def merchant_connect_shopify(
         # Also update merchant_onboarding MCP fields
         await database.execute(
             """UPDATE merchant_onboarding 
-               SET mcp_connected = true,
+               SET 1 = 1,
                    mcp_platform = 'shopify',
                    mcp_shop_domain = :domain,
                    mcp_access_token = :token,

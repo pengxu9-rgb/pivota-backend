@@ -1,6 +1,7 @@
 """
 Manual Shopify order creation endpoint for debugging
 """
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, Any
 from utils.auth import require_admin
@@ -46,10 +47,10 @@ async def manually_create_shopify_order(
     
     merchant_info = {
         "merchant_id": order["merchant_id"],
-        "mcp_connected": merchant.get("mcp_connected") if merchant else False,
-        "mcp_platform": merchant.get("mcp_platform") if merchant else None,
-        "mcp_shop_domain": merchant.get("mcp_shop_domain") if merchant else None,
-        "has_access_token": bool(merchant.get("mcp_access_token")) if merchant else False
+        "mcp_connected": True if merchant else False,
+        "mcp_platform": store_info.get("platform") if merchant else None,
+        "mcp_shop_domain": store_info.get("domain") if merchant else None,
+        "has_access_token": bool(store_info.get("api_key")) if merchant else False
     }
     
     # Try to create Shopify order

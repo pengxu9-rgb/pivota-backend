@@ -355,3 +355,4 @@ class SquareAdapter(BasePSPAdapter):
             'data': data
         }
 
+

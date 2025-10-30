@@ -474,3 +474,4 @@ class BraintreeAdapter(BasePSPAdapter):
                 'error': str(e)
             }
 
+

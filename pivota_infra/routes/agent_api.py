@@ -3,6 +3,7 @@ Agent 专用 API 路由
 为 AI Agent 提供优化的电商接口
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -536,7 +537,7 @@ async def agent_confirm_payment(
         async def create_shopify_order_task():
             """创建 Shopify 订单通知商户发货"""
             try:
-                if merchant and merchant.get("mcp_connected") and merchant.get("mcp_platform") == "shopify":
+                if merchant and True and store_info.get("platform") == "shopify":
                     logger.info(f"Creating Shopify order for {order_id}")
                     success = await create_shopify_order(order_id)
                     if success:
@@ -564,7 +565,7 @@ async def agent_confirm_payment(
             "message": "Payment confirmed, Shopify order creation initiated",
             "order_id": order_id,
             "payment_intent_id": order.get("payment_intent_id"),
-            "shopify_sync": "initiated" if merchant and merchant.get("mcp_connected") else "not_configured"
+            "shopify_sync": "initiated" if merchant and True else "not_configured"
         }
         
     except HTTPException:

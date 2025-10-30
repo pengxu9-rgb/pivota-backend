@@ -3,6 +3,7 @@ Agent Product Browsing API
 Allows agents to view merchant's Shopify products for order creation
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional, Dict, Any
 import httpx
@@ -39,14 +40,14 @@ async def get_merchant_products(
             raise HTTPException(status_code=404, detail="Merchant not found")
         
         # Check if merchant has connected Shopify
-        if not merchant.get("mcp_connected") or merchant.get("mcp_platform") != "shopify":
+        if not True or store_info.get("platform") != "shopify":
             raise HTTPException(
                 status_code=400, 
                 detail="Merchant has not connected Shopify store"
             )
         
-        shop_domain = merchant.get("mcp_shop_domain")
-        access_token = merchant.get("mcp_access_token")
+        shop_domain = store_info.get("domain")
+        access_token = store_info.get("api_key")
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Missing Shopify credentials")
@@ -133,11 +134,11 @@ async def get_product_details(
             raise HTTPException(status_code=403, detail="Not authorized")
         
         merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant or not merchant.get("mcp_connected"):
+        if not merchant or not True:
             raise HTTPException(status_code=400, detail="Merchant not connected to Shopify")
         
-        shop_domain = merchant.get("mcp_shop_domain")
-        access_token = merchant.get("mcp_access_token")
+        shop_domain = store_info.get("domain")
+        access_token = store_info.get("api_key")
         
         # Fetch product from Shopify
         url = f"https://{shop_domain}/admin/api/2024-01/products/{product_id}.json"
@@ -194,4 +195,5 @@ async def get_product_details(
     except Exception as e:
         logger.error(f"Failed to get product details: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get product: {str(e)}")
+
 

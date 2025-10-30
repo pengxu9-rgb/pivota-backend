@@ -24,3 +24,4 @@ echo "📊 Next steps:"
 echo "1. Go to Merchant Portal > Analytics"
 echo "2. Check if orders appear in the charts"
 echo "3. Verify revenue and PSP distribution data"
+

@@ -7,6 +7,7 @@ Note: This is a minimal viable integration using PAT (Admin API access token).
 In production prefer OAuth per merchant and encrypt credentials.
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List

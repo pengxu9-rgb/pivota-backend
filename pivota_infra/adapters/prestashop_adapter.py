@@ -591,3 +591,4 @@ class PrestaShopAdapter:
         # Module should implement custom validation
         return True
 
+

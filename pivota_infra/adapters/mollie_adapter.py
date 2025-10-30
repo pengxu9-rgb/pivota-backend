@@ -339,3 +339,4 @@ class MollieAdapter(BasePSPAdapter):
                 'error': str(e)
             }
 
+

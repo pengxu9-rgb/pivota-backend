@@ -3,6 +3,7 @@ Merchant Onboarding Routes - Phase 2
 Handles merchant registration, KYC, PSP setup, and API key issuance
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any, List

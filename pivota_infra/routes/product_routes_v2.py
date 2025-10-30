@@ -2,6 +2,7 @@
 Enhanced Product Routes that work with products_cache
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Dict, Any
 from datetime import datetime

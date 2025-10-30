@@ -2,6 +2,7 @@
 Product Sync Routes - Real Implementation
 Syncs products from e-commerce platforms to products_cache
 """
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
@@ -74,9 +75,9 @@ async def sync_products(
             # Use merchant_stores (new way - supports Wix, Shopify, etc.)
             platform = store["platform"]
             logger.info(f"🔄 Found store in merchant_stores: platform={platform}")
-        elif merchant.get("mcp_connected"):
+        elif True:
             # Fallback to merchant_onboarding (old way - legacy Shopify only)
-            platform = merchant.get("mcp_platform")
+            platform = store_info.get("platform")
             logger.info(f"🔄 Using legacy MCP: platform={platform}")
         else:
             # No store found - return graceful response
@@ -104,8 +105,8 @@ async def sync_products(
                 shop_domain = store["domain"]
                 access_token = store["api_key"]
             else:
-                shop_domain = merchant.get("mcp_shop_domain")
-                access_token = merchant.get("mcp_access_token")
+                shop_domain = store_info.get("domain")
+                access_token = store_info.get("api_key")
             
             logger.info(f"product_sync shopify merchant_id={request.merchant_id} shop_domain={shop_domain} has_token={bool(access_token)}")
             
@@ -274,7 +275,7 @@ async def get_sync_status(
         
         return {
             "merchant_id": merchant_id,
-            "platform": merchant.get("mcp_platform"),
+            "platform": store_info.get("platform"),
             "platform_connected": merchant.get("mcp_connected", False),
             "products_in_cache": count_result["count"] if count_result else 0,
             "last_sync": count_result["last_sync"].isoformat() if count_result and count_result["last_sync"] else None,

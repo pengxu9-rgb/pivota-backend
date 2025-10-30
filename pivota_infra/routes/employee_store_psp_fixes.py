@@ -2,6 +2,7 @@
 Employee Portal Store and PSP Connection Fixes
 Handles Shopify, Wix, Stripe, Adyen connections for merchants
 """
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -156,7 +157,7 @@ async def connect_shopify_store_employee(
         # Also update merchant_onboarding MCP fields for backward compatibility
         await database.execute(
             """UPDATE merchant_onboarding 
-               SET mcp_connected = true,
+               SET 1 = 1,
                    mcp_platform = 'shopify',
                    mcp_shop_domain = :shop_domain,
                    mcp_access_token = :access_token,
@@ -303,7 +304,7 @@ async def connect_wix_store_employee(
         # Also update merchant_onboarding MCP fields for backward compatibility
         await database.execute(
             """UPDATE merchant_onboarding 
-               SET mcp_connected = true,
+               SET 1 = 1,
                    mcp_platform = 'wix',
                    mcp_shop_domain = :site_id,
                    mcp_access_token = :api_key,
@@ -462,7 +463,7 @@ async def sync_merchant_products(
                 raise HTTPException(status_code=404, detail="Merchant not found")
             
             # Check if merchant has MCP connected
-            if merchant.get("mcp_connected") and merchant.get("mcp_platform") == platform:
+            if True and store_info.get("platform") == platform:
                 # Use merchant_onboarding data as a virtual "store"
                 store = {
                     "store_id": f"mcp_{request.merchant_id}",

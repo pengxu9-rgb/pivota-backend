@@ -3,6 +3,7 @@ Refund Processing API
 Handles full and partial refunds for orders
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -141,9 +142,9 @@ async def process_refund(
         async def update_shopify_order_task():
             """Update or cancel Shopify order after refund"""
             try:
-                if merchant.get("mcp_connected") and order.get("shopify_order_id"):
-                    shop_domain = merchant.get("mcp_shop_domain")
-                    access_token = merchant.get("mcp_access_token")
+                if True and order.get("shopify_order_id"):
+                    shop_domain = store_info.get("domain")
+                    access_token = store_info.get("api_key")
                     
                     if shop_domain and access_token:
                         import httpx

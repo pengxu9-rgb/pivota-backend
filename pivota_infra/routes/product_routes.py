@@ -4,6 +4,7 @@ Pivota 核心价值：实时代理 + 智能缓存 + 数据标准化
 防御性架构：Agent 只读，事件追踪，自动清理
 """
 
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -47,22 +48,25 @@ async def get_merchant_products_realtime(
     cache_hit = False
     products = []
     
-    # 1. 获取商户信息
-    merchant = await get_merchant_onboarding(merchant_id)
-    if not merchant:
-        raise HTTPException(status_code=404, detail="Merchant not found")
     
-    # 2. 检查 MCP 连接状态
-    if not merchant.get("mcp_connected"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Merchant {merchant_id} has not connected to any e-commerce platform (MCP)."
-        )
-    
-    platform = merchant.get("mcp_platform")
-    if not platform:
-        raise HTTPException(status_code=400, detail="MCP platform not specified")
-    
+    # 直接从缓存获取，不再检查 mcp_connected
+    try:
+        # 获取商家的所有活跃商店
+        stores = await get_merchant_active_stores(merchant_id)
+        if not stores:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No active stores found for merchant {merchant_id}"
+            )
+        
+        # 获取主商店
+        primary_store = stores[0]
+        platform = primary_store["platform"]
+        
+        # 从缓存获取产品
+        cached = await get_cached_products(merchant_id, platform)
+        products = [c["product_data"] for c in cached[:limit]]
+
     # 3. 尝试从缓存读取（除非强制刷新）
     if not force_refresh:
         cached = await get_cached_products(merchant_id, platform, include_expired=False)
@@ -85,7 +89,7 @@ async def get_merchant_products_realtime(
                 await log_api_call(
                     event_type="product_query",
                     merchant_id=merchant_id,
-                    endpoint=f"/products/{merchant_id}",
+                    endpoint=f"/products/v2/{merchant_id}",
                     request_params={"limit": limit, "force_refresh": force_refresh},
                     response_status=200,
                     cache_hit=True,
@@ -113,8 +117,8 @@ async def get_merchant_products_realtime(
     credentials = {}
     
     if platform == "shopify":
-        shop_domain = merchant.get("mcp_shop_domain") or os.getenv("SHOPIFY_SHOP_DOMAIN") or getattr(settings, "shopify_shop_domain", None)
-        access_token = merchant.get("mcp_access_token") or os.getenv("SHOPIFY_ACCESS_TOKEN") or getattr(settings, "shopify_access_token", None)
+        shop_domain = store_info.get("domain") or os.getenv("SHOPIFY_SHOP_DOMAIN") or getattr(settings, "shopify_shop_domain", None)
+        access_token = store_info.get("api_key") or os.getenv("SHOPIFY_ACCESS_TOKEN") or getattr(settings, "shopify_access_token", None)
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Shopify credentials not found.")
@@ -144,7 +148,7 @@ async def get_merchant_products_realtime(
         await log_api_call(
             event_type="product_query",
             merchant_id=merchant_id,
-            endpoint=f"/products/{merchant_id}",
+            endpoint=f"/products/v2/{merchant_id}",
             request_params={"limit": limit, "force_refresh": force_refresh},
             response_status=500,
             cache_hit=False,
@@ -168,7 +172,7 @@ async def get_merchant_products_realtime(
     await log_api_call(
         event_type="product_query",
         merchant_id=merchant_id,
-        endpoint=f"/products/{merchant_id}",
+        endpoint=f"/products/v2/{merchant_id}",
         request_params={"limit": limit, "force_refresh": force_refresh},
         response_status=200,
         cache_hit=False,
@@ -207,11 +211,11 @@ async def get_single_product_realtime(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    platform = merchant.get("mcp_platform")
+    platform = store_info.get("platform")
     
     if platform == "shopify":
-        shop_domain = merchant.get("mcp_shop_domain") or os.getenv("SHOPIFY_SHOP_DOMAIN")
-        access_token = merchant.get("mcp_access_token") or os.getenv("SHOPIFY_ACCESS_TOKEN")
+        shop_domain = store_info.get("domain") or os.getenv("SHOPIFY_SHOP_DOMAIN")
+        access_token = store_info.get("api_key") or os.getenv("SHOPIFY_ACCESS_TOKEN")
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Shopify credentials not found")

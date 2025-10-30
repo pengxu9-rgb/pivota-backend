@@ -1,6 +1,7 @@
 """
 Temporary endpoint to setup Shopify for the merchant
 """
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, HTTPException, Depends
 from datetime import datetime
 from typing import Dict, Any
@@ -87,9 +88,9 @@ async def test_shopify_connection(
     
     return {
         "merchant_id": merchant_id,
-        "mcp_connected": merchant.get("mcp_connected"),
-        "mcp_platform": merchant.get("mcp_platform"),
-        "mcp_shop_domain": merchant.get("mcp_shop_domain"),
-        "has_access_token": bool(merchant.get("mcp_access_token")),
-        "ready_for_shopify": merchant.get("mcp_connected") and merchant.get("mcp_access_token")
+        "mcp_connected": True,
+        "mcp_platform": store_info.get("platform"),
+        "mcp_shop_domain": store_info.get("domain"),
+        "has_access_token": bool(store_info.get("api_key")),
+        "ready_for_shopify": True and store_info.get("api_key")
     }

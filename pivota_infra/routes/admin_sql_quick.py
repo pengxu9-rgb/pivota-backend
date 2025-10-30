@@ -21,3 +21,4 @@ async def execute_sql(request: SQLRequest):
         return {"success": True, "affected_rows": result if result else 0}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
