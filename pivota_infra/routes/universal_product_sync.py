@@ -84,16 +84,15 @@ async def universal_product_sync(
         
         if not credentials:
             logger.warning(f"Incomplete credentials for {platform}")
-            # Return demo products instead of error
-            demo_count = await create_demo_products(request.merchant_id, platform)
+            # Return clear status without creating fake products
             return UniversalSyncResponse(
-                status="success",
-                message=f"{platform.title()} credentials pending. Showing {demo_count} demo products.",
+                status="warning",
+                message=f"{platform.title()} API credentials are missing or incomplete. Please reconnect your {platform.title()} store in the Integrations page.",
                 merchant_id=request.merchant_id,
                 platform=platform,
-                products_synced=demo_count,
+                products_synced=0,
                 sync_time=datetime.now().isoformat(),
-                demo_mode=True
+                demo_mode=False
             )
         
         # 4. Fetch products using the universal adapter
@@ -229,38 +228,6 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
     return None
 
 
-async def create_demo_products(merchant_id: str, platform: str) -> int:
-    """Create demo products for testing"""
-    demo_products = [
-        {
-            "id": f"demo_{platform}_1",
-            "title": f"Demo {platform.title()} Product 1",
-            "price": 29.99,
-            "inventory_quantity": 100,
-            "platform": platform
-        },
-        {
-            "id": f"demo_{platform}_2",
-            "title": f"Demo {platform.title()} Product 2",
-            "price": 49.99,
-            "inventory_quantity": 50,
-            "platform": platform
-        }
-    ]
-    
-    for product in demo_products:
-        try:
-            await upsert_product_cache(
-                merchant_id=merchant_id,
-                platform=platform,
-                platform_product_id=product["id"],
-                product_data=product,
-                ttl_seconds=3600  # 1 hour for demo products
-            )
-        except Exception as e:
-            logger.error(f"Failed to create demo product: {e}")
-    
-    return len(demo_products)
 
 
 async def update_sync_status(store_id: Optional[str], product_count: int):
