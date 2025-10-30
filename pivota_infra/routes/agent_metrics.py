@@ -30,6 +30,7 @@ async def get_metrics_summary(
         last_hour = now - timedelta(hours=1)
         last_24h = now - timedelta(hours=24)
         last_7d = now - timedelta(days=7)
+        last_30d = now - timedelta(days=30)
         
         # Resolve agent_id from JWT or X-API-Key
         agent_id = None
@@ -111,6 +112,16 @@ async def get_metrics_summary(
             {"since": last_24h, "agent_id": agent_id}
         ) or 0
         
+        # Revenue (last 30d) for this agent (paid only)
+        revenue_30d = await database.fetch_val(
+            """SELECT COALESCE(SUM(total), 0) FROM orders 
+               WHERE created_at >= :since 
+                 AND (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND payment_status = 'paid'
+                 AND agent_id = :agent_id""",
+            {"since": last_30d, "agent_id": agent_id}
+        ) or 0
+        
         # Total orders (all time) for this agent
         total_orders = await database.fetch_val(
             """SELECT COUNT(*) FROM orders 
@@ -165,6 +176,8 @@ async def get_metrics_summary(
                 # Last 24h metrics
                 "count_last_24h": orders_count_24h,
                 "revenue_last_24h": float(revenue_24h),
+                # Last 30d metrics
+                "revenue_last_30d": float(revenue_30d),
                 # All-time metrics (for dashboard calculations)
                 "total_orders": total_orders,
                 "total_paid_orders": total_paid_orders,
