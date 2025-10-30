@@ -3,7 +3,6 @@ Unified Merchant Store Service
 Provides consistent access to merchant store data across old and new systems
 """
 
-from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from typing import List, Dict, Any, Optional
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
