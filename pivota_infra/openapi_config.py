@@ -52,21 +52,13 @@ Base URL: `https://api.pivota.com/v1`
 | 429 | Too Many Requests - Rate limit exceeded |
 | 500 | Internal Server Error |
 | 503 | Service Unavailable - Temporary outage |
-
-## Support
-- Documentation: https://docs.pivota.com
-- Email: support@pivota.com
-- Status Page: https://status.pivota.com
             """,
-            "termsOfService": "https://pivota.com/terms",
             "contact": {
-                "name": "Pivota Support",
-                "email": "support@pivota.com",
-                "url": "https://pivota.com/support"
+                "name": "Pivota Team",
+                "email": "team@pivota.cc"
             },
             "license": {
-                "name": "Proprietary",
-                "url": "https://pivota.com/license"
+                "name": "Proprietary"
             },
             "x-logo": {
                 "url": "https://pivota.com/logo.png",
@@ -75,12 +67,12 @@ Base URL: `https://api.pivota.com/v1`
         },
         "servers": [
             {
-                "url": "https://api.pivota.com",
-                "description": "Production server"
+                "url": "https://web-production-fedb.up.railway.app",
+                "description": "Production API server"
             },
             {
-                "url": "https://staging-api.pivota.com",
-                "description": "Staging server"
+                "url": "http://localhost:8000",
+                "description": "Local development server"
             }
         ],
         "security": [
