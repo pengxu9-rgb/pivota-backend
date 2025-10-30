@@ -156,6 +156,8 @@ except ImportError:
 from utils.logger import logger
 from config.settings import settings
 
+from openapi_config import get_custom_openapi_schema
+
 app = FastAPI(
     title="Pivota Infra Dashboard", 
     version="0.2",
@@ -164,6 +166,16 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
+
+# Override OpenAPI schema with our custom, investor-ready version
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_custom_openapi_schema()
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 
 # CORS middleware - Allow Lovable origins
 app.add_middleware(
@@ -374,7 +386,7 @@ async def startup():
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -787,8 +799,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
@@ -819,6 +831,69 @@ async def root():
         "status": "healthy",
         "db_status": db_status,
         "timestamp": time.time(),
+        "health": "OK"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Dedicated health check endpoint"""
+    return {"status": "ok", "timestamp": time.time()}
+
+@app.get("/operations", response_class=HTMLResponse)
+async def operations_dashboard():
+    """Serve the operations dashboard"""
+    try:
+        with open("templates/operations_dashboard.html", "r") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    from config.settings import settings
+    
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "database": "connected",
+        "config_check": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+        }
+    }
+
+@app.get("/config-check")
+async def config_check():
+    """Public endpoint to check environment variable configuration (no auth required)"""
+    from config.settings import settings
+    
+    return {
+        "status": "success",
+        "message": "Environment variable configuration check",
+        "config": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
+            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
+            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
+            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
+            "metrics_query_version": settings.metrics_query_version,
+            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+        },
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
+
+
         "health": "OK"
     }
 
