@@ -156,7 +156,14 @@ except ImportError:
 from utils.logger import logger
 from config.settings import settings
 
-app = FastAPI(title="Pivota Infra Dashboard", version="0.2")
+app = FastAPI(
+    title="Pivota Infra Dashboard", 
+    version="0.2",
+    description="Pivota Infrastructure API with comprehensive payment processing and agent SDK support",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
 
 # CORS middleware - Allow Lovable origins
 app.add_middleware(
@@ -367,7 +374,7 @@ async def startup():
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
-        await database.connect()
+    await database.connect()
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -780,8 +787,8 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await database.disconnect()
-        logger.info("Database disconnected")
+    await database.disconnect()
+    logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
