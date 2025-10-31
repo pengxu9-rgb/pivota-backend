@@ -62,6 +62,7 @@ class CreateOrderRequest(BaseModel):
     """创建订单请求"""
     merchant_id: str
     customer_email: str
+    customer_name: Optional[str] = None  # Customer name (optional)
     items: List[OrderItem]
     shipping_address: ShippingAddress
     currency: str = "USD"
