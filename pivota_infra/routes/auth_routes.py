@@ -14,6 +14,9 @@ from datetime import datetime, timedelta
 import os
 # Supabase logic removed. Using in-memory store for development/testing.
 
+# Database import for employee authentication
+from db.database import database
+
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
 
