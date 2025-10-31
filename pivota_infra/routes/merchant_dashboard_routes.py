@@ -523,7 +523,21 @@ async def get_merchant_analytics(
     except Exception as e:
         logger.error(f"Error fetching analytics for {merchant_id}: {e}")
         import traceback
-        traceback.print_exc()
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Try to at least get product count even if analytics query failed
+        try:
+            products_query = """
+                SELECT COUNT(*) as count 
+                FROM products_cache 
+                WHERE merchant_id = :merchant_id 
+                AND (expires_at IS NULL OR expires_at > NOW())
+            """
+            products_count = await database.fetch_one(products_query, {"merchant_id": merchant_id})
+            total_products = products_count["count"] if products_count else 0
+        except:
+            total_products = 0
+        
         # Return empty/zero stats instead of random data
         return {
             "status": "success",
@@ -531,7 +545,7 @@ async def get_merchant_analytics(
                 "total_orders": 0,
                 "total_revenue": 0.0,
                 "total_customers": 0,
-                "total_products": 0,
+                "total_products": total_products,  # At least get this right
                 "average_order_value": 0.0,
                 "order_growth": 0,
                 "revenue_growth": 0,
