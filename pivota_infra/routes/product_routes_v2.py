@@ -51,9 +51,7 @@ async def get_merchant_products_v2(
     try:
         logger.info(f"Fetching products for merchant {merchant_id}, platform={platform}")
         
-        # Build query - use text() with bindparams for limit/offset
-        from sqlalchemy import text
-        
+        # Build query - use raw string queries
         query_conditions = ["merchant_id = :merchant_id"]
         query_params = {"merchant_id": merchant_id}
         
@@ -67,16 +65,16 @@ async def get_merchant_products_v2(
         where_clause = " AND ".join(query_conditions)
         
         # Get total count
-        count_query = text(f"""
+        count_query = f"""
             SELECT COUNT(*) as total
             FROM products_cache
             WHERE {where_clause}
-        """)
+        """
         count_result = await database.fetch_one(count_query, query_params)
         total = count_result["total"] if count_result else 0
         
-        # Get products - use string formatting for LIMIT/OFFSET to avoid binding issues
-        products_query = text(f"""
+        # Get products - use direct formatting for LIMIT/OFFSET (safe because they're validated integers)
+        products_query = f"""
             SELECT 
                 product_data,
                 platform,
@@ -86,7 +84,7 @@ async def get_merchant_products_v2(
             WHERE {where_clause}
             ORDER BY platform, cached_at DESC
             LIMIT {limit} OFFSET {offset}
-        """)
+        """
         
         rows = await database.fetch_all(products_query, query_params)
         
