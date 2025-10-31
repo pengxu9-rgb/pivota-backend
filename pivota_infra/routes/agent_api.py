@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
 import json
+import time
 
 from models.order import CreateOrderRequest, OrderResponse
 from models.standard_product import StandardProduct
@@ -418,7 +419,15 @@ async def agent_create_order(
     创建订单（代理标准订单创建流程）
     
     自动添加 Agent 追踪信息
+    集成 Agent Governance 治理检查
     """
+    # STEP 1: Governance validation (before main logic)
+    from services.agent_governance import agent_governance
+    await agent_governance.validate_request(context.agent_id)
+    
+    start_time = time.time()
+    success = False
+    
     try:
         # 验证商户访问权限
         if not context.can_access_merchant(order_request.merchant_id):
@@ -454,8 +463,11 @@ async def agent_create_order(
             order_amount=order_amount
         )
         
+        # STEP 3: Record governance metrics (success)
+        success = True
+        
         # 返回简化的响应给 Agent
-        return {
+        response = {
             "status": "success",
             "order_id": order_response.order_id,
             "total": str(order_response.total),
@@ -471,7 +483,10 @@ async def agent_create_order(
             }
         }
         
+        return response
+        
     except HTTPException as e:
+        success = False
         await log_agent_request(
             context=context,
             status_code=e.status_code,
@@ -480,6 +495,7 @@ async def agent_create_order(
         )
         raise
     except Exception as e:
+        success = False
         logger.error(f"Agent order creation error: {e}")
         await log_agent_request(
             context=context,
@@ -488,6 +504,14 @@ async def agent_create_order(
             error_message=str(e)
         )
         raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
+    finally:
+        # STEP 3: Record governance metrics (always executed)
+        latency_ms = int((time.time() - start_time) * 1000)
+        await agent_governance.record_response(
+            agent_id=context.agent_id,
+            latency_ms=latency_ms,
+            success=success
+        )
 
 
 @router.post("/orders/{order_id}/confirm-payment")
