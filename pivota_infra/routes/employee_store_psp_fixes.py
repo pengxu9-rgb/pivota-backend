@@ -154,22 +154,8 @@ async def connect_shopify_store_employee(
                 }
             )
         
-        # Also update merchant_onboarding MCP fields for backward compatibility
-        await database.execute(
-            """UPDATE merchant_onboarding 
-               SET 1 = 1,
-                   mcp_platform = 'shopify',
-                   mcp_shop_domain = :shop_domain,
-                   mcp_access_token = :access_token,
-                   updated_at = :updated_at
-               WHERE merchant_id = :merchant_id""",
-            {
-                "shop_domain": request.shop_domain,
-                "access_token": request.access_token,
-                "updated_at": datetime.now(),
-                "merchant_id": request.merchant_id
-            }
-        )
+        # Legacy MCP fields have been migrated to merchant_stores table
+        # No need to update merchant_onboarding anymore
         
         return {
             "status": "success",
@@ -301,22 +287,8 @@ async def connect_wix_store_employee(
                 }
             )
         
-        # Also update merchant_onboarding MCP fields for backward compatibility
-        await database.execute(
-            """UPDATE merchant_onboarding 
-               SET 1 = 1,
-                   mcp_platform = 'wix',
-                   mcp_shop_domain = :site_id,
-                   mcp_access_token = :api_key,
-                   updated_at = :updated_at
-               WHERE merchant_id = :merchant_id""",
-            {
-                "site_id": request.site_id,
-                "api_key": request.api_key,
-                "updated_at": datetime.now(),
-                "merchant_id": request.merchant_id
-            }
-        )
+        # Legacy MCP fields have been migrated to merchant_stores table
+        # No need to update merchant_onboarding anymore
         
         return {
             "status": "success",
