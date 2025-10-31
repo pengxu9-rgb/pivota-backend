@@ -52,6 +52,7 @@ async def get_psp_overview(
             FROM merchant_psps mp
             LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
                 AND o.created_at >= :start_time
+                AND (o.psp_id = mp.psp_id OR o.psp_used = mp.provider)
             WHERE mp.status = 'active'
             GROUP BY mp.provider, mp.status
         ),
