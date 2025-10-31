@@ -110,6 +110,7 @@ from routes.sync_all_platforms import router as sync_all_router
 # from routes.public_products_temp import router as public_products_router
 from routes.product_sync_monitoring import router as product_monitoring_router
 from routes.admin_reset_employee import router as admin_reset_employee_router
+from routes.admin_cleanup_duplicates import router as admin_cleanup_duplicates_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -252,6 +253,7 @@ app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_reset_employee_router)  # Admin employee password reset
+app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplicate data
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
