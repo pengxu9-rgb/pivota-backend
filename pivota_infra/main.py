@@ -106,7 +106,7 @@ from routes.product_sync import router as product_sync_router
 from routes.universal_product_sync import router as universal_sync_router
 from routes.sync_all_platforms import router as sync_all_router
 from routes.products_no_auth import router as products_debug_router
-from routes.test_public_products import router as public_products_router
+from routes.public_products_temp import router as public_products_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
