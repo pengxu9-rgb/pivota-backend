@@ -146,6 +146,22 @@ async def get_psp_overview(
                 "activity_status": row["activity_status"]
             })
         
+        # Calculate weighted average success rate (by transaction volume)
+        total_transactions = sum(p["transactions_today"] for p in psp_list)
+        if total_transactions > 0:
+            # Weighted average: (success_rate * transactions) / total_transactions
+            weighted_success = sum(
+                p["success_rate"] * p["transactions_today"] 
+                for p in psp_list
+            ) / total_transactions
+            avg_success_rate = round(weighted_success, 2)
+        else:
+            # No transactions - calculate simple average of PSPs with transactions
+            psps_with_txns = [p for p in psp_list if p["transactions_today"] > 0]
+            avg_success_rate = round(
+                sum(p["success_rate"] for p in psps_with_txns) / len(psps_with_txns), 2
+            ) if psps_with_txns else 0
+        
         return {
             "psps": psp_list,
             "summary": {
@@ -153,9 +169,9 @@ async def get_psp_overview(
                 "healthy_psps": len([p for p in psp_list if p["health_status"] == "healthy"]),
                 "degraded_psps": len([p for p in psp_list if p["health_status"] == "degraded"]),
                 "critical_psps": len([p for p in psp_list if p["health_status"] == "critical"]),
-                "total_transactions": sum(p["transactions_today"] for p in psp_list),
+                "total_transactions": total_transactions,
                 "total_volume": sum(p["total_volume"] for p in psp_list),
-                "avg_success_rate": round(sum(p["success_rate"] for p in psp_list) / len(psp_list), 2) if psp_list else 0
+                "avg_success_rate": avg_success_rate  # Now weighted by transaction volume
             },
             "time_range": time_range,
             "generated_at": datetime.utcnow().isoformat()
