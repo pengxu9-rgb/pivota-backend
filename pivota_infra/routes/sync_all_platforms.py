@@ -184,3 +184,4 @@ async def sync_all_platforms(
             total_products=0,
             sync_time=datetime.now().isoformat()
         )
+

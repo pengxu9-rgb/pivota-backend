@@ -200,3 +200,4 @@ async def auto_fix_consistency(merchant_id: str):
     except Exception as e:
         logger.error(f"Auto-fix failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+

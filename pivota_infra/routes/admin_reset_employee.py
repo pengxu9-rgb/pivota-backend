@@ -117,3 +117,4 @@ async def list_all_employees():
         }
     except Exception as e:
         return {"error": str(e), "employees": []}
+

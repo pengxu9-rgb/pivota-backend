@@ -1,13 +1,15 @@
 """
 Agent Product Browsing API
-Allows agents to view merchant's Shopify products for order creation
+Allows agents to view merchant products via hybrid query (cache or realtime)
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from services.product_query_service import get_products_hybrid, log_query_source
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional, Dict, Any
 import httpx
 import logging
+import time
 
 from routes.agent_api import get_agent_context, AgentContext, log_agent_request
 from routes.merchant_onboarding_routes import get_merchant_onboarding
@@ -25,93 +27,95 @@ async def get_merchant_products(
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
-    Get merchant's Shopify products for order creation
+    Get merchant products via hybrid query (cache or realtime merchant API)
     
-    Returns real products with variant_ids for proper inventory management
+    Automatically decides between:
+    - Cached products (fast, <100ms)
+    - Realtime merchant API (if configured, <1s)
+    
+    Returns unified format regardless of source
     """
+    start_time = time.time()
+    
     try:
         # Verify agent has access to this merchant
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
-        # Get merchant info
-        merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found")
+        # Use hybrid query service (decides cache vs realtime)
+        products, query_source, error = await get_products_hybrid(
+            merchant_id=merchant_id,
+            limit=limit,
+            agent_id=context.agent_id,
+            background_tasks=background_tasks
+        )
         
-        # Check if merchant has connected Shopify
-        if not True or store_info.get("platform") != "shopify":
-            raise HTTPException(
-                status_code=400, 
-                detail="Merchant has not connected Shopify store"
-            )
+        if error and not products:
+            # Both realtime and cache failed
+            raise HTTPException(status_code=502, detail=f"Failed to fetch products: {error}")
         
-        shop_domain = store_info.get("domain")
-        access_token = store_info.get("api_key")
+        # Calculate response time
+        response_time_ms = int((time.time() - start_time) * 1000)
         
-        if not shop_domain or not access_token:
-            raise HTTPException(status_code=400, detail="Missing Shopify credentials")
+        # Log query with source tracking
+        log_query_source(
+            agent_id=context.agent_id,
+            merchant_id=merchant_id,
+            endpoint="/agent/v1/products/merchants/{merchant_id}",
+            query_source=query_source,
+            response_time_ms=response_time_ms,
+            product_count=len(products)
+        )
         
-        logger.info(f"Fetching products from Shopify store: {shop_domain}")
-        
-        # Fetch products from Shopify
-        url = f"https://{shop_domain}/admin/api/2024-01/products.json"
-        params = {"limit": limit, "status": "active"}
-        headers = {
-            "X-Shopify-Access-Token": access_token,
-            "Content-Type": "application/json"
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params, headers=headers, timeout=15.0)
-            
-            if response.status_code != 200:
-                logger.error(f"Shopify API error: {response.status_code} - {response.text[:200]}")
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to fetch products from Shopify: {response.status_code}"
-                )
-            
-            shopify_data = response.json()
-            products = shopify_data.get("products", [])
-            
-            logger.info(f"Retrieved {len(products)} products from Shopify")
-            
-            # Transform to agent-friendly format
-            agent_products = []
-            for product in products:
-                # Get all variants
-                variants = product.get("variants", [])
-                
-                for variant in variants:
+        # Transform StandardProduct to agent-friendly format
+        agent_products = []
+        for product in products:
+            # Handle variants (if exists) or create default variant
+            if product.variants and len(product.variants) > 0:
+                for variant in product.variants:
                     agent_products.append({
-                        "product_id": str(product["id"]),
-                        "variant_id": str(variant["id"]),
-                        "title": product["title"],
-                        "variant_title": variant.get("title", "Default"),
-                        "price": float(variant.get("price", 0)),
-                        "sku": variant.get("sku"),
-                        "inventory_quantity": variant.get("inventory_quantity", 0),
-                        "available": variant.get("inventory_quantity", 0) > 0,
-                        "image_url": product.get("image", {}).get("src") if product.get("image") else None,
-                        "currency": merchant.get("currency", "USD")
+                        "product_id": product.id,
+                        "variant_id": variant.id,
+                        "title": product.title,
+                        "variant_title": variant.title,
+                        "price": variant.price,
+                        "sku": variant.sku,
+                        "inventory_quantity": variant.inventory_quantity,
+                        "available": variant.inventory_quantity > 0,
+                        "image_url": variant.image_url or product.image_url,
+                        "currency": product.currency
                     })
-            
-            # Log request
-            background_tasks.add_task(
-                log_agent_request,
-                context=context,
-                status_code=200,
-                merchant_id=merchant_id
-            )
-            
-            return {
-                "status": "success",
-                "merchant_id": merchant_id,
-                "store": shop_domain,
-                "total_products": len(agent_products),
-                "products": agent_products
-            }
+            else:
+                # No variants - single product
+                agent_products.append({
+                    "product_id": product.id,
+                    "variant_id": product.id,  # Use product_id as variant_id
+                    "title": product.title,
+                    "variant_title": "Default",
+                    "price": product.price,
+                    "sku": product.sku,
+                    "inventory_quantity": product.inventory_quantity,
+                    "available": product.inventory_quantity > 0,
+                    "image_url": product.image_url,
+                    "currency": product.currency
+                })
+        
+        # Log request for analytics
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=merchant_id
+        )
+        
+        return {
+            "status": "success",
+            "merchant_id": merchant_id,
+            "query_source": query_source,  # NEW: indicate data source
+            "total_products": len(agent_products),
+            "products": agent_products,
+            "response_time_ms": response_time_ms  # NEW: performance metric
+        }
             
     except HTTPException:
         raise

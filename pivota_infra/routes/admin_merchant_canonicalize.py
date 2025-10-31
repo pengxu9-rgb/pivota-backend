@@ -153,3 +153,4 @@ async def canonicalize_merchants(payload: CanonicalizeRequest):
     except Exception as e:
         logger.error(f"Canonicalization failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+

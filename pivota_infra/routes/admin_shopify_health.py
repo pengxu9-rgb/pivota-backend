@@ -115,3 +115,4 @@ async def shopify_health(merchant_id: str):
     except Exception as e:
         logger.error(f"Shopify health failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
