@@ -105,8 +105,10 @@ from routes.product_routes_v2 import router as product_router_v2
 from routes.product_sync import router as product_sync_router
 from routes.universal_product_sync import router as universal_sync_router
 from routes.sync_all_platforms import router as sync_all_router
-from routes.products_no_auth import router as products_debug_router
-from routes.public_products_temp import router as public_products_router
+# Temporary debug endpoints removed - v2 endpoint is now stable
+# from routes.products_no_auth import router as products_debug_router
+# from routes.public_products_temp import router as public_products_router
+from routes.product_sync_monitoring import router as product_monitoring_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -306,8 +308,10 @@ app.include_router(product_sync_router)  # Product sync from platforms (legacy)
 app.include_router(product_router)  # Product management - MUST be after v2 to avoid /{merchant_id} matching /v2/xxx
 app.include_router(universal_sync_router)
 app.include_router(sync_all_router)  # Universal product sync (new)
-app.include_router(products_debug_router)  # Debug products endpoint (no auth)
-app.include_router(public_products_router)  # Public test endpoint
+app.include_router(product_monitoring_router)  # Product sync monitoring and metrics
+# Temporary debug endpoints commented out - v2 is stable now
+# app.include_router(products_debug_router)  # Debug products endpoint (no auth)
+# app.include_router(public_products_router)  # Public test endpoint
 app.include_router(order_router)  # Order processing
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
