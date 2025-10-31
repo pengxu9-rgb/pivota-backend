@@ -1,6 +1,6 @@
 """
 MCP End-to-End Integration Test
-Validates complete merchant commerce pipeline: Store → Products → Inventory → Orders → Payment
+Validates complete merchant commerce pipeline: ALL Stores → Products → Inventory → Orders → ALL PSPs
 """
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -36,30 +36,23 @@ async def run_mcp_e2e_test(
 ):
     """
     Run comprehensive MCP integration test covering:
-    1. Store connectivity (Shopify/Wix/etc)
-    2. Product sync capability
-    3. Inventory query
-    4. Order creation
-    5. Payment processing readiness
+    1. ALL Store connectivity (Shopify, Wix, WooCommerce, BigCommerce, etc.)
+    2. Product sync status per platform
+    3. Inventory data availability
+    4. Order processing capability
+    5. ALL Payment processors readiness
     """
     start_time = datetime.now()
     tests: List[MCPTestResult] = []
     
     try:
-        # Test 1: Store Connectivity
-        store_test = await _test_store_connectivity(merchant_id)
-        tests.append(store_test)
+        # Test 1: ALL Stores Connectivity
+        stores_test = await _test_all_stores_connectivity(merchant_id)
+        tests.append(stores_test)
         
-        # Test 2: Product Sync (only if store connected)
-        if store_test.status == "success":
-            product_test = await _test_product_sync(merchant_id, store_test.details)
-            tests.append(product_test)
-        else:
-            tests.append(MCPTestResult(
-                component="Product Sync",
-                status="skipped",
-                message="Skipped due to store connectivity failure"
-            ))
+        # Test 2: Product Sync per platform
+        product_test = await _test_product_sync_by_platform(merchant_id)
+        tests.append(product_test)
         
         # Test 3: Inventory Query
         inventory_test = await _test_inventory_query(merchant_id)
@@ -69,8 +62,8 @@ async def run_mcp_e2e_test(
         order_test = await _test_order_capability(merchant_id)
         tests.append(order_test)
         
-        # Test 5: Payment Integration
-        payment_test = await _test_payment_integration(merchant_id)
+        # Test 5: ALL Payment Integrations
+        payment_test = await _test_all_payment_integrations(merchant_id)
         tests.append(payment_test)
         
         # Calculate summary
@@ -105,197 +98,62 @@ async def run_mcp_e2e_test(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _test_store_connectivity(merchant_id: str) -> MCPTestResult:
-    """Test 1: Store API connectivity"""
+async def _test_all_stores_connectivity(merchant_id: str) -> MCPTestResult:
+    """Test 1: Test ALL connected stores (Shopify, Wix, WooCommerce, etc.)"""
     start = datetime.now()
     try:
-        # Get connected stores
+        # Get ALL connected stores
         stores_query = """
-            SELECT store_id, platform, domain, api_key, status
+            SELECT store_id, platform, domain, name, api_key, status
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
             AND status IN ('active', 'connected')
-            ORDER BY connected_at DESC
-            LIMIT 1
+            ORDER BY platform, connected_at DESC
         """
-        store = await database.fetch_one(stores_query, {"merchant_id": merchant_id})
+        stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
         
-        if not store:
+        if not stores or len(stores) == 0:
             return MCPTestResult(
                 component="Store Connectivity",
                 status="error",
-                message="No store connected. Please connect your store in Integrations.",
+                message="No stores connected. Please connect your stores in Integrations.",
                 latency_ms=(datetime.now() - start).microseconds // 1000
             )
         
-        platform = store["platform"]
-        domain = store["domain"]
-        api_key = store["api_key"]
-        
-        # Platform-specific connectivity test
-        if platform == "shopify":
-            if not domain or not api_key:
-                return MCPTestResult(
-                    component="Store Connectivity",
-                    status="error",
-                    message=f"Shopify credentials incomplete (domain={bool(domain)}, token={bool(api_key)})",
-                    latency_ms=(datetime.now() - start).microseconds // 1000
-                )
+        # Test each store
+        store_results = []
+        for store in stores:
+            platform = store["platform"]
+            domain = store["domain"]
+            api_key = store["api_key"]
+            name = store["name"]
             
-            # Test Shopify API
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        f"https://{domain}/admin/api/2023-10/shop.json",
-                        headers={"X-Shopify-Access-Token": api_key}
-                    )
-                    if resp.status_code == 200:
-                        shop_data = resp.json().get("shop", {})
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="success",
-                            message=f"Shopify store connected: {shop_data.get('name', domain)}",
-                            details={"platform": platform, "domain": domain, "shop_name": shop_data.get("name")},
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-                    else:
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="error",
-                            message=f"Shopify API returned {resp.status_code}: {resp.text[:200]}",
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-            except Exception as e:
-                return MCPTestResult(
-                    component="Store Connectivity",
-                    status="error",
-                    message=f"Shopify API unreachable: {str(e)}",
-                    latency_ms=(datetime.now() - start).microseconds // 1000
-                )
+            store_test = await _test_single_store_api(platform, domain, api_key, name)
+            store_results.append(store_test)
         
-        elif platform == "wix":
-            # Wix connectivity test
-            if not domain or not api_key:
-                return MCPTestResult(
-                    component="Store Connectivity",
-                    status="error",
-                    message=f"Wix credentials incomplete (site_id={bool(domain)}, api_key={bool(api_key)})",
-                    latency_ms=(datetime.now() - start).microseconds // 1000
-                )
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(
-                        "https://www.wixapis.com/stores/v1/products/query",
-                        json={"query": {"limit": 1}},
-                        headers={"Authorization": api_key, "wix-site-id": domain}
-                    )
-                    if resp.status_code in [200, 401, 403]:  # 401/403 means auth reached server
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="success" if resp.status_code == 200 else "warning",
-                            message=f"Wix store reachable: {domain}" + (f" (HTTP {resp.status_code})" if resp.status_code != 200 else ""),
-                            details={"platform": platform, "domain": domain},
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-                    else:
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="error",
-                            message=f"Wix API returned {resp.status_code}",
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-            except Exception as e:
-                return MCPTestResult(
-                    component="Store Connectivity",
-                    status="error",
-                    message=f"Wix API unreachable: {str(e)}",
-                    latency_ms=(datetime.now() - start).microseconds // 1000
-                )
+        # Aggregate
+        success_count = len([r for r in store_results if r["status"] == "success"])
+        warning_count = len([r for r in store_results if r["status"] == "warning"])
+        error_count = len([r for r in store_results if r["status"] == "error"])
         
-        elif platform == "woocommerce":
-            # WooCommerce connectivity test
-            try:
-                creds = api_key.split(":", 1) if ":" in api_key else [api_key, ""]
-                consumer_key, consumer_secret = (creds[0], creds[1]) if len(creds) == 2 else (api_key, "")
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        f"{domain.rstrip('/')}/wp-json/wc/v3/system_status",
-                        auth=(consumer_key, consumer_secret)
-                    )
-                    if resp.status_code == 200:
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="success",
-                            message=f"WooCommerce store connected: {domain}",
-                            details={"platform": platform, "domain": domain},
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-                    else:
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="warning",
-                            message=f"WooCommerce reachable but auth may need review (HTTP {resp.status_code})",
-                            details={"platform": platform, "domain": domain},
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-            except Exception as e:
-                return MCPTestResult(
-                    component="Store Connectivity",
-                    status="error",
-                    message=f"WooCommerce unreachable: {str(e)}",
-                    latency_ms=(datetime.now() - start).microseconds // 1000
-                )
+        overall_status = "success" if success_count == len(stores) else ("warning" if error_count == 0 else "error")
         
-        elif platform == "bigcommerce":
-            # BigCommerce connectivity test
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        f"https://api.bigcommerce.com/stores/{domain}/v3/catalog/summary",
-                        headers={"X-Auth-Token": api_key}
-                    )
-                    if resp.status_code == 200:
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="success",
-                            message=f"BigCommerce store connected: {domain}",
-                            details={"platform": platform, "domain": domain},
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-                    else:
-                        return MCPTestResult(
-                            component="Store Connectivity",
-                            status="warning",
-                            message=f"BigCommerce reachable but returned {resp.status_code}",
-                            details={"platform": platform, "domain": domain},
-                            latency_ms=(datetime.now() - start).microseconds // 1000
-                        )
-            except Exception as e:
-                return MCPTestResult(
-                    component="Store Connectivity",
-                    status="error",
-                    message=f"BigCommerce unreachable: {str(e)}",
-                    latency_ms=(datetime.now() - start).microseconds // 1000
-                )
+        # Build message
+        platform_list = ', '.join([f"{r['platform']}({r['status'][:1].upper()})" for r in store_results])
         
-        elif platform in ["prestashop", "square", "magento"]:
-            # Generic platform connectivity (no deep API test, just record presence)
-            return MCPTestResult(
-                component="Store Connectivity",
-                status="success",
-                message=f"{platform.title()} store connected: {domain}",
-                details={"platform": platform, "domain": domain},
-                latency_ms=(datetime.now() - start).microseconds // 1000
-            )
-        
-        else:
-            return MCPTestResult(
-                component="Store Connectivity",
-                status="warning",
-                message=f"{platform.title()} store connected but detailed test not available",
-                details={"platform": platform, "domain": domain},
-                latency_ms=(datetime.now() - start).microseconds // 1000
-            )
+        return MCPTestResult(
+            component="Store Connectivity",
+            status=overall_status,
+            message=f"{len(stores)} store(s) tested: {platform_list}",
+            details={
+                "total_stores": len(stores),
+                "success": success_count,
+                "warning": warning_count,
+                "error": error_count,
+                "stores": store_results
+            },
+            latency_ms=(datetime.now() - start).microseconds // 1000
+        )
             
     except Exception as e:
         logger.error(f"Store connectivity test failed: {e}")
@@ -307,38 +165,218 @@ async def _test_store_connectivity(merchant_id: str) -> MCPTestResult:
         )
 
 
-async def _test_product_sync(merchant_id: str, store_details: Optional[Dict]) -> MCPTestResult:
-    """Test 2: Product sync capability"""
+async def _test_single_store_api(platform: str, domain: str, api_key: str, name: str) -> Dict[str, Any]:
+    """Test a single store's API connectivity"""
+    try:
+        if platform == "shopify":
+            if not domain or not api_key:
+                return {
+                    "platform": "Shopify",
+                    "name": name,
+                    "domain": domain,
+                    "status": "error",
+                    "message": "Credentials incomplete"
+                }
+            
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"https://{domain}/admin/api/2023-10/shop.json",
+                        headers={"X-Shopify-Access-Token": api_key}
+                    )
+                    if resp.status_code == 200:
+                        shop_data = resp.json().get("shop", {})
+                        return {
+                            "platform": "Shopify",
+                            "name": shop_data.get("name", name),
+                            "domain": domain,
+                            "status": "success",
+                            "message": "Connected & reachable"
+                        }
+                    else:
+                        return {
+                            "platform": "Shopify",
+                            "name": name,
+                            "domain": domain,
+                            "status": "error",
+                            "message": f"API error {resp.status_code}"
+                        }
+            except Exception as e:
+                return {
+                    "platform": "Shopify",
+                    "name": name,
+                    "domain": domain,
+                    "status": "error",
+                    "message": f"Unreachable: {str(e)[:50]}"
+                }
+        
+        elif platform == "wix":
+            if not domain or not api_key:
+                return {
+                    "platform": "Wix",
+                    "name": name,
+                    "domain": domain,
+                    "status": "error",
+                    "message": "Credentials incomplete"
+                }
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(
+                        "https://www.wixapis.com/stores/v1/products/query",
+                        json={"query": {"limit": 1}},
+                        headers={"Authorization": api_key, "wix-site-id": domain}
+                    )
+                    if resp.status_code == 200:
+                        return {
+                            "platform": "Wix",
+                            "name": name,
+                            "domain": domain,
+                            "status": "success",
+                            "message": "Connected & reachable"
+                        }
+                    elif resp.status_code in [401, 403]:
+                        return {
+                            "platform": "Wix",
+                            "name": name,
+                            "domain": domain,
+                            "status": "warning",
+                            "message": f"Reachable but auth issue (HTTP {resp.status_code})"
+                        }
+                    else:
+                        return {
+                            "platform": "Wix",
+                            "name": name,
+                            "domain": domain,
+                            "status": "error",
+                            "message": f"API error {resp.status_code}"
+                        }
+            except Exception as e:
+                return {
+                    "platform": "Wix",
+                    "name": name,
+                    "domain": domain,
+                    "status": "error",
+                    "message": f"Unreachable: {str(e)[:50]}"
+                }
+        
+        elif platform == "woocommerce":
+            try:
+                creds = api_key.split(":", 1) if ":" in api_key else [api_key, ""]
+                consumer_key, consumer_secret = (creds[0], creds[1]) if len(creds) == 2 else (api_key, "")
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{domain.rstrip('/')}/wp-json/wc/v3/system_status",
+                        auth=(consumer_key, consumer_secret)
+                    )
+                    return {
+                        "platform": "WooCommerce",
+                        "name": name,
+                        "domain": domain,
+                        "status": "success" if resp.status_code == 200 else "warning",
+                        "message": f"Connected (HTTP {resp.status_code})"
+                    }
+            except Exception as e:
+                return {
+                    "platform": "WooCommerce",
+                    "name": name,
+                    "domain": domain,
+                    "status": "error",
+                    "message": f"Unreachable: {str(e)[:50]}"
+                }
+        
+        elif platform == "bigcommerce":
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"https://api.bigcommerce.com/stores/{domain}/v3/catalog/summary",
+                        headers={"X-Auth-Token": api_key}
+                    )
+                    return {
+                        "platform": "BigCommerce",
+                        "name": name,
+                        "domain": domain,
+                        "status": "success" if resp.status_code == 200 else "warning",
+                        "message": f"Connected (HTTP {resp.status_code})"
+                    }
+            except Exception as e:
+                return {
+                    "platform": "BigCommerce",
+                    "name": name,
+                    "domain": domain,
+                    "status": "error",
+                    "message": f"Unreachable: {str(e)[:50]}"
+                }
+        
+        else:
+            # Generic platform (PrestaShop, Square, Magento, etc.)
+            return {
+                "platform": platform.title(),
+                "name": name,
+                "domain": domain,
+                "status": "success",
+                "message": "Connected (detailed test not available)"
+            }
+            
+    except Exception as e:
+        return {
+            "platform": platform.title(),
+            "name": name or "Unknown",
+            "domain": domain or "Unknown",
+            "status": "error",
+            "message": str(e)[:100]
+        }
+
+
+async def _test_product_sync_by_platform(merchant_id: str) -> MCPTestResult:
+    """Test 2: Product sync capability - SEPARATED by platform"""
     start = datetime.now()
     try:
-        # Check products cache
+        # Get products count per platform
         cache_query = """
-            SELECT COUNT(*) as count, MAX(cached_at) as last_sync
+            SELECT 
+                platform,
+                COUNT(*) as count,
+                MAX(cached_at) as last_sync
             FROM products_cache
             WHERE merchant_id = :merchant_id
             AND (expires_at IS NULL OR expires_at > NOW())
+            GROUP BY platform
+            ORDER BY platform
         """
-        result = await database.fetch_one(cache_query, {"merchant_id": merchant_id})
+        results = await database.fetch_all(cache_query, {"merchant_id": merchant_id})
         
-        product_count = result["count"] if result else 0
-        last_sync = result["last_sync"] if result else None
-        
-        if product_count > 0:
-            return MCPTestResult(
-                component="Product Sync",
-                status="success",
-                message=f"{product_count} products synced from {store_details.get('platform', 'store') if store_details else 'store'}",
-                details={"product_count": product_count, "last_sync": str(last_sync)},
-                latency_ms=(datetime.now() - start).microseconds // 1000
-            )
-        else:
+        if not results or len(results) == 0:
             return MCPTestResult(
                 component="Product Sync",
                 status="warning",
                 message="No products synced yet. Run product sync to populate cache.",
-                details={"product_count": 0},
+                details={"platforms": []},
                 latency_ms=(datetime.now() - start).microseconds // 1000
             )
+        
+        # Build per-platform details
+        platform_details = []
+        total_products = 0
+        for row in results:
+            platform = row["platform"]
+            count = row["count"]
+            last_sync = row["last_sync"]
+            total_products += count
+            platform_details.append({
+                "platform": platform.title(),
+                "product_count": count,
+                "last_sync": str(last_sync) if last_sync else None
+            })
+        
+        platforms_str = ', '.join([f"{p['platform']}({p['product_count']})" for p in platform_details])
+        
+        return MCPTestResult(
+            component="Product Sync",
+            status="success",
+            message=f"{total_products} products across {len(results)} platform(s): {platforms_str}",
+            details={"platforms": platform_details, "total_products": total_products},
+            latency_ms=(datetime.now() - start).microseconds // 1000
+        )
             
     except Exception as e:
         logger.error(f"Product sync test failed: {e}")
@@ -360,7 +398,10 @@ async def _test_inventory_query(merchant_id: str) -> MCPTestResult:
             FROM products_cache
             WHERE merchant_id = :merchant_id
             AND (expires_at IS NULL OR expires_at > NOW())
-            AND product_data->>'inventory_quantity' IS NOT NULL
+            AND (
+                product_data->>'inventory_quantity' IS NOT NULL 
+                OR product_data->>'stock' IS NOT NULL
+            )
         """
         result = await database.fetch_one(inventory_query, {"merchant_id": merchant_id})
         
@@ -427,39 +468,54 @@ async def _test_order_capability(merchant_id: str) -> MCPTestResult:
         )
 
 
-async def _test_payment_integration(merchant_id: str) -> MCPTestResult:
-    """Test 5: Payment integration readiness"""
+async def _test_all_payment_integrations(merchant_id: str) -> MCPTestResult:
+    """Test 5: ALL Payment integrations readiness"""
     start = datetime.now()
     try:
-        # Check connected PSPs
+        # Check ALL connected PSPs
         psp_query = """
-            SELECT COUNT(*) as psp_count,
-                   STRING_AGG(DISTINCT provider, ', ') as providers
+            SELECT provider, name, status, account_id
             FROM merchant_psps
             WHERE merchant_id = :merchant_id
-            AND status = 'active'
+            ORDER BY provider
         """
-        result = await database.fetch_one(psp_query, {"merchant_id": merchant_id})
+        psps = await database.fetch_all(psp_query, {"merchant_id": merchant_id})
         
-        psp_count = result["psp_count"] if result else 0
-        providers = result["providers"] if result else None
-        
-        if psp_count > 0:
-            return MCPTestResult(
-                component="Payment Integration",
-                status="success",
-                message=f"{psp_count} PSP(s) connected: {providers}",
-                details={"psp_count": psp_count, "providers": providers},
-                latency_ms=(datetime.now() - start).microseconds // 1000
-            )
-        else:
+        if not psps or len(psps) == 0:
             return MCPTestResult(
                 component="Payment Integration",
                 status="warning",
                 message="No PSPs connected. Add payment processors in Integrations to accept payments.",
-                details={"psp_count": 0},
+                details={"psps": []},
                 latency_ms=(datetime.now() - start).microseconds // 1000
             )
+        
+        # Build PSP details
+        psp_details = []
+        active_count = 0
+        for psp in psps:
+            provider = psp["provider"]
+            name = psp["name"]
+            status = psp["status"]
+            if status == "active":
+                active_count += 1
+            psp_details.append({
+                "provider": provider.title(),
+                "name": name,
+                "status": status
+            })
+        
+        psps_str = ', '.join([f"{p['provider']}({p['status'][:1].upper()})" for p in psp_details])
+        
+        overall_status = "success" if active_count > 0 else "warning"
+        
+        return MCPTestResult(
+            component="Payment Integration",
+            status=overall_status,
+            message=f"{len(psps)} PSP(s) configured: {psps_str}",
+            details={"psps": psp_details, "total": len(psps), "active": active_count},
+            latency_ms=(datetime.now() - start).microseconds // 1000
+        )
             
     except Exception as e:
         logger.error(f"Payment integration test failed: {e}")
@@ -470,3 +526,71 @@ async def _test_payment_integration(merchant_id: str) -> MCPTestResult:
             latency_ms=(datetime.now() - start).microseconds // 1000
         )
 
+
+async def _test_single_store_api(platform: str, domain: str, api_key: str, name: str) -> Dict[str, Any]:
+    """Test a single store's API (returns dict for aggregation)"""
+    
+    if platform == "shopify":
+        if not domain or not api_key:
+            return {"platform": "Shopify", "name": name, "domain": domain, "status": "error", "message": "Incomplete credentials"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://{domain}/admin/api/2023-10/shop.json",
+                    headers={"X-Shopify-Access-Token": api_key}
+                )
+                if resp.status_code == 200:
+                    return {"platform": "Shopify", "name": name, "domain": domain, "status": "success", "message": "OK"}
+                else:
+                    return {"platform": "Shopify", "name": name, "domain": domain, "status": "error", "message": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"platform": "Shopify", "name": name, "domain": domain, "status": "error", "message": str(e)[:50]}
+    
+    elif platform == "wix":
+        if not domain or not api_key:
+            return {"platform": "Wix", "name": name, "domain": domain, "status": "error", "message": "Incomplete credentials"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    "https://www.wixapis.com/stores/v1/products/query",
+                    json={"query": {"limit": 1}},
+                    headers={"Authorization": api_key, "wix-site-id": domain}
+                )
+                if resp.status_code == 200:
+                    return {"platform": "Wix", "name": name, "domain": domain, "status": "success", "message": "OK"}
+                elif resp.status_code in [401, 403]:
+                    return {"platform": "Wix", "name": name, "domain": domain, "status": "warning", "message": f"Auth issue (HTTP {resp.status_code})"}
+                else:
+                    return {"platform": "Wix", "name": name, "domain": domain, "status": "error", "message": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"platform": "Wix", "name": name, "domain": domain, "status": "error", "message": str(e)[:50]}
+    
+    elif platform == "woocommerce":
+        try:
+            creds = api_key.split(":", 1) if ":" in api_key else [api_key, ""]
+            consumer_key, consumer_secret = (creds[0], creds[1]) if len(creds) == 2 else (api_key, "")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{domain.rstrip('/')}/wp-json/wc/v3/system_status",
+                    auth=(consumer_key, consumer_secret)
+                )
+                status = "success" if resp.status_code == 200 else "warning"
+                return {"platform": "WooCommerce", "name": name, "domain": domain, "status": status, "message": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"platform": "WooCommerce", "name": name, "domain": domain, "status": "error", "message": str(e)[:50]}
+    
+    elif platform == "bigcommerce":
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://api.bigcommerce.com/stores/{domain}/v3/catalog/summary",
+                    headers={"X-Auth-Token": api_key}
+                )
+                status = "success" if resp.status_code == 200 else "warning"
+                return {"platform": "BigCommerce", "name": name, "domain": domain, "status": status, "message": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"platform": "BigCommerce", "name": name, "domain": domain, "status": "error", "message": str(e)[:50]}
+    
+    else:
+        # Generic platform
+        return {"platform": platform.title(), "name": name, "domain": domain, "status": "success", "message": "Connected (no API test)"}
