@@ -33,13 +33,20 @@ async def get_merchant_products_v2(
     4. Proper authentication with merchant access control
     """
     # Check merchant access
-    logger.info(f"[V2] Fetching products for merchant {merchant_id}, user_role={current_user.get('role')}")
-    
-    if not can_access_merchant(current_user, merchant_id):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Not authorized. Your merchant_id: {current_user.get('merchant_id')}, Requested: {merchant_id}"
-        )
+    try:
+        logger.info(f"[V2] Fetching products for merchant {merchant_id}, user_role={current_user.get('role')}, user_merchant_id={current_user.get('merchant_id')}")
+        
+        if not can_access_merchant(current_user, merchant_id):
+            logger.warning(f"[V2] Access denied for user {current_user.get('email')}")
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not authorized. Your merchant_id: {current_user.get('merchant_id')}, Requested: {merchant_id}"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[V2] Error in access check: {e}")
+        raise HTTPException(status_code=500, detail=f"Access check failed: {str(e)}")
     
     try:
         logger.info(f"Fetching products for merchant {merchant_id}, platform={platform}")
@@ -119,7 +126,9 @@ async def get_merchant_products_v2(
         )
         
     except Exception as e:
-        logger.error(f"Error fetching products: {e}")
+        import traceback
+        logger.error(f"[V2] Error fetching products: {e}")
+        logger.error(f"[V2] Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to fetch products: {str(e)}"
