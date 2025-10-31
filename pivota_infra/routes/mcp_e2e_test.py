@@ -178,11 +178,20 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
                     "message": "Credentials incomplete"
                 }
             
+            # Parse token if it's JSON
+            token = api_key
+            try:
+                if isinstance(api_key, str) and api_key.strip().startswith("{"):
+                    parsed = json.loads(api_key)
+                    token = parsed.get("access_token") or parsed.get("token") or api_key
+            except:
+                pass
+            
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
                         f"https://{domain}/admin/api/2023-10/shop.json",
-                        headers={"X-Shopify-Access-Token": api_key}
+                        headers={"X-Shopify-Access-Token": token}
                     )
                     if resp.status_code == 200:
                         shop_data = resp.json().get("shop", {})

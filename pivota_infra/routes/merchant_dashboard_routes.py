@@ -505,8 +505,13 @@ async def get_merchant_analytics(
             "conversion_rate": round((analytics["successful_orders"] / analytics["total_orders"] * 100), 1) if analytics and analytics["total_orders"] > 0 else 0
         }
         
-        # Get actual product count from products_cache
-        products_query = "SELECT COUNT(*) as count FROM products_cache WHERE merchant_id = :merchant_id"
+        # Get actual product count from products_cache (only non-expired)
+        products_query = """
+            SELECT COUNT(*) as count 
+            FROM products_cache 
+            WHERE merchant_id = :merchant_id 
+            AND (expires_at IS NULL OR expires_at > NOW())
+        """
         products_count = await database.fetch_one(products_query, {"merchant_id": merchant_id})
         data["total_products"] = products_count["count"] if products_count else 0
         
