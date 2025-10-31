@@ -38,12 +38,11 @@ async def reset_employee_password(request: ResetPasswordRequest):
             
             await database.execute(
                 """INSERT INTO employees 
-                   (employee_id, name, email, password, role, department, status, created_at, updated_at)
-                   VALUES (:employee_id, :name, :email, :password, :role, :department, :status, NOW(), NOW())
+                   (employee_id, name, email, password, role, department, status, created_at)
+                   VALUES (:employee_id, :name, :email, :password, :role, :department, :status, NOW())
                    ON CONFLICT (email) DO UPDATE SET
                        password = :password,
-                       status = 'active',
-                       updated_at = NOW()
+                       status = 'active'
                 """,
                 {
                     "employee_id": f"emp_{request.email.split('@')[0]}",
@@ -70,8 +69,7 @@ async def reset_employee_password(request: ResetPasswordRequest):
             await database.execute(
                 """UPDATE employees 
                    SET password = :password, 
-                       status = 'active',
-                       updated_at = NOW()
+                       status = 'active'
                    WHERE email = :email""",
                 {"password": hashed_password, "email": request.email}
             )
