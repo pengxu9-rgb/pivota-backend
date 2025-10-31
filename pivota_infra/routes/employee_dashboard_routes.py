@@ -24,8 +24,8 @@ async def get_analytics_dashboard(
         transactions_query = """
             SELECT 
                 COUNT(*) as total_transactions,
-                COALESCE(SUM(amount), 0) as total_revenue,
-                SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_transactions
+                COALESCE(SUM(total), 0) as total_revenue,
+                SUM(CASE WHEN payment_status = 'paid' OR status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_transactions
             FROM orders
         """
         transactions = await database.fetch_one(transactions_query)
@@ -57,7 +57,7 @@ async def get_analytics_dashboard(
             SELECT 
                 DATE(created_at) as date,
                 COUNT(*) as transactions,
-                COALESCE(SUM(amount), 0) as revenue
+                COALESCE(SUM(total), 0) as revenue
             FROM orders
             WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
             GROUP BY DATE(created_at)
