@@ -53,7 +53,7 @@ async def get_merchant_products_v2(
         
         # Build query
         query_conditions = ["merchant_id = :merchant_id"]
-        query_params = {"merchant_id": merchant_id, "limit": limit, "offset": offset}
+        query_params = {"merchant_id": merchant_id, "row_limit": limit, "row_offset": offset}
         
         if platform:
             query_conditions.append("platform = :platform")
@@ -83,7 +83,7 @@ async def get_merchant_products_v2(
             FROM products_cache
             WHERE {where_clause}
             ORDER BY platform, cached_at DESC
-            LIMIT :limit OFFSET :offset
+            LIMIT :row_limit OFFSET :row_offset
         """
         
         rows = await database.fetch_all(products_query, query_params)
