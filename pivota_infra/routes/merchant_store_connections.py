@@ -130,21 +130,8 @@ async def merchant_connect_shopify(
                 }
             )
         
-        # Also update merchant_onboarding MCP fields
-        await database.execute(
-            """UPDATE merchant_onboarding 
-               SET 1 = 1,
-                   mcp_platform = 'shopify',
-                   mcp_shop_domain = :domain,
-                   mcp_access_token = :token,
-                   last_sync = CURRENT_TIMESTAMP
-               WHERE merchant_id = :merchant_id""",
-            {
-                "merchant_id": request.merchant_id,
-                "domain": request.shop_domain,
-                "token": request.access_token
-            }
-        )
+        # Legacy MCP fields have been migrated to merchant_stores table
+        # No need to update merchant_onboarding anymore
         
         return {
             "status": "success",
