@@ -120,8 +120,8 @@ async def get_products_hybrid(
         config = await get_merchant_realtime_config(merchant_id)
         
         if not config:
-            logger.warning(f"No config found for merchant {merchant_id}, using cache")
-            products = await _get_from_cache(merchant_id, config.platform if config else "unknown", limit)
+            logger.warning(f"No config found for merchant {merchant_id}, using cache for all platforms")
+            products = await _get_from_cache_all_platforms(merchant_id, limit)
             return products, "cache", None
         
         # Step 2: Decide query path
@@ -190,7 +190,7 @@ async def _get_from_cache(
     platform: str, 
     limit: int
 ) -> List[StandardProduct]:
-    """Get products from local cache"""
+    """Get products from local cache for specific platform"""
     try:
         # Use existing cache function
         cached = await get_cached_products(merchant_id, platform, include_expired=False)
@@ -213,6 +213,45 @@ async def _get_from_cache(
         
     except Exception as e:
         logger.error(f"Failed to get from cache: {e}")
+        return []
+
+
+async def _get_from_cache_all_platforms(
+    merchant_id: str,
+    limit: int
+) -> List[StandardProduct]:
+    """Get products from cache across all platforms (when config not found)"""
+    try:
+        # Query cache without platform filter
+        query = f"""
+            SELECT product_data
+            FROM products_cache
+            WHERE merchant_id = :merchant_id
+            AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY cached_at DESC
+            LIMIT {limit}
+        """
+        
+        rows = await database.fetch_all(query, {"merchant_id": merchant_id})
+        
+        products = []
+        for row in rows:
+            product_data = row["product_data"]
+            if isinstance(product_data, str):
+                product_data = json.loads(product_data)
+            
+            try:
+                product = StandardProduct(**product_data)
+                products.append(product)
+            except Exception as e:
+                logger.warning(f"Failed to parse cached product: {e}")
+                continue
+        
+        logger.info(f"Loaded {len(products)} products from cache (all platforms)")
+        return products
+        
+    except Exception as e:
+        logger.error(f"Failed to get from cache (all platforms): {e}")
         return []
 
 
