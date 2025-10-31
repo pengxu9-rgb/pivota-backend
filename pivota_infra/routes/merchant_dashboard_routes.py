@@ -493,16 +493,37 @@ async def get_merchant_analytics(
             if growth["revenue_prev_30"] > 0:
                 revenue_growth = ((analytics["revenue_last_30_days"] - float(growth["revenue_prev_30"])) / float(growth["revenue_prev_30"])) * 100
         
+        # Calculate Analytics rates
+        total_orders = analytics["total_orders"] if analytics else 0
+        successful_orders = analytics["successful_orders"] if analytics else 0
+        
+        # Order Generation Rate: (orders created / total attempts) * 100
+        # For now, assume total_orders = attempts
+        order_generation_rate = 100.0 if total_orders > 0 else 0.0
+        
+        # Order Placement Rate: same as generation (simplified)
+        order_placement_rate = 100.0 if total_orders > 0 else 0.0
+        
+        # Payment Success Rate: (paid orders / total orders) * 100
+        payment_success_rate = round((successful_orders / total_orders * 100), 1) if total_orders > 0 else 0.0
+        
         # Format response
         data = {
-            "total_orders": analytics["total_orders"] if analytics else 0,
+            "total_orders": total_orders,
             "total_revenue": float(analytics["total_revenue"]) if analytics else 0,
             "total_customers": analytics["total_customers"] if analytics else 0,
             "average_order_value": float(analytics["avg_order_value"]) if analytics else 0,
             "order_growth": round(order_growth, 1),
             "revenue_growth": round(revenue_growth, 1),
             "recent_orders": recent_orders,
-            "conversion_rate": round((analytics["successful_orders"] / analytics["total_orders"] * 100), 1) if analytics and analytics["total_orders"] > 0 else 0
+            "conversion_rate": round((successful_orders / total_orders * 100), 1) if total_orders > 0 else 0,
+            # Analytics page specific fields
+            "order_generation_rate": order_generation_rate,
+            "total_order_attempts": total_orders,
+            "order_placement_rate": order_placement_rate,
+            "total_orders_placed": total_orders,
+            "payment_success_rate": payment_success_rate,
+            "total_payments_succeeded": successful_orders
         }
         
         # Get actual product count from products_cache (only non-expired)

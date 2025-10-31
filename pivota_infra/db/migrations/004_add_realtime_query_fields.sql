@@ -18,3 +18,4 @@ COMMENT ON COLUMN merchant_stores.realtime_enabled IS 'If true, query merchant A
 COMMENT ON COLUMN merchant_stores.api_endpoint IS 'Merchant self-hosted API endpoint for realtime queries';
 COMMENT ON COLUMN merchant_stores.query_ttl_seconds IS 'Cache TTL in seconds (default 600 = 10 minutes)';
 
+

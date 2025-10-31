@@ -99,3 +99,4 @@ async def reset_all_merchants(payload: ResetRequest):
         logger.error(f"Reset failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
