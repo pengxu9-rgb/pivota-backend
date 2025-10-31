@@ -21,7 +21,7 @@ async def get_products_public(
     try:
         logger.info(f"[PUBLIC] Getting products for {merchant_id}")
         
-        query = """
+        query = f"""
             SELECT 
                 product_data,
                 platform,
@@ -30,10 +30,10 @@ async def get_products_public(
             WHERE merchant_id = :merchant_id
                 AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY platform, cached_at DESC
-            LIMIT :limit
+            LIMIT {limit}
         """
         
-        rows = await database.fetch_all(query, {"merchant_id": merchant_id, "limit": limit})
+        rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         
         logger.info(f"[PUBLIC] Found {len(rows)} products")
         

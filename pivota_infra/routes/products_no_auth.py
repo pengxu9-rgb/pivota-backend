@@ -50,7 +50,7 @@ async def get_merchant_products_no_auth(
         
         logger.info(f"[NO_AUTH] Found {total} products in cache")
         
-        # Get products
+        # Get products - use direct formatting for LIMIT/OFFSET
         products_query = f"""
             SELECT 
                 product_data,
@@ -60,7 +60,7 @@ async def get_merchant_products_no_auth(
             FROM products_cache
             WHERE {where_clause}
             ORDER BY platform, cached_at DESC
-            LIMIT :limit OFFSET :offset
+            LIMIT {limit} OFFSET {offset}
         """
         
         rows = await database.fetch_all(products_query, query_params)
