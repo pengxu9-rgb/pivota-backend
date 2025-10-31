@@ -105,22 +105,8 @@ def generate_demo_orders(merchant_id: str, limit: int = 10) -> List[Dict[str, An
     
     return sorted(orders, key=lambda x: x["created_at"], reverse=True)
 
-def generate_analytics(merchant_id: str) -> Dict[str, Any]:
-    """Generate analytics data for merchant"""
-    return {
-        "total_revenue": round(random.uniform(10000, 50000), 2),
-        "total_orders": random.randint(100, 500),
-        "average_order_value": round(random.uniform(50, 150), 2),
-        "conversion_rate": round(random.uniform(1.5, 3.5), 2),
-        "top_products": [
-            {"name": f"Product {i+1}", "sales": random.randint(10, 100)} 
-            for i in range(5)
-        ],
-        "revenue_by_month": [
-            {"month": f"2025-{str(i).zfill(2)}", "revenue": round(random.uniform(1000, 5000), 2)}
-            for i in range(1, 11)
-        ]
-    }
+# REMOVED: generate_analytics() - was causing random data display
+# All analytics now come from real database queries only
 
 @router.get("/merchant/profile")
 async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
@@ -530,11 +516,24 @@ async def get_merchant_analytics(
         }
         
     except Exception as e:
-        print(f"Error fetching analytics: {e}")
-        # Fallback to generated data
+        logger.error(f"Error fetching analytics for {merchant_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return empty/zero stats instead of random data
         return {
             "status": "success",
-            "data": generate_analytics(merchant_id)
+            "data": {
+                "total_orders": 0,
+                "total_revenue": 0.0,
+                "total_customers": 0,
+                "total_products": 0,
+                "average_order_value": 0.0,
+                "order_growth": 0,
+                "revenue_growth": 0,
+                "recent_orders": [],
+                "conversion_rate": 0,
+                "error": str(e)  # Include error for debugging
+            }
         }
 
 @router.get("/merchant/webhooks/config")
