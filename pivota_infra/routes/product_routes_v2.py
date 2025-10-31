@@ -43,8 +43,8 @@ async def get_merchant_products_v2(
             query_conditions.append("platform = :platform")
             query_params["platform"] = platform
         
-        # Add TTL check - only get non-expired products
-        query_conditions.append("(cached_at + INTERVAL '1 second' * ttl_seconds) > NOW()")
+        # Add expiration check using expires_at column
+        query_conditions.append("(expires_at IS NULL OR expires_at > NOW())")
         
         where_clause = " AND ".join(query_conditions)
         
@@ -62,10 +62,11 @@ async def get_merchant_products_v2(
             SELECT 
                 product_data,
                 platform,
-                cached_at
+                cached_at,
+                expires_at
             FROM products_cache
             WHERE {where_clause}
-            ORDER BY cached_at DESC
+            ORDER BY platform, cached_at DESC
             LIMIT :limit OFFSET :offset
         """
         
@@ -120,7 +121,7 @@ async def get_merchant_platforms(
                 MAX(cached_at) as last_sync
             FROM products_cache
             WHERE merchant_id = :merchant_id
-                AND (cached_at + INTERVAL '1 second' * ttl_seconds) > NOW()
+                AND (expires_at IS NULL OR expires_at > NOW())
             GROUP BY platform
             ORDER BY platform
         """

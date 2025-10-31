@@ -127,7 +127,7 @@ async def universal_product_sync(
                         platform=platform,
                         platform_product_id=product.id,
                         product_data=product_data,
-                        ttl_seconds=86400  # 24 hours
+                        ttl_seconds=604800  # 7 days
                     )
                     synced_count += 1
                 except Exception as e:

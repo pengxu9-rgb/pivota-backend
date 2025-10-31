@@ -204,7 +204,7 @@ async def sync_products(
                     platform=platform,
                     platform_product_id=product.id,
                     product_data=product_data,
-                    ttl_seconds=86400  # 24 hours cache
+                    ttl_seconds=604800  # 7 days cache
                 )
                 synced_count += 1
             except Exception as e:
