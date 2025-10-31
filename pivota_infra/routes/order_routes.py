@@ -210,10 +210,21 @@ async def create_new_order(
         psp_type = order_request.preferred_psp
         if not psp_type:
             psp_type = merchant.get("psp_type")
-        # Also get psp_id for PSP metrics tracking
+        
+        # Always get psp_id for PSP metrics tracking (even if psp_type is known)
         psp_id_value = None
-        if not psp_type:
-            try:
+        try:
+            # Query for psp_id based on psp_type or get first active PSP
+            if psp_type:
+                psp_row = await database.fetch_one(
+                    """
+                    SELECT provider, psp_id FROM merchant_psps
+                    WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+                    LIMIT 1
+                    """,
+                    {"merchant_id": order_request.merchant_id, "provider": psp_type}
+                )
+            else:
                 psp_row = await database.fetch_one(
                     """
                     SELECT provider, psp_id FROM merchant_psps
@@ -223,11 +234,12 @@ async def create_new_order(
                     """,
                     {"merchant_id": order_request.merchant_id}
                 )
-                if psp_row:
-                    psp_type = psp_row["provider"]
-                    psp_id_value = psp_row["psp_id"]
-            except:
-                pass
+            
+            if psp_row:
+                psp_type = psp_row["provider"]  # Update psp_type if not set
+                psp_id_value = psp_row["psp_id"]
+        except Exception as e:
+            logger.warning(f"Failed to get PSP ID: {e}")
         
         order_data = {
             "merchant_id": order_request.merchant_id,

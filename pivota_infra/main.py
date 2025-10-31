@@ -119,6 +119,7 @@ from routes.products_cache_maintenance import router as products_cache_maintenan
 from routes.mcp_e2e_test import router as mcp_e2e_test_router
 from routes.admin_recover_psps import router as admin_recover_psps_router
 from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_router
+from routes.admin_fix_order_psp import router as admin_fix_order_psp_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -270,6 +271,7 @@ app.include_router(products_cache_maintenance_router)  # Products cache maintena
 app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
 app.include_router(admin_recover_psps_router)  # Admin PSP recovery
 app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
+app.include_router(admin_fix_order_psp_router)  # Admin fix order PSP associations
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
@@ -651,6 +653,81 @@ async def startup():
             
             # REMOVED: Lines 649-731 - demo merchant initialization code
             # This was causing duplicate merchants on every restart
+                
+                if not merchant_exists:
+                    # Create merchant if doesn't exist
+                    await database.execute("""
+                        INSERT INTO merchant_onboarding (merchant_id, business_name, contact_email, store_url, status, mcp_connected, mcp_platform, mcp_shop_domain, psp_connected, psp_type)
+                        VALUES (:merchant_id, :business_name, :contact_email, :store_url, :status, :mcp_connected, :mcp_platform, :mcp_shop_domain, :psp_connected, :psp_type)
+                    """, {
+                        "merchant_id": merchant_id,
+                        "business_name": "ChydanTest Store",
+                        "contact_email": "merchant@test.com",
+                        "store_url": "https://chydantest.myshopify.com",
+                        "status": "approved",
+                        "mcp_connected": True,
+                        "mcp_platform": "shopify",
+                        "mcp_shop_domain": "chydantest.myshopify.com",
+                        "psp_connected": True,
+                        "psp_type": "stripe"
+                    })
+                    logger.info(f"✅ Created merchant {merchant_id}")
+                else:
+                    # Update existing merchant to ensure it has MCP connection
+                    await database.execute("""
+                        UPDATE merchant_onboarding 
+                        SET store_url = :store_url,
+                            1 = 1,
+                            mcp_platform = :mcp_platform,
+                            mcp_shop_domain = :mcp_shop_domain,
+                            psp_connected = :psp_connected,
+                            psp_type = :psp_type
+                        WHERE merchant_id = :merchant_id
+                    """, {
+                        "merchant_id": merchant_id,
+                        "store_url": "https://chydantest.myshopify.com",
+                        "mcp_connected": True,
+                        "mcp_platform": "shopify",
+                        "mcp_shop_domain": "chydantest.myshopify.com",
+                        "psp_connected": True,
+                        "psp_type": "stripe"
+                    })
+                    logger.info(f"✅ Updated merchant {merchant_id} with Shopify connection")
+                
+                # Insert Shopify store
+                await database.execute("""
+                    INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, status, product_count, connected_at)
+                    VALUES (:store_id, :merchant_id, :platform, :name, :domain, :status, :product_count, NOW())
+                    ON CONFLICT (store_id) DO NOTHING
+                """, {
+                    "store_id": "store_shopify_chydantest",
+                    "merchant_id": merchant_id,
+                    "platform": "shopify",
+                    "name": "chydantest.myshopify.com",
+                    "domain": "chydantest.myshopify.com",
+                    "status": "connected",
+                    "product_count": 4
+                })
+                
+                # Insert Stripe PSP
+                await database.execute("""
+                    INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, account_id, capabilities, status, connected_at)
+                    VALUES (:psp_id, :merchant_id, :provider, :name, :account_id, :capabilities, :status, NOW())
+                    ON CONFLICT (psp_id) DO NOTHING
+                """, {
+                    "psp_id": "psp_stripe_chydantest",
+                    "merchant_id": merchant_id,
+                    "provider": "stripe",
+                    "name": "Stripe Account",
+                    "account_id": "acct_real_stripe",
+                    "capabilities": "card,bank_transfer,alipay,wechat_pay",
+                    "status": "active"
+                })
+                
+                # logger.info(f"✅ Initialized real integrations for merchant {merchant_id}")
+                
+            # except Exception as e:
+            #     logger.warning(f"⚠️ Could not initialize merchant data: {e}")
         except Exception as e:
             logger.warning(f"⚠️ Could not create integration tables: {e}")
         from db.agents import agents, agent_usage_logs
