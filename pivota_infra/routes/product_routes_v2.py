@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Dict, Any
 from datetime import datetime
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import get_current_user, can_access_merchant
 from models.standard_product import StandardProduct, ProductListResponse
 import json
 import logging
@@ -32,6 +32,13 @@ async def get_merchant_products_v2(
     3. Returns standardized product format
     4. Does not require mcp_connected flag
     """
+    # Check if user can access this merchant's data
+    if not can_access_merchant(current_user, merchant_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to access this merchant's products"
+        )
+    
     try:
         logger.info(f"Fetching products for merchant {merchant_id}, platform={platform}")
         
@@ -123,6 +130,13 @@ async def get_merchant_platforms(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all platforms that have cached products for this merchant"""
+    # Check if user can access this merchant's data
+    if not can_access_merchant(current_user, merchant_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to access this merchant's data"
+        )
+    
     try:
         query = """
             SELECT DISTINCT 
