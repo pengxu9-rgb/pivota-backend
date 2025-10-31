@@ -93,10 +93,20 @@ async def get_merchant_products_v2(
         
         logger.info(f"Found {len(products)} products for merchant {merchant_id}")
         
+        # Determine platform for response (use first product's platform or "all")
+        response_platform = "all"
+        if products and len(products) > 0:
+            response_platform = products[0].platform
+        elif platform:
+            response_platform = platform
+        
         return ProductListResponse(
+            merchant_id=merchant_id,
+            platform=response_platform,
             products=products,
             total=total,
-            has_more=total > (offset + limit)
+            next_page_token=str(offset + limit) if total > (offset + limit) else None,
+            fetched_at=datetime.now()
         )
         
     except Exception as e:
