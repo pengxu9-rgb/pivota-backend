@@ -118,6 +118,7 @@ from routes.admin_shopify_health import router as admin_shopify_health_router
 from routes.products_cache_maintenance import router as products_cache_maintenance_router
 from routes.mcp_e2e_test import router as mcp_e2e_test_router
 from routes.admin_recover_psps import router as admin_recover_psps_router
+from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -268,6 +269,7 @@ app.include_router(admin_shopify_health_router)  # Admin Shopify health check
 app.include_router(products_cache_maintenance_router)  # Products cache maintenance
 app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
 app.include_router(admin_recover_psps_router)  # Admin PSP recovery
+app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
