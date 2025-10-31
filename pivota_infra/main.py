@@ -646,8 +646,9 @@ async def startup():
             
             logger.info("✅ Integration tables created/verified")
             
-            # Initialize merchant data for merch_6b90dc9838d5fd9c
-            try:
+            # DISABLED: Auto-initialization of demo merchant (causes duplicate data)
+            # Merchants should be created via onboarding flow, not auto-initialized
+            # try:
                 merchant_id = "merch_6b90dc9838d5fd9c"
                 
                 # Check if merchant exists
@@ -724,10 +725,10 @@ async def startup():
                     "status": "active"
                 })
                 
-                logger.info(f"✅ Initialized real integrations for merchant {merchant_id}")
+                # logger.info(f"✅ Initialized real integrations for merchant {merchant_id}")
                 
-            except Exception as e:
-                logger.warning(f"⚠️ Could not initialize merchant data: {e}")
+            # except Exception as e:
+            #     logger.warning(f"⚠️ Could not initialize merchant data: {e}")
         except Exception as e:
             logger.warning(f"⚠️ Could not create integration tables: {e}")
         from db.agents import agents, agent_usage_logs
