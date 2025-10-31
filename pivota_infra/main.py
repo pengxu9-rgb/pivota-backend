@@ -300,9 +300,10 @@ if DEBUG_MODE:
     logger.warning("⚠️ DEBUG MODE ENABLED - Debug endpoints are accessible!")
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
-app.include_router(product_router)  # Product management
-app.include_router(product_router_v2)  # Product management v2 (cache-based)
+# Register more specific product routes FIRST to avoid path conflicts
+app.include_router(product_router_v2)  # Product management v2 (cache-based) - MUST be before product_router
 app.include_router(product_sync_router)  # Product sync from platforms (legacy)
+app.include_router(product_router)  # Product management - MUST be after v2 to avoid /{merchant_id} matching /v2/xxx
 app.include_router(universal_sync_router)
 app.include_router(sync_all_router)  # Universal product sync (new)
 app.include_router(products_debug_router)  # Debug products endpoint (no auth)
@@ -985,7 +986,7 @@ async def config_check():
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
-# Deploy trigger: 1730344800
+# Deploy trigger: 1761041007
 
 @app.get("/health")
 async def health_check():
@@ -1044,7 +1045,7 @@ async def config_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1730344800
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
 
 @app.get("/health")
 async def health():
@@ -1089,5 +1090,5 @@ async def config_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1730344800
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
 

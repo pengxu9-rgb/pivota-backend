@@ -20,7 +20,8 @@ async def get_merchant_products_v2(
     merchant_id: str,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    platform: str = Query(None, description="Filter by platform")
+    platform: str = Query(None, description="Filter by platform"),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get merchant products from cache (works for all platforms)
@@ -29,10 +30,16 @@ async def get_merchant_products_v2(
     1. Reads from products_cache table
     2. Supports all platforms (Shopify, Wix, WooCommerce, etc.)
     3. Returns standardized product format
-    4. NO AUTH REQUIRED (temporary for debugging)
+    4. Proper authentication with merchant access control
     """
-    # TEMPORARILY REMOVED AUTH CHECK TO DEBUG 403 ISSUE
-    logger.info(f"[V2_NO_AUTH] Fetching products for merchant {merchant_id}, platform={platform}")
+    # Check merchant access
+    logger.info(f"[V2] Fetching products for merchant {merchant_id}, user_role={current_user.get('role')}")
+    
+    if not can_access_merchant(current_user, merchant_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Not authorized. Your merchant_id: {current_user.get('merchant_id')}, Requested: {merchant_id}"
+        )
     
     try:
         logger.info(f"Fetching products for merchant {merchant_id}, platform={platform}")
@@ -121,11 +128,18 @@ async def get_merchant_products_v2(
 
 @router.get("/{merchant_id}/platforms")
 async def get_merchant_platforms(
-    merchant_id: str
+    merchant_id: str,
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get all platforms that have cached products for this merchant - NO AUTH"""
-    # TEMPORARILY REMOVED AUTH CHECK
-    logger.info(f"[V2_NO_AUTH] Getting platforms for merchant {merchant_id}")
+    """Get all platforms that have cached products for this merchant"""
+    # Check merchant access
+    if not can_access_merchant(current_user, merchant_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to access this merchant's data"
+        )
+    
+    logger.info(f"[V2] Getting platforms for merchant {merchant_id}")
     
     try:
         query = """
