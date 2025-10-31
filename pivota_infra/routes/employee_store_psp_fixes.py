@@ -435,7 +435,7 @@ async def sync_merchant_products(
                 raise HTTPException(status_code=404, detail="Merchant not found")
             
             # Check if merchant has MCP connected
-            if True and store_info.get("platform") == platform:
+            if merchant.get("mcp_platform") == platform:
                 # Use merchant_onboarding data as a virtual "store"
                 store = {
                     "store_id": f"mcp_{request.merchant_id}",

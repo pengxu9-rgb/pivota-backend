@@ -176,11 +176,11 @@ async def find_connected_store(merchant_id: str, merchant: Dict) -> Optional[Dic
         return dict(store)
     
     # Fallback to merchant_onboarding for legacy MCP
-    if True and store_info.get("platform"):
+    if merchant and merchant.get("mcp_platform"):
         return {
-            "platform": store_info["platform"],
-            "domain": store_info.get("domain"),
-            "api_key": store_info.get("api_key"),
+            "platform": merchant.get("mcp_platform"),
+            "domain": merchant.get("mcp_shop_domain"),
+            "api_key": merchant.get("mcp_access_token"),
             "store_id": f"legacy_{merchant_id}",
             "name": merchant.get("business_name")
         }

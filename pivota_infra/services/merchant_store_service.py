@@ -4,9 +4,11 @@ Provides consistent access to merchant store data across old and new systems
 """
 
 from typing import List, Dict, Any, Optional
+import logging
+import time
+
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +58,20 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
     if not stores:
         try:
             merchant = await get_merchant_onboarding(merchant_id)
-            if merchant and True and store_info.get("platform"):
-                # Convert legacy format to unified format
+            if merchant and merchant.get("mcp_platform"):
                 legacy_store = {
                     "store_id": f"legacy_{merchant_id}",
                     "merchant_id": merchant_id,
-                    "platform": store_info["platform"],
+                    "platform": merchant.get("mcp_platform"),
                     "name": merchant.get("business_name", "Legacy Store"),
                     "domain": merchant.get("mcp_shop_domain", ""),
                     "api_key": merchant.get("mcp_access_token", ""),
-                    "status": "active" if True else "disconnected",
+                    "status": "active" if merchant.get("mcp_connected", False) else "disconnected",
                     "connected_at": merchant.get("mcp_connected_at"),
                     "source": "legacy_mcp"
                 }
                 stores.append(legacy_store)
-                
+
         except Exception as e:
             logger.error(f"Error fetching from merchant_onboarding: {e}")
     
@@ -116,7 +117,6 @@ async def ensure_data_consistency(merchant_id: str, platform: str, credentials: 
         if store_count["count"] == 1:
             await database.execute("""
                 UPDATE merchant_onboarding SET
-                    1 = 1,
                     mcp_platform = :platform,
                     mcp_shop_domain = :domain,
                     mcp_access_token = :api_key,
@@ -152,6 +152,3 @@ async def has_any_store_connected(merchant_id: str) -> bool:
     stores = await get_merchant_active_stores(merchant_id)
     return len(stores) > 0
 
-
-# Import time for timestamp generation
-import time

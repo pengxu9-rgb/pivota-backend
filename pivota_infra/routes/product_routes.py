@@ -62,6 +62,7 @@ async def get_merchant_products_realtime(
         # 获取主商店
         primary_store = stores[0]
         platform = primary_store["platform"]
+        store_info = primary_store
         
         # 从缓存获取产品
         cached = await get_cached_products(merchant_id, platform)
@@ -222,7 +223,11 @@ async def get_single_product_realtime(
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
-    
+
+    store_info = await get_primary_store(merchant_id)
+    if not store_info:
+        raise HTTPException(status_code=404, detail="No connected stores found for merchant")
+
     platform = store_info.get("platform")
     
     if platform == "shopify":
