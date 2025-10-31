@@ -33,10 +33,13 @@ async def get_merchant_products_v2(
     4. Does not require mcp_connected flag
     """
     # Check if user can access this merchant's data
+    logger.info(f"Access check: user_role={current_user.get('role')}, user_merchant_id={current_user.get('merchant_id')}, requested_merchant_id={merchant_id}")
+    
     if not can_access_merchant(current_user, merchant_id):
+        logger.warning(f"Access denied: user {current_user.get('email')} (role={current_user.get('role')}, merchant_id={current_user.get('merchant_id')}) cannot access merchant {merchant_id}")
         raise HTTPException(
             status_code=403,
-            detail="Not authorized to access this merchant's products"
+            detail=f"Not authorized to access this merchant's products. Your merchant_id: {current_user.get('merchant_id')}, Requested: {merchant_id}"
         )
     
     try:
