@@ -116,6 +116,7 @@ from routes.admin_merchant_canonicalize import router as admin_merchant_canonica
 from routes.admin_merchant_reset import router as admin_merchant_reset_router
 from routes.admin_shopify_health import router as admin_shopify_health_router
 from routes.products_cache_maintenance import router as products_cache_maintenance_router
+from routes.mcp_e2e_test import router as mcp_e2e_test_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -264,6 +265,7 @@ app.include_router(admin_merchant_canonicalize_router)  # Admin merchant canonic
 app.include_router(admin_merchant_reset_router)  # Admin merchant reset
 app.include_router(admin_shopify_health_router)  # Admin Shopify health check
 app.include_router(products_cache_maintenance_router)  # Products cache maintenance
+app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API

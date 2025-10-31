@@ -173,7 +173,23 @@ async def find_connected_store(merchant_id: str, merchant: Dict) -> Optional[Dic
     store = await database.fetch_one(store_query, {"merchant_id": merchant_id})
     
     if store:
-        return dict(store)
+        store_dict = dict(store)
+        # If api_key is empty but legacy token exists, migrate it in-place for stability
+        try:
+            if not store_dict.get("api_key") and merchant and merchant.get("mcp_access_token"):
+                legacy_token = merchant.get("mcp_access_token")
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET api_key = :api_key
+                    WHERE store_id = :store_id
+                    """,
+                    {"api_key": legacy_token, "store_id": store_dict.get("store_id")}
+                )
+                store_dict["api_key"] = legacy_token
+        except Exception as e:
+            logger.warning(f"Could not migrate legacy token to merchant_stores: {e}")
+        return store_dict
     
     # Fallback to merchant_onboarding for legacy MCP
     if merchant and merchant.get("mcp_platform"):
@@ -192,14 +208,23 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
     """Prepare credentials based on platform requirements"""
     
     if platform == "shopify":
-        # For Shopify, domain is the shop domain and api_key is the access token
+        # For Shopify, domain is the shop domain and api_key is the access token (raw or JSON)
         domain = store_info.get("domain")
-        token = store_info.get("api_key")
-        
-        if domain and token:
+        token_raw = store_info.get("api_key")
+        token_val = None
+        if token_raw:
+            try:
+                if isinstance(token_raw, str) and token_raw.strip().startswith("{"):
+                    parsed = json.loads(token_raw)
+                    token_val = parsed.get("access_token") or parsed.get("token")
+                else:
+                    token_val = token_raw
+            except Exception:
+                token_val = token_raw
+        if domain and token_val:
             return {
                 "shop_domain": domain,
-                "access_token": token
+                "access_token": token_val
             }
     
     elif platform == "wix":

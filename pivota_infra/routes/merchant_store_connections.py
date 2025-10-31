@@ -104,14 +104,14 @@ async def merchant_connect_shopify(
         )
         
         if existing:
-            # Update existing store
+            # Update existing store - store token as JSON for consistency
             await database.execute(
                 """UPDATE merchant_stores 
                    SET api_key = :token, 
                        status = 'active',
                        last_sync = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"token": request.access_token, "store_id": existing["store_id"]}
+                {"token": '{"access_token":"' + request.access_token + '"}', "store_id": existing["store_id"]}
             )
             store_id = existing["store_id"]
         else:
@@ -126,7 +126,7 @@ async def merchant_connect_shopify(
                     "merchant_id": request.merchant_id,
                     "domain": request.shop_domain,
                     "name": shop_info.get("name", request.shop_domain),
-                    "token": request.access_token
+                    "token": '{"access_token":"' + request.access_token + '"}'
                 }
             )
         
