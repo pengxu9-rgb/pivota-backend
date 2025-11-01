@@ -7,27 +7,14 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from db.database import database
 from utils.auth import get_current_user
 import secrets
 import hashlib
-import uuid
 
 router = APIRouter(prefix="/employee/agents", tags=["Employee Agents Management"])
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# Request Models
-# ============================================================================
-
-class CreateAgentRequest(BaseModel):
-    """创建 Agent 的请求"""
-    name: str
-    email: EmailStr
-    company: str
-    use_case: str
-    expected_volume: Optional[int] = 100
 
 # ============================================================================
 # Response Models with Reserved Fields
@@ -536,79 +523,4 @@ async def reactivate_agent(
     except Exception as e:
         logger.error(f"Failed to reactivate agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/create")
-async def create_agent(
-    request: CreateAgentRequest,
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    创建新的 Agent
-    """
-    if current_user["role"] not in ["employee", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    try:
-        # Check if email already exists
-        existing = await database.fetch_one(
-            "SELECT agent_id FROM agents WHERE email = :email",
-            {"email": request.email}
-        )
-        
-        if existing:
-            raise HTTPException(status_code=400, detail="Agent with this email already exists")
-        
-        # Generate agent credentials
-        agent_id = f"agent_{uuid.uuid4().hex[:16]}"
-        api_key = f"ak_live_{secrets.token_hex(32)}"
-        
-        # Create agent
-        await database.execute(
-            """INSERT INTO agents 
-               (agent_id, name, email, company, use_case, api_key, status, 
-                created_at, rate_limit, request_count, success_rate, 
-                total_requests, total_orders, total_gmv)
-               VALUES (:agent_id, :name, :email, :company, :use_case, :api_key, 
-                       :status, :created_at, :rate_limit, :request_count, :success_rate,
-                       :total_requests, :total_orders, :total_gmv)""",
-            {
-                "agent_id": agent_id,
-                "name": request.name,
-                "email": request.email,
-                "company": request.company,
-                "use_case": request.use_case,
-                "api_key": api_key,
-                "status": "active",
-                "created_at": datetime.now(),
-                "rate_limit": min(request.expected_volume * 10, 10000),
-                "request_count": 0,
-                "success_rate": 0,
-                "total_requests": 0,
-                "total_orders": 0,
-                "total_gmv": 0
-            }
-        )
-        
-        logger.info(f"Agent {agent_id} created by {current_user.get('email')}")
-        
-        return {
-            "status": "success",
-            "message": "Agent created successfully",
-            "agent": {
-                "agent_id": agent_id,
-                "name": request.name,
-                "email": request.email,
-                "company": request.company,
-                "api_key": api_key,
-                "status": "active",
-                "rate_limit": min(request.expected_volume * 10, 10000)
-            }
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to create agent: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create agent: {str(e)}")
 
