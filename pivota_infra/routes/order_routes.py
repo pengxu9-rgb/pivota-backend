@@ -238,8 +238,34 @@ async def create_new_order(
             if psp_row:
                 psp_type = psp_row["provider"]  # Update psp_type if not set
                 psp_id_value = psp_row["psp_id"]
+            else:
+                logger.error(f"No active PSP found for merchant {order_request.merchant_id}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="No active PSP configuration found for this merchant"
+                )
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to get PSP ID: {e}")
+            logger.error(f"Failed to get PSP configuration: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to determine PSP: {str(e)}"
+            )
+        
+        # Ensure psp_type is lowercase for consistency
+        if psp_type:
+            psp_type = psp_type.lower()
+        
+        # Validate PSP fields are set
+        if not psp_type or not psp_id_value:
+            logger.error(f"PSP fields incomplete: psp_type={psp_type}, psp_id={psp_id_value}")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to determine complete PSP configuration"
+            )
+        
+        logger.info(f"✅ PSP determined: {psp_type} (ID: {psp_id_value})")
         
         order_data = {
             "merchant_id": order_request.merchant_id,
@@ -255,7 +281,7 @@ async def create_new_order(
             "agent_id": agent_id,  # Extract from metadata
             "agent_session_id": order_request.agent_session_id,
             "metadata": order_request.metadata or {},
-            "psp_used": psp_type,  # Record which PSP provider is used
+            "psp_used": psp_type,  # Record which PSP provider is used (lowercase)
             # Legacy fields (optional, can be null)
             "store_id": None,
             "psp_id": psp_id_value,  # Include actual PSP ID for metrics tracking
