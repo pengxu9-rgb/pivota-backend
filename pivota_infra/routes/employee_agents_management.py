@@ -81,7 +81,7 @@ async def get_all_agents(
             where_clause = "WHERE a.status = :status"
             params["status"] = status_filter
         
-        # Main query - get agents with basic stats
+        # Main query - get agents with REAL stats from orders table
         query = f"""
             SELECT 
                 a.agent_id,
@@ -94,13 +94,29 @@ async def get_all_agents(
                 a.rate_limit,
                 a.created_at,
                 a.last_active,
-                a.request_count,
-                a.success_rate,
+                COALESCE(o.total_orders, 0) as request_count,
+                COALESCE(o.success_rate, 0) as success_rate,
+                COALESCE(o.total_orders, 0) as total_orders,
+                COALESCE(o.total_gmv, 0) as total_gmv,
                 COUNT(DISTINCT am.merchant_id) as merchant_count
             FROM agents a
             LEFT JOIN agent_merchants am ON a.agent_id = am.agent_id
+            LEFT JOIN (
+                SELECT 
+                    agent_id,
+                    COUNT(*) as total_orders,
+                    COALESCE(SUM(total), 0) as total_gmv,
+                    CASE 
+                        WHEN COUNT(*) > 0 THEN 
+                            (COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
+                        ELSE 0 
+                    END as success_rate
+                FROM orders
+                WHERE agent_id IS NOT NULL
+                GROUP BY agent_id
+            ) o ON a.agent_id = o.agent_id
             {where_clause}
-            GROUP BY a.agent_id
+            GROUP BY a.agent_id, o.total_orders, o.success_rate, o.total_gmv
             ORDER BY a.created_at DESC
         """
         
@@ -117,23 +133,23 @@ async def get_all_agents(
                 "90d": "90 days"
             }.get(date_range, "7 days")
             
-            # Get metrics based on selected time range (not just 24h)
+            # Get metrics from ORDERS table (not usage_logs) - same as merchant!
             metrics_query = f"""
                 SELECT 
                     COUNT(*) as requests_24h,
-                    COUNT(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 END) as successful_24h,
-                    COUNT(CASE WHEN status_code >= 400 THEN 1 END) as failed_24h,
+                    COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END) as successful_24h,
+                    COUNT(CASE WHEN payment_status IN ('failed', 'cancelled', 'error') THEN 1 END) as failed_24h,
                     CASE 
                         WHEN COUNT(*) > 0 THEN 
-                            (COUNT(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
+                            (COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
                         ELSE 0 
                     END as success_rate_24h,
-                    COALESCE(AVG(response_time_ms), 0) as avg_latency_24h,
-                    COUNT(DISTINCT order_id) FILTER (WHERE order_id IS NOT NULL) as orders_24h,
-                    COALESCE(SUM(order_amount), 0) as gmv_24h
-                FROM agent_usage_logs
+                    0 as avg_latency_24h,
+                    COUNT(*) as orders_24h,
+                    COALESCE(SUM(total), 0) as gmv_24h
+                FROM orders
                 WHERE agent_id = :agent_id
-                    AND timestamp >= NOW() - INTERVAL '{time_interval}'
+                    AND created_at >= NOW() - INTERVAL '{time_interval}'
             """
             
             metrics_row = await database.fetch_one(metrics_query, {"agent_id": agent["agent_id"]})
@@ -158,7 +174,7 @@ async def get_all_agents(
             """
             policy_row = await database.fetch_one(policy_query, {"agent_id": agent["agent_id"]})
             
-            # Build response with reserved fields
+            # Build response with REAL data from orders table
             result.append({
                 "agent_id": agent["agent_id"],
                 "name": agent["name"],
@@ -171,6 +187,11 @@ async def get_all_agents(
                 "created_at": agent["created_at"].isoformat() if agent["created_at"] else None,
                 "last_active": agent["last_active"].isoformat() if agent["last_active"] else None,
                 "merchant_count": agent["merchant_count"],
+                
+                # Add total stats from orders table
+                "total_orders": agent["total_orders"],
+                "total_gmv": float(agent["total_gmv"]),
+                "total_requests": agent["request_count"],  # For compatibility
                 
                 # Reserved: metrics field (always present)
                 "metrics": {
