@@ -1,6 +1,11 @@
 """
 Employee Agents Management API
 Provides comprehensive agent monitoring and control for Employee Portal
+
+⚠️ WARNING: THIS FILE IS CURRENTLY DISABLED IN main.py
+⚠️ Active router: employee_agent_mgmt.py (simpler, stable version)
+⚠️ Do NOT enable this router without thorough testing
+⚠️ This file is kept for reference or future advanced features
 """
 
 import logging
