@@ -41,23 +41,18 @@ async def get_all_agents(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Build query with merchant count from ORDERS table (where the real data is)
+        # Simple query first - just get agents
         where_condition = ""
         params = {}
         
         if status:
-            where_condition = "WHERE a.status = :status"
+            where_condition = "WHERE status = :status"
             params["status"] = status
         
         query = f"""
-            SELECT 
-                a.*,
-                COUNT(DISTINCT o.merchant_id) FILTER (WHERE o.merchant_id IS NOT NULL) as merchant_count
-            FROM agents a
-            LEFT JOIN orders o ON a.agent_id = o.agent_id
+            SELECT * FROM agents
             {where_condition}
-            GROUP BY a.agent_id 
-            ORDER BY a.created_at DESC
+            ORDER BY created_at DESC
         """
         
         agents = await database.fetch_all(query, params)
@@ -65,34 +60,31 @@ async def get_all_agents(
         # Format response - match frontend expectations
         formatted_agents = []
         for agent in agents:
-            # Normalize record to plain dict to safely use .get()
-            # databases.Record exposes a `_mapping` with dict-like interface
-            if isinstance(agent, dict):
-                agent_dict = agent
-            elif hasattr(agent, "_mapping"):
-                agent_dict = dict(agent._mapping)
-            else:
-                # Fallback for other row types
-                agent_dict = dict(agent)
+            # Use direct dict() conversion - works with databases.Record
+            agent_dict = dict(agent)
+            
+            # Safe access with defaults
+            api_key = agent_dict.get("api_key") or ""
+            api_key_prefix = api_key[:10] + "..." if len(api_key) > 10 else None
+            
             formatted_agents.append({
                 "agent_id": agent_dict.get("agent_id"),
-                "agent_name": agent_dict.get("name", "Unknown Agent"),  # Frontend expects agent_name
-                "owner_email": agent_dict.get("email"),  # Frontend expects owner_email
-                "agent_type": agent_dict.get("agent_type", "Generic"),  # Add agent_type field
+                "agent_name": agent_dict.get("name") or "Unknown Agent",
+                "owner_email": agent_dict.get("email"),
+                "agent_type": agent_dict.get("agent_type") or "Generic",
                 "company": agent_dict.get("company"),
-                "api_key_prefix": agent_dict.get("api_key", "")[:10] + "..." if agent_dict.get("api_key") else None,
-                "status": agent_dict.get("status", "active"),
-                "is_active": agent_dict.get("status", "active") == "active",  # Frontend expects is_active boolean
+                "api_key_prefix": api_key_prefix,
+                "status": agent_dict.get("status") or "active",
+                "is_active": (agent_dict.get("status") or "active") == "active",
                 "created_at": str(agent_dict.get("created_at")) if agent_dict.get("created_at") else None,
                 "last_active": str(agent_dict.get("last_active")) if agent_dict.get("last_active") else None,
-                "request_count": agent_dict.get("request_count", 0),
-                "success_rate": agent_dict.get("success_rate", 0),
-                "rate_limit": agent_dict.get("rate_limit", 1000),
-                # Add missing fields for frontend
-                "total_orders": agent_dict.get("total_orders", 0),
-                "total_gmv": float(agent_dict.get("total_gmv", 0)),
-                "total_requests": agent_dict.get("total_requests", agent_dict.get("request_count", 0)),
-                "merchant_count": agent_dict.get("merchant_count", 0)
+                "request_count": agent_dict.get("request_count") or 0,
+                "success_rate": agent_dict.get("success_rate") or 0,
+                "rate_limit": agent_dict.get("rate_limit") or 1000,
+                "total_orders": agent_dict.get("total_orders") or 0,
+                "total_gmv": float(agent_dict.get("total_gmv") or 0),
+                "total_requests": agent_dict.get("total_requests") or agent_dict.get("request_count") or 0,
+                "merchant_count": agent_dict.get("merchant_count") or 0
             })
         
         return {
