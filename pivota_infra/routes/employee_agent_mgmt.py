@@ -65,8 +65,15 @@ async def get_all_agents(
         # Format response - match frontend expectations
         formatted_agents = []
         for agent in agents:
-            # Handle both dict and Row objects
-            agent_dict = dict(agent) if hasattr(agent, 'keys') else agent
+            # Normalize record to plain dict to safely use .get()
+            # databases.Record exposes a `_mapping` with dict-like interface
+            if isinstance(agent, dict):
+                agent_dict = agent
+            elif hasattr(agent, "_mapping"):
+                agent_dict = dict(agent._mapping)
+            else:
+                # Fallback for other row types
+                agent_dict = dict(agent)
             formatted_agents.append({
                 "agent_id": agent_dict.get("agent_id"),
                 "agent_name": agent_dict.get("name", "Unknown Agent"),  # Frontend expects agent_name
