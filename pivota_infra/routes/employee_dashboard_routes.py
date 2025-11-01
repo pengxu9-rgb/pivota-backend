@@ -27,21 +27,48 @@ async def get_analytics_dashboard(
         start_date = datetime.utcnow() - timedelta(days=days)
         
         # Get transactions from orders table (filtered by time_range)
+        # Revenue breakdown with time-based pending classification
         transactions_query = """
             SELECT 
-                COUNT(*) as total_transactions,
-                COALESCE(SUM(total), 0) as total_revenue,
-                SUM(CASE WHEN payment_status = 'paid' OR status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_transactions,
+                COUNT(*) as total_orders,
+                
+                -- Confirmed Revenue (only paid orders)
+                COUNT(CASE WHEN payment_status = 'paid' THEN 1 END) as paid_orders,
+                COALESCE(SUM(CASE WHEN payment_status = 'paid' THEN total ELSE 0 END), 0) as confirmed_revenue,
+                
+                -- Pending Revenue (time-based classification)
+                COUNT(CASE WHEN payment_status = 'pending' 
+                    AND created_at >= NOW() - INTERVAL '5 minutes' THEN 1 END) as pending_recent_count,
+                COALESCE(SUM(CASE WHEN payment_status = 'pending' 
+                    AND created_at >= NOW() - INTERVAL '5 minutes' THEN total ELSE 0 END), 0) as pending_recent_revenue,
+                
+                COUNT(CASE WHEN payment_status = 'pending' 
+                    AND created_at < NOW() - INTERVAL '5 minutes'
+                    AND created_at >= NOW() - INTERVAL '30 minutes' THEN 1 END) as pending_stale_count,
+                COALESCE(SUM(CASE WHEN payment_status = 'pending' 
+                    AND created_at < NOW() - INTERVAL '5 minutes'
+                    AND created_at >= NOW() - INTERVAL '30 minutes' THEN total ELSE 0 END), 0) as pending_stale_revenue,
+                
+                COUNT(CASE WHEN payment_status = 'pending' 
+                    AND created_at < NOW() - INTERVAL '30 minutes' THEN 1 END) as pending_abandoned_count,
+                COALESCE(SUM(CASE WHEN payment_status = 'pending' 
+                    AND created_at < NOW() - INTERVAL '30 minutes' THEN total ELSE 0 END), 0) as pending_abandoned_revenue,
+                
+                -- Failed Revenue
+                COUNT(CASE WHEN payment_status = 'failed' THEN 1 END) as failed_orders,
+                COALESCE(SUM(CASE WHEN payment_status = 'failed' THEN total ELSE 0 END), 0) as failed_revenue,
+                
+                -- Average Transaction (only paid)
                 AVG(CASE WHEN payment_status = 'paid' THEN total ELSE NULL END) as avg_transaction_value
             FROM orders
             WHERE created_at >= :start_date
         """
         transactions = await database.fetch_one(transactions_query, {"start_date": start_date})
         
-        # Calculate success rate
+        # Calculate success rate (paid orders / total orders)
         success_rate = 0
-        if transactions and transactions["total_transactions"] > 0:
-            success_rate = (transactions["successful_transactions"] / transactions["total_transactions"]) * 100
+        if transactions and transactions["total_orders"] > 0:
+            success_rate = (transactions["paid_orders"] / transactions["total_orders"]) * 100
         
         # Get merchant counts
         merchants_query = """
@@ -84,10 +111,32 @@ async def get_analytics_dashboard(
         return {
             "status": "success",
             "data": {
-                "total_transactions": transactions["total_transactions"] if transactions else 0,
-                "total_revenue": float(transactions["total_revenue"]) if transactions else 0,
+                # Main metrics (only paid orders)
+                "total_transactions": transactions["paid_orders"] if transactions else 0,
+                "total_revenue": float(transactions["confirmed_revenue"]) if transactions else 0,
                 "success_rate": round(success_rate, 1),
                 "avg_transaction_value": float(transactions["avg_transaction_value"]) if transactions and transactions["avg_transaction_value"] else 0,
+                
+                # Revenue breakdown
+                "revenue_breakdown": {
+                    "confirmed": float(transactions["confirmed_revenue"]) if transactions else 0,
+                    "pending_recent": float(transactions["pending_recent_revenue"]) if transactions else 0,
+                    "pending_stale": float(transactions["pending_stale_revenue"]) if transactions else 0,
+                    "pending_abandoned": float(transactions["pending_abandoned_revenue"]) if transactions else 0,
+                    "failed": float(transactions["failed_revenue"]) if transactions else 0
+                },
+                
+                # Order breakdown
+                "order_breakdown": {
+                    "total": transactions["total_orders"] if transactions else 0,
+                    "paid": transactions["paid_orders"] if transactions else 0,
+                    "pending_recent": transactions["pending_recent_count"] if transactions else 0,
+                    "pending_stale": transactions["pending_stale_count"] if transactions else 0,
+                    "pending_abandoned": transactions["pending_abandoned_count"] if transactions else 0,
+                    "failed": transactions["failed_orders"] if transactions else 0
+                },
+                
+                # Other metrics
                 "total_merchants": merchants["total_merchants"] if merchants else 0,
                 "active_merchants": merchants["active_merchants"] if merchants else 0,
                 "total_psps": psps["total_psps"] if psps else 0,
@@ -108,6 +157,21 @@ async def get_analytics_dashboard(
                 "total_revenue": 0,
                 "success_rate": 0,
                 "avg_transaction_value": 0,
+                "revenue_breakdown": {
+                    "confirmed": 0,
+                    "pending_recent": 0,
+                    "pending_stale": 0,
+                    "pending_abandoned": 0,
+                    "failed": 0
+                },
+                "order_breakdown": {
+                    "total": 0,
+                    "paid": 0,
+                    "pending_recent": 0,
+                    "pending_stale": 0,
+                    "pending_abandoned": 0,
+                    "failed": 0
+                },
                 "total_merchants": 0,
                 "active_merchants": 0,
                 "total_psps": 0,
