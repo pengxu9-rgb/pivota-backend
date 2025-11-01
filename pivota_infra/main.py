@@ -126,6 +126,7 @@ from routes.employee_agents_management import router as employee_agents_manageme
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
 from routes.admin_run_migration import router as admin_run_migration_router
 from routes.admin_fix_agents import router as admin_fix_agents_router
+from routes.admin_fix_agent_metrics import router as admin_fix_agent_metrics_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -282,6 +283,7 @@ app.include_router(admin_debug_psp_router)  # Admin debug PSP data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
 app.include_router(employee_agents_management_router)  # Employee agents management
 app.include_router(admin_fix_agents_router)  # Admin fix agents data
+app.include_router(admin_fix_agent_metrics_router)  # Admin fix agent metrics
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(merchant_router)  # Merchant management endpoints
