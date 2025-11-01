@@ -41,10 +41,12 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
         query = """
             SELECT * FROM merchants WHERE merchant_id = :merchant_id
         """
-        merchant = await database.fetch_one(query, {"merchant_id": merchant_id})
+        merchant_row = await database.fetch_one(query, {"merchant_id": merchant_id})
         
-        if not merchant:
+        if not merchant_row:
             raise HTTPException(status_code=404, detail=f"Merchant {merchant_id} not found")
+        
+        merchant = dict(merchant_row)
         
         # Get real statistics
         stats_query = """
@@ -54,22 +56,23 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
             FROM orders
             WHERE merchant_id = :merchant_id
         """
-        stats = await database.fetch_one(stats_query, {"merchant_id": merchant_id})
+        stats_row = await database.fetch_one(stats_query, {"merchant_id": merchant_id})
+        stats = dict(stats_row) if stats_row else {}
         
         return {
             "status": "success",
             "data": {
-                "merchant_id": merchant["merchant_id"],
-                "business_name": merchant["business_name"],
-                "email": merchant["email"],
-                "phone": merchant["phone"],
-                "website": merchant["website"],
-                "country": merchant["country"],
-                "business_type": merchant["business_type"],
-                "status": merchant["status"],
-                "created_at": merchant["created_at"].isoformat() if merchant["created_at"] else None,
-                "total_orders": stats["total_orders"] if stats else 0,
-                "total_revenue": float(stats["total_revenue"]) if stats else 0
+                "merchant_id": merchant.get("merchant_id"),
+                "business_name": merchant.get("business_name"),
+                "email": merchant.get("email"),
+                "phone": merchant.get("phone"),
+                "website": merchant.get("website"),
+                "country": merchant.get("country"),
+                "business_type": merchant.get("business_type"),
+                "status": merchant.get("status"),
+                "created_at": merchant.get("created_at").isoformat() if merchant.get("created_at") else None,
+                "total_orders": stats.get("total_orders") or 0,
+                "total_revenue": float(stats.get("total_revenue") or 0)
             }
         }
     except HTTPException:
@@ -107,13 +110,15 @@ async def get_merchant_stores(
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         
         for row in rows:
+            # Convert Record to dict
+            r = dict(row)
             stores.append({
-                "id": row["id"],
-                "platform": row["platform"],
-                "name": row["name"],
-                "status": row["status"],
-                "connected_at": row["connected_at"].isoformat() if row["connected_at"] else None,
-                "product_count": row["product_count"] or 0
+                "id": r.get("id"),
+                "platform": r.get("platform"),
+                "name": r.get("name"),
+                "status": r.get("status"),
+                "connected_at": r.get("connected_at").isoformat() if r.get("connected_at") else None,
+                "product_count": r.get("product_count") or 0
             })
     except Exception as e:
         logger.error(f"Database error in get_merchant_stores: {e}")
@@ -153,14 +158,16 @@ async def get_merchant_psps(
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         
         for row in rows:
+            # Convert Record to dict
+            r = dict(row)
             psps.append({
-                "id": row["psp_id"],
-                "name": row["psp_name"],
-                "status": row["status"],
-                "is_primary": row["is_primary"],
-                "connected_at": row["created_at"].isoformat() if row["created_at"] else None,
-                "transaction_count": row["transaction_count"],
-                "total_volume": float(row["total_volume"])
+                "id": r.get("psp_id"),
+                "name": r.get("psp_name"),
+                "status": r.get("status"),
+                "is_primary": r.get("is_primary"),
+                "connected_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "transaction_count": r.get("transaction_count") or 0,
+                "total_volume": float(r.get("total_volume") or 0)
             })
     except Exception as e:
         logger.error(f"Database error in get_merchant_psps: {e}")
@@ -220,21 +227,23 @@ async def get_merchant_orders(
         else:
             count_result = await database.fetch_one(count_query, {"merchant_id": merchant_id})
         
-        total = count_result["total"] if count_result else 0
+        total = dict(count_result).get("total", 0) if count_result else 0
         
         # Format orders
         orders = []
         for row in rows:
+            # Convert Record to dict
+            r = dict(row)
             orders.append({
-                "id": row["order_id"],
-                "customer_email": row["customer_email"],
-                "customer_name": row["customer_name"],
-                "amount": float(row["total"]) if row["total"] else 0,
-                "currency": row["currency"] or "USD",
-                "status": row["status"],
-                "psp_id": row["psp_id"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None
+                "id": r.get("order_id"),
+                "customer_email": r.get("customer_email"),
+                "customer_name": r.get("customer_name"),
+                "amount": float(r.get("total") or 0),
+                "currency": r.get("currency") or "USD",
+                "status": r.get("status"),
+                "psp_id": r.get("psp_id"),
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None
             })
         
         return {
@@ -295,28 +304,31 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         WHERE merchant_id = :merchant_id AND status = 'active'
         """
         psp_result = await database.fetch_one(psp_query, {"merchant_id": merchant_id})
-        psp_count = psp_result["count"] if psp_result else 0
+        psp_count = dict(psp_result).get("count", 0) if psp_result else 0
         
-        # Calculate statistics
+        # Calculate statistics - convert Records to dicts
         total_orders = len(orders)
-        total_revenue = sum(float(order["total"]) for order in orders if order["total"])
-        paid_orders = [o for o in orders if o["status"] in ["paid", "completed", "succeeded"]]
+        total_revenue = sum(float(dict(order).get("total") or 0) for order in orders)
+        paid_orders = [o for o in orders if dict(o).get("status") in ["paid", "completed", "succeeded"]]
         
         # Get unique customers
         customers = set()
-        for order in orders:
+        for order_row in orders:
+            order = dict(order_row)
             if order.get("customer_email"):
-                customers.add(order["customer_email"])
+                customers.add(order.get("customer_email"))
         
         # Get recent orders
         recent_orders = []
-        for order in orders[:5]:
+        for order_row in orders[:5]:
+            # Convert Record to dict
+            order = dict(order_row)
             recent_orders.append({
-                "id": order["order_id"],
-                "amount": float(order["total"]) if order["total"] else 0,
-                "status": order["status"],
-                "customer": order.get("customer_email", "Guest"),
-                "date": order["created_at"].isoformat() if order["created_at"] else None
+                "id": order.get("order_id"),
+                "amount": float(order.get("total") or 0),
+                "status": order.get("status"),
+                "customer": order.get("customer_email") or "Guest",
+                "date": order.get("created_at").isoformat() if order.get("created_at") else None
             })
         
         return {
@@ -361,7 +373,8 @@ async def get_merchant_analytics(
             WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
         """
         
-        analytics = await database.fetch_one(analytics_query, {"merchant_id": merchant_id})
+        analytics_row = await database.fetch_one(analytics_query, {"merchant_id": merchant_id})
+        analytics = dict(analytics_row) if analytics_row else {}
         
         # Get recent orders
         recent_orders_query = """
@@ -375,24 +388,26 @@ async def get_merchant_analytics(
         
         recent_orders = []
         for row in recent_orders_rows:
+            # Convert Record to dict
+            r = dict(row)
             recent_orders.append({
-                "id": row["order_id"],
-                "amount": float(row["amount"]) if row["amount"] else 0,
-                "status": row["status"],
-                "customer": row["customer_name"] or "Guest",
-                "date": row["created_at"].isoformat() if row["created_at"] else None
+                "id": r.get("order_id"),
+                "amount": float(r.get("amount") or 0),
+                "status": r.get("status"),
+                "customer": r.get("customer_name") or "Guest",
+                "date": r.get("created_at").isoformat() if r.get("created_at") else None
             })
         
         return {
             "status": "success",
             "data": {
-                "total_orders": analytics["total_orders"] or 0,
-                "total_revenue": float(analytics["total_revenue"]) or 0,
-                "average_order_value": float(analytics["avg_order_value"]) or 0,
-                "total_customers": analytics["total_customers"] or 0,
-                "successful_orders": analytics["successful_orders"] or 0,
-                "orders_last_30_days": analytics["orders_last_30_days"] or 0,
-                "revenue_last_30_days": float(analytics["revenue_last_30_days"]) or 0,
+                "total_orders": analytics.get("total_orders") or 0,
+                "total_revenue": float(analytics.get("total_revenue") or 0),
+                "average_order_value": float(analytics.get("avg_order_value") or 0),
+                "total_customers": analytics.get("total_customers") or 0,
+                "successful_orders": analytics.get("successful_orders") or 0,
+                "orders_last_30_days": analytics.get("orders_last_30_days") or 0,
+                "revenue_last_30_days": float(analytics.get("revenue_last_30_days") or 0),
                 "recent_orders": recent_orders
             }
         }
