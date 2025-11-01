@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 @router.get("/overview")
 async def get_psp_overview(
     current_user: dict = Depends(require_employee),
-    time_range: str = Query("today", description="Time range: today, week, month")
+    time_range: str = Query("week", description="Time range: today, week, month")
 ):
     """
     Get overview of all PSPs with aggregated metrics
