@@ -62,11 +62,13 @@ class AgentResponse(BaseModel):
 @router.get("/")
 async def get_all_agents(
     status_filter: Optional[str] = Query(None, description="Filter by status: active, inactive, suspended"),
+    date_range: Optional[str] = Query("7d", description="Date range: 1d, 7d, 30d, 90d"),
     current_user: dict = Depends(get_current_user)
 ):
     """
     获取所有 agents 及其统计信息
     包含预留的 metrics 和 governance 字段
+    支持时间范围过滤: 1d (今天), 7d (7天), 30d (30天), 90d (90天)
     """
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -107,37 +109,46 @@ async def get_all_agents(
         # Enrich with metrics and governance
         result = []
         for agent in agents:
-            # Get 24h metrics (from agent_metrics_24h view or calculate from logs)
-            metrics_query = """
+            # Determine time interval based on date_range
+            time_interval = {
+                "1d": "24 hours",
+                "7d": "7 days",
+                "30d": "30 days",
+                "90d": "90 days"
+            }.get(date_range, "7 days")
+            
+            # Get metrics based on selected time range (not just 24h)
+            metrics_query = f"""
                 SELECT 
-                    COALESCE(requests_24h, 0) as requests_24h,
-                    COALESCE(successful_24h, 0) as successful_24h,
-                    COALESCE(failed_24h, 0) as failed_24h,
-                    COALESCE(success_rate_24h, 0) as success_rate_24h,
-                    COALESCE(avg_latency_24h, 0) as avg_latency_24h,
-                    COALESCE(gmv_24h, 0) as gmv_24h,
-                    COALESCE(orders_24h, 0) as orders_24h
-                FROM agent_metrics_24h
+                    COUNT(*) as requests_24h,
+                    COUNT(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 END) as successful_24h,
+                    COUNT(CASE WHEN status_code >= 400 THEN 1 END) as failed_24h,
+                    CASE 
+                        WHEN COUNT(*) > 0 THEN 
+                            (COUNT(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
+                        ELSE 0 
+                    END as success_rate_24h,
+                    COALESCE(AVG(response_time_ms), 0) as avg_latency_24h,
+                    COUNT(DISTINCT order_id) FILTER (WHERE order_id IS NOT NULL) as orders_24h,
+                    COALESCE(SUM(order_amount), 0) as gmv_24h
+                FROM agent_usage_logs
                 WHERE agent_id = :agent_id
+                    AND timestamp >= NOW() - INTERVAL '{time_interval}'
             """
             
             metrics_row = await database.fetch_one(metrics_query, {"agent_id": agent["agent_id"]})
             
-            # If view doesn't exist or no data, calculate from usage_logs
+            # If no metrics, provide default values
             if not metrics_row:
-                fallback_query = """
-                    SELECT 
-                        COUNT(*) as requests_24h,
-                        COUNT(CASE WHEN status_code = 200 THEN 1 END) as successful_24h,
-                        COUNT(CASE WHEN status_code != 200 THEN 1 END) as failed_24h,
-                        COALESCE(AVG(response_time_ms), 0) as avg_latency_24h,
-                        COUNT(DISTINCT order_id) FILTER (WHERE order_id IS NOT NULL) as orders_24h,
-                        COALESCE(SUM(order_amount), 0) as gmv_24h
-                    FROM agent_usage_logs
-                    WHERE agent_id = :agent_id
-                        AND timestamp >= NOW() - INTERVAL '24 hours'
-                """
-                metrics_row = await database.fetch_one(fallback_query, {"agent_id": agent["agent_id"]})
+                metrics_row = {
+                    "requests_24h": 0,
+                    "successful_24h": 0,
+                    "failed_24h": 0,
+                    "success_rate_24h": 0,
+                    "avg_latency_24h": 0,
+                    "orders_24h": 0,
+                    "gmv_24h": 0
+                }
             
             # Get governance policy
             policy_query = """
