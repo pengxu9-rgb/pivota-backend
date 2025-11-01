@@ -98,14 +98,14 @@ async def get_all_agents(
                 COALESCE(o.success_rate, 0) as success_rate,
                 COALESCE(o.total_orders, 0) as total_orders,
                 COALESCE(o.total_gmv, 0) as total_gmv,
-                COUNT(DISTINCT am.merchant_id) as merchant_count
+                COALESCE(o.merchant_count, 0) as merchant_count
             FROM agents a
-            LEFT JOIN agent_merchants am ON a.agent_id = am.agent_id
             LEFT JOIN (
                 SELECT 
                     agent_id,
                     COUNT(*) as total_orders,
                     COALESCE(SUM(total), 0) as total_gmv,
+                    COUNT(DISTINCT merchant_id) as merchant_count,
                     CASE 
                         WHEN COUNT(*) > 0 THEN 
                             (COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
@@ -116,7 +116,7 @@ async def get_all_agents(
                 GROUP BY agent_id
             ) o ON a.agent_id = o.agent_id
             {where_clause}
-            GROUP BY a.agent_id, o.total_orders, o.success_rate, o.total_gmv
+            GROUP BY a.agent_id, o.total_orders, o.success_rate, o.total_gmv, o.merchant_count
             ORDER BY a.created_at DESC
         """
         
