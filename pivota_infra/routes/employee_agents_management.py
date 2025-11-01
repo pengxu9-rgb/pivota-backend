@@ -124,7 +124,9 @@ async def get_all_agents(
         
         # Enrich with metrics and governance
         result = []
-        for agent in agents:
+        for agent_row in agents:
+            # Convert Record to dict first
+            agent = dict(agent_row)
             # Determine time interval based on date_range
             time_interval = {
                 "1d": "24 hours",
