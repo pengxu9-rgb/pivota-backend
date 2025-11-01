@@ -41,18 +41,23 @@ async def get_all_agents(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Simple query first - just get agents
+        # Query agents with merchant count from orders table
         where_condition = ""
         params = {}
         
         if status:
-            where_condition = "WHERE status = :status"
+            where_condition = "WHERE a.status = :status"
             params["status"] = status
         
         query = f"""
-            SELECT * FROM agents
+            SELECT 
+                a.*,
+                COUNT(DISTINCT o.merchant_id) as merchant_count
+            FROM agents a
+            LEFT JOIN orders o ON a.agent_id = o.agent_id AND o.merchant_id IS NOT NULL
             {where_condition}
-            ORDER BY created_at DESC
+            GROUP BY a.agent_id
+            ORDER BY a.created_at DESC
         """
         
         agents = await database.fetch_all(query, params)
