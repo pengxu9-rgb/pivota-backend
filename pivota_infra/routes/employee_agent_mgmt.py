@@ -106,13 +106,16 @@ async def get_agent_details(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        agent = await database.fetch_one(
+        agent_row = await database.fetch_one(
             "SELECT * FROM agents WHERE agent_id = :agent_id",
             {"agent_id": agent_id}
         )
         
-        if not agent:
+        if not agent_row:
             raise HTTPException(status_code=404, detail="Agent not found")
+        
+        # Convert to dict
+        agent = dict(agent_row)
         
         # Get agent's merchant connections
         merchant_connections = await database.fetch_all(
@@ -130,19 +133,19 @@ async def get_agent_details(
                 "name": agent.get("name"),
                 "email": agent.get("email"),
                 "company": agent.get("company"),
-                "use_case": agent.get("use_case", "General integration"),
+                "use_case": agent.get("use_case") or "General integration",
                 "api_key": agent.get("api_key"),
-                "status": agent.get("status", "active"),
+                "status": agent.get("status") or "active",
                 "created_at": agent.get("created_at"),
                 "last_active": agent.get("last_active"),
-                "request_count": agent.get("request_count", 0),
-                "success_rate": agent.get("success_rate", 0),
-                "rate_limit": agent.get("rate_limit", 1000),
+                "request_count": agent.get("request_count") or 0,
+                "success_rate": agent.get("success_rate") or 0,
+                "rate_limit": agent.get("rate_limit") or 1000,
                 "merchant_connections": [
                     {
-                        "merchant_id": mc["merchant_id"],
-                        "business_name": mc["business_name"],
-                        "connected_at": mc["connected_at"]
+                        "merchant_id": dict(mc).get("merchant_id"),
+                        "business_name": dict(mc).get("business_name"),
+                        "connected_at": dict(mc).get("connected_at")
                     }
                     for mc in merchant_connections
                 ]
