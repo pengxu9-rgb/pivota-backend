@@ -398,3 +398,4 @@ def _generate_recommendations(null_check, case_check, mismatch_check, fixable_or
     
     return recommendations
 
+
