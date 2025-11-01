@@ -123,6 +123,7 @@ from routes.admin_fix_order_psp import router as admin_fix_order_psp_router
 from routes.admin_debug_psp import router as admin_debug_psp_router
 from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
 from routes.employee_agents_management import router as employee_agents_management_router
+from routes.employee_agents_simple import router as employee_agents_simple_router
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
 from routes.admin_run_migration import router as admin_run_migration_router
 from routes.admin_fix_agents import router as admin_fix_agents_router
@@ -282,7 +283,8 @@ app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
 app.include_router(admin_fix_order_psp_router)
 app.include_router(admin_debug_psp_router)  # Admin debug PSP data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
-app.include_router(employee_agents_management_router)  # Employee agents management
+# TEMPORARILY DISABLED - causing "Failed to fetch agents: get" error
+# app.include_router(employee_agents_management_router)  # Employee agents management
 app.include_router(admin_fix_agents_router)  # Admin fix agents data
 app.include_router(admin_fix_agent_metrics_router)  # Admin fix agent metrics
 app.include_router(admin_fix_agent_metrics_v2_router)  # Admin fix agent metrics v2 (from orders)
@@ -312,7 +314,7 @@ app.include_router(employee_missing_router)  # Missing employee endpoints
 # app.include_router(agent_sdk_router)  # Replaced with fixed version
 app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
 app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
-# app.include_router(emp_agent_mgmt_router)  # Employee agent management - DISABLED: conflicts with employee_agents_management_router
+app.include_router(emp_agent_mgmt_router)  # Employee agent management - RE-ENABLED (simpler version)
 app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing
