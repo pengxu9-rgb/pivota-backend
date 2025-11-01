@@ -41,15 +41,21 @@ async def get_all_agents(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Build query
-        query = "SELECT * FROM agents"
+        # Build query with merchant count
+        query = """
+            SELECT 
+                a.*,
+                COUNT(DISTINCT am.merchant_id) as merchant_count
+            FROM agents a
+            LEFT JOIN agent_merchants am ON a.agent_id = am.agent_id
+        """
         params = {}
         
         if status:
-            query += " WHERE status = :status"
+            query += " WHERE a.status = :status"
             params["status"] = status
         
-        query += " ORDER BY created_at DESC"
+        query += " GROUP BY a.agent_id ORDER BY a.created_at DESC"
         
         agents = await database.fetch_all(query, params)
         
@@ -71,7 +77,12 @@ async def get_all_agents(
                 "last_active": str(agent_dict.get("last_active")) if agent_dict.get("last_active") else None,
                 "request_count": agent_dict.get("request_count", 0),
                 "success_rate": agent_dict.get("success_rate", 0),
-                "rate_limit": agent_dict.get("rate_limit", 1000)
+                "rate_limit": agent_dict.get("rate_limit", 1000),
+                # Add missing fields for frontend
+                "total_orders": agent_dict.get("total_orders", 0),
+                "total_gmv": float(agent_dict.get("total_gmv", 0)),
+                "total_requests": agent_dict.get("total_requests", agent_dict.get("request_count", 0)),
+                "merchant_count": agent_dict.get("merchant_count", 0)
             })
         
         return {
@@ -334,58 +345,8 @@ async def activate_agent(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to activate agent: {str(e)}")
 
-@router.get("/agents/{agent_id}/analytics")
-async def get_agent_analytics(
-    agent_id: str,
-    days: int = Query(default=30, ge=1, le=365),
-    current_user: dict = Depends(get_current_user)
-):
-    """Get agent analytics (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    try:
-        # Get agent
-        agent = await database.fetch_one(
-            "SELECT * FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        # Generate demo analytics
-        analytics = {
-            "period": f"Last {days} days",
-            "total_requests": random.randint(1000, 50000),
-            "successful_requests": random.randint(900, 49000),
-            "failed_requests": random.randint(10, 1000),
-            "success_rate": round(random.uniform(95, 99.9), 1),
-            "average_response_time": round(random.uniform(50, 500), 2),
-            "peak_hour": random.randint(10, 18),
-            "most_used_endpoints": [
-                {"endpoint": "/products/search", "count": random.randint(100, 5000)},
-                {"endpoint": "/orders", "count": random.randint(50, 2000)},
-                {"endpoint": "/payments", "count": random.randint(20, 1000)}
-            ],
-            "daily_requests": [
-                {
-                    "date": (datetime.now() - timedelta(days=i)).date().isoformat(),
-                    "count": random.randint(50, 500)
-                }
-                for i in range(min(days, 30))
-            ]
-        }
-        
-        return {
-            "status": "success",
-            "analytics": analytics
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get analytics: {str(e)}")
+# REMOVED: Analytics endpoint with random demo data
+# This was generating fake data and should not be used
 
 
 
