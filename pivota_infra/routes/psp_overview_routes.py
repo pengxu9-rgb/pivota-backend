@@ -43,16 +43,17 @@ async def get_psp_overview(
                 mp.provider as psp_name,
                 mp.status,
                 COUNT(DISTINCT mp.merchant_id) as merchant_count,
-                COUNT(CASE WHEN o.psp_used = mp.provider THEN o.order_id END) as transaction_count,
-                COUNT(CASE WHEN o.payment_status = 'paid' AND o.psp_used = mp.provider THEN 1 END) as success_count,
-                COALESCE(SUM(CASE WHEN o.payment_status = 'paid' AND o.psp_used = mp.provider THEN o.total ELSE 0 END), 0) as total_volume,
-                AVG(CASE WHEN o.payment_status = 'paid' AND o.psp_used = mp.provider THEN o.total ELSE NULL END) as avg_transaction_size,
-                COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') AND o.psp_used = mp.provider THEN 1 END) as refund_count,
-                MAX(CASE WHEN o.psp_used = mp.provider THEN o.created_at END) as last_transaction
+                COUNT(CASE WHEN LOWER(o.psp_used) = LOWER(mp.provider) THEN o.order_id END) as transaction_count,
+                COUNT(CASE WHEN o.payment_status = 'paid' AND LOWER(o.psp_used) = LOWER(mp.provider) THEN 1 END) as success_count,
+                COALESCE(SUM(CASE WHEN o.payment_status = 'paid' AND LOWER(o.psp_used) = LOWER(mp.provider) THEN o.total ELSE 0 END), 0) as total_volume,
+                AVG(CASE WHEN o.payment_status = 'paid' AND LOWER(o.psp_used) = LOWER(mp.provider) THEN o.total ELSE NULL END) as avg_transaction_size,
+                COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') AND LOWER(o.psp_used) = LOWER(mp.provider) THEN 1 END) as refund_count,
+                MAX(CASE WHEN LOWER(o.psp_used) = LOWER(mp.provider) THEN o.created_at END) as last_transaction
             FROM merchant_psps mp
             LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
                 AND o.created_at >= :start_time
-                AND (o.psp_id = mp.psp_id OR o.psp_used = mp.provider)
+                AND ((o.psp_id IS NOT NULL AND mp.psp_id IS NOT NULL AND o.psp_id = mp.psp_id)
+                     OR (o.psp_used IS NOT NULL AND LOWER(o.psp_used) = LOWER(mp.provider)))
             WHERE mp.status = 'active'
             GROUP BY mp.provider, mp.status
         ),
