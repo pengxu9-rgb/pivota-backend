@@ -131,6 +131,13 @@ async def get_agent_details(
             {"agent_id": agent_id}
         )
         
+        # Calculate merchant count from orders
+        merchant_count_result = await database.fetch_one(
+            "SELECT COUNT(DISTINCT merchant_id) as count FROM orders WHERE agent_id = :agent_id",
+            {"agent_id": agent_id}
+        )
+        merchant_count = dict(merchant_count_result).get("count", 0) if merchant_count_result else 0
+        
         return {
             "status": "success",
             "agent": {
@@ -146,6 +153,11 @@ async def get_agent_details(
                 "request_count": agent.get("request_count") or 0,
                 "success_rate": agent.get("success_rate") or 0,
                 "rate_limit": agent.get("rate_limit") or 1000,
+                "total_orders": agent.get("total_orders") or 0,
+                "total_gmv": float(agent.get("total_gmv") or 0),
+                "total_requests": agent.get("total_requests") or agent.get("request_count") or 0,
+                "merchant_count": merchant_count,
+                "merchants": [dict(mc) for mc in merchant_connections],
                 "merchant_connections": [
                     {
                         "merchant_id": dict(mc).get("merchant_id"),
@@ -161,6 +173,62 @@ async def get_agent_details(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get agent details: {str(e)}")
+
+@router.get("/agents/{agent_id}/calls")
+async def get_agent_calls(
+    agent_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get agent API call logs"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        # Get calls from agent_usage_logs
+        calls = await database.fetch_all(
+            """SELECT * FROM agent_usage_logs 
+               WHERE agent_id = :agent_id 
+               ORDER BY timestamp DESC 
+               LIMIT :limit OFFSET :offset""",
+            {"agent_id": agent_id, "limit": limit, "offset": offset}
+        )
+        
+        # Count total
+        total_result = await database.fetch_one(
+            "SELECT COUNT(*) as total FROM agent_usage_logs WHERE agent_id = :agent_id",
+            {"agent_id": agent_id}
+        )
+        total = dict(total_result).get("total", 0) if total_result else 0
+        
+        # Format calls
+        formatted_calls = []
+        for call_row in calls:
+            call = dict(call_row)
+            formatted_calls.append({
+                "id": call.get("id"),
+                "endpoint": call.get("endpoint"),
+                "method": call.get("method"),
+                "merchant_id": call.get("merchant_id"),
+                "status_code": call.get("status_code"),
+                "response_time_ms": call.get("response_time_ms"),
+                "error_message": call.get("error_message"),
+                "order_id": call.get("order_id"),
+                "order_amount": call.get("order_amount"),
+                "timestamp": str(call.get("timestamp")) if call.get("timestamp") else None
+            })
+        
+        return {
+            "status": "success",
+            "calls": formatted_calls,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get calls: {str(e)}")
 
 @router.post("/agents/create")
 async def create_agent(
