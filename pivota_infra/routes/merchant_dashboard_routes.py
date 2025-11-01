@@ -185,7 +185,16 @@ async def get_merchant_stores(
     try:
         print(f"DEBUG get_merchant_stores: Querying for merchant_id: {merchant_id}")
         query = """
-            SELECT store_id, platform, name, domain, status, connected_at, last_sync, product_count
+            SELECT 
+                store_id, 
+                platform, 
+                name, 
+                domain, 
+                status, 
+                connected_at, 
+                last_sync, 
+                product_count,
+                CASE WHEN api_key IS NOT NULL AND api_key != '' THEN true ELSE false END as api_key_present
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
             ORDER BY connected_at DESC
@@ -194,12 +203,20 @@ async def get_merchant_stores(
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         print(f"DEBUG get_merchant_stores: Found {len(rows)} stores")
         for row in rows:
+            is_active = row["status"] == "active"
+            has_api_key = row["api_key_present"]
+            is_connected = is_active and has_api_key
+            
             stores.append({
                 "id": row["store_id"],
                 "platform": row["platform"],
                 "name": row["name"],
                 "domain": row["domain"],
                 "status": row["status"],
+                "is_active": is_active,
+                "is_connected": is_connected,
+                "api_key_present": has_api_key,
+                "shop_domain": row["domain"],  # Alias for compatibility
                 "connected_at": row["connected_at"],
                 "last_sync": row["last_sync"],
                 "product_count": row["product_count"] or 0
