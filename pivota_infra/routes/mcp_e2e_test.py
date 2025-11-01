@@ -180,12 +180,18 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
             
             # Parse token if it's JSON
             token = api_key
+            token_source = "direct"
             try:
                 if isinstance(api_key, str) and api_key.strip().startswith("{"):
                     parsed = json.loads(api_key)
                     token = parsed.get("access_token") or parsed.get("token") or api_key
-            except:
-                pass
+                    token_source = "json_parsed"
+                    logger.info(f"Shopify token parsed from JSON: {token[:15]}...")
+            except Exception as parse_error:
+                logger.warning(f"Failed to parse Shopify token as JSON: {parse_error}")
+                token_source = "parse_failed"
+            
+            logger.info(f"Testing Shopify {domain} with token (length={len(token)}, source={token_source})")
             
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
@@ -193,6 +199,9 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
                         f"https://{domain}/admin/api/2024-01/shop.json",
                         headers={"X-Shopify-Access-Token": token}
                     )
+                    
+                    logger.info(f"Shopify API response: {resp.status_code}")
+                    
                     if resp.status_code == 200:
                         shop_data = resp.json().get("shop", {})
                         return {
@@ -203,12 +212,15 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
                             "message": "Connected & reachable"
                         }
                     else:
+                        error_body = resp.text[:200] if resp.text else "No error body"
+                        logger.error(f"Shopify API error {resp.status_code}: {error_body}")
                         return {
                             "platform": "Shopify",
                             "name": name,
                             "domain": domain,
                             "status": "error",
-                            "message": f"API error {resp.status_code}"
+                            "message": f"HTTP {resp.status_code}",
+                            "error": error_body
                         }
             except Exception as e:
                 return {
