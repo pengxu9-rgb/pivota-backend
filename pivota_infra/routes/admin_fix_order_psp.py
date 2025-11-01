@@ -62,3 +62,4 @@ async def fix_order_psp_associations(merchant_id: str):
         logger.error(f"Failed to fix order PSP associations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+

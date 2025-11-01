@@ -28,3 +28,4 @@ COMMENT ON COLUMN agent_policies.max_requests_per_minute IS 'Maximum requests al
 COMMENT ON COLUMN agent_policies.max_error_rate IS 'Maximum error rate threshold (0.1 = 10%)';
 COMMENT ON COLUMN agent_policies.status IS 'Policy status: active, suspended, blocked';
 
+

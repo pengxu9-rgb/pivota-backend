@@ -19,3 +19,4 @@ COMMENT ON COLUMN merchant_stores.api_endpoint IS 'Merchant self-hosted API endp
 COMMENT ON COLUMN merchant_stores.query_ttl_seconds IS 'Cache TTL in seconds (default 600 = 10 minutes)';
 
 
+
