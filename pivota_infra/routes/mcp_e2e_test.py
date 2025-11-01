@@ -554,11 +554,22 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
     if platform == "shopify":
         if not domain or not api_key:
             return {"platform": "Shopify", "name": name, "domain": domain, "status": "error", "message": "Incomplete credentials"}
+        
+        # Parse token if it's JSON (CRITICAL: must match _test_single_store_api logic)
+        token = api_key
+        try:
+            if isinstance(api_key, str) and api_key.strip().startswith("{"):
+                parsed = json.loads(api_key)
+                token = parsed.get("access_token") or parsed.get("token") or api_key
+                logger.info(f"[Aggregation] Shopify token parsed from JSON")
+        except:
+            pass
+        
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     f"https://{domain}/admin/api/2024-01/shop.json",
-                    headers={"X-Shopify-Access-Token": api_key}
+                    headers={"X-Shopify-Access-Token": token}
                 )
                 if resp.status_code == 200:
                     return {"platform": "Shopify", "name": name, "domain": domain, "status": "success", "message": "OK"}
