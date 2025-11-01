@@ -122,6 +122,7 @@ from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_route
 from routes.admin_fix_order_psp import router as admin_fix_order_psp_router
 from routes.admin_debug_psp import router as admin_debug_psp_router
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
+from routes.admin_run_migration import router as admin_run_migration_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -276,6 +277,7 @@ app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
 app.include_router(admin_fix_order_psp_router)
 app.include_router(admin_debug_psp_router)  # Admin debug PSP data
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
+app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
