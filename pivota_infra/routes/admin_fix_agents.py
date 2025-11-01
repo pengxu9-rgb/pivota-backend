@@ -1,7 +1,7 @@
 """Admin endpoint to fix agent data (name/email)"""
 from fastapi import APIRouter, Depends, HTTPException, status
-from database.connection import get_db_connection
-from auth import get_current_user
+from db.database import database
+from utils.auth import get_current_user
 import logging
 from typing import Dict, Any
 
@@ -20,19 +20,16 @@ async def fix_agents_data(current_user: dict = Depends(get_current_user)):
             detail="Only admins can execute this fix"
         )
     
-    conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
         # First, count how many agents need fixing
-        cur.execute("""
-            SELECT COUNT(*) 
+        count_query = """
+            SELECT COUNT(*) as count 
             FROM agents 
             WHERE name IS NULL OR name = '' 
                OR email IS NULL OR email = ''
-        """)
-        needs_fix = cur.fetchone()[0]
+        """
+        result = await database.fetch_one(count_query)
+        needs_fix = result['count']
         
         if needs_fix == 0:
             return {
@@ -42,7 +39,7 @@ async def fix_agents_data(current_user: dict = Depends(get_current_user)):
             }
         
         # Update agents with missing name/email
-        cur.execute("""
+        update_query = """
             UPDATE agents 
             SET 
                 name = CASE 
@@ -57,11 +54,11 @@ async def fix_agents_data(current_user: dict = Depends(get_current_user)):
                 email = CASE 
                     WHEN email IS NULL OR email = '' THEN 
                         CONCAT(
-                            LOWER(COALESCE(
+                            LOWER(REPLACE(COALESCE(
                                 company,
                                 use_case,
                                 CONCAT('agent_', SUBSTRING(agent_id, 1, 8))
-                            )),
+                            ), ' ', '_')),
                             '@example.com'
                         )
                     ELSE email
@@ -69,20 +66,20 @@ async def fix_agents_data(current_user: dict = Depends(get_current_user)):
             WHERE name IS NULL OR name = '' 
                OR email IS NULL OR email = ''
             RETURNING agent_id, name, email, company, use_case
-        """)
+        """
         
-        updated_agents = cur.fetchall()
-        conn.commit()
+        # Execute update and get results
+        updated_agents = await database.fetch_all(update_query)
         
         # Format results
         results = []
         for agent in updated_agents:
             results.append({
-                "agent_id": agent[0],
-                "new_name": agent[1],
-                "new_email": agent[2],
-                "company": agent[3],
-                "use_case": agent[4]
+                "agent_id": agent['agent_id'],
+                "new_name": agent['name'],
+                "new_email": agent['email'],
+                "company": agent['company'],
+                "use_case": agent['use_case']
             })
         
         return {
@@ -93,17 +90,11 @@ async def fix_agents_data(current_user: dict = Depends(get_current_user)):
         }
         
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"Error fixing agents data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fix agents data: {str(e)}"
         )
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
 
 @router.get("/agents-status")
 async def check_agents_status(current_user: dict = Depends(get_current_user)):
@@ -117,50 +108,48 @@ async def check_agents_status(current_user: dict = Depends(get_current_user)):
             detail="Only admins can check agent status"
         )
     
-    conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
         # Count agents needing fix
-        cur.execute("""
+        stats_query = """
             SELECT 
                 COUNT(*) as total,
                 COUNT(CASE WHEN name IS NULL OR name = '' THEN 1 END) as missing_name,
                 COUNT(CASE WHEN email IS NULL OR email = '' THEN 1 END) as missing_email
             FROM agents
-        """)
+        """
         
-        stats = cur.fetchone()
+        stats = await database.fetch_one(stats_query)
         
         # Get sample of agents needing fix
-        cur.execute("""
+        sample_query = """
             SELECT agent_id, name, email, company, use_case, created_at
             FROM agents
             WHERE name IS NULL OR name = '' 
                OR email IS NULL OR email = ''
             LIMIT 5
-        """)
+        """
         
-        sample_agents = []
-        for agent in cur.fetchall():
-            sample_agents.append({
-                "agent_id": agent[0],
-                "name": agent[1],
-                "email": agent[2],
-                "company": agent[3],
-                "use_case": agent[4],
-                "created_at": agent[5].isoformat() if agent[5] else None
+        sample_agents = await database.fetch_all(sample_query)
+        
+        formatted_samples = []
+        for agent in sample_agents:
+            formatted_samples.append({
+                "agent_id": agent['agent_id'],
+                "name": agent['name'],
+                "email": agent['email'],
+                "company": agent['company'],
+                "use_case": agent['use_case'],
+                "created_at": agent['created_at'].isoformat() if agent['created_at'] else None
             })
         
         return {
-            "total_agents": stats[0],
+            "total_agents": stats['total'],
             "needs_fix": {
-                "missing_name": stats[1],
-                "missing_email": stats[2],
-                "any_missing": stats[1] + stats[2]
+                "missing_name": stats['missing_name'],
+                "missing_email": stats['missing_email'],
+                "any_missing": stats['missing_name'] + stats['missing_email']
             },
-            "sample_agents_needing_fix": sample_agents
+            "sample_agents_needing_fix": formatted_samples
         }
         
     except Exception as e:
@@ -169,7 +158,3 @@ async def check_agents_status(current_user: dict = Depends(get_current_user)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to check agents status: {str(e)}"
         )
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
