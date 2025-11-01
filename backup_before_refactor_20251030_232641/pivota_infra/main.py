@@ -8,7 +8,6 @@ import asyncio
 import logging
 import time
 import uvicorn
-from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
@@ -41,7 +40,7 @@ from routes.agent_account import router as agent_account_router  # Agent account
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
-from routes.merchant_dashboard_routes_fixed import router as merchant_dashboard_router
+from routes.merchant_dashboard_routes import router as merchant_dashboard_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
 from routes.debug_integrations import router as debug_integrations_router
@@ -63,8 +62,7 @@ from routes.employee_missing_endpoints import router as employee_missing_router
 from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
-# REMOVED: from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
-# Merged into employee_agents_management.py to avoid route conflicts
+from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.debug_psp_insert import router as debug_psp_router
 from routes.debug_psp_validation import router as debug_psp_validation_router
@@ -105,30 +103,6 @@ from routes.product_routes import router as product_router
 from routes.product_routes_v2 import router as product_router_v2
 from routes.product_sync import router as product_sync_router
 from routes.universal_product_sync import router as universal_sync_router
-from routes.sync_all_platforms import router as sync_all_router
-# Temporary debug endpoints removed - v2 endpoint is now stable
-# from routes.products_no_auth import router as products_debug_router
-# from routes.public_products_temp import router as public_products_router
-from routes.product_sync_monitoring import router as product_monitoring_router
-from routes.admin_reset_employee import router as admin_reset_employee_router
-from routes.admin_cleanup_duplicates import router as admin_cleanup_duplicates_router
-from routes.admin_data_consistency import router as admin_data_consistency_router
-from routes.admin_merchant_canonicalize import router as admin_merchant_canonicalize_router
-from routes.admin_merchant_reset import router as admin_merchant_reset_router
-from routes.admin_shopify_health import router as admin_shopify_health_router
-from routes.products_cache_maintenance import router as products_cache_maintenance_router
-from routes.mcp_e2e_test import router as mcp_e2e_test_router
-from routes.admin_recover_psps import router as admin_recover_psps_router
-from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_router
-from routes.admin_fix_order_psp import router as admin_fix_order_psp_router
-from routes.admin_debug_psp import router as admin_debug_psp_router
-from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
-from routes.employee_agents_management import router as employee_agents_management_router
-from routes.admin_psp_integrity import router as admin_psp_integrity_router
-from routes.admin_run_migration import router as admin_run_migration_router
-from routes.admin_fix_agents import router as admin_fix_agents_router
-from routes.admin_fix_agent_metrics import router as admin_fix_agent_metrics_router
-from routes.admin_fix_agent_metrics_v2 import router as admin_fix_agent_metrics_v2_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -270,25 +244,6 @@ app.include_router(debug_psp_validation_router)  # Debug PSP validation
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(admin_api_router)  # Admin API endpoints
-app.include_router(admin_reset_employee_router)  # Admin employee password reset
-app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplicate data
-app.include_router(admin_data_consistency_router)  # Admin data consistency check and fix
-app.include_router(admin_merchant_canonicalize_router)  # Admin merchant canonicalization
-app.include_router(admin_merchant_reset_router)  # Admin merchant reset
-app.include_router(admin_shopify_health_router)  # Admin Shopify health check
-app.include_router(products_cache_maintenance_router)  # Products cache maintenance
-app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
-app.include_router(admin_recover_psps_router)  # Admin PSP recovery
-app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
-app.include_router(admin_fix_order_psp_router)
-app.include_router(admin_debug_psp_router)  # Admin debug PSP data
-app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
-app.include_router(employee_agents_management_router)  # Employee agents management
-app.include_router(admin_fix_agents_router)  # Admin fix agents data
-app.include_router(admin_fix_agent_metrics_router)  # Admin fix agent metrics
-app.include_router(admin_fix_agent_metrics_v2_router)  # Admin fix agent metrics v2 (from orders)
-app.include_router(admin_psp_integrity_router)  # PSP data integrity management
-app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
@@ -313,7 +268,7 @@ app.include_router(employee_missing_router)  # Missing employee endpoints
 # app.include_router(agent_sdk_router)  # Replaced with fixed version
 app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
 app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
-# REMOVED: app.include_router(emp_agent_mgmt_router) - Merged into employee_agents_management_router
+app.include_router(emp_agent_mgmt_router)  # Employee agent management
 app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing
@@ -341,16 +296,10 @@ if DEBUG_MODE:
     logger.warning("⚠️ DEBUG MODE ENABLED - Debug endpoints are accessible!")
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
-# Register more specific product routes FIRST to avoid path conflicts
-app.include_router(product_router_v2)  # Product management v2 (cache-based) - MUST be before product_router
+app.include_router(product_router)  # Product management
+app.include_router(product_router_v2)  # Product management v2 (cache-based)
 app.include_router(product_sync_router)  # Product sync from platforms (legacy)
-app.include_router(product_router)  # Product management - MUST be after v2 to avoid /{merchant_id} matching /v2/xxx
-app.include_router(universal_sync_router)
-app.include_router(sync_all_router)  # Universal product sync (new)
-app.include_router(product_monitoring_router)  # Product sync monitoring and metrics
-# Temporary debug endpoints commented out - v2 is stable now
-# app.include_router(products_debug_router)  # Debug products endpoint (no auth)
-# app.include_router(public_products_router)  # Public test endpoint
+app.include_router(universal_sync_router)  # Universal product sync (new)
 app.include_router(order_router)  # Order processing
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
@@ -533,25 +482,6 @@ async def startup():
                 )
             """)
             
-            # Fix missing columns in agents table (2024-10-30)
-            logger.info("🔧 Applying database fixes for agents table...")
-            try:
-                await database.execute("""
-                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_gmv NUMERIC(12,2) DEFAULT 0
-                """)
-                await database.execute("""
-                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_requests INTEGER DEFAULT 0
-                """)
-                await database.execute("""
-                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_orders INTEGER DEFAULT 0
-                """)
-                await database.execute("""
-                    ALTER TABLE agents ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP WITH TIME ZONE
-                """)
-                logger.info("✅ Added missing columns to agents table")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not add columns to agents table: {e}")
-            
             # Create payments table
             await database.execute("""
                 CREATE TABLE IF NOT EXISTS payments (
@@ -589,29 +519,6 @@ async def startup():
                     timestamp TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
-            
-            # Fix request_id constraint issue (2024-10-30)
-            logger.info("🔧 Fixing agent_usage_logs request_id constraint...")
-            try:
-                # Drop existing constraint
-                await database.execute("""
-                    ALTER TABLE agent_usage_logs DROP CONSTRAINT IF EXISTS agent_usage_logs_request_id_key
-                """)
-                # Clean up empty request_ids
-                await database.execute("""
-                    UPDATE agent_usage_logs SET request_id = NULL WHERE request_id = ''
-                """)
-                # Allow NULLs for request_id
-                await database.execute("""
-                    ALTER TABLE agent_usage_logs ALTER COLUMN request_id DROP NOT NULL
-                """)
-                # Re-add unique constraint (NULLs allowed)
-                await database.execute("""
-                    ALTER TABLE agent_usage_logs ADD CONSTRAINT agent_usage_logs_request_id_key UNIQUE (request_id)
-                """)
-                logger.info("✅ Fixed request_id constraint in agent_usage_logs")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not fix request_id constraint: {e}")
             
             # Create agent_merchants table
             await database.execute("""
@@ -659,15 +566,90 @@ async def startup():
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_id ON merchant_stores(merchant_id)")
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_merchant_id ON merchant_psps(merchant_id)")
             
-            # Create performance indexes for agent tables
-            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_agent_id_timestamp ON agent_usage_logs(agent_id, timestamp DESC)")
-            await database.execute("CREATE INDEX IF NOT EXISTS idx_agents_agent_id ON agents(agent_id)")
-            
             logger.info("✅ Integration tables created/verified")
             
-            # DISABLED: Auto-initialization of demo merchant (causes duplicate data)
-            # Merchants should be created via onboarding flow, not auto-initialized
-            
+            # Initialize merchant data for merch_6b90dc9838d5fd9c
+            try:
+                merchant_id = "merch_6b90dc9838d5fd9c"
+                
+                # Check if merchant exists
+                check_merchant = "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :merchant_id"
+                merchant_exists = await database.fetch_one(check_merchant, {"merchant_id": merchant_id})
+                
+                if not merchant_exists:
+                    # Create merchant if doesn't exist
+                    await database.execute("""
+                        INSERT INTO merchant_onboarding (merchant_id, business_name, contact_email, store_url, status, mcp_connected, mcp_platform, mcp_shop_domain, psp_connected, psp_type)
+                        VALUES (:merchant_id, :business_name, :contact_email, :store_url, :status, :mcp_connected, :mcp_platform, :mcp_shop_domain, :psp_connected, :psp_type)
+                    """, {
+                        "merchant_id": merchant_id,
+                        "business_name": "ChydanTest Store",
+                        "contact_email": "merchant@test.com",
+                        "store_url": "https://chydantest.myshopify.com",
+                        "status": "approved",
+                        "mcp_connected": True,
+                        "mcp_platform": "shopify",
+                        "mcp_shop_domain": "chydantest.myshopify.com",
+                        "psp_connected": True,
+                        "psp_type": "stripe"
+                    })
+                    logger.info(f"✅ Created merchant {merchant_id}")
+                else:
+                    # Update existing merchant to ensure it has MCP connection
+                    await database.execute("""
+                        UPDATE merchant_onboarding 
+                        SET store_url = :store_url,
+                            mcp_connected = :mcp_connected,
+                            mcp_platform = :mcp_platform,
+                            mcp_shop_domain = :mcp_shop_domain,
+                            psp_connected = :psp_connected,
+                            psp_type = :psp_type
+                        WHERE merchant_id = :merchant_id
+                    """, {
+                        "merchant_id": merchant_id,
+                        "store_url": "https://chydantest.myshopify.com",
+                        "mcp_connected": True,
+                        "mcp_platform": "shopify",
+                        "mcp_shop_domain": "chydantest.myshopify.com",
+                        "psp_connected": True,
+                        "psp_type": "stripe"
+                    })
+                    logger.info(f"✅ Updated merchant {merchant_id} with Shopify connection")
+                
+                # Insert Shopify store
+                await database.execute("""
+                    INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, status, product_count, connected_at)
+                    VALUES (:store_id, :merchant_id, :platform, :name, :domain, :status, :product_count, NOW())
+                    ON CONFLICT (store_id) DO NOTHING
+                """, {
+                    "store_id": "store_shopify_chydantest",
+                    "merchant_id": merchant_id,
+                    "platform": "shopify",
+                    "name": "chydantest.myshopify.com",
+                    "domain": "chydantest.myshopify.com",
+                    "status": "connected",
+                    "product_count": 4
+                })
+                
+                # Insert Stripe PSP
+                await database.execute("""
+                    INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, account_id, capabilities, status, connected_at)
+                    VALUES (:psp_id, :merchant_id, :provider, :name, :account_id, :capabilities, :status, NOW())
+                    ON CONFLICT (psp_id) DO NOTHING
+                """, {
+                    "psp_id": "psp_stripe_chydantest",
+                    "merchant_id": merchant_id,
+                    "provider": "stripe",
+                    "name": "Stripe Account",
+                    "account_id": "acct_real_stripe",
+                    "capabilities": "card,bank_transfer,alipay,wechat_pay",
+                    "status": "active"
+                })
+                
+                logger.info(f"✅ Initialized real integrations for merchant {merchant_id}")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Could not initialize merchant data: {e}")
         except Exception as e:
             logger.warning(f"⚠️ Could not create integration tables: {e}")
         from db.agents import agents, agent_usage_logs
@@ -1011,49 +993,3 @@ async def config_check():
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
 
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    from config.settings import settings
-    
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "database": "connected",
-        "config_check": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-        }
-    }
-
-@app.get("/config-check")
-async def config_check():
-    """Public endpoint to check environment variable configuration (no auth required)"""
-    from config.settings import settings
-    
-    return {
-        "status": "success",
-        "message": "Environment variable configuration check",
-        "config": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
-            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
-            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
-            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
-            "metrics_query_version": settings.metrics_query_version,
-            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
-        },
-        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
-    }
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
-
-# Force redeploy: 1761914340
