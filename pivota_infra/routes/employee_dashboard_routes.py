@@ -13,6 +13,7 @@ router = APIRouter()
 
 @router.get("/analytics/dashboard")
 async def get_analytics_dashboard(
+    time_range: str = Query("30d", description="Time range: 1d, 7d, 30d, 90d"),
     current_user: dict = Depends(get_current_user)
 ):
     """Get analytics dashboard for employee portal"""
@@ -20,15 +21,22 @@ async def get_analytics_dashboard(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Get total transactions from orders table
+        # Parse time_range to get days
+        days_map = {"1d": 1, "7d": 7, "30d": 30, "90d": 90}
+        days = days_map.get(time_range, 30)
+        start_date = datetime.utcnow() - timedelta(days=days)
+        
+        # Get transactions from orders table (filtered by time_range)
         transactions_query = """
             SELECT 
                 COUNT(*) as total_transactions,
                 COALESCE(SUM(total), 0) as total_revenue,
-                SUM(CASE WHEN payment_status = 'paid' OR status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_transactions
+                SUM(CASE WHEN payment_status = 'paid' OR status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_transactions,
+                AVG(CASE WHEN payment_status = 'paid' THEN total ELSE NULL END) as avg_transaction_value
             FROM orders
+            WHERE created_at >= :start_date
         """
-        transactions = await database.fetch_one(transactions_query)
+        transactions = await database.fetch_one(transactions_query, {"start_date": start_date})
         
         # Calculate success rate
         success_rate = 0
@@ -52,18 +60,18 @@ async def get_analytics_dashboard(
         """
         psps = await database.fetch_one(psp_query)
         
-        # Get recent transaction trends (last 7 days)
+        # Get recent transaction trends (based on time_range)
         trends_query = """
             SELECT 
                 DATE(created_at) as date,
                 COUNT(*) as transactions,
                 COALESCE(SUM(total), 0) as revenue
             FROM orders
-            WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
+            WHERE created_at >= :start_date
             GROUP BY DATE(created_at)
             ORDER BY date DESC
         """
-        trends = await database.fetch_all(trends_query)
+        trends = await database.fetch_all(trends_query, {"start_date": start_date})
         
         trend_data = []
         for trend in trends:
@@ -79,15 +87,19 @@ async def get_analytics_dashboard(
                 "total_transactions": transactions["total_transactions"] if transactions else 0,
                 "total_revenue": float(transactions["total_revenue"]) if transactions else 0,
                 "success_rate": round(success_rate, 1),
+                "avg_transaction_value": float(transactions["avg_transaction_value"]) if transactions and transactions["avg_transaction_value"] else 0,
                 "total_merchants": merchants["total_merchants"] if merchants else 0,
                 "active_merchants": merchants["active_merchants"] if merchants else 0,
                 "total_psps": psps["total_psps"] if psps else 0,
                 "total_psp_connections": psps["total_connections"] if psps else 0,
-                "transaction_trends": trend_data
+                "transaction_trends": trend_data,
+                "time_range": time_range
             }
         }
     except Exception as e:
         print(f"Error in analytics dashboard: {e}")
+        import traceback
+        traceback.print_exc()
         # Return default values if error
         return {
             "status": "success",
@@ -95,11 +107,13 @@ async def get_analytics_dashboard(
                 "total_transactions": 0,
                 "total_revenue": 0,
                 "success_rate": 0,
+                "avg_transaction_value": 0,
                 "total_merchants": 0,
                 "active_merchants": 0,
                 "total_psps": 0,
                 "total_psp_connections": 0,
-                "transaction_trends": []
+                "transaction_trends": [],
+                "time_range": time_range
             }
         }
 
