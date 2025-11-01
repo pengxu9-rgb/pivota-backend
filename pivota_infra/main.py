@@ -41,7 +41,7 @@ from routes.agent_account import router as agent_account_router  # Agent account
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
-from routes.merchant_dashboard_routes_fixed import router as merchant_dashboard_router  # Real data only, no demo fallback
+from routes.merchant_dashboard_routes import router as merchant_dashboard_router  # Original with fallback - STABLE
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
 from routes.debug_integrations import router as debug_integrations_router
