@@ -12,10 +12,24 @@ import uuid
 import secrets
 import random
 import logging
+import json as json_module
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/employee", tags=["employee-agents"])
+
+# ============== Helpers ==============
+
+def parse_json_field(value):
+    """Safely parse JSON field - handles both string and already-parsed JSON"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            return json_module.loads(value)
+        except:
+            return []
+    return []
 
 # ============== Models ==============
 
@@ -221,7 +235,8 @@ async def get_agent_details(
                     {
                         "key_id": dict(k).get("key_id"),
                         "key_prefix": dict(k).get("key_prefix"),
-                        "scopes": dict(k).get("scopes") or [],
+                        "scopes": parse_json_field(dict(k).get("scopes")),
+                        "ip_whitelist": parse_json_field(dict(k).get("ip_whitelist")),
                         "is_active": dict(k).get("is_active"),
                         "created_at": str(dict(k).get("created_at")) if dict(k).get("created_at") else None,
                         "expires_at": str(dict(k).get("expires_at")) if dict(k).get("expires_at") else None,
@@ -523,8 +538,8 @@ async def get_agent_api_keys(
                 {
                     "key_id": dict(k).get("key_id"),
                     "key_prefix": dict(k).get("key_prefix"),
-                    "scopes": dict(k).get("scopes") or [],
-                    "ip_whitelist": dict(k).get("ip_whitelist") or [],
+                    "scopes": parse_json_field(dict(k).get("scopes")),
+                    "ip_whitelist": parse_json_field(dict(k).get("ip_whitelist")),
                     "is_active": dict(k).get("is_active"),
                     "created_at": str(dict(k).get("created_at")) if dict(k).get("created_at") else None,
                     "expires_at": str(dict(k).get("expires_at")) if dict(k).get("expires_at") else None,
