@@ -16,9 +16,12 @@ async def run_migration_009(current_user: dict = Depends(get_current_user)):
     try:
         results = []
         
-        # Step 1: Create agent_metrics table
+        # Step 1: Drop and recreate agent_metrics table with correct schema
+        await database.execute("DROP TABLE IF EXISTS agent_metrics CASCADE")
+        results.append("✅ Dropped old agent_metrics table if exists")
+        
         await database.execute("""
-            CREATE TABLE IF NOT EXISTS agent_metrics (
+            CREATE TABLE agent_metrics (
                 id SERIAL PRIMARY KEY,
                 agent_id VARCHAR(50) NOT NULL,
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
