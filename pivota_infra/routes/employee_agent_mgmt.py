@@ -949,6 +949,253 @@ async def get_agent_performance(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get performance stats: {str(e)}")
 
+# ============== Phase 3: Metrics & Alerts ==============
+
+@router.get("/agents/{agent_id}/metrics-history")
+async def get_agent_metrics_history(
+    agent_id: str,
+    hours: int = 24,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get agent metrics history from agent_metrics table"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        from services.agent_metrics_collector import get_agent_metrics_history
+        
+        metrics = await get_agent_metrics_history(agent_id, hours)
+        
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "period_hours": hours,
+            "metrics": [
+                {
+                    "timestamp": str(m.get("timestamp")),
+                    "avg_response_time_ms": m.get("avg_response_time_ms"),
+                    "success_rate": float(m.get("success_rate") or 0),
+                    "error_rate": float(m.get("error_rate") or 0),
+                    "queries_per_min": m.get("queries_per_min"),
+                    "total_queries": m.get("total_queries_count"),
+                    "last_seen_at": str(m.get("last_seen_at")) if m.get("last_seen_at") else None
+                }
+                for m in metrics
+            ],
+            "total": len(metrics)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get metrics history: {str(e)}")
+
+@router.get("/agents/{agent_id}/alerts")
+async def get_agent_alerts(
+    agent_id: str,
+    resolved: bool = False,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get alerts for an agent"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        alerts = await database.fetch_all(
+            """SELECT alert_id, alert_type, severity, message, metadata,
+                      resolved, resolved_at, resolved_by, created_at
+               FROM agent_alerts
+               WHERE agent_id = :agent_id AND resolved = :resolved
+               ORDER BY created_at DESC""",
+            {"agent_id": agent_id, "resolved": resolved}
+        )
+        
+        return {
+            "status": "success",
+            "alerts": [
+                {
+                    "alert_id": dict(a).get("alert_id"),
+                    "alert_type": dict(a).get("alert_type"),
+                    "severity": dict(a).get("severity"),
+                    "message": dict(a).get("message"),
+                    "metadata": dict(a).get("metadata"),
+                    "resolved": dict(a).get("resolved"),
+                    "created_at": str(dict(a).get("created_at")) if dict(a).get("created_at") else None,
+                    "resolved_at": str(dict(a).get("resolved_at")) if dict(a).get("resolved_at") else None,
+                    "resolved_by": dict(a).get("resolved_by")
+                }
+                for a in alerts
+            ],
+            "total": len(alerts)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get alerts: {str(e)}")
+
+@router.post("/agents/alerts/{alert_id}/resolve")
+async def resolve_agent_alert(
+    alert_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Resolve an alert"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        await database.execute(
+            """UPDATE agent_alerts
+               SET resolved = true, resolved_at = :resolved_at, resolved_by = :resolved_by
+               WHERE alert_id = :alert_id""",
+            {
+                "resolved_at": datetime.now(),
+                "resolved_by": current_user.get("email"),
+                "alert_id": alert_id
+            }
+        )
+        
+        logger.info(f"✅ Alert {alert_id} resolved by {current_user.get('email')}")
+        
+        return {
+            "status": "success",
+            "message": "Alert resolved successfully"
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to resolve alert: {str(e)}")
+
+@router.get("/agents/alerts")
+async def get_all_alerts(
+    severity: Optional[str] = None,
+    resolved: bool = False,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all alerts across all agents"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        query = """
+            SELECT 
+                al.alert_id, al.agent_id, al.alert_type, al.severity, 
+                al.message, al.created_at, al.resolved,
+                a.name as agent_name, a.email as agent_email
+            FROM agent_alerts al
+            JOIN agents a ON al.agent_id = a.agent_id
+            WHERE al.resolved = :resolved
+        """
+        params = {"resolved": resolved}
+        
+        if severity:
+            query += " AND al.severity = :severity"
+            params["severity"] = severity
+        
+        query += " ORDER BY al.created_at DESC LIMIT 100"
+        
+        alerts = await database.fetch_all(query, params)
+        
+        return {
+            "status": "success",
+            "alerts": [
+                {
+                    "alert_id": dict(a).get("alert_id"),
+                    "agent_id": dict(a).get("agent_id"),
+                    "agent_name": dict(a).get("agent_name"),
+                    "alert_type": dict(a).get("alert_type"),
+                    "severity": dict(a).get("severity"),
+                    "message": dict(a).get("message"),
+                    "created_at": str(dict(a).get("created_at")) if dict(a).get("created_at") else None
+                }
+                for a in alerts
+            ],
+            "total": len(alerts)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get alerts: {str(e)}")
+
+@router.get("/agents/{agent_id}/health-score")
+async def get_agent_health_score(
+    agent_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Calculate agent health score (0-100)"""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        # Get recent metrics (last hour)
+        recent = await database.fetch_one(
+            """SELECT AVG(success_rate) as avg_success,
+                      AVG(avg_response_time_ms) as avg_latency,
+                      MAX(last_seen_at) as last_activity
+               FROM agent_metrics
+               WHERE agent_id = :agent_id
+                 AND timestamp >= NOW() - INTERVAL '1 hour'""",
+            {"agent_id": agent_id}
+        )
+        
+        # Count unresolved alerts
+        alerts = await database.fetch_one(
+            """SELECT 
+                COUNT(*) as total,
+                COUNT(CASE WHEN severity = 'critical' THEN 1 END) as critical_count
+               FROM agent_alerts
+               WHERE agent_id = :agent_id AND resolved = false""",
+            {"agent_id": agent_id}
+        )
+        
+        # Calculate health score
+        score = 100.0
+        details = {}
+        
+        if recent:
+            r = dict(recent)
+            avg_success = r.get("avg_success") or 0
+            avg_latency = r.get("avg_latency") or 0
+            last_activity = r.get("last_activity")
+            
+            # Penalize for low success rate
+            if avg_success < 95:
+                penalty = (95 - avg_success) * 2  # -2 points per 1% below 95
+                score -= penalty
+                details["success_rate_penalty"] = penalty
+            
+            # Penalize for high latency
+            if avg_latency > 1000:
+                penalty = min((avg_latency - 1000) / 100, 20)  # Max -20 points
+                score -= penalty
+                details["latency_penalty"] = penalty
+            
+            # Penalize for staleness
+            if last_activity:
+                hours_since_active = (datetime.now() - last_activity).total_seconds() / 3600
+                if hours_since_active > 24:
+                    penalty = min(hours_since_active, 30)  # Max -30 points
+                    score -= penalty
+                    details["staleness_penalty"] = penalty
+        
+        # Penalize for unresolved alerts
+        if alerts:
+            a = dict(alerts)
+            total_alerts = a.get("total", 0)
+            critical = a.get("critical_count", 0)
+            
+            score -= total_alerts * 5  # -5 points per alert
+            score -= critical * 10  # Additional -10 for critical
+            details["alerts_penalty"] = total_alerts * 5 + critical * 10
+        
+        # Ensure score is in range [0, 100]
+        score = max(0, min(100, score))
+        
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "health_score": round(score, 1),
+            "grade": "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D" if score >= 40 else "F",
+            "details": details
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to calculate health score: {str(e)}")
+
 
 
 

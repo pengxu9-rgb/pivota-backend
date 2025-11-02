@@ -131,6 +131,8 @@ from routes.admin_fix_agent_metrics import router as admin_fix_agent_metrics_rou
 from routes.admin_fix_agent_metrics_v2 import router as admin_fix_agent_metrics_v2_router
 from routes.debug_mcp_data import router as debug_mcp_data_router
 from routes.admin_run_migration_008 import router as admin_run_migration_008_router
+from routes.admin_governance import router as admin_governance_router
+from routes.admin_run_migration_009 import router as admin_run_migration_009_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -292,6 +294,8 @@ app.include_router(admin_fix_agent_metrics_router)  # Admin fix agent metrics
 app.include_router(admin_fix_agent_metrics_v2_router)  # Admin fix agent metrics v2 (from orders)
 app.include_router(debug_mcp_data_router)  # Debug MCP data
 app.include_router(admin_run_migration_008_router)  # Run migration 008 - Agents Phase 2
+app.include_router(admin_governance_router)  # Admin governance - Phase 3
+app.include_router(admin_run_migration_009_router)  # Run migration 009 - Agents Phase 3
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(merchant_router)  # Merchant management endpoints
