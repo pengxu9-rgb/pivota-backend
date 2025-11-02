@@ -8,9 +8,9 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
 
-from ..database import database
-from ..services.payment_metrics_collector import PaymentMetricsCollector
-from ..auth import verify_employee_token
+from db.database import database
+from services.payment_metrics_collector import PaymentMetricsCollector
+from utils.auth import get_current_employee
 
 
 router = APIRouter(prefix="/employee/psp", tags=["Employee PSP Dashboard"])
@@ -56,7 +56,7 @@ metrics_collector = PaymentMetricsCollector(database)
 @router.get("/performance", response_model=List[PSPPerformanceResponse])
 async def get_psp_performance(
     include_inactive: bool = Query(False, description="Include inactive PSPs"),
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get real-time PSP performance metrics
@@ -116,7 +116,7 @@ async def get_psp_performance(
 
 @router.get("/routes/overview", response_model=RoutingOverviewResponse)
 async def get_routing_overview(
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get overview of all routing configurations
@@ -221,7 +221,7 @@ async def get_failover_events(
     hours: int = Query(24, description="Hours to look back"),
     limit: int = Query(100, description="Maximum events to return"),
     agent_id: Optional[str] = Query(None, description="Filter by agent ID"),
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get recent failover events
@@ -285,7 +285,7 @@ async def test_route_configuration(
     route_id: str = Path(..., description="Route ID to test"),
     test_amount: float = Query(100.0, description="Test amount"),
     test_currency: str = Query("USD", description="Test currency"),
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Test a routing configuration with simulated payment
@@ -355,7 +355,7 @@ async def test_route_configuration(
 
 @router.get("/metrics/realtime")
 async def get_realtime_metrics(
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get real-time payment routing metrics for monitoring
@@ -422,7 +422,7 @@ async def get_realtime_metrics(
 
 @router.post("/metrics/collect")
 async def trigger_metrics_collection(
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Manually trigger metrics collection cycle
@@ -449,7 +449,7 @@ async def trigger_metrics_collection(
 
 @router.get("/alerts/active")
 async def get_active_psp_alerts(
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get currently active PSP alerts

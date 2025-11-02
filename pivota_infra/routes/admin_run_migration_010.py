@@ -5,15 +5,15 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, Any
 import os
 
-from ..database import database
-from ..auth import verify_employee_token
+from db.database import database
+from utils.auth import get_current_employee
 
 router = APIRouter(prefix="/admin/migrations", tags=["Admin Migrations"])
 
 
 @router.post("/run/010", response_model=Dict[str, Any])
 async def run_migration_010(
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Run migration 010 to create payment routing and protocol tables for Phase 4
@@ -26,7 +26,7 @@ async def run_migration_010(
     - psp_performance_metrics: Aggregated PSP performance data
     """
     # Verify admin access
-    if token_data.get("role") != "admin":
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:
@@ -142,14 +142,14 @@ async def run_migration_010(
 
 @router.delete("/rollback/010", response_model=Dict[str, Any])
 async def rollback_migration_010(
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Rollback migration 010 - removes payment routing and protocol tables
     WARNING: This will delete all payment routing data!
     """
     # Verify admin access
-    if token_data.get("role") != "admin":
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:

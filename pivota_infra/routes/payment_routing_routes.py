@@ -8,9 +8,9 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
 
-from ..database import database
-from ..services.payment_routing_service import PaymentRoutingService
-from ..auth import verify_agent_token, verify_employee_token
+from db.database import database
+from services.payment_routing_service import PaymentRoutingService
+from utils.auth import get_current_user, get_current_employee
 
 
 router = APIRouter(prefix="/agents", tags=["Payment Routing"])
@@ -81,13 +81,13 @@ routing_service = PaymentRoutingService(database)
 async def execute_payment_with_routing(
     agent_id: str = Path(..., description="Agent ID"),
     request: RoutePaymentRequest = ...,
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Execute payment with intelligent routing and automatic failover
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -117,13 +117,13 @@ async def execute_payment_with_routing(
 async def get_agent_routes(
     agent_id: str = Path(..., description="Agent ID"),
     include_inactive: bool = Query(False, description="Include inactive routes"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get routing configurations for an agent
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     query = """
@@ -167,13 +167,13 @@ async def update_route_config(
     agent_id: str = Path(..., description="Agent ID"),
     route_id: str = Path(..., description="Route ID"),
     request: UpdateRouteRequest = ...,
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Update routing configuration
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Check route exists and belongs to agent
@@ -238,7 +238,7 @@ async def update_route_config(
 @router.get("/payments/{payment_id}/attempts", response_model=List[PaymentAttemptResponse])
 async def get_payment_attempts(
     payment_id: str = Path(..., description="Payment/Order ID"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get all attempts for a specific payment
@@ -282,13 +282,13 @@ async def create_route_config(
     agent_id: str = Path(..., description="Agent ID"),
     request: UpdateRouteRequest = ...,
     merchant_id: Optional[str] = Query(None, description="Merchant ID (optional)"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Create a new routing configuration
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Generate route ID
@@ -350,13 +350,13 @@ async def create_route_config(
 async def delete_route_config(
     agent_id: str = Path(..., description="Agent ID"),
     route_id: str = Path(..., description="Route ID"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Delete (deactivate) a routing configuration
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Deactivate route instead of hard delete
@@ -382,7 +382,7 @@ employee_router = APIRouter(prefix="/employee/routing", tags=["Employee Routing"
 @employee_router.get("/performance")
 async def get_routing_performance(
     hours: int = Query(24, description="Hours to look back"),
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get overall routing performance metrics (Employee only)
@@ -445,7 +445,7 @@ async def get_routing_performance(
 @employee_router.get("/recent-failovers")
 async def get_recent_failovers(
     limit: int = Query(50, description="Number of recent failovers"),
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get recent payment failover events (Employee only)

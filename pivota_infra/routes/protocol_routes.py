@@ -8,9 +8,9 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
 
-from ..database import database
-from ..services.protocol_adapter_service import ProtocolAdapterService
-from ..auth import verify_agent_token, verify_employee_token
+from db.database import database
+from services.protocol_adapter_service import ProtocolAdapterService
+from utils.auth import get_current_user, get_current_employee
 
 
 router = APIRouter(prefix="/protocols", tags=["Protocol Management"])
@@ -108,13 +108,13 @@ async def test_protocol_call(
     agent_id: str = Path(..., description="Agent ID"),
     protocol_name: str = Path(..., description="Protocol name: AP2, ACP, or X-402"),
     request: ProtocolTestRequest = ...,
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Test a protocol call in sandbox mode
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Verify agent has this protocol enabled
@@ -153,13 +153,13 @@ async def get_protocol_events(
     protocol_name: str = Path(..., description="Protocol name"),
     hours: int = Query(24, description="Hours to look back"),
     event_type: Optional[str] = Query(None, description="Filter by event type"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get protocol events for an agent
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     cutoff = datetime.utcnow() - timedelta(hours=hours)
@@ -261,13 +261,13 @@ agent_router = APIRouter(prefix="/agents/{agent_id}/protocols", tags=["Agent Pro
 @agent_router.get("/", response_model=List[Dict[str, Any]])
 async def get_agent_protocols(
     agent_id: str = Path(..., description="Agent ID"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get protocols enabled for an agent
     """
     # Verify agent access
-    if token_data.get("agent_id") != agent_id and token_data.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
     
     protocols = await database.fetch_all(
@@ -305,13 +305,13 @@ async def enable_protocol_for_agent(
     agent_id: str = Path(..., description="Agent ID"),
     protocol_name: str = Query(..., description="Protocol to enable"),
     version: Optional[str] = Query(None, description="Protocol version (uses latest if not specified)"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Enable a protocol for an agent
     """
     # Verify agent access (admin only for enabling protocols)
-    if token_data.get("role") != "admin":
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     # Get protocol version if not specified
@@ -366,13 +366,13 @@ async def enable_protocol_for_agent(
 async def disable_protocol_for_agent(
     agent_id: str = Path(..., description="Agent ID"),
     protocol_name: str = Path(..., description="Protocol to disable"),
-    token_data: dict = Depends(verify_agent_token)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Disable a protocol for an agent
     """
     # Verify agent access (admin only for disabling protocols)
-    if token_data.get("role") != "admin":
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     result = await database.execute(
@@ -397,7 +397,7 @@ employee_router = APIRouter(prefix="/employee/protocols", tags=["Employee Protoc
 @employee_router.get("/usage-stats")
 async def get_protocol_usage_stats(
     hours: int = Query(24, description="Hours to look back"),
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get protocol usage statistics across all agents (Employee only)
@@ -467,7 +467,7 @@ async def get_protocol_usage_stats(
 
 @employee_router.get("/adoption")
 async def get_protocol_adoption(
-    token_data: dict = Depends(verify_employee_token)
+    current_user: dict = Depends(get_current_employee)
 ):
     """
     Get protocol adoption metrics (Employee only)
