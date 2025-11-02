@@ -821,7 +821,7 @@ class PaymentRoutingService:
                 LEFT JOIN merchants m ON m.merchant_id = rl.merchant_id
                 LEFT JOIN agents a ON a.agent_id = rl.agent_id
                 WHERE rl.conflict_detected = true
-                AND rl.created_at > NOW() - MAKE_INTERVAL(days => :days)
+                AND rl.created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
                 ORDER BY rl.created_at DESC
                 LIMIT :limit
                 """,

@@ -296,7 +296,7 @@ async def get_routing_logs(
             FROM routing_logs rl
             LEFT JOIN merchants m ON m.merchant_id = rl.merchant_id
             LEFT JOIN agents a ON a.agent_id = rl.agent_id
-            WHERE rl.created_at > NOW() - MAKE_INTERVAL(days => :days)
+            WHERE rl.created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
         """
         
         params = {"days": days, "limit": limit, "offset": offset}
@@ -435,7 +435,7 @@ async def get_conflict_summary(
                 COUNT(DISTINCT merchant_id) FILTER (WHERE conflict_detected) as merchants_with_conflicts,
                 COUNT(DISTINCT agent_id) FILTER (WHERE conflict_detected) as agents_with_conflicts
             FROM routing_logs
-            WHERE created_at > NOW() - MAKE_INTERVAL(days => :days)
+            WHERE created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
             """,
             {"days": days}
         )
@@ -448,7 +448,7 @@ async def get_conflict_summary(
                 COUNT(*) as count
             FROM routing_logs
             WHERE conflict_detected = true
-            AND created_at > NOW() - MAKE_INTERVAL(days => :days)
+            AND created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
             GROUP BY resolution_method
             """,
             {"days": days}
@@ -488,7 +488,7 @@ async def get_psp_selection_analytics(
                 COUNT(*) as selection_count,
                 ROUND((COUNT(*)::numeric / SUM(COUNT(*)) OVER () * 100), 2) as percentage
             FROM routing_logs
-            WHERE created_at > NOW() - MAKE_INTERVAL(days => :days)
+            WHERE created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
             AND chosen_psp IS NOT NULL
             GROUP BY chosen_psp
             ORDER BY selection_count DESC
@@ -505,7 +505,7 @@ async def get_psp_selection_analytics(
                 MIN(execution_time_ms) as min_execution_time,
                 MAX(execution_time_ms) as max_execution_time
             FROM routing_logs
-            WHERE created_at > NOW() - MAKE_INTERVAL(days => :days)
+            WHERE created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
             AND chosen_psp IS NOT NULL
             AND execution_time_ms IS NOT NULL
             GROUP BY chosen_psp
