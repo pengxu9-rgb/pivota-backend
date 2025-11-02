@@ -69,3 +69,4 @@ async def create_user_for_merchant():
 
 if __name__ == "__main__":
     asyncio.run(create_user_for_merchant())
+

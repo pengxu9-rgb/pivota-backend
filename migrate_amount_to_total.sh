@@ -33,3 +33,4 @@ echo ""
 echo "未来可以执行："
 echo "ALTER TABLE orders DROP COLUMN amount;"
 echo "来彻底删除 amount 列"
+

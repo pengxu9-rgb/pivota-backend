@@ -189,3 +189,4 @@ PAYPAL_CLIENT_SECRET=your_secret    # 需要添加到 settings.py
 **创建时间**: 2025-10-26 07:20 UTC  
 **最新修复**: fe1def1c
 
+

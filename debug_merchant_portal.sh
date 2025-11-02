@@ -36,3 +36,4 @@ echo ""
 echo "步骤 5: 测试 /merchant/dashboard/analytics..."
 curl -sS "$API_URL/merchant/dashboard/analytics" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | head -30
+

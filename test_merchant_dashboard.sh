@@ -39,3 +39,4 @@ echo ""
 echo "步骤 3: 测试 User Info API..."
 curl -sS "$API_URL/user" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+

@@ -182,3 +182,4 @@ async def get_merchant_platforms(
             status_code=500,
             detail=f"Failed to fetch platforms: {str(e)}"
         )
+

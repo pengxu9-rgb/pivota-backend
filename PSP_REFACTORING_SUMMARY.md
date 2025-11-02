@@ -211,3 +211,4 @@ CLIENT_SECRET="..."
 - `pivota_infra/adapters/psp_adapter.py`
 - `pivota_infra/adapters/checkout_adapter.py`
 
+

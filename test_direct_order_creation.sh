@@ -38,3 +38,4 @@ echo ""
 echo "=== Checking Merchant PSPs in Database ==="
 echo "This would require direct DB access..."
 
+

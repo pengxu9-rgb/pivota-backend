@@ -75,3 +75,4 @@ curl -sS -X POST "$API_URL/admin/sql/execute" \
 
 echo ""
 echo "✅ 完成！现在 PSP 统计应该显示正确的数据了"
+

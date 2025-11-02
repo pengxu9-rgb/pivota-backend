@@ -36,3 +36,4 @@ FROM merchant_psps
 GROUP BY provider, status
 ORDER BY provider, status;
 
+

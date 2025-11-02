@@ -46,3 +46,4 @@ git push origin main
 - 忽略关于 "../pivota-marketing" 的提示，那是父目录的事情
 - 专注于当前 merchant portal 的部署即可
 
+

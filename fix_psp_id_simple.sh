@@ -49,3 +49,4 @@ curl -sS -X POST "$API_URL/admin/sql/execute" \
 
 echo ""
 echo "✅ 完成！"
+

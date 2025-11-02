@@ -90,3 +90,4 @@ echo "- PSP Overview should show all configured PSPs with metrics"
 echo "- Merchant Portal should show merchant@test.com's 20+ orders"
 echo "- Both pages should display real data, not 0s"
 
+

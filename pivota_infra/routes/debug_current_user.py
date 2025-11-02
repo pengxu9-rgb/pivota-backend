@@ -15,3 +15,4 @@ async def whoami(current_user: dict = Depends(get_current_user)):
         "note": "This is your current login session info"
     }
 
+

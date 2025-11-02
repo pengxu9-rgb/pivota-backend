@@ -139,3 +139,4 @@ async def get_merchant_full_data(
     except Exception as e:
         logger.error(f"Error getting merchant full data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+

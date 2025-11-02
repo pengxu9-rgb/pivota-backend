@@ -22,3 +22,4 @@ echo "1. 在所有 INSERT 时，同时设置 amount = total"
 echo "2. 在所有 SELECT 时，使用 COALESCE(total, amount) as total_amount"
 echo "3. 前端统一使用 total_amount 字段"
 echo "4. 逐步废弃 amount 字段"
+

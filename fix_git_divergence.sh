@@ -26,3 +26,4 @@ git status
 echo -e "\n=== Ready to push ==="
 echo "If everything looks good, run: git push origin main"
 
+

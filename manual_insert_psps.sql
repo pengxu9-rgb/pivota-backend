@@ -55,3 +55,4 @@ ORDER BY connected_at DESC;
 
 -- Expected result: Should see adyen, checkout, paypal with active status
 
+

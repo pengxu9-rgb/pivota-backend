@@ -163,3 +163,4 @@ async def sync_wix_products_fixed(
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
+

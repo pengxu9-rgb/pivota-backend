@@ -123,3 +123,4 @@ echo ""
 echo "如果 Adyen 或 PayPal 失败，请："
 echo "1. 使用 quick_test_psps.py 测试您的 API keys"
 echo "2. 在 Employee Portal 重新配置"
+

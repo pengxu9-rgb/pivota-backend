@@ -34,3 +34,4 @@ async def migrate_employees_add_password(
         logger.error(f"Error migrating employees table: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+

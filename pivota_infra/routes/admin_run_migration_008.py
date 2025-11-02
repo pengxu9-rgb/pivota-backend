@@ -228,3 +228,4 @@ async def check_migration_008_status(current_user: dict = Depends(get_current_us
         logger.error(f"Check migration 008 status failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+

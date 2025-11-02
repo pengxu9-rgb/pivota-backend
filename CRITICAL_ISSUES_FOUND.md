@@ -170,3 +170,4 @@ WHERE table_name = 'agents' AND column_name = 'total_requests';
 2. 测试 PayPal
 3. 重新配置 Adyen
 4. 运行数据库迁移
+

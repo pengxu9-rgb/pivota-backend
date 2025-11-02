@@ -57,3 +57,4 @@ async def debug_wix_sync(merchant_id: str):
             "traceback": traceback.format_exc()
         }
 
+

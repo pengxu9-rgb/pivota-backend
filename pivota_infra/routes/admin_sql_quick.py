@@ -22,3 +22,4 @@ async def execute_sql(request: SQLRequest):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+

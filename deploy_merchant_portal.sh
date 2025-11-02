@@ -20,3 +20,4 @@ git push origin main
 echo -e "\n✅ Deployment triggered! Check Vercel for deployment status."
 echo "🔗 https://vercel.com/dashboard"
 
+

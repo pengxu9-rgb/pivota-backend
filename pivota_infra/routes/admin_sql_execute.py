@@ -69,3 +69,4 @@ async def query_sql(request: SQLExecuteRequest):
             "error": str(e)
         }
 
+

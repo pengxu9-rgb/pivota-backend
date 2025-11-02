@@ -114,3 +114,4 @@ async def apply_fixes():
 if __name__ == "__main__":
     print(f"🚀 Starting database fixes at {datetime.now()}")
     asyncio.run(apply_fixes())
+

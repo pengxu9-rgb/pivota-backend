@@ -53,3 +53,4 @@ done
 echo "=== Summary ==="
 echo "If Payment Intent is NULL, the PSP is not configured in database"
 
+

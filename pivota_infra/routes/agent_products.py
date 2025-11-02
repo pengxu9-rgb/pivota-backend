@@ -201,3 +201,4 @@ async def get_product_details(
         raise HTTPException(status_code=500, detail=f"Failed to get product: {str(e)}")
 
 
+

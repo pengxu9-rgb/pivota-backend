@@ -127,3 +127,4 @@ except Exception as e:
     print()
     print("请稍后重试，或在 Railway Dashboard 中检查数据库状态")
 
+

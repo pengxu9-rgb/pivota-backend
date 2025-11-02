@@ -592,3 +592,4 @@ class PrestaShopAdapter:
         return True
 
 
+

@@ -26,3 +26,4 @@ done
 
 echo "=== If all show 'No payment' for Adyen/Checkout/PayPal, configs are NOT in database ==="
 
+

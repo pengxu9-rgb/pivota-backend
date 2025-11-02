@@ -67,3 +67,4 @@ async def cleanup_wix_stores():
 if __name__ == "__main__":
     asyncio.run(cleanup_wix_stores())
 
+

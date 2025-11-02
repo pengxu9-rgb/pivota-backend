@@ -49,3 +49,4 @@ echo -e "${GREEN}✅ 修复完成！${NC}"
 echo ""
 echo "现在用 merchant@test.com / Admin123! 重新登录"
 echo "应该能看到 20 个订单和正确的 merchant_id: merch_208139f7600dbf42"
+

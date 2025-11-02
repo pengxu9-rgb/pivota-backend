@@ -134,6 +134,14 @@ from routes.admin_run_migration_008 import router as admin_run_migration_008_rou
 from routes.admin_governance import router as admin_governance_router
 from routes.admin_run_migration_009 import router as admin_run_migration_009_router
 from routes.admin_seed_test_data import router as admin_seed_test_data_router
+# Phase 4 imports
+from routes.payment_routing_routes import router as payment_routing_router
+from routes.payment_routing_routes import employee_router as employee_payment_routing_router
+from routes.protocol_routes import router as protocol_router
+from routes.protocol_routes import agent_router as agent_protocol_router
+from routes.protocol_routes import employee_router as employee_protocol_router
+from routes.employee_routing_dashboard import router as employee_routing_dashboard_router
+from routes.admin_run_migration_010 import router as admin_run_migration_010_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -298,6 +306,14 @@ app.include_router(admin_run_migration_008_router)  # Run migration 008 - Agents
 app.include_router(admin_governance_router)  # Admin governance - Phase 3
 app.include_router(admin_run_migration_009_router)  # Run migration 009 - Agents Phase 3
 app.include_router(admin_seed_test_data_router)  # Seed test data for Phase 3 demo
+app.include_router(admin_run_migration_010_router)  # Run migration 010 - Phase 4 Payment Routing
+# Phase 4 - Payment Routing & Protocol Support
+app.include_router(payment_routing_router)  # Payment routing with failover
+app.include_router(employee_payment_routing_router)  # Employee payment routing monitoring
+app.include_router(protocol_router)  # Protocol management (AP2, ACP, X-402)
+app.include_router(agent_protocol_router)  # Agent-specific protocol management
+app.include_router(employee_protocol_router)  # Employee protocol monitoring
+app.include_router(employee_routing_dashboard_router)  # Employee PSP routing dashboard
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(merchant_router)  # Merchant management endpoints

@@ -44,3 +44,4 @@ async def get_all_agents_simple(current_user: dict = Depends(get_current_user)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
+

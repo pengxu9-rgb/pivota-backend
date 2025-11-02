@@ -172,3 +172,4 @@ async def check_agent_metrics_status(current_user: dict = Depends(get_current_us
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to check metrics status: {str(e)}"
         )
+

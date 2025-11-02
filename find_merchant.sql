@@ -37,3 +37,4 @@ LEFT JOIN merchant_onboarding m ON u.email = m.contact_email
 WHERE u.email = 'yao.wang@chydan.com';
 
 
+
