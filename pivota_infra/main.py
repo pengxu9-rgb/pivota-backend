@@ -143,6 +143,7 @@ from routes.protocol_routes import employee_router as employee_protocol_router
 from routes.employee_routing_dashboard import router as employee_routing_dashboard_router
 from routes.admin_run_migration_010 import router as admin_run_migration_010_router
 from routes.admin_fix_agent_protocols import router as admin_fix_agent_protocols_router
+from routes.agent_protocol_test import router as agent_protocol_test_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -313,6 +314,7 @@ app.include_router(admin_fix_agent_protocols_router)  # Fix agent protocols - Ph
 app.include_router(payment_routing_router)  # Payment routing with failover
 app.include_router(employee_payment_routing_router)  # Employee payment routing monitoring
 app.include_router(protocol_router)  # Protocol management (AP2, ACP, X-402)
+app.include_router(agent_protocol_test_router)  # Agent protocol testing (must be before agent_protocol_router)
 app.include_router(agent_protocol_router)  # Agent-specific protocol management
 app.include_router(employee_protocol_router)  # Employee protocol monitoring
 app.include_router(employee_routing_dashboard_router)  # Employee PSP routing dashboard
