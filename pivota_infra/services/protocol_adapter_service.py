@@ -3,8 +3,8 @@ Protocol Adapter Service - Phase 4
 Handles AP2, ACP, X-402 protocol support with validation and transformation
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
-from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime, timedelta
 import json
 import hashlib
 import asyncio
@@ -503,7 +503,3 @@ class ProtocolAdapterService:
                 "protocol": protocol_name
             }
 
-
-# Import Tuple for type hints
-from typing import Tuple
-from datetime import timedelta
