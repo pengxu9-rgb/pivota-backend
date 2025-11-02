@@ -142,6 +142,7 @@ from routes.protocol_routes import agent_router as agent_protocol_router
 from routes.protocol_routes import employee_router as employee_protocol_router
 from routes.employee_routing_dashboard import router as employee_routing_dashboard_router
 from routes.admin_run_migration_010 import router as admin_run_migration_010_router
+from routes.admin_fix_agent_protocols import router as admin_fix_agent_protocols_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -307,6 +308,7 @@ app.include_router(admin_governance_router)  # Admin governance - Phase 3
 app.include_router(admin_run_migration_009_router)  # Run migration 009 - Agents Phase 3
 app.include_router(admin_seed_test_data_router)  # Seed test data for Phase 3 demo
 app.include_router(admin_run_migration_010_router)  # Run migration 010 - Phase 4 Payment Routing
+app.include_router(admin_fix_agent_protocols_router)  # Fix agent protocols - Phase 4
 # Phase 4 - Payment Routing & Protocol Support
 app.include_router(payment_routing_router)  # Payment routing with failover
 app.include_router(employee_payment_routing_router)  # Employee payment routing monitoring
