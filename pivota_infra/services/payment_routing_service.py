@@ -464,3 +464,439 @@ class PaymentRoutingService:
                 """,
                 params
             )
+    
+    # ========================================================================
+    # [Phase 4++] Dual-routing support - NEW METHODS
+    # All existing Phase 4 methods above remain unchanged
+    # ========================================================================
+    
+    async def get_merchant_routing_policy(self, merchant_id: str) -> Dict[str, Any]:
+        """
+        [Phase 4++] Get merchant routing policy from routing_policies table
+        
+        Args:
+            merchant_id: Merchant ID
+            
+        Returns:
+            Dict with merchant routing policy or empty dict
+        """
+        try:
+            result = await self.database.fetch_one(
+                """
+                SELECT policy, is_active, priority
+                FROM routing_policies
+                WHERE owner_type = 'merchant' AND owner_id = :merchant_id AND is_active = true
+                """,
+                {"merchant_id": merchant_id}
+            )
+            
+            if result:
+                policy = json.loads(result['policy']) if isinstance(result['policy'], str) else result['policy']
+                return {
+                    **policy,
+                    '_priority': result['priority'],
+                    '_active': result['is_active']
+                }
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"[Phase 4++] Failed to get merchant routing policy: {e}")
+            return {}
+    
+    async def get_agent_routing_policy(self, agent_id: str) -> Dict[str, Any]:
+        """
+        [Phase 4++] Get agent routing policy from routing_policies table
+        
+        Args:
+            agent_id: Agent ID
+            
+        Returns:
+            Dict with agent routing policy or empty dict
+        """
+        try:
+            result = await self.database.fetch_one(
+                """
+                SELECT policy, is_active, priority
+                FROM routing_policies
+                WHERE owner_type = 'agent' AND owner_id = :agent_id AND is_active = true
+                """,
+                {"agent_id": agent_id}
+            )
+            
+            if result:
+                policy = json.loads(result['policy']) if isinstance(result['policy'], str) else result['policy']
+                return {
+                    **policy,
+                    '_priority': result['priority'],
+                    '_active': result['is_active']
+                }
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"[Phase 4++] Failed to get agent routing policy: {e}")
+            return {}
+    
+    async def check_agent_whitelisted(self, agent_id: str) -> bool:
+        """
+        [Phase 4++] Check if agent has routing override permission
+        
+        Args:
+            agent_id: Agent ID
+            
+        Returns:
+            bool: True if agent can override merchant rules
+        """
+        try:
+            result = await self.database.fetch_one(
+                """
+                SELECT routing_override_enabled
+                FROM agents
+                WHERE agent_id = :agent_id
+                """,
+                {"agent_id": agent_id}
+            )
+            
+            return result['routing_override_enabled'] if result else False
+            
+        except Exception as e:
+            logger.error(f"[Phase 4++] Failed to check agent whitelist: {e}")
+            return False
+    
+    async def resolve_dual_routing(
+        self,
+        merchant_id: str,
+        agent_id: str,
+        amount: float,
+        currency: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        [Phase 4++] Resolve PSP selection using dual-side routing engine
+        
+        Args:
+            merchant_id: Merchant ID
+            agent_id: Agent ID
+            amount: Payment amount
+            currency: Currency code
+            
+        Returns:
+            Tuple of (selected_psp, routing_decision)
+        """
+        from core.routing_engine import DualRoutingEngine
+        
+        try:
+            # Get merchant and agent policies
+            merchant_policy = await self.get_merchant_routing_policy(merchant_id)
+            agent_policy = await self.get_agent_routing_policy(agent_id)
+            
+            # Check if agent is whitelisted for overrides
+            agent_whitelisted = await self.check_agent_whitelisted(agent_id)
+            
+            # Get available PSPs (from existing route config)
+            route_config = await self._get_route_config(agent_id, merchant_id)
+            available_psps = route_config.get('psp_priority', [])
+            
+            if not available_psps:
+                # Fall back to default PSPs
+                available_psps = [
+                    {"psp": "stripe", "priority": 1},
+                    {"psp": "adyen", "priority": 2},
+                    {"psp": "paypal", "priority": 3}
+                ]
+            
+            # Use DualRoutingEngine to resolve
+            engine = DualRoutingEngine(
+                merchant_rules=merchant_policy,
+                agent_rules=agent_policy,
+                available_psps=available_psps,
+                agent_whitelisted=agent_whitelisted
+            )
+            
+            routing_decision = engine.resolve()
+            
+            # Log routing decision
+            await self.log_routing_decision(
+                merchant_id=merchant_id,
+                agent_id=agent_id,
+                decision=routing_decision,
+                amount=amount,
+                currency=currency
+            )
+            
+            selected_psp = routing_decision.get('selected_psp', 'stripe')
+            
+            logger.info(
+                f"[Phase 4++] Dual routing resolved: merchant={merchant_id}, agent={agent_id}, "
+                f"selected={selected_psp}, conflicts={routing_decision.get('conflict_detected')}"
+            )
+            
+            return selected_psp, routing_decision
+            
+        except Exception as e:
+            logger.error(f"[Phase 4++] Dual routing resolution failed: {e}")
+            # Fall back to single routing
+            return await self.select_psp(agent_id, merchant_id, amount, currency)
+    
+    async def route_transaction_dual(
+        self,
+        payment_request: Dict[str, Any],
+        merchant_id: str,
+        agent_id: str
+    ) -> Dict[str, Any]:
+        """
+        [Phase 4++] Route transaction using dual-side routing
+        Backward-compatible wrapper that falls back to single-routing if no dual rules
+        
+        Args:
+            payment_request: Payment request details
+            merchant_id: Merchant ID
+            agent_id: Agent ID
+            
+        Returns:
+            Payment result with routing trace
+        """
+        try:
+            # Check if dual routing policies exist
+            merchant_policy = await self.get_merchant_routing_policy(merchant_id)
+            agent_policy = await self.get_agent_routing_policy(agent_id)
+            
+            if not merchant_policy and not agent_policy:
+                # No dual routing policies, use existing single routing
+                logger.info(f"[Phase 4++] No dual routing policies found, using single routing")
+                return await self.execute_with_failover(
+                    agent_id=agent_id,
+                    payment_request=payment_request,
+                    preferred_psp=None
+                )
+            
+            # Use dual routing
+            amount = payment_request.get('amount', 0)
+            currency = payment_request.get('currency', 'USD')
+            
+            selected_psp, routing_decision = await self.resolve_dual_routing(
+                merchant_id=merchant_id,
+                agent_id=agent_id,
+                amount=amount,
+                currency=currency
+            )
+            
+            # Add routing context to payment request
+            payment_request['metadata'] = payment_request.get('metadata', {})
+            payment_request['metadata']['routing_context'] = {
+                'log_id': routing_decision.get('log_id'),
+                'dual_routing': True,
+                'conflicts_detected': routing_decision.get('conflict_detected', False),
+                'resolution_method': routing_decision.get('resolution_method')
+            }
+            payment_request['metadata']['merchant_id'] = merchant_id
+            payment_request['metadata']['agent_id'] = agent_id
+            
+            # Execute payment with selected PSP
+            result = await self.execute_with_failover(
+                agent_id=agent_id,
+                payment_request=payment_request,
+                preferred_psp=selected_psp
+            )
+            
+            # Add routing decision to result
+            result['routing_decision'] = routing_decision
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"[Phase 4++] Dual routing transaction failed: {e}")
+            # Fall back to single routing on error
+            return await self.execute_with_failover(
+                agent_id=agent_id,
+                payment_request=payment_request,
+                preferred_psp=None
+            )
+    
+    async def log_routing_decision(
+        self,
+        merchant_id: str,
+        agent_id: str,
+        decision: Dict[str, Any],
+        amount: float,
+        currency: str,
+        order_id: Optional[str] = None
+    ) -> int:
+        """
+        [Phase 4++] Log routing decision to routing_logs table
+        
+        Args:
+            merchant_id: Merchant ID
+            agent_id: Agent ID
+            decision: Routing decision from DualRoutingEngine
+            amount: Payment amount
+            currency: Currency code
+            order_id: Optional order ID
+            
+        Returns:
+            Log ID
+        """
+        try:
+            # Extract data from decision
+            considered_psps = [
+                psp.get('psp') for psp in decision.get('decision_trace', [{}])[-1].get('output_psps', [])
+                if isinstance(psp, dict)
+            ]
+            
+            result = await self.database.execute(
+                """
+                INSERT INTO routing_logs (
+                    merchant_id, agent_id, order_id,
+                    considered_psps, chosen_psp, decision_trace,
+                    merchant_rules_applied, agent_rules_applied,
+                    conflict_detected, resolution_method,
+                    execution_time_ms, created_at
+                ) VALUES (
+                    :merchant_id, :agent_id, :order_id,
+                    :considered_psps, :chosen_psp, :decision_trace,
+                    :merchant_rules_applied, :agent_rules_applied,
+                    :conflict_detected, :resolution_method,
+                    :execution_time_ms, NOW()
+                )
+                RETURNING id
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "agent_id": agent_id,
+                    "order_id": order_id,
+                    "considered_psps": json.dumps(considered_psps),
+                    "chosen_psp": decision.get('selected_psp'),
+                    "decision_trace": json.dumps(decision.get('decision_trace', [])),
+                    "merchant_rules_applied": json.dumps(decision.get('merchant_rules_applied', {})),
+                    "agent_rules_applied": json.dumps(decision.get('agent_rules_applied', {})),
+                    "conflict_detected": decision.get('conflict_detected', False),
+                    "resolution_method": decision.get('resolution_method'),
+                    "execution_time_ms": decision.get('execution_time_ms', 0)
+                }
+            )
+            
+            # Add log ID to decision for reference
+            decision['log_id'] = result
+            
+            logger.info(f"[Phase 4++] Logged routing decision with ID {result}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"[Phase 4++] Failed to log routing decision: {e}")
+            return 0
+    
+    async def get_routing_conflicts(
+        self,
+        days: int = 30,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        [Phase 4++] Get recent routing conflicts for monitoring
+        
+        Args:
+            days: Number of days to look back
+            limit: Maximum number of conflicts to return
+            
+        Returns:
+            List of routing conflicts with details
+        """
+        try:
+            results = await self.database.fetch_all(
+                """
+                SELECT 
+                    rl.id,
+                    rl.merchant_id,
+                    rl.agent_id,
+                    rl.order_id,
+                    rl.chosen_psp,
+                    rl.decision_trace,
+                    rl.resolution_method,
+                    rl.created_at,
+                    m.name as merchant_name,
+                    a.agent_name
+                FROM routing_logs rl
+                LEFT JOIN merchants m ON m.merchant_id = rl.merchant_id
+                LEFT JOIN agents a ON a.agent_id = rl.agent_id
+                WHERE rl.conflict_detected = true
+                AND rl.created_at > NOW() - INTERVAL :days DAY
+                ORDER BY rl.created_at DESC
+                LIMIT :limit
+                """,
+                {"days": days, "limit": limit}
+            )
+            
+            conflicts = []
+            for row in results:
+                decision_trace = json.loads(row['decision_trace']) if isinstance(row['decision_trace'], str) else row['decision_trace']
+                
+                # Extract conflicts from trace
+                conflicts_from_trace = []
+                for item in decision_trace:
+                    if isinstance(item, dict) and 'conflicts' in item:
+                        conflicts_from_trace.extend(item['conflicts'])
+                
+                conflicts.append({
+                    "id": row['id'],
+                    "merchant_id": row['merchant_id'],
+                    "merchant_name": row['merchant_name'],
+                    "agent_id": row['agent_id'],
+                    "agent_name": row['agent_name'],
+                    "order_id": row['order_id'],
+                    "chosen_psp": row['chosen_psp'],
+                    "conflicts": conflicts_from_trace,
+                    "resolution_method": row['resolution_method'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                })
+            
+            return conflicts
+            
+        except Exception as e:
+            logger.error(f"[Phase 4++] Failed to get routing conflicts: {e}")
+            return []
+    
+    async def simulate_routing(
+        self,
+        merchant_id: str,
+        agent_id: str,
+        test_scenarios: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        [Phase 4++] Simulate routing decisions without executing payments
+        
+        Args:
+            merchant_id: Merchant ID
+            agent_id: Agent ID
+            test_scenarios: List of test scenarios with amount, currency, etc.
+            
+        Returns:
+            List of simulated routing results
+        """
+        results = []
+        
+        for scenario in test_scenarios:
+            try:
+                selected_psp, routing_decision = await self.resolve_dual_routing(
+                    merchant_id=merchant_id,
+                    agent_id=agent_id,
+                    amount=scenario.get('amount', 100.00),
+                    currency=scenario.get('currency', 'USD')
+                )
+                
+                results.append({
+                    "scenario": scenario,
+                    "selected_psp": selected_psp,
+                    "conflict_detected": routing_decision.get('conflict_detected'),
+                    "conflicts": routing_decision.get('conflicts'),
+                    "resolution_method": routing_decision.get('resolution_method'),
+                    "execution_time_ms": routing_decision.get('execution_time_ms')
+                })
+                
+            except Exception as e:
+                results.append({
+                    "scenario": scenario,
+                    "error": str(e)
+                })
+        
+        return results
+    
+    # [Phase 4++] End of dual-routing extensions
