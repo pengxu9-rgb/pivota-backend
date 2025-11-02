@@ -8,9 +8,12 @@ import asyncio
 import json
 import hashlib
 import random
+import logging
 from enum import Enum
 
 from databases import Database
+
+logger = logging.getLogger(__name__)
 
 class RoutingStrategy(Enum):
     PRIORITY = "priority"  # Use PSP order
@@ -818,7 +821,7 @@ class PaymentRoutingService:
                 LEFT JOIN merchants m ON m.merchant_id = rl.merchant_id
                 LEFT JOIN agents a ON a.agent_id = rl.agent_id
                 WHERE rl.conflict_detected = true
-                AND rl.created_at > NOW() - INTERVAL :days DAY
+                AND rl.created_at > NOW() - MAKE_INTERVAL(days => :days)
                 ORDER BY rl.created_at DESC
                 LIMIT :limit
                 """,
