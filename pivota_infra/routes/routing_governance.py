@@ -292,9 +292,8 @@ async def get_routing_logs(
             SELECT 
                 rl.*,
                 rl.merchant_id as merchant_name,
-                a.agent_name
+                rl.agent_id as agent_name
             FROM routing_logs rl
-            LEFT JOIN agents a ON a.agent_id = rl.agent_id
             WHERE rl.created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
         """
         
