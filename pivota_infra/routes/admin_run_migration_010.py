@@ -39,12 +39,42 @@ async def run_migration_010(
         with open(migration_path, 'r') as f:
             migration_sql = f.read()
         
-        # Split into individual statements (separated by semicolons)
-        statements = [
-            stmt.strip() 
-            for stmt in migration_sql.split(';') 
-            if stmt.strip() and not stmt.strip().startswith('--')
-        ]
+        # Split into individual statements, preserving DO $$ blocks
+        # DO $$ blocks should not be split by internal semicolons
+        statements = []
+        current_statement = []
+        in_do_block = False
+        
+        for line in migration_sql.split('\n'):
+            stripped = line.strip()
+            
+            # Skip comment-only lines
+            if stripped.startswith('--'):
+                continue
+            
+            # Track DO $$ blocks
+            if 'DO $$' in line or 'DO $' in line:
+                in_do_block = True
+            elif in_do_block and ('END $$' in line or '$$;' in line):
+                current_statement.append(line)
+                statements.append('\n'.join(current_statement))
+                current_statement = []
+                in_do_block = False
+                continue
+            
+            # Add line to current statement
+            if line.strip():
+                current_statement.append(line)
+            
+            # End of statement (semicolon outside DO block)
+            if ';' in line and not in_do_block and not stripped.startswith('--'):
+                if current_statement:
+                    statements.append('\n'.join(current_statement))
+                    current_statement = []
+        
+        # Add any remaining statement
+        if current_statement:
+            statements.append('\n'.join(current_statement))
         
         results = []
         
@@ -55,8 +85,9 @@ async def run_migration_010(
                 if not statement or statement.isspace():
                     continue
                 
-                # Add semicolon back
-                statement = statement + ';'
+                # Add semicolon back if not already present
+                if not statement.rstrip().endswith(';'):
+                    statement = statement + ';'
                 
                 # Execute statement
                 await database.execute(statement)
