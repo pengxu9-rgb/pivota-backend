@@ -1125,3 +1125,133 @@ if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
 
 # Force redeploy: 1761914340
+
+        "status": "success",
+        "message": "Environment variable configuration check",
+        "config": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
+            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
+            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
+            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
+            "metrics_query_version": settings.metrics_query_version,
+            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+        },
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+# Deploy trigger: 1761041007
+
+@app.get("/health")
+async def health_check():
+    """Dedicated health check endpoint"""
+    return {"status": "ok", "timestamp": time.time()}
+
+@app.get("/operations", response_class=HTMLResponse)
+async def operations_dashboard():
+    """Serve the operations dashboard"""
+    try:
+        with open("templates/operations_dashboard.html", "r") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    from config.settings import settings
+    
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "database": "connected",
+        "config_check": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+        }
+    }
+
+@app.get("/config-check")
+async def config_check():
+    """Public endpoint to check environment variable configuration (no auth required)"""
+    from config.settings import settings
+    
+    return {
+        "status": "success",
+        "message": "Environment variable configuration check",
+        "config": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
+            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
+            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
+            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
+            "metrics_query_version": settings.metrics_query_version,
+            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+        },
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    from config.settings import settings
+    
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "database": "connected",
+        "config_check": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+        }
+    }
+
+@app.get("/config-check")
+async def config_check():
+    """Public endpoint to check environment variable configuration (no auth required)"""
+    from config.settings import settings
+    
+    return {
+        "status": "success",
+        "message": "Environment variable configuration check",
+        "config": {
+            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
+            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
+            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
+            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
+            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
+            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
+            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
+            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
+            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
+            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
+            "metrics_query_version": settings.metrics_query_version,
+            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+        },
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
+
+# Force redeploy: 1761914340

@@ -531,3 +531,42 @@ async def reactivate_agent(
         logger.error(f"Failed to reactivate agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+    except Exception as e:
+        logger.error(f"Failed to deactivate agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/reactivate")
+async def reactivate_agent(
+    agent_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    重新激活 Agent
+    """
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        query = """
+            UPDATE agents
+            SET status = 'active',
+                deactivated_at = NULL
+            WHERE agent_id = :agent_id
+        """
+        
+        await database.execute(query, {"agent_id": agent_id})
+        
+        logger.info(f"Agent {agent_id} reactivated by {current_user.get('email')}")
+        
+        return {
+            "status": "success",
+            "message": "Agent reactivated",
+            "agent_id": agent_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to reactivate agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
