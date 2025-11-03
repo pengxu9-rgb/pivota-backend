@@ -1,0 +1,33 @@
+# Railway Environment Variables Template
+# Copy these to your Railway project's environment variables
+
+# Database (will be auto-set by Railway PostgreSQL plugin)
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+
+# Stripe
+STRIPE_SECRET_KEY=your_stripe_secret_key
+STRIPE_WEBHOOK_SECRET=your_stripe_webhook_secret
+
+# Adyen
+ADYEN_API_KEY=your_adyen_api_key
+ADYEN_MERCHANT_ACCOUNT=WoopayECOM
+ADYEN_WEBHOOK_SECRET=your_adyen_webhook_secret
+ADYEN_WEBHOOK_USERNAME=adyen_webhook_user
+ADYEN_WEBHOOK_PASSWORD=your_adyen_webhook_password
+
+# Shopify (Legacy)
+SHOPIFY_ACCESS_TOKEN=your_shopify_token
+SHOPIFY_STORE_URL=your_shopify_store_url
+
+# Wix (Legacy)
+WIX_API_KEY=your_wix_api_key
+WIX_STORE_URL=your_wix_store_url
+
+# JWT Secret (generate a random string)
+JWT_SECRET_KEY=your-super-secret-jwt-key-change-this
+
+# Supabase (Optional - for user management)
+SUPABASE_URL=your_supabase_url
+SUPABASE_ANON_KEY=your_supabase_anon_key
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+

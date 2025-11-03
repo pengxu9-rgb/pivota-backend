@@ -1,0 +1,11 @@
+{
+  "terminal.integrated.defaultProfile.osx": "bash",
+  "terminal.integrated.shell.osx": "/bin/bash",
+  "terminal.integrated.shellArgs.osx": ["-l"],
+  "terminal.integrated.inheritEnv": true,
+  "terminal.integrated.env.osx": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "SHELL": "/bin/bash"
+  },
+  "terminal.external.osxExec": "Terminal.app"
+}

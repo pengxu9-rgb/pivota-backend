@@ -1,0 +1,28 @@
+{
+  "mappings": {
+    "SHIRT_001": [
+      {
+        "mcp_sku": "SHIRT_001",
+        "store_sku": "AF-JOG-002",
+        "store_type": "shopify",
+        "store_name": "chydantest_store",
+        "confidence": 1.0,
+        "strategy": "manual_mapping",
+        "metadata": {}
+      }
+    ],
+    "NF-TEE-010": [
+      {
+        "mcp_sku": "NF-TEE-010",
+        "store_sku": "NF-TEE-010",
+        "store_type": "shopify",
+        "store_name": "chydantest_store",
+        "confidence": 1.0,
+        "strategy": "manual_mapping",
+        "metadata": {}
+      }
+    ]
+  },
+  "version": "1.0",
+  "total_mappings": 2
+}

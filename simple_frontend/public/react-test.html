@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>React Loading Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .card {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 20px 0;
+        }
+        h1 {
+            color: #1e293b;
+            border-bottom: 3px solid #3b82f6;
+            padding-bottom: 10px;
+        }
+        .status {
+            padding: 10px 15px;
+            border-radius: 6px;
+            margin: 10px 0;
+            font-family: monospace;
+        }
+        .success {
+            background: #dcfce7;
+            color: #059669;
+            border: 1px solid #10b981;
+        }
+        .error {
+            background: #fee2e2;
+            color: #dc2626;
+            border: 1px solid #ef4444;
+        }
+        .info {
+            background: #dbeafe;
+            color: #2563eb;
+            border: 1px solid #3b82f6;
+        }
+        button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #2563eb;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 React App Loading Diagnostic</h1>
+    
+    <div class="card">
+        <h2>Step 1: Check if React App is Loading</h2>
+        <div id="react-status" class="status info">⏳ Checking...</div>
+        <button onclick="checkReactApp()">Recheck</button>
+    </div>
+
+    <div class="card">
+        <h2>Step 2: Check Browser Console</h2>
+        <div id="console-status" class="status info">
+            <strong>Open Developer Tools (F12) and check:</strong><br>
+            1. Console tab - Any red errors?<br>
+            2. Network tab - Is the React app loading?<br>
+            3. Elements tab - Is there a #root div with content?
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Step 3: Manual Tests</h2>
+        <button onclick="testLocalhost()">Test http://localhost:3000</button>
+        <button onclick="testRootDiv()">Check #root div</button>
+        <button onclick="testScripts()">Check loaded scripts</button>
+        <div id="manual-test-result"></div>
+    </div>
+
+    <script>
+        function checkReactApp() {
+            const rootDiv = document.getElementById('root');
+            const statusDiv = document.getElementById('react-status');
+            
+            if (!rootDiv) {
+                statusDiv.className = 'status error';
+                statusDiv.innerHTML = '❌ No #root div found on http://localhost:3000<br>The React app is NOT loading!';
+                return false;
+            }
+            
+            if (rootDiv.children.length === 0) {
+                statusDiv.className = 'status error';
+                statusDiv.innerHTML = '❌ #root div is empty<br>React might not be rendering';
+                return false;
+            }
+            
+            statusDiv.className = 'status success';
+            statusDiv.innerHTML = `✅ React app appears to be loaded!<br>Root div has ${rootDiv.children.length} child element(s)`;
+            return true;
+        }
+
+        function testLocalhost() {
+            const result = document.getElementById('manual-test-result');
+            result.className = 'status info';
+            result.innerHTML = `
+                <strong>Testing localhost:3000...</strong><br><br>
+                Current URL: ${window.location.href}<br>
+                Expected: http://localhost:3000<br><br>
+                ${window.location.href.includes('localhost:3000') ? 
+                  '✅ You are on localhost:3000' : 
+                  '⚠️  You are NOT on localhost:3000. Please navigate to http://localhost:3000'}
+            `;
+        }
+
+        function testRootDiv() {
+            const result = document.getElementById('manual-test-result');
+            const rootDiv = document.getElementById('root');
+            
+            if (!rootDiv) {
+                result.className = 'status error';
+                result.innerHTML = '❌ No #root div found<br>This page cannot detect the React app';
+            } else {
+                result.className = 'status info';
+                result.innerHTML = `
+                    <strong>#root div found:</strong><br>
+                    Children: ${rootDiv.children.length}<br>
+                    HTML Length: ${rootDiv.innerHTML.length} chars<br>
+                    Inner Text: ${rootDiv.innerText.substring(0, 100)}...
+                `;
+            }
+        }
+
+        function testScripts() {
+            const result = document.getElementById('manual-test-result');
+            const scripts = Array.from(document.getElementsByTagName('script'));
+            
+            result.className = 'status info';
+            result.innerHTML = `
+                <strong>Loaded Scripts:</strong><br>
+                ${scripts.map(s => `${s.src || '(inline)'}`).join('<br>')}
+                <br><br>
+                Total scripts: ${scripts.length}
+            `;
+        }
+
+        // Auto-check on load
+        window.addEventListener('load', () => {
+            console.log('🚀 Diagnostic page loaded');
+            setTimeout(checkReactApp, 1000);
+        });
+    </script>
+</body>
+</html>
+
+

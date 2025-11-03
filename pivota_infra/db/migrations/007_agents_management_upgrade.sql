@@ -1,0 +1,186 @@
+-- Migration 007: Agents Management Upgrade
+-- Extends agents table and adds agent_metrics for performance tracking
+
+-- ============================================================================
+-- Part 1: Extend agents table with management fields
+-- ============================================================================
+
+-- Add management fields to agents table
+ALTER TABLE agents 
+  ADD COLUMN IF NOT EXISTS company VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS use_case TEXT,
+  ADD COLUMN IF NOT EXISTS website VARCHAR(500),
+  ADD COLUMN IF NOT EXISTS description TEXT;
+
+-- These might already exist from previous migrations, add only if missing
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agents' AND column_name='rate_limit') THEN
+        ALTER TABLE agents ADD COLUMN rate_limit INTEGER DEFAULT 1000;
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agents' AND column_name='last_key_rotation') THEN
+        ALTER TABLE agents ADD COLUMN last_key_rotation TIMESTAMP WITH TIME ZONE;
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agents' AND column_name='deactivated_at') THEN
+        ALTER TABLE agents ADD COLUMN deactivated_at TIMESTAMP WITH TIME ZONE;
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agents' AND column_name='request_count') THEN
+        ALTER TABLE agents ADD COLUMN request_count INTEGER DEFAULT 0;
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agents' AND column_name='success_rate') THEN
+        ALTER TABLE agents ADD COLUMN success_rate FLOAT DEFAULT 0;
+    END IF;
+END $$;
+
+-- Add indexes for performance
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+CREATE INDEX IF NOT EXISTS idx_agents_email ON agents(email);
+CREATE INDEX IF NOT EXISTS idx_agents_created_at ON agents(created_at DESC);
+
+-- ============================================================================
+-- Part 2: Create agent_metrics table for time-series performance data
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_metrics (
+    id SERIAL PRIMARY KEY,
+    agent_id VARCHAR(50) NOT NULL,
+    
+    -- Time window
+    window_start TIMESTAMP WITH TIME ZONE NOT NULL,
+    window_end TIMESTAMP WITH TIME ZONE NOT NULL,
+    window_type VARCHAR(20) DEFAULT 'hourly',  -- hourly, daily, weekly
+    
+    -- Core metrics
+    total_requests INTEGER DEFAULT 0,
+    successful_requests INTEGER DEFAULT 0,
+    failed_requests INTEGER DEFAULT 0,
+    
+    -- Performance metrics
+    avg_response_time_ms INTEGER,
+    p50_response_time_ms INTEGER,
+    p95_response_time_ms INTEGER,
+    p99_response_time_ms INTEGER,
+    min_response_time_ms INTEGER,
+    max_response_time_ms INTEGER,
+    
+    -- Business metrics
+    total_orders INTEGER DEFAULT 0,
+    total_gmv NUMERIC(12,2) DEFAULT 0,
+    unique_merchants INTEGER DEFAULT 0,
+    unique_customers INTEGER DEFAULT 0,
+    
+    -- Error analysis
+    error_rate FLOAT,
+    timeout_count INTEGER DEFAULT 0,
+    rate_limit_hits INTEGER DEFAULT 0,
+    auth_errors INTEGER DEFAULT 0,
+    
+    -- Endpoint breakdown (JSON for flexibility)
+    endpoint_stats JSONB,
+    
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+-- Indexes for efficient queries
+CREATE INDEX IF NOT EXISTS idx_agent_metrics_agent_window ON agent_metrics(agent_id, window_start DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_metrics_window_type ON agent_metrics(window_type, window_start DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_metrics_agent_type_window ON agent_metrics(agent_id, window_type, window_start DESC);
+
+-- ============================================================================
+-- Part 3: Create views for common queries
+-- ============================================================================
+
+-- Real-time 24h metrics view
+CREATE OR REPLACE VIEW agent_metrics_24h AS
+SELECT 
+    agent_id,
+    SUM(total_requests) as requests_24h,
+    SUM(successful_requests) as successful_24h,
+    SUM(failed_requests) as failed_24h,
+    ROUND(AVG(avg_response_time_ms)) as avg_latency_24h,
+    ROUND(100.0 * SUM(successful_requests) / NULLIF(SUM(total_requests), 0), 2) as success_rate_24h,
+    SUM(total_orders) as orders_24h,
+    SUM(total_gmv) as gmv_24h,
+    COUNT(DISTINCT window_start) as data_points
+FROM agent_metrics
+WHERE window_start >= NOW() - INTERVAL '24 hours'
+GROUP BY agent_id;
+
+-- Agent summary view (combines agents + metrics)
+CREATE OR REPLACE VIEW agent_summary AS
+SELECT 
+    a.agent_id,
+    a.name,
+    a.email,
+    a.company,
+    a.status,
+    a.rate_limit,
+    a.created_at,
+    a.last_active,
+    COALESCE(m.requests_24h, 0) as requests_24h,
+    COALESCE(m.success_rate_24h, 0) as success_rate_24h,
+    COALESCE(m.avg_latency_24h, 0) as avg_latency_24h,
+    COALESCE(m.gmv_24h, 0) as gmv_24h,
+    COALESCE(m.orders_24h, 0) as orders_24h
+FROM agents a
+LEFT JOIN agent_metrics_24h m ON a.agent_id = m.agent_id;
+
+-- ============================================================================
+-- Part 4: Comments for documentation
+-- ============================================================================
+
+COMMENT ON TABLE agent_metrics IS 'Time-series performance metrics for agents (hourly/daily aggregations)';
+COMMENT ON COLUMN agent_metrics.window_type IS 'Aggregation window: hourly, daily, weekly';
+COMMENT ON COLUMN agent_metrics.endpoint_stats IS 'JSON breakdown of requests by endpoint';
+
+COMMENT ON VIEW agent_metrics_24h IS 'Real-time view of agent metrics for last 24 hours';
+COMMENT ON VIEW agent_summary IS 'Combined view of agent info + 24h metrics for dashboard';
+
+-- ============================================================================
+-- Part 5: Sample data population helper (optional)
+-- ============================================================================
+
+-- Function to aggregate agent_usage_logs into agent_metrics (can be run as cron job)
+CREATE OR REPLACE FUNCTION aggregate_agent_metrics(
+    p_agent_id VARCHAR(50),
+    p_window_start TIMESTAMP,
+    p_window_end TIMESTAMP,
+    p_window_type VARCHAR(20)
+) RETURNS void AS $$
+BEGIN
+    INSERT INTO agent_metrics (
+        agent_id, window_start, window_end, window_type,
+        total_requests, successful_requests, failed_requests,
+        avg_response_time_ms, min_response_time_ms, max_response_time_ms,
+        total_orders, total_gmv
+    )
+    SELECT 
+        p_agent_id,
+        p_window_start,
+        p_window_end,
+        p_window_type,
+        COUNT(*) as total_requests,
+        COUNT(CASE WHEN status_code = 200 THEN 1 END) as successful_requests,
+        COUNT(CASE WHEN status_code != 200 THEN 1 END) as failed_requests,
+        AVG(response_time_ms)::INTEGER as avg_response_time_ms,
+        MIN(response_time_ms) as min_response_time_ms,
+        MAX(response_time_ms) as max_response_time_ms,
+        COUNT(DISTINCT order_id) FILTER (WHERE order_id IS NOT NULL) as total_orders,
+        SUM(order_amount) FILTER (WHERE order_amount IS NOT NULL) as total_gmv
+    FROM agent_usage_logs
+    WHERE agent_id = p_agent_id
+        AND timestamp >= p_window_start
+        AND timestamp < p_window_end
+    ON CONFLICT DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION aggregate_agent_metrics IS 'Aggregates agent_usage_logs into agent_metrics for a given time window';
+

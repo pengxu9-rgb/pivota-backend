@@ -1,0 +1,4249 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Pivota Agent API",
+    "version": "1.0.0",
+    "description": "Production-ready API for AI agent integrations with e-commerce platforms",
+    "contact": {
+      "name": "Pivota Support",
+      "email": "support@pivota.com",
+      "url": "https://pivota.cc"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://web-production-fedb.up.railway.app/agent/v1",
+      "description": "Production server"
+    }
+  ],
+  "paths": {
+    "/agent/v1/health": {
+      "get": {
+        "tags": [
+          "agent-sdk"
+        ],
+        "summary": "Health Check",
+        "description": "Health check endpoint",
+        "operationId": "health_check_agent_v1_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/auth": {
+      "post": {
+        "tags": [
+          "agent-sdk"
+        ],
+        "summary": "Generate Api Key",
+        "description": "Generate or retrieve agent API key",
+        "operationId": "generate_api_key_agent_v1_auth_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentAuthRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/merchants": {
+      "get": {
+        "tags": [
+          "agent-sdk"
+        ],
+        "summary": "List Merchants",
+        "description": "List connected merchants - FIXED to only query existing columns",
+        "operationId": "list_merchants_agent_v1_merchants_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "active",
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/products/search": {
+      "get": {
+        "tags": [
+          "agent-api"
+        ],
+        "summary": "Agent Search Products",
+        "description": "\u667a\u80fd\u4ea7\u54c1\u641c\u7d22 - Cross-Merchant Support\n\n\u7279\u70b9\uff1a\n- \u2728 NEW: Cross-merchant search (omit merchant_id to search all)\n- \u652f\u6301\u81ea\u7136\u8bed\u8a00\u67e5\u8be2\n- \u81ea\u52a8\u8fc7\u6ee4\u5e93\u5b58\n- \u4ef7\u683c\u533a\u95f4\u7b5b\u9009\n- \u5206\u9875\u652f\u6301\n- \u76f8\u5173\u5ea6\u8bc4\u5206",
+        "operationId": "agent_search_products_agent_v1_products_search_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "merchant_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Merchant Id"
+            }
+          },
+          {
+            "name": "merchant_ids",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "List of merchant IDs to search",
+              "title": "Merchant Ids"
+            },
+            "description": "List of merchant IDs to search"
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Query"
+            }
+          },
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          },
+          {
+            "name": "min_price",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Price"
+            }
+          },
+          {
+            "name": "max_price",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Price"
+            }
+          },
+          {
+            "name": "in_stock_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "In Stock Only"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/orders": {
+      "get": {
+        "tags": [
+          "agent-api"
+        ],
+        "summary": "Agent List Orders",
+        "description": "\u5217\u51fa Agent \u521b\u5efa\u7684\u8ba2\u5355\n\n\u53ef\u4ee5\u6309\u5546\u6237\u6216\u72b6\u6001\u8fc7\u6ee4",
+        "operationId": "agent_list_orders_agent_v1_orders_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "merchant_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Merchant Id"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "agent-sdk"
+        ],
+        "summary": "Get Openapi Spec",
+        "description": "Return OpenAPI specification for SDK generation",
+        "operationId": "get_openapi_spec_agent_v1_openapi_json_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/payments": {
+      "post": {
+        "tags": [
+          "agent-payments"
+        ],
+        "summary": "Create Payment",
+        "description": "Create payment for an order\n\nFlow:\n1. Validate order exists and not already paid\n2. Get merchant PSP configuration\n3. Create payment intent with PSP\n4. Handle 3DS if required\n5. Return payment status\n\nFeatures:\n- Automatic PSP failover\n- 3DS authentication support\n- Idempotency protection\n- Payment retry logic",
+        "operationId": "create_payment_agent_v1_payments_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/routes__agent_payment_sdk__PaymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/routes__agent_payment_sdk__PaymentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/agent/v1/payments/{payment_id}": {
+      "get": {
+        "tags": [
+          "agent-payments"
+        ],
+        "summary": "Get Payment Status",
+        "description": "Get payment status\n\nReturns current status of payment including:\n- Payment status (requires_action, processing, succeeded, failed)\n- PSP used\n- Amount and currency\n- Next action if required",
+        "operationId": "get_payment_status_agent_v1_payments__payment_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "payment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Payment Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/products/{merchant_id}/{product_id}": {
+      "get": {
+        "tags": [
+          "agent-api"
+        ],
+        "summary": "Agent Get Product",
+        "description": "\u83b7\u53d6\u5355\u4e2a\u4ea7\u54c1\u8be6\u60c5",
+        "operationId": "agent_get_product_agent_v1_products__merchant_id___product_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "merchant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Merchant Id"
+            }
+          },
+          {
+            "name": "product_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Product Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/cart/validate": {
+      "post": {
+        "tags": [
+          "agent-api"
+        ],
+        "summary": "Agent Validate Cart",
+        "description": "\u9a8c\u8bc1\u8d2d\u7269\u8f66\u5e76\u8ba1\u7b97\u4ef7\u683c\n\n\u529f\u80fd\uff1a\n- \u5e93\u5b58\u9a8c\u8bc1\n- \u4ef7\u683c\u66f4\u65b0\n- \u8fd0\u8d39\u8ba1\u7b97\n- \u7a0e\u8d39\u4f30\u7b97",
+        "operationId": "agent_validate_cart_agent_v1_cart_validate_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "merchant_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Merchant Id"
+            }
+          },
+          {
+            "name": "shipping_country",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "US",
+              "title": "Shipping Country"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "title": "Items"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/orders/create": {
+      "post": {
+        "tags": [
+          "agent-api"
+        ],
+        "summary": "Agent Create Order",
+        "description": "\u521b\u5efa\u8ba2\u5355\uff08\u4ee3\u7406\u6807\u51c6\u8ba2\u5355\u521b\u5efa\u6d41\u7a0b\uff09\n\n\u81ea\u52a8\u6dfb\u52a0 Agent \u8ffd\u8e2a\u4fe1\u606f",
+        "operationId": "agent_create_order_agent_v1_orders_create_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/models__order__CreateOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/agent/v1/orders/{order_id}": {
+      "get": {
+        "tags": [
+          "agent-api"
+        ],
+        "summary": "Agent Get Order",
+        "description": "\u83b7\u53d6\u8ba2\u5355\u72b6\u6001",
+        "operationId": "agent_get_order_agent_v1_orders__order_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Order Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/analytics/summary": {
+      "get": {
+        "tags": [
+          "agent-api"
+        ],
+        "summary": "Agent Get Analytics",
+        "description": "\u83b7\u53d6 Agent \u81ea\u5df1\u7684\u5206\u6790\u6570\u636e\n\n\u5305\u62ec\uff1a\n- \u8bf7\u6c42\u7edf\u8ba1\n- \u8ba2\u5355\u8f6c\u5316\u7387\n- GMV\n- \u70ed\u95e8\u5546\u6237",
+        "operationId": "agent_get_analytics_agent_v1_analytics_summary_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 365,
+              "default": 30,
+              "title": "Days"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/fulfillment/track/{order_id}": {
+      "get": {
+        "tags": [
+          "agent-fulfillment"
+        ],
+        "summary": "Track Order Fulfillment",
+        "description": "Get fulfillment and tracking information for an order\n\nReturns:\n- Fulfillment status\n- Tracking number (if available)\n- Carrier information\n- Estimated delivery (if available)\n- Shipment timeline",
+        "operationId": "track_order_fulfillment_agent_v1_fulfillment_track__order_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Order Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/v1/fulfillment/orders/in-transit": {
+      "get": {
+        "tags": [
+          "agent-fulfillment"
+        ],
+        "summary": "Get In Transit Orders",
+        "description": "Get all orders that are currently in transit\n\nUseful for agents to track active deliveries",
+        "operationId": "get_in_transit_orders_agent_v1_fulfillment_orders_in_transit_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "merchant_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Merchant Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AgentAuthRequest": {
+        "properties": {
+          "agent_name": {
+            "type": "string",
+            "title": "Agent Name"
+          },
+          "agent_email": {
+            "type": "string",
+            "title": "Agent Email"
+          },
+          "company": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Company",
+            "default": "Independent"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "agent_name",
+          "agent_email"
+        ],
+        "title": "AgentAuthRequest"
+      },
+      "AgentOnboardingRequest": {
+        "properties": {
+          "agent_name": {
+            "type": "string",
+            "title": "Agent Name"
+          },
+          "contact_email": {
+            "type": "string",
+            "title": "Contact Email"
+          },
+          "company_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Company Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "expected_volume": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Volume"
+          },
+          "preferred_psps": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preferred Psps"
+          }
+        },
+        "type": "object",
+        "required": [
+          "agent_name",
+          "contact_email"
+        ],
+        "title": "AgentOnboardingRequest"
+      },
+      "AgentPayRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Item"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "amount": {
+            "type": "number",
+            "title": "Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "EUR"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id",
+            "default": "agent_demo"
+          },
+          "customer_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Email"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "default": {}
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "items",
+          "amount"
+        ],
+        "title": "AgentPayRequest"
+      },
+      "AnalyticsResponse": {
+        "properties": {
+          "total_orders": {
+            "type": "integer",
+            "title": "Total Orders"
+          },
+          "total_payments": {
+            "type": "integer",
+            "title": "Total Payments"
+          },
+          "total_volume": {
+            "type": "number",
+            "title": "Total Volume"
+          },
+          "success_rate": {
+            "type": "number",
+            "title": "Success Rate"
+          },
+          "average_order_value": {
+            "type": "number",
+            "title": "Average Order Value"
+          },
+          "psp_breakdown": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Psp Breakdown"
+          },
+          "currency_breakdown": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Currency Breakdown"
+          },
+          "time_series": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Time Series"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total_orders",
+          "total_payments",
+          "total_volume",
+          "success_rate",
+          "average_order_value",
+          "psp_breakdown",
+          "currency_breakdown",
+          "time_series"
+        ],
+        "title": "AnalyticsResponse"
+      },
+      "ApprovalUpdate": {
+        "properties": {
+          "approved": {
+            "type": "boolean",
+            "title": "Approved"
+          }
+        },
+        "type": "object",
+        "required": [
+          "approved"
+        ],
+        "title": "ApprovalUpdate"
+      },
+      "Body_upload_kyb_document_merchants__merchant_id__documents_upload_post": {
+        "properties": {
+          "document_type": {
+            "type": "string",
+            "title": "Document Type"
+          },
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "document_type",
+          "file"
+        ],
+        "title": "Body_upload_kyb_document_merchants__merchant_id__documents_upload_post"
+      },
+      "Body_upload_kyc_file_merchant_onboarding_kyc_upload_file__merchant_id__post": {
+        "properties": {
+          "document_type": {
+            "type": "string",
+            "title": "Document Type"
+          },
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "document_type",
+          "file"
+        ],
+        "title": "Body_upload_kyc_file_merchant_onboarding_kyc_upload_file__merchant_id__post"
+      },
+      "Body_upload_kyc_files_merchant_onboarding_upload__merchant_id__post": {
+        "properties": {
+          "files": {
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "type": "array",
+            "title": "Files"
+          },
+          "document_type": {
+            "type": "string",
+            "title": "Document Type",
+            "default": "other"
+          }
+        },
+        "type": "object",
+        "required": [
+          "files"
+        ],
+        "title": "Body_upload_kyc_files_merchant_onboarding_upload__merchant_id__post"
+      },
+      "ConnectPSPRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "psp_type": {
+            "type": "string",
+            "title": "Psp Type"
+          },
+          "api_key": {
+            "type": "string",
+            "title": "Api Key"
+          },
+          "test_mode": {
+            "type": "boolean",
+            "title": "Test Mode",
+            "default": true
+          },
+          "account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "psp_type",
+          "api_key"
+        ],
+        "title": "ConnectPSPRequest"
+      },
+      "ConnectShopifyRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "shop_domain": {
+            "type": "string",
+            "title": "Shop Domain"
+          },
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "store_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Store Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "shop_domain",
+          "access_token"
+        ],
+        "title": "ConnectShopifyRequest"
+      },
+      "ConnectWixRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "api_key": {
+            "type": "string",
+            "title": "Api Key"
+          },
+          "site_id": {
+            "type": "string",
+            "title": "Site Id"
+          },
+          "store_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Store Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "api_key",
+          "site_id"
+        ],
+        "title": "ConnectWixRequest"
+      },
+      "DemoDataResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "title": "DemoDataResponse"
+      },
+      "EntityType": {
+        "type": "string",
+        "enum": [
+          "agent",
+          "merchant"
+        ],
+        "title": "EntityType"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "InventoryItem": {
+        "properties": {
+          "sku": {
+            "type": "string",
+            "title": "Sku"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "price": {
+            "type": "number",
+            "title": "Price"
+          },
+          "quantity": {
+            "type": "integer",
+            "title": "Quantity"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sku",
+          "name",
+          "price",
+          "quantity"
+        ],
+        "title": "InventoryItem"
+      },
+      "Item": {
+        "properties": {
+          "sku": {
+            "type": "string",
+            "title": "Sku"
+          },
+          "qty": {
+            "type": "integer",
+            "title": "Qty"
+          },
+          "unit_price": {
+            "type": "number",
+            "title": "Unit Price"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sku",
+          "qty",
+          "unit_price",
+          "name"
+        ],
+        "title": "Item"
+      },
+      "KYBUpdateRequest": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "KYBUpdateRequest",
+        "description": "Request model for updating KYB status via JSON body"
+      },
+      "KYCUploadRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "documents": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Documents"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "documents"
+        ],
+        "title": "KYCUploadRequest"
+      },
+      "LoginRequest": {
+        "properties": {
+          "username": {
+            "type": "string",
+            "title": "Username"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "LoginRequest"
+      },
+      "LoginResponse": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "token_type": {
+            "type": "string",
+            "title": "Token Type",
+            "default": "bearer"
+          },
+          "user": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "User"
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token",
+          "user"
+        ],
+        "title": "LoginResponse"
+      },
+      "MerchantInfo": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "location": {
+            "type": "string",
+            "title": "Location"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "inventory": {
+            "items": {
+              "$ref": "#/components/schemas/InventoryItem"
+            },
+            "type": "array",
+            "title": "Inventory"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "name",
+          "location",
+          "currency",
+          "inventory"
+        ],
+        "title": "MerchantInfo"
+      },
+      "MerchantRegisterRequest": {
+        "properties": {
+          "business_name": {
+            "type": "string",
+            "title": "Business Name"
+          },
+          "store_url": {
+            "type": "string",
+            "title": "Store Url"
+          },
+          "region": {
+            "type": "string",
+            "title": "Region"
+          },
+          "contact_email": {
+            "type": "string",
+            "format": "email",
+            "title": "Contact Email"
+          },
+          "contact_phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contact Phone"
+          },
+          "website": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Website"
+          }
+        },
+        "type": "object",
+        "required": [
+          "business_name",
+          "store_url",
+          "region",
+          "contact_email"
+        ],
+        "title": "MerchantRegisterRequest"
+      },
+      "MerchantStatusUpdate": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "rejection_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejection Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "MerchantStatusUpdate"
+      },
+      "NextAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "redirect_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redirect Url"
+          },
+          "qr_code_data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qr Code Data"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "title": "NextAction",
+        "description": "Next action for 3DS or additional verification"
+      },
+      "OnboardingStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "under_review",
+          "approved",
+          "rejected",
+          "active",
+          "suspended",
+          "deactivated"
+        ],
+        "title": "OnboardingStatus"
+      },
+      "OnboardingUpdate": {
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OnboardingStatus"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          },
+          "assigned_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assigned To"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "OnboardingUpdate"
+      },
+      "OrderItem-Input": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "title": "Product Id"
+          },
+          "product_title": {
+            "type": "string",
+            "title": "Product Title"
+          },
+          "variant_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Variant Id"
+          },
+          "variant_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Variant Title"
+          },
+          "sku": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sku"
+          },
+          "quantity": {
+            "type": "integer",
+            "title": "Quantity"
+          },
+          "unit_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              }
+            ],
+            "title": "Unit Price"
+          },
+          "subtotal": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              }
+            ],
+            "title": "Subtotal"
+          }
+        },
+        "type": "object",
+        "required": [
+          "product_id",
+          "product_title",
+          "quantity",
+          "unit_price",
+          "subtotal"
+        ],
+        "title": "OrderItem",
+        "description": "\u8ba2\u5355\u9879\uff08\u5355\u4e2a\u4ea7\u54c1\uff09"
+      },
+      "OrderItem-Output": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "title": "Product Id"
+          },
+          "product_title": {
+            "type": "string",
+            "title": "Product Title"
+          },
+          "variant_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Variant Id"
+          },
+          "variant_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Variant Title"
+          },
+          "sku": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sku"
+          },
+          "quantity": {
+            "type": "integer",
+            "title": "Quantity"
+          },
+          "unit_price": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Unit Price"
+          },
+          "subtotal": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Subtotal"
+          }
+        },
+        "type": "object",
+        "required": [
+          "product_id",
+          "product_title",
+          "quantity",
+          "unit_price",
+          "subtotal"
+        ],
+        "title": "OrderItem",
+        "description": "\u8ba2\u5355\u9879\uff08\u5355\u4e2a\u4ea7\u54c1\uff09"
+      },
+      "OrderItemRequest": {
+        "properties": {
+          "sku": {
+            "type": "string",
+            "title": "Sku"
+          },
+          "quantity": {
+            "type": "integer",
+            "title": "Quantity"
+          },
+          "unit_price": {
+            "type": "number",
+            "title": "Unit Price"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sku",
+          "quantity",
+          "unit_price"
+        ],
+        "title": "OrderItemRequest"
+      },
+      "OrderListResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "default": "success"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "orders": {
+            "items": {
+              "$ref": "#/components/schemas/models__order__OrderResponse"
+            },
+            "type": "array",
+            "title": "Orders"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "orders"
+        ],
+        "title": "OrderListResponse",
+        "description": "\u8ba2\u5355\u5217\u8868\u54cd\u5e94"
+      },
+      "OrderStatusUpdate": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "payment_intent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Intent Id"
+          },
+          "psp_used": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Psp Used"
+          },
+          "payment_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id",
+          "status"
+        ],
+        "title": "OrderStatusUpdate"
+      },
+      "PSPSetupRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "psp_type": {
+            "type": "string",
+            "title": "Psp Type"
+          },
+          "psp_key": {
+            "type": "string",
+            "title": "Psp Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "psp_type",
+          "psp_key"
+        ],
+        "title": "PSPSetupRequest"
+      },
+      "PaymentConfirmRequest": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "payment_method_id": {
+            "type": "string",
+            "title": "Payment Method Id"
+          },
+          "billing_address": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShippingAddress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id",
+          "payment_method_id"
+        ],
+        "title": "PaymentConfirmRequest",
+        "description": "\u652f\u4ed8\u786e\u8ba4\u8bf7\u6c42"
+      },
+      "PaymentExecuteRequest": {
+        "properties": {
+          "amount": {
+            "type": "number",
+            "title": "Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "customer_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Email"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "amount",
+          "currency",
+          "order_id"
+        ],
+        "title": "PaymentExecuteRequest"
+      },
+      "PaymentExecuteResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "payment_id": {
+            "type": "string",
+            "title": "Payment Id"
+          },
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "amount": {
+            "type": "number",
+            "title": "Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "psp_used": {
+            "type": "string",
+            "title": "Psp Used"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "transaction_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transaction Id"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "timestamp": {
+            "type": "string",
+            "title": "Timestamp"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success",
+          "payment_id",
+          "order_id",
+          "amount",
+          "currency",
+          "psp_used",
+          "status",
+          "timestamp"
+        ],
+        "title": "PaymentExecuteResponse"
+      },
+      "PaymentMethod": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "title": "Type",
+            "description": "card, bank_transfer, wallet"
+          },
+          "token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token",
+            "description": "Payment token from PSP (e.g., Stripe token)"
+          },
+          "card_last4": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Last4",
+            "description": "Last 4 digits of card"
+          },
+          "brand": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Brand",
+            "description": "Card brand (visa, mastercard)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "title": "PaymentMethod",
+        "description": "Payment method details"
+      },
+      "ProductListResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "default": "success"
+          },
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "products": {
+            "items": {
+              "$ref": "#/components/schemas/StandardProduct"
+            },
+            "type": "array",
+            "title": "Products"
+          },
+          "next_page_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Page Token"
+          },
+          "fetched_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Fetched At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "platform",
+          "total",
+          "products",
+          "fetched_at"
+        ],
+        "title": "ProductListResponse",
+        "description": "\u4ea7\u54c1\u5217\u8868\u54cd\u5e94\uff08\u7528\u4e8e Agent \u8c03\u7528\uff09"
+      },
+      "ProductStatus": {
+        "type": "string",
+        "enum": [
+          "active",
+          "draft",
+          "archived"
+        ],
+        "title": "ProductStatus",
+        "description": "\u4ea7\u54c1\u72b6\u6001\uff08\u6807\u51c6\u5316\uff09"
+      },
+      "RefundRequest": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "restore_inventory": {
+            "type": "boolean",
+            "title": "Restore Inventory",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id"
+        ],
+        "title": "RefundRequest",
+        "description": "Refund request model"
+      },
+      "RetryRequest": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "retry_count": {
+            "type": "integer",
+            "title": "Retry Count",
+            "default": 1
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id"
+        ],
+        "title": "RetryRequest"
+      },
+      "RoleUpdate": {
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/UserRole"
+          }
+        },
+        "type": "object",
+        "required": [
+          "role"
+        ],
+        "title": "RoleUpdate"
+      },
+      "ShippingAddress": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "address_line1": {
+            "type": "string",
+            "title": "Address Line1"
+          },
+          "address_line2": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Address Line2"
+          },
+          "city": {
+            "type": "string",
+            "title": "City"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "postal_code": {
+            "type": "string",
+            "title": "Postal Code"
+          },
+          "country": {
+            "type": "string",
+            "title": "Country"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "address_line1",
+          "city",
+          "postal_code",
+          "country"
+        ],
+        "title": "ShippingAddress",
+        "description": "\u6536\u8d27\u5730\u5740"
+      },
+      "ShopifyConnectRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "shop_domain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shop Domain"
+          },
+          "access_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Access Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id"
+        ],
+        "title": "ShopifyConnectRequest"
+      },
+      "SimpleAgentPaymentRequest": {
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "amount": {
+            "type": "number",
+            "title": "Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          }
+        },
+        "type": "object",
+        "required": [
+          "agent_id",
+          "order_id",
+          "amount",
+          "currency"
+        ],
+        "title": "SimpleAgentPaymentRequest"
+      },
+      "StandardProduct": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform"
+          },
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "vendor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vendor"
+          },
+          "product_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Type"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags",
+            "default": []
+          },
+          "price": {
+            "type": "number",
+            "title": "Price"
+          },
+          "compare_at_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compare At Price"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "USD"
+          },
+          "inventory_quantity": {
+            "type": "integer",
+            "title": "Inventory Quantity",
+            "default": 0
+          },
+          "sku": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sku"
+          },
+          "barcode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Barcode"
+          },
+          "image_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Url"
+          },
+          "images": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Images",
+            "default": []
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/StandardProductVariant"
+            },
+            "type": "array",
+            "title": "Variants",
+            "default": []
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProductStatus",
+            "default": "active"
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "platform_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Platform Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "platform",
+          "merchant_id",
+          "title",
+          "price"
+        ],
+        "title": "StandardProduct",
+        "description": "Pivota \u7edf\u4e00\u4ea7\u54c1\u6807\u51c6\u683c\u5f0f\n\u6240\u6709\u5e73\u53f0\uff08Shopify/Wix/WooCommerce\uff09\u7684\u4ea7\u54c1\u90fd\u8f6c\u6362\u4e3a\u6b64\u683c\u5f0f"
+      },
+      "StandardProductVariant": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "sku": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sku"
+          },
+          "barcode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Barcode"
+          },
+          "price": {
+            "type": "number",
+            "title": "Price"
+          },
+          "compare_at_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compare At Price"
+          },
+          "inventory_quantity": {
+            "type": "integer",
+            "title": "Inventory Quantity",
+            "default": 0
+          },
+          "weight": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
+          },
+          "weight_unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight Unit"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Options"
+          },
+          "image_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "price"
+        ],
+        "title": "StandardProductVariant",
+        "description": "\u4ea7\u54c1\u53d8\u4f53\uff08\u6807\u51c6\u683c\u5f0f\uff09"
+      },
+      "SyncProductsRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "platform": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Platform",
+            "default": "shopify"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id"
+        ],
+        "title": "SyncProductsRequest"
+      },
+      "SyncRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "force_refresh": {
+            "type": "boolean",
+            "title": "Force Refresh",
+            "default": false
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "default": 250
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id"
+        ],
+        "title": "SyncRequest"
+      },
+      "SyncResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform"
+          },
+          "products_synced": {
+            "type": "integer",
+            "title": "Products Synced"
+          },
+          "sync_time": {
+            "type": "string",
+            "title": "Sync Time"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "message",
+          "merchant_id",
+          "platform",
+          "products_synced",
+          "sync_time"
+        ],
+        "title": "SyncResponse"
+      },
+      "UpdateAgentRequest": {
+        "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_active": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Active"
+          },
+          "rate_limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate Limit"
+          },
+          "daily_quota": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Quota"
+          },
+          "allowed_merchants": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allowed Merchants"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "title": "UpdateAgentRequest",
+        "description": "\u66f4\u65b0 Agent \u8bf7\u6c42"
+      },
+      "UserLogin": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "UserLogin"
+      },
+      "UserRole": {
+        "type": "string",
+        "enum": [
+          "employee",
+          "agent",
+          "merchant",
+          "operator",
+          "admin"
+        ],
+        "title": "UserRole"
+      },
+      "UserSignup": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          },
+          "role": {
+            "$ref": "#/components/schemas/UserRole",
+            "default": "employee"
+          },
+          "full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "UserSignup"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "VerificationRequest": {
+        "properties": {
+          "entity_id": {
+            "type": "string",
+            "title": "Entity Id"
+          },
+          "entity_type": {
+            "$ref": "#/components/schemas/EntityType"
+          },
+          "verification_type": {
+            "type": "string",
+            "title": "Verification Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "entity_id",
+          "entity_type",
+          "verification_type"
+        ],
+        "title": "VerificationRequest"
+      },
+      "VerificationStatus": {
+        "type": "string",
+        "enum": [
+          "not_started",
+          "in_progress",
+          "verified",
+          "failed"
+        ],
+        "title": "VerificationStatus"
+      },
+      "models__order__CreateOrderRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "customer_email": {
+            "type": "string",
+            "title": "Customer Email"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OrderItem-Input"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "shipping_address": {
+            "$ref": "#/components/schemas/ShippingAddress"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "USD"
+          },
+          "agent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Session Id"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "customer_email",
+          "items",
+          "shipping_address"
+        ],
+        "title": "CreateOrderRequest",
+        "description": "\u521b\u5efa\u8ba2\u5355\u8bf7\u6c42"
+      },
+      "models__order__OrderResponse": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "customer_email": {
+            "type": "string",
+            "title": "Customer Email"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OrderItem-Output"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "shipping_address": {
+            "$ref": "#/components/schemas/ShippingAddress"
+          },
+          "subtotal": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Subtotal"
+          },
+          "shipping_fee": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Shipping Fee"
+          },
+          "tax": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Tax"
+          },
+          "total": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Total"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "payment_status": {
+            "type": "string",
+            "title": "Payment Status"
+          },
+          "fulfillment_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fulfillment Status"
+          },
+          "payment_intent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Intent Id"
+          },
+          "client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Secret"
+          },
+          "shopify_order_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shopify Order Id"
+          },
+          "tracking_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tracking Number"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "paid_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paid At"
+          },
+          "shipped_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shipped At"
+          },
+          "agent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Session Id"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id",
+          "merchant_id",
+          "customer_email",
+          "items",
+          "shipping_address",
+          "subtotal",
+          "shipping_fee",
+          "tax",
+          "total",
+          "currency",
+          "status",
+          "payment_status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "OrderResponse",
+        "description": "\u8ba2\u5355\u54cd\u5e94"
+      },
+      "models__schemas__PaymentResponse": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "payment_intent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Intent Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "psp_suggestion": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Psp Suggestion",
+            "default": []
+          },
+          "ai_selected_psp": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Selected Psp"
+          },
+          "processing_latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Processing Latency Ms"
+          },
+          "psp_latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Psp Latency Ms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id",
+          "payment_intent_id",
+          "status"
+        ],
+        "title": "PaymentResponse"
+      },
+      "routes__agent_management__CreateAgentRequest": {
+        "properties": {
+          "agent_name": {
+            "type": "string",
+            "title": "Agent Name"
+          },
+          "agent_type": {
+            "type": "string",
+            "title": "Agent Type"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "owner_email": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "email"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Email"
+          },
+          "rate_limit": {
+            "type": "integer",
+            "title": "Rate Limit",
+            "default": 100
+          },
+          "daily_quota": {
+            "type": "integer",
+            "title": "Daily Quota",
+            "default": 10000
+          },
+          "allowed_merchants": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allowed Merchants"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "agent_name",
+          "agent_type"
+        ],
+        "title": "CreateAgentRequest",
+        "description": "\u521b\u5efa Agent \u8bf7\u6c42"
+      },
+      "routes__agent_payment_sdk__PaymentRequest": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id",
+            "description": "Order ID to create payment for"
+          },
+          "payment_method": {
+            "$ref": "#/components/schemas/PaymentMethod"
+          },
+          "return_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Return Url",
+            "description": "URL for 3DS redirect callback"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key",
+            "description": "Prevent duplicate payments"
+          },
+          "save_payment_method": {
+            "type": "boolean",
+            "title": "Save Payment Method",
+            "description": "Save for future use",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id",
+          "payment_method"
+        ],
+        "title": "PaymentRequest",
+        "description": "Unified payment request"
+      },
+      "routes__agent_payment_sdk__PaymentResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "payment_id": {
+            "type": "string",
+            "title": "Payment Id"
+          },
+          "payment_intent_id": {
+            "type": "string",
+            "title": "Payment Intent Id"
+          },
+          "client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Secret"
+          },
+          "amount": {
+            "type": "number",
+            "title": "Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "psp_used": {
+            "type": "string",
+            "title": "Psp Used"
+          },
+          "next_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NextAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "payment_id",
+          "payment_intent_id",
+          "amount",
+          "currency",
+          "psp_used",
+          "created_at"
+        ],
+        "title": "PaymentResponse",
+        "description": "Unified payment response"
+      },
+      "routes__dashboard_api__OrderResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "customer_email": {
+            "type": "string",
+            "title": "Customer Email"
+          },
+          "total_amount": {
+            "type": "number",
+            "title": "Total Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "merchant_id",
+          "agent_id",
+          "customer_email",
+          "total_amount",
+          "currency",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "OrderResponse"
+      },
+      "routes__dashboard_api__PaymentResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "amount": {
+            "type": "number",
+            "title": "Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "psp": {
+            "type": "string",
+            "title": "Psp"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "transaction_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transaction Id"
+          },
+          "fees": {
+            "type": "number",
+            "title": "Fees"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "order_id",
+          "amount",
+          "currency",
+          "psp",
+          "status",
+          "transaction_id",
+          "fees",
+          "created_at"
+        ],
+        "title": "PaymentResponse"
+      },
+      "routes__employee_agent_mgmt__CreateAgentRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "title": "Email"
+          },
+          "company": {
+            "type": "string",
+            "title": "Company"
+          },
+          "use_case": {
+            "type": "string",
+            "title": "Use Case"
+          },
+          "expected_volume": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Volume",
+            "default": 100
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "email",
+          "company",
+          "use_case"
+        ],
+        "title": "CreateAgentRequest"
+      },
+      "routes__mcp_routes__CreateOrderRequest": {
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OrderItemRequest"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "customer_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Email"
+          },
+          "shipping_address": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shipping Address"
+          }
+        },
+        "type": "object",
+        "required": [
+          "agent_id",
+          "merchant_id",
+          "items"
+        ],
+        "title": "CreateOrderRequest"
+      },
+      "routes__mcp_routes__OrderResponse": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "total_amount": {
+            "type": "number",
+            "title": "Total Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "payment_intent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Intent Id"
+          },
+          "psp_used": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Psp Used"
+          },
+          "payment_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id",
+          "agent_id",
+          "merchant_id",
+          "items",
+          "status",
+          "total_amount",
+          "currency",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "OrderResponse"
+      },
+      "routes__merchant_routes__MerchantOnboardingRequest": {
+        "properties": {
+          "business_name": {
+            "type": "string",
+            "title": "Business Name"
+          },
+          "legal_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Legal Name"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform"
+          },
+          "store_url": {
+            "type": "string",
+            "title": "Store Url"
+          },
+          "contact_email": {
+            "type": "string",
+            "format": "email",
+            "title": "Contact Email"
+          },
+          "contact_phone": {
+            "type": "string",
+            "title": "Contact Phone"
+          },
+          "business_type": {
+            "type": "string",
+            "title": "Business Type"
+          },
+          "country": {
+            "type": "string",
+            "title": "Country"
+          },
+          "expected_monthly_volume": {
+            "type": "number",
+            "title": "Expected Monthly Volume"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "business_name",
+          "platform",
+          "store_url",
+          "contact_email",
+          "contact_phone",
+          "business_type",
+          "country",
+          "expected_monthly_volume"
+        ],
+        "title": "MerchantOnboardingRequest"
+      },
+      "routes__operations_routes__MerchantOnboardingRequest": {
+        "properties": {
+          "merchant_name": {
+            "type": "string",
+            "title": "Merchant Name"
+          },
+          "contact_email": {
+            "type": "string",
+            "title": "Contact Email"
+          },
+          "store_url": {
+            "type": "string",
+            "title": "Store Url"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform"
+          },
+          "api_credentials": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Credentials"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "expected_volume": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Volume"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_name",
+          "contact_email",
+          "store_url",
+          "platform"
+        ],
+        "title": "MerchantOnboardingRequest"
+      },
+      "routes__payment_routes__PaymentRequest": {
+        "properties": {
+          "merchant_id": {
+            "type": "string",
+            "title": "Merchant Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "customer_email": {
+            "type": "string",
+            "title": "Customer Email"
+          },
+          "total_amount": {
+            "type": "number",
+            "title": "Total Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "USD"
+          },
+          "payment_method": {
+            "type": "string",
+            "title": "Payment Method",
+            "default": "card"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Items",
+            "default": []
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata",
+            "default": {}
+          },
+          "preferred_psp": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preferred Psp"
+          }
+        },
+        "type": "object",
+        "required": [
+          "merchant_id",
+          "customer_email",
+          "total_amount"
+        ],
+        "title": "PaymentRequest"
+      },
+      "routes__payment_routes__PaymentResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "order_id": {
+            "type": "string",
+            "title": "Order Id"
+          },
+          "payment_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Id"
+          },
+          "psp_used": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Psp Used"
+          },
+          "transaction_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transaction Id"
+          },
+          "amount": {
+            "type": "number",
+            "title": "Amount"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "fees": {
+            "type": "number",
+            "title": "Fees"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata",
+            "default": {}
+          }
+        },
+        "type": "object",
+        "required": [
+          "success",
+          "order_id",
+          "payment_id",
+          "psp_used",
+          "transaction_id",
+          "amount",
+          "currency",
+          "fees"
+        ],
+        "title": "PaymentResponse"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBasic": {
+        "type": "http",
+        "scheme": "basic"
+      },
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "APIKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      },
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Agent API key (get from /agent/v1/auth endpoint)"
+      }
+    }
+  },
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ]
+}
