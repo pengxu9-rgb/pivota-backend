@@ -31,11 +31,11 @@ routing_service = PaymentRoutingService(database)
 class RoutingPolicyRequest(BaseModel):
     """Request model for setting routing policy"""
     exclude: List[str] = Field(default=[], description="PSPs to exclude")
-    prefer: List[str] = Field(default=[], description="Preferred PSPs in order")
+    prefer: List[str] = Field(default=[], description="Preferred PSPs in order (auto-generated from weights)")
     required: List[str] = Field(default=[], description="Required PSPs (merchant only)")
     weights: Dict[str, float] = Field(default={}, description="PSP weights (0.0-1.0)")
     failover: List[str] = Field(default=[], description="Failover PSPs")
-    priority: int = Field(default=1, ge=1, le=10, description="Policy priority (1=highest)")
+    priority: int = Field(default=1, ge=1, le=10, description="Policy priority (auto-set to 1)")
     
     class Config:
         schema_extra = {
