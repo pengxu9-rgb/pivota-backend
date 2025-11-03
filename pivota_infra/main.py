@@ -157,6 +157,9 @@ from routes.admin_run_migration_012 import router as admin_run_migration_012_rou
 from routes.admin_run_migration_013 import router as admin_run_migration_013_router
 # [Phase 5.5] Dual-sided revenue
 from routes.merchant_commission_api import router as merchant_commission_api_router
+# [Phase 5.6] Agent Portal settlement, protocol, integration
+from routes.agent_settlement_routes import router as agent_settlement_router
+from routes.agent_integration_status import router as agent_integration_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -347,6 +350,10 @@ app.include_router(admin_run_migration_013_router)  # Run migration 013 - Consol
 
 # [Phase 5.5] Dual-sided revenue matching
 app.include_router(merchant_commission_api_router)  # Merchant commission offers
+
+# [Phase 5.6] Agent Portal - Settlement, Protocol, Integration
+app.include_router(agent_settlement_router)  # Agent settlements and payouts
+app.include_router(agent_integration_router)  # Agent integration status (aggregates existing data)
 
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
