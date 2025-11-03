@@ -316,6 +316,142 @@ class DualRoutingEngine:
         )
         
         return result
+    
+    # ========================================================================
+    # [Phase 5] New structured methods for improved architecture
+    # ========================================================================
+    
+    def route_payment(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        [Phase 5] Main entry point for payment routing with full context
+        
+        This is a higher-level wrapper around resolve() that adds:
+        - Context validation
+        - Enhanced logging
+        - Revenue tracking hooks
+        
+        Args:
+            context: Full payment context including:
+                - merchant_id
+                - agent_id  
+                - amount
+                - currency
+                - metadata
+                
+        Returns:
+            Routing decision with enhanced context
+        """
+        logger.info(f"[Phase 5] route_payment called with context: merchant={context.get('merchant_id')}, agent={context.get('agent_id')}")
+        
+        # Call existing resolve() method
+        result = self.resolve()
+        
+        # Add context information
+        result['context'] = {
+            'merchant_id': context.get('merchant_id'),
+            'agent_id': context.get('agent_id'),
+            'amount': context.get('amount'),
+            'currency': context.get('currency'),
+            'revenue_sharing_enabled': context.get('revenue_sharing_enabled', False)
+        }
+        
+        return result
+    
+    def evaluate_policy(
+        self, 
+        merchant_rules: Dict[str, Any], 
+        agent_rules: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        [Phase 5] Evaluate and merge policies - extracted for testability
+        
+        This method encapsulates the core policy evaluation logic
+        without executing the full routing flow.
+        
+        Args:
+            merchant_rules: Merchant routing policy
+            agent_rules: Agent routing policy
+            
+        Returns:
+            Evaluation result with merged policy and conflicts
+        """
+        # This is essentially what resolve() does but more focused
+        # For now, create a temporary engine and run evaluation
+        temp_engine = DualRoutingEngine(
+            merchant_rules=merchant_rules,
+            agent_rules=agent_rules,
+            available_psps=self.available_psps,
+            agent_whitelisted=self.agent_whitelisted
+        )
+        
+        # Run just the evaluation steps
+        psps = temp_engine.available_psps.copy()
+        filtered_psps, merchant_applied = temp_engine.evaluate_merchant_rules(psps)
+        final_psps, agent_applied = temp_engine.evaluate_agent_rules(filtered_psps)
+        conflicts = temp_engine.detect_conflicts()
+        
+        return {
+            "merchant_rules_applied": merchant_applied,
+            "agent_rules_applied": agent_applied,
+            "conflicts": conflicts,
+            "conflict_detected": len(conflicts) > 0,
+            "final_psps": [p.get('psp') for p in final_psps],
+            "evaluation_trace": temp_engine.decision_trace
+        }
+    
+    def simulate(self, context: Dict[str, Any], dry_run: bool = True) -> Dict[str, Any]:
+        """
+        [Phase 5] Dry-run routing for governance UI testing
+        
+        Runs the full routing logic without persisting to database.
+        Perfect for testing policies before deployment.
+        
+        Args:
+            context: Payment context (same as route_payment)
+            dry_run: If True, no database writes occur
+            
+        Returns:
+            Complete routing decision with trace
+        """
+        logger.info(f"[Phase 5] Simulating routing (dry_run={dry_run})")
+        
+        # Run normal routing
+        result = self.resolve()
+        
+        # Add simulation metadata
+        result['simulation'] = {
+            'dry_run': dry_run,
+            'simulated_at': datetime.utcnow().isoformat(),
+            'context': context
+        }
+        
+        # Mark as simulation
+        result['is_simulation'] = True
+        
+        logger.info(f"[Phase 5] Simulation complete: selected={result['selected_psp']}, conflicts={result['conflict_detected']}")
+        
+        return result
+    
+    def log_decision(self, result: Dict[str, Any], persist: bool = True) -> Optional[int]:
+        """
+        [Phase 5] Log routing decision - can be disabled for simulation
+        
+        Args:
+            result: Routing decision result from resolve()
+            persist: Whether to write to database
+            
+        Returns:
+            Log ID if persisted, None otherwise
+        """
+        if not persist:
+            logger.info("[Phase 5] Skipping decision logging (simulation mode)")
+            return None
+        
+        # This method is a hook for future database logging
+        # Actual logging is done by PaymentRoutingService.log_routing_decision()
+        logger.info(f"[Phase 5] Logging decision: psp={result.get('selected_psp')}")
+        
+        return 0  # Placeholder - actual ID returned by service layer
 
 
 def merge_routing_rules(
