@@ -32,7 +32,8 @@ from routes.dashboard_routes import router as dashboard_router
 from routes.dashboard_api import router as dashboard_api_router
 # payment_routes already imported above, removed duplicate
 from routes.demo_data_routes import router as demo_data_router
-# from routes.test_data_routes import router as test_data_router  # File not in Git
+# [REMOVED] test_data_routes - File not tracked in Git (causes ModuleNotFoundError)
+# from routes.test_data_routes import router as test_data_router
 from routes.simple_ws_routes import router as simple_ws_router
 from routes.agent_metrics_routes import router as agent_metrics_router
 from routes.auth_routes import router as auth_router
@@ -450,7 +451,8 @@ app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 # payment_routes_router is same as payment_router, already included above
 app.include_router(demo_data_router)  # Demo data management
-# app.include_router(test_data_router)  # Test data for Lovable - File not in Git
+# [REMOVED] test_data_router - File not tracked in Git (causes ModuleNotFoundError)
+# app.include_router(test_data_router)
 app.include_router(simple_ws_router)  # Simple WebSocket
 # agent_metrics_router already included above on line 195
 
