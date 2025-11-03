@@ -182,6 +182,7 @@ async def login_agent(data: AgentLoginRequest):
         # 5. Create JWT token
         token = create_access_token({
             "sub": user["email"],
+            "email": user["email"],  # Required by get_current_user
             "user_id": str(user["id"]),
             "role": "agent",
             "agent_id": agent["agent_id"]
