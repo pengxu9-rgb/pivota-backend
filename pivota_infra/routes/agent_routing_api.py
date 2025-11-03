@@ -286,16 +286,17 @@ async def get_agent_routing_history(
         
         history = []
         for row in results:
+            row_dict = dict(row)  # Convert Record to dict
             history.append({
-                "id": row["id"],
-                "merchant_id": row["merchant_id"],
-                "order_id": row["order_id"],
-                "chosen_psp": row["chosen_psp"],
-                "conflict_detected": row["conflict_detected"],
-                "resolution_method": row["resolution_method"],
-                "resolved_by": row.get("resolved_by", "consensus"),
-                "execution_time_ms": row["execution_time_ms"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None
+                "id": row_dict.get("id"),
+                "merchant_id": row_dict.get("merchant_id"),
+                "order_id": row_dict.get("order_id"),
+                "chosen_psp": row_dict.get("chosen_psp"),
+                "conflict_detected": row_dict.get("conflict_detected"),
+                "resolution_method": row_dict.get("resolution_method"),
+                "resolved_by": row_dict.get("resolved_by", "consensus"),
+                "execution_time_ms": row_dict.get("execution_time_ms"),
+                "created_at": row_dict.get("created_at").isoformat() if row_dict.get("created_at") else None
             })
         
         return {
