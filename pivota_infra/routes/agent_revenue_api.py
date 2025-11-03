@@ -422,12 +422,13 @@ async def get_revenue_expectations(
         if not exp:
             return {"agent_id": agent_id, "has_expectations": False}
         
+        exp_dict = dict(exp)  # Convert Record to dict
         return {
             "agent_id": agent_id,
             "has_expectations": True,
-            "expected_commission_rate": float(exp["expected_commission_rate"]) if exp.get("expected_commission_rate") else None,
-            "min_acceptable_rate": float(exp["min_acceptable_rate"]) if exp.get("min_acceptable_rate") else None,
-            "agent_type": exp.get("agent_type")
+            "expected_commission_rate": float(exp_dict["expected_commission_rate"]) if exp_dict.get("expected_commission_rate") else None,
+            "min_acceptable_rate": float(exp_dict["min_acceptable_rate"]) if exp_dict.get("min_acceptable_rate") else None,
+            "agent_type": exp_dict.get("agent_type")
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
