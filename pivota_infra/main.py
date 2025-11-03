@@ -953,7 +953,7 @@ async def root():
     
     return {
         "message": "Pivota Infrastructure Dashboard API",
-        .2.2-fix-1762178678",
+        "version": "0.2.3",
         "status": "healthy",
         "db_status": db_status,
         "timestamp": time.time(),
