@@ -5,8 +5,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict
 import asyncpg
-from auth import get_current_admin_user
-from database import get_db_pool
+from utils.auth import get_current_admin_user
+from db.database import get_db_pool
 
 router = APIRouter()
 
