@@ -152,6 +152,7 @@ from routes.admin_cleanup_routing_test_data import router as admin_cleanup_routi
 # [Phase 5] Agent routing control and revenue
 from routes.agent_routing_api import router as agent_routing_api_router
 from routes.agent_revenue_api import router as agent_revenue_api_router
+from routes.admin_run_migration_012 import router as admin_run_migration_012_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -336,6 +337,7 @@ app.include_router(admin_cleanup_routing_router)  # Cleanup routing test data
 # [Phase 5] Agent routing control and revenue
 app.include_router(agent_routing_api_router)  # Agent routing policies and testing
 app.include_router(agent_revenue_api_router)  # Agent revenue policies and earnings
+app.include_router(admin_run_migration_012_router)  # Run migrations 012a/012b - Phase 5 Revenue
 
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
