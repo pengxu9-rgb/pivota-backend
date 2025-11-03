@@ -149,6 +149,7 @@ from routes.routing_governance import router as routing_governance_router
 from routes.admin_run_migration_011 import router as admin_run_migration_011_router
 from routes.admin_seed_routing_logs import router as admin_seed_routing_logs_router
 from routes.admin_cleanup_routing_test_data import router as admin_cleanup_routing_router
+from routes.admin_cleanup_phase5_data import router as admin_cleanup_phase5_router  # Phase 6
 from routes.admin_seed_agent_routing_history import router as admin_seed_agent_history_router
 # [Phase 5] Agent routing control and revenue
 from routes.agent_routing_api import router as agent_routing_api_router
@@ -340,6 +341,7 @@ app.include_router(routing_governance_router)  # Routing policy management
 app.include_router(admin_run_migration_011_router)  # Run migration 011 - Phase 4++ Dual Routing
 app.include_router(admin_seed_routing_logs_router)  # Seed test routing logs
 app.include_router(admin_cleanup_routing_router)  # Cleanup routing test data
+app.include_router(admin_cleanup_phase5_router)  # Phase 6 cleanup
 app.include_router(admin_seed_agent_history_router)  # Seed agent routing history for demo
 
 # [Phase 5] Agent routing control and revenue

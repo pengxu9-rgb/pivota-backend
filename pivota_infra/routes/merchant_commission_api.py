@@ -37,6 +37,10 @@ async def create_commission_offer(
 ):
     """[Phase 5.5] Create commission offer"""
     
+    # [Phase 6] Auth check - merchant can only manage their own commission
+    if current_user.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=403, detail="Cannot manage other merchant's commission")
+    
     try:
         await database.execute(
             """
@@ -77,6 +81,10 @@ async def get_commission_offers(
 ):
     """[Phase 5.5] Get all commission offers"""
     
+    # [Phase 6] Auth check 
+    if current_user.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=403, detail="Cannot access other merchant's commission")
+    
     try:
         offers = await database.fetch_all(
             "SELECT * FROM merchant_commission_offers WHERE merchant_id = :merchant_id ORDER BY created_at DESC",
@@ -97,6 +105,42 @@ async def get_commission_offers(
                 for o in offers
             ]
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/offers/{offer_id}")
+async def delete_commission_offer(
+    merchant_id: str = Path(...),
+    offer_id: int = Path(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """[Phase 6] Delete commission offer"""
+    
+    # Auth check
+    if current_user.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=403, detail="Cannot delete other merchant's commission")
+    
+    try:
+        # Verify offer belongs to merchant
+        existing = await database.fetch_one(
+            "SELECT id FROM merchant_commission_offers WHERE id = :id AND merchant_id = :merchant_id",
+            {"id": offer_id, "merchant_id": merchant_id}
+        )
+        
+        if not existing:
+            raise HTTPException(status_code=404, detail="Offer not found")
+        
+        # Soft delete
+        await database.execute(
+            "UPDATE merchant_commission_offers SET is_active = false WHERE id = :id",
+            {"id": offer_id}
+        )
+        
+        return {"status": "success", "message": "Offer deleted"}
+        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
