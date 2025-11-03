@@ -370,5 +370,68 @@ async def get_settlement_history(
         raise HTTPException(status_code=500, detail=f"Failed to get settlement history: {str(e)}")
 
 
+# ========================================================================
+# [Phase 5.5] Revenue Expectations Endpoints
+# ========================================================================
+
+@router.put("/expectations")
+async def set_revenue_expectations(
+    agent_id: str = Path(...),
+    expected_rate: float = Query(..., ge=0, le=1),
+    min_acceptable_rate: float = Query(..., ge=0, le=1),
+    current_user: dict = Depends(get_current_user)
+):
+    """[Phase 5.5] Set agent revenue expectations"""
+    
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    try:
+        await database.execute(
+            """
+            UPDATE agent_revenue_expectations
+            SET expected_commission_rate = :expected,
+                min_acceptable_rate = :minimum,
+                updated_at = NOW()
+            WHERE agent_id = :agent_id AND merchant_id IS NULL
+            """,
+            {"agent_id": agent_id, "expected": expected_rate, "minimum": min_acceptable_rate}
+        )
+        
+        return {"status": "success", "expected_rate": expected_rate, "min_rate": min_acceptable_rate}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/expectations")
+async def get_revenue_expectations(
+    agent_id: str = Path(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """[Phase 5.5] Get agent revenue expectations"""
+    
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    try:
+        exp = await database.fetch_one(
+            "SELECT * FROM agent_revenue_expectations WHERE agent_id = :agent_id AND merchant_id IS NULL",
+            {"agent_id": agent_id}
+        )
+        
+        if not exp:
+            return {"agent_id": agent_id, "has_expectations": False}
+        
+        return {
+            "agent_id": agent_id,
+            "has_expectations": True,
+            "expected_commission_rate": float(exp["expected_commission_rate"]) if exp.get("expected_commission_rate") else None,
+            "min_acceptable_rate": float(exp["min_acceptable_rate"]) if exp.get("min_acceptable_rate") else None,
+            "agent_type": exp.get("agent_type")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # [Phase 5] Agent revenue API initialized
-print("[Phase 5] Agent revenue API routes initialized")
+print("[Phase 5.5] Agent revenue API routes initialized (with expectations)")
