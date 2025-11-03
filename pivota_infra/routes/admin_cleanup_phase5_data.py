@@ -5,14 +5,14 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict
 import asyncpg
-from utils.auth import get_current_admin_user
+from utils.auth import get_current_admin
 from db.database import get_db_pool
 
 router = APIRouter()
 
 @router.post("/admin/cleanup/phase5-data")
 async def cleanup_phase5_test_data(
-    current_admin = Depends(get_current_admin_user),
+    current_admin = Depends(get_current_admin),
     pool = Depends(get_db_pool)
 ):
     """Clean up Phase 5.x test data from database"""

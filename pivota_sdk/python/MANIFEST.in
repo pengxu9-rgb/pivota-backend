@@ -1,7 +1,0 @@
-include README.md
-include LICENSE
-recursive-include pivota_agent *.py
-
-
-
-
