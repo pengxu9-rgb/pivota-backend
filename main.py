@@ -224,7 +224,7 @@ from openapi_config import get_custom_openapi_schema
 
 app = FastAPI(
     title="Pivota Infra Dashboard", 
-    version="0.2.1-fixed",  # Updated to verify Railway deployment
+    version="0.2.1-build-1762178331",  # Updated to verify Railway deployment
     description="Pivota Infrastructure API with comprehensive payment processing and agent SDK support",
     docs_url="/docs",
     redoc_url="/redoc",
