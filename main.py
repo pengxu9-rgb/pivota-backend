@@ -32,8 +32,11 @@ from routes.dashboard_routes import router as dashboard_router
 from routes.dashboard_api import router as dashboard_api_router
 # payment_routes already imported above, removed duplicate
 from routes.demo_data_routes import router as demo_data_router
-# [REMOVED] test_data_routes - File not tracked in Git (causes ModuleNotFoundError)
-# from routes.test_data_routes import router as test_data_router
+# ============================================================================
+# [LINE 35-36 PERMANENTLY DELETED] test_data_routes import removed
+# This file does not exist in Git and causes: ModuleNotFoundError
+# If you see this comment, Railway is using the LATEST code (commit: f1db95e9+)
+# ============================================================================
 from routes.simple_ws_routes import router as simple_ws_router
 from routes.agent_metrics_routes import router as agent_metrics_router
 from routes.auth_routes import router as auth_router
@@ -221,7 +224,7 @@ from openapi_config import get_custom_openapi_schema
 
 app = FastAPI(
     title="Pivota Infra Dashboard", 
-    version="0.2",
+    version="0.2.1-fixed",  # Updated to verify Railway deployment
     description="Pivota Infrastructure API with comprehensive payment processing and agent SDK support",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -451,8 +454,7 @@ app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 # payment_routes_router is same as payment_router, already included above
 app.include_router(demo_data_router)  # Demo data management
-# [REMOVED] test_data_router - File not tracked in Git (causes ModuleNotFoundError)
-# app.include_router(test_data_router)
+# [DELETED] test_data_router router registration removed (file not in Git)
 app.include_router(simple_ws_router)  # Simple WebSocket
 # agent_metrics_router already included above on line 195
 
@@ -956,7 +958,7 @@ async def root():
     
     return {
         "message": "Pivota Infrastructure Dashboard API",
-        "version": "0.2",
+        "version": "0.2.1-fixed",  # test_data_routes removed
         "status": "healthy",
         "db_status": db_status,
         "timestamp": time.time(),
