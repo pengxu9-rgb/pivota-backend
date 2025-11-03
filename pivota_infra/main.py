@@ -148,6 +148,7 @@ from routes.agent_protocol_test import router as agent_protocol_test_router
 from routes.routing_governance import router as routing_governance_router
 from routes.admin_run_migration_011 import router as admin_run_migration_011_router
 from routes.admin_seed_routing_logs import router as admin_seed_routing_logs_router
+from routes.admin_cleanup_routing_test_data import router as admin_cleanup_routing_router
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -327,6 +328,7 @@ app.include_router(employee_routing_dashboard_router)  # Employee PSP routing da
 app.include_router(routing_governance_router)  # Routing policy management
 app.include_router(admin_run_migration_011_router)  # Run migration 011 - Phase 4++ Dual Routing
 app.include_router(admin_seed_routing_logs_router)  # Seed test routing logs
+app.include_router(admin_cleanup_routing_router)  # Cleanup routing test data
 
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
