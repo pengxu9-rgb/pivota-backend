@@ -504,8 +504,10 @@ async def get_admin_test_token():
     ⚠️ FOR DEVELOPMENT ONLY - Remove in production!
     """
     payload = {
-        "user_id": "superadmin@pivota.com",  # Changed from "sub" to "user_id"
-        "role": "admin",
+        "sub": "superadmin@pivota.com",  # Required by get_current_user
+        "user_id": "superadmin@pivota.com",  # For backward compatibility
+        "email": "superadmin@pivota.com",  # Required by get_current_user
+        "role": "admin",  # Required by get_current_user
         "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
         "iat": datetime.utcnow()
     }
