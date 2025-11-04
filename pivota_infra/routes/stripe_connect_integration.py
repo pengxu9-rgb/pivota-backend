@@ -120,8 +120,8 @@ async def create_stripe_connect_account(
             await _save_stripe_account_id(agent_id, account_id)
         
         # Create account link for onboarding
-        refresh_url = request.refresh_url or "https://agents.pivota.cc/settings/payout"
-        return_url = request.return_url or "https://agents.pivota.cc/settings/payout/success"
+        refresh_url = request.refresh_url or "https://agents.pivota.cc/payout"
+        return_url = request.return_url or "https://agents.pivota.cc/payout/success"
         
         account_link = stripe.AccountLink.create(
             account=account_id,
