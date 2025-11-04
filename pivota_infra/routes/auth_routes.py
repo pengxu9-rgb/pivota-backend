@@ -504,10 +504,10 @@ async def get_admin_test_token():
     ⚠️ FOR DEVELOPMENT ONLY - Remove in production!
     """
     payload = {
-        "sub": "superadmin@pivota.com",  # Required by get_current_user
-        "user_id": "superadmin@pivota.com",  # For backward compatibility
-        "email": "superadmin@pivota.com",  # Required by get_current_user
-        "role": "admin",  # Required by get_current_user
+        "sub": "admin_superuser",  # Unique admin ID (JWT standard)
+        "user_id": "admin_superuser",  # Admin user ID
+        "email": "superadmin@pivota.com",  # Admin email
+        "role": "admin",  # Admin role
         "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
         "iat": datetime.utcnow()
     }
@@ -518,7 +518,7 @@ async def get_admin_test_token():
         "status": "success",
         "token": token,
         "expires_in": f"{JWT_EXPIRATION_HOURS} hours",
-        "user": "superadmin@pivota.com",
+        "user": "admin_superuser",
         "role": "admin",
         "note": "⚠️ This is a test endpoint. Remove in production!"
     }
