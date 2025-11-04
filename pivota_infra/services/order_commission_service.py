@@ -251,3 +251,4 @@ async def process_order_commission(order_id: str, database: Database) -> Dict[st
     service = OrderCommissionService(database)
     return await service.calculate_commission_for_order(order_id)
 
+
