@@ -3,7 +3,7 @@ Stripe Connect Integration for Agent Payouts
 Handles onboarding, verification, and payout execution
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Request
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, Response
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -17,6 +17,20 @@ router = APIRouter(
     prefix="/stripe-connect",
     tags=["Stripe Connect"]
 )
+
+# Add CORS headers to all responses
+@router.options("/onboard")
+async def onboard_options():
+    """Handle OPTIONS preflight for Stripe Connect onboard"""
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Max-Age": "3600"
+        }
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +73,7 @@ class ConnectStatusResponse(BaseModel):
 @router.post("/onboard")
 async def create_stripe_connect_account(
     request: ConnectOnboardingRequest,
+    response: Response,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -66,6 +81,10 @@ async def create_stripe_connect_account(
     
     Agent initiates this from their payout settings page
     """
+    # Explicitly set CORS headers (in addition to middleware)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    
     if not stripe:
         raise HTTPException(status_code=503, detail="Stripe integration not available")
     
