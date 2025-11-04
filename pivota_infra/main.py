@@ -90,6 +90,7 @@ from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
 from routes.admin_usage_debug import router as admin_usage_debug_router
 from routes.agent_analytics import router as agent_analytics_router
+from routes.admin_settlement_batch import router as admin_settlement_batch_router  # Phase 6 - Settlement Batch Processing
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -405,6 +406,7 @@ app.include_router(admin_agents_debug_router)  # Admin agents debug
 app.include_router(agent_health_router)  # Agent health check
 app.include_router(admin_usage_debug_router)  # Admin usage logs debug
 app.include_router(agent_analytics_router)  # Agent analytics (funnel, queries)
+app.include_router(admin_settlement_batch_router)  # Phase 6 - Settlement batch processing
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints

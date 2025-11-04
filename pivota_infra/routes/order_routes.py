@@ -582,6 +582,27 @@ async def confirm_payment(
             
             background_tasks.add_task(create_shopify_order_task)
             
+            # 后台任务：计算订单佣金（Phase 6 - Commission Automation）
+            async def calculate_commission_task():
+                """自动计算订单佣金并记录"""
+                try:
+                    from services.order_commission_service import process_order_commission
+                    logger.info(f"Calculating commission for order {payment_request.order_id}")
+                    result = await process_order_commission(payment_request.order_id, database)
+                    if result.get("status") == "success":
+                        logger.info(
+                            f"Commission calculated: ${result.get('commission_amount', 0):.2f} "
+                            f"at {result.get('commission_rate', 0) * 100}%"
+                        )
+                    elif result.get("status") == "skipped":
+                        logger.info(f"Commission skipped: {result.get('reason')}")
+                    else:
+                        logger.error(f"Commission calculation failed: {result.get('message')}")
+                except Exception as e:
+                    logger.error(f"Error in commission calculation task: {e}")
+            
+            background_tasks.add_task(calculate_commission_task)
+            
             return {
                 "status": "success",
                 "message": "Payment confirmed successfully",
