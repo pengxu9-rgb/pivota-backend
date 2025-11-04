@@ -498,7 +498,7 @@ async def get_agents_pending_verification(
         raise HTTPException(status_code=500, detail="Failed to get pending verifications")
 
 
-@router.post("/{agent_id}/admin/verify", tags=["Admin - Payout Management"])
+@router.post("/admin/verify", tags=["Admin - Payout Management"])
 async def verify_agent_payout_settings(
     agent_id: str,
     approved: bool = True,
