@@ -78,12 +78,10 @@ async def create_and_complete_test_order(
                 order_id,
                 merchant_id,
                 agent_id,
-                amount,
+                total,
                 currency,
                 status,
                 payment_status,
-                description,
-                customer_email,
                 created_at
             ) VALUES (
                 :order_id,
@@ -92,9 +90,7 @@ async def create_and_complete_test_order(
                 :amount,
                 'USD',
                 'confirmed',
-                'completed',
-                :description,
-                'test@customer.com',
+                'paid',
                 NOW()
             )
             """,
@@ -102,8 +98,7 @@ async def create_and_complete_test_order(
                 "order_id": order_id,
                 "merchant_id": merchant_id,
                 "agent_id": agent_id,
-                "amount": request.amount,
-                "description": request.description
+                "amount": request.amount
             }
         )
         
