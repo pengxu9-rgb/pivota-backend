@@ -55,10 +55,9 @@ async def sync_wix_products(
         # Simulate Wix API call to sync products
         # In production, this would use actual Wix API
         try:
-            # Simulate API call
-            product_count = 15  # Simulated product count
-            
-            # Update store with synced product count
+            # Simulate API call - until full integration, keep existing product count
+            existing_count = store.get("product_count") or 0
+
             update_query = """
                 UPDATE merchant_stores
                 SET product_count = :product_count,
@@ -66,19 +65,19 @@ async def sync_wix_products(
                     status = 'active'
                 WHERE store_id = :store_id
             """
-            
+
             await database.execute(update_query, {
-                "product_count": product_count,
+                "product_count": existing_count,
                 "last_sync": datetime.now(),
                 "store_id": store["store_id"]
             })
-            
+
             return {
                 "status": "success",
-                "message": f"Successfully synced {product_count} products from Wix",
+                "message": f"Wix store sync completed. Product count remains {existing_count} until live API data is available.",
                 "store_id": store["store_id"],
                 "store_name": store["name"],
-                "product_count": product_count,
+                "product_count": existing_count,
                 "synced_at": datetime.now().isoformat()
             }
         except Exception as api_error:

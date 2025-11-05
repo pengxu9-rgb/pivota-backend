@@ -169,7 +169,7 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
         # 1. Check if store is actually connected
         store_check = await database.fetch_one(
             """
-            SELECT store_id, platform, domain, status 
+            SELECT store_id, platform, domain, status, product_count 
             FROM merchant_stores 
             WHERE merchant_id = :merchant_id AND platform = 'shopify'
             LIMIT 1
@@ -197,21 +197,31 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
             "SELECT COUNT(*) as count FROM products WHERE merchant_id = :merchant_id",
             {"merchant_id": merchant_id}
         )
-        product_count = product_count_result["count"] if product_count_result else 0
-        
-        # 4. Update merchant_stores with actual count and last sync time
-        update_result = await database.execute(
-            "UPDATE merchant_stores SET product_count = :count, last_sync = NOW() WHERE merchant_id = :merchant_id AND platform = 'shopify'",
-            {"count": product_count, "merchant_id": merchant_id}
-        )
-        
-        print(f"✅ Synced {product_count} products for merchant {merchant_id}")
-        
+        calculated_count = product_count_result["count"] if product_count_result else 0
+
+        # Prefer calculated count when we have real data (>0). Otherwise preserve existing value.
+        existing_count = store_check.get("product_count") if store_check else 0
+        final_count = calculated_count if calculated_count > 0 else (existing_count or 0)
+
+        if calculated_count > 0:
+            await database.execute(
+                "UPDATE merchant_stores SET product_count = :count, last_sync = NOW() WHERE merchant_id = :merchant_id AND platform = 'shopify'",
+                {"count": final_count, "merchant_id": merchant_id}
+            )
+        else:
+            # No reliable product data - only update last_sync timestamp
+            await database.execute(
+                "UPDATE merchant_stores SET last_sync = NOW() WHERE merchant_id = :merchant_id AND platform = 'shopify'",
+                {"merchant_id": merchant_id}
+            )
+
+        print(f"✅ Synced Shopify products for merchant {merchant_id} (count preserved: {final_count})")
+
         return {
             "status": "success",
-            "message": f"Products synced: {product_count} products from {store_check['domain']}",
+            "message": f"Products synced for {store_check['domain']}. Current count: {final_count}",
             "data": {
-                "product_count": product_count,
+                "product_count": final_count,
                 "store_domain": store_check['domain'],
                 "synced_at": datetime.now().isoformat()
             }
