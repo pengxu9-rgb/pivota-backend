@@ -109,6 +109,7 @@ class RevenueShareService:
             logger.error(f"[Phase 5.5] Commission matching failed: {e}")
             # Return platform default on error
             return {
+                'actual_rate': float(self.platform_default),
                 'actual_commission_rate': float(self.platform_default),
                 'match_status': 'fallback_platform',
                 'match_source': 'platform_default',
@@ -236,6 +237,7 @@ class RevenueShareService:
             if offered_rate >= expected_rate:
                 # Perfect match!
                 return {
+                    'actual_rate': float(offered_rate),
                     'actual_commission_rate': float(offered_rate),
                     'match_status': 'perfect_match',
                     'match_source': 'merchant_offer',
@@ -247,6 +249,7 @@ class RevenueShareService:
             elif offered_rate >= min_rate:
                 # Acceptable match (below expected but above minimum)
                 return {
+                    'actual_rate': float(offered_rate),
                     'actual_commission_rate': float(offered_rate),
                     'match_status': 'merchant_offer_accepted',
                     'match_source': 'merchant_offer',
@@ -259,6 +262,7 @@ class RevenueShareService:
                 # Below minimum - use platform default
                 platform_rate = PLATFORM_DEFAULT_COMMISSION.get(agent_type, self.platform_default)
                 return {
+                    'actual_rate': float(platform_rate),
                     'actual_commission_rate': float(platform_rate),
                     'match_status': 'agent_below_min',
                     'match_source': 'platform_default',
@@ -273,6 +277,7 @@ class RevenueShareService:
         elif merchant_offer:
             offered_rate = Decimal(str(merchant_offer['offered_commission_rate']))
             return {
+                'actual_rate': float(offered_rate),
                 'actual_commission_rate': float(offered_rate),
                 'match_status': 'merchant_offer_accepted',
                 'match_source': 'merchant_offer',
@@ -286,6 +291,7 @@ class RevenueShareService:
         elif agent_expectation:
             expected_rate = Decimal(str(agent_expectation.get('expected_commission_rate', self.platform_default)))
             return {
+                'actual_rate': float(expected_rate),
                 'actual_commission_rate': float(expected_rate),
                 'match_status': 'fallback_platform',
                 'match_source': 'agent_expectation',
