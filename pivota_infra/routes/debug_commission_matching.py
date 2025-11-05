@@ -150,6 +150,15 @@ async def test_offer_query(
             )
         }
 
+    except Exception as e:
+        logger.error(f"Error testing query: {e}", exc_info=True)
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
 
 @router.get("/service-match/{merchant_id}/{agent_id}/{amount}")
 async def service_match_test(
@@ -182,15 +191,6 @@ async def service_match_test(
 
     except Exception as e:
         logger.error(f"Error running service match test: {e}", exc_info=True)
-        import traceback
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-    
-    except Exception as e:
-        logger.error(f"Error testing query: {e}", exc_info=True)
         import traceback
         return {
             "success": False,

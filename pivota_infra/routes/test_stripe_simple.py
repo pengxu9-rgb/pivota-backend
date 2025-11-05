@@ -87,3 +87,4 @@ async def test_stripe_connect_simple(current_user: dict = Depends(get_current_us
             "traceback": traceback.format_exc()
         }
 
+

@@ -274,8 +274,8 @@ class OrderCommissionService:
             logger.info(f"✅ Revenue matching logged successfully for order {order_id}")
             
         except Exception as e:
-            logger.error(f"Error logging revenue matching: {e}")
-            raise
+            logger.error(f"❌ Error logging revenue matching: {e}", exc_info=True)
+            # Don't raise - commission is already recorded, this is just audit log
     
     async def _update_order_commission(
         self,
