@@ -52,11 +52,14 @@ async def sync_wix_products(
         if not store:
             raise HTTPException(status_code=404, detail="Wix store not found")
         
+        # Convert Row to dict
+        store_dict = dict(store)
+        
         # Simulate Wix API call to sync products
         # In production, this would use actual Wix API
         try:
             # Simulate API call - until full integration, keep existing product count
-            existing_count = store.get("product_count") or 0
+            existing_count = store_dict.get("product_count") or 0
 
             update_query = """
                 UPDATE merchant_stores
@@ -69,14 +72,14 @@ async def sync_wix_products(
             await database.execute(update_query, {
                 "product_count": existing_count,
                 "last_sync": datetime.now(),
-                "store_id": store["store_id"]
+                "store_id": store_dict["store_id"]
             })
-
+            
             return {
                 "status": "success",
                 "message": f"Wix store sync completed. Product count remains {existing_count} until live API data is available.",
-                "store_id": store["store_id"],
-                "store_name": store["name"],
+                "store_id": store_dict["store_id"],
+                "store_name": store_dict["name"],
                 "product_count": existing_count,
                 "synced_at": datetime.now().isoformat()
             }

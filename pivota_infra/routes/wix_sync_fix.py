@@ -63,17 +63,20 @@ async def sync_wix_products_fixed(
                 "demo_mode": True
             }
         
+        # Convert Row to dict
+        store_dict = dict(store)
+        
         # Check if store has valid credentials
-        if not store.get("api_key") or not store.get("domain"):
-            logger.warning(f"Wix store missing credentials: api_key={bool(store.get('api_key'))}, domain={bool(store.get('domain'))}")
+        if not store_dict.get("api_key") or not store_dict.get("domain"):
+            logger.warning(f"Wix store missing credentials: api_key={bool(store_dict.get('api_key'))}, domain={bool(store_dict.get('domain'))}")
             
             # Update store without altering existing product count
-            current_count = store.get("product_count") or 0
+            current_count = store_dict.get("product_count") or 0
             await database.execute(
                 """UPDATE merchant_stores 
                    SET product_count = :product_count, last_sync = :last_sync, status = 'active'
                    WHERE store_id = :store_id""",
-                {"product_count": current_count, "last_sync": datetime.now(), "store_id": store["store_id"]}
+                {"product_count": current_count, "last_sync": datetime.now(), "store_id": store_dict["store_id"]}
             )
             
             return {
@@ -90,8 +93,8 @@ async def sync_wix_products_fixed(
         try:
             url = "https://www.wixapis.com/stores/v1/products/query"
             headers = {
-                "Authorization": store["api_key"],
-                "wix-site-id": store["domain"],
+                "Authorization": store_dict["api_key"],
+                "wix-site-id": store_dict["domain"],
                 "Content-Type": "application/json"
             }
             
@@ -109,7 +112,7 @@ async def sync_wix_products_fixed(
                         """UPDATE merchant_stores 
                            SET product_count = :count, last_sync = :last_sync, status = 'active'
                            WHERE store_id = :store_id""",
-                        {"count": len(products), "last_sync": datetime.now(), "store_id": store["store_id"]}
+                        {"count": len(products), "last_sync": datetime.now(), "store_id": store_dict["store_id"]}
                     )
                     
                     # Cache products for agent access

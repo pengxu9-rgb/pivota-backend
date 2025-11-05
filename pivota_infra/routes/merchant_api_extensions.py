@@ -167,7 +167,7 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
     
     try:
         # 1. Check if store is actually connected
-        store_check = await database.fetch_one(
+        store_check_row = await database.fetch_one(
             """
             SELECT store_id, platform, domain, status, product_count 
             FROM merchant_stores 
@@ -177,11 +177,14 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
             {"merchant_id": merchant_id}
         )
         
-        if not store_check:
+        if not store_check_row:
             raise HTTPException(
                 status_code=400, 
                 detail="No Shopify store connected. Please connect your store first in Integrations."
             )
+        
+        # Convert Row to dict
+        store_check = dict(store_check_row)
         
         if store_check["status"] != "active":
             raise HTTPException(
@@ -200,8 +203,8 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
         calculated_count = product_count_result["count"] if product_count_result else 0
 
         # Prefer calculated count when we have real data (>0). Otherwise preserve existing value.
-        existing_count = store_check.get("product_count") if store_check else 0
-        final_count = calculated_count if calculated_count > 0 else (existing_count or 0)
+        existing_count = store_check.get("product_count") or 0
+        final_count = calculated_count if calculated_count > 0 else existing_count
 
         if calculated_count > 0:
             await database.execute(
