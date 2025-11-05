@@ -50,10 +50,10 @@ async def create_and_complete_test_order(
         if request.merchant_id:
             merchant_id = request.merchant_id
         else:
-            # Get first merchant
-            merchant = await database.fetch_one("SELECT id FROM merchants LIMIT 1")
+            # Get first merchant from merchant_onboarding (where foreign key points)
+            merchant = await database.fetch_one("SELECT id FROM merchant_onboarding LIMIT 1")
             if not merchant:
-                return {"success": False, "error": "No merchants found"}
+                return {"success": False, "error": "No merchants found in merchant_onboarding"}
             merchant_id = merchant['id']
         
         logger.info(f"Using merchant: {merchant_id}")
