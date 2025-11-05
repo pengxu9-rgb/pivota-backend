@@ -142,20 +142,6 @@ class RevenueShareService:
         
         logger.info(f"[get_merchant_offer] Searching for: merchant={merchant_id}, agent_type={agent_type}, amount={amount}, currency={currency}")
         
-        # DIAGNOSTIC: Hardcode for testing - if this works, we know the query is the problem
-        if merchant_id == 'merch_208139f7600dbf42' and agent_type in ['standard', None] and amount >= 50:
-            logger.info(f"[get_merchant_offer] 🔧 DIAGNOSTIC: Returning hardcoded 2.5% for testing")
-            return {
-                'id': 999,
-                'merchant_id': merchant_id,
-                'agent_type': None,
-                'offered_commission_rate': Decimal('0.025'),
-                'min_order_amount': Decimal('50'),
-                'max_order_amount': None,
-                'currency': 'USD',
-                'is_active': True
-            }
-        
         # Try agent-type specific offer first
         offer = await self.database.fetch_one(
             """
