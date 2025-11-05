@@ -79,7 +79,15 @@ class OrderCommissionService:
             commission_rate = match_result.get('actual_rate', Decimal('0'))
             commission_amount = order_amount * commission_rate
             
-            # 3. Log revenue matching
+            # 3. Record commission to commissions table
+            await self._record_commission(
+                order_id=order_id,
+                order=order,
+                commission_rate=commission_rate,
+                commission_amount=commission_amount
+            )
+            
+            # 4. Log revenue matching
             await self._log_revenue_matching(
                 order_id=order_id,
                 order=order,
@@ -87,7 +95,7 @@ class OrderCommissionService:
                 commission_amount=commission_amount
             )
             
-            # 4. Update order with commission details
+            # 5. Update order with commission details
             await self._update_order_commission(
                 order_id=order_id,
                 commission_rate=commission_rate,
@@ -147,6 +155,58 @@ class OrderCommissionService:
             logger.error(f"Error checking existing commission: {e}")
             return False
     
+    async def _record_commission(
+        self,
+        order_id: str,
+        order: Dict[str, Any],
+        commission_rate: Decimal,
+        commission_amount: Decimal
+    ):
+        """Record commission to commissions table"""
+        try:
+            import uuid
+            
+            # Record agent commission
+            await self.database.execute(
+                """
+                INSERT INTO commissions (
+                    commission_id,
+                    order_id,
+                    merchant_id,
+                    agent_id,
+                    type,
+                    amount,
+                    rate,
+                    matched,
+                    created_at
+                ) VALUES (
+                    :commission_id,
+                    :order_id,
+                    :merchant_id,
+                    :agent_id,
+                    'agent',
+                    :amount,
+                    :rate,
+                    true,
+                    NOW()
+                )
+                """,
+                {
+                    "commission_id": f"COMM_{uuid.uuid4().hex[:12].upper()}",
+                    "order_id": order_id,
+                    "merchant_id": order['merchant_id'],
+                    "agent_id": order['agent_id'],
+                    "amount": float(commission_amount),
+                    "rate": float(commission_rate)
+                }
+            )
+            
+            logger.info(f"Commission record created for order {order_id}: ${commission_amount}")
+            
+        except Exception as e:
+            logger.error(f"Error recording commission: {e}")
+            raise
+    
     async def _log_revenue_matching(
         self,
         order_id: str,
@@ -156,52 +216,53 @@ class OrderCommissionService:
     ):
         """Log revenue matching to database"""
         try:
-            # Insert into revenue_matching_logs
+            # Insert into revenue_matching_logs (match Migration 014 schema)
             query = """
                 INSERT INTO revenue_matching_logs (
+                    order_id,
                     agent_id,
                     merchant_id,
-                    order_id,
-                    order_amount,
-                    currency,
-                    final_rate,
-                    agent_commission,
-                    match_type,
+                    merchant_offered_rate,
+                    agent_expected_rate,
+                    agent_minimum_rate,
+                    actual_commission_rate,
+                    match_status,
                     match_source,
-                    merchant_offer_id,
-                    agent_expectation_id,
-                    notes,
-                    created_at
+                    platform_default_used,
+                    metadata,
+                    matched_at
                 ) VALUES (
+                    :order_id,
                     :agent_id,
                     :merchant_id,
-                    :order_id,
-                    :order_amount,
-                    :currency,
-                    :final_rate,
-                    :agent_commission,
-                    :match_type,
+                    :merchant_offered,
+                    :agent_expected,
+                    :agent_minimum,
+                    :actual_rate,
+                    :match_status,
                     :match_source,
-                    :merchant_offer_id,
-                    :agent_expectation_id,
-                    :notes,
+                    :platform_default,
+                    :metadata,
                     NOW()
                 )
             """
             
             await self.database.execute(query, {
+                "order_id": order_id,
                 "agent_id": order['agent_id'],
                 "merchant_id": order['merchant_id'],
-                "order_id": order_id,
-                "order_amount": float(order.get('total', 0)),
-                "currency": order.get('currency', 'USD'),
-                "final_rate": float(match_result.get('actual_rate', 0)),
-                "agent_commission": float(commission_amount),
-                "match_type": match_result.get('match_type', 'platform_default'),
-                "match_source": match_result.get('match_source', 'system'),
-                "merchant_offer_id": match_result.get('merchant_offer_id'),
-                "agent_expectation_id": match_result.get('agent_expectation_id'),
-                "notes": f"Auto-calculated on order completion: {match_result.get('match_type')}"
+                "merchant_offered": match_result.get('merchant_offered_rate'),
+                "agent_expected": match_result.get('agent_expected_rate'),
+                "agent_minimum": match_result.get('agent_minimum_rate'),
+                "actual_rate": float(match_result.get('actual_rate', 0)),
+                "match_status": match_result.get('match_status', 'no_rules'),
+                "match_source": match_result.get('match_source', 'platform_default'),
+                "platform_default": match_result.get('platform_default_used', False),
+                "metadata": {
+                    "order_amount": float(order.get('total', 0)),
+                    "currency": order.get('currency', 'USD'),
+                    "commission_amount": float(commission_amount)
+                }
             })
             
             logger.info(f"Revenue matching logged for order {order_id}")
