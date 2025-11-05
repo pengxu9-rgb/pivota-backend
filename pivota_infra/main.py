@@ -95,6 +95,7 @@ from routes.stripe_connect_integration import router as stripe_connect_router  #
 from routes.agent_payout_management import router as agent_payout_router  # Phase 6.1 - Agent Payout Settings
 from routes.debug_stripe_connect import router as debug_stripe_connect_router  # Debug Stripe Connect
 from routes.test_stripe_simple import router as test_stripe_simple_router  # Test Stripe Simple
+from routes.test_commission_flow import router as test_commission_flow_router  # Test Commission Flow
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -417,6 +418,7 @@ app.include_router(stripe_connect_router)  # Phase 6.1 - Stripe Connect integrat
 app.include_router(agent_payout_router)  # Phase 6.1 - Agent payout management
 app.include_router(debug_stripe_connect_router)  # Debug Stripe Connect
 app.include_router(test_stripe_simple_router)  # Test Stripe Simple
+app.include_router(test_commission_flow_router)  # Test Commission Flow
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
