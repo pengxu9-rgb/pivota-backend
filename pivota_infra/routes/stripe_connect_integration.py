@@ -85,13 +85,19 @@ async def create_stripe_connect_account(
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     
+    logger.info(f"Stripe Connect onboard request for agent: {request.agent_id}")
+    logger.info(f"Stripe module available: {stripe is not None}")
+    logger.info(f"Current user: {current_user}")
+    
     if not stripe:
-        raise HTTPException(status_code=503, detail="Stripe integration not available")
+        logger.error("Stripe SDK not available")
+        raise HTTPException(status_code=503, detail="Stripe SDK not installed or configured")
     
     agent_id = request.agent_id
     
     # Auth check - agent can only create for themselves
     if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
+        logger.error(f"Auth failed: user agent_id={current_user.get('agent_id')}, requested agent_id={agent_id}")
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     try:
@@ -176,7 +182,7 @@ async def get_stripe_connect_status(
         raise HTTPException(status_code=503, detail="Stripe integration not available")
     
     # Auth check
-    if current_user.get("role") != "admin" and current_user.get("user_id") != agent_id:
+    if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     try:
@@ -268,7 +274,7 @@ async def disconnect_stripe_account(
     **Agent or Admin only**
     """
     # Auth check
-    if current_user.get("role") != "admin" and current_user.get("user_id") != agent_id:
+    if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     try:
