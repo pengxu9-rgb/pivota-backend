@@ -68,7 +68,21 @@ class RevenueShareService:
                 "SELECT agent_type FROM agents WHERE agent_id = :agent_id",
                 {"agent_id": agent_id}
             )
-            agent_type = agent.get('agent_type', 'standard') if agent else 'standard'
+            logger.info(f"[Revenue Match] Agent query result: {agent}, type: {type(agent)}")
+            
+            if agent:
+                try:
+                    # Try to convert to dict if it's a Row object
+                    agent_dict = dict(agent) if agent else {}
+                    agent_type = agent_dict.get('agent_type', 'standard')
+                    logger.info(f"[Revenue Match] Agent dict: {agent_dict}")
+                except Exception as e:
+                    logger.error(f"[Revenue Match] Error converting agent to dict: {e}")
+                    agent_type = 'standard'
+            else:
+                logger.warning(f"[Revenue Match] Agent {agent_id} not found in database")
+                agent_type = 'standard'
+            
             logger.info(f"[Revenue Match] Agent type: {agent_type}")
             
             # Step 1: Get merchant's commission offer
