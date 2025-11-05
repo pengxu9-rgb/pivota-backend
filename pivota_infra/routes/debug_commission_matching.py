@@ -5,6 +5,7 @@ Debug endpoint for commission matching
 from fastapi import APIRouter, Depends
 from utils.auth import require_admin
 from db.database import database
+from services.revenue_share_service import RevenueShareService
 import logging
 
 router = APIRouter(
@@ -13,6 +14,8 @@ router = APIRouter(
 )
 
 logger = logging.getLogger(__name__)
+
+revenue_service = RevenueShareService(database)
 
 
 @router.get("/merchant-offers/{merchant_id}")
@@ -145,6 +148,45 @@ async def test_offer_query(
             "recommended_rate": float(specific_offer['offered_commission_rate']) if specific_offer else (
                 float(general_offer['offered_commission_rate']) if general_offer else 0.015
             )
+        }
+
+
+@router.get("/service-match/{merchant_id}/{agent_id}/{amount}")
+async def service_match_test(
+    merchant_id: str,
+    agent_id: str,
+    amount: float,
+    currency: str = "USD",
+    current_user: dict = Depends(require_admin)
+):
+    """使用实际 RevenueShareService 流程测试匹配结果"""
+
+    try:
+        from decimal import Decimal
+
+        match_result = await revenue_service.match_commission(
+            agent_id=agent_id,
+            merchant_id=merchant_id,
+            order_amount=Decimal(str(amount)),
+            currency=currency
+        )
+
+        return {
+            "success": True,
+            "merchant_id": merchant_id,
+            "agent_id": agent_id,
+            "amount": amount,
+            "currency": currency,
+            "match_result": match_result
+        }
+
+    except Exception as e:
+        logger.error(f"Error running service match test: {e}", exc_info=True)
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
         }
     
     except Exception as e:
