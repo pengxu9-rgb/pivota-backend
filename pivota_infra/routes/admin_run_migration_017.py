@@ -16,9 +16,17 @@ router = APIRouter(
 
 logger = logging.getLogger(__name__)
 
-@router.post("/017-agent-payout")
+@router.post("/run/017")
 async def run_migration_017(current_user: dict = Depends(require_admin)):
-    """Run migration 017 to create agent payout tables"""
+    """
+    Run migration 017 to create agent payout tables for Phase 6.1
+    
+    Creates:
+    - agent_payout_settings: Comprehensive agent payout information
+    - payout_transactions: Track individual payout executions
+    - payout_method_availability: Track which methods are available per country
+    - agent_payout_history: Audit log of all payout attempts
+    """
     
     try:
         # Read migration file
