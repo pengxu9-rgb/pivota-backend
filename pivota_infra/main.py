@@ -94,6 +94,7 @@ from routes.admin_settlement_batch import router as admin_settlement_batch_route
 from routes.stripe_connect_integration import router as stripe_connect_router  # Phase 6.1 - Stripe Connect Payouts
 from routes.agent_payout_management import router as agent_payout_router  # Phase 6.1 - Agent Payout Settings
 from routes.debug_stripe_connect import router as debug_stripe_connect_router  # Debug Stripe Connect
+from routes.test_stripe_simple import router as test_stripe_simple_router  # Test Stripe Simple
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -415,6 +416,7 @@ app.include_router(admin_settlement_batch_router)  # Phase 6 - Settlement batch 
 app.include_router(stripe_connect_router)  # Phase 6.1 - Stripe Connect integration
 app.include_router(agent_payout_router)  # Phase 6.1 - Agent payout management
 app.include_router(debug_stripe_connect_router)  # Debug Stripe Connect
+app.include_router(test_stripe_simple_router)  # Test Stripe Simple
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
