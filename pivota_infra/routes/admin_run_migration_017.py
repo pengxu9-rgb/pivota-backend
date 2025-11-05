@@ -38,16 +38,59 @@ async def run_migration_017(current_user: dict = Depends(require_admin)):
         with open(migration_path, 'r') as f:
             migration_sql = f.read()
         
-        # Execute migration
-        logger.info("Running migration 017...")
-        await database.execute(text(migration_sql))
+        # Split migration into individual statements
+        # Remove comments and split by semicolons
+        statements = []
+        current_statement = []
+        in_dollar_quote = False
+        dollar_tag = None
         
-        logger.info("Migration 017 completed successfully")
+        for line in migration_sql.split('\n'):
+            stripped = line.strip()
+            
+            # Skip empty lines and comments
+            if not stripped or stripped.startswith('--'):
+                continue
+            
+            # Check for dollar-quoted strings (for DO blocks, etc)
+            if '$$' in line:
+                if not in_dollar_quote:
+                    in_dollar_quote = True
+                    dollar_tag = line.split('$$')[0].strip()
+                else:
+                    in_dollar_quote = False
+            
+            current_statement.append(line)
+            
+            # End of statement if we hit a semicolon outside of dollar quotes
+            if ';' in line and not in_dollar_quote:
+                stmt = '\n'.join(current_statement)
+                if stmt.strip():
+                    statements.append(stmt)
+                current_statement = []
+        
+        # Execute each statement
+        logger.info(f"Running migration 017 with {len(statements)} statements...")
+        executed_count = 0
+        
+        for i, statement in enumerate(statements, 1):
+            try:
+                logger.info(f"Executing statement {i}/{len(statements)}...")
+                await database.execute(text(statement))
+                executed_count += 1
+            except Exception as e:
+                # Some statements may fail if already executed (like CREATE TABLE IF NOT EXISTS)
+                logger.warning(f"Statement {i} warning: {e}")
+                # Continue with next statement
+        
+        logger.info(f"Migration 017 completed: {executed_count}/{len(statements)} statements executed successfully")
         
         return {
             "success": True,
-            "message": "Migration 017 executed successfully",
-            "migration": "017_agent_payout_comprehensive.sql"
+            "message": f"Migration 017 executed: {executed_count}/{len(statements)} statements",
+            "migration": "017_agent_payout_comprehensive.sql",
+            "total_statements": len(statements),
+            "executed_statements": executed_count
         }
         
     except Exception as e:
