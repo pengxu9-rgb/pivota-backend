@@ -69,6 +69,7 @@ class RevenueShareService:
                 {"agent_id": agent_id}
             )
             agent_type = agent.get('agent_type', 'standard') if agent else 'standard'
+            logger.info(f"[Revenue Match] Agent type: {agent_type}")
             
             # Step 1: Get merchant's commission offer
             merchant_offer = await self.get_merchant_offer(
@@ -77,6 +78,9 @@ class RevenueShareService:
                 amount=order_amount,
                 currency=currency
             )
+            logger.info(f"[Revenue Match] Merchant offer found: {merchant_offer is not None}")
+            if merchant_offer:
+                logger.info(f"[Revenue Match] Merchant offers: {merchant_offer.get('offered_commission_rate')}")
             
             # Step 2: Get agent's revenue expectation
             agent_expectation = await self.get_agent_expectation(
@@ -84,6 +88,7 @@ class RevenueShareService:
                 merchant_id=merchant_id,
                 currency=currency
             )
+            logger.info(f"[Revenue Match] Agent expectation found: {agent_expectation is not None}")
             
             # Step 3: Calculate matched rate
             match_result = self.calculate_match(
@@ -294,7 +299,11 @@ class RevenueShareService:
         # Case 4: No rules - platform default
         else:
             platform_rate = PLATFORM_DEFAULT_COMMISSION.get(agent_type, self.platform_default)
+            logger.info(f"[Revenue Match] No rules found, using platform default for {agent_type}: {platform_rate}")
+            logger.info(f"[Revenue Match] PLATFORM_DEFAULT_COMMISSION: {PLATFORM_DEFAULT_COMMISSION}")
+            logger.info(f"[Revenue Match] self.platform_default: {self.platform_default}")
             return {
+                'actual_rate': float(platform_rate),
                 'actual_commission_rate': float(platform_rate),
                 'match_status': 'no_rules',
                 'match_source': 'platform_default',
