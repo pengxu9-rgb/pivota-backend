@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 class TestOrderRequest(BaseModel):
     amount: float = 150.00
-    merchant_email: str = "admin@pivota.cc"
-    agent_email: str = "superadmin@pivota.com"
+    merchant_id: Optional[str] = None  # If not provided, will use first active merchant
+    agent_id: Optional[str] = "agent_ee38f2b3645a2ec2"  # Default to our test agent
     description: Optional[str] = "Commission Flow Test Order"
 
 
@@ -46,35 +46,28 @@ async def create_and_complete_test_order(
     """
     
     try:
-        # Step 1: Find merchant
-        merchant = await database.fetch_one(
-            "SELECT id, email FROM merchants WHERE email = :email LIMIT 1",
-            {"email": request.merchant_email}
-        )
+        # Step 1: Get merchant ID
+        if request.merchant_id:
+            merchant_id = request.merchant_id
+        else:
+            # Get first merchant
+            merchant = await database.fetch_one("SELECT id FROM merchants LIMIT 1")
+            if not merchant:
+                return {"success": False, "error": "No merchants found"}
+            merchant_id = merchant['id']
         
-        if not merchant:
-            return {
-                "success": False,
-                "error": f"Merchant not found: {request.merchant_email}"
-            }
+        logger.info(f"Using merchant: {merchant_id}")
         
-        merchant_id = merchant['id']
-        logger.info(f"Found merchant: {merchant_id}")
+        # Step 2: Get agent ID
+        agent_id = request.agent_id
+        if not agent_id:
+            # Get first agent
+            agent = await database.fetch_one("SELECT agent_id FROM agents LIMIT 1")
+            if not agent:
+                return {"success": False, "error": "No agents found"}
+            agent_id = agent['agent_id']
         
-        # Step 2: Find agent
-        agent = await database.fetch_one(
-            "SELECT agent_id, email FROM agents WHERE email = :email LIMIT 1",
-            {"email": request.agent_email}
-        )
-        
-        if not agent:
-            return {
-                "success": False,
-                "error": f"Agent not found: {request.agent_email}"
-            }
-        
-        agent_id = agent['agent_id']
-        logger.info(f"Found agent: {agent_id}")
+        logger.info(f"Using agent: {agent_id}")
         
         # Step 3: Create order
         order_id = f"ORDER_{uuid.uuid4().hex[:12].upper()}"
