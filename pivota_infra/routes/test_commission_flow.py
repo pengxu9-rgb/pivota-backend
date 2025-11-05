@@ -119,8 +119,8 @@ async def create_and_complete_test_order(
         # Step 4: Trigger commission calculation (background task)
         async def calculate_commission_task():
             try:
-                commission_service = OrderCommissionService()
-                result = await commission_service.calculate_and_record_commission(order_id)
+                commission_service = OrderCommissionService(database)
+                result = await commission_service.calculate_commission_for_order(order_id)
                 logger.info(f"Commission calculation result: {result}")
             except Exception as e:
                 logger.error(f"Commission calculation failed: {e}", exc_info=True)
