@@ -76,7 +76,7 @@ class OrderCommissionService:
                 currency=currency
             )
             
-            commission_rate = match_result.get('actual_rate', Decimal('0'))
+            commission_rate = Decimal(str(match_result.get('actual_rate', 0)))
             commission_amount = order_amount * commission_rate
             
             # 3. Record commission to commissions table
