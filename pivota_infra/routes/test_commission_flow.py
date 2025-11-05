@@ -54,7 +54,7 @@ async def create_and_complete_test_order(
             merchant = await database.fetch_one("SELECT id FROM merchant_onboarding LIMIT 1")
             if not merchant:
                 return {"success": False, "error": "No merchants found in merchant_onboarding"}
-            merchant_id = merchant['id']
+            merchant_id = str(merchant['id'])  # Convert to string
         
         logger.info(f"Using merchant: {merchant_id}")
         
