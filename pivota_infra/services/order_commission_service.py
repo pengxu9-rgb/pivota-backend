@@ -247,6 +247,8 @@ class OrderCommissionService:
                 )
             """
             
+            import json
+            
             await self.database.execute(query, {
                 "order_id": order_id,
                 "agent_id": order['agent_id'],
@@ -258,11 +260,11 @@ class OrderCommissionService:
                 "match_status": match_result.get('match_status', 'no_rules'),
                 "match_source": match_result.get('match_source', 'platform_default'),
                 "platform_default": match_result.get('platform_default_used', False),
-                "metadata": {
+                "metadata": json.dumps({
                     "order_amount": float(order.get('total', 0)),
                     "currency": order.get('currency', 'USD'),
                     "commission_amount": float(commission_amount)
-                }
+                })
             })
             
             logger.info(f"Revenue matching logged for order {order_id}")
