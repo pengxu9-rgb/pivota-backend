@@ -73,7 +73,6 @@ class ConnectStatusResponse(BaseModel):
 @router.post("/onboard")
 async def create_stripe_connect_account(
     request: ConnectOnboardingRequest,
-    response: Response,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -82,9 +81,6 @@ async def create_stripe_connect_account(
     Agent initiates this from their payout settings page
     """
     try:
-        # Explicitly set CORS headers (in addition to middleware)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
         
         logger.info(f"=== Stripe Connect onboard request ===")
         logger.info(f"Agent ID: {request.agent_id}")
@@ -183,8 +179,18 @@ async def create_stripe_connect_account(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Outer exception in Stripe Connect onboard: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Critical error: {str(e)}")
+        import traceback
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "error_repr": repr(e),
+            "traceback": traceback.format_exc()
+        }
+        logger.error(f"Outer exception in Stripe Connect onboard: {error_details}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Critical error: {type(e).__name__}: {str(e) or repr(e)}"
+        )
 
 
 @router.get("/status/{agent_id}")
