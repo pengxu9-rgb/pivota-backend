@@ -249,6 +249,10 @@ class OrderCommissionService:
             
             import json
             
+            logger.info(f"[_log_revenue_matching] About to insert with match_result: {match_result}")
+            logger.info(f"[_log_revenue_matching] merchant_offered_rate = {match_result.get('merchant_offered_rate')}")
+            logger.info(f"[_log_revenue_matching] actual_rate = {match_result.get('actual_rate')}")
+            
             await self.database.execute(query, {
                 "order_id": order_id,
                 "agent_id": order['agent_id'],
@@ -267,7 +271,7 @@ class OrderCommissionService:
                 })
             })
             
-            logger.info(f"Revenue matching logged for order {order_id}")
+            logger.info(f"✅ Revenue matching logged successfully for order {order_id}")
             
         except Exception as e:
             logger.error(f"Error logging revenue matching: {e}")
