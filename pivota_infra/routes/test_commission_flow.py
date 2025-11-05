@@ -136,19 +136,19 @@ async def create_and_complete_test_order(
             {"order_id": order_id}
         )
         
-        # Check revenue match logs  
+        # Check revenue matching logs  
         revenue_logs = await database.fetch_all(
             """
             SELECT 
                 match_status,
-                merchant_commission,
-                agent_commission,
-                total_revenue,
-                variance,
-                created_at
-            FROM revenue_match_logs
+                actual_commission_rate,
+                match_source,
+                merchant_offered_rate,
+                agent_expected_rate,
+                matched_at
+            FROM revenue_matching_logs
             WHERE order_id = :order_id
-            ORDER BY created_at DESC
+            ORDER BY matched_at DESC
             LIMIT 1
             """,
             {"order_id": order_id}
@@ -160,10 +160,10 @@ async def create_and_complete_test_order(
             SELECT 
                 settlement_id,
                 agent_id,
-                total_commission,
+                settlement_amount,
                 status,
-                period_start,
-                period_end
+                settlement_period_start,
+                settlement_period_end
             FROM agent_settlements
             WHERE agent_id = :agent_id
             ORDER BY created_at DESC
