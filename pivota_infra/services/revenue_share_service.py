@@ -126,6 +126,8 @@ class RevenueShareService:
     ) -> Optional[Dict[str, Any]]:
         """Get merchant's commission offer for this agent/amount"""
         
+        logger.info(f"[get_merchant_offer] Searching for: merchant={merchant_id}, agent_type={agent_type}, amount={amount}, currency={currency}")
+        
         # Try agent-type specific offer first
         offer = await self.database.fetch_one(
             """
@@ -145,12 +147,15 @@ class RevenueShareService:
                 "merchant_id": merchant_id,
                 "agent_type": agent_type,
                 "currency": currency,
-                "amount": amount
+                "amount": float(amount)
             }
         )
         
         if offer:
+            logger.info(f"[get_merchant_offer] Found agent-type specific offer: {offer['offered_commission_rate']}")
             return dict(offer)
+        
+        logger.info(f"[get_merchant_offer] No agent-type specific offer, trying general offer (agent_type=NULL)")
         
         # Fall back to general offer (agent_type = NULL)
         offer = await self.database.fetch_one(
@@ -170,9 +175,14 @@ class RevenueShareService:
             {
                 "merchant_id": merchant_id,
                 "currency": currency,
-                "amount": amount
+                "amount": float(amount)
             }
         )
+        
+        if offer:
+            logger.info(f"[get_merchant_offer] Found general offer: {offer['offered_commission_rate']}")
+        else:
+            logger.warning(f"[get_merchant_offer] No offers found for merchant {merchant_id}")
         
         return dict(offer) if offer else None
     
