@@ -73,6 +73,7 @@ async def sync_wix_products(
             # Fallback to existing count if cache query fails
             real_count = store_dict.get("product_count") or 0
 
+        # Update merchant_stores with products_cache count
         update_query = """
             UPDATE merchant_stores
             SET product_count = (
@@ -99,13 +100,6 @@ async def sync_wix_products(
             "product_count": real_count,
             "synced_at": datetime.now().isoformat()
         }
-        except Exception as api_error:
-            # Log error but return graceful message
-            print(f"Wix API error: {api_error}")
-            raise HTTPException(
-                status_code=503,
-                detail="Failed to connect to Wix API. Please check your API credentials."
-            )
     
     except HTTPException:
         raise

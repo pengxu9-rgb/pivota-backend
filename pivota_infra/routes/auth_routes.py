@@ -179,7 +179,20 @@ async def signup(user_data: UserSignup):
 
 @router.post("/signin")
 async def signin(login_data: UserLogin):
-    """User signin (in-memory, with built-in demo accounts)."""
+    """
+    [DEPRECATED] User signin (in-memory, with built-in demo accounts).
+    
+    ⚠️ WARNING: This endpoint only supports hardcoded demo accounts.
+    For real merchant/agent accounts, use /api/auth/login instead.
+    
+    Demo accounts only:
+    - merchant@test.com
+    - employee@pivota.com  
+    - agent@test.com
+    - superadmin@pivota.com
+    
+    Real accounts should use: POST /api/auth/login
+    """
     try:
         demo_accounts = {
             "merchant@test.com": {"password": "Admin123!", "role": "merchant", "merchant_id": "merch_6b90dc9838d5fd9c"},
