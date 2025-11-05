@@ -81,93 +81,110 @@ async def create_stripe_connect_account(
     
     Agent initiates this from their payout settings page
     """
-    # Explicitly set CORS headers (in addition to middleware)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    
-    logger.info(f"Stripe Connect onboard request for agent: {request.agent_id}")
-    logger.info(f"Stripe module available: {stripe is not None}")
-    logger.info(f"Current user: {current_user}")
-    
-    if not stripe:
-        logger.error("Stripe SDK not available")
-        raise HTTPException(status_code=503, detail="Stripe SDK not installed or configured")
-    
-    agent_id = request.agent_id
-    
-    # Auth check - agent can only create for themselves
-    if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
-        logger.error(f"Auth failed: user agent_id={current_user.get('agent_id')}, requested agent_id={agent_id}")
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    
     try:
-        # Get agent details
-        agent = await database.fetch_one(
-            "SELECT email, name, company FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        )
+        # Explicitly set CORS headers (in addition to middleware)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
         
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
+        logger.info(f"=== Stripe Connect onboard request ===")
+        logger.info(f"Agent ID: {request.agent_id}")
+        logger.info(f"Stripe module available: {stripe is not None}")
+        logger.info(f"Current user: {current_user}")
         
-        # Check if agent already has Stripe account
-        existing = await database.fetch_one(
-            "SELECT stripe_account_id FROM agent_payout_settings WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        )
+        if not stripe:
+            logger.error("Stripe SDK not available")
+            raise HTTPException(status_code=503, detail="Stripe SDK not installed or configured")
         
-        if existing and existing['stripe_account_id']:
-            # Account exists, just create new onboarding link
-            account_id = existing['stripe_account_id']
-            logger.info(f"Using existing Stripe account for agent {agent_id}: {account_id}")
-        else:
-            # Create new Stripe Connect Express account
-            account = stripe.Account.create(
-                type="express",
-                email=agent['email'],
-                business_profile={
-                    "name": agent['company'] or agent['name'],
-                    "support_email": agent['email']
-                },
-                capabilities={
-                    "transfers": {"requested": True}
-                },
-                metadata={
-                    "agent_id": agent_id,
-                    "platform": "pivota"
-                }
+        agent_id = request.agent_id
+        
+        # Auth check - agent can only create for themselves
+        if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
+            logger.error(f"Auth failed: user agent_id={current_user.get('agent_id')}, requested agent_id={agent_id}")
+            raise HTTPException(status_code=403, detail="Unauthorized")
+        
+        try:
+            # Get agent details
+            logger.info(f"Fetching agent details for: {agent_id}")
+            agent = await database.fetch_one(
+                "SELECT email, name, company FROM agents WHERE agent_id = :agent_id",
+                {"agent_id": agent_id}
             )
             
-            account_id = account.id
-            logger.info(f"Created Stripe Connect account for agent {agent_id}: {account_id}")
+            if not agent:
+                logger.error(f"Agent not found: {agent_id}")
+                raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
             
-            # Save account ID to database
-            await _save_stripe_account_id(agent_id, account_id)
+            logger.info(f"Agent found: {agent['email']}")
+            
+            # Check if agent already has Stripe account
+            existing = await database.fetch_one(
+                "SELECT stripe_account_id FROM agent_payout_settings WHERE agent_id = :agent_id",
+                {"agent_id": agent_id}
+            )
+            
+            if existing and existing['stripe_account_id']:
+                # Account exists, just create new onboarding link
+                account_id = existing['stripe_account_id']
+                logger.info(f"Using existing Stripe account for agent {agent_id}: {account_id}")
+            else:
+                # Create new Stripe Connect Express account
+                logger.info(f"Creating new Stripe account for {agent['email']}")
+                account = stripe.Account.create(
+                    type="express",
+                    email=agent['email'],
+                    business_profile={
+                        "name": agent['company'] or agent['name'],
+                        "support_email": agent['email']
+                    },
+                    capabilities={
+                        "transfers": {"requested": True}
+                    },
+                    metadata={
+                        "agent_id": agent_id,
+                        "platform": "pivota"
+                    }
+                )
+                
+                account_id = account.id
+                logger.info(f"Created Stripe Connect account for agent {agent_id}: {account_id}")
+                
+                # Save account ID to database
+                await _save_stripe_account_id(agent_id, account_id)
+            
+            # Create account link for onboarding
+            refresh_url = request.refresh_url or "https://agents.pivota.cc/payout"
+            return_url = request.return_url or "https://agents.pivota.cc/payout/success"
+            
+            logger.info(f"Creating account link for {account_id}")
+            account_link = stripe.AccountLink.create(
+                account=account_id,
+                refresh_url=refresh_url,
+                return_url=return_url,
+                type="account_onboarding"
+            )
+            
+            logger.info(f"Successfully created onboarding link")
+            return {
+                "status": "success",
+                "account_id": account_id,
+                "onboarding_url": account_link.url,
+                "expires_at": datetime.fromtimestamp(account_link.expires_at).isoformat()
+            }
         
-        # Create account link for onboarding
-        refresh_url = request.refresh_url or "https://agents.pivota.cc/payout"
-        return_url = request.return_url or "https://agents.pivota.cc/payout/success"
-        
-        account_link = stripe.AccountLink.create(
-            account=account_id,
-            refresh_url=refresh_url,
-            return_url=return_url,
-            type="account_onboarding"
-        )
-        
-        return {
-            "status": "success",
-            "account_id": account_id,
-            "onboarding_url": account_link.url,
-            "expires_at": datetime.fromtimestamp(account_link.expires_at).isoformat()
-        }
+        except HTTPException:
+            raise
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe error creating account: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error creating Stripe Connect account: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
     
-    except stripe.error.StripeError as e:
-        logger.error(f"Stripe error creating account: {e}")
-        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error creating Stripe Connect account: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Outer exception in Stripe Connect onboard: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Critical error: {str(e)}")
 
 
 @router.get("/status/{agent_id}")
