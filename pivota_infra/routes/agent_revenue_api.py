@@ -224,17 +224,18 @@ async def get_agent_earnings(
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
+        # Query from commissions table (Phase 6 commission automation)
         summary = await database.fetch_one(
             """
             SELECT 
-                COALESCE(SUM(agent_earned_amount), 0) as total_earned,
-                COALESCE(SUM(agent_earned_amount) FILTER (WHERE settlement_status = 'settled'), 0) as settled,
-                COALESCE(SUM(agent_earned_amount) FILTER (WHERE settlement_status = 'pending'), 0) as pending,
+                COALESCE(SUM(amount), 0) as total_earned,
+                0 as settled,
+                COALESCE(SUM(amount), 0) as pending,
                 COUNT(*) as transactions,
-                AVG(split_ratio_applied) as avg_ratio
-            FROM agent_revenue_logs
+                AVG(rate) as avg_ratio
+            FROM commissions
             WHERE agent_id = :agent_id
-            AND currency = :currency
+            AND type = 'agent'
             AND created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
             """,
             {"agent_id": agent_id, "currency": currency, "days": days}
