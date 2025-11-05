@@ -94,7 +94,7 @@ async def save_payout_settings(
     **Agent can only update their own settings**
     """
     # Auth check - agent can only manage their own payout settings
-    if current_user.get("role") != "admin" and current_user.get("user_id") != agent_id:
+    if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
         raise HTTPException(status_code=403, detail="Cannot manage other agent's payout settings")
     
     try:
@@ -260,7 +260,7 @@ async def get_payout_settings(
     **Agent can only view their own settings**
     """
     # Auth check
-    if current_user.get("role") != "admin" and current_user.get("user_id") != agent_id:
+    if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
         raise HTTPException(status_code=403, detail="Cannot view other agent's payout settings")
     
     try:
@@ -424,7 +424,7 @@ async def verify_paypal_email(
     **Agent only**
     """
     # Auth check
-    if current_user.get("role") != "admin" and current_user.get("user_id") != agent_id:
+    if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     try:

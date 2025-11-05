@@ -91,7 +91,7 @@ async def create_stripe_connect_account(
     agent_id = request.agent_id
     
     # Auth check - agent can only create for themselves
-    if current_user.get("role") != "admin" and current_user.get("user_id") != agent_id:
+    if current_user.get("role") != "admin" and current_user.get("agent_id") != agent_id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     try:
