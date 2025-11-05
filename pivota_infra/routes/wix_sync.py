@@ -55,34 +55,50 @@ async def sync_wix_products(
         # Convert Row to dict
         store_dict = dict(store)
         
-        # Simulate Wix API call to sync products
-        # In production, this would use actual Wix API
+        # Get merchant_id for cache query
+        merchant_id = store_dict.get("merchant_id")
+        if not merchant_id:
+            raise HTTPException(status_code=400, detail="Merchant ID not found in store record")
+        
+        # Get real product count from products_cache
         try:
-            # Simulate API call - until full integration, keep existing product count
-            existing_count = store_dict.get("product_count") or 0
+            cache_count_result = await database.fetch_one(
+                """SELECT COUNT(*) as count FROM products_cache 
+                   WHERE merchant_id = :merchant_id AND platform = 'wix'
+                   AND (expires_at IS NULL OR expires_at > NOW())""",
+                {"merchant_id": merchant_id}
+            )
+            real_count = cache_count_result["count"] if cache_count_result else 0
+        except Exception as e:
+            # Fallback to existing count if cache query fails
+            real_count = store_dict.get("product_count") or 0
 
-            update_query = """
-                UPDATE merchant_stores
-                SET product_count = :product_count,
-                    last_sync = :last_sync,
-                    status = 'active'
-                WHERE store_id = :store_id
-            """
+        update_query = """
+            UPDATE merchant_stores
+            SET product_count = (
+                SELECT COUNT(*) FROM products_cache 
+                WHERE merchant_id = :merchant_id AND platform = 'wix'
+                AND (expires_at IS NULL OR expires_at > NOW())
+            ),
+            last_sync = :last_sync,
+            status = 'active'
+            WHERE store_id = :store_id
+        """
 
-            await database.execute(update_query, {
-                "product_count": existing_count,
-                "last_sync": datetime.now(),
-                "store_id": store_dict["store_id"]
-            })
-            
-            return {
-                "status": "success",
-                "message": f"Wix store sync completed. Product count remains {existing_count} until live API data is available.",
-                "store_id": store_dict["store_id"],
-                "store_name": store_dict["name"],
-                "product_count": existing_count,
-                "synced_at": datetime.now().isoformat()
-            }
+        await database.execute(update_query, {
+            "merchant_id": merchant_id,
+            "last_sync": datetime.now(),
+            "store_id": store_dict["store_id"]
+        })
+        
+        return {
+            "status": "success",
+            "message": f"Wix store synced: {real_count} products from cache",
+            "store_id": store_dict["store_id"],
+            "store_name": store_dict["name"],
+            "product_count": real_count,
+            "synced_at": datetime.now().isoformat()
+        }
         except Exception as api_error:
             # Log error but return graceful message
             print(f"Wix API error: {api_error}")

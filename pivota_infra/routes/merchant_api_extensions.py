@@ -192,31 +192,31 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
                 detail=f"Store is {store_check['status']}. Please reconnect your store."
             )
         
-        # 2. TODO: Actually call Shopify API to fetch products
-        # For now, just count existing products in our database
-        
-        # 3. Get actual product count from products table
-        product_count_result = await database.fetch_one(
-            "SELECT COUNT(*) as count FROM products WHERE merchant_id = :merchant_id",
+        # 2. Get actual product count from products_cache (real synced data)
+        cache_count_result = await database.fetch_one(
+            """SELECT COUNT(*) as count FROM products_cache 
+               WHERE merchant_id = :merchant_id AND platform = 'shopify'
+               AND (expires_at IS NULL OR expires_at > NOW())""",
             {"merchant_id": merchant_id}
         )
-        calculated_count = product_count_result["count"] if product_count_result else 0
+        calculated_count = cache_count_result["count"] if cache_count_result else 0
 
-        # Prefer calculated count when we have real data (>0). Otherwise preserve existing value.
+        # Use cached count if available, otherwise keep existing
         existing_count = store_check.get("product_count") or 0
         final_count = calculated_count if calculated_count > 0 else existing_count
 
-        if calculated_count > 0:
-            await database.execute(
-                "UPDATE merchant_stores SET product_count = :count, last_sync = NOW() WHERE merchant_id = :merchant_id AND platform = 'shopify'",
-                {"count": final_count, "merchant_id": merchant_id}
-            )
-        else:
-            # No reliable product data - only update last_sync timestamp
-            await database.execute(
-                "UPDATE merchant_stores SET last_sync = NOW() WHERE merchant_id = :merchant_id AND platform = 'shopify'",
-                {"merchant_id": merchant_id}
-            )
+        # Always update last_sync, update product_count from cache
+        await database.execute(
+            """UPDATE merchant_stores 
+               SET product_count = (
+                   SELECT COUNT(*) FROM products_cache 
+                   WHERE merchant_id = :merchant_id AND platform = 'shopify'
+                   AND (expires_at IS NULL OR expires_at > NOW())
+               ), 
+               last_sync = NOW() 
+               WHERE merchant_id = :merchant_id AND platform = 'shopify'""",
+            {"merchant_id": merchant_id}
+        )
 
         print(f"✅ Synced Shopify products for merchant {merchant_id} (count preserved: {final_count})")
 
