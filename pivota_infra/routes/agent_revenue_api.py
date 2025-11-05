@@ -238,7 +238,7 @@ async def get_agent_earnings(
             AND type = 'agent'
             AND created_at > CURRENT_TIMESTAMP - (CAST(:days AS INTEGER) || ' days')::INTERVAL
             """,
-            {"agent_id": agent_id, "currency": currency, "days": days}
+            {"agent_id": agent_id, "days": days}
         )
         
         return EarningsSummary(
