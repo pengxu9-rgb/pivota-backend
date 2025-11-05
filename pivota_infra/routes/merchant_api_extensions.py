@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Dict, Any, Optional
 from utils.auth import get_current_user
-from datetime import datetime
+from datetime import datetime, timezone
 from db.database import database
 import httpx
 import os
@@ -231,6 +231,125 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"❌ Sync failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
+
+
+@router.get("/merchant/mcp/summary")
+async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user)):
+    """Return MCP dashboard metrics for the current merchant"""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        stores_query = """
+            SELECT 
+                store_id,
+                platform,
+                name,
+                domain,
+                status,
+                product_count,
+                COALESCE(last_sync, last_sync_at) AS last_sync,
+                connected_at
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+            ORDER BY connected_at DESC NULLS LAST
+        """
+
+        stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
+
+        store_list = [dict(store) for store in stores]
+        total_stores = len(store_list)
+        active_statuses = {"active", "connected"}
+        active_stores = sum(1 for s in store_list if (s.get("status") or "").lower() in active_statuses)
+
+        # Aggregate product data
+        product_cache_stats = None
+        try:
+            cache_query = """
+                SELECT 
+                    COUNT(*) AS total_cached,
+                    COUNT(CASE WHEN expires_at IS NULL OR expires_at > NOW() THEN 1 END) AS active_cached
+                FROM products_cache
+                WHERE merchant_id = :merchant_id
+            """
+            product_cache_stats = await database.fetch_one(cache_query, {"merchant_id": merchant_id})
+        except Exception:
+            product_cache_stats = None
+
+        total_cached = product_cache_stats["total_cached"] if product_cache_stats and product_cache_stats["total_cached"] else 0
+        active_cached = product_cache_stats["active_cached"] if product_cache_stats and product_cache_stats["active_cached"] else 0
+
+        sum_product_counts = sum((s.get("product_count") or 0) for s in store_list)
+        total_requests = active_cached or total_cached or sum_product_counts
+
+        now_utc = datetime.now(timezone.utc)
+        latencies_seconds = []
+        nodes = []
+        latest_sync_dt = None
+
+        for store in store_list:
+            store_status = (store.get("status") or "").lower()
+            last_sync = store.get("last_sync")
+            if last_sync is not None and isinstance(last_sync, datetime):
+                sync_dt = last_sync if last_sync.tzinfo else last_sync.replace(tzinfo=timezone.utc)
+            else:
+                sync_dt = None
+
+            latency_seconds = None
+            if sync_dt:
+                latency_seconds = max((now_utc - sync_dt).total_seconds(), 0)
+                latencies_seconds.append(latency_seconds)
+                latest_sync_dt = max(latest_sync_dt, sync_dt) if latest_sync_dt else sync_dt
+
+            latency_ms = int(latency_seconds * 1000) if latency_seconds is not None else None
+            uptime = 99.9 if store_status in active_statuses else 0.0
+
+            nodes.append({
+                "id": store.get("store_id"),
+                "name": store.get("name") or f"{store.get('platform', 'Store').title()} Store",
+                "platform": store.get("platform"),
+                "status": "online" if store_status in active_statuses else "offline",
+                "latency": latency_ms,
+                "latency_ms": latency_ms,
+                "uptime": uptime,
+                "product_count": store.get("product_count") or 0,
+                "domain": store.get("domain"),
+                "last_sync": sync_dt.isoformat() if sync_dt else None
+            })
+
+        avg_latency_ms = int(sum(latencies_seconds) / len(latencies_seconds) * 1000) if latencies_seconds else 0
+
+        success_rate = round((active_stores / total_stores) * 100, 2) if total_stores else 0.0
+        latest_sync = latest_sync_dt.isoformat() if latest_sync_dt else None
+
+        primary_store = store_list[0] if store_list else {}
+
+        return {
+            "status": "success",
+            "data": {
+                "connected": active_stores > 0,
+                "total_stores": total_stores,
+                "active_stores": active_stores,
+                "platform": primary_store.get("platform"),
+                "shop_domain": primary_store.get("domain"),
+                "total_requests": total_requests,
+                "avg_latency": avg_latency_ms,
+                "avg_latency_ms": avg_latency_ms,
+                "success_rate": success_rate,
+                "latest_sync": latest_sync,
+                "last_sync": latest_sync,
+                "active_products": active_cached or sum_product_counts,
+                "total_products": sum_product_counts or active_cached,
+                "nodes": nodes
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Failed to load MCP summary for merchant {merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to load MCP summary: {str(e)}")
 
 @router.post("/merchant/integrations/psp/connect")
 async def connect_psp(

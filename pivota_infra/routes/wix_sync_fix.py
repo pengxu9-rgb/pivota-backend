@@ -58,7 +58,7 @@ async def sync_wix_products_fixed(
                 "message": "Demo sync completed (no real Wix store connected)",
                 "merchant_id": merchant_id,
                 "platform": "wix",
-                "products_synced": 5,
+                "products_synced": 0,
                 "sync_time": datetime.now().isoformat(),
                 "demo_mode": True
             }
@@ -67,12 +67,13 @@ async def sync_wix_products_fixed(
         if not store.get("api_key") or not store.get("domain"):
             logger.warning(f"Wix store missing credentials: api_key={bool(store.get('api_key'))}, domain={bool(store.get('domain'))}")
             
-            # Update store with demo products
+            # Update store without altering existing product count
+            current_count = store.get("product_count") or 0
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET product_count = 10, last_sync = :last_sync, status = 'active'
+                   SET product_count = :product_count, last_sync = :last_sync, status = 'active'
                    WHERE store_id = :store_id""",
-                {"last_sync": datetime.now(), "store_id": store["store_id"]}
+                {"product_count": current_count, "last_sync": datetime.now(), "store_id": store["store_id"]}
             )
             
             return {
@@ -80,7 +81,7 @@ async def sync_wix_products_fixed(
                 "message": "Demo products synced (API credentials pending)",
                 "merchant_id": merchant_id,
                 "platform": "wix",
-                "products_synced": 10,
+                "products_synced": current_count,
                 "sync_time": datetime.now().isoformat(),
                 "demo_mode": True
             }
