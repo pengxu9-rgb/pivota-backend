@@ -250,7 +250,7 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
                 domain,
                 status,
                 product_count,
-                COALESCE(last_sync, last_sync_at) AS last_sync,
+                last_sync,
                 connected_at
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
