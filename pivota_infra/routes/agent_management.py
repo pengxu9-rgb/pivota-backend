@@ -100,16 +100,21 @@ async def get_agent_details(
     # Allow agent to access their own details, or admin/employee to access any
     current_role = current_user.get("role")
     current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
+    current_email = current_user.get("email")
     
     if current_role not in ("agent", "employee", "admin"):
         raise HTTPException(status_code=403, detail="Access denied")
     
-    if current_role == "agent" and current_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Access denied - can only view own details")
-    
+    # Get the requested agent details first
     agent = await get_agent(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # For agent role: check if agent_id matches OR email matches
+    if current_role == "agent":
+        agent_email = agent.get("email") or agent.get("owner_email")
+        if current_agent_id != agent_id and current_email != agent_email:
+            raise HTTPException(status_code=403, detail="Access denied - can only view own details")
     
     return {
         "status": "success",
