@@ -79,14 +79,23 @@ async def get_all_agents(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
+        # Determine time interval based on date_range
+        time_interval_map = {
+            "1d": "1 day",
+            "7d": "7 days",
+            "30d": "30 days",
+            "90d": "90 days"
+        }
+        time_interval = time_interval_map.get(date_range, "7 days")
+        
         # Build query with optional filter
         where_clause = ""
-        params = {}
+        params = {"time_interval": time_interval}
         if status_filter:
             where_clause = "WHERE a.status = :status"
             params["status"] = status_filter
         
-        # Main query - get agents with REAL stats from orders table
+        # Main query - get agents with stats filtered by date_range
         query = f"""
             SELECT 
                 a.agent_id,
@@ -95,6 +104,7 @@ async def get_all_agents(
                 a.company,
                 a.use_case,
                 a.status,
+                a.agent_type,
                 a.api_key,
                 a.rate_limit,
                 a.created_at,
@@ -118,6 +128,7 @@ async def get_all_agents(
                     END as success_rate
                 FROM orders
                 WHERE agent_id IS NOT NULL
+                    AND created_at >= NOW() - INTERVAL '{time_interval}'
                 GROUP BY agent_id
             ) o ON a.agent_id = o.agent_id
             {where_clause}
@@ -140,19 +151,28 @@ async def get_all_agents(
                 "90d": "90 days"
             }.get(date_range, "7 days")
             
-            # Get metrics from ORDERS table (not usage_logs) - same as merchant!
+            # Get metrics: requests from usage_logs, orders/GMV from orders table
             metrics_query = f"""
                 SELECT 
-                    COUNT(*) as requests_24h,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM agent_usage_logs 
+                         WHERE agent_id = :agent_id 
+                         AND timestamp >= NOW() - INTERVAL '{time_interval}'), 
+                        0
+                    ) as requests_24h,
+                    COUNT(*) as orders_24h,
                     COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END) as successful_24h,
                     COUNT(CASE WHEN payment_status IN ('failed', 'cancelled', 'error') THEN 1 END) as failed_24h,
                     CASE 
                         WHEN COUNT(*) > 0 THEN 
                             (COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
-                        ELSE 0 
+                        ELSE 100 
                     END as success_rate_24h,
-                    0 as avg_latency_24h,
-                    COUNT(*) as orders_24h,
+                    COALESCE(AVG(
+                        (SELECT AVG(response_time_ms) FROM agent_usage_logs 
+                         WHERE agent_id = :agent_id 
+                         AND timestamp >= NOW() - INTERVAL '{time_interval}')
+                    ), 0) as avg_latency_24h,
                     COALESCE(SUM(total), 0) as gmv_24h
                 FROM orders
                 WHERE agent_id = :agent_id
