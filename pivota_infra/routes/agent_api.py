@@ -541,6 +541,19 @@ async def agent_confirm_payment(
         # 标记订单已支付
         await mark_order_paid(order_id)
         
+        # [Phase 6.2] 自动触发 commission 计算
+        if order.get("agent_id"):
+            async def trigger_commission():
+                try:
+                    from services.order_commission_service import OrderCommissionService
+                    service = OrderCommissionService(database)
+                    await service.calculate_commission_for_order(order_id)
+                    logger.info(f"✅ Commission calculated for order {order_id}")
+                except Exception as e:
+                    logger.error(f"Commission calculation failed for {order_id}: {e}")
+            
+            background_tasks.add_task(trigger_commission)
+        
         # 记录支付成功事件
         await log_order_event(
             event_type="payment_succeeded",
