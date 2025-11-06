@@ -177,6 +177,16 @@ async def login(data: LoginRequest):
             if merchant_record:
                 merchant_id = merchant_record['merchant_id']
         
+        # [Phase 6.2] For agents, get their agent_id from agents table
+        agent_id = None
+        if user['role'] == 'agent':
+            agent_record = await database.fetch_one(
+                "SELECT agent_id FROM agents WHERE email = :email LIMIT 1",
+                {"email": user['email']}
+            )
+            if agent_record:
+                agent_id = agent_record['agent_id']
+        
         # Create JWT token
         token_data = {
             "sub": user['email'],
@@ -186,6 +196,8 @@ async def login(data: LoginRequest):
         }
         if merchant_id:
             token_data["merchant_id"] = merchant_id
+        if agent_id:
+            token_data["agent_id"] = agent_id
         
         token = create_access_token(token_data)
         
@@ -197,6 +209,8 @@ async def login(data: LoginRequest):
         }
         if merchant_id:
             user_response["merchant_id"] = merchant_id
+        if agent_id:
+            user_response["agent_id"] = agent_id
         
         return LoginResponse(
             success=True,
