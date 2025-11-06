@@ -129,13 +129,13 @@ async def get_agent_details(
             "status": "success",
             "agent": {
                 "agent_id": agent["agent_id"],
-                "name": agent["name"],
-                "email": agent["email"],
-                "phone": agent["phone"],
-                "status": agent["status"],
+                "name": agent.get("name") or agent.get("agent_name") or "Agent",
+                "email": agent.get("email") or agent.get("owner_email"),
+                "phone": agent.get("phone"),
+                "status": agent.get("status", "active"),
                 "agent_type": agent.get("agent_type", "basic"),  # [Phase 6.2] Include tier
-                "created_at": agent["created_at"].isoformat() if agent["created_at"] else None,
-                "last_active": agent["last_active"].isoformat() if agent["last_active"] else None,
+                "created_at": agent["created_at"].isoformat() if agent.get("created_at") else None,
+                "last_active": agent.get("last_active").isoformat() if agent.get("last_active") else None,
                 "stats": {
                     "total_merchants": merchants_stats["total_merchants"] if merchants_stats else 0,
                     "active_merchants": merchants_stats["active_merchants"] if merchants_stats else 0,
