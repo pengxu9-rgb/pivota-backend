@@ -100,7 +100,8 @@ from routes.test_trigger_commission import router as test_trigger_commission_rou
 from routes.debug_commission_matching import router as debug_commission_matching_router
 from routes.debug_agent_tier import router as debug_agent_tier_router  # Debug Commission Matching
 from routes.admin_fix_psp_format import router as admin_fix_psp_format_router
-from routes.admin_fix_commission_offers import router as admin_fix_commission_offers_router  # Fix PSP ID format
+from routes.admin_fix_commission_offers import router as admin_fix_commission_offers_router
+from routes.agent_self_api import router as agent_self_api_router  # Fix PSP ID format
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -461,6 +462,7 @@ app.include_router(order_router)  # Order processing
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
 app.include_router(agent_management_router)  # Agent management
+app.include_router(agent_self_api_router)  # Agent self-service endpoints
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
 app.include_router(refund_api_router)  # Refund processing
 app.include_router(agent_docs_router)  # Agent developer docs
