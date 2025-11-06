@@ -467,7 +467,15 @@ async def employee_update_agent_tier(
 @router.options("/agents/{agent_id}/tier")
 async def employee_update_agent_tier_options(agent_id: str):
     """Handle CORS preflight for tier updates."""
-    return Response(status_code=204)
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "PATCH, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Allow-Credentials": "true"
+        }
+    )
 
 
 @router.post("/agents/{agent_id}/reset-api-key")
