@@ -1,6 +1,20 @@
 """
-Agents Management Routes
-Provides endpoints for managing agents in the system
+⚠️ DEPRECATED - 2025-11-06
+
+This file has been DISABLED in main.py (Line 402) due to:
+1. Route conflicts with agent_management.py (both define GET /agents/{id})
+2. Field access errors causing 500 (missing phone, etc.)  
+3. Missing Phase 6.2 tier management (no PATCH /tier endpoint)
+
+✅ Use routes/agent_management.py instead - provides:
+- All CRUD operations (same endpoints)
+- PATCH /agents/{id}/tier for tier management
+- Safe field access with .get() methods
+- More analytics endpoints (funnel, query-analytics, usage)
+- Better maintained and tested
+
+Keeping this file for reference only.
+File can be deleted after 2025-11-13 if no issues found.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional, List
