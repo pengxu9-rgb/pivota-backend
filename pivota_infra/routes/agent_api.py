@@ -546,11 +546,12 @@ async def agent_confirm_payment(
             async def trigger_commission():
                 try:
                     from services.order_commission_service import OrderCommissionService
+                    from db.database import database
                     service = OrderCommissionService(database)
                     await service.calculate_commission_for_order(order_id)
-                    logger.info(f"✅ Commission calculated for order {order_id}")
+                    logger.info(f"✅ Commission auto-calculated for order {order_id}")
                 except Exception as e:
-                    logger.error(f"Commission calculation failed for {order_id}: {e}")
+                    logger.error(f"Commission auto-calculation failed for {order_id}: {e}")
             
             background_tasks.add_task(trigger_commission)
         
