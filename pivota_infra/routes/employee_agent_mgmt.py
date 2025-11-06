@@ -80,14 +80,24 @@ class AgentProtocolResponse(BaseModel):
 @router.get("/agents")
 async def get_all_agents(
     status: Optional[str] = Query(None, description="Filter by status: active, inactive, suspended"),
+    date_range: Optional[str] = Query("7d", description="Date range: 1d, 7d, 30d, 90d"),
     current_user: dict = Depends(get_current_user)
 ):
-    """Get all agents (Employee only)"""
+    """Get all agents (Employee only) with metrics filtered by date_range"""
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Query agents with merchant count from orders table
+        # Determine time interval
+        time_interval_map = {
+            "1d": "1 day",
+            "7d": "7 days",
+            "30d": "30 days",
+            "90d": "90 days"
+        }
+        time_interval = time_interval_map.get(date_range, "7 days")
+        
+        # Query agents with metrics from orders table (filtered by date)
         where_condition = ""
         params = {}
         
@@ -98,11 +108,31 @@ async def get_all_agents(
         query = f"""
             SELECT 
                 a.*,
-                COUNT(DISTINCT o.merchant_id) as merchant_count
+                COALESCE(o.total_orders, 0) as total_orders,
+                COALESCE(o.total_gmv, 0) as total_gmv,
+                COALESCE(o.merchant_count, 0) as merchant_count,
+                COALESCE(o.success_rate, 100) as success_rate,
+                COALESCE(r.request_count, 0) as request_count
             FROM agents a
-            LEFT JOIN orders o ON a.agent_id = o.agent_id AND o.merchant_id IS NOT NULL
+            LEFT JOIN (
+                SELECT 
+                    agent_id,
+                    COUNT(*) as total_orders,
+                    SUM(total) as total_gmv,
+                    COUNT(DISTINCT merchant_id) as merchant_count,
+                    ROUND((COUNT(CASE WHEN payment_status IN ('paid', 'completed') THEN 1 END)::FLOAT / NULLIF(COUNT(*), 0)::FLOAT * 100)::numeric, 1) as success_rate
+                FROM orders
+                WHERE agent_id IS NOT NULL
+                    AND created_at >= NOW() - INTERVAL '{time_interval}'
+                GROUP BY agent_id
+            ) o ON a.agent_id = o.agent_id
+            LEFT JOIN (
+                SELECT agent_id, COUNT(*) as request_count
+                FROM agent_usage_logs
+                WHERE timestamp >= NOW() - INTERVAL '{time_interval}'
+                GROUP BY agent_id
+            ) r ON a.agent_id = r.agent_id
             {where_condition}
-            GROUP BY a.agent_id
             ORDER BY a.created_at DESC
         """
         
