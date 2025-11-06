@@ -32,7 +32,7 @@ async def get_own_api_key(
         # Get agent's full API key
         query = """
             SELECT agent_id, api_key, name, created_at, last_active, 
-                   total_requests, agent_type
+                   agent_type, email, phone, status, is_active
             FROM agents 
             WHERE (agent_id = :agent_id OR email = :email)
             AND is_active = true
@@ -57,7 +57,7 @@ async def get_own_api_key(
             "name": agent_dict.get("name"),
             "created_at": agent_dict.get("created_at"),
             "last_active": agent_dict.get("last_active"),
-            "usage_count": agent_dict.get("total_requests", 0),
+            "usage_count": 0,  # TODO: Get from usage logs
             "agent_type": agent_dict.get("agent_type", "basic")
         }
         
