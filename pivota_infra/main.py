@@ -396,7 +396,10 @@ app.include_router(cleanup_all_duplicates_router)  # Cleanup all duplicates
 app.include_router(admin_cleanup_router)  # Admin cleanup (no auth)
 app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
-app.include_router(agents_router)  # Agents management
+# ⚠️ DISABLED: agents_router conflicts with agent_management_router (registered later at line 456)
+# agents_mgmt.py causes 500 errors due to missing fields (phone, etc.)
+# Use agent_management_router instead - has complete Phase 6.2 support
+# app.include_router(agents_router)  # Agents management - DISABLED 2025-11-06
 app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
 app.include_router(employee_missing_router)  # Missing employee endpoints
