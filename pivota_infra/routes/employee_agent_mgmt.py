@@ -423,60 +423,53 @@ async def employee_update_agent_tier(
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    new_tier = (tier_data.get("agent_type") or "").lower().strip()
-    if new_tier not in ["basic", "premium"]:
-        raise HTTPException(status_code=400, detail="agent_type must be 'basic' or 'premium'")
+    try:
+        new_tier = (tier_data.get("agent_type") or "").lower().strip()
+        if new_tier not in ["basic", "premium"]:
+            raise HTTPException(status_code=400, detail="agent_type must be 'basic' or 'premium'")
 
-    agent_row = await database.fetch_one(
-        "SELECT agent_id, agent_type FROM agents WHERE agent_id = :agent_id",
-        {"agent_id": agent_id}
-    )
-    if not agent_row:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        agent_row = await database.fetch_one(
+            "SELECT agent_id, agent_type FROM agents WHERE agent_id = :agent_id",
+            {"agent_id": agent_id}
+        )
+        if not agent_row:
+            raise HTTPException(status_code=404, detail="Agent not found")
 
-    old_tier = dict(agent_row).get("agent_type", "basic")
+        old_tier = dict(agent_row).get("agent_type", "basic")
 
-    await database.execute(
-        """UPDATE agents
-               SET agent_type = :tier,
-                   updated_at = :updated_at
-               WHERE agent_id = :agent_id""",
-        {
-            "tier": new_tier,
+        await database.execute(
+            """UPDATE agents
+                   SET agent_type = :tier,
+                       updated_at = :updated_at
+                   WHERE agent_id = :agent_id""",
+            {
+                "tier": new_tier,
+                "agent_id": agent_id,
+                "updated_at": datetime.now()
+            }
+        )
+
+        logger.info(
+            "[Phase 6.2] Employee portal tier change %s: %s -> %s by %s",
+            agent_id,
+            old_tier,
+            new_tier,
+            current_user.get("email")
+        )
+
+        return {
+            "status": "success",
             "agent_id": agent_id,
-            "updated_at": datetime.utcnow()
+            "agent_type": new_tier,
+            "previous_tier": old_tier,
+            "message": f"Agent tier updated to {new_tier}"
         }
-    )
-
-    logger.info(
-        "[Phase 6.2] Employee portal tier change %s: %s -> %s by %s",
-        agent_id,
-        old_tier,
-        new_tier,
-        current_user.get("email")
-    )
-
-    return {
-        "status": "success",
-        "agent_id": agent_id,
-        "agent_type": new_tier,
-        "previous_tier": old_tier,
-        "message": f"Agent tier updated to {new_tier}"
-    }
-
-@router.options("/agents/{agent_id}/tier")
-async def employee_update_agent_tier_options(agent_id: str):
-    """Handle CORS preflight for tier updates."""
-    return Response(
-        status_code=204,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "PATCH, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, Content-Type",
-            "Access-Control-Allow-Credentials": "true"
-        }
-    )
-
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update agent tier: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update tier: {str(e)}")
 
 @router.post("/agents/{agent_id}/reset-api-key")
 async def reset_agent_api_key(
