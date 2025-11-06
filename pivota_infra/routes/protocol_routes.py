@@ -115,7 +115,13 @@ async def get_protocol_events(
     Get protocol events for an agent
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    current_role = current_user.get("role")
+    current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
+
+    if current_role not in ("agent", "admin"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if current_role == "agent" and current_agent_id != agent_id:
         raise HTTPException(status_code=403, detail="Access denied")
     
     cutoff = datetime.utcnow() - timedelta(hours=hours)
@@ -223,7 +229,13 @@ async def get_agent_protocols(
     Get protocols enabled for an agent
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    current_role = current_user.get("role")
+    current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
+
+    if current_role not in ("agent", "admin"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if current_role == "agent" and current_agent_id != agent_id:
         raise HTTPException(status_code=403, detail="Access denied")
     
     protocols = await database.fetch_all(
