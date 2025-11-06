@@ -311,7 +311,7 @@ app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_
 app.add_middleware(StructuredLoggingMiddleware)
 
 # Include available routers
-app.include_router(agent_router)
+app.include_router(agent_router)  # ⚠️ DEPRECATED - Use agent_api_router (/agent/v1/*) instead. Will be removed 2026-05-01
 app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system

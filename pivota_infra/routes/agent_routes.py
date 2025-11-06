@@ -1,3 +1,17 @@
+"""
+⚠️ DEPRECATED - 已弃用 (2025-11-06)
+
+此模块包含旧版 Agent API 端点，已被 /agent/v1/* 取代。
+
+迁移指南：
+- /agent/pay → /agent/v1/orders/create
+- /agent/confirm/{order_id} → /agent/v1/orders/{order_id}/confirm-payment
+- /agent/psp-metrics → 已移除（使用内部监控）
+
+请使用 routes/agent_api.py 中的新版本 API。
+计划在 2026-05-01 完全移除。
+"""
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from models.schemas import AgentPayRequest, PaymentResponse
@@ -7,6 +21,7 @@ from adapters.stripe_adapter import create_payment_intent
 # AI router functions (implemented locally to avoid import issues)
 from collections import defaultdict
 import random
+import warnings
 
 # In-memory PSP metrics storage
 ai_psp_metrics = defaultdict(lambda: {"success_rate": 0.95, "latency": 200, "cost": 1.0})
@@ -40,7 +55,22 @@ from utils.logger import logger
 import time
 import asyncio
 
-router = APIRouter(prefix="/agent", tags=["agent"])
+router = APIRouter(
+    prefix="/agent", 
+    tags=["agent-deprecated"],
+    deprecated=True,
+    responses={
+        303: {
+            "description": "Redirect to new API version",
+            "headers": {
+                "Location": {
+                    "description": "New API endpoint location",
+                    "schema": {"type": "string"}
+                }
+            }
+        }
+    }
+)
 
 # in-memory mapping for prototype: order_id -> payment_intent_id
 ORDER_INTENT_MAP = {}
@@ -70,7 +100,19 @@ async def simulate_payment_processing(psp: str, amount: float, currency: str):
 
 @router.post("/pay", response_model=PaymentResponse)
 async def agent_pay(req: AgentPayRequest):
-    """Enhanced agent payment with AI-powered PSP selection and realistic simulation."""
+    """
+    Enhanced agent payment with AI-powered PSP selection and realistic simulation.
+    
+    ⚠️ DEPRECATED: Use POST /agent/v1/orders/create instead.
+    This endpoint will be removed on 2026-05-01.
+    """
+    warnings.warn(
+        "POST /agent/pay is deprecated. Use POST /agent/v1/orders/create instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    logger.warning("⚠️ DEPRECATED API CALL: POST /agent/pay - Use /agent/v1/orders/create")
+    
     start_time = time.time()
     
     try:
@@ -135,7 +177,18 @@ class SimpleAgentPaymentRequest(BaseModel):
 
 @router.post("/pay-simple")
 async def agent_pay_simple(req: SimpleAgentPaymentRequest):
-    """Simplified agent payment endpoint with AI-powered PSP selection."""
+    """
+    Simplified agent payment endpoint with AI-powered PSP selection.
+    
+    ⚠️ DEPRECATED: Use POST /agent/v1/orders/create instead.
+    This endpoint will be removed on 2026-05-01.
+    """
+    warnings.warn(
+        "POST /agent/pay-simple is deprecated. Use POST /agent/v1/orders/create instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    logger.warning("⚠️ DEPRECATED API CALL: POST /agent/pay-simple - Use /agent/v1/orders/create")
     start_time = time.time()
     
     try:
