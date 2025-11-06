@@ -411,6 +411,58 @@ async def create_agent(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create agent: {str(e)}")
 
+
+@router.patch("/agents/{agent_id}/tier")
+async def employee_update_agent_tier(
+    agent_id: str,
+    tier_data: Dict[str, Any],
+    current_user: dict = Depends(get_current_user)
+):
+    """Employee portal endpoint to switch agent tier between basic/premium."""
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    new_tier = (tier_data.get("agent_type") or "").lower().strip()
+    if new_tier not in ["basic", "premium"]:
+        raise HTTPException(status_code=400, detail="agent_type must be 'basic' or 'premium'")
+
+    agent_row = await database.fetch_one(
+        "SELECT agent_id, agent_type FROM agents WHERE agent_id = :agent_id",
+        {"agent_id": agent_id}
+    )
+    if not agent_row:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    old_tier = dict(agent_row).get("agent_type", "basic")
+
+    await database.execute(
+        """UPDATE agents
+               SET agent_type = :tier,
+                   updated_at = :updated_at
+               WHERE agent_id = :agent_id""",
+        {
+            "tier": new_tier,
+            "agent_id": agent_id,
+            "updated_at": datetime.utcnow()
+        }
+    )
+
+    logger.info(
+        "[Phase 6.2] Employee portal tier change %s: %s -> %s by %s",
+        agent_id,
+        old_tier,
+        new_tier,
+        current_user.get("email")
+    )
+
+    return {
+        "status": "success",
+        "agent_id": agent_id,
+        "agent_type": new_tier,
+        "previous_tier": old_tier,
+        "message": f"Agent tier updated to {new_tier}"
+    }
+
 @router.post("/agents/{agent_id}/reset-api-key")
 async def reset_agent_api_key(
     agent_id: str,
