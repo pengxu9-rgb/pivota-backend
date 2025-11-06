@@ -439,13 +439,11 @@ async def employee_update_agent_tier(
 
         await database.execute(
             """UPDATE agents
-                   SET agent_type = :tier,
-                       updated_at = :updated_at
+                   SET agent_type = :tier
                    WHERE agent_id = :agent_id""",
             {
                 "tier": new_tier,
-                "agent_id": agent_id,
-                "updated_at": datetime.now()
+                "agent_id": agent_id
             }
         )
 
