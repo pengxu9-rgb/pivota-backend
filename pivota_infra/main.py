@@ -281,11 +281,19 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-# CORS middleware - Allow Lovable origins
+# CORS middleware - Allow all portal origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],                # 不使用白名单
-    allow_origin_regex=".*",        # 允许任意来源
+    allow_origins=[
+        "https://employee.pivota.cc",
+        "https://merchant.pivota.cc",
+        "https://agents.pivota.cc",
+        "https://admin.pivota.cc",
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://localhost:3003"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
