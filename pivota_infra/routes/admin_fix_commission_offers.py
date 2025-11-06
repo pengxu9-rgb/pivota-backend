@@ -43,11 +43,11 @@ async def cleanup_invalid_commission_offers(
         updated_25pct = await database.execute(
             """
             UPDATE merchant_commission_offers
-            SET minimum_order_amount = 50.0
+            SET min_order_amount = 50.0
             WHERE merchant_id = :merchant_id
               AND offered_commission_rate = 0.025
               AND agent_type IS NULL
-              AND (minimum_order_amount < 50 OR minimum_order_amount IS NULL)
+              AND (min_order_amount < 50 OR min_order_amount IS NULL)
             """,
             {"merchant_id": merchant_id}
         )
@@ -56,11 +56,11 @@ async def cleanup_invalid_commission_offers(
         updated_5pct = await database.execute(
             """
             UPDATE merchant_commission_offers
-            SET minimum_order_amount = 100.0
+            SET min_order_amount = 100.0
             WHERE merchant_id = :merchant_id
               AND offered_commission_rate = 0.05
               AND agent_type = 'premium'
-              AND (minimum_order_amount < 100 OR minimum_order_amount IS NULL)
+              AND (min_order_amount < 100 OR min_order_amount IS NULL)
             """,
             {"merchant_id": merchant_id}
         )
@@ -72,12 +72,12 @@ async def cleanup_invalid_commission_offers(
                 id,
                 agent_type,
                 offered_commission_rate * 100 as rate_percent,
-                minimum_order_amount,
+                min_order_amount,
                 is_active
             FROM merchant_commission_offers
             WHERE merchant_id = :merchant_id
               AND is_active = true
-            ORDER BY minimum_order_amount
+            ORDER BY min_order_amount
             """,
             {"merchant_id": merchant_id}
         )
@@ -117,13 +117,13 @@ async def check_merchant_offers(
                 id,
                 agent_type,
                 offered_commission_rate * 100 as rate_percent,
-                minimum_order_amount,
+                min_order_amount,
                 maximum_order_amount,
                 is_active,
                 created_at
             FROM merchant_commission_offers
             WHERE merchant_id = :merchant_id
-            ORDER BY offered_commission_rate, minimum_order_amount
+            ORDER BY offered_commission_rate, min_order_amount
             """,
             {"merchant_id": merchant_id}
         )
