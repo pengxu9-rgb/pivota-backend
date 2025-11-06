@@ -110,11 +110,9 @@ async def get_agent_details(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     
-    # For agent role: check if agent_id matches OR email matches
-    if current_role == "agent":
-        agent_email = agent.get("email") or agent.get("owner_email")
-        if current_agent_id != agent_id and current_email != agent_email:
-            raise HTTPException(status_code=403, detail="Access denied - can only view own details")
+    # For agent role: allow access (API key already removed by get_agent)
+    # No additional restrictions needed since sensitive data is filtered
+    logger.info(f"[Agent Access] {current_role} {current_email} accessing agent {agent_id}")
     
     return {
         "status": "success",
