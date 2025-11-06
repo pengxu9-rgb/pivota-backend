@@ -99,7 +99,8 @@ from routes.test_commission_flow import router as test_commission_flow_router  #
 from routes.test_trigger_commission import router as test_trigger_commission_router  # Test Trigger Commission
 from routes.debug_commission_matching import router as debug_commission_matching_router
 from routes.debug_agent_tier import router as debug_agent_tier_router  # Debug Commission Matching
-from routes.admin_fix_psp_format import router as admin_fix_psp_format_router  # Fix PSP ID format
+from routes.admin_fix_psp_format import router as admin_fix_psp_format_router
+from routes.admin_fix_commission_offers import router as admin_fix_commission_offers_router  # Fix PSP ID format
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -438,6 +439,7 @@ app.include_router(test_trigger_commission_router)  # Test Trigger Commission
 app.include_router(debug_commission_matching_router)  # Debug Commission Matching
 app.include_router(debug_agent_tier_router)  # Debug Agent Tier (no auth)
 app.include_router(admin_fix_psp_format_router)  # Fix PSP ID format (admin only)
+app.include_router(admin_fix_commission_offers_router)  # Fix commission offers (admin only)
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
