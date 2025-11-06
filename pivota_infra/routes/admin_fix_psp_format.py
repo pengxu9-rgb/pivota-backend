@@ -23,7 +23,7 @@ async def fix_psp_format(current_user: dict = Depends(get_current_user)):
         # 1. Find all incorrect PSP IDs
         wrong_psps = await database.fetch_all("""
             SELECT psp_id, merchant_id, provider
-            FROM merchant_psp_configs
+            FROM merchant_psps
             WHERE psp_id !~ '^psp_[a-z0-9]+_[a-z0-9]{12}$'
         """)
         
@@ -50,9 +50,9 @@ async def fix_psp_format(current_user: dict = Depends(get_current_user)):
             
             logger.info(f"Fixing PSP ID: {old_id} → {new_id}")
             
-            # Update merchant_psp_configs
+            # Update merchant_psps
             await database.execute("""
-                UPDATE merchant_psp_configs
+                UPDATE merchant_psps
                 SET psp_id = :new_id
                 WHERE psp_id = :old_id
                     AND merchant_id = :merchant_id
@@ -101,13 +101,13 @@ async def check_psp_format(current_user: dict = Depends(get_current_user)):
                 COUNT(*) as total,
                 COUNT(CASE WHEN psp_id ~* '^psp_[a-z0-9]+_[a-z0-9]{12}$' THEN 1 END) as correct_format,
                 COUNT(CASE WHEN psp_id !~ '^psp_[a-z0-9]+_[a-z0-9]{12}$' THEN 1 END) as wrong_format
-            FROM merchant_psp_configs
+            FROM merchant_psps
         """)
         
         # Get examples of wrong format
         wrong_examples = await database.fetch_all("""
             SELECT psp_id, provider, merchant_id
-            FROM merchant_psp_configs
+            FROM merchant_psps
             WHERE psp_id !~ '^psp_[a-z0-9]+_[a-z0-9]{12}$'
             LIMIT 10
         """)
