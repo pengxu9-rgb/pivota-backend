@@ -3,6 +3,7 @@ Employee Portal Agent Management
 Handles agent CRUD operations for employees
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -462,6 +463,12 @@ async def employee_update_agent_tier(
         "previous_tier": old_tier,
         "message": f"Agent tier updated to {new_tier}"
     }
+
+@router.options("/agents/{agent_id}/tier")
+async def employee_update_agent_tier_options(agent_id: str):
+    """Handle CORS preflight for tier updates."""
+    return Response(status_code=204)
+
 
 @router.post("/agents/{agent_id}/reset-api-key")
 async def reset_agent_api_key(
