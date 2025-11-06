@@ -96,14 +96,21 @@ async def get_agent_details(
     agent_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """获取 Agent 详情（不含 API Key）"""
+    """获取 Agent 详情（不含 API Key）- v331ebf4e+"""
     # Allow agent to access their own details, or admin/employee to access any
     current_role = current_user.get("role")
     current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
     current_email = current_user.get("email")
     
+    logger.info(
+        f"[GET /agents/{{id}}] Auth check: role={current_role}, "
+        f"email={current_email}, agent_id={current_agent_id}, "
+        f"requested={agent_id}"
+    )
+    
     if current_role not in ("agent", "employee", "admin"):
-        raise HTTPException(status_code=403, detail="Access denied")
+        logger.error(f"[GET /agents/{{id}}] Role '{current_role}' not allowed")
+        raise HTTPException(status_code=403, detail=f"Access denied - invalid role: {current_role}")
     
     # Get the requested agent details first
     agent = await get_agent(agent_id)
@@ -112,7 +119,7 @@ async def get_agent_details(
     
     # For agent role: allow access (API key already removed by get_agent)
     # No additional restrictions needed since sensitive data is filtered
-    logger.info(f"[Agent Access] {current_role} {current_email} accessing agent {agent_id}")
+    logger.info(f"[Agent Access OK] {current_role} {current_email} → agent {agent_id}")
     
     return {
         "status": "success",

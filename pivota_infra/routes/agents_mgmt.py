@@ -95,7 +95,8 @@ async def get_agent_details(
     current_user: dict = Depends(get_current_user)
 ):
     """Get detailed agent information"""
-    if current_user["role"] not in ["employee", "admin"]:
+    # [Phase 6.2] Allow agent role to access agent details
+    if current_user["role"] not in ["agent", "employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -132,6 +133,7 @@ async def get_agent_details(
                 "email": agent["email"],
                 "phone": agent["phone"],
                 "status": agent["status"],
+                "agent_type": agent.get("agent_type", "basic"),  # [Phase 6.2] Include tier
                 "created_at": agent["created_at"].isoformat() if agent["created_at"] else None,
                 "last_active": agent["last_active"].isoformat() if agent["last_active"] else None,
                 "stats": {
