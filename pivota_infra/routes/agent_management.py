@@ -159,6 +159,65 @@ async def update_agent(
         raise HTTPException(status_code=500, detail="Failed to update agent")
 
 
+@router.patch("/{agent_id}/tier")
+async def update_agent_tier(
+    agent_id: str,
+    tier_data: Dict[str, Any],
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    [Phase 6.2] Update agent tier (basic/premium)
+    
+    Only employees/admins can change agent tiers.
+    Valid values: 'basic', 'premium'
+    """
+    if current_user["role"] not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        # Validate tier
+        new_tier = tier_data.get("agent_type", "").lower().strip()
+        if new_tier not in ["basic", "premium"]:
+            raise HTTPException(
+                status_code=400,
+                detail="agent_type must be 'basic' or 'premium'"
+            )
+        
+        # Check agent exists
+        agent = await get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        old_tier = agent.get("agent_type", "basic")
+        
+        # Update tier
+        await database.execute(
+            """UPDATE agents 
+               SET agent_type = :tier, updated_at = NOW()
+               WHERE agent_id = :agent_id""",
+            {"tier": new_tier, "agent_id": agent_id}
+        )
+        
+        logger.info(
+            f"[Phase 6.2] Agent {agent_id} tier changed: {old_tier} → {new_tier} "
+            f"by {current_user.get('email')}"
+        )
+        
+        return {
+            "status": "success",
+            "agent_id": agent_id,
+            "agent_type": new_tier,
+            "previous_tier": old_tier,
+            "message": f"Agent tier updated to {new_tier}"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update agent tier: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update tier: {str(e)}")
+
+
 @router.delete("/{agent_id}")
 async def deactivate_agent(
     agent_id: str,
