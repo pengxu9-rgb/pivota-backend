@@ -377,7 +377,8 @@ async def connect_psp(
         raise HTTPException(status_code=400, detail="PayPal requires both Client ID and Client Secret")
     
     # Save to database
-    psp_id = "psp_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    # [Phase 6.2 Fix] Include provider in psp_id to match constraint: psp_{provider}_{12chars}
+    psp_id = f"psp_{provider}_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
     account_id = "acct_" + ''.join(random.choices(string.digits, k=10))
     capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen"] else ["card"]
     
