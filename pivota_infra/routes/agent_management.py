@@ -94,9 +94,19 @@ async def create_new_agent(
 @router.get("/{agent_id}")
 async def get_agent_details(
     agent_id: str,
-    admin_user: dict = Depends(get_current_user)  # Allow authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """获取 Agent 详情（不含 API Key）"""
+    # Allow agent to access their own details, or admin/employee to access any
+    current_role = current_user.get("role")
+    current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
+    
+    if current_role not in ("agent", "employee", "admin"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    if current_role == "agent" and current_agent_id != agent_id:
+        raise HTTPException(status_code=403, detail="Access denied - can only view own details")
+    
     agent = await get_agent(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
