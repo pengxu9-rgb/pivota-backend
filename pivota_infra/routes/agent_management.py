@@ -193,7 +193,7 @@ async def update_agent_tier(
         # Update tier
         await database.execute(
             """UPDATE agents 
-               SET agent_type = :tier, updated_at = NOW()
+               SET agent_type = :tier
                WHERE agent_id = :agent_id""",
             {"tier": new_tier, "agent_id": agent_id}
         )
