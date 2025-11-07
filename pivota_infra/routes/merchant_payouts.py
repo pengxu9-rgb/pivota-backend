@@ -18,6 +18,78 @@ router = APIRouter(
     tags=["payouts"]
 )
 
+
+async def _fetch_unpaid_commission_entries(
+    merchant_id: str,
+    period_start: datetime,
+    period_end: datetime,
+    agent_ids: Optional[List[str]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Load unpaid commission rows (legacy agent_revenue_logs) and aggregate per agent."""
+    agent_filter = "AND ar.agent_id = ANY(:agent_ids)" if agent_ids else ""
+    params: Dict[str, Any] = {
+        "merchant_id": merchant_id,
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+    if agent_ids:
+        params["agent_ids"] = agent_ids
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT 
+            ar.id,
+            ar.agent_id,
+            COALESCE(ar.currency, 'USD') AS currency,
+            ar.agent_earned_amount,
+            ar.created_at
+        FROM agent_revenue_logs ar
+        LEFT JOIN agent_payout_links apl ON ar.id = apl.revenue_id
+        WHERE ar.merchant_id = :merchant_id
+          AND ar.agent_id IS NOT NULL
+          AND ar.created_at >= :period_start
+          AND ar.created_at <= :period_end
+          AND (ar.settlement_status IS NULL OR ar.settlement_status IN ('pending','processing'))
+          AND apl.revenue_id IS NULL
+          {agent_filter}
+        ORDER BY ar.created_at DESC
+        """,
+        params
+    )
+
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        agent_id = row["agent_id"]
+        if not agent_id:
+            continue
+        amount = float(row["agent_earned_amount"] or 0)
+        created_at = row["created_at"]
+        currency = row["currency"] or "USD"
+
+        agent_data = aggregated.setdefault(agent_id, {
+            "agent_id": agent_id,
+            "total_commission": 0.0,
+            "transaction_count": 0,
+            "currency": currency,
+            "earliest": created_at,
+            "latest": created_at,
+            "entries": []
+        })
+
+        agent_data["total_commission"] += amount
+        agent_data["transaction_count"] += 1
+        agent_data["currency"] = currency
+        if created_at < agent_data["earliest"]:
+            agent_data["earliest"] = created_at
+        if created_at > agent_data["latest"]:
+            agent_data["latest"] = created_at
+        agent_data["entries"].append({
+            "id": row["id"],
+            "amount": amount
+        })
+
+    return aggregated
+
 # ============================================================================
 # Pending Commissions (NEW - to show what needs to be paid)
 # ============================================================================
@@ -33,57 +105,56 @@ async def get_pending_commissions(
     This shows what commission is owed but hasn't been converted to payouts yet
     """
     try:
-        # Query unpaid commissions from commissions table
-        # Exclude commissions that are already linked to payouts
-        query = """
-            SELECT 
-                c.agent_id,
-                COUNT(DISTINCT c.id) as transaction_count,
-                COALESCE(SUM(c.amount), 0) as total_commission,
-                'USD' as currency,
-                MIN(c.created_at) as earliest_transaction,
-                MAX(c.created_at) as latest_transaction
-            FROM commissions c
-            LEFT JOIN agent_payout_links apl ON c.id = apl.revenue_id
-            WHERE c.merchant_id = :merchant_id
-            AND c.type = 'agent'
-            AND c.created_at >= NOW() - make_interval(days => :days)
-            AND apl.revenue_id IS NULL  -- Not yet linked to any payout
-            GROUP BY c.agent_id
-            ORDER BY total_commission DESC
-        """
-        
-        results = await database.fetch_all(query, {
-            "merchant_id": merchant_id,
-            "days": days
-        })
-        
-        # Calculate totals
-        total_amount = sum(float(r['total_commission']) for r in results)
-        total_transactions = sum(r['transaction_count'] for r in results)
-        unique_agents = len(results)
-        
+        period_end = datetime.now()
+        period_start = period_end - timedelta(days=days)
+
+        aggregated = await _fetch_unpaid_commission_entries(
+            merchant_id=merchant_id,
+            period_start=period_start,
+            period_end=period_end
+        )
+
+        if not aggregated:
+            return {
+                "status": "success",
+                "summary": {
+                    "total_amount": 0,
+                    "total_transactions": 0,
+                    "unique_agents": 0,
+                    "period_days": days
+                },
+                "agents": []
+            }
+
+        agents = []
+        total_amount = 0.0
+        total_transactions = 0
+
+        for agent_data in aggregated.values():
+            total_amount += agent_data["total_commission"]
+            total_transactions += agent_data["transaction_count"]
+            agents.append({
+                "agent_id": agent_data["agent_id"],
+                "transaction_count": agent_data["transaction_count"],
+                "total_commission": agent_data["total_commission"],
+                "currency": agent_data["currency"],
+                "earliest_transaction": agent_data["earliest"].isoformat() if agent_data["earliest"] else None,
+                "latest_transaction": agent_data["latest"].isoformat() if agent_data["latest"] else None
+            })
+
+        agents.sort(key=lambda item: item["total_commission"], reverse=True)
+
         return {
             "status": "success",
             "summary": {
                 "total_amount": total_amount,
                 "total_transactions": total_transactions,
-                "unique_agents": unique_agents,
+                "unique_agents": len(aggregated),
                 "period_days": days
             },
-            "agents": [
-                {
-                    "agent_id": r['agent_id'],
-                    "transaction_count": r['transaction_count'],
-                    "total_commission": float(r['total_commission']),
-                    "currency": r['currency'],
-                    "earliest_transaction": r['earliest_transaction'].isoformat() if r['earliest_transaction'] else None,
-                    "latest_transaction": r['latest_transaction'].isoformat() if r['latest_transaction'] else None
-                }
-                for r in results
-            ]
+            "agents": agents
         }
-        
+
     except Exception as e:
         logger.error(f"Failed to get pending commissions: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get pending commissions: {str(e)}")
@@ -105,72 +176,52 @@ async def generate_payouts_from_commissions(
         period_end = datetime.now()
         period_start = period_end - timedelta(days=days)
         
-        # Get unpaid commissions
-        if agent_ids:
-            # For specific agents
-            agent_filter = "AND c.agent_id = ANY(:agent_ids)"
-            params = {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end, "agent_ids": agent_ids}
-        else:
-            # For all agents with unpaid commissions
-            agent_filter = ""
-            params = {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end}
+        aggregated = await _fetch_unpaid_commission_entries(
+            merchant_id=merchant_id,
+            period_start=period_start,
+            period_end=period_end,
+            agent_ids=agent_ids
+        )
         
-        query = f"""
-            SELECT 
-                c.agent_id,
-                COALESCE(SUM(c.amount), 0) as total_commission,
-                'USD' as currency,
-                ARRAY_AGG(c.id) as revenue_ids
-            FROM commissions c
-            LEFT JOIN agent_payout_links apl ON c.id = apl.revenue_id
-            WHERE c.merchant_id = :merchant_id
-            AND c.type = 'agent'
-            AND c.created_at >= :period_start
-            AND c.created_at <= :period_end
-            AND apl.revenue_id IS NULL
-            {agent_filter}
-            GROUP BY c.agent_id
-            HAVING SUM(c.amount) > 0
-        """
-        
-        commissions = await database.fetch_all(query, params)
-        
-        if not commissions:
+        if not aggregated:
             return {
                 "status": "success",
                 "message": "No unpaid commissions found for the selected period",
                 "payouts_created": 0
             }
         
-        # Create payouts
+        # Create payouts per agent
         repo = PayoutRepo()
-        created_ids = []
+        created_ids: List[int] = []
         
-        for comm in commissions:
-            # Create payout record
+        for agent_id, agent_data in aggregated.items():
             payout_data = {
-                "agent_id": comm['agent_id'],
-                "amount": float(comm['total_commission']),
-                "currency": comm['currency'],
+                "agent_id": agent_id,
+                "amount": float(agent_data["total_commission"]),
+                "currency": agent_data["currency"],
                 "period_start": period_start.isoformat(),
                 "period_end": period_end.isoformat()
             }
+            payout_ids = await repo.create_bulk(merchant_id, [payout_data])
+            if not payout_ids:
+                continue
+            created_ids.extend(payout_ids)
+            payout_id = payout_ids[0]
             
-            payout_id = await repo.create_bulk(merchant_id, [payout_data])
-            
-            if payout_id:
-                created_ids.extend(payout_id)
-                
-                # Link commissions to payout
-                for revenue_id in comm['revenue_ids']:
-                    await database.execute(
-                        """
-                        INSERT INTO agent_payout_links (payout_id, revenue_id)
-                        VALUES (:payout_id, :revenue_id)
-                        ON CONFLICT DO NOTHING
-                        """,
-                        {"payout_id": payout_id[0], "revenue_id": revenue_id}
-                    )
+            # Link each commission entry to the newly created payout
+            for entry in agent_data["entries"]:
+                await database.execute(
+                    """
+                    INSERT INTO agent_payout_links (payout_id, revenue_id, amount)
+                    VALUES (:payout_id, :revenue_id, :amount)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    {
+                        "payout_id": payout_id,
+                        "revenue_id": entry["id"],
+                        "amount": entry["amount"]
+                    }
+                )
         
         return {
             "status": "success",

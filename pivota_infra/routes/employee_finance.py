@@ -35,22 +35,30 @@ async def get_finance_summary(
         else:  # all
             since = datetime(2020, 1, 1)  # Far past date
         
+        successful_statuses = (
+            'paid', 'captured', 'succeeded', 'completed', 'fulfilled'
+        )
+        status_params = {
+            "since": since,
+            "statuses": list(successful_statuses)
+        }
+        
         # Total Revenue (all paid orders)
         total_revenue = await database.fetch_val(
             """SELECT COALESCE(SUM(total), 0) FROM orders 
-               WHERE payment_status = 'paid' 
+               WHERE payment_status = ANY(:statuses)
                AND created_at >= :since
                AND (is_deleted IS NULL OR is_deleted = FALSE)""",
-            {"since": since}
+            status_params
         ) or 0
         
         # Total orders count
         total_orders = await database.fetch_val(
             """SELECT COUNT(*) FROM orders 
-               WHERE payment_status = 'paid'
+               WHERE payment_status = ANY(:statuses)
                AND created_at >= :since
                AND (is_deleted IS NULL OR is_deleted = FALSE)""",
-            {"since": since}
+            dict(status_params)
         ) or 0
         
         # Platform fee (assume 2.9% + $0.30 per transaction for now)
