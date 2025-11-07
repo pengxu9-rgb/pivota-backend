@@ -243,6 +243,7 @@ async def get_agent_details(
                 "use_case": agent.get("use_case") or "General integration",
                 "api_key": agent.get("api_key"),
                 "status": agent.get("status") or "active",
+                "agent_type": agent.get("agent_type"),  # [Phase 6.2] Include agent_type
                 "created_at": agent.get("created_at"),
                 "last_active": agent.get("last_active"),
                 "request_count": agent.get("request_count") or 0,
