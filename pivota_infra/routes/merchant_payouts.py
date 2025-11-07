@@ -199,8 +199,8 @@ async def generate_payouts_from_commissions(
                 "agent_id": agent_id,
                 "amount": float(agent_data["total_commission"]),
                 "currency": agent_data["currency"],
-                "period_start": period_start.isoformat(),
-                "period_end": period_end.isoformat()
+                "period_start": period_start,
+                "period_end": period_end
             }
             payout_ids = await repo.create_bulk(merchant_id, [payout_data])
             if not payout_ids:
