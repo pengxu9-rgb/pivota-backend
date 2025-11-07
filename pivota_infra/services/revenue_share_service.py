@@ -31,7 +31,10 @@ class RevenueShareService:
     
     def __init__(self, database: Database):
         self.database = database
-        self.platform_default = Decimal('0.015')  # 1.5% fallback
+        # [Phase 6.2] Platform-controlled fallback rate
+        # When merchant has no offer, use this rate (not agent's expectation)
+        self.platform_fallback_rate = Decimal('0.01')  # 1% platform fallback
+        self.platform_default = Decimal('0.015')  # 1.5% legacy fallback
         
     async def match_commission(
         self,
@@ -285,18 +288,25 @@ class RevenueShareService:
                     'platform_default_used': False
                 }
             else:
-                # Below minimum - use platform default
-                platform_rate = PLATFORM_DEFAULT_COMMISSION.get(agent_type, self.platform_default)
+                # Below minimum - use platform fallback
+                # [Phase 6.2] Apply minimum threshold and platform fallback
+                if order_amount < Decimal('50'):
+                    platform_rate = Decimal('0')
+                    note = 'Merchant offer below agent minimum & order below $50 threshold'
+                else:
+                    platform_rate = self.platform_fallback_rate
+                    note = 'Merchant offer below agent minimum, using platform fallback (1%)'
+                
                 return {
                     'actual_rate': float(platform_rate),
                     'actual_commission_rate': float(platform_rate),
                     'match_status': 'agent_below_min',
-                    'match_source': 'platform_default',
+                    'match_source': 'platform_policy',
                     'merchant_offered_rate': float(offered_rate),
                     'agent_expected_rate': float(expected_rate),
                     'agent_minimum_rate': float(min_rate),
                     'platform_default_used': True,
-                    'note': 'Merchant offer below agent minimum, using platform default'
+                    'note': note
                 }
         
         # Case 2: Only merchant has offer
@@ -313,19 +323,32 @@ class RevenueShareService:
                 'platform_default_used': False
             }
         
-        # Case 3: Only agent has expectation
+        # Case 3: Only agent has expectation (but no merchant offer)
         elif agent_expectation:
-            expected_rate = Decimal(str(agent_expectation.get('expected_commission_rate', self.platform_default)))
+            # [Phase 6.2] Platform-controlled fallback
+            # Don't use agent expectation when merchant has no offer
+            # This prevents agents from setting arbitrary rates
+            
+            # Apply minimum order threshold first
+            if order_amount < Decimal('50'):
+                rate = Decimal('0')
+                note = 'Order below $50 minimum threshold'
+            else:
+                # Use platform-controlled fallback rate (1%)
+                rate = self.platform_fallback_rate
+                note = 'No merchant offer, using platform fallback rate (1%)'
+            
+            expected_rate = Decimal(str(agent_expectation.get('expected_commission_rate', 0)))
             return {
-                'actual_rate': float(expected_rate),
-                'actual_commission_rate': float(expected_rate),
-                'match_status': 'fallback_platform',
-                'match_source': 'agent_expectation',
+                'actual_rate': float(rate),
+                'actual_commission_rate': float(rate),
+                'match_status': 'platform_fallback',
+                'match_source': 'platform_policy',
                 'merchant_offered_rate': None,
                 'agent_expected_rate': float(expected_rate),
                 'agent_minimum_rate': float(agent_expectation.get('min_acceptable_rate', 0)),
-                'platform_default_used': False,
-                'note': 'No merchant offer, using agent expectation'
+                'platform_default_used': True,
+                'note': note
             }
         
         # Case 4: No rules - platform default (with minimum threshold check)
@@ -350,21 +373,20 @@ class RevenueShareService:
                     'note': f'Order amount ${order_amount} below minimum threshold of $50'
                 }
             
-            # Above threshold - use platform default for agent type
-            platform_rate = PLATFORM_DEFAULT_COMMISSION.get(agent_type, self.platform_default)
-            logger.info(f"[Revenue Match] No rules found, using platform default for {agent_type}: {platform_rate}")
-            logger.info(f"[Revenue Match] PLATFORM_DEFAULT_COMMISSION: {PLATFORM_DEFAULT_COMMISSION}")
-            logger.info(f"[Revenue Match] self.platform_default: {self.platform_default}")
+            # Above threshold - use platform-controlled fallback rate
+            # [Phase 6.2] Platform-controlled fallback (1%)
+            platform_rate = self.platform_fallback_rate
+            logger.info(f"[Revenue Match] No rules found, using platform fallback rate: {platform_rate}")
             return {
                 'actual_rate': float(platform_rate),
                 'actual_commission_rate': float(platform_rate),
                 'match_status': 'no_rules',
-                'match_source': 'platform_default',
+                'match_source': 'platform_policy',
                 'merchant_offered_rate': None,
                 'agent_expected_rate': None,
                 'agent_minimum_rate': None,
                 'platform_default_used': True,
-                'note': f'No merchant or agent rules, using platform default for {agent_type}'
+                'note': f'No merchant or agent rules, using platform fallback rate (1%)'
             }
     
     async def log_matching(
@@ -398,6 +420,29 @@ class RevenueShareService:
             "agent_id": agent_id,
             "merchant_id": merchant_id,
             "merchant_offered": match_result.get('merchant_offered_rate'),
+            "agent_expected": match_result.get('agent_expected_rate'),
+            "agent_minimum": match_result.get('agent_minimum_rate'),
+            "actual_rate": match_result['actual_commission_rate'],
+            "match_status": match_result['match_status'],
+            "match_source": match_result['match_source'],
+            "platform_default": match_result['platform_default_used'],
+            "metadata": match_result.get('note', '')
+        })
+        
+        logger.info(f"[Phase 5.5] Logged revenue matching: id={result}, rate={match_result['actual_commission_rate']}")
+        
+        return result
+
+
+# [Phase 5.5] Test if module loads correctly
+if __name__ == "__main__":
+    print("[Phase 5.5] RevenueShareService module loaded")
+    print("Matching algorithm:")
+    print("  1. Merchant offer >= Agent expected → Use merchant offer")
+    print("  2. Merchant offer >= Agent minimum → Accept with note")
+    print("  3. Merchant offer < Agent minimum → Platform default")
+    print("  4. No rules → Platform default by agent type")
+
             "agent_expected": match_result.get('agent_expected_rate'),
             "agent_minimum": match_result.get('agent_minimum_rate'),
             "actual_rate": match_result['actual_commission_rate'],
