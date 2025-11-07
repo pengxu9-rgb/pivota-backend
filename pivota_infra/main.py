@@ -56,6 +56,7 @@ from routes.cleanup_all_duplicates import router as cleanup_all_duplicates_route
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.init_orders_table import router as init_orders_router
 from routes.employee_dashboard_routes import router as employee_dashboard_router
+from routes.employee_finance import router as employee_finance_router
 from routes.agents_mgmt import router as agents_router
 from routes.employees_security import router as employees_security_router
 from routes.mcp_mgmt import router as mcp_mgmt_router
@@ -408,6 +409,7 @@ app.include_router(cleanup_all_duplicates_router)  # Cleanup all duplicates
 app.include_router(admin_cleanup_router)  # Admin cleanup (no auth)
 app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
+app.include_router(employee_finance_router)  # Employee finance management
 # ⚠️ DISABLED: agents_router conflicts with agent_management_router (registered later at line 456)
 # agents_mgmt.py causes 500 errors due to missing fields (phone, etc.)
 # Use agent_management_router instead - has complete Phase 6.2 support
