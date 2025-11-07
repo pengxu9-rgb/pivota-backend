@@ -32,10 +32,10 @@ async def get_own_api_key(
         # Get agent's full API key
         query = """
             SELECT agent_id, api_key, name, created_at, last_active, 
-                   agent_type, email, status, is_active
+                   agent_type, email, status
             FROM agents 
             WHERE (agent_id = :agent_id OR email = :email)
-            AND is_active = true
+            AND status = 'active'
             LIMIT 1
         """
         
@@ -85,15 +85,13 @@ async def get_own_profile(
                 agent_id,
                 name,
                 email,
-                phone,
                 agent_type,
                 status,
                 created_at,
-                last_active,
-                total_requests,
-                is_active
+                last_active
             FROM agents
             WHERE (agent_id = :agent_id OR email = :email)
+            AND status = 'active'
             LIMIT 1
             """,
             {"agent_id": agent_id or "", "email": email or ""}
