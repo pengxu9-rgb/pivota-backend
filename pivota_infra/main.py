@@ -101,7 +101,8 @@ from routes.debug_commission_matching import router as debug_commission_matching
 from routes.debug_agent_tier import router as debug_agent_tier_router  # Debug Commission Matching
 from routes.admin_fix_psp_format import router as admin_fix_psp_format_router
 from routes.admin_fix_commission_offers import router as admin_fix_commission_offers_router
-from routes.agent_self_api import router as agent_self_api_router  # Fix PSP ID format
+from routes.agent_self_api import router as agent_self_api_router
+from routes.admin_fix_agent_type import router as admin_fix_agent_type_router  # Fix PSP ID format
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -441,6 +442,7 @@ app.include_router(debug_commission_matching_router)  # Debug Commission Matchin
 app.include_router(debug_agent_tier_router)  # Debug Agent Tier (no auth)
 app.include_router(admin_fix_psp_format_router)  # Fix PSP ID format (admin only)
 app.include_router(admin_fix_commission_offers_router)  # Fix commission offers (admin only)
+app.include_router(admin_fix_agent_type_router)  # Fix agent type NULL issues
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
     app.include_router(debug_products_router)  # Debug products endpoints
