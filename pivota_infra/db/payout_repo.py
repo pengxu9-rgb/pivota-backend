@@ -96,7 +96,7 @@ class PayoutRepo:
                 query="""
                 INSERT INTO agent_payouts
                 (merchant_id, agent_id, amount, currency, status, period_start, period_end, metadata)
-                VALUES (:mid, :aid, :amt, COALESCE(:ccy,'USD'), 'pending', :p0, :p1, COALESCE(:meta, '{}'))
+                VALUES (:mid, :aid, :amt, COALESCE(:ccy,'USD'), 'pending', :p0, :p1, COALESCE(:meta, '{}'::jsonb))
                 RETURNING id
                 """,
                 values={
