@@ -64,20 +64,24 @@ async def get_finance_summary(
             dict(status_params)
         ) or 0
         
+        # Query actual agent commissions from commissions table
+        agent_commissions_raw = await database.fetch_val(
+            """SELECT COALESCE(SUM(amount), 0) FROM commissions
+               WHERE type = 'agent'
+               AND created_at >= :since""",
+            {"since": since}
+        ) or 0
+        agent_commissions = float(agent_commissions_raw)
+        
         # Platform fee (assume 2.9% + $0.30 per transaction for now)
         # TODO: Get actual PSP fees from payment records
         estimated_fees = float(total_orders) * 0.30 + (total_revenue * 0.029)
         
-        # Platform revenue (simplified: assume we take 1% commission)
-        platform_commission_rate = 0.01
-        platform_revenue = total_revenue * platform_commission_rate
+        # Platform revenue - currently $0 (not charging yet)
+        platform_revenue = 0.0
         
-        # Merchant payouts (revenue - fees - platform commission)
-        merchant_payouts = total_revenue - estimated_fees - platform_revenue
-        
-        # Agent commissions (assume 10% of platform revenue for now)
-        # TODO: Implement proper agent commission structure
-        agent_commissions = platform_revenue * 0.10
+        # Merchant payouts = revenue - PSP fees - agent commissions
+        merchant_payouts = total_revenue - estimated_fees - agent_commissions
         
         return {
             "status": "success",
