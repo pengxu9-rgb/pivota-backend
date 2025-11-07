@@ -117,7 +117,7 @@ class BeneficiaryRepo:
               account_number_last4 = COALESCE(:last4, account_number_last4),
               iban_preview = COALESCE(:preview, iban_preview),
               allow_share_with_merchants = :share,
-              metadata = COALESCE(:meta, metadata),
+              metadata = COALESCE(:meta, metadata, '{}'::jsonb),
               updated_at = NOW()
             WHERE agent_id = :aid AND method = :method AND currency = :currency
             RETURNING id
@@ -153,7 +153,7 @@ class BeneficiaryRepo:
             VALUES 
             (:aid, :method, :currency, :name, :iban, :bic, 
              :bank, :country, :acct, :routing, 
-             :last4, :preview, :share, COALESCE(:meta, '{}'))
+             :last4, :preview, :share, COALESCE(:meta, '{}'::jsonb))
             RETURNING id
             """
             
