@@ -8,6 +8,7 @@ import asyncio
 import logging
 import time
 import uvicorn
+from pathlib import Path
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -93,6 +94,10 @@ from routes.agent_analytics import router as agent_analytics_router
 from routes.admin_settlement_batch import router as admin_settlement_batch_router  # Phase 6 - Settlement Batch Processing
 from routes.stripe_connect_integration import router as stripe_connect_router  # Phase 6.1 - Stripe Connect Payouts
 from routes.agent_payout_management import router as agent_payout_router  # Phase 6.1 - Agent Payout Settings
+from routes.merchant_payouts import router as merchant_payouts_router  # Phase 6 - Merchant Payout Management
+from routes.agent_payouts import router as agent_payouts_router  # Phase 6 - Agent Payout View
+from routes.agent_bank import router as agent_bank_router  # Phase 6 - Agent Bank Management
+from routes.employee_payouts import router as employee_payouts_router  # Phase 6 - Employee Payout Management
 from routes.debug_stripe_connect import router as debug_stripe_connect_router  # Debug Stripe Connect
 from routes.test_stripe_simple import router as test_stripe_simple_router  # Test Stripe Simple
 from routes.test_commission_flow import router as test_commission_flow_router  # Test Commission Flow
@@ -437,6 +442,10 @@ app.include_router(agent_analytics_router)  # Agent analytics (funnel, queries)
 app.include_router(admin_settlement_batch_router)  # Phase 6 - Settlement batch processing
 app.include_router(stripe_connect_router)  # Phase 6.1 - Stripe Connect integration
 app.include_router(agent_payout_router)  # Phase 6.1 - Agent payout management
+app.include_router(merchant_payouts_router)  # Phase 6 - Merchant payout management
+app.include_router(agent_payouts_router)  # Phase 6 - Agent payout view
+app.include_router(agent_bank_router)  # Phase 6 - Agent bank management
+app.include_router(employee_payouts_router)  # Phase 6 - Employee payout management
 app.include_router(debug_stripe_connect_router)  # Debug Stripe Connect
 app.include_router(test_stripe_simple_router)  # Test Stripe Simple
 app.include_router(test_commission_flow_router)  # Test Commission Flow
@@ -605,6 +614,47 @@ async def startup():
         # Test the connection
         await database.execute("SELECT 1")
         logger.info("✅ Database connection test passed")
+        
+        # Run Phase 6 Payout migrations if needed
+        try:
+            # Check if payout tables exist
+            result = await database.fetch_one(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'agent_payouts'"
+            )
+            
+            if result and result[0] == 0:
+                logger.info("🚀 Running Phase 6 payout migrations...")
+                
+                # Run migration 019 - agent_payouts
+                migration_019_path = Path("pivota_infra/db/migrations/019_agent_payouts.sql")
+                if migration_019_path.exists():
+                    with open(migration_019_path, 'r') as f:
+                        migration_sql = f.read()
+                        # Split by semicolon and execute each statement
+                        statements = [s.strip() for s in migration_sql.split(';') if s.strip()]
+                        for statement in statements:
+                            if statement:
+                                await database.execute(statement)
+                    logger.info("✅ Migration 019_agent_payouts.sql completed")
+                
+                # Run migration 020 - agent_beneficiaries  
+                migration_020_path = Path("pivota_infra/db/migrations/020_agent_beneficiaries.sql")
+                if migration_020_path.exists():
+                    with open(migration_020_path, 'r') as f:
+                        migration_sql = f.read()
+                        # Split by semicolon and execute each statement
+                        statements = [s.strip() for s in migration_sql.split(';') if s.strip()]
+                        for statement in statements:
+                            if statement:
+                                await database.execute(statement)
+                    logger.info("✅ Migration 020_agent_beneficiaries.sql completed")
+                    
+                logger.info("✅ Phase 6 payout tables created successfully")
+            else:
+                logger.info("✅ Payout tables already exist, skipping migration")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Payout migration check/run skipped: {e}")
         
         # Run automatic migrations
         try:
