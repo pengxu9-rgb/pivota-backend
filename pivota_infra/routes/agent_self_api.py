@@ -62,8 +62,10 @@ async def get_own_api_key(
         }
         
     except Exception as e:
-        logger.error(f"Failed to get own API key: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve API key")
+        logger.error(f"Failed to get own API key for agent_id={agent_id}, email={email}: {str(e)}")
+        logger.error(f"Query executed: {query}")
+        logger.error(f"Parameters: agent_id={agent_id or 'None'}, email={email or 'None'}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.get("/profile")
 async def get_own_profile(
