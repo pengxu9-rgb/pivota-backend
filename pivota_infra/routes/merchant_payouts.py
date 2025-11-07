@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from datetime import date, timedelta, datetime
 from db.database import database
 from db.payout_repo import PayoutRepo
-from auth.jwt_handler import get_current_user
+from utils.auth import get_current_user
 import logging
 
 logger = logging.getLogger(__name__)
