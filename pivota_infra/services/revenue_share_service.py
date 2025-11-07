@@ -289,13 +289,9 @@ class RevenueShareService:
                 }
             else:
                 # Below minimum - use platform fallback
-                # [Phase 6.2] Apply minimum threshold and platform fallback
-                if order_amount < Decimal('50'):
-                    platform_rate = Decimal('0')
-                    note = 'Merchant offer below agent minimum & order below $50 threshold'
-                else:
-                    platform_rate = self.platform_fallback_rate
-                    note = 'Merchant offer below agent minimum, using platform fallback (1%)'
+                # [Phase 6.2] Always use platform fallback rate (1%)
+                platform_rate = self.platform_fallback_rate
+                note = 'Merchant offer below agent minimum, using platform fallback (1%)'
                 
                 return {
                     'actual_rate': float(platform_rate),
@@ -329,14 +325,9 @@ class RevenueShareService:
             # Don't use agent expectation when merchant has no offer
             # This prevents agents from setting arbitrary rates
             
-            # Apply minimum order threshold first
-            if order_amount < Decimal('50'):
-                rate = Decimal('0')
-                note = 'Order below $50 minimum threshold'
-            else:
-                # Use platform-controlled fallback rate (1%)
-                rate = self.platform_fallback_rate
-                note = 'No merchant offer, using platform fallback rate (1%)'
+            # Always use platform-controlled fallback rate (1%)
+            rate = self.platform_fallback_rate
+            note = 'No merchant offer, using platform fallback rate (1%)'
             
             expected_rate = Decimal(str(agent_expectation.get('expected_commission_rate', 0)))
             return {
@@ -351,30 +342,10 @@ class RevenueShareService:
                 'note': note
             }
         
-        # Case 4: No rules - platform default (with minimum threshold check)
+        # Case 4: No rules - platform fallback
         else:
-            # [Phase 6.2] Platform defaults should also respect minimum order thresholds
-            # All Agents: $50 minimum
-            # Premium: $100 minimum for 5% (but can get 2.5% at $50)
-            
-            # Check minimum thresholds
-            if order_amount < Decimal('50'):
-                # Below minimum threshold - no commission
-                logger.info(f"[Revenue Match] Order amount ${order_amount} below $50 minimum, no commission")
-                return {
-                    'actual_rate': 0,
-                    'actual_commission_rate': 0,
-                    'match_status': 'below_minimum',
-                    'match_source': 'platform_policy',
-                    'merchant_offered_rate': None,
-                    'agent_expected_rate': None,
-                    'agent_minimum_rate': None,
-                    'platform_default_used': False,
-                    'note': f'Order amount ${order_amount} below minimum threshold of $50'
-                }
-            
-            # Above threshold - use platform-controlled fallback rate
             # [Phase 6.2] Platform-controlled fallback (1%)
+            # No minimum threshold in fallback - that's controlled by merchant offers
             platform_rate = self.platform_fallback_rate
             logger.info(f"[Revenue Match] No rules found, using platform fallback rate: {platform_rate}")
             return {
