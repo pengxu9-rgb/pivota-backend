@@ -97,6 +97,7 @@ from routes.admin_settlement_batch import router as admin_settlement_batch_route
 from routes.stripe_connect_integration import router as stripe_connect_router  # Phase 6.1 - Stripe Connect Payouts
 from routes.agent_payout_management import router as agent_payout_router  # Phase 6.1 - Agent Payout Settings
 from routes.merchant_payouts import router as merchant_payouts_router  # Phase 6 - Merchant Payout Management
+from routes.merchant_agent_bank import router as merchant_agent_bank_router  # Phase 6 - Merchant View Agent Bank
 from routes.agent_payouts import router as agent_payouts_router  # Phase 6 - Agent Payout View
 from routes.agent_bank import router as agent_bank_router  # Phase 6 - Agent Bank Management
 from routes.employee_payouts import router as employee_payouts_router  # Phase 6 - Employee Payout Management
@@ -447,6 +448,7 @@ app.include_router(admin_settlement_batch_router)  # Phase 6 - Settlement batch 
 app.include_router(stripe_connect_router)  # Phase 6.1 - Stripe Connect integration
 app.include_router(agent_payout_router)  # Phase 6.1 - Agent payout management
 app.include_router(merchant_payouts_router)  # Phase 6 - Merchant payout management
+app.include_router(merchant_agent_bank_router)  # Phase 6 - Merchant view agent bank
 app.include_router(agent_payouts_router)  # Phase 6 - Agent payout view
 app.include_router(agent_bank_router)  # Phase 6 - Agent bank management
 app.include_router(employee_payouts_router)  # Phase 6 - Employee payout management
