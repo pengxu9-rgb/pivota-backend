@@ -33,22 +33,23 @@ async def get_pending_commissions(
     This shows what commission is owed but hasn't been converted to payouts yet
     """
     try:
-        # Query unpaid commissions from agent_revenues table
+        # Query unpaid commissions from commissions table
         # Exclude commissions that are already linked to payouts
         query = """
             SELECT 
-                ar.agent_id,
-                COUNT(DISTINCT ar.id) as transaction_count,
-                COALESCE(SUM(ar.commission_amount), 0) as total_commission,
-                ar.currency,
-                MIN(ar.created_at) as earliest_transaction,
-                MAX(ar.created_at) as latest_transaction
-            FROM agent_revenues ar
-            LEFT JOIN agent_payout_links apl ON ar.id = apl.revenue_id
-            WHERE ar.merchant_id = :merchant_id
-            AND ar.created_at >= NOW() - INTERVAL ':days days'
+                c.agent_id,
+                COUNT(DISTINCT c.id) as transaction_count,
+                COALESCE(SUM(c.amount), 0) as total_commission,
+                'USD' as currency,
+                MIN(c.created_at) as earliest_transaction,
+                MAX(c.created_at) as latest_transaction
+            FROM commissions c
+            LEFT JOIN agent_payout_links apl ON c.id = apl.revenue_id
+            WHERE c.merchant_id = :merchant_id
+            AND c.type = 'agent'
+            AND c.created_at >= NOW() - make_interval(days => :days)
             AND apl.revenue_id IS NULL  -- Not yet linked to any payout
-            GROUP BY ar.agent_id, ar.currency
+            GROUP BY c.agent_id
             ORDER BY total_commission DESC
         """
         
@@ -107,7 +108,7 @@ async def generate_payouts_from_commissions(
         # Get unpaid commissions
         if agent_ids:
             # For specific agents
-            agent_filter = "AND ar.agent_id = ANY(:agent_ids)"
+            agent_filter = "AND c.agent_id = ANY(:agent_ids)"
             params = {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end, "agent_ids": agent_ids}
         else:
             # For all agents with unpaid commissions
@@ -116,19 +117,20 @@ async def generate_payouts_from_commissions(
         
         query = f"""
             SELECT 
-                ar.agent_id,
-                COALESCE(SUM(ar.commission_amount), 0) as total_commission,
-                ar.currency,
-                ARRAY_AGG(ar.id) as revenue_ids
-            FROM agent_revenues ar
-            LEFT JOIN agent_payout_links apl ON ar.id = apl.revenue_id
-            WHERE ar.merchant_id = :merchant_id
-            AND ar.created_at >= :period_start
-            AND ar.created_at <= :period_end
+                c.agent_id,
+                COALESCE(SUM(c.amount), 0) as total_commission,
+                'USD' as currency,
+                ARRAY_AGG(c.id) as revenue_ids
+            FROM commissions c
+            LEFT JOIN agent_payout_links apl ON c.id = apl.revenue_id
+            WHERE c.merchant_id = :merchant_id
+            AND c.type = 'agent'
+            AND c.created_at >= :period_start
+            AND c.created_at <= :period_end
             AND apl.revenue_id IS NULL
             {agent_filter}
-            GROUP BY ar.agent_id, ar.currency
-            HAVING SUM(ar.commission_amount) > 0
+            GROUP BY c.agent_id
+            HAVING SUM(c.amount) > 0
         """
         
         commissions = await database.fetch_all(query, params)
