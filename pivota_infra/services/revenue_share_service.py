@@ -328,8 +328,29 @@ class RevenueShareService:
                 'note': 'No merchant offer, using agent expectation'
             }
         
-        # Case 4: No rules - platform default
+        # Case 4: No rules - platform default (with minimum threshold check)
         else:
+            # [Phase 6.2] Platform defaults should also respect minimum order thresholds
+            # All Agents: $50 minimum
+            # Premium: $100 minimum for 5% (but can get 2.5% at $50)
+            
+            # Check minimum thresholds
+            if order_amount < Decimal('50'):
+                # Below minimum threshold - no commission
+                logger.info(f"[Revenue Match] Order amount ${order_amount} below $50 minimum, no commission")
+                return {
+                    'actual_rate': 0,
+                    'actual_commission_rate': 0,
+                    'match_status': 'below_minimum',
+                    'match_source': 'platform_policy',
+                    'merchant_offered_rate': None,
+                    'agent_expected_rate': None,
+                    'agent_minimum_rate': None,
+                    'platform_default_used': False,
+                    'note': f'Order amount ${order_amount} below minimum threshold of $50'
+                }
+            
+            # Above threshold - use platform default for agent type
             platform_rate = PLATFORM_DEFAULT_COMMISSION.get(agent_type, self.platform_default)
             logger.info(f"[Revenue Match] No rules found, using platform default for {agent_type}: {platform_rate}")
             logger.info(f"[Revenue Match] PLATFORM_DEFAULT_COMMISSION: {PLATFORM_DEFAULT_COMMISSION}")
