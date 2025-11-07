@@ -44,13 +44,16 @@ async def get_finance_summary(
         }
         
         # Total Revenue (all paid orders)
-        total_revenue = await database.fetch_val(
+        total_revenue_raw = await database.fetch_val(
             """SELECT COALESCE(SUM(total), 0) FROM orders 
                WHERE payment_status = ANY(:statuses)
                AND created_at >= :since
                AND (is_deleted IS NULL OR is_deleted = FALSE)""",
             status_params
         ) or 0
+        
+        # Convert to float to avoid Decimal * float errors
+        total_revenue = float(total_revenue_raw)
         
         # Total orders count
         total_orders = await database.fetch_val(
@@ -63,7 +66,7 @@ async def get_finance_summary(
         
         # Platform fee (assume 2.9% + $0.30 per transaction for now)
         # TODO: Get actual PSP fees from payment records
-        estimated_fees = total_orders * 0.30 + (total_revenue * 0.029)
+        estimated_fees = float(total_orders) * 0.30 + (total_revenue * 0.029)
         
         # Platform revenue (simplified: assume we take 1% commission)
         platform_commission_rate = 0.01
