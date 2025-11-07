@@ -25,8 +25,8 @@ async def _fetch_unpaid_commission_entries(
     period_end: datetime,
     agent_ids: Optional[List[str]] = None
 ) -> Dict[str, Dict[str, Any]]:
-    """Load unpaid commission rows (legacy agent_revenue_logs) and aggregate per agent."""
-    agent_filter = "AND ar.agent_id = ANY(:agent_ids)" if agent_ids else ""
+    """Load unpaid commission rows from commissions table and aggregate per agent."""
+    agent_filter = "AND c.agent_id = ANY(:agent_ids)" if agent_ids else ""
     params: Dict[str, Any] = {
         "merchant_id": merchant_id,
         "period_start": period_start,
@@ -35,30 +35,24 @@ async def _fetch_unpaid_commission_entries(
     if agent_ids:
         params["agent_ids"] = agent_ids
 
-    successful_statuses = ['paid', 'captured', 'succeeded', 'completed', 'fulfilled']
-    params["statuses"] = successful_statuses
-
     rows = await database.fetch_all(
         f"""
         SELECT 
-            ar.id,
-            ar.agent_id,
-            COALESCE(ar.currency, o.currency, 'USD') AS currency,
-            ar.agent_earned_amount,
-            ar.created_at,
-            o.order_id,
-            o.payment_status
-        FROM agent_revenue_logs ar
-        LEFT JOIN orders o ON o.order_id = ar.tx_id
-        LEFT JOIN agent_payout_links apl ON ar.id = apl.revenue_id
-        WHERE COALESCE(ar.merchant_id, o.merchant_id) = :merchant_id
-          AND ar.agent_id IS NOT NULL
-          AND ar.created_at >= :period_start
-          AND ar.created_at <= :period_end
-          AND (ar.settlement_status IS NULL OR ar.settlement_status IN ('pending','processing'))
+            c.id,
+            c.agent_id,
+            c.amount,
+            c.created_at,
+            'USD' as currency
+        FROM commissions c
+        LEFT JOIN agent_payout_links apl ON c.id = apl.revenue_id
+        WHERE c.merchant_id = :merchant_id
+          AND c.type = 'agent'
+          AND c.agent_id IS NOT NULL
+          AND c.created_at >= :period_start
+          AND c.created_at <= :period_end
           AND apl.revenue_id IS NULL
-          AND (o.order_id IS NULL OR (o.payment_status = ANY(:statuses) AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)))
-        ORDER BY ar.created_at DESC
+          {agent_filter}
+        ORDER BY c.created_at DESC
         """,
         params
     )
@@ -68,7 +62,7 @@ async def _fetch_unpaid_commission_entries(
         agent_id = row["agent_id"]
         if not agent_id:
             continue
-        amount = float(row["agent_earned_amount"] or 0)
+        amount = float(row["amount"] or 0)
         created_at = row["created_at"]
         currency = row["currency"] or "USD"
 
