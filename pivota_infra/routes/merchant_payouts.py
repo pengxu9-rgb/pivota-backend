@@ -1,62 +1,192 @@
 """
 Merchant Payout Management Routes
-Allows merchants to create, upload, and manage agent payouts
-Phase 6 - Payouts & Banking
+Handles commission payout operations for merchants
 """
 
-from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
-from typing import Optional, List
-from pydantic import BaseModel, Field
-from datetime import date, datetime
-import logging
-
+from fastapi import APIRouter, Depends, Query, Path, HTTPException
+from typing import Optional, List, Dict, Any
+from datetime import date, timedelta, datetime
 from db.database import database
 from db.payout_repo import PayoutRepo
-from utils.auth import get_current_user
+from auth.jwt_handler import get_current_user
+import logging
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/merchants/{merchant_id}/payouts", tags=["merchant-payouts"])
+router = APIRouter(
+    prefix="/merchants/{merchant_id}/payouts",
+    tags=["payouts"]
+)
 
-# Request/Response Models
-class PayoutItem(BaseModel):
-    agent_id: str
-    amount: float = Field(gt=0, description="Payout amount")
-    currency: Optional[str] = "USD"
-    period_start: date
-    period_end: date
-    metadata: Optional[dict] = None
+# ============================================================================
+# Pending Commissions (NEW - to show what needs to be paid)
+# ============================================================================
 
-class CreatePayoutRequest(BaseModel):
-    items: List[PayoutItem]
+@router.get("/pending-commissions")
+async def get_pending_commissions(
+    merchant_id: str,
+    days: int = Query(30, ge=1, le=365, description="Period to check (days)"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get summary of unpaid commissions grouped by agent
+    This shows what commission is owed but hasn't been converted to payouts yet
+    """
+    try:
+        # Query unpaid commissions from agent_revenues table
+        # Exclude commissions that are already linked to payouts
+        query = """
+            SELECT 
+                ar.agent_id,
+                COUNT(DISTINCT ar.id) as transaction_count,
+                COALESCE(SUM(ar.commission_amount), 0) as total_commission,
+                ar.currency,
+                MIN(ar.created_at) as earliest_transaction,
+                MAX(ar.created_at) as latest_transaction
+            FROM agent_revenues ar
+            LEFT JOIN agent_payout_links apl ON ar.id = apl.revenue_id
+            WHERE ar.merchant_id = :merchant_id
+            AND ar.created_at >= NOW() - INTERVAL ':days days'
+            AND apl.revenue_id IS NULL  -- Not yet linked to any payout
+            GROUP BY ar.agent_id, ar.currency
+            ORDER BY total_commission DESC
+        """
+        
+        results = await database.fetch_all(query, {
+            "merchant_id": merchant_id,
+            "days": days
+        })
+        
+        # Calculate totals
+        total_amount = sum(float(r['total_commission']) for r in results)
+        total_transactions = sum(r['transaction_count'] for r in results)
+        unique_agents = len(results)
+        
+        return {
+            "status": "success",
+            "summary": {
+                "total_amount": total_amount,
+                "total_transactions": total_transactions,
+                "unique_agents": unique_agents,
+                "period_days": days
+            },
+            "agents": [
+                {
+                    "agent_id": r['agent_id'],
+                    "transaction_count": r['transaction_count'],
+                    "total_commission": float(r['total_commission']),
+                    "currency": r['currency'],
+                    "earliest_transaction": r['earliest_transaction'].isoformat() if r['earliest_transaction'] else None,
+                    "latest_transaction": r['latest_transaction'].isoformat() if r['latest_transaction'] else None
+                }
+                for r in results
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get pending commissions: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get pending commissions: {str(e)}")
 
-class UploadPayoutRequest(BaseModel):
-    reference: str = Field(..., description="Payment reference number")
-    file_url: Optional[str] = Field(None, description="URL to payment proof")
-    method: Optional[str] = Field(None, description="Payment method (wire, ach, paypal)")
-    provider: Optional[str] = Field(None, description="Payment provider name")
-    external_id: Optional[str] = Field(None, description="External transaction ID")
 
-class PayoutResponse(BaseModel):
-    id: int
-    merchant_id: str
-    agent_id: str
-    amount: float
-    currency: str
-    status: str
-    payout_reference: Optional[str]
-    file_url: Optional[str]
-    method: Optional[str]
-    provider: Optional[str]
-    external_id: Optional[str]
-    period_start: date
-    period_end: date
-    uploaded_at: Optional[datetime]
-    confirmed_at: Optional[datetime]
-    created_at: datetime
-    updated_at: datetime
+@router.post("/generate-from-commissions")
+async def generate_payouts_from_commissions(
+    merchant_id: str,
+    days: int = Query(30, ge=1, le=365, description="Period to include (days)"),
+    agent_ids: Optional[List[str]] = None,  # If None, generate for all agents
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate payouts from unpaid commissions
+    Creates payout records and links them to the source commissions
+    """
+    try:
+        # Calculate period
+        period_end = datetime.now()
+        period_start = period_end - timedelta(days=days)
+        
+        # Get unpaid commissions
+        if agent_ids:
+            # For specific agents
+            agent_filter = "AND ar.agent_id = ANY(:agent_ids)"
+            params = {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end, "agent_ids": agent_ids}
+        else:
+            # For all agents with unpaid commissions
+            agent_filter = ""
+            params = {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end}
+        
+        query = f"""
+            SELECT 
+                ar.agent_id,
+                COALESCE(SUM(ar.commission_amount), 0) as total_commission,
+                ar.currency,
+                ARRAY_AGG(ar.id) as revenue_ids
+            FROM agent_revenues ar
+            LEFT JOIN agent_payout_links apl ON ar.id = apl.revenue_id
+            WHERE ar.merchant_id = :merchant_id
+            AND ar.created_at >= :period_start
+            AND ar.created_at <= :period_end
+            AND apl.revenue_id IS NULL
+            {agent_filter}
+            GROUP BY ar.agent_id, ar.currency
+            HAVING SUM(ar.commission_amount) > 0
+        """
+        
+        commissions = await database.fetch_all(query, params)
+        
+        if not commissions:
+            return {
+                "status": "success",
+                "message": "No unpaid commissions found for the selected period",
+                "payouts_created": 0
+            }
+        
+        # Create payouts
+        repo = PayoutRepo()
+        created_ids = []
+        
+        for comm in commissions:
+            # Create payout record
+            payout_data = {
+                "agent_id": comm['agent_id'],
+                "amount": float(comm['total_commission']),
+                "currency": comm['currency'],
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat()
+            }
+            
+            payout_id = await repo.create_bulk(merchant_id, [payout_data])
+            
+            if payout_id:
+                created_ids.extend(payout_id)
+                
+                # Link commissions to payout
+                for revenue_id in comm['revenue_ids']:
+                    await database.execute(
+                        """
+                        INSERT INTO agent_payout_links (payout_id, revenue_id)
+                        VALUES (:payout_id, :revenue_id)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        {"payout_id": payout_id[0], "revenue_id": revenue_id}
+                    )
+        
+        return {
+            "status": "success",
+            "message": f"Created {len(created_ids)} payouts",
+            "payouts_created": len(created_ids),
+            "payout_ids": created_ids
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to generate payouts: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate payouts: {str(e)}")
 
-@router.get("", response_model=dict)
+
+# ============================================================================
+# Payout Management (Existing functionality)
+# ============================================================================
+
+@router.get("")
 async def list_payouts(
     merchant_id: str,
     status: Optional[str] = Query(None, description="Filter by status: pending, uploaded, paid"),
@@ -64,280 +194,143 @@ async def list_payouts(
     size: int = Query(50, ge=1, le=500),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    List all payouts for a merchant with optional status filter
-    """
-    # Verify merchant access
-    if current_user.get("role") != "merchant":
-        raise HTTPException(status_code=403, detail="Only merchants can access this endpoint")
-    
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Not authorized to access this merchant's payouts")
-    
+    """List all payouts for a merchant"""
     try:
         repo = PayoutRepo()
+        offset = (page - 1) * size
         
-        # Get paginated results
         items = await repo.list(
             merchant_id=merchant_id,
-            agent_id=None,
             status=status,
             limit=size,
-            offset=(page-1)*size
+            offset=offset
         )
         
-        # Get total count for pagination
-        count_query = "SELECT COUNT(*) as total FROM agent_payouts WHERE merchant_id = :mid"
-        params = {"mid": merchant_id}
-        if status:
-            count_query += " AND status = :st"
-            params["st"] = status
-        
-        total_result = await database.fetch_one(query=count_query, values=params)
-        total = total_result["total"] if total_result else 0
-        
-        # Get summary statistics
-        summary = await repo.get_summary_by_merchant(merchant_id, status)
+        # Get summary
+        summary = await repo.get_summary_by_merchant(merchant_id)
         
         return {
+            "status": "success",
             "items": items,
-            "total": total,
-            "page": page,
-            "pages": (total + size - 1) // size if size > 0 else 0,
-            "summary": summary
+            "summary": summary,
+            "pagination": {
+                "page": page,
+                "size": size,
+                "total": len(items)
+            }
         }
         
     except Exception as e:
-        logger.error(f"Error listing payouts for merchant {merchant_id}: {e}")
+        logger.error(f"Failed to list payouts: {e}")
         raise HTTPException(status_code=500, detail="Failed to list payouts")
 
-@router.post("/bulk", response_model=dict)
+
+@router.post("/bulk")
 async def create_bulk_payouts(
     merchant_id: str,
-    request: CreatePayoutRequest,
+    body: Dict[str, Any],
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Create multiple payouts in bulk
-    """
-    # Verify merchant access
-    if current_user.get("role") != "merchant":
-        raise HTTPException(status_code=403, detail="Only merchants can access this endpoint")
-    
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+    """Create multiple payouts at once"""
     try:
-        # Validate items
-        if not request.items:
+        items = body.get("items", [])
+        if not items:
             raise HTTPException(status_code=400, detail="No payout items provided")
         
-        if len(request.items) > 1000:
-            raise HTTPException(status_code=400, detail="Maximum 1000 payouts per batch")
-        
-        # Convert Pydantic models to dicts
-        items_data = [item.dict() for item in request.items]
-        
-        # Create payouts
         repo = PayoutRepo()
-        ids = await repo.create_bulk(merchant_id, items_data)
-        
-        logger.info(f"Merchant {merchant_id} created {len(ids)} payouts")
+        ids = await repo.create_bulk(merchant_id, items)
         
         return {
             "status": "success",
             "created": len(ids),
-            "ids": ids,
-            "message": f"Created {len(ids)} payouts successfully"
+            "ids": ids
         }
         
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Error creating bulk payouts: {e}")
-        raise HTTPException(status_code=500, detail="Failed to create payouts")
+        logger.error(f"Failed to create payouts: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create payouts: {str(e)}")
 
-@router.get("/{payout_id}", response_model=PayoutResponse)
+
+@router.get("/{payout_id}")
 async def get_payout_details(
     merchant_id: str,
     payout_id: int,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Get details of a specific payout
-    """
-    # Verify merchant access
-    if current_user.get("role") != "merchant":
-        raise HTTPException(status_code=403, detail="Only merchants can access this endpoint")
-    
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+    """Get detailed information about a specific payout"""
     try:
-        repo = PayoutRepo()
-        payout = await repo.get_by_id(payout_id)
+        query = """
+            SELECT * FROM agent_payouts
+            WHERE id = :payout_id AND merchant_id = :merchant_id
+        """
+        
+        payout = await database.fetch_one(query, {
+            "payout_id": payout_id,
+            "merchant_id": merchant_id
+        })
         
         if not payout:
             raise HTTPException(status_code=404, detail="Payout not found")
-        
-        if payout["merchant_id"] != merchant_id:
-            raise HTTPException(status_code=403, detail="Not authorized to access this payout")
-        
-        return payout
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting payout {payout_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get payout details")
-
-@router.post("/{payout_id}/upload", response_model=dict)
-async def upload_payout_proof(
-    merchant_id: str,
-    payout_id: int,
-    request: UploadPayoutRequest,
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    Upload payment proof and mark payout as uploaded
-    """
-    # Verify merchant access
-    if current_user.get("role") != "merchant":
-        raise HTTPException(status_code=403, detail="Only merchants can access this endpoint")
-    
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    try:
-        # Verify payout belongs to merchant and is pending
-        repo = PayoutRepo()
-        payout = await repo.get_by_id(payout_id)
-        
-        if not payout:
-            raise HTTPException(status_code=404, detail="Payout not found")
-        
-        if payout["merchant_id"] != merchant_id:
-            raise HTTPException(status_code=403, detail="Not authorized to update this payout")
-        
-        if payout["status"] != "pending":
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Payout is already {payout['status']}. Only pending payouts can be uploaded."
-            )
-        
-        # Upload payment proof
-        await repo.upload(
-            payout_id=payout_id,
-            reference=request.reference,
-            file_url=request.file_url,
-            method=request.method,
-            provider=request.provider,
-            external_id=request.external_id
-        )
-        
-        logger.info(f"Merchant {merchant_id} uploaded proof for payout {payout_id}")
         
         return {
             "status": "success",
-            "message": "Payment proof uploaded successfully",
-            "payout_id": payout_id,
-            "new_status": "uploaded"
+            "payout": dict(payout)
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error uploading proof for payout {payout_id}: {e}")
+        logger.error(f"Failed to get payout: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get payout")
+
+
+@router.post("/{payout_id}/upload")
+async def upload_payment_proof(
+    merchant_id: str,
+    payout_id: int,
+    body: Dict[str, Any],
+    current_user: dict = Depends(get_current_user)
+):
+    """Upload payment proof and mark payout as uploaded"""
+    try:
+        repo = PayoutRepo()
+        await repo.upload(
+            payout_id=payout_id,
+            reference=body.get("reference"),
+            file_url=body.get("file_url"),
+            method=body.get("method"),
+            provider=body.get("provider"),
+            external_id=body.get("external_id")
+        )
+        
+        return {
+            "status": "success",
+            "message": "Payment proof uploaded"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to upload proof: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload payment proof")
 
-@router.get("/export/csv", response_model=dict)
+
+@router.get("/export/csv")
 async def export_payouts_csv(
     merchant_id: str,
     status: Optional[str] = Query(None),
-    start_date: Optional[date] = Query(None),
-    end_date: Optional[date] = Query(None),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Export payouts as CSV (returns data, frontend handles download)
-    """
-    # Verify merchant access
-    if current_user.get("role") != "merchant":
-        raise HTTPException(status_code=403, detail="Only merchants can access this endpoint")
-    
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+    """Export payouts as CSV data"""
     try:
-        # Build query with filters
-        conditions = ["merchant_id = :mid"]
-        params = {"mid": merchant_id}
-        
-        if status:
-            conditions.append("status = :st")
-            params["st"] = status
-        
-        if start_date:
-            conditions.append("created_at >= :start")
-            params["start"] = start_date
-        
-        if end_date:
-            conditions.append("created_at <= :end")
-            params["end"] = end_date
-        
-        where_clause = " AND ".join(conditions)
-        
-        query = f"""
-        SELECT 
-            id,
-            agent_id,
-            amount,
-            currency,
-            status,
-            payout_reference,
-            method,
-            provider,
-            period_start,
-            period_end,
-            created_at,
-            uploaded_at,
-            confirmed_at
-        FROM agent_payouts
-        WHERE {where_clause}
-        ORDER BY created_at DESC
-        """
-        
-        results = await database.fetch_all(query=query, values=params)
-        
-        # Convert to list of dicts for CSV export
-        data = []
-        for row in results:
-            data.append({
-                "Payout ID": row["id"],
-                "Agent ID": row["agent_id"],
-                "Amount": row["amount"],
-                "Currency": row["currency"],
-                "Status": row["status"],
-                "Reference": row["payout_reference"] or "",
-                "Method": row["method"] or "",
-                "Provider": row["provider"] or "",
-                "Period Start": row["period_start"],
-                "Period End": row["period_end"],
-                "Created": row["created_at"],
-                "Uploaded": row["uploaded_at"] or "",
-                "Confirmed": row["confirmed_at"] or ""
-            })
+        repo = PayoutRepo()
+        items = await repo.list(merchant_id=merchant_id, status=status, limit=10000, offset=0)
         
         return {
             "status": "success",
-            "count": len(data),
-            "data": data,
-            "filename": f"payouts_{merchant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            "count": len(items),
+            "data": items,
+            "filename": f"payouts_{merchant_id}_{date.today().isoformat()}.csv"
         }
         
     except Exception as e:
-        logger.error(f"Error exporting payouts: {e}")
+        logger.error(f"Failed to export payouts: {e}")
         raise HTTPException(status_code=500, detail="Failed to export payouts")
-
-# Note: File upload endpoint would typically be separate for actual file storage
-# This is a simplified version where frontend provides the URL after uploading to cloud storage
