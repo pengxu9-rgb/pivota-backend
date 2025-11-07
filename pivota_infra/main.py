@@ -104,7 +104,7 @@ from routes.admin_fix_commission_offers import router as admin_fix_commission_of
 from routes.agent_self_api import router as agent_self_api_router
 from routes.admin_fix_agent_type import router as admin_fix_agent_type_router
 from routes.admin_check_hidden_offers import router as admin_check_hidden_offers_router
-from routes.admin_debug_commission import router as admin_debug_commission_router
+# from routes.admin_debug_commission import router as admin_debug_commission_router  # Temporarily disabled
 from routes.admin_fix_agent_expectations import router as admin_fix_agent_expectations_router  # Fix PSP ID format
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -447,7 +447,7 @@ app.include_router(admin_fix_psp_format_router)  # Fix PSP ID format (admin only
 app.include_router(admin_fix_commission_offers_router)  # Fix commission offers (admin only)
 app.include_router(admin_fix_agent_type_router)  # Fix agent type NULL issues
 app.include_router(admin_check_hidden_offers_router)  # Debug hidden commission offers
-app.include_router(admin_debug_commission_router)  # Debug commission calculations
+# app.include_router(admin_debug_commission_router)  # Debug commission calculations - temporarily disabled
 app.include_router(admin_fix_agent_expectations_router)  # Fix agent revenue expectations
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
