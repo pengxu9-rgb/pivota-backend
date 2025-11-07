@@ -32,7 +32,7 @@ async def get_own_api_key(
         # Get agent's full API key
         query = """
             SELECT agent_id, api_key, name, created_at, last_active, 
-                   agent_type, email, phone, status, is_active
+                   agent_type, email, status, is_active
             FROM agents 
             WHERE (agent_id = :agent_id OR email = :email)
             AND is_active = true
