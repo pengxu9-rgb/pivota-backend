@@ -413,26 +413,3 @@ if __name__ == "__main__":
     print("  2. Merchant offer >= Agent minimum → Accept with note")
     print("  3. Merchant offer < Agent minimum → Platform default")
     print("  4. No rules → Platform default by agent type")
-
-            "agent_expected": match_result.get('agent_expected_rate'),
-            "agent_minimum": match_result.get('agent_minimum_rate'),
-            "actual_rate": match_result['actual_commission_rate'],
-            "match_status": match_result['match_status'],
-            "match_source": match_result['match_source'],
-            "platform_default": match_result['platform_default_used'],
-            "metadata": match_result.get('note', '')
-        })
-        
-        logger.info(f"[Phase 5.5] Logged revenue matching: id={result}, rate={match_result['actual_commission_rate']}")
-        
-        return result
-
-
-# [Phase 5.5] Test if module loads correctly
-if __name__ == "__main__":
-    print("[Phase 5.5] RevenueShareService module loaded")
-    print("Matching algorithm:")
-    print("  1. Merchant offer >= Agent expected → Use merchant offer")
-    print("  2. Merchant offer >= Agent minimum → Accept with note")
-    print("  3. Merchant offer < Agent minimum → Platform default")
-    print("  4. No rules → Platform default by agent type")
