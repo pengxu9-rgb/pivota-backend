@@ -13,10 +13,11 @@ from databases import Database
 logger = logging.getLogger(__name__)
 
 # Platform default commission rates
+# [Phase 6.2] Only basic and premium allowed (no standard)
 PLATFORM_DEFAULT_COMMISSION = {
     'premium': Decimal('0.025'),   # 2.5% for premium agents
-    'standard': Decimal('0.020'),  # 2.0% for standard agents
     'basic': Decimal('0.015')      # 1.5% for basic agents
+    # 'standard' removed - converted to 'basic' per migration 018
 }
 
 
@@ -74,14 +75,15 @@ class RevenueShareService:
                 try:
                     # Try to convert to dict if it's a Row object
                     agent_dict = dict(agent) if agent else {}
-                    agent_type = agent_dict.get('agent_type', 'standard')
+                    # [Phase 6.2] Default to 'basic' instead of 'standard' (which no longer exists)
+                    agent_type = agent_dict.get('agent_type', 'basic')
                     logger.info(f"[Revenue Match] Agent dict: {agent_dict}")
                 except Exception as e:
                     logger.error(f"[Revenue Match] Error converting agent to dict: {e}")
-                    agent_type = 'standard'
+                    agent_type = 'basic'  # [Phase 6.2] Default to 'basic'
             else:
                 logger.warning(f"[Revenue Match] Agent {agent_id} not found in database")
-                agent_type = 'standard'
+                agent_type = 'basic'  # [Phase 6.2] Default to 'basic'
             
             logger.info(f"[Revenue Match] Agent type: {agent_type}")
             

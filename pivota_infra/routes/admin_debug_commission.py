@@ -64,8 +64,8 @@ async def debug_commission_calculation(
         # 4. Check what platform default would be used
         agent_type = agent_dict.get('agent_type')
         if agent_type is None:
-            agent_type_display = "NULL → defaults to 'standard'"
-            effective_agent_type = 'standard'
+            agent_type_display = "NULL → defaults to 'basic'"  # [Phase 6.2]
+            effective_agent_type = 'basic'  # [Phase 6.2] 'standard' no longer exists
         else:
             agent_type_display = agent_type
             effective_agent_type = agent_type
@@ -125,12 +125,9 @@ def _analyze_2_percent(self, agent_dict, merchant_offers, match_result):
     reasons = []
     
     if match_result.get('actual_rate') == 0.02:
-        if agent_dict.get('agent_type') is None:
-            reasons.append("agent_type is NULL, defaulting to 'standard' → 2%")
-        elif agent_dict.get('agent_type') == 'standard':
-            reasons.append("agent_type is 'standard' → 2% platform default")
-        else:
-            reasons.append("Unknown reason for 2% rate")
+        # [Phase 6.2] 'standard' no longer exists, only basic/premium
+        reasons.append("Getting 2% rate but 'standard' no longer exists!")
+        reasons.append("This should not happen after Phase 6.2 migration")
             
         if not merchant_offers:
             reasons.append("No merchant offers found, using platform default")
