@@ -75,9 +75,9 @@ async def sync_products(
             # Use merchant_stores (new way - supports Wix, Shopify, etc.)
             platform = store["platform"]
             logger.info(f"🔄 Found store in merchant_stores: platform={platform}")
-        elif True:
-            # Fallback to merchant_onboarding (old way - legacy Shopify only)
-            platform = store_info.get("platform")
+        elif merchant.get("mcp_platform"):
+            # Fallback to merchant_onboarding (old way - legacy MCP)
+            platform = merchant.get("mcp_platform")
             logger.info(f"🔄 Using legacy MCP: platform={platform}")
         else:
             # No store found - return graceful response
@@ -105,8 +105,9 @@ async def sync_products(
                 shop_domain = store["domain"]
                 access_token = store["api_key"]
             else:
-                shop_domain = store_info.get("domain")
-                access_token = store_info.get("api_key")
+                # Fallback to merchant_onboarding MCP fields
+                shop_domain = merchant.get("mcp_domain") or merchant.get("store_url")
+                access_token = merchant.get("mcp_api_key")
             
             logger.info(f"product_sync shopify merchant_id={request.merchant_id} shop_domain={shop_domain} has_token={bool(access_token)}")
             
@@ -273,10 +274,19 @@ async def get_sync_status(
             {"merchant_id": merchant_id}
         )
         
+        # Get platform from merchant_stores or merchant_onboarding
+        store = await database.fetch_one(
+            """SELECT platform FROM merchant_stores 
+               WHERE merchant_id = :merchant_id AND status = 'active'
+               ORDER BY connected_at DESC LIMIT 1""",
+            {"merchant_id": merchant_id}
+        )
+        platform = store["platform"] if store else merchant.get("mcp_platform", "unknown")
+        
         return {
             "merchant_id": merchant_id,
-            "platform": store_info.get("platform"),
-            "platform_connected": merchant.get("mcp_connected", False),
+            "platform": platform,
+            "platform_connected": merchant.get("mcp_connected", False) or (store is not None),
             "products_in_cache": count_result["count"] if count_result else 0,
             "last_sync": count_result["last_sync"].isoformat() if count_result and count_result["last_sync"] else None,
             "merchant_updated_at": merchant.get("updated_at").isoformat() if merchant.get("updated_at") else None
