@@ -3,12 +3,60 @@ Employee Finance Management
 Real financial data from orders and transactions
 """
 from fastapi import APIRouter, Depends, HTTPException
-from typing import Dict, Any
+from typing import Dict, Any, List
 from datetime import datetime, timedelta
 from db.database import database
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/employee/finance", tags=["Employee Finance"])
+
+
+async def get_uploaded_payouts() -> List[Dict[str, Any]]:
+    """Get payouts that have been uploaded by merchants and await employee confirmation"""
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT 
+                p.id,
+                p.merchant_id,
+                p.agent_id,
+                p.amount,
+                p.currency,
+                p.status,
+                p.payout_reference,
+                p.method,
+                p.provider,
+                p.uploaded_at,
+                p.created_at,
+                'agent' as type,
+                a.name as agent_name,
+                a.email as agent_email
+            FROM agent_payouts p
+            LEFT JOIN agents a ON p.agent_id = a.agent_id
+            WHERE p.status = 'uploaded'
+            ORDER BY p.uploaded_at DESC
+            LIMIT 50
+            """
+        )
+        
+        return [
+            {
+                "id": str(row["id"]),
+                "type": row["type"],
+                "name": row["agent_name"] or row["agent_id"],
+                "email": row["agent_email"],
+                "amount": float(row["amount"]),
+                "currency": row["currency"],
+                "date": row["uploaded_at"].isoformat() if row["uploaded_at"] else row["created_at"].isoformat(),
+                "reference": row["payout_reference"],
+                "method": row["method"],
+                "provider": row["provider"]
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        print(f"Error fetching uploaded payouts: {e}")
+        return []
 
 
 @router.get("/summary")
@@ -83,6 +131,9 @@ async def get_finance_summary(
         # Merchant payouts = revenue - PSP fees - agent commissions
         merchant_payouts = total_revenue - estimated_fees - agent_commissions
         
+        # Get pending payouts (status='uploaded')
+        pending_payouts = await get_uploaded_payouts()
+        
         return {
             "status": "success",
             "summary": {
@@ -90,11 +141,11 @@ async def get_finance_summary(
                 "merchant_payouts": float(merchant_payouts),
                 "agent_commissions": float(agent_commissions),
                 "platform_revenue": float(platform_revenue),
-                "pending_amount": 0,  # TODO: Query pending payouts table
+                "pending_amount": sum(p["amount"] for p in pending_payouts),
                 "total_orders": total_orders,
                 "period": time_range
             },
-            "pending_payouts": [],  # TODO: Implement payouts table and query
+            "pending_payouts": pending_payouts,
             "time_range": time_range,
             "calculated_at": now.isoformat()
         }
