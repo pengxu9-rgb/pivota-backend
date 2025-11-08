@@ -126,32 +126,34 @@ async def list_all_payouts(
         WHERE {where_clause}
         """
         
-        summary = await database.fetch_one(query=summary_query, values=params)
+        summary_row = await database.fetch_one(query=summary_query, values=params)
+        summary = dict(summary_row) if summary_row else None
         
         # Format results
         items = []
         for row in results:
+            record = dict(row)
             items.append({
-                "id": row["id"],
-                "merchant_id": row["merchant_id"],
-                "merchant_name": row.get("merchant_name"),
-                "agent_id": row["agent_id"],
-                "agent_name": row.get("agent_name"),
-                "agent_email": row.get("agent_email"),
-                "amount": row["amount"],
-                "currency": row["currency"],
-                "status": row["status"],
-                "payout_reference": row.get("payout_reference"),
-                "file_url": row.get("file_url"),
-                "method": row.get("method"),
-                "provider": row.get("provider"),
-                "external_id": row.get("external_id"),
-                "period_start": row["period_start"],
-                "period_end": row["period_end"],
-                "uploaded_at": row.get("uploaded_at"),
-                "confirmed_at": row.get("confirmed_at"),
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"]
+                "id": record["id"],
+                "merchant_id": record["merchant_id"],
+                "merchant_name": record.get("merchant_name"),
+                "agent_id": record["agent_id"],
+                "agent_name": record.get("agent_name"),
+                "agent_email": record.get("agent_email"),
+                "amount": record["amount"],
+                "currency": record["currency"],
+                "status": record["status"],
+                "payout_reference": record.get("payout_reference"),
+                "file_url": record.get("file_url"),
+                "method": record.get("method"),
+                "provider": record.get("provider"),
+                "external_id": record.get("external_id"),
+                "period_start": record["period_start"],
+                "period_end": record["period_end"],
+                "uploaded_at": record.get("uploaded_at"),
+                "confirmed_at": record.get("confirmed_at"),
+                "created_at": record["created_at"],
+                "updated_at": record["updated_at"]
             })
         
         return {
@@ -326,7 +328,8 @@ async def get_payout_dashboard(
         WHERE created_at >= NOW() - INTERVAL '{days} days'
         """
         
-        stats = await database.fetch_one(query=stats_query)
+        stats_row = await database.fetch_one(query=stats_query)
+        stats = dict(stats_row) if stats_row else None
         
         # Get top merchants by payout volume
         top_merchants_query = f"""
@@ -343,7 +346,8 @@ async def get_payout_dashboard(
         LIMIT 10
         """
         
-        top_merchants = await database.fetch_all(query=top_merchants_query)
+        top_merchants_rows = await database.fetch_all(query=top_merchants_query)
+        top_merchants = [dict(row) for row in top_merchants_rows]
         
         # Get pending actions summary
         pending_actions_query = """
@@ -355,7 +359,8 @@ async def get_payout_dashboard(
         FROM agent_payouts
         """
         
-        pending = await database.fetch_one(query=pending_actions_query)
+        pending_row = await database.fetch_one(query=pending_actions_query)
+        pending = dict(pending_row) if pending_row else None
         
         return {
             "period_days": days,
