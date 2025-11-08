@@ -71,20 +71,24 @@ async def generate_test_commissions(
             
             # Create commission
             try:
+                import uuid
+                commission_id = f"COMM_{uuid.uuid4().hex[:12].upper()}"
+                
                 await database.execute(
                     """
                     INSERT INTO commissions (
-                        order_id, merchant_id, agent_id,
-                        amount, rate, currency, type,
+                        commission_id, order_id, merchant_id, agent_id,
+                        amount, rate, currency, type, matched,
                         created_at
                     )
                     VALUES (
-                        :order_id, :merchant_id, :agent_id,
-                        :amount, :rate, 'USD', 'agent',
+                        :commission_id, :order_id, :merchant_id, :agent_id,
+                        :amount, :rate, 'USD', 'agent', true,
                         NOW()
                     )
                     """,
                     {
+                        "commission_id": commission_id,
                         "order_id": order_id,
                         "merchant_id": MERCHANT_ID,
                         "agent_id": AGENT_ID,
