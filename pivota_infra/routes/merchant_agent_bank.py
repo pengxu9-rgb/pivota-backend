@@ -44,7 +44,11 @@ async def get_agent_bank_details(
                 method,
                 currency,
                 account_holder_name,
+                iban,
+                swift_bic,
                 iban_preview,
+                account_number,
+                routing_number,
                 account_number_last4,
                 bank_name,
                 bank_country,
@@ -97,7 +101,31 @@ async def get_agent_bank_details(
                 "instructions": f"Please contact {agent['email']} directly to obtain bank account details for payment."
             }
         
-        # Sharing is enabled - return bank details
+        # Sharing is enabled - return FULL bank details
+        bank_info = {
+            "method": bank_details["method"],
+            "currency": bank_details["currency"],
+            "account_holder_name": bank_details["account_holder_name"],
+            "bank_name": bank_details["bank_name"],
+            "bank_country": bank_details["bank_country"],
+            "verify_status": bank_details["verify_status"],
+            "last_updated": bank_details["updated_at"].isoformat() if bank_details["updated_at"] else None
+        }
+        
+        # Include full account details based on method
+        if bank_details["method"] == "bank_wire" and bank_details["iban"]:
+            bank_info["iban"] = bank_details["iban"]  # Full IBAN
+            bank_info["swift_bic"] = bank_details["swift_bic"]
+            bank_info["iban_preview"] = bank_details["iban_preview"]  # Keep preview for backward compatibility
+        elif bank_details["method"] in ["ach", "wire"] and bank_details["account_number"]:
+            bank_info["account_number"] = bank_details["account_number"]  # Full account number
+            bank_info["routing_number"] = bank_details["routing_number"]
+            bank_info["account_number_last4"] = bank_details["account_number_last4"]
+        else:
+            # Fallback to preview versions
+            bank_info["iban_preview"] = bank_details["iban_preview"]
+            bank_info["account_number_last4"] = bank_details["account_number_last4"]
+        
         return {
             "status": "success",
             "message": "Bank details available",
@@ -106,17 +134,7 @@ async def get_agent_bank_details(
                 "name": agent["name"],
                 "email": agent["email"]
             },
-            "bank_details": {
-                "method": bank_details["method"],
-                "currency": bank_details["currency"],
-                "account_holder_name": bank_details["account_holder_name"],
-                "iban_preview": bank_details["iban_preview"],
-                "account_number_last4": bank_details["account_number_last4"],
-                "bank_name": bank_details["bank_name"],
-                "bank_country": bank_details["bank_country"],
-                "verify_status": bank_details["verify_status"],
-                "last_updated": bank_details["updated_at"].isoformat() if bank_details["updated_at"] else None
-            },
+            "bank_details": bank_info,
             "sharing_enabled": True
         }
         
@@ -125,3 +143,4 @@ async def get_agent_bank_details(
     except Exception as e:
         logger.error(f"Failed to get agent bank details: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve bank details")
+
