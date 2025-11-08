@@ -75,7 +75,7 @@ async def sync_products(
             # Use merchant_stores (new way - supports Wix, Shopify, etc.)
             platform = store["platform"]
             logger.info(f"🔄 Found store in merchant_stores: platform={platform}")
-        elif merchant.get("mcp_platform"):
+        elif merchant and merchant.get("mcp_platform"):
             # Fallback to merchant_onboarding (old way - legacy MCP)
             platform = merchant.get("mcp_platform")
             logger.info(f"🔄 Using legacy MCP: platform={platform}")
@@ -130,8 +130,8 @@ async def sync_products(
                     detail="Wix store not found in merchant_stores. Please reconnect Wix."
                 )
             
-            api_key = store.get("api_key")
-            domain = store.get("domain")
+            api_key = store["api_key"]
+            domain = store["domain"]
             
             logger.info(f"🔍 Wix store data: domain={domain}, has_api_key={bool(api_key)}")
             
