@@ -22,6 +22,7 @@ class SyncRequest(BaseModel):
     merchant_id: str
     force_refresh: bool = False
     limit: int = 250
+    platform: Optional[str] = None  # Optional: specify which platform to sync
 
 class SyncResponse(BaseModel):
     status: str
@@ -61,14 +62,24 @@ async def sync_products(
             raise HTTPException(status_code=404, detail="Merchant not found")
         
         # 2. Check merchant_stores table first (new way)
-        store_query = """
+        # Check if a specific platform was requested
+        platform_filter = ""
+        query_params = {"merchant_id": request.merchant_id}
+        
+        # Add platform filter if provided in request
+        if hasattr(request, 'platform') and request.platform:
+            platform_filter = "AND platform = :platform"
+            query_params["platform"] = request.platform
+            
+        store_query = f"""
             SELECT store_id, platform, domain, api_key, status 
             FROM merchant_stores 
             WHERE merchant_id = :merchant_id AND status = 'active'
+            {platform_filter}
             ORDER BY connected_at DESC
             LIMIT 1
         """
-        store = await database.fetch_one(store_query, {"merchant_id": request.merchant_id})
+        store = await database.fetch_one(store_query, query_params)
         
         # 3. Determine platform and credentials
         if store:

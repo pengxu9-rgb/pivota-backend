@@ -199,7 +199,8 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
         sync_request = SyncRequest(
             merchant_id=merchant_id,
             force_refresh=True,  # 强制刷新
-            limit=250
+            limit=250,
+            platform="shopify"  # 明确指定同步 Shopify
         )
         
         # 执行真正的同步
