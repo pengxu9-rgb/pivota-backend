@@ -62,7 +62,7 @@ async def sync_products(
         
         # 2. Check merchant_stores table first (new way)
         store_query = """
-            SELECT platform, domain, api_key, status 
+            SELECT store_id, platform, domain, api_key, status 
             FROM merchant_stores 
             WHERE merchant_id = :merchant_id AND status = 'active'
             ORDER BY connected_at DESC
