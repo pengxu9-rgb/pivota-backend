@@ -130,8 +130,13 @@ async def get_merchant_products_realtime(
     credentials = {}
     
     if platform == "shopify":
-        shop_domain = store_info.get("domain") or os.getenv("SHOPIFY_SHOP_DOMAIN") or getattr(settings, "shopify_shop_domain", None)
-        access_token = store_info.get("api_key") or os.getenv("SHOPIFY_ACCESS_TOKEN") or getattr(settings, "shopify_access_token", None)
+        # 安全地访问 store_info，避免未定义错误
+        shop_domain = store_info.get("domain") if 'store_info' in locals() and store_info else None
+        access_token = store_info.get("api_key") if 'store_info' in locals() and store_info else None
+        
+        # 如果从 store_info 获取失败，尝试环境变量或设置
+        shop_domain = shop_domain or os.getenv("SHOPIFY_SHOP_DOMAIN") or getattr(settings, "shopify_shop_domain", None)
+        access_token = access_token or os.getenv("SHOPIFY_ACCESS_TOKEN") or getattr(settings, "shopify_access_token", None)
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Shopify credentials not found.")
@@ -139,9 +144,13 @@ async def get_merchant_products_realtime(
         credentials = {"shop_domain": shop_domain, "access_token": access_token}
     
     elif platform == "wix":
-        # Wix credentials
-        site_id = store_info.get("domain") or os.getenv("WIX_SITE_ID")
-        api_key = store_info.get("api_key") or os.getenv("WIX_API_KEY")
+        # Wix credentials - 安全地访问 store_info
+        site_id = store_info.get("domain") if 'store_info' in locals() and store_info else None
+        api_key = store_info.get("api_key") if 'store_info' in locals() and store_info else None
+        
+        # 如果从 store_info 获取失败，尝试环境变量
+        site_id = site_id or os.getenv("WIX_SITE_ID")
+        api_key = api_key or os.getenv("WIX_API_KEY")
         
         if not site_id or not api_key:
             raise HTTPException(status_code=400, detail="Wix credentials not found.")
