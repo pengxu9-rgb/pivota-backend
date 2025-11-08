@@ -24,6 +24,7 @@ async def get_uploaded_payouts() -> List[Dict[str, Any]]:
                 p.currency,
                 p.status,
                 p.payout_reference,
+                p.file_url,
                 p.method,
                 p.provider,
                 p.uploaded_at,
@@ -49,6 +50,7 @@ async def get_uploaded_payouts() -> List[Dict[str, Any]]:
                 "currency": row["currency"],
                 "date": row["uploaded_at"].isoformat() if row["uploaded_at"] else row["created_at"].isoformat(),
                 "reference": row["payout_reference"],
+                "file_url": row["file_url"],
                 "method": row["method"],
                 "provider": row["provider"]
             }
