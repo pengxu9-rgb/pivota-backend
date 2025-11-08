@@ -897,3 +897,105 @@ async def agent_get_analytics(
     except Exception as e:
         logger.error(f"Agent analytics error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get analytics")
+
+
+# ============================================================================
+# 佣金查询
+# ============================================================================
+
+@router.get("/commissions")
+async def get_agent_commissions(
+    limit: int = Query(50, ge=1, le=200, description="返回数量"),
+    offset: int = Query(0, ge=0, description="偏移量"),
+    status: Optional[str] = Query(None, description="状态过滤: pending, paid"),
+    context: AgentContext = Depends(get_agent_context)
+):
+    """
+    获取 Agent 的佣金列表
+    
+    返回所有与此 Agent 相关的订单佣金
+    """
+    try:
+        # 构建查询条件
+        conditions = ["agent_id = :agent_id"]
+        params = {
+            "agent_id": context.agent_id,
+            "limit": limit,
+            "offset": offset
+        }
+        
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        
+        where_clause = " AND ".join(conditions)
+        
+        # 获取佣金总数
+        count_query = f"""
+            SELECT COUNT(*) as total
+            FROM commissions
+            WHERE {where_clause}
+        """
+        count_result = await database.fetch_one(count_query, params)
+        total = count_result["total"] if count_result else 0
+        
+        # 获取佣金列表
+        commissions_query = f"""
+            SELECT 
+                commission_id,
+                order_id,
+                merchant_id,
+                amount,
+                rate,
+                status,
+                matched,
+                created_at,
+                updated_at
+            FROM commissions
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """
+        
+        rows = await database.fetch_all(commissions_query, params)
+        commissions = [dict(row) for row in rows]
+        
+        # 格式化日期
+        for comm in commissions:
+            if comm.get('created_at'):
+                comm['created_at'] = comm['created_at'].isoformat() if hasattr(comm['created_at'], 'isoformat') else str(comm['created_at'])
+            if comm.get('updated_at'):
+                comm['updated_at'] = comm['updated_at'].isoformat() if hasattr(comm['updated_at'], 'isoformat') else str(comm['updated_at'])
+        
+        # 计算摘要
+        summary_query = """
+            SELECT 
+                COUNT(*) as total_count,
+                COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END), 0) as pending_amount,
+                COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) as paid_amount,
+                COALESCE(SUM(amount), 0) as total_amount
+            FROM commissions
+            WHERE agent_id = :agent_id
+        """
+        summary_result = await database.fetch_one(summary_query, {"agent_id": context.agent_id})
+        
+        return {
+            "status": "success",
+            "commissions": commissions,
+            "summary": {
+                "total_count": summary_result["total_count"] if summary_result else 0,
+                "pending_amount": float(summary_result["pending_amount"]) if summary_result else 0.0,
+                "paid_amount": float(summary_result["paid_amount"]) if summary_result else 0.0,
+                "total_amount": float(summary_result["total_amount"]) if summary_result else 0.0
+            },
+            "pagination": {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": (offset + limit) < total
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Get commissions error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get commissions: {str(e)}")
