@@ -312,7 +312,7 @@ async def get_payout_dashboard(
     
     try:
         # Get overall statistics
-        stats_query = """
+        stats_query = f"""
         SELECT
             COUNT(DISTINCT merchant_id) as active_merchants,
             COUNT(DISTINCT agent_id) as active_agents,
@@ -323,13 +323,13 @@ async def get_payout_dashboard(
             COUNT(CASE WHEN status = 'uploaded' THEN 1 END) as uploaded_count,
             COUNT(CASE WHEN status = 'paid' THEN 1 END) as paid_count
         FROM agent_payouts
-        WHERE created_at >= NOW() - INTERVAL ':days days'
+        WHERE created_at >= NOW() - INTERVAL '{days} days'
         """
         
-        stats = await database.fetch_one(query=stats_query, values={"days": days})
+        stats = await database.fetch_one(query=stats_query)
         
         # Get top merchants by payout volume
-        top_merchants_query = """
+        top_merchants_query = f"""
         SELECT 
             p.merchant_id,
             m.business_name as merchant_name,
@@ -337,13 +337,13 @@ async def get_payout_dashboard(
             SUM(p.amount) as total_amount
         FROM agent_payouts p
         LEFT JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
-        WHERE p.created_at >= NOW() - INTERVAL ':days days'
+        WHERE p.created_at >= NOW() - INTERVAL '{days} days'
         GROUP BY p.merchant_id, m.business_name
         ORDER BY total_amount DESC
         LIMIT 10
         """
         
-        top_merchants = await database.fetch_all(query=top_merchants_query, values={"days": days})
+        top_merchants = await database.fetch_all(query=top_merchants_query)
         
         # Get pending actions summary
         pending_actions_query = """
