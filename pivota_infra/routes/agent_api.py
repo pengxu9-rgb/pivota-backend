@@ -14,6 +14,7 @@ import time
 
 from models.order import CreateOrderRequest, OrderResponse
 from models.standard_product import StandardProduct
+from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import get_cached_products
 from db.orders import get_order, get_orders_by_merchant, update_payment_info
