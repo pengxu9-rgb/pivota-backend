@@ -159,7 +159,7 @@ async def update_merchant_profile(
 
 @router.post("/merchant/integrations/shopify/sync")
 async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
-    """Sync products from Shopify store"""
+    """Sync products from Shopify store - 真正同步产品，不只是读缓存"""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -192,41 +192,32 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
                 detail=f"Store is {store_check['status']}. Please reconnect your store."
             )
         
-        # 2. Get actual product count from products_cache (real synced data)
-        cache_count_result = await database.fetch_one(
-            """SELECT COUNT(*) as count FROM products_cache 
-               WHERE merchant_id = :merchant_id AND platform = 'shopify'
-               AND (expires_at IS NULL OR expires_at > NOW())""",
-            {"merchant_id": merchant_id}
+        # 2. 调用真正的产品同步（会从 Shopify API 拉取产品并更新 products_cache）
+        from routes.product_sync import sync_products, SyncRequest
+        from fastapi import BackgroundTasks
+        
+        sync_request = SyncRequest(
+            merchant_id=merchant_id,
+            force_refresh=True,  # 强制刷新
+            limit=250
         )
-        calculated_count = cache_count_result["count"] if cache_count_result else 0
-
-        # Use cached count if available, otherwise keep existing
-        existing_count = store_check.get("product_count") or 0
-        final_count = calculated_count if calculated_count > 0 else existing_count
-
-        # Always update last_sync, update product_count from cache
-        await database.execute(
-            """UPDATE merchant_stores 
-               SET product_count = (
-                   SELECT COUNT(*) FROM products_cache 
-                   WHERE merchant_id = :merchant_id AND platform = 'shopify'
-                   AND (expires_at IS NULL OR expires_at > NOW())
-               ), 
-               last_sync = NOW() 
-               WHERE merchant_id = :merchant_id AND platform = 'shopify'""",
-            {"merchant_id": merchant_id}
+        
+        # 执行真正的同步
+        sync_result = await sync_products(
+            request=sync_request,
+            background_tasks=BackgroundTasks(),
+            current_user=current_user
         )
-
-        print(f"✅ Synced Shopify products for merchant {merchant_id} (count preserved: {final_count})")
+        
+        print(f"✅ Synced {sync_result.products_synced} Shopify products for merchant {merchant_id}")
 
         return {
             "status": "success",
-            "message": f"Products synced for {store_check['domain']}. Current count: {final_count}",
+            "message": f"Successfully synced {sync_result.products_synced} products from {store_check['domain']}",
             "data": {
-                "product_count": final_count,
+                "product_count": sync_result.products_synced,
                 "store_domain": store_check['domain'],
-                "synced_at": datetime.now().isoformat()
+                "synced_at": sync_result.sync_time
             }
         }
     except HTTPException:
