@@ -139,7 +139,14 @@ async def get_merchant_products_realtime(
         credentials = {"shop_domain": shop_domain, "access_token": access_token}
     
     elif platform == "wix":
-        raise HTTPException(status_code=501, detail="Wix platform not yet implemented")
+        # Wix credentials
+        site_id = store_info.get("domain") or os.getenv("WIX_SITE_ID")
+        api_key = store_info.get("api_key") or os.getenv("WIX_API_KEY")
+        
+        if not site_id or not api_key:
+            raise HTTPException(status_code=400, detail="Wix credentials not found.")
+        
+        credentials = {"site_id": site_id, "api_key": api_key}
     
     elif platform == "woocommerce":
         raise HTTPException(status_code=501, detail="WooCommerce platform not yet implemented")
