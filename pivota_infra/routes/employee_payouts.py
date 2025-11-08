@@ -181,7 +181,7 @@ async def list_all_payouts(
         
     except Exception as e:
         logger.error(f"Error listing payouts for employee: {e}")
-        raise HTTPException(status_code=500, detail="Failed to list payouts")
+        raise HTTPException(status_code=500, detail=f"Failed to list payouts: {e}")
 
 @router.post("/confirm-bulk", response_model=dict)
 async def confirm_bulk_payouts(
