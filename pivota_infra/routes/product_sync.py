@@ -133,7 +133,7 @@ async def sync_products(
             api_key = store["api_key"]
             domain = store["domain"]
             
-            logger.info(f"🔍 Wix store data: domain={domain}, has_api_key={bool(api_key)}")
+            logger.info(f"🔍 Wix store data: domain={domain}, has_api_key={bool(api_key)} (v2)")
             
             if not api_key or not domain:
                 logger.warning(f"⚠️ Wix credentials incomplete for merchant {request.merchant_id}")
