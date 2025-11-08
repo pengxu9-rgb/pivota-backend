@@ -212,7 +212,8 @@ async def sync_products(
                 logger.error(f"Failed to cache product {product.id}: {e}")
                 continue
         
-        # 6. Update merchant sync status
+        # 6. Update merchant sync status and product count
+        # Update merchant_onboarding
         await database.execute(
             """UPDATE merchant_onboarding 
                SET updated_at = :updated_at
@@ -222,6 +223,37 @@ async def sync_products(
                 "merchant_id": request.merchant_id
             }
         )
+        
+        # Update merchant_stores product count
+        if store:
+            await database.execute(
+                """UPDATE merchant_stores 
+                   SET product_count = :product_count,
+                       last_sync = :last_sync
+                   WHERE store_id = :store_id""",
+                {
+                    "product_count": synced_count,
+                    "last_sync": datetime.now(),
+                    "store_id": store["store_id"]
+                }
+            )
+            logger.info(f"Updated merchant_stores product_count={synced_count} for store_id={store['store_id']}")
+        else:
+            # For legacy MCP, update based on merchant_id and platform
+            await database.execute(
+                """UPDATE merchant_stores 
+                   SET product_count = :product_count,
+                       last_sync = :last_sync
+                   WHERE merchant_id = :merchant_id 
+                   AND platform = :platform""",
+                {
+                    "product_count": synced_count,
+                    "last_sync": datetime.now(),
+                    "merchant_id": request.merchant_id,
+                    "platform": platform
+                }
+            )
+            logger.info(f"Updated merchant_stores product_count={synced_count} for merchant_id={request.merchant_id} platform={platform}")
         
         sync_duration = (datetime.now() - start_time).total_seconds()
         
