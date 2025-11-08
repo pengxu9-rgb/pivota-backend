@@ -68,19 +68,23 @@ async def list_all_payouts(
     try:
         # Build query with joins for additional info
         conditions = []
-        params = {"limit": size, "offset": (page-1)*size}
+        filter_params: Dict[str, Any] = {}
+        query_params: Dict[str, Any] = {"limit": size, "offset": (page-1)*size}
         
         if status:
             conditions.append("p.status = :st")
-            params["st"] = status
+            filter_params["st"] = status
         
         if merchant_id:
             conditions.append("p.merchant_id = :mid")
-            params["mid"] = merchant_id
+            filter_params["mid"] = merchant_id
         
         if agent_id:
             conditions.append("p.agent_id = :aid")
-            params["aid"] = agent_id
+            filter_params["aid"] = agent_id
+
+        # Merge filter params for main query (with pagination)
+        query_params.update(filter_params)
         
         where_clause = " AND ".join(conditions) if conditions else "1=1"
         
@@ -104,11 +108,11 @@ async def list_all_payouts(
         LIMIT :limit OFFSET :offset
         """
         
-        results = await database.fetch_all(query=query, values=params)
+        results = await database.fetch_all(query=query, values=query_params)
         
         # Get total count
         count_query = f"SELECT COUNT(*) as total FROM agent_payouts p WHERE {where_clause}"
-        total_result = await database.fetch_one(query=count_query, values=params)
+        total_result = await database.fetch_one(query=count_query, values=filter_params)
         total = total_result["total"] if total_result else 0
         
         # Get summary statistics
@@ -126,7 +130,7 @@ async def list_all_payouts(
         WHERE {where_clause}
         """
         
-        summary_row = await database.fetch_one(query=summary_query, values=params)
+        summary_row = await database.fetch_one(query=summary_query, values=filter_params)
         summary = dict(summary_row) if summary_row else None
         
         # Format results
