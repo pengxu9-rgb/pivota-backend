@@ -67,12 +67,17 @@ async def get_merchant_products_realtime(
         # 从缓存获取所有平台的产品（不只是主商店）
         all_cached = []
         for store in stores:
-            store_platform = store["platform"]
-            platform_cached = await get_cached_products(merchant_id, store_platform, include_expired=False)
-            all_cached.extend(platform_cached)
+            try:
+                store_platform = store["platform"]
+                platform_cached = await get_cached_products(merchant_id, store_platform, include_expired=False)
+                all_cached.extend(platform_cached)
+                logger.info(f"📦 Loaded {len(platform_cached)} products from {store_platform}")
+            except Exception as store_error:
+                logger.error(f"Error loading products from {store.get('platform', 'unknown')}: {store_error}")
+                continue
         
         products = [c["product_data"] for c in all_cached[:limit]]
-        logger.info(f"📦 Loaded {len(products)} products from {len(stores)} stores")
+        logger.info(f"📦 Total loaded: {len(products)} products from {len(stores)} stores")
     except Exception as e:
         # Handle errors when getting stores
         logger.error(f"Error getting stores for merchant {merchant_id}: {str(e)}")
@@ -362,6 +367,11 @@ async def recalculate_analytics(
     from db.products import calculate_merchant_analytics
     await calculate_merchant_analytics(merchant_id, days=days)
     
+    return {
+        "status": "success",
+        "message": f"Analytics recalculated for merchant {merchant_id} (last {days} days)"
+    }
+
     return {
         "status": "success",
         "message": f"Analytics recalculated for merchant {merchant_id} (last {days} days)"

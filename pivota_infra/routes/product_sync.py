@@ -373,3 +373,16 @@ async def get_sync_status(
     except Exception as e:
         logger.error(f"Get sync status error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get sync status: {str(e)}")
+
+            "platform": platform,
+            "platform_connected": merchant.get("mcp_connected", False) or (store is not None),
+            "products_in_cache": count_result["count"] if count_result else 0,
+            "last_sync": count_result["last_sync"].isoformat() if count_result and count_result["last_sync"] else None,
+            "merchant_updated_at": merchant.get("updated_at").isoformat() if merchant.get("updated_at") else None
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get sync status error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get sync status: {str(e)}")
