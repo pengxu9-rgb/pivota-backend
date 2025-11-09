@@ -126,7 +126,6 @@ async def sync_products(
                 # Parse token if it's stored as JSON
                 try:
                     if api_key_raw and api_key_raw.strip().startswith("{"):
-                        import json
                         token_data = json.loads(api_key_raw)
                         access_token = token_data.get("access_token") or token_data.get("token") or api_key_raw
                         logger.info(f"🔑 Parsed Shopify token from JSON")
@@ -167,7 +166,6 @@ async def sync_products(
             # Parse token if it's stored as JSON (same as Shopify)
             try:
                 if api_key_raw and api_key_raw.strip().startswith("{"):
-                    import json
                     token_data = json.loads(api_key_raw)
                     api_key = token_data.get("api_key") or token_data.get("access_token") or token_data.get("token") or api_key_raw
                     logger.info(f"🔑 Parsed Wix token from JSON")
