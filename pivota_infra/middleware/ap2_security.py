@@ -41,6 +41,20 @@ class AP2SecurityMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/ap2/"):
             return await call_next(request)
         
+        # Define public endpoints that don't require authentication
+        public_endpoints = [
+            "/ap2/status",
+            "/ap2/protocols",
+        ]
+        
+        # Check if this is a public endpoint
+        is_public = (
+            request.url.path in public_endpoints or
+            (request.url.path.startswith("/ap2/transaction/") and request.method == "GET") or
+            request.url.path.startswith("/ap2/receipt/") or
+            request.url.path == "/ap2/x402/quote"
+        )
+        
         try:
             # Extract headers
             consent_token = request.headers.get("X-Agent-Consent")
@@ -48,8 +62,8 @@ class AP2SecurityMiddleware(BaseHTTPMiddleware):
             nonce = request.headers.get("X-AP2-Nonce")
             wallet_address = request.headers.get("X-Wallet-Address")
             
-            # Validate required headers (for non-public endpoints)
-            if "/ap2/public/" not in request.url.path:
+            # Validate required headers (for non-public endpoints only)
+            if not is_public:
                 if not consent_token:
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
