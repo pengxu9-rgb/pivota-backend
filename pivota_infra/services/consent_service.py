@@ -11,7 +11,15 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from db.database import database
-from services.crypto_service import crypto_service
+
+# Use lazy import to avoid circular dependency
+crypto_service = None
+def get_crypto_service():
+    global crypto_service
+    if crypto_service is None:
+        from pivota_infra.services.crypto_service import crypto_service as cs
+        crypto_service = cs
+    return crypto_service
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +61,8 @@ class ConsentService:
                 "nonce": nonce
             }
             
-            is_valid = crypto_service.verify_agent_signature(
+            crypto_svc = get_crypto_service()
+            is_valid = crypto_svc.verify_agent_signature(
                 public_key=public_key,
                 signature=signature,
                 payload=payload,
