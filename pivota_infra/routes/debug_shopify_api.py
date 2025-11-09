@@ -77,3 +77,4 @@ async def test_shopify_api(merchant_id: str):
         logger.error(f"❌ Shopify API test failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
