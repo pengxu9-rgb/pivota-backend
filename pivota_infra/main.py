@@ -132,9 +132,6 @@ if AP2_ENABLED:
     from routes.ap2_routes import router as ap2_router
     from routes.admin_protocol_sync import router as admin_protocol_sync_router
     from routes.admin_wallet_management import router as admin_wallet_mgmt_router
-    logger.info("✅ AP2 Protocol routes enabled")
-else:
-    logger.info("⚠️ AP2 Protocol routes disabled (ENABLE_AP2_ROUTES=false)")
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
