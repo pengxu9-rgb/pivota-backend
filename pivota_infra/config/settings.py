@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     # Nightly backfill guard
     enable_nightly_psp_id_backfill: bool = os.getenv("ENABLE_NIGHTLY_PSP_ID_BACKFILL", "false").lower() == "true"
     
+    # AP2 Protocol (Phase 4++)
+    enable_ap2_routes: bool = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"
+    platform_signing_key: Optional[str] = os.getenv("PLATFORM_SIGNING_KEY")  # For receipt signing
+    
     # JWT
     jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "your-super-secret-key")
     jwt_algorithm: str = "HS256"

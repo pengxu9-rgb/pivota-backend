@@ -1,0 +1,554 @@
+"""
+AP2 Protocol Routes
+Implements Agent Payment Protocol v2 endpoints for payment processing
+"""
+import logging
+from datetime import datetime
+from typing import Optional
+from fastapi import APIRouter, Request, HTTPException, Depends, status
+from pydantic import BaseModel, Field
+from db.database import database
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/ap2",
+    tags=["AP2 Protocol"]
+)
+
+
+# ========================
+# Request/Response Models
+# ========================
+
+class AP2PaymentRequest(BaseModel):
+    """AP2 payment request"""
+    merchant_id: str = Field(..., description="Target merchant ID")
+    amount: float = Field(..., description="Payment amount", gt=0)
+    currency: str = Field(..., description="Currency code (USD, EUR, etc.)")
+    product_id: Optional[str] = Field(None, description="Product ID if purchasing product")
+    metadata: Optional[dict] = Field(None, description="Additional payment metadata")
+
+
+class AP2TransactionResponse(BaseModel):
+    """AP2 transaction response"""
+    transaction_id: str = Field(..., description="Unique transaction ID")
+    status: str = Field(..., description="Transaction status (pending, completed, failed)")
+    receipt_url: Optional[str] = Field(None, description="Receipt URL")
+    signature: Optional[str] = Field(None, description="Platform signature")
+
+
+class AP2ExchangeRateRequest(BaseModel):
+    """X-402 exchange rate request"""
+    from_currency: str = Field(..., description="Source currency")
+    to_currency: str = Field(..., description="Target currency")
+    amount: float = Field(..., description="Amount to convert", gt=0)
+
+
+class AP2ExchangeRateResponse(BaseModel):
+    """X-402 exchange rate response"""
+    from_currency: str
+    to_currency: str
+    rate: float = Field(..., description="Exchange rate")
+    converted_amount: float = Field(..., description="Converted amount")
+    timestamp: str = Field(..., description="Rate timestamp")
+
+
+# ========================
+# Public Endpoints
+# ========================
+
+@router.get("/status")
+async def get_ap2_status():
+    """
+    Get AP2 protocol status and capabilities
+    
+    Public endpoint - no authentication required
+    """
+    return {
+        "protocol": "AP2",
+        "version": "0.1",
+        "status": "active",
+        "capabilities": [
+            "agent_consent",
+            "signature_verification",
+            "wallet_payments",
+            "x402_exchange"
+        ],
+        "supported_protocols": ["AP2", "X-402"],
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.get("/protocols")
+async def list_supported_protocols():
+    """
+    List all supported protocols and their versions
+    
+    Public endpoint - no authentication required
+    """
+    return {
+        "protocols": [
+            {
+                "name": "AP2",
+                "version": "0.1",
+                "description": "Agent Payment Protocol v2",
+                "endpoints": [
+                    "/ap2/transaction/initiate",
+                    "/ap2/transaction/confirm",
+                    "/ap2/wallet/balance"
+                ]
+            },
+            {
+                "name": "X-402",
+                "version": "0.1",
+                "description": "Payment Required Protocol",
+                "endpoints": [
+                    "/ap2/x402/quote",
+                    "/ap2/x402/exchange"
+                ]
+            }
+        ]
+    }
+
+
+# ========================
+# Agent Consent Endpoints
+# ========================
+
+@router.post("/consent/grant")
+async def grant_consent(request: Request):
+    """
+    Grant agent consent for payment operations
+    
+    Requires:
+    - X-AP2-Signature: Agent signature
+    - X-AP2-Nonce: Unique nonce
+    
+    Returns consent token for subsequent requests
+    """
+    from services.consent_service import consent_service
+    
+    # Extract headers
+    signature = request.headers.get("X-AP2-Signature")
+    nonce = request.headers.get("X-AP2-Nonce")
+    
+    if not signature or not nonce:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing required headers (X-AP2-Signature, X-AP2-Nonce)"
+        )
+    
+    # Parse request body
+    body = await request.json()
+    agent_id = body.get("agent_id")
+    scope = body.get("scope", ["read"])
+    duration_hours = body.get("duration_hours", 24)
+    
+    if not agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing agent_id"
+        )
+    
+    try:
+        # Create consent
+        consent_data = await consent_service.create_consent(
+            agent_id=agent_id,
+            scope=scope,
+            duration_hours=duration_hours,
+            signature=signature,
+            nonce=nonce
+        )
+        
+        return {
+            "consent_token": consent_data["token"],
+            "expires_at": consent_data["expires_at"],
+            "scope": consent_data["scope"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Consent grant failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to grant consent"
+        )
+
+
+@router.post("/consent/revoke")
+async def revoke_consent(request: Request):
+    """
+    Revoke agent consent
+    
+    Requires:
+    - X-Agent-Consent: Valid consent token
+    """
+    from services.consent_service import consent_service
+    
+    consent_token = request.headers.get("X-Agent-Consent")
+    
+    if not consent_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing X-Agent-Consent header"
+        )
+    
+    try:
+        await consent_service.revoke_consent(consent_token)
+        return {"status": "revoked"}
+        
+    except Exception as e:
+        logger.error(f"Consent revoke failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to revoke consent"
+        )
+
+
+# ========================
+# Transaction Endpoints
+# ========================
+
+@router.post("/transaction/initiate", response_model=AP2TransactionResponse)
+async def initiate_transaction(
+    payment: AP2PaymentRequest,
+    request: Request
+):
+    """
+    Initiate AP2 payment transaction
+    
+    Requires:
+    - X-Agent-Consent: Valid consent token
+    - X-AP2-Signature: Request signature
+    - X-AP2-Nonce: Unique nonce
+    """
+    from services.consent_service import consent_service
+    from services.crypto_service import crypto_service
+    
+    # Verify consent
+    consent_token = request.headers.get("X-Agent-Consent")
+    if not consent_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing agent consent"
+        )
+    
+    consent_data = await consent_service.verify_consent(consent_token)
+    agent_id = consent_data["agent_id"]
+    
+    # Verify nonce
+    nonce = request.headers.get("X-AP2-Nonce")
+    if not nonce:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing nonce"
+        )
+    
+    # Check nonce uniqueness
+    from middleware.ap2_security import verify_ap2_nonce
+    await verify_ap2_nonce(request, nonce)
+    
+    # Create transaction
+    transaction_id = f"ap2_txn_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{nonce[:8]}"
+    
+    insert_query = """
+        INSERT INTO x402_transactions (
+            transaction_id,
+            agent_id,
+            merchant_id,
+            amount,
+            currency,
+            product_id,
+            status,
+            metadata,
+            created_at
+        ) VALUES (
+            :transaction_id,
+            :agent_id,
+            :merchant_id,
+            :amount,
+            :currency,
+            :product_id,
+            'pending',
+            :metadata,
+            NOW()
+        )
+    """
+    
+    await database.execute(
+        insert_query,
+        {
+            "transaction_id": transaction_id,
+            "agent_id": agent_id,
+            "merchant_id": payment.merchant_id,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "product_id": payment.product_id,
+            "metadata": payment.metadata
+        }
+    )
+    
+    # Generate receipt signature
+    receipt_data = {
+        "transaction_id": transaction_id,
+        "amount": payment.amount,
+        "currency": payment.currency,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    signature = crypto_service.sign_receipt(receipt_data)
+    
+    return AP2TransactionResponse(
+        transaction_id=transaction_id,
+        status="pending",
+        receipt_url=f"/ap2/receipt/{transaction_id}",
+        signature=signature
+    )
+
+
+@router.post("/transaction/confirm")
+async def confirm_transaction(request: Request):
+    """
+    Confirm pending transaction
+    
+    Requires:
+    - X-Agent-Consent: Valid consent token
+    - X-Wallet-Address: Agent wallet address
+    """
+    from services.wallet_service import wallet_service
+    
+    # Verify consent
+    consent_token = request.headers.get("X-Agent-Consent")
+    if not consent_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing agent consent"
+        )
+    
+    # Parse body
+    body = await request.json()
+    transaction_id = body.get("transaction_id")
+    wallet_address = request.headers.get("X-Wallet-Address")
+    
+    if not transaction_id or not wallet_address:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing transaction_id or wallet_address"
+        )
+    
+    # Verify wallet
+    from services.consent_service import consent_service
+    consent_data = await consent_service.verify_consent(consent_token)
+    agent_id = consent_data["agent_id"]
+    
+    is_valid = await wallet_service.verify_agent_wallet(agent_id, wallet_address)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Wallet not authorized"
+        )
+    
+    # Update transaction status
+    update_query = """
+        UPDATE x402_transactions
+        SET status = 'completed',
+            wallet_address = :wallet_address,
+            confirmed_at = NOW()
+        WHERE transaction_id = :transaction_id
+    """
+    
+    await database.execute(
+        update_query,
+        {
+            "transaction_id": transaction_id,
+            "wallet_address": wallet_address
+        }
+    )
+    
+    return {
+        "transaction_id": transaction_id,
+        "status": "completed",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.get("/transaction/{transaction_id}")
+async def get_transaction_status(transaction_id: str):
+    """
+    Get transaction status
+    
+    Public endpoint - no authentication required
+    """
+    query = """
+        SELECT transaction_id, agent_id, merchant_id, amount, currency,
+               status, created_at, confirmed_at
+        FROM x402_transactions
+        WHERE transaction_id = :transaction_id
+    """
+    
+    result = await database.fetch_one(query, {"transaction_id": transaction_id})
+    
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Transaction not found"
+        )
+    
+    return dict(result)
+
+
+# ========================
+# X-402 Exchange Endpoints
+# ========================
+
+@router.post("/x402/quote", response_model=AP2ExchangeRateResponse)
+async def get_exchange_quote(exchange_request: AP2ExchangeRateRequest):
+    """
+    Get exchange rate quote (X-402 protocol)
+    
+    Public endpoint - no authentication required
+    """
+    # Query exchange rates
+    query = """
+        SELECT rate, updated_at
+        FROM x402_exchange_rates
+        WHERE from_currency = :from_currency
+          AND to_currency = :to_currency
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """
+    
+    result = await database.fetch_one(
+        query,
+        {
+            "from_currency": exchange_request.from_currency.upper(),
+            "to_currency": exchange_request.to_currency.upper()
+        }
+    )
+    
+    if not result:
+        # Use default 1:1 rate if not found
+        rate = 1.0
+        logger.warning(
+            f"No exchange rate found for {exchange_request.from_currency}/"
+            f"{exchange_request.to_currency}, using 1:1"
+        )
+    else:
+        rate = float(result["rate"])
+    
+    converted_amount = exchange_request.amount * rate
+    
+    return AP2ExchangeRateResponse(
+        from_currency=exchange_request.from_currency.upper(),
+        to_currency=exchange_request.to_currency.upper(),
+        rate=rate,
+        converted_amount=converted_amount,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+
+@router.post("/x402/exchange")
+async def execute_exchange(request: Request):
+    """
+    Execute currency exchange (X-402 protocol)
+    
+    Requires:
+    - X-Agent-Consent: Valid consent token
+    - X-Wallet-Address: Agent wallet address
+    """
+    # TODO: Implement X-402 exchange execution
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="X-402 exchange execution not yet implemented"
+    )
+
+
+# ========================
+# Wallet Endpoints
+# ========================
+
+@router.get("/wallet/balance")
+async def get_wallet_balance(request: Request):
+    """
+    Get agent wallet balance
+    
+    Requires:
+    - X-Agent-Consent: Valid consent token
+    - X-Wallet-Address: Wallet address
+    """
+    from services.consent_service import consent_service
+    
+    # Verify consent
+    consent_token = request.headers.get("X-Agent-Consent")
+    wallet_address = request.headers.get("X-Wallet-Address")
+    
+    if not consent_token or not wallet_address:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing required headers"
+        )
+    
+    consent_data = await consent_service.verify_consent(consent_token)
+    agent_id = consent_data["agent_id"]
+    
+    # Query wallet balance
+    query = """
+        SELECT wallet_id, balance, currency, status, last_updated
+        FROM agent_wallets
+        WHERE agent_id = :agent_id AND wallet_address = :wallet_address
+    """
+    
+    wallet = await database.fetch_one(
+        query,
+        {
+            "agent_id": agent_id,
+            "wallet_address": wallet_address
+        }
+    )
+    
+    if not wallet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Wallet not found"
+        )
+    
+    return dict(wallet)
+
+
+@router.get("/receipt/{transaction_id}")
+async def get_transaction_receipt(transaction_id: str):
+    """
+    Get transaction receipt with platform signature
+    
+    Public endpoint - no authentication required
+    """
+    from services.crypto_service import crypto_service
+    
+    # Query transaction
+    query = """
+        SELECT transaction_id, agent_id, merchant_id, amount, currency,
+               status, created_at, confirmed_at
+        FROM x402_transactions
+        WHERE transaction_id = :transaction_id
+    """
+    
+    result = await database.fetch_one(query, {"transaction_id": transaction_id})
+    
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Transaction not found"
+        )
+    
+    receipt_data = dict(result)
+    
+    # Sign receipt
+    signature = crypto_service.sign_receipt(receipt_data)
+    
+    return {
+        "receipt": receipt_data,
+        "signature": signature,
+        "protocol": "AP2",
+        "version": "0.1"
+    }
+

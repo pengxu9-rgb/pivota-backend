@@ -1,0 +1,600 @@
+"""
+Admin Wallet Management Routes
+Administrator endpoints for managing merchant and agent wallets
+"""
+import logging
+from datetime import datetime
+from typing import Optional, List
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, Field
+from db.database import database
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/admin/wallets",
+    tags=["Admin - Wallet Management"]
+)
+
+
+# ========================
+# Request/Response Models
+# ========================
+
+class MerchantWalletCreate(BaseModel):
+    """Create merchant wallet"""
+    merchant_id: str = Field(..., description="Merchant ID")
+    wallet_address: str = Field(..., description="Wallet address")
+    wallet_type: str = Field(..., description="Wallet type (ethereum, bitcoin, etc.)")
+    currency: str = Field(default="USD", description="Currency")
+
+
+class AgentWalletCreate(BaseModel):
+    """Create agent wallet"""
+    agent_id: str = Field(..., description="Agent ID")
+    wallet_address: str = Field(..., description="Wallet address")
+    wallet_type: str = Field(..., description="Wallet type (ethereum, bitcoin, etc.)")
+    currency: str = Field(default="USD", description="Currency")
+
+
+class WalletBalanceUpdate(BaseModel):
+    """Update wallet balance"""
+    balance: float = Field(..., description="New balance")
+    reason: Optional[str] = Field(None, description="Reason for update")
+
+
+class WalletStatusUpdate(BaseModel):
+    """Update wallet status"""
+    status: str = Field(..., description="New status (active, suspended, closed)")
+    reason: Optional[str] = Field(None, description="Reason for status change")
+
+
+# ========================
+# Merchant Wallet Management
+# ========================
+
+@router.get("/merchant")
+async def list_merchant_wallets(
+    merchant_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    List merchant wallets
+    
+    Admin only - no authentication implemented yet
+    """
+    query = """
+        SELECT wallet_id, merchant_id, wallet_address, wallet_type,
+               balance, currency, status, created_at, last_updated
+        FROM merchant_wallets
+        WHERE 1=1
+    """
+    
+    params = {}
+    
+    if merchant_id:
+        query += " AND merchant_id = :merchant_id"
+        params["merchant_id"] = merchant_id
+    
+    if status:
+        query += " AND status = :status"
+        params["status"] = status
+    
+    query += " ORDER BY created_at DESC LIMIT :limit"
+    params["limit"] = limit
+    
+    results = await database.fetch_all(query, params)
+    
+    return {
+        "wallets": [dict(r) for r in results],
+        "count": len(results)
+    }
+
+
+@router.post("/merchant")
+async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
+    """
+    Create merchant wallet
+    
+    Admin only - no authentication implemented yet
+    """
+    # Check if wallet already exists
+    check_query = """
+        SELECT wallet_id FROM merchant_wallets
+        WHERE merchant_id = :merchant_id AND wallet_address = :wallet_address
+    """
+    
+    existing = await database.fetch_one(
+        check_query,
+        {
+            "merchant_id": wallet_data.merchant_id,
+            "wallet_address": wallet_data.wallet_address
+        }
+    )
+    
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Wallet already exists for this merchant"
+        )
+    
+    # Create wallet
+    wallet_id = f"mw_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{wallet_data.merchant_id[:8]}"
+    
+    insert_query = """
+        INSERT INTO merchant_wallets (
+            wallet_id, merchant_id, wallet_address, wallet_type,
+            balance, currency, status, created_at, last_updated
+        ) VALUES (
+            :wallet_id, :merchant_id, :wallet_address, :wallet_type,
+            0, :currency, 'active', NOW(), NOW()
+        )
+    """
+    
+    await database.execute(
+        insert_query,
+        {
+            "wallet_id": wallet_id,
+            "merchant_id": wallet_data.merchant_id,
+            "wallet_address": wallet_data.wallet_address,
+            "wallet_type": wallet_data.wallet_type,
+            "currency": wallet_data.currency
+        }
+    )
+    
+    logger.info(f"Merchant wallet created: {wallet_id}")
+    
+    return {
+        "wallet_id": wallet_id,
+        "merchant_id": wallet_data.merchant_id,
+        "wallet_address": wallet_data.wallet_address,
+        "status": "active",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.get("/merchant/{wallet_id}")
+async def get_merchant_wallet(wallet_id: str):
+    """
+    Get merchant wallet details
+    
+    Admin only - no authentication implemented yet
+    """
+    query = """
+        SELECT wallet_id, merchant_id, wallet_address, wallet_type,
+               balance, currency, status, created_at, last_updated
+        FROM merchant_wallets
+        WHERE wallet_id = :wallet_id
+    """
+    
+    result = await database.fetch_one(query, {"wallet_id": wallet_id})
+    
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Merchant wallet not found"
+        )
+    
+    return dict(result)
+
+
+@router.patch("/merchant/{wallet_id}/balance")
+async def update_merchant_wallet_balance(
+    wallet_id: str,
+    balance_update: WalletBalanceUpdate
+):
+    """
+    Update merchant wallet balance (admin override)
+    
+    Admin only - no authentication implemented yet
+    """
+    update_query = """
+        UPDATE merchant_wallets
+        SET balance = :balance,
+            last_updated = NOW()
+        WHERE wallet_id = :wallet_id
+    """
+    
+    result = await database.execute(
+        update_query,
+        {
+            "wallet_id": wallet_id,
+            "balance": balance_update.balance
+        }
+    )
+    
+    logger.info(
+        f"Merchant wallet balance updated: {wallet_id} = {balance_update.balance} "
+        f"(reason: {balance_update.reason})"
+    )
+    
+    return {
+        "status": "updated",
+        "wallet_id": wallet_id,
+        "new_balance": balance_update.balance,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.patch("/merchant/{wallet_id}/status")
+async def update_merchant_wallet_status(
+    wallet_id: str,
+    status_update: WalletStatusUpdate
+):
+    """
+    Update merchant wallet status
+    
+    Admin only - no authentication implemented yet
+    """
+    if status_update.status not in ["active", "suspended", "closed"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid status. Must be: active, suspended, or closed"
+        )
+    
+    update_query = """
+        UPDATE merchant_wallets
+        SET status = :status,
+            last_updated = NOW()
+        WHERE wallet_id = :wallet_id
+    """
+    
+    result = await database.execute(
+        update_query,
+        {
+            "wallet_id": wallet_id,
+            "status": status_update.status
+        }
+    )
+    
+    logger.info(
+        f"Merchant wallet status updated: {wallet_id} = {status_update.status} "
+        f"(reason: {status_update.reason})"
+    )
+    
+    return {
+        "status": "updated",
+        "wallet_id": wallet_id,
+        "new_status": status_update.status,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.delete("/merchant/{wallet_id}")
+async def delete_merchant_wallet(wallet_id: str):
+    """
+    Delete merchant wallet
+    
+    Admin only - no authentication implemented yet
+    """
+    delete_query = """
+        DELETE FROM merchant_wallets
+        WHERE wallet_id = :wallet_id
+    """
+    
+    await database.execute(delete_query, {"wallet_id": wallet_id})
+    
+    logger.info(f"Merchant wallet deleted: {wallet_id}")
+    
+    return {
+        "status": "deleted",
+        "wallet_id": wallet_id,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+# ========================
+# Agent Wallet Management
+# ========================
+
+@router.get("/agent")
+async def list_agent_wallets(
+    agent_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    List agent wallets
+    
+    Admin only - no authentication implemented yet
+    """
+    query = """
+        SELECT wallet_id, agent_id, wallet_address, wallet_type,
+               balance, currency, status, created_at, last_updated
+        FROM agent_wallets
+        WHERE 1=1
+    """
+    
+    params = {}
+    
+    if agent_id:
+        query += " AND agent_id = :agent_id"
+        params["agent_id"] = agent_id
+    
+    if status:
+        query += " AND status = :status"
+        params["status"] = status
+    
+    query += " ORDER BY created_at DESC LIMIT :limit"
+    params["limit"] = limit
+    
+    results = await database.fetch_all(query, params)
+    
+    return {
+        "wallets": [dict(r) for r in results],
+        "count": len(results)
+    }
+
+
+@router.post("/agent")
+async def create_agent_wallet(wallet_data: AgentWalletCreate):
+    """
+    Create agent wallet
+    
+    Admin only - no authentication implemented yet
+    """
+    # Check if wallet already exists
+    check_query = """
+        SELECT wallet_id FROM agent_wallets
+        WHERE agent_id = :agent_id AND wallet_address = :wallet_address
+    """
+    
+    existing = await database.fetch_one(
+        check_query,
+        {
+            "agent_id": wallet_data.agent_id,
+            "wallet_address": wallet_data.wallet_address
+        }
+    )
+    
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Wallet already exists for this agent"
+        )
+    
+    # Create wallet
+    wallet_id = f"aw_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{wallet_data.agent_id[:8]}"
+    
+    insert_query = """
+        INSERT INTO agent_wallets (
+            wallet_id, agent_id, wallet_address, wallet_type,
+            balance, currency, status, created_at, last_updated
+        ) VALUES (
+            :wallet_id, :agent_id, :wallet_address, :wallet_type,
+            0, :currency, 'active', NOW(), NOW()
+        )
+    """
+    
+    await database.execute(
+        insert_query,
+        {
+            "wallet_id": wallet_id,
+            "agent_id": wallet_data.agent_id,
+            "wallet_address": wallet_data.wallet_address,
+            "wallet_type": wallet_data.wallet_type,
+            "currency": wallet_data.currency
+        }
+    )
+    
+    logger.info(f"Agent wallet created: {wallet_id}")
+    
+    return {
+        "wallet_id": wallet_id,
+        "agent_id": wallet_data.agent_id,
+        "wallet_address": wallet_data.wallet_address,
+        "status": "active",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.get("/agent/{wallet_id}")
+async def get_agent_wallet(wallet_id: str):
+    """
+    Get agent wallet details
+    
+    Admin only - no authentication implemented yet
+    """
+    query = """
+        SELECT wallet_id, agent_id, wallet_address, wallet_type,
+               balance, currency, status, created_at, last_updated
+        FROM agent_wallets
+        WHERE wallet_id = :wallet_id
+    """
+    
+    result = await database.fetch_one(query, {"wallet_id": wallet_id})
+    
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent wallet not found"
+        )
+    
+    return dict(result)
+
+
+@router.patch("/agent/{wallet_id}/balance")
+async def update_agent_wallet_balance(
+    wallet_id: str,
+    balance_update: WalletBalanceUpdate
+):
+    """
+    Update agent wallet balance (admin override)
+    
+    Admin only - no authentication implemented yet
+    """
+    update_query = """
+        UPDATE agent_wallets
+        SET balance = :balance,
+            last_updated = NOW()
+        WHERE wallet_id = :wallet_id
+    """
+    
+    result = await database.execute(
+        update_query,
+        {
+            "wallet_id": wallet_id,
+            "balance": balance_update.balance
+        }
+    )
+    
+    logger.info(
+        f"Agent wallet balance updated: {wallet_id} = {balance_update.balance} "
+        f"(reason: {balance_update.reason})"
+    )
+    
+    return {
+        "status": "updated",
+        "wallet_id": wallet_id,
+        "new_balance": balance_update.balance,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.patch("/agent/{wallet_id}/status")
+async def update_agent_wallet_status(
+    wallet_id: str,
+    status_update: WalletStatusUpdate
+):
+    """
+    Update agent wallet status
+    
+    Admin only - no authentication implemented yet
+    """
+    if status_update.status not in ["active", "suspended", "closed"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid status. Must be: active, suspended, or closed"
+        )
+    
+    update_query = """
+        UPDATE agent_wallets
+        SET status = :status,
+            last_updated = NOW()
+        WHERE wallet_id = :wallet_id
+    """
+    
+    result = await database.execute(
+        update_query,
+        {
+            "wallet_id": wallet_id,
+            "status": status_update.status
+        }
+    )
+    
+    logger.info(
+        f"Agent wallet status updated: {wallet_id} = {status_update.status} "
+        f"(reason: {status_update.reason})"
+    )
+    
+    return {
+        "status": "updated",
+        "wallet_id": wallet_id,
+        "new_status": status_update.status,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.delete("/agent/{wallet_id}")
+async def delete_agent_wallet(wallet_id: str):
+    """
+    Delete agent wallet
+    
+    Admin only - no authentication implemented yet
+    """
+    delete_query = """
+        DELETE FROM agent_wallets
+        WHERE wallet_id = :wallet_id
+    """
+    
+    await database.execute(delete_query, {"wallet_id": wallet_id})
+    
+    logger.info(f"Agent wallet deleted: {wallet_id}")
+    
+    return {
+        "status": "deleted",
+        "wallet_id": wallet_id,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+# ========================
+# Wallet Statistics
+# ========================
+
+@router.get("/stats")
+async def get_wallet_stats():
+    """
+    Get wallet statistics
+    
+    Admin only - no authentication implemented yet
+    """
+    # Merchant wallet stats
+    merchant_stats = await database.fetch_one("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
+            SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) as suspended,
+            SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed,
+            SUM(balance) as total_balance
+        FROM merchant_wallets
+    """)
+    
+    # Agent wallet stats
+    agent_stats = await database.fetch_one("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
+            SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) as suspended,
+            SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed,
+            SUM(balance) as total_balance
+        FROM agent_wallets
+    """)
+    
+    return {
+        "merchant_wallets": dict(merchant_stats) if merchant_stats else {},
+        "agent_wallets": dict(agent_stats) if agent_stats else {},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.get("/transactions")
+async def get_wallet_transactions(
+    wallet_id: Optional[str] = None,
+    wallet_type: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Get wallet transactions
+    
+    Admin only - no authentication implemented yet
+    
+    Args:
+        wallet_id: Specific wallet ID
+        wallet_type: Filter by wallet type (merchant or agent)
+        limit: Max number of transactions
+    """
+    query = """
+        SELECT transaction_id, agent_id, merchant_id, wallet_address,
+               amount, currency, status, created_at
+        FROM x402_transactions
+        WHERE 1=1
+    """
+    
+    params = {}
+    
+    if wallet_id:
+        # TODO: Join with wallet tables to filter by wallet_id
+        pass
+    
+    query += " ORDER BY created_at DESC LIMIT :limit"
+    params["limit"] = limit
+    
+    results = await database.fetch_all(query, params)
+    
+    return {
+        "transactions": [dict(r) for r in results],
+        "count": len(results)
+    }
+

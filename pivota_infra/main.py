@@ -124,6 +124,17 @@ if DEBUG_MODE:
     from routes.agent_debug import router as agent_debug_router
     from routes.admin_debug_products import router as debug_products_router
     from routes.admin_populate_products import router as test_populate_router
+
+# AP2 Protocol routers - only import if ENABLE_AP2_ROUTES is enabled
+AP2_ENABLED = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"
+
+if AP2_ENABLED:
+    from routes.ap2_routes import router as ap2_router
+    from routes.admin_protocol_sync import router as admin_protocol_sync_router
+    from routes.admin_wallet_management import router as admin_wallet_mgmt_router
+    logger.info("✅ AP2 Protocol routes enabled")
+else:
+    logger.info("⚠️ AP2 Protocol routes disabled (ENABLE_AP2_ROUTES=false)")
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -327,6 +338,11 @@ app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_
 # Add structured logging middleware (logs all requests in JSON format)
 app.add_middleware(StructuredLoggingMiddleware)
 
+# Add AP2 security middleware if enabled
+if AP2_ENABLED:
+    from middleware.ap2_security import AP2SecurityMiddleware
+    app.add_middleware(AP2SecurityMiddleware, enabled=True)
+
 # Include available routers
 app.include_router(agent_router)  # ⚠️ DEPRECATED - Use agent_api_router (/agent/v1/*) instead. Will be removed 2026-05-01
 app.include_router(psp_router)
@@ -475,6 +491,14 @@ if DEBUG_MODE:
     app.include_router(debug_products_router)  # Debug products endpoints
     app.include_router(test_populate_router)  # Test data population
     logger.warning("⚠️ DEBUG MODE ENABLED - Debug endpoints are accessible!")
+
+# Include AP2 Protocol routers if enabled
+if AP2_ENABLED:
+    app.include_router(ap2_router)  # AP2 protocol endpoints
+    app.include_router(admin_protocol_sync_router)  # Admin protocol sync
+    app.include_router(admin_wallet_mgmt_router)  # Admin wallet management
+    logger.info("✅ AP2 Protocol routers included")
+
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 # Register more specific product routes FIRST to avoid path conflicts
