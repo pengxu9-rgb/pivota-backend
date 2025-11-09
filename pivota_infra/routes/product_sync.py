@@ -121,7 +121,20 @@ async def sync_products(
             # Try merchant_stores first, then fallback to merchant_onboarding
             if store:
                 shop_domain = store["domain"]
-                access_token = store["api_key"]
+                api_key_raw = store["api_key"]
+                
+                # Parse token if it's stored as JSON
+                try:
+                    if api_key_raw and api_key_raw.strip().startswith("{"):
+                        import json
+                        token_data = json.loads(api_key_raw)
+                        access_token = token_data.get("access_token") or token_data.get("token") or api_key_raw
+                        logger.info(f"🔑 Parsed Shopify token from JSON")
+                    else:
+                        access_token = api_key_raw
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to parse token JSON, using raw: {e}")
+                    access_token = api_key_raw
             else:
                 # Fallback to merchant_onboarding MCP fields
                 shop_domain = merchant.get("mcp_domain") or merchant.get("store_url")
