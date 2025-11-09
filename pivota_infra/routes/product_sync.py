@@ -161,10 +161,23 @@ async def sync_products(
                     detail="Wix store not found in merchant_stores. Please reconnect Wix."
                 )
             
-            api_key = store["api_key"]
+            api_key_raw = store["api_key"]
             domain = store["domain"]
             
-            logger.info(f"🔍 Wix store data: domain={domain}, has_api_key={bool(api_key)} (v2)")
+            # Parse token if it's stored as JSON (same as Shopify)
+            try:
+                if api_key_raw and api_key_raw.strip().startswith("{"):
+                    import json
+                    token_data = json.loads(api_key_raw)
+                    api_key = token_data.get("api_key") or token_data.get("access_token") or token_data.get("token") or api_key_raw
+                    logger.info(f"🔑 Parsed Wix token from JSON")
+                else:
+                    api_key = api_key_raw
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to parse Wix token JSON, using raw: {e}")
+                api_key = api_key_raw
+            
+            logger.info(f"🔍 Wix store data: domain={domain}, has_api_key={bool(api_key)} (v3)")
             
             if not api_key or not domain:
                 logger.warning(f"⚠️ Wix credentials incomplete for merchant {request.merchant_id}")
