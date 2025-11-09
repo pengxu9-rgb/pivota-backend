@@ -101,6 +101,36 @@ async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
     
     Admin only - no authentication implemented yet
     """
+    # Validate wallet address
+    from services.wallet_service import wallet_service
+    is_valid, error_msg = wallet_service.validate_address(wallet_data.network, wallet_data.address)
+    
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid wallet address: {error_msg}"
+        )
+    
+    # Check if merchant exists (avoid FK constraint error)
+    merchant_check = await database.fetch_one(
+        "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+        {"merchant_id": wallet_data.merchant_id}
+    )
+    
+    if not merchant_check:
+        # Create minimal merchant record to satisfy FK constraint
+        await database.execute(
+            """INSERT INTO merchant_onboarding (merchant_id, business_name, email, status, created_at)
+               VALUES (:merchant_id, :business_name, :email, 'pending', NOW())
+               ON CONFLICT (merchant_id) DO NOTHING""",
+            {
+                "merchant_id": wallet_data.merchant_id,
+                "business_name": f"Test Merchant {wallet_data.merchant_id}",
+                "email": f"{wallet_data.merchant_id}@test.example.com"
+            }
+        )
+        logger.info(f"Created minimal merchant record for FK: {wallet_data.merchant_id}")
+    
     # Check if wallet already exists
     check_query = """
         SELECT wallet_id FROM merchant_wallets
@@ -135,28 +165,35 @@ async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
         )
     """
     
-    await database.execute(
-        insert_query,
-        {
+    try:
+        await database.execute(
+            insert_query,
+            {
+                "wallet_id": wallet_id,
+                "merchant_id": wallet_data.merchant_id,
+                "network": wallet_data.network,
+                "address": wallet_data.address,
+                "custodian": wallet_data.custodian,
+                "custodian_account_id": wallet_data.custodian_account_id
+            }
+        )
+        
+        logger.info(f"Merchant wallet created: {wallet_id}")
+        
+        return {
             "wallet_id": wallet_id,
             "merchant_id": wallet_data.merchant_id,
             "network": wallet_data.network,
             "address": wallet_data.address,
-            "custodian": wallet_data.custodian,
-            "custodian_account_id": wallet_data.custodian_account_id
+            "status": "active",
+            "timestamp": datetime.utcnow().isoformat()
         }
-    )
-    
-    logger.info(f"Merchant wallet created: {wallet_id}")
-    
-    return {
-        "wallet_id": wallet_id,
-        "merchant_id": wallet_data.merchant_id,
-        "network": wallet_data.network,
-        "address": wallet_data.address,
-        "status": "active",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    except Exception as e:
+        logger.error(f"Failed to create merchant wallet: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create wallet: {str(e)}"
+        )
 
 
 @router.get("/merchant/{wallet_id}")
@@ -327,6 +364,36 @@ async def create_agent_wallet(wallet_data: AgentWalletCreate):
     
     Admin only - no authentication implemented yet
     """
+    # Validate wallet address
+    from services.wallet_service import wallet_service
+    is_valid, error_msg = wallet_service.validate_address(wallet_data.network, wallet_data.address)
+    
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid wallet address: {error_msg}"
+        )
+    
+    # Check if agent exists (avoid FK constraint error)
+    agent_check = await database.fetch_one(
+        "SELECT agent_id FROM agents WHERE agent_id = :agent_id",
+        {"agent_id": wallet_data.agent_id}
+    )
+    
+    if not agent_check:
+        # Create minimal agent record to satisfy FK constraint
+        await database.execute(
+            """INSERT INTO agents (agent_id, name, email, status, created_at)
+               VALUES (:agent_id, :name, :email, 'active', NOW())
+               ON CONFLICT (agent_id) DO NOTHING""",
+            {
+                "agent_id": wallet_data.agent_id,
+                "name": f"Test Agent {wallet_data.agent_id}",
+                "email": f"{wallet_data.agent_id}@test.example.com"
+            }
+        )
+        logger.info(f"Created minimal agent record for FK: {wallet_data.agent_id}")
+    
     # Check if wallet already exists
     check_query = """
         SELECT wallet_id FROM agent_wallets
@@ -361,28 +428,35 @@ async def create_agent_wallet(wallet_data: AgentWalletCreate):
         )
     """
     
-    await database.execute(
-        insert_query,
-        {
+    try:
+        await database.execute(
+            insert_query,
+            {
+                "wallet_id": wallet_id,
+                "agent_id": wallet_data.agent_id,
+                "network": wallet_data.network,
+                "address": wallet_data.address,
+                "custodian": wallet_data.custodian,
+                "custodian_account_id": wallet_data.custodian_account_id
+            }
+        )
+        
+        logger.info(f"Agent wallet created: {wallet_id}")
+        
+        return {
             "wallet_id": wallet_id,
             "agent_id": wallet_data.agent_id,
             "network": wallet_data.network,
             "address": wallet_data.address,
-            "custodian": wallet_data.custodian,
-            "custodian_account_id": wallet_data.custodian_account_id
+            "status": "active",
+            "timestamp": datetime.utcnow().isoformat()
         }
-    )
-    
-    logger.info(f"Agent wallet created: {wallet_id}")
-    
-    return {
-        "wallet_id": wallet_id,
-        "agent_id": wallet_data.agent_id,
-        "network": wallet_data.network,
-        "address": wallet_data.address,
-        "status": "active",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    except Exception as e:
+        logger.error(f"Failed to create agent wallet: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create wallet: {str(e)}"
+        )
 
 
 @router.get("/agent/{wallet_id}")
@@ -518,9 +592,9 @@ async def get_wallet_stats():
     merchant_stats = await database.fetch_one("""
         SELECT
             COUNT(*) as total,
-            SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
-            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) as inactive
+            COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) as active,
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending,
+            COALESCE(SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END), 0) as inactive
         FROM merchant_wallets
     """)
     
@@ -528,9 +602,9 @@ async def get_wallet_stats():
     agent_stats = await database.fetch_one("""
         SELECT
             COUNT(*) as total,
-            SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
-            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) as inactive
+            COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) as active,
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending,
+            COALESCE(SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END), 0) as inactive
         FROM agent_wallets
     """)
     
