@@ -120,13 +120,16 @@ async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
     if not merchant_check:
         # Create minimal merchant record to satisfy FK constraint
         await database.execute(
-            """INSERT INTO merchant_onboarding (merchant_id, business_name, email, status, created_at)
-               VALUES (:merchant_id, :business_name, :email, 'pending', NOW())
-               ON CONFLICT (merchant_id) DO NOTHING""",
+            """INSERT INTO merchant_onboarding (
+                   merchant_id, business_name, store_url, contact_email, status, created_at
+               ) VALUES (
+                   :merchant_id, :business_name, :store_url, :contact_email, 'pending_verification', NOW()
+               ) ON CONFLICT (merchant_id) DO NOTHING""",
             {
                 "merchant_id": wallet_data.merchant_id,
                 "business_name": f"Test Merchant {wallet_data.merchant_id}",
-                "email": f"{wallet_data.merchant_id}@test.example.com"
+                "store_url": f"https://test-merchant-{wallet_data.merchant_id}.example.com",
+                "contact_email": f"{wallet_data.merchant_id}@test.example.com"
             }
         )
         logger.info(f"Created minimal merchant record for FK: {wallet_data.merchant_id}")
@@ -382,14 +385,24 @@ async def create_agent_wallet(wallet_data: AgentWalletCreate):
     
     if not agent_check:
         # Create minimal agent record to satisfy FK constraint
+        import secrets
+        api_key = f"test_key_{secrets.token_hex(16)}"
+        api_key_hash = f"hash_{secrets.token_hex(32)}"
+        
         await database.execute(
-            """INSERT INTO agents (agent_id, name, email, status, created_at)
-               VALUES (:agent_id, :name, :email, 'active', NOW())
-               ON CONFLICT (agent_id) DO NOTHING""",
+            """INSERT INTO agents (
+                   agent_id, agent_name, agent_type, api_key, api_key_hash,
+                   is_active, created_at
+               ) VALUES (
+                   :agent_id, :agent_name, :agent_type, :api_key, :api_key_hash,
+                   true, NOW()
+               ) ON CONFLICT (agent_id) DO NOTHING""",
             {
                 "agent_id": wallet_data.agent_id,
-                "name": f"Test Agent {wallet_data.agent_id}",
-                "email": f"{wallet_data.agent_id}@test.example.com"
+                "agent_name": f"Test Agent {wallet_data.agent_id}",
+                "agent_type": "basic",
+                "api_key": api_key,
+                "api_key_hash": api_key_hash
             }
         )
         logger.info(f"Created minimal agent record for FK: {wallet_data.agent_id}")
