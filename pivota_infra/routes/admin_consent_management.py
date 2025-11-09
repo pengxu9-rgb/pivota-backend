@@ -98,14 +98,16 @@ async def issue_consent(
                 "action": "issued",
                 "admin_user": getattr(request.state, "admin_user", "admin"),
                 "agent_id": consent_request.agent_id,
-                "details": {
+                "details": json.dumps({
                     "scope": consent_request.scope,
                     "duration_hours": consent_request.duration_hours,
                     "spending_limit": consent_request.spending_limit,
                     "notes": consent_request.notes
-                }
+                })
             }
         )
+        except Exception as audit_error:
+            logger.warning(f"Audit log failed (table may not exist): {audit_error}")
         
         logger.info(
             f"✅ Admin issued consent {consent_data['token']} "
@@ -364,7 +366,7 @@ async def list_active_consents(
     """
     query = """
         SELECT c.consent_id, c.agent_id, a.agent_name, c.scope, 
-               c.granted_at, c.expires_at, c.status
+               c.created_at, c.expires_at, c.status
         FROM agent_consents c
         LEFT JOIN agents a ON c.agent_id = a.agent_id
         WHERE c.status = 'active'

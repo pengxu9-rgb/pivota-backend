@@ -95,7 +95,7 @@ class ConsentService:
         
         await database.execute(
             """INSERT INTO agent_consents (
-                   consent_id, agent_id, scope, status, granted_at, expires_at
+                   consent_id, agent_id, scope, status, created_at, expires_at
                ) VALUES (
                    :consent_id, :agent_id, :scope, 'active', NOW(), :expires_at
                )""",
