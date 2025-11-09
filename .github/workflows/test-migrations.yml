@@ -1,0 +1,74 @@
+name: Test Database Migrations
+
+on:
+  pull_request:
+    paths:
+      - 'pivota_infra/db/migrations/**'
+  push:
+    branches:
+      - 'feature/ap2-x402-v2'
+    paths:
+      - 'pivota_infra/db/migrations/**'
+
+jobs:
+  test-migrations:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: pivota_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Wait for Postgres
+        run: |
+          until pg_isready -h localhost -p 5432 -U postgres; do
+            echo "Waiting for postgres..."
+            sleep 2
+          done
+      
+      - name: Apply migrations
+        env:
+          PGPASSWORD: test_password
+        run: |
+          echo "Testing database migrations..."
+          cd pivota_infra/db/migrations
+          
+          for migration in $(ls *.sql | sort); do
+            echo ""
+            echo "Testing: $migration"
+            if psql -h localhost -U postgres -d pivota_test -f $migration; then
+              echo "✅ $migration passed"
+            else
+              echo "❌ $migration failed"
+              exit 1
+            fi
+          done
+          
+          echo ""
+          echo "✅ All migrations passed!"
+      
+      - name: Verify tables created
+        env:
+          PGPASSWORD: test_password
+        run: |
+          echo "Verifying tables..."
+          psql -h localhost -U postgres -d pivota_test -c "\dt" | tee tables.txt
+          
+          # Check for AP2 tables (if this branch includes them)
+          if grep -q "agent_consents" tables.txt; then
+            echo "✅ AP2 tables detected"
+          fi
+
