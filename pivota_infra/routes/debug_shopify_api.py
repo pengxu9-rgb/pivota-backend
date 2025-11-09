@@ -1,0 +1,79 @@
+"""
+Debug endpoint to test Shopify API directly
+"""
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import httpx
+from utils.logger import logger
+from db.database import database
+
+router = APIRouter(prefix="/debug", tags=["debug"])
+
+class ShopifyTestResponse(BaseModel):
+    status: str
+    shop_domain: str
+    api_response_code: int
+    product_count: int
+    raw_response: dict
+    error: str = None
+
+@router.get("/test-shopify/{merchant_id}")
+async def test_shopify_api(merchant_id: str):
+    """直接测试 Shopify API 调用"""
+    try:
+        # 1. 获取 Shopify 商店信息
+        store = await database.fetch_one(
+            """SELECT domain, api_key FROM merchant_stores 
+               WHERE merchant_id = :merchant_id AND platform = 'shopify'
+               LIMIT 1""",
+            {"merchant_id": merchant_id}
+        )
+        
+        if not store:
+            raise HTTPException(status_code=404, detail="Shopify store not found")
+        
+        shop_domain = store["domain"]
+        access_token = store["api_key"]
+        
+        logger.info(f"🔍 Testing Shopify API: domain={shop_domain}, has_token={bool(access_token)}")
+        
+        # 2. 直接调用 Shopify API
+        url = f"https://{shop_domain}/admin/api/2024-07/products.json"
+        headers = {"X-Shopify-Access-Token": access_token}
+        params = {"limit": 250}
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers, params=params)
+        
+        logger.info(f"📊 Shopify API response: status={response.status_code}")
+        
+        # 3. 解析响应
+        if response.status_code != 200:
+            return {
+                "status": "error",
+                "shop_domain": shop_domain,
+                "api_response_code": response.status_code,
+                "product_count": 0,
+                "raw_response": {},
+                "error": response.text[:500]
+            }
+        
+        data = response.json()
+        products = data.get("products", [])
+        
+        return {
+            "status": "success",
+            "shop_domain": shop_domain,
+            "api_response_code": response.status_code,
+            "product_count": len(products),
+            "raw_response": {
+                "products_sample": products[:2] if products else [],
+                "total_in_response": len(products)
+            },
+            "error": None
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Shopify API test failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+

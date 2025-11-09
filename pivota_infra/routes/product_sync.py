@@ -70,6 +70,9 @@ async def sync_products(
         if hasattr(request, 'platform') and request.platform:
             platform_filter = "AND platform = :platform"
             query_params["platform"] = request.platform
+            logger.info(f"🔍 Platform filter applied: {request.platform}")
+        else:
+            logger.info(f"⚠️ No platform filter - will select most recent store")
             
         store_query = f"""
             SELECT store_id, platform, domain, api_key, status 
@@ -79,7 +82,11 @@ async def sync_products(
             ORDER BY connected_at DESC
             LIMIT 1
         """
+        logger.info(f"🔍 Query params: {query_params}")
         store = await database.fetch_one(store_query, query_params)
+        
+        if store:
+            logger.info(f"🔍 Selected store: store_id={store['store_id']}, platform={store['platform']}, domain={store['domain']}")
         
         # 3. Determine platform and credentials
         if store:
@@ -289,6 +296,64 @@ async def sync_products(
         raise HTTPException(
             status_code=500,
             detail=f"Product sync failed: {str(e)}"
+        )
+
+@router.get("/status/{merchant_id}")
+async def get_sync_status(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get product sync status for a merchant
+    
+    Returns:
+        Last sync time, product count, platform info
+    """
+    try:
+        # Get merchant info
+        merchant = await get_merchant_onboarding(merchant_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        # Get product count from cache
+        count_result = await database.fetch_one(
+            """SELECT COUNT(*) as count, MAX(cached_at) as last_sync
+               FROM products_cache
+               WHERE merchant_id = :merchant_id
+               AND cache_status != 'expired'""",
+            {"merchant_id": merchant_id}
+        )
+        
+        # Get platform from merchant_stores or merchant_onboarding
+        store = await database.fetch_one(
+            """SELECT platform FROM merchant_stores 
+               WHERE merchant_id = :merchant_id AND status = 'active'
+               ORDER BY connected_at DESC LIMIT 1""",
+            {"merchant_id": merchant_id}
+        )
+        platform = store["platform"] if store else merchant.get("mcp_platform", "unknown")
+        
+        return {
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_connected": merchant.get("mcp_connected", False) or (store is not None),
+            "products_in_cache": count_result["count"] if count_result else 0,
+            "last_sync": count_result["last_sync"].isoformat() if count_result and count_result["last_sync"] else None,
+            "merchant_updated_at": merchant.get("updated_at").isoformat() if merchant.get("updated_at") else None
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get sync status error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get sync status: {str(e)}")
+
+
+
+
+
+
+
         )
 
 @router.get("/status/{merchant_id}")

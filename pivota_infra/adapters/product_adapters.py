@@ -39,6 +39,7 @@ class ShopifyProductAdapter:
         headers = {"X-Shopify-Access-Token": access_token}
         
         try:
+            logger.info(f"🌐 ShopifyAdapter Fetch start merchant_id={merchant_id} shop_domain={shop_domain} limit={limit}")
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, headers=headers, params=params)
             
@@ -49,6 +50,10 @@ class ShopifyProductAdapter:
             
             data = response.json()
             shopify_products = data.get("products", [])
+            logger.info(
+                f"📊 ShopifyAdapter response status={response.status_code} "
+                f"products_len={len(shopify_products)} keys={list(data.keys())}"
+            )
             
             # 转换为标准格式
             standard_products = [
