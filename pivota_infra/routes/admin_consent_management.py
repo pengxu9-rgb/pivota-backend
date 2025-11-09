@@ -2,6 +2,7 @@
 Admin Consent Management Routes
 Self-service tools for issuing, revoking, and auditing agent consents
 """
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
@@ -87,25 +88,26 @@ async def issue_consent(
         )
         
         # Record audit log
-        await database.execute(
-            """INSERT INTO consent_audit_logs (
-                   consent_id, action, admin_user, agent_id, details, created_at
-               ) VALUES (
-                   :consent_id, :action, :admin_user, :agent_id, :details, NOW()
-               )""",
-            {
-                "consent_id": consent_data["token"],
-                "action": "issued",
-                "admin_user": getattr(request.state, "admin_user", "admin"),
-                "agent_id": consent_request.agent_id,
-                "details": json.dumps({
-                    "scope": consent_request.scope,
-                    "duration_hours": consent_request.duration_hours,
-                    "spending_limit": consent_request.spending_limit,
-                    "notes": consent_request.notes
-                })
-            }
-        )
+        try:
+            await database.execute(
+                """INSERT INTO consent_audit_logs (
+                       consent_id, action, admin_user, agent_id, details, created_at
+                   ) VALUES (
+                       :consent_id, :action, :admin_user, :agent_id, :details, NOW()
+                   )""",
+                {
+                    "consent_id": consent_data["token"],
+                    "action": "issued",
+                    "admin_user": getattr(request.state, "admin_user", "admin"),
+                    "agent_id": consent_request.agent_id,
+                    "details": json.dumps({
+                        "scope": consent_request.scope,
+                        "duration_hours": consent_request.duration_hours,
+                        "spending_limit": consent_request.spending_limit,
+                        "notes": consent_request.notes
+                    })
+                }
+            )
         except Exception as audit_error:
             logger.warning(f"Audit log failed (table may not exist): {audit_error}")
         
