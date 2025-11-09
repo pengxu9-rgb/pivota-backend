@@ -226,14 +226,16 @@ class WixProductAdapter:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 
+                logger.info(f"🔍 Wix API response: status={response.status_code}, content_length={len(response.text)}")
+                
                 if response.status_code != 200:
-                    error_msg = f"Wix API error: {response.status_code}"
+                    error_msg = f"Wix API error: {response.status_code} - {response.text[:200]}"
                     logger.error(error_msg)
                     return [], None, error_msg
                 
                 data = response.json()
                 wix_products = data.get("products", [])
-                logger.info(f"✅ Fetched {len(wix_products)} products from Wix")
+                logger.info(f"✅ Wix API returned {len(wix_products)} products (total_results={data.get('totalResults', 'unknown')})")
                 
                 standard_products = []
                 for wp in wix_products:
