@@ -408,21 +408,22 @@ async def get_exchange_quote(exchange_request: AP2ExchangeRateRequest):
     
     Public endpoint - no authentication required
     """
-    import json
-    
-    # Query latest exchange rate snapshot
+    # Query exchange rates
     query = """
-        SELECT rates, base_currency, created_at
+        SELECT rate, updated_at
         FROM x402_exchange_rates
-        WHERE base_currency = :base_currency
-          AND (expires_at IS NULL OR expires_at > NOW())
-        ORDER BY created_at DESC
+        WHERE from_currency = :from_currency
+          AND to_currency = :to_currency
+        ORDER BY updated_at DESC
         LIMIT 1
     """
     
     result = await database.fetch_one(
         query,
-        {"base_currency": exchange_request.from_currency.upper()}
+        {
+            "from_currency": exchange_request.from_currency.upper(),
+            "to_currency": exchange_request.to_currency.upper()
+        }
     )
     
     if not result:
@@ -433,18 +434,7 @@ async def get_exchange_quote(exchange_request: AP2ExchangeRateRequest):
             f"{exchange_request.to_currency}, using 1:1"
         )
     else:
-        # Parse JSONB rates field
-        rates_data = json.loads(result["rates"]) if isinstance(result["rates"], str) else result["rates"]
-        to_currency = exchange_request.to_currency.upper()
-        
-        if to_currency in rates_data:
-            rate = float(rates_data[to_currency])
-        else:
-            # Currency not found in snapshot
-            rate = 1.0
-            logger.warning(
-                f"Currency {to_currency} not found in snapshot, using 1:1"
-            )
+        rate = float(result["rate"])
     
     converted_amount = exchange_request.amount * rate
     
