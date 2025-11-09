@@ -24,17 +24,19 @@ router = APIRouter(
 class MerchantWalletCreate(BaseModel):
     """Create merchant wallet"""
     merchant_id: str = Field(..., description="Merchant ID")
-    wallet_address: str = Field(..., description="Wallet address")
-    wallet_type: str = Field(..., description="Wallet type (ethereum, bitcoin, etc.)")
-    currency: str = Field(default="USD", description="Currency")
+    network: str = Field(..., description="Network (ethereum, bitcoin, polygon, etc.)")
+    address: str = Field(..., description="Wallet address")
+    custodian: Optional[str] = Field(None, description="Custodian service (optional)")
+    custodian_account_id: Optional[str] = Field(None, description="Custodian account ID")
 
 
 class AgentWalletCreate(BaseModel):
     """Create agent wallet"""
     agent_id: str = Field(..., description="Agent ID")
-    wallet_address: str = Field(..., description="Wallet address")
-    wallet_type: str = Field(..., description="Wallet type (ethereum, bitcoin, etc.)")
-    currency: str = Field(default="USD", description="Currency")
+    network: str = Field(..., description="Network (ethereum, bitcoin, polygon, etc.)")
+    address: str = Field(..., description="Wallet address")
+    custodian: Optional[str] = Field(None, description="Custodian service (optional)")
+    custodian_account_id: Optional[str] = Field(None, description="Custodian account ID")
 
 
 class WalletBalanceUpdate(BaseModel):
@@ -65,8 +67,8 @@ async def list_merchant_wallets(
     Admin only - no authentication implemented yet
     """
     query = """
-        SELECT wallet_id, merchant_id, wallet_address, wallet_type,
-               balance, currency, status, created_at, last_updated
+        SELECT wallet_id, merchant_id, network, address,
+               custodian, status, verified_at, created_at, updated_at
         FROM merchant_wallets
         WHERE 1=1
     """
@@ -102,14 +104,15 @@ async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
     # Check if wallet already exists
     check_query = """
         SELECT wallet_id FROM merchant_wallets
-        WHERE merchant_id = :merchant_id AND wallet_address = :wallet_address
+        WHERE merchant_id = :merchant_id AND network = :network AND address = :address
     """
     
     existing = await database.fetch_one(
         check_query,
         {
             "merchant_id": wallet_data.merchant_id,
-            "wallet_address": wallet_data.wallet_address
+            "network": wallet_data.network,
+            "address": wallet_data.address
         }
     )
     
@@ -124,11 +127,11 @@ async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
     
     insert_query = """
         INSERT INTO merchant_wallets (
-            wallet_id, merchant_id, wallet_address, wallet_type,
-            balance, currency, status, created_at, last_updated
+            wallet_id, merchant_id, network, address,
+            custodian, custodian_account_id, status, created_at, updated_at
         ) VALUES (
-            :wallet_id, :merchant_id, :wallet_address, :wallet_type,
-            0, :currency, 'active', NOW(), NOW()
+            :wallet_id, :merchant_id, :network, :address,
+            :custodian, :custodian_account_id, 'active', NOW(), NOW()
         )
     """
     
@@ -137,9 +140,10 @@ async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
         {
             "wallet_id": wallet_id,
             "merchant_id": wallet_data.merchant_id,
-            "wallet_address": wallet_data.wallet_address,
-            "wallet_type": wallet_data.wallet_type,
-            "currency": wallet_data.currency
+            "network": wallet_data.network,
+            "address": wallet_data.address,
+            "custodian": wallet_data.custodian,
+            "custodian_account_id": wallet_data.custodian_account_id
         }
     )
     
@@ -148,7 +152,8 @@ async def create_merchant_wallet(wallet_data: MerchantWalletCreate):
     return {
         "wallet_id": wallet_id,
         "merchant_id": wallet_data.merchant_id,
-        "wallet_address": wallet_data.wallet_address,
+        "network": wallet_data.network,
+        "address": wallet_data.address,
         "status": "active",
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -162,8 +167,8 @@ async def get_merchant_wallet(wallet_id: str):
     Admin only - no authentication implemented yet
     """
     query = """
-        SELECT wallet_id, merchant_id, wallet_address, wallet_type,
-               balance, currency, status, created_at, last_updated
+        SELECT wallet_id, merchant_id, network, address,
+               custodian, status, verified_at, created_at, updated_at
         FROM merchant_wallets
         WHERE wallet_id = :wallet_id
     """
@@ -179,40 +184,28 @@ async def get_merchant_wallet(wallet_id: str):
     return dict(result)
 
 
-@router.patch("/merchant/{wallet_id}/balance")
-async def update_merchant_wallet_balance(
-    wallet_id: str,
-    balance_update: WalletBalanceUpdate
-):
+@router.patch("/merchant/{wallet_id}/verify")
+async def verify_merchant_wallet(wallet_id: str):
     """
-    Update merchant wallet balance (admin override)
+    Verify merchant wallet (mark as verified)
     
     Admin only - no authentication implemented yet
     """
     update_query = """
         UPDATE merchant_wallets
-        SET balance = :balance,
-            last_updated = NOW()
+        SET status = 'active',
+            verified_at = NOW(),
+            updated_at = NOW()
         WHERE wallet_id = :wallet_id
     """
     
-    result = await database.execute(
-        update_query,
-        {
-            "wallet_id": wallet_id,
-            "balance": balance_update.balance
-        }
-    )
+    await database.execute(update_query, {"wallet_id": wallet_id})
     
-    logger.info(
-        f"Merchant wallet balance updated: {wallet_id} = {balance_update.balance} "
-        f"(reason: {balance_update.reason})"
-    )
+    logger.info(f"Merchant wallet verified: {wallet_id}")
     
     return {
-        "status": "updated",
+        "status": "verified",
         "wallet_id": wallet_id,
-        "new_balance": balance_update.balance,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -300,8 +293,8 @@ async def list_agent_wallets(
     Admin only - no authentication implemented yet
     """
     query = """
-        SELECT wallet_id, agent_id, wallet_address, wallet_type,
-               balance, currency, status, created_at, last_updated
+        SELECT wallet_id, agent_id, network, address,
+               custodian, status, verified_at, created_at, updated_at
         FROM agent_wallets
         WHERE 1=1
     """
@@ -337,14 +330,15 @@ async def create_agent_wallet(wallet_data: AgentWalletCreate):
     # Check if wallet already exists
     check_query = """
         SELECT wallet_id FROM agent_wallets
-        WHERE agent_id = :agent_id AND wallet_address = :wallet_address
+        WHERE agent_id = :agent_id AND network = :network AND address = :address
     """
     
     existing = await database.fetch_one(
         check_query,
         {
             "agent_id": wallet_data.agent_id,
-            "wallet_address": wallet_data.wallet_address
+            "network": wallet_data.network,
+            "address": wallet_data.address
         }
     )
     
@@ -359,11 +353,11 @@ async def create_agent_wallet(wallet_data: AgentWalletCreate):
     
     insert_query = """
         INSERT INTO agent_wallets (
-            wallet_id, agent_id, wallet_address, wallet_type,
-            balance, currency, status, created_at, last_updated
+            wallet_id, agent_id, network, address,
+            custodian, custodian_account_id, status, created_at, updated_at
         ) VALUES (
-            :wallet_id, :agent_id, :wallet_address, :wallet_type,
-            0, :currency, 'active', NOW(), NOW()
+            :wallet_id, :agent_id, :network, :address,
+            :custodian, :custodian_account_id, 'active', NOW(), NOW()
         )
     """
     
@@ -372,9 +366,10 @@ async def create_agent_wallet(wallet_data: AgentWalletCreate):
         {
             "wallet_id": wallet_id,
             "agent_id": wallet_data.agent_id,
-            "wallet_address": wallet_data.wallet_address,
-            "wallet_type": wallet_data.wallet_type,
-            "currency": wallet_data.currency
+            "network": wallet_data.network,
+            "address": wallet_data.address,
+            "custodian": wallet_data.custodian,
+            "custodian_account_id": wallet_data.custodian_account_id
         }
     )
     
@@ -383,7 +378,8 @@ async def create_agent_wallet(wallet_data: AgentWalletCreate):
     return {
         "wallet_id": wallet_id,
         "agent_id": wallet_data.agent_id,
-        "wallet_address": wallet_data.wallet_address,
+        "network": wallet_data.network,
+        "address": wallet_data.address,
         "status": "active",
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -397,8 +393,8 @@ async def get_agent_wallet(wallet_id: str):
     Admin only - no authentication implemented yet
     """
     query = """
-        SELECT wallet_id, agent_id, wallet_address, wallet_type,
-               balance, currency, status, created_at, last_updated
+        SELECT wallet_id, agent_id, network, address,
+               custodian, status, verified_at, created_at, updated_at
         FROM agent_wallets
         WHERE wallet_id = :wallet_id
     """
@@ -414,40 +410,28 @@ async def get_agent_wallet(wallet_id: str):
     return dict(result)
 
 
-@router.patch("/agent/{wallet_id}/balance")
-async def update_agent_wallet_balance(
-    wallet_id: str,
-    balance_update: WalletBalanceUpdate
-):
+@router.patch("/agent/{wallet_id}/verify")
+async def verify_agent_wallet(wallet_id: str):
     """
-    Update agent wallet balance (admin override)
+    Verify agent wallet (mark as verified)
     
     Admin only - no authentication implemented yet
     """
     update_query = """
         UPDATE agent_wallets
-        SET balance = :balance,
-            last_updated = NOW()
+        SET status = 'active',
+            verified_at = NOW(),
+            updated_at = NOW()
         WHERE wallet_id = :wallet_id
     """
     
-    result = await database.execute(
-        update_query,
-        {
-            "wallet_id": wallet_id,
-            "balance": balance_update.balance
-        }
-    )
+    await database.execute(update_query, {"wallet_id": wallet_id})
     
-    logger.info(
-        f"Agent wallet balance updated: {wallet_id} = {balance_update.balance} "
-        f"(reason: {balance_update.reason})"
-    )
+    logger.info(f"Agent wallet verified: {wallet_id}")
     
     return {
-        "status": "updated",
+        "status": "verified",
         "wallet_id": wallet_id,
-        "new_balance": balance_update.balance,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -535,9 +519,8 @@ async def get_wallet_stats():
         SELECT
             COUNT(*) as total,
             SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
-            SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) as suspended,
-            SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed,
-            SUM(balance) as total_balance
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) as inactive
         FROM merchant_wallets
     """)
     
@@ -546,9 +529,8 @@ async def get_wallet_stats():
         SELECT
             COUNT(*) as total,
             SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
-            SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) as suspended,
-            SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed,
-            SUM(balance) as total_balance
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) as inactive
         FROM agent_wallets
     """)
     
