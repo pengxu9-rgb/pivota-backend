@@ -56,73 +56,80 @@ class TransactionStats(BaseModel):
 
 @router.get("/exchange-rates")
 async def list_exchange_rates(
-    from_currency: Optional[str] = None,
-    to_currency: Optional[str] = None
+    base_currency: Optional[str] = None
 ):
     """
-    List all exchange rates
+    List all exchange rate snapshots
     
     Admin only - no authentication implemented yet
     """
     query = """
-        SELECT rate_id, from_currency, to_currency, rate, updated_at
+        SELECT id, snapshot_id, base_currency, rates, provider, created_at, expires_at
         FROM x402_exchange_rates
         WHERE 1=1
     """
     
     params = {}
     
-    if from_currency:
-        query += " AND from_currency = :from_currency"
-        params["from_currency"] = from_currency.upper()
+    if base_currency:
+        query += " AND base_currency = :base_currency"
+        params["base_currency"] = base_currency.upper()
     
-    if to_currency:
-        query += " AND to_currency = :to_currency"
-        params["to_currency"] = to_currency.upper()
-    
-    query += " ORDER BY updated_at DESC"
+    query += " ORDER BY created_at DESC LIMIT 50"
     
     results = await database.fetch_all(query, params)
     
     return {
-        "rates": [dict(r) for r in results],
+        "snapshots": [dict(r) for r in results],
         "count": len(results)
     }
 
 
 @router.post("/exchange-rates")
-async def update_exchange_rate(rate_update: ExchangeRateUpdate):
+async def create_exchange_rate_snapshot(
+    base_currency: str,
+    rates: dict,
+    provider: Optional[str] = "manual"
+):
     """
-    Update single exchange rate
+    Create exchange rate snapshot
     
     Admin only - no authentication implemented yet
+    
+    Example:
+    {
+        "base_currency": "USD",
+        "rates": {"EUR": 0.85, "GBP": 0.73, "JPY": 110.5},
+        "provider": "manual"
+    }
     """
+    snapshot_id = f"snap_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    
     insert_query = """
-        INSERT INTO x402_exchange_rates (from_currency, to_currency, rate, updated_at)
-        VALUES (:from_currency, :to_currency, :rate, NOW())
-        ON CONFLICT (from_currency, to_currency)
-        DO UPDATE SET rate = :rate, updated_at = NOW()
+        INSERT INTO x402_exchange_rates (
+            snapshot_id, base_currency, rates, provider, created_at, expires_at
+        ) VALUES (
+            :snapshot_id, :base_currency, :rates, :provider, NOW(), NOW() + INTERVAL '1 day'
+        )
     """
     
     await database.execute(
         insert_query,
         {
-            "from_currency": rate_update.from_currency.upper(),
-            "to_currency": rate_update.to_currency.upper(),
-            "rate": rate_update.rate
+            "snapshot_id": snapshot_id,
+            "base_currency": base_currency.upper(),
+            "rates": json.dumps(rates),
+            "provider": provider
         }
     )
     
-    logger.info(
-        f"Exchange rate updated: {rate_update.from_currency}/"
-        f"{rate_update.to_currency} = {rate_update.rate}"
-    )
+    logger.info(f"Exchange rate snapshot created: {snapshot_id} ({base_currency})")
     
     return {
-        "status": "updated",
-        "from_currency": rate_update.from_currency.upper(),
-        "to_currency": rate_update.to_currency.upper(),
-        "rate": rate_update.rate,
+        "status": "created",
+        "snapshot_id": snapshot_id,
+        "base_currency": base_currency.upper(),
+        "rates": rates,
         "timestamp": datetime.utcnow().isoformat()
     }
 
