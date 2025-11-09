@@ -2,19 +2,152 @@
 Consent Management Service for AP2 Protocol
 Handles consent validation, usage tracking, and nonce replay protection
 """
+import base64
 import json
 import logging
+import secrets
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from decimal import Decimal
 
 from db.database import database
+from services.crypto_service import crypto_service
 
 logger = logging.getLogger(__name__)
 
 
 class ConsentService:
     """Manage AP2 consent tokens and nonce tracking"""
+    
+    async def create_consent(
+        self,
+        agent_id: str,
+        scope: list,
+        duration_hours: int = 24,
+        signature: str = None,
+        nonce: str = None,
+        public_key: str = None,
+        algorithm: str = "ES256"
+    ) -> Dict[str, Any]:
+        """
+        Create new agent consent with signature verification
+        
+        Args:
+            agent_id: Agent identifier
+            scope: List of permitted actions
+            duration_hours: Consent validity period
+            signature: Agent's signature (base64)
+            nonce: Unique nonce
+            public_key: Agent's public key (PEM)
+            algorithm: ES256 or Ed25519
+            
+        Returns:
+            Consent data including consent_id and expiry
+        """
+        # Verify signature if provided
+        if signature and public_key:
+            payload = {
+                "agent_id": agent_id,
+                "scope": scope,
+                "duration_hours": duration_hours,
+                "nonce": nonce
+            }
+            
+            is_valid = crypto_service.verify_agent_signature(
+                public_key=public_key,
+                signature=signature,
+                payload=payload,
+                algorithm=algorithm
+            )
+            
+            if not is_valid:
+                raise ValueError("Invalid signature")
+            
+            logger.info(f"✅ Signature verified for agent {agent_id}")
+        
+        # Verify nonce uniqueness
+        if nonce:
+            existing_nonce = await database.fetch_one(
+                "SELECT nonce FROM nonce_tracker WHERE nonce = :nonce",
+                {"nonce": nonce}
+            )
+            if existing_nonce:
+                raise ValueError("Nonce already used")
+            
+            await database.execute(
+                """INSERT INTO nonce_tracker (nonce, used_at, request_path)
+                   VALUES (:nonce, NOW(), '/consent/grant')""",
+                {"nonce": nonce}
+            )
+        
+        # Create consent token
+        consent_id = f"consent_{secrets.token_hex(16)}"
+        expires_at = datetime.utcnow() + timedelta(hours=duration_hours)
+        
+        await database.execute(
+            """INSERT INTO agent_consents (
+                   consent_id, agent_id, scope, status, granted_at, expires_at
+               ) VALUES (
+                   :consent_id, :agent_id, :scope, 'active', NOW(), :expires_at
+               )""",
+            {
+                "consent_id": consent_id,
+                "agent_id": agent_id,
+                "scope": json.dumps({"actions": scope}),
+                "expires_at": expires_at
+            }
+        )
+        
+        logger.info(f"✅ Consent created: {consent_id} for agent {agent_id}")
+        
+        return {
+            "token": consent_id,
+            "agent_id": agent_id,
+            "scope": scope,
+            "expires_at": expires_at.isoformat()
+        }
+    
+    async def verify_consent(
+        self,
+        consent_token: str
+    ) -> Dict[str, Any]:
+        """
+        Verify and return consent data
+        
+        Args:
+            consent_token: Consent ID
+            
+        Returns:
+            Consent data
+            
+        Raises:
+            ValueError: If consent is invalid
+        """
+        consent = await database.fetch_one(
+            """SELECT * FROM agent_consents 
+               WHERE consent_id = :consent_id AND status = 'active'""",
+            {"consent_id": consent_token}
+        )
+        
+        if not consent:
+            raise ValueError("Consent not found or inactive")
+        
+        if consent["expires_at"] and consent["expires_at"] < datetime.utcnow():
+            raise ValueError("Consent has expired")
+        
+        return {"agent_id": consent["agent_id"], "scope": json.loads(consent["scope"])["actions"]}
+    
+    async def revoke_consent(
+        self,
+        consent_token: str
+    ):
+        """Revoke consent"""
+        await database.execute(
+            """UPDATE agent_consents 
+               SET status = 'revoked', revoked_at = NOW()
+               WHERE consent_id = :consent_id""",
+            {"consent_id": consent_token}
+        )
     
     async def validate_consent(
         self,
