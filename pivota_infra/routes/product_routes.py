@@ -21,7 +21,9 @@ from db.products import (
 )
 from utils.auth import require_admin, get_current_user
 from config.settings import settings
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products", tags=["products"])
 
 
