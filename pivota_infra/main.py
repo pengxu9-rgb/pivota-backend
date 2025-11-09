@@ -132,6 +132,7 @@ if AP2_ENABLED:
     from routes.ap2_routes import router as ap2_router
     from routes.admin_protocol_sync import router as admin_protocol_sync_router
     from routes.admin_wallet_management import router as admin_wallet_mgmt_router
+    from routes.admin_consent_management import router as admin_consent_mgmt_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.product_routes import router as product_router
@@ -340,6 +341,12 @@ if AP2_ENABLED:
     from middleware.ap2_security import AP2SecurityMiddleware
     app.add_middleware(AP2SecurityMiddleware, enabled=True)
 
+# Add Admin authentication middleware if enabled
+ADMIN_AUTH_ENABLED = os.getenv("ENABLE_ADMIN_AUTH", "false").lower() == "true"
+if ADMIN_AUTH_ENABLED:
+    from middleware.admin_auth import AdminAuthMiddleware
+    app.add_middleware(AdminAuthMiddleware, enabled=True)
+
 # Include available routers
 app.include_router(agent_router)  # ⚠️ DEPRECATED - Use agent_api_router (/agent/v1/*) instead. Will be removed 2026-05-01
 app.include_router(psp_router)
@@ -494,6 +501,7 @@ if AP2_ENABLED:
     app.include_router(ap2_router)  # AP2 protocol endpoints
     app.include_router(admin_protocol_sync_router)  # Admin protocol sync
     app.include_router(admin_wallet_mgmt_router)  # Admin wallet management
+    app.include_router(admin_consent_mgmt_router)  # Admin consent management
     logger.info("✅ AP2 Protocol routers included")
 
 app.include_router(shopify_router)  # Shopify MCP integration
