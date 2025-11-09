@@ -80,9 +80,43 @@ async def get_merchant_products_realtime(
         
         products = [c["product_data"] for c in all_cached[:limit]]
         logger.info(f"📦 Total loaded: {len(products)} products from {len(stores)} stores")
+        
+        # 如果有产品，直接返回（已经从多平台聚合）
+        if products:
+            cache_hit = True
+            response_time_ms = int((time.time() - start_time) * 1000)
+            
+            # 从缓存返回的是字典，需要转换为 StandardProduct 对象
+            from models.standard_product import StandardProduct
+            product_objects = [StandardProduct(**p) for p in products]
+            
+            # 使用 "multi" 表示多平台
+            platform_label = "multi" if len(stores) > 1 else platform
+            
+            return ProductListResponse(
+                status="success",
+                merchant_id=merchant_id,
+                platform=platform_label,
+                total=len(products),
+                products=product_objects,
+                next_page_token=None,
+                fetched_at=datetime.now()
+            )
+        else:
+            # 没有产品，返回空列表
+            return ProductListResponse(
+                status="success",
+                merchant_id=merchant_id,
+                platform="multi" if len(stores) > 1 else platform,
+                total=0,
+                products=[],
+                next_page_token=None,
+                fetched_at=datetime.now()
+            )
+    
     except Exception as e:
-        # Handle errors when getting stores
-        logger.error(f"Error getting stores for merchant {merchant_id}: {str(e)}")
+        # Handle errors
+        logger.error(f"Error in product query: {str(e)}")
         return ProductListResponse(
             status="success",
             merchant_id=merchant_id,
@@ -93,53 +127,7 @@ async def get_merchant_products_realtime(
             fetched_at=datetime.now()
         )
     
-    # 3. 尝试从缓存读取（除非强制刷新）
-    if not force_refresh:
-        cached = await get_cached_products(merchant_id, platform, include_expired=False)
-        if cached:
-            cache_hit = True
-            products = [c["product_data"] for c in cached[:limit]]
-            response_time_ms = int((time.time() - start_time) * 1000)
-            
-            # 🚀 后台任务：更新访问统计和日志（不阻塞响应）
-            cache_ids = [c["id"] for c in cached[:limit]]
-            product_ids = [p["id"] for p in products]
-            
-            async def background_logging():
-                """后台任务：访问统计 + 日志记录"""
-                # 批量更新访问统计
-                for cache_id in cache_ids:
-                    await mark_cache_accessed(cache_id)
-                
-                # 记录 API 调用事件
-                await log_api_call(
-                    event_type="product_query",
-                    merchant_id=merchant_id,
-                    endpoint=f"/products/v2/{merchant_id}",
-                    request_params={"limit": limit, "force_refresh": force_refresh},
-                    response_status=200,
-                    cache_hit=True,
-                    response_time_ms=response_time_ms,
-                    product_ids=product_ids
-                )
-            
-            background_tasks.add_task(background_logging)
-            
-            # 从缓存返回的是字典，需要转换为 StandardProduct 对象
-            from models.standard_product import StandardProduct
-            product_objects = [StandardProduct(**p) for p in products]
-            
-            return ProductListResponse(
-                status="success",
-                merchant_id=merchant_id,
-                platform=platform,
-                total=len(products),
-                products=product_objects,
-                next_page_token=None,
-                fetched_at=datetime.now()
-            )
-    
-    # 4. Cache miss → 实时拉取
+    # 4. Cache miss → 实时拉取（这段代码不应该被执行到了）
     credentials = {}
     
     if platform == "shopify":

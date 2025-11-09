@@ -60,45 +60,31 @@ async def sync_wix_products(
         if not merchant_id:
             raise HTTPException(status_code=400, detail="Merchant ID not found in store record")
         
-        # Get real product count from products_cache
-        try:
-            cache_count_result = await database.fetch_one(
-                """SELECT COUNT(*) as count FROM products_cache 
-                   WHERE merchant_id = :merchant_id AND platform = 'wix'
-                   AND (expires_at IS NULL OR expires_at > NOW())""",
-                {"merchant_id": merchant_id}
-            )
-            real_count = cache_count_result["count"] if cache_count_result else 0
-        except Exception as e:
-            # Fallback to existing count if cache query fails
-            real_count = store_dict.get("product_count") or 0
-
-        # Update merchant_stores with products_cache count
-        update_query = """
-            UPDATE merchant_stores
-            SET product_count = (
-                SELECT COUNT(*) FROM products_cache 
-                WHERE merchant_id = :merchant_id AND platform = 'wix'
-                AND (expires_at IS NULL OR expires_at > NOW())
-            ),
-            last_sync = :last_sync,
-            status = 'active'
-            WHERE store_id = :store_id
-        """
-
-        await database.execute(update_query, {
-            "merchant_id": merchant_id,
-            "last_sync": datetime.now(),
-            "store_id": store_dict["store_id"]
-        })
+        # 调用真正的产品同步（和 Shopify 一样）
+        from routes.product_sync import sync_products, SyncRequest
+        from fastapi import BackgroundTasks
+        
+        sync_request = SyncRequest(
+            merchant_id=merchant_id,
+            force_refresh=True,  # 强制刷新
+            limit=250,
+            platform="wix"  # 明确指定同步 Wix
+        )
+        
+        # 执行真正的同步
+        sync_result = await sync_products(
+            request=sync_request,
+            background_tasks=BackgroundTasks(),
+            current_user=current_user
+        )
         
         return {
             "status": "success",
-            "message": f"Wix store synced: {real_count} products from cache",
+            "message": f"Successfully synced {sync_result.products_synced} products from Wix",
             "store_id": store_dict["store_id"],
             "store_name": store_dict["name"],
-            "product_count": real_count,
-            "synced_at": datetime.now().isoformat()
+            "product_count": sync_result.products_synced,
+            "synced_at": sync_result.sync_time
         }
     
     except HTTPException:
