@@ -64,9 +64,15 @@ async def get_merchant_products_realtime(
         platform = primary_store["platform"]
         store_info = primary_store
         
-        # 从缓存获取产品
-        cached = await get_cached_products(merchant_id, platform)
-        products = [c["product_data"] for c in cached[:limit]]
+        # 从缓存获取所有平台的产品（不只是主商店）
+        all_cached = []
+        for store in stores:
+            store_platform = store["platform"]
+            platform_cached = await get_cached_products(merchant_id, store_platform, include_expired=False)
+            all_cached.extend(platform_cached)
+        
+        products = [c["product_data"] for c in all_cached[:limit]]
+        logger.info(f"📦 Loaded {len(products)} products from {len(stores)} stores")
     except Exception as e:
         # Handle errors when getting stores
         logger.error(f"Error getting stores for merchant {merchant_id}: {str(e)}")
