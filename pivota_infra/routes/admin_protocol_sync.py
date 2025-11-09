@@ -34,6 +34,13 @@ class BulkExchangeRateUpdate(BaseModel):
     rates: List[ExchangeRateUpdate] = Field(..., description="List of exchange rates")
 
 
+class ExchangeRateSnapshotCreate(BaseModel):
+    """Exchange rate snapshot creation"""
+    base_currency: str = Field(..., description="Base currency (e.g., USD)")
+    rates: dict = Field(..., description="Currency rates as dict (e.g., {'EUR': 0.85})")
+    provider: Optional[str] = Field("manual", description="Rate provider")
+
+
 class ConsentStats(BaseModel):
     """Consent statistics"""
     total: int = Field(..., description="Total consents")
@@ -87,9 +94,7 @@ async def list_exchange_rates(
 
 @router.post("/exchange-rates")
 async def create_exchange_rate_snapshot(
-    base_currency: str,
-    rates: dict,
-    provider: Optional[str] = "manual"
+    snapshot_data: ExchangeRateSnapshotCreate
 ):
     """
     Create exchange rate snapshot
@@ -117,19 +122,19 @@ async def create_exchange_rate_snapshot(
         insert_query,
         {
             "snapshot_id": snapshot_id,
-            "base_currency": base_currency.upper(),
-            "rates": json.dumps(rates),
-            "provider": provider
+            "base_currency": snapshot_data.base_currency.upper(),
+            "rates": json.dumps(snapshot_data.rates),
+            "provider": snapshot_data.provider
         }
     )
     
-    logger.info(f"Exchange rate snapshot created: {snapshot_id} ({base_currency})")
+    logger.info(f"Exchange rate snapshot created: {snapshot_id} ({snapshot_data.base_currency})")
     
     return {
         "status": "created",
         "snapshot_id": snapshot_id,
-        "base_currency": base_currency.upper(),
-        "rates": rates,
+        "base_currency": snapshot_data.base_currency.upper(),
+        "rates": snapshot_data.rates,
         "timestamp": datetime.utcnow().isoformat()
     }
 
