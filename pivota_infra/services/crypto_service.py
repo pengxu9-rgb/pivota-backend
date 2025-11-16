@@ -1,6 +1,6 @@
 """
-Cryptographic Service for AP2 Protocol
-Handles signature verification and receipt signing
+Cryptographic Service for AP2 Protocol and Connector Credentials
+Handles signature verification, receipt signing, and credential encryption
 """
 import base64
 import json
@@ -10,17 +10,33 @@ import os
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger(__name__)
 
 class CryptoService:
-    """Cryptographic operations for AP2 protocol"""
+    """Cryptographic operations for AP2 protocol and connector credentials"""
     
     def __init__(self):
         self.platform_signing_key = os.getenv("PLATFORM_SIGNING_KEY")
         if not self.platform_signing_key:
             logger.warning("PLATFORM_SIGNING_KEY not configured - receipt signing disabled")
+        
+        # Initialize AES-GCM for connector credentials encryption
+        connector_key_b64 = os.getenv("CONNECTOR_CREDENTIALS_KEY")
+        if connector_key_b64:
+            try:
+                self.connector_key = base64.b64decode(connector_key_b64)
+                if len(self.connector_key) != 32:
+                    logger.error(f"CONNECTOR_CREDENTIALS_KEY must be 32 bytes (got {len(self.connector_key)})")
+                    self.connector_key = None
+            except Exception as e:
+                logger.error(f"Failed to decode CONNECTOR_CREDENTIALS_KEY: {e}")
+                self.connector_key = None
+        else:
+            logger.warning("CONNECTOR_CREDENTIALS_KEY not set - connector credential encryption disabled")
+            self.connector_key = None
     
     @staticmethod
     def canonicalize_json(data: Dict[str, Any]) -> str:
@@ -235,6 +251,84 @@ class CryptoService:
         except Exception as e:
             logger.error(f"Receipt signing failed: {e}")
             return None
+    
+    def encrypt_json_secret(self, data: Dict[str, Any]) -> str:
+        """
+        Encrypt JSON data using AES-GCM for connector credentials
+        
+        Args:
+            data: Dictionary to encrypt
+            
+        Returns:
+            Base64-encoded encrypted data with nonce prepended
+            
+        Raises:
+            RuntimeError: If encryption key is not configured
+        """
+        if not self.connector_key:
+            raise RuntimeError("CONNECTOR_CREDENTIALS_KEY not configured - cannot encrypt")
+        
+        try:
+            # Serialize to JSON
+            json_str = json.dumps(data, sort_keys=True)
+            plaintext = json_str.encode('utf-8')
+            
+            # Generate random nonce (96 bits for GCM)
+            aesgcm = AESGCM(self.connector_key)
+            nonce = os.urandom(12)
+            
+            # Encrypt
+            ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+            
+            # Prepend nonce to ciphertext and encode as base64
+            encrypted_blob = nonce + ciphertext
+            encoded = base64.b64encode(encrypted_blob).decode('utf-8')
+            
+            logger.info("✅ Credentials encrypted successfully")
+            return encoded
+            
+        except Exception as e:
+            logger.error(f"Encryption failed: {e}")
+            raise RuntimeError(f"Failed to encrypt credentials: {e}")
+    
+    def decrypt_json_secret(self, encoded_data: str) -> Dict[str, Any]:
+        """
+        Decrypt AES-GCM encrypted JSON data
+        
+        Args:
+            encoded_data: Base64-encoded encrypted data (nonce + ciphertext)
+            
+        Returns:
+            Decrypted dictionary
+            
+        Raises:
+            RuntimeError: If decryption fails
+        """
+        if not self.connector_key:
+            raise RuntimeError("CONNECTOR_CREDENTIALS_KEY not configured - cannot decrypt")
+        
+        try:
+            # Decode from base64
+            encrypted_blob = base64.b64decode(encoded_data)
+            
+            # Extract nonce and ciphertext
+            nonce = encrypted_blob[:12]
+            ciphertext = encrypted_blob[12:]
+            
+            # Decrypt
+            aesgcm = AESGCM(self.connector_key)
+            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            
+            # Parse JSON
+            json_str = plaintext.decode('utf-8')
+            data = json.loads(json_str)
+            
+            logger.info("✅ Credentials decrypted successfully")
+            return data
+            
+        except Exception as e:
+            logger.error(f"Decryption failed: {e}")
+            raise RuntimeError(f"Failed to decrypt credentials: {e}")
 
 # Singleton instance
 crypto_service = CryptoService()
