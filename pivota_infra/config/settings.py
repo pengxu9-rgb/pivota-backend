@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     # Nightly backfill guard
     enable_nightly_psp_id_backfill: bool = os.getenv("ENABLE_NIGHTLY_PSP_ID_BACKFILL", "false").lower() == "true"
     
+    # Platform Onboarding v2 (EPIC-1/2/3)
+    platform_onboarding_v2_enabled: bool = os.getenv("FEATURE_PLATFORM_ONBOARDING_V2", "false").lower() == "true"
+    
     # AP2 Protocol (Phase 4++)
     enable_ap2_routes: bool = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"
     enable_admin_auth: bool = os.getenv("ENABLE_ADMIN_AUTH", "false").lower() == "true"
