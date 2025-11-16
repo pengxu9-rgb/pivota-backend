@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 SHOPIFY_API_VERSION = "2024-07"
 SHOPIFY_IMPORT_LIMIT = 50
+SHOPIFY_MAX_RETRY_ATTEMPTS = int(os.getenv("SHOPIFY_MAX_RETRY_ATTEMPTS", "5"))
 
 
 class ShopifyAPIError(Exception):
@@ -408,8 +409,13 @@ async def process_next_import_task() -> Dict[str, Any]:
         }
     except ShopifyRateLimitError as exc:
         logger.warning(
-            "Shopify import rate limited; scheduling retry",
-            extra={"task_id": task_id, "merchant_id": merchant_id, "attempt": attempt},
+            "Shopify import rate limited; handling retry decision",
+            extra={
+                "task_id": task_id,
+                "merchant_id": merchant_id,
+                "attempt": attempt,
+                "max_attempts": SHOPIFY_MAX_RETRY_ATTEMPTS,
+            },
         )
 
         if connector == "shopify":
@@ -418,7 +424,32 @@ async def process_next_import_task() -> Dict[str, Any]:
         else:
             counts["error_type"] = "generic"
 
-        # Simple exponential backoff with upper bound (in seconds).
+        # If we've reached the maximum retry attempts, mark as failed instead of rescheduling.
+        if attempt >= SHOPIFY_MAX_RETRY_ATTEMPTS:
+            logger.warning(
+                "Max retry attempts reached for Shopify import; marking task as failed",
+                extra={
+                    "task_id": task_id,
+                    "merchant_id": merchant_id,
+                    "attempt": attempt,
+                    "max_attempts": SHOPIFY_MAX_RETRY_ATTEMPTS,
+                },
+            )
+            await mark_import_task_failed(
+                task_id,
+                error=str(exc),
+                counts=counts,
+            )
+            return {
+                "processed": True,
+                "task_id": task_id,
+                "status": "failed",
+                "attempt": attempt,
+                "error": str(exc),
+                "counts": counts,
+            }
+
+        # Otherwise schedule a retry with exponential backoff (bounded).
         backoff_seconds = min(60 * (2 ** max(attempt - 1, 0)), 3600)
         next_run_at = datetime.utcnow() + timedelta(seconds=backoff_seconds)
 

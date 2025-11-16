@@ -93,3 +93,18 @@ async def mark_credential_used(credential_id: int) -> bool:
     await database.execute(query)
     return True
 
+
+async def list_connector_credentials_for_merchant(
+    merchant_id: str,
+    connector: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    List connector credentials for a merchant, optionally filtered by connector.
+    Newest first.
+    """
+    query = connector_credentials.select().where(connector_credentials.c.merchant_id == merchant_id)
+    if connector:
+        query = query.where(connector_credentials.c.connector == connector)
+    query = query.order_by(connector_credentials.c.created_at.desc())
+    rows = await database.fetch_all(query)
+    return [dict(r) for r in rows]
