@@ -43,8 +43,6 @@ merchant_onboarding = Table(
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
     Column("verified_at", DateTime, nullable=True),
     Column("psp_connected_at", DateTime, nullable=True),
-    # Platform Onboarding v2 side-car field
-    Column("platform_profile", JSON, nullable=True),
 )
 
 # ============================================================================
@@ -230,21 +228,5 @@ async def hard_delete_merchant_onboarding(merchant_id: str) -> bool:
         except Exception as e:
             print(f"⚠️ Failed to delete user account: {e}")
     
-    return True
-
-async def update_platform_profile(merchant_id: str, profile: Dict[str, Any]) -> bool:
-    """
-    Update the platform_profile JSON column for a given merchant.
-    
-    This is used by Platform Onboarding v2 to store metadata about
-    connector configuration, import status, etc.
-    """
-    query = merchant_onboarding.update().where(
-        merchant_onboarding.c.merchant_id == merchant_id
-    ).values(
-        platform_profile=profile,
-        updated_at=datetime.now()
-    )
-    await database.execute(query)
     return True
 
