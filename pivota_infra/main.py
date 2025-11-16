@@ -41,7 +41,9 @@ from routes.agent_account import router as agent_account_router  # Agent account
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
+from routes.platform_onboarding_routes import router as platform_onboarding_router
 from routes.merchant_dashboard_routes import router as merchant_dashboard_router  # Original with fallback - STABLE
+from routes.merchant_analytics_routes import router as merchant_analytics_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
 from routes.debug_integrations import router as debug_integrations_router
@@ -97,6 +99,8 @@ from routes.agent_health import router as agent_health_router
 from routes.admin_usage_debug import router as admin_usage_debug_router
 from routes.agent_analytics import router as agent_analytics_router
 from routes.admin_settlement_batch import router as admin_settlement_batch_router  # Phase 6 - Settlement Batch Processing
+from routes.admin_platform_import import router as admin_platform_import_router  # EPIC-2 Platform Import
+from routes.admin_connector_credentials import router as admin_connector_credentials_router  # EPIC-3 Connector credentials
 from routes.stripe_connect_integration import router as stripe_connect_router  # Phase 6.1 - Stripe Connect Payouts
 from routes.agent_payout_management import router as agent_payout_router  # Phase 6.1 - Agent Payout Settings
 from routes.merchant_payouts import router as merchant_payouts_router  # Phase 6 - Merchant Payout Management
@@ -115,6 +119,7 @@ from routes.admin_fix_commission_offers import router as admin_fix_commission_of
 from routes.agent_self_api import router as agent_self_api_router
 from routes.admin_fix_agent_type import router as admin_fix_agent_type_router
 from routes.admin_check_hidden_offers import router as admin_check_hidden_offers_router
+from routes.admin_apply_webhook_migration import router as admin_webhook_migration_router
 # from routes.admin_debug_commission import router as admin_debug_commission_router  # Temporarily disabled
 # from routes.admin_fix_agent_expectations import router as admin_fix_agent_expectations_router  # Fix PSP ID format
 # Debug routers - only import if DEBUG_MODE is enabled
@@ -419,7 +424,14 @@ app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
+
+# Platform merchant onboarding v2 – TEMPORARY: feature flag removed for staging testing
+# TODO: Re-enable feature flag check after verifying env var configuration
+app.include_router(platform_onboarding_router)
+logger.info("✅ Platform Onboarding v2 router registered (feature flag temporarily disabled)")
+
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
+app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
 app.include_router(payout_router)  # Payout management
 app.include_router(debug_integrations_router)  # Debug integrations
@@ -471,6 +483,8 @@ app.include_router(agent_health_router)  # Agent health check
 app.include_router(admin_usage_debug_router)  # Admin usage logs debug
 app.include_router(agent_analytics_router)  # Agent analytics (funnel, queries)
 app.include_router(admin_settlement_batch_router)  # Phase 6 - Settlement batch processing
+app.include_router(admin_platform_import_router)  # EPIC-2 Platform Import worker trigger
+app.include_router(admin_connector_credentials_router)  # EPIC-3 Connector credentials management
 app.include_router(stripe_connect_router)  # Phase 6.1 - Stripe Connect integration
 app.include_router(agent_payout_router)  # Phase 6.1 - Agent payout management
 app.include_router(merchant_payouts_router)  # Phase 6 - Merchant payout management
@@ -488,6 +502,7 @@ app.include_router(admin_fix_psp_format_router)  # Fix PSP ID format (admin only
 app.include_router(admin_fix_commission_offers_router)  # Fix commission offers (admin only)
 app.include_router(admin_fix_agent_type_router)  # Fix agent type NULL issues
 app.include_router(admin_check_hidden_offers_router)  # Debug hidden commission offers
+app.include_router(admin_webhook_migration_router)  # Apply webhook events migration
 # app.include_router(admin_debug_commission_router)  # Debug commission calculations - temporarily disabled
 # app.include_router(admin_fix_agent_expectations_router)  # Fix agent revenue expectations
 if DEBUG_MODE:
@@ -878,6 +893,12 @@ async def startup():
         except Exception as e:
             logger.warning(f"⚠️ Could not create integration tables: {e}")
         from db.agents import agents, agent_usage_logs
+        # Platform Onboarding v2 tables
+        try:
+            from db.platform_import_tasks import platform_import_tasks
+            logger.info("✅ Platform import tasks table imported")
+        except ImportError:
+            logger.info("⚠️ Platform import tasks table not available")
         from db.database import metadata, engine
         metadata.create_all(engine)
         logger.info("✅ Tables created:")
@@ -886,37 +907,48 @@ async def startup():
         logger.info("   - Cache: products_cache")
         logger.info("   - Events: api_call_events, order_events")
         logger.info("   - Analytics: merchant_analytics")
+        logger.info("   - Platform v2: platform_import_tasks (if feature enabled)")
         
-        # Run SQL migration files
-        logger.info("🔄 Running SQL migration files...")
-        try:
-            from sqlalchemy import text
-            import glob
-            
-            # Run all SQL migration files in order
-            migration_dir = os.path.join(os.path.dirname(__file__), "db", "migrations")
-            sql_files = sorted(glob.glob(os.path.join(migration_dir, "*.sql")))
-            
-            for sql_file in sql_files:
-                logger.info(f"   Running migration: {os.path.basename(sql_file)}")
-                with open(sql_file, 'r') as f:
-                    sql_content = f.read()
-                    # Execute the entire file as one transaction to preserve $$ blocks
-                    # PostgreSQL functions use $$ delimiters which shouldn't be split
-                    try:
-                        # Use raw connection for complex SQL with functions
-                        from sqlalchemy import create_engine
-                        engine = create_engine(str(database.url))
-                        with engine.connect() as conn:
-                            conn.execute(text(sql_content))
-                            conn.commit()
-                    except Exception as e:
-                        logger.warning(f"   Migration {os.path.basename(sql_file)} error (may be already applied): {e}")
-                logger.info(f"   ✅ {os.path.basename(sql_file)} completed")
-            
-            logger.info("✅ All SQL migrations completed")
-        except Exception as migration_err:
-            logger.warning(f"⚠️ SQL migration warning: {migration_err}")
+        # Run SQL migration files (DISABLED for clean Railway deployments)
+        # Migrations should be run manually via admin API or psql
+        # This prevents deployment failures due to migration warnings
+        ENABLE_AUTO_MIGRATIONS = os.getenv("ENABLE_AUTO_MIGRATIONS", "false").lower() == "true"
+        
+        if ENABLE_AUTO_MIGRATIONS:
+            logger.info("🔄 Running SQL migration files...")
+            try:
+                from sqlalchemy import text
+                import glob
+                
+                # Run all SQL migration files in order
+                migration_dir = os.path.join(os.path.dirname(__file__), "db", "migrations")
+                sql_files = sorted(glob.glob(os.path.join(migration_dir, "*.sql")))
+                
+                for sql_file in sql_files:
+                    logger.info(f"   Running migration: {os.path.basename(sql_file)}")
+                    with open(sql_file, 'r') as f:
+                        sql_content = f.read()
+                        # Execute the entire file as one transaction to preserve $$ blocks
+                        # PostgreSQL functions use $$ delimiters which shouldn't be split
+                        try:
+                            # Use raw connection for complex SQL with functions
+                            from sqlalchemy import create_engine
+                            engine = create_engine(str(database.url))
+                            with engine.connect() as conn:
+                                conn.execute(text(sql_content))
+                                conn.commit()
+                        except Exception as e:
+                            # Log warning but don't fail startup
+                            # Some migrations (like 017) have view syntax warnings that don't affect functionality
+                            logger.warning(f"   Migration {os.path.basename(sql_file)} warning (may be already applied): {e}")
+                            # Continue with other migrations
+                    logger.info(f"   ✅ {os.path.basename(sql_file)} completed")
+                
+                logger.info("✅ All SQL migrations completed")
+            except Exception as migration_err:
+                logger.warning(f"⚠️ SQL migration warning: {migration_err}")
+        else:
+            logger.info("⚠️ Auto-migrations disabled (ENABLE_AUTO_MIGRATIONS=false)")
         
         # Run inline migrations for merchant_onboarding table
         logger.info("🔄 Running inline database migrations...")
