@@ -1,20 +1,22 @@
 """
-Catalog Import Worker - EPIC‑2 Shopify Phase 1 & 2
+Catalog Import Worker - EPIC‑2 Shopify Phase 1 & 2 & EPIC‑3 Pagination
 
 This worker processes ImportTasks for Platform merchants.
 
 For Shopify connector tasks we:
-- Fetch a small batch of products from Shopify Admin API
+- Fetch one or more pages of products from Shopify Admin API
 - Normalize them into a minimal DTO
 - Write them into the products_cache table only (no core tables)
-- Record counts and basic timing in the ImportTask
+- Record counts, pagination stats, and basic timing in the ImportTask
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
 import os
+import re
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 
@@ -107,10 +109,43 @@ class ShopifyProductDTO:
         return payload
 
 
-async def _fetch_shopify_products(shop_domain: str, access_token: str, limit: int) -> List[Dict[str, Any]]:
-    """Fetch a small batch of products from Shopify."""
+def _parse_shopify_next_page_info(link_header: Optional[str]) -> Optional[str]:
+    """
+    Parse Shopify Link header to extract next page_info cursor.
+
+    Example Link header:
+    <https://shop.myshopify.com/admin/api/2024-07/products.json?limit=50&page_info=XYZ>; rel="next"
+    """
+    if not link_header:
+        return None
+
+    parts = link_header.split(",")
+    for part in parts:
+        if 'rel="next"' not in part and "rel='next'" not in part:
+            continue
+        match = re.search(r"<([^>]+)>", part)
+        if not match:
+            continue
+        url = match.group(1)
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        page_info_values = params.get("page_info")
+        if page_info_values:
+            return page_info_values[0]
+    return None
+
+
+async def _fetch_shopify_products_page(
+    shop_domain: str,
+    access_token: str,
+    limit: int,
+    page_info: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Fetch a single page of products from Shopify and return (products, next_page_info)."""
     url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/products.json"
-    params = {"limit": limit}
+    params: Dict[str, Any] = {"limit": limit}
+    if page_info:
+        params["page_info"] = page_info
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -130,7 +165,19 @@ async def _fetch_shopify_products(shop_domain: str, access_token: str, limit: in
         raise ShopifyAPIError(f"Shopify products fetch failed (status={resp.status_code})")
 
     data = resp.json()
-    return data.get("products", []) or []
+    products = data.get("products", []) or []
+    next_page_info = _parse_shopify_next_page_info(resp.headers.get("Link"))
+    return products, next_page_info
+
+
+async def _fetch_shopify_products(shop_domain: str, access_token: str, limit: int) -> List[Dict[str, Any]]:
+    """
+    Backwards-compatible helper: fetch a single page of products.
+
+    Retained for compatibility; new code should prefer _fetch_shopify_products_page.
+    """
+    products, _ = await _fetch_shopify_products_page(shop_domain, access_token, limit, page_info=None)
+    return products
 
 
 def _get_shopify_config() -> Dict[str, Any]:
@@ -232,49 +279,120 @@ async def process_next_import_task() -> Dict[str, Any]:
             if not shop_domain or not access_token:
                 raise ShopifyConfigError("Shopify configuration missing (SHOPIFY_STORE_URL/SHOPIFY_ACCESS_TOKEN)")
 
-            started_at = datetime.utcnow()
-            products = await _fetch_shopify_products(shop_domain, access_token, SHOPIFY_IMPORT_LIMIT)
-            duration = (datetime.utcnow() - started_at).total_seconds()
+            # Pagination-aware import: fetch up to SHOPIFY_MAX_PAGES_PER_RUN pages.
+            # NOTE: We keep the public constant SHOPIFY_IMPORT_LIMIT as the default page size.
+            page_size = SHOPIFY_IMPORT_LIMIT
+            max_pages = int(os.getenv("SHOPIFY_MAX_PAGES_PER_RUN", "5"))
+            if max_pages < 1:
+                logger.warning("Invalid SHOPIFY_MAX_PAGES_PER_RUN=%s, falling back to 5", max_pages)
+                max_pages = 5
 
-            # Phase 2: write products into cache layer only (products_cache)
+            max_products = int(os.getenv("SHOPIFY_MAX_PRODUCTS_PER_RUN", "500"))
+            if max_products < 1:
+                logger.warning("Invalid SHOPIFY_MAX_PRODUCTS_PER_RUN=%s, falling back to 500", max_products)
+                max_products = 500
+
+            started_at = datetime.utcnow()
+            all_products: List[Dict[str, Any]] = []
+            page_info: Optional[str] = None
+            pages_fetched = 0
             succeeded = 0
             failed = 0
-            for p in products:
-                try:
-                    dto = ShopifyProductDTO.from_shopify_api(p)
-                    platform_product_id = dto.shopify_id
 
-                    await upsert_product_cache(
-                        merchant_id=merchant_id,
-                        platform="shopify",
-                        platform_product_id=platform_product_id,
-                        product_data=dto.to_cache_payload(),
-                        ttl_seconds=3600,
-                    )
-                    succeeded += 1
-                except Exception as cache_exc:
-                    failed += 1
-                    logger.error(
-                        "Failed to cache Shopify product",
+            while pages_fetched < max_pages and len(all_products) < max_products:
+                logger.info(
+                    "Fetching Shopify products page",
+                    extra={
+                        "task_id": task_id,
+                        "merchant_id": merchant_id,
+                        "page": pages_fetched + 1,
+                        "page_info_present": bool(page_info),
+                    },
+                )
+
+                products_page, next_page_info = await _fetch_shopify_products_page(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    limit=page_size,
+                    page_info=page_info,
+                )
+
+                if not products_page:
+                    break
+
+                for p in products_page:
+                    try:
+                        dto = ShopifyProductDTO.from_shopify_api(p)
+                        platform_product_id = dto.shopify_id
+
+                        await upsert_product_cache(
+                            merchant_id=merchant_id,
+                            platform="shopify",
+                            platform_product_id=platform_product_id,
+                            product_data=dto.to_cache_payload(),
+                            ttl_seconds=3600,
+                        )
+                        succeeded += 1
+                    except Exception as cache_exc:
+                        failed += 1
+                        logger.error(
+                            "Failed to cache Shopify product",
+                            extra={
+                                "task_id": task_id,
+                                "merchant_id": merchant_id,
+                                "product_id": p.get("id"),
+                                "error": str(cache_exc),
+                            },
+                        )
+
+                all_products.extend(products_page)
+                pages_fetched += 1
+
+                logger.info(
+                    "Shopify page imported",
+                    extra={
+                        "task_id": task_id,
+                        "merchant_id": merchant_id,
+                        "page": pages_fetched,
+                        "products_in_page": len(products_page),
+                        "total_so_far": len(all_products),
+                        "has_next_page": next_page_info is not None,
+                    },
+                )
+
+                if not next_page_info:
+                    break
+
+                page_info = next_page_info
+
+                if len(all_products) >= max_products:
+                    logger.info(
+                        "Reached SHOPIFY_MAX_PRODUCTS_PER_RUN limit; stopping pagination",
                         extra={
                             "task_id": task_id,
                             "merchant_id": merchant_id,
-                            "product_id": p.get("id"),
-                            "error": str(cache_exc),
+                            "max_products": max_products,
                         },
                     )
+                    break
 
-            counts["total"] = len(products)
+            duration = (datetime.utcnow() - started_at).total_seconds()
+
+            counts["total"] = len(all_products)
             counts["succeeded"] = succeeded
             counts["failed"] = failed
             counts["duration_sec"] = duration
+            counts["pages_fetched"] = pages_fetched
+            counts["page_size"] = page_size
+            counts["max_pages_limit"] = max_pages
 
             logger.info(
                 "Shopify import completed",
                 extra={
                     "task_id": task_id,
                     "merchant_id": merchant_id,
-                    "products_fetched": len(products),
+                    "products_fetched": len(all_products),
+                    "pages_fetched": pages_fetched,
                     "duration_sec": duration,
                 },
             )
