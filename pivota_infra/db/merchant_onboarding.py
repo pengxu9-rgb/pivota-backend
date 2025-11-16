@@ -230,3 +230,34 @@ async def hard_delete_merchant_onboarding(merchant_id: str) -> bool:
     
     return True
 
+
+async def update_platform_profile(merchant_id: str, profile: Dict[str, Any]) -> bool:
+    """
+    Update platform_profile JSON column for Platform Onboarding v2.
+    
+    Args:
+        merchant_id: The merchant ID (onboarding_id)
+        profile: The platform profile data to store
+        
+    Returns:
+        True if update succeeded, False otherwise
+    """
+    from db.database import database
+    import json
+    
+    query = """
+        UPDATE merchant_onboarding 
+        SET platform_profile = :profile
+        WHERE merchant_id = :merchant_id
+    """
+    
+    try:
+        result = await database.execute(
+            query,
+            {"merchant_id": merchant_id, "profile": json.dumps(profile)}
+        )
+        return result > 0
+    except Exception as e:
+        print(f"⚠️ Failed to update platform_profile for {merchant_id}: {e}")
+        return False
+
