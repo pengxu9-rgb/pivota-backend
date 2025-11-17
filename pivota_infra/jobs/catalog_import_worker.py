@@ -611,6 +611,7 @@ async def process_next_import_task() -> Dict[str, Any]:
             total = 0
             succeeded = 0
             failed = 0
+            error_reasons: Dict[str, int] = {}
 
             # Derive platform from connector name.
             platform = "amazon" if connector == "amazon_report" else "temu"
@@ -633,6 +634,8 @@ async def process_next_import_task() -> Dict[str, Any]:
                     succeeded += 1
                 except Exception as row_exc:
                     failed += 1
+                    reason = type(row_exc).__name__
+                    error_reasons[reason] = error_reasons.get(reason, 0) + 1
                     logger.error(
                         "Failed to import platform report row",
                         extra={
@@ -651,6 +654,10 @@ async def process_next_import_task() -> Dict[str, Any]:
             counts["report_id"] = report_id
             counts["report_type"] = report.get("report_type")
             counts["platform"] = platform
+            if failed:
+                counts["error_type"] = "report_import"
+                counts["error_category"] = "row_mapping"
+                counts["error_reasons"] = error_reasons
 
             logger.info(
                 "Platform report import completed",
