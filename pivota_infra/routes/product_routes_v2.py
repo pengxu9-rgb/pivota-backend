@@ -2,18 +2,83 @@
 Enhanced Product Routes that work with products_cache
 """
 
-from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Dict, Any
 from datetime import datetime
 from db.database import database
 from utils.auth import get_current_user, can_access_merchant
-from models.standard_product import StandardProduct, ProductListResponse
+from models.standard_product import StandardProduct, ProductListResponse, ProductStatus
 import json
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products/v2", tags=["products-v2"])
+
+
+def _map_cache_row_to_standard_product(
+    merchant_id: str,
+    platform: str,
+    product_data: Dict[str, Any],
+) -> StandardProduct:
+    """
+    Map products_cache.product_data into StandardProduct.
+
+    If the payload already looks like a StandardProduct (id/merchant_id/platform/price present),
+    we trust it and construct directly. Otherwise we build a minimal StandardProduct from the
+    cached fields (e.g. ShopifyProductDTO payload).
+    """
+    # Fast path: already in StandardProduct shape
+    if all(k in product_data for k in ("id", "merchant_id", "platform", "price")):
+        return StandardProduct(**product_data)
+
+    # Fallback mapping for minimal Shopify-style payload
+    shopify_id = product_data.get("shopify_id") or product_data.get("id")
+    title = product_data.get("title") or ""
+    variants_count = int(product_data.get("variants_count") or 0)
+    images_count = int(product_data.get("images_count") or 0)
+    vendor = product_data.get("vendor")
+    product_type = product_data.get("product_type")
+    status_raw = product_data.get("status") or ProductStatus.ACTIVE.value
+
+    # Simple data completeness score (EPIC-4 baseline)
+    score = 0.0
+    if title:
+        score += 0.4
+    if images_count > 0:
+        score += 0.3
+    if variants_count > 0:
+        score += 0.2
+    if product_type or vendor:
+        score += 0.1
+    score = round(score, 2)
+
+    mapped: Dict[str, Any] = {
+        "id": str(shopify_id or ""),
+        "platform": platform,
+        "merchant_id": merchant_id,
+        "title": title,
+        "description": None,
+        "vendor": vendor,
+        "product_type": product_type,
+        "tags": [],
+        "price": 0.0,
+        "compare_at_price": None,
+        "currency": "USD",
+        "inventory_quantity": 0,
+        "sku": None,
+        "barcode": None,
+        "image_url": None,
+        "images": [],
+        "variants": [],
+        "status": status_raw,
+        "published_at": None,
+        "created_at": product_data.get("created_at"),
+        "updated_at": product_data.get("updated_at"),
+        "platform_metadata": {"raw": product_data.get("raw")},
+        "data_completeness_score": score,
+    }
+
+    return StandardProduct(**mapped)
 
 @router.get("/{merchant_id}", response_model=ProductListResponse)
 async def get_merchant_products_v2(
@@ -100,8 +165,12 @@ async def get_merchant_products_v2(
                 if "platform" not in product_data:
                     product_data["platform"] = row["platform"]
                 
-                # Create StandardProduct
-                product = StandardProduct(**product_data)
+                # Create StandardProduct (supports minimal Shopify payloads)
+                product = _map_cache_row_to_standard_product(
+                    merchant_id=merchant_id,
+                    platform=row["platform"],
+                    product_data=product_data,
+                )
                 products.append(product)
             except Exception as e:
                 logger.error(f"Failed to parse product: {e}")
@@ -182,4 +251,3 @@ async def get_merchant_platforms(
             status_code=500,
             detail=f"Failed to fetch platforms: {str(e)}"
         )
-

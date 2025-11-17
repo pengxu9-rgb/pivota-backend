@@ -72,6 +72,9 @@ class StandardProduct(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     
+    # 简单数据完整度评分（EPIC-4，用于 MDQS 预览）
+    data_completeness_score: Optional[float] = None
+    
     # 元数据（保留原始平台特定数据）
     platform_metadata: Optional[Dict[str, Any]] = None
     
@@ -95,4 +98,3 @@ class ProductListResponse(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat() if v else None
         }
-
