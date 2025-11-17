@@ -1,12 +1,14 @@
 """
-Admin Platform Order POC - EPIC-7
+Admin Platform Order POC - EPIC-7/8
 
 Unified Admin-only POC endpoint for creating platform orders from products_cache.
-Phase 1: Shopify-only, with a single entry point and platform switch.
+Phase 1: Shopify (real API).
+Phase 2 (EPIC-8): Amazon/Temu stub adapters (no external API calls yet).
 """
 
 from datetime import datetime
 from typing import Any, Dict, Optional, Literal
+from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -16,6 +18,7 @@ from utils.auth import require_admin
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import get_product_cache_row
 from jobs.catalog_import_worker import _get_shopify_config_for_merchant, SHOPIFY_API_VERSION
+from models.standard_product import StandardProduct
 
 import logging
 
@@ -226,6 +229,228 @@ async def _place_shopify_order_from_cache(
     )
 
 
+async def _place_amazon_order_from_cache(
+    onboarding_id: str,
+    payload: PlatformOrderPOCRequest,
+) -> PlatformOrderPOCResponse:
+    """
+    Amazon Order POC adapter (stub).
+
+    - Reads StandardProduct from products_cache (platform='amazon').
+    - Requires product.orderable == True.
+    - Selects variant by payload.variant_id or first variant.
+    - Constructs a synthetic order id/name and logs payload; no external API call.
+    """
+
+    logger.info(
+        "Platform Order POC (Amazon stub) - Starting",
+        extra={
+            "onboarding_id": onboarding_id,
+            "platform_product_id": payload.platform_product_id,
+            "quantity": payload.quantity,
+        },
+    )
+
+    record = await get_merchant_onboarding(onboarding_id)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Onboarding not found",
+        )
+
+    cache_row = await get_product_cache_row(
+        merchant_id=onboarding_id,
+        platform="amazon",
+        platform_product_id=payload.platform_product_id,
+        include_expired=False,
+    )
+    if not cache_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found in cache",
+        )
+
+    product_data = cache_row.get("product_data") or {}
+    try:
+        product = StandardProduct(**product_data)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to parse StandardProduct for amazon: {exc}",
+        )
+
+    if not product.orderable:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "PRODUCT_NOT_ORDERABLE",
+                "validation": product.orderable_validation,
+            },
+        )
+
+    chosen_variant = None
+    if payload.variant_id:
+        for v in product.variants:
+            if v.id == str(payload.variant_id):
+                chosen_variant = v
+                break
+    if not chosen_variant and product.variants:
+        chosen_variant = product.variants[0]
+    if not chosen_variant:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No variant available for this product",
+        )
+
+    synthetic_id = f"poc-amazon-{uuid4().hex[:8]}"
+    synthetic_name = f"AMZ-POC-{synthetic_id.split('-')[-1].upper()}"
+
+    platform_payload = {
+        "asin": product.id,
+        "seller_sku": chosen_variant.sku or chosen_variant.id,
+        "quantity": payload.quantity,
+        "price": chosen_variant.price,
+        "currency": product.currency,
+        "buyer_email": payload.buyer_email or "poc-buyer@example.com",
+        "mode": "stub",
+    }
+
+    logger.info(
+        "Platform Order POC (Amazon stub) - Success",
+        extra={
+            "onboarding_id": onboarding_id,
+            "platform_order_id": synthetic_id,
+            "variant_id": chosen_variant.id,
+        },
+    )
+
+    return PlatformOrderPOCResponse(
+        status="success",
+        platform="amazon",
+        platform_order_id=synthetic_id,
+        platform_order_name=synthetic_name,
+        platform_order_url=None,
+        variant_info={
+            "variant_id": chosen_variant.id,
+            "title": chosen_variant.title,
+            "price": chosen_variant.price,
+            "sku": chosen_variant.sku,
+        },
+        raw={"mode": "stub", "payload": platform_payload},
+    )
+
+
+async def _place_temu_order_from_cache(
+    onboarding_id: str,
+    payload: PlatformOrderPOCRequest,
+) -> PlatformOrderPOCResponse:
+    """
+    Temu Order POC adapter (stub).
+
+    - Reads StandardProduct from products_cache (platform='temu').
+    - Requires product.orderable == True.
+    - Selects variant by payload.variant_id or first variant.
+    - Constructs a synthetic order id/name and logs payload; no external API call.
+    """
+
+    logger.info(
+        "Platform Order POC (Temu stub) - Starting",
+        extra={
+            "onboarding_id": onboarding_id,
+            "platform_product_id": payload.platform_product_id,
+            "quantity": payload.quantity,
+        },
+    )
+
+    record = await get_merchant_onboarding(onboarding_id)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Onboarding not found",
+        )
+
+    cache_row = await get_product_cache_row(
+        merchant_id=onboarding_id,
+        platform="temu",
+        platform_product_id=payload.platform_product_id,
+        include_expired=False,
+    )
+    if not cache_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found in cache",
+        )
+
+    product_data = cache_row.get("product_data") or {}
+    try:
+        product = StandardProduct(**product_data)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to parse StandardProduct for temu: {exc}",
+        )
+
+    if not product.orderable:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "PRODUCT_NOT_ORDERABLE",
+                "validation": product.orderable_validation,
+            },
+        )
+
+    chosen_variant = None
+    if payload.variant_id:
+        for v in product.variants:
+            if v.id == str(payload.variant_id):
+                chosen_variant = v
+                break
+    if not chosen_variant and product.variants:
+        chosen_variant = product.variants[0]
+    if not chosen_variant:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No variant available for this product",
+        )
+
+    synthetic_id = f"poc-temu-{uuid4().hex[:8]}"
+    synthetic_name = f"TEMU-POC-{synthetic_id.split('-')[-1].upper()}"
+
+    platform_payload = {
+        "product_id": product.id,
+        "variant_id": chosen_variant.id,
+        "quantity": payload.quantity,
+        "price": chosen_variant.price,
+        "currency": product.currency,
+        "buyer_email": payload.buyer_email or "poc-buyer@example.com",
+        "mode": "stub",
+    }
+
+    logger.info(
+        "Platform Order POC (Temu stub) - Success",
+        extra={
+            "onboarding_id": onboarding_id,
+            "platform_order_id": synthetic_id,
+            "variant_id": chosen_variant.id,
+        },
+    )
+
+    return PlatformOrderPOCResponse(
+        status="success",
+        platform="temu",
+        platform_order_id=synthetic_id,
+        platform_order_name=synthetic_name,
+        platform_order_url=None,
+        variant_info={
+            "variant_id": chosen_variant.id,
+            "title": chosen_variant.title,
+            "price": chosen_variant.price,
+            "sku": chosen_variant.sku,
+        },
+        raw={"mode": "stub", "payload": platform_payload},
+    )
+
+
 @router.post(
     "/{onboarding_id}/orders/poc",
     response_model=PlatformOrderPOCResponse,
@@ -238,14 +463,20 @@ async def create_platform_order_poc(
     """
     Unified Admin-only Order POC endpoint.
 
-    Phase 1: only Shopify is supported; Amazon/Temu will return 501 Not Implemented.
+    Phase 1: Shopify (real API).
+    Phase 2 (EPIC-8): Amazon/Temu stub adapters (no external API calls yet).
     """
 
     if payload.platform == "shopify":
         return await _place_shopify_order_from_cache(onboarding_id, payload)
 
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=f"Platform '{payload.platform}' order POC is not yet implemented",
-    )
+    if payload.platform == "amazon":
+        return await _place_amazon_order_from_cache(onboarding_id, payload)
 
+    if payload.platform == "temu":
+        return await _place_temu_order_from_cache(onboarding_id, payload)
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unsupported platform: {payload.platform}",
+    )
