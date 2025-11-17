@@ -177,6 +177,28 @@ async def get_cached_products(
     return [dict(r) for r in results]
 
 
+async def get_product_cache_row(
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+    include_expired: bool = False
+) -> Optional[Dict[str, Any]]:
+    """
+    获取单个产品缓存行（用于后台任务/POC 下单等）
+    """
+    query = products_cache.select().where(
+        (products_cache.c.merchant_id == merchant_id)
+        & (products_cache.c.platform == platform)
+        & (products_cache.c.platform_product_id == platform_product_id)
+    )
+
+    if not include_expired:
+        query = query.where(products_cache.c.expires_at > datetime.now())
+
+    row = await database.fetch_one(query)
+    return dict(row) if row else None
+
+
 async def upsert_product_cache(
     merchant_id: str,
     platform: str,
