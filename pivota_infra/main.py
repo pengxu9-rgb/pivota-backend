@@ -103,6 +103,7 @@ from routes.admin_platform_import import router as admin_platform_import_router 
 from routes.admin_platform_report_import import router as admin_platform_report_import_router  # EPIC-6 Platform Report Import
 from routes.admin_connector_credentials import router as admin_connector_credentials_router  # EPIC-3 Connector credentials
 from routes.admin_shopify_order_poc import router as admin_shopify_order_poc_router  # EPIC-5 Shopify order POC
+from routes.admin_platform_order_poc import router as admin_platform_order_poc_router  # EPIC-7 Platform Order POC (unified)
 from routes.stripe_connect_integration import router as stripe_connect_router  # Phase 6.1 - Stripe Connect Payouts
 from routes.agent_payout_management import router as agent_payout_router  # Phase 6.1 - Agent Payout Settings
 from routes.merchant_payouts import router as merchant_payouts_router  # Phase 6 - Merchant Payout Management
@@ -489,6 +490,7 @@ app.include_router(admin_platform_import_router)  # EPIC-2 Platform Import worke
 app.include_router(admin_platform_report_import_router)  # EPIC-6 Platform Report Import upload
 app.include_router(admin_connector_credentials_router)  # EPIC-3 Connector credentials management
 app.include_router(admin_shopify_order_poc_router)  # EPIC-5 Shopify order POC
+app.include_router(admin_platform_order_poc_router)  # EPIC-7 Platform Order POC (unified)
 app.include_router(stripe_connect_router)  # Phase 6.1 - Stripe Connect integration
 app.include_router(agent_payout_router)  # Phase 6.1 - Agent payout management
 app.include_router(merchant_payouts_router)  # Phase 6 - Merchant payout management
