@@ -9,6 +9,8 @@ Phase 2 (EPIC-8): Amazon/Temu stub adapters (no external API calls yet).
 from datetime import datetime
 from typing import Any, Dict, Optional, Literal
 from uuid import uuid4
+import hashlib
+import os
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -17,6 +19,7 @@ from pydantic import BaseModel, Field, EmailStr
 from utils.auth import require_admin
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import get_product_cache_row
+from db.shopify_order_poc_log import get_poc_log_by_hash, insert_poc_log
 from jobs.catalog_import_worker import _get_shopify_config_for_merchant, SHOPIFY_API_VERSION
 from models.standard_product import StandardProduct
 
@@ -69,6 +72,52 @@ async def _place_shopify_order_from_cache(
             "quantity": payload.quantity,
         },
     )
+
+    # 0. Safety: allowlist for Shopify live POC (optional env override).
+    # If SHOPIFY_LIVE_ONBOARDINGS is set, only those onboarding_ids are allowed.
+    raw_whitelist = os.getenv("SHOPIFY_LIVE_ONBOARDINGS", "")
+    whitelist = {x.strip() for x in raw_whitelist.split(",") if x.strip()}
+    if whitelist and onboarding_id not in whitelist:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Shopify live order POC is not enabled for this onboarding_id",
+        )
+
+    # Idempotency key based on input tuple.
+    hash_input = "|".join(
+        [
+            onboarding_id,
+            "shopify",
+            payload.platform_product_id,
+            str(payload.variant_id or ""),
+            str(payload.quantity),
+            payload.buyer_email or "",
+        ]
+    )
+    request_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+
+    # 0.1 Check if we already created a POC order for this exact request.
+    existing = await get_poc_log_by_hash(request_hash)
+    if existing and existing.get("shopify_order_id"):
+        logger.info(
+            "Platform Order POC (Shopify) - Idempotent replay",
+            extra={
+                "onboarding_id": onboarding_id,
+                "platform_product_id": payload.platform_product_id,
+                "quantity": payload.quantity,
+                "shopify_order_id": existing.get("shopify_order_id"),
+            },
+        )
+        return PlatformOrderPOCResponse(
+            status="success",
+            platform="shopify",
+            poc_mode="shopify_live",
+            platform_order_id=existing.get("shopify_order_id"),
+            platform_order_name=existing.get("shopify_order_name"),
+            platform_order_url=existing.get("shopify_order_url"),
+            variant_info=None,
+            raw=existing.get("raw_order"),
+        )
 
     # 1. Ensure onboarding exists
     record = await get_merchant_onboarding(onboarding_id)
@@ -218,6 +267,31 @@ async def _place_shopify_order_from_cache(
             "duration_ms": duration_ms,
         },
     )
+
+    # Persist basic POC log for idempotency and auditing.
+    try:
+        await insert_poc_log(
+            onboarding_id=onboarding_id,
+            request_hash=request_hash,
+            platform_product_id=payload.platform_product_id,
+            variant_id=str(variant_id),
+            quantity=payload.quantity,
+            buyer_email=payload.buyer_email or None,
+            shopify_order_id=str(order.get("id")) if order.get("id") is not None else None,
+            shopify_order_name=order.get("name"),
+            shopify_order_url=f"https://{shop_domain}/admin/orders/{order.get('id')}" if order.get("id") else None,
+            raw_order=order,
+        )
+    except Exception as exc:
+        # Logging failures must not break the main flow.
+        logger.warning(
+            "Failed to persist Shopify order POC log",
+            extra={
+                "onboarding_id": onboarding_id,
+                "platform_product_id": payload.platform_product_id,
+                "error": str(exc),
+            },
+        )
 
     return PlatformOrderPOCResponse(
         status="success",
