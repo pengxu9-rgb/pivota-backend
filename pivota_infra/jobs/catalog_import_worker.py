@@ -37,7 +37,7 @@ from db.connector_credentials import (
 from services.crypto_service import crypto_service
 from db.products import upsert_product_cache
 from db.platform_import_reports import get_platform_report
-from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
+from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus, validate_orderable
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +284,10 @@ def _map_report_row_to_standard_product(
             platform_metadata={"raw_report_row": row},
         )
 
+        orderable, validation = validate_orderable(product)
+        product.orderable = orderable
+        product.orderable_validation = validation
+
         return product
 
     # Temu mapping
@@ -358,6 +362,10 @@ def _map_report_row_to_standard_product(
             data_completeness_score=score,
             platform_metadata={"raw_report_row": row},
         )
+
+        orderable, validation = validate_orderable(product)
+        product.orderable = orderable
+        product.orderable_validation = validation
 
         return product
 

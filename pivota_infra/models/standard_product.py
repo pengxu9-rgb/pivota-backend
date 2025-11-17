@@ -5,7 +5,7 @@ Pivota 的核心价值：将多平台产品数据转换为统一标准格式
 """
 
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
 
@@ -77,11 +77,35 @@ class StandardProduct(BaseModel):
     
     # 元数据（保留原始平台特定数据）
     platform_metadata: Optional[Dict[str, Any]] = None
+    # 是否可下单及校验结果（EPIC-7 准备）
+    orderable: bool = False
+    orderable_validation: Optional[Dict[str, Any]] = None
     
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat() if v else None
         }
+
+
+def validate_orderable(product: StandardProduct) -> Tuple[bool, Dict[str, Any]]:
+    required_fields_present = {
+        "id": bool(product.id),
+        "platform": bool(product.platform),
+        "price": product.price is not None and product.price > 0,
+        "currency": bool(product.currency),
+        "variant_id": bool(product.variants and product.variants[0].id),
+    }
+    errors: List[str] = []
+    for field_name, present in required_fields_present.items():
+        if not present:
+            errors.append(f"missing_or_invalid_{field_name}")
+    orderable = len(errors) == 0
+    validation = {
+        "orderable": orderable,
+        "required_fields_present": required_fields_present,
+        "errors": errors,
+    }
+    return orderable, validation
 
 
 class ProductListResponse(BaseModel):
