@@ -26,19 +26,21 @@ router = APIRouter(
 )
 
 
-ALLOWED_REPORT_TYPES = {"amazon"}  # Phase 1: only Amazon; Temu can be added later.
+ALLOWED_REPORT_TYPES = {"amazon", "temu"}  # Phase 1: Amazon; Phase 2: Temu.
 
 
 def _get_required_columns_for_report(report_type: str) -> Set[str]:
     """
     Return the minimal required CSV header columns for a given report_type.
 
-    Phase 1 supports only the Amazon template described in EPIC-6:
-    asin, seller_sku, title, price, currency
+    Supported templates from EPIC-6:
+    - Amazon: asin, seller_sku, title, price, currency
+    - Temu: product_id, variant_id, name, price, currency
     """
     if report_type == "amazon":
         return {"asin", "seller_sku", "title", "price", "currency"}
-    # Placeholder for future extensions (e.g. Temu)
+    if report_type == "temu":
+        return {"product_id", "variant_id", "name", "price", "currency"}
     return set()
 
 
@@ -52,8 +54,8 @@ async def upload_platform_report(
     """
     Admin-only endpoint to upload a platform product report (CSV).
 
-    Phase 1:
-    - Supports report_type="amazon" only.
+    Phase 1/2:
+    - Supports report_type="amazon" and "temu".
     - Validates onboarding exists.
     - Performs basic CSV header validation.
     - Stores raw content in platform_import_reports.
@@ -197,4 +199,3 @@ async def upload_platform_report(
         "rows_total": rows_total,
         "message": "Report uploaded and import task scheduled",
     }
-

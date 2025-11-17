@@ -193,8 +193,11 @@ def _map_report_row_to_standard_product(
     """
     Map a single CSV report row into a StandardProduct instance.
 
-    Phase 1: supports only Amazon report rows, using the template from EPIC-6:
-    asin, seller_sku, title, price, currency, image_url, product_type, brand, quantity_available, tags
+    Phase 1: Amazon report rows
+      asin, seller_sku, title, price, currency, image_url, product_type, brand, quantity_available, tags
+
+    Phase 2: Temu report rows
+      product_id, variant_id, name, price, currency, image_url, category, brand, stock
     """
 
     # Normalize report_type to a simple platform identifier.
@@ -202,87 +205,163 @@ def _map_report_row_to_standard_product(
     if normalized_type.endswith("_report"):
         normalized_type = normalized_type[: -len("_report")]
 
-    if normalized_type != "amazon":
-        raise ValueError(f"Unsupported report_type for mapping: {report_type}")
+    # Amazon mapping
+    if normalized_type == "amazon":
+        asin = (row.get("asin") or "").strip()
+        seller_sku = (row.get("seller_sku") or "").strip()
+        title = (row.get("title") or "").strip()
+        price_raw = row.get("price")
+        currency = (row.get("currency") or "USD").strip() or "USD"
 
-    asin = (row.get("asin") or "").strip()
-    seller_sku = (row.get("seller_sku") or "").strip()
-    title = (row.get("title") or "").strip()
-    price_raw = row.get("price")
-    currency = (row.get("currency") or "USD").strip() or "USD"
+        if not asin or not seller_sku or not title or price_raw in (None, ""):
+            raise ValueError("Missing required Amazon report fields (asin, seller_sku, title, price)")
 
-    if not asin or not seller_sku or not title or price_raw in (None, ""):
-        raise ValueError("Missing required Amazon report fields (asin, seller_sku, title, price)")
-
-    try:
-        price = float(price_raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"Invalid price value: {price_raw}")
-
-    qty_raw = row.get("quantity_available")
-    quantity = 0
-    if qty_raw not in (None, ""):
         try:
-            quantity = int(qty_raw)
+            price = float(price_raw)
         except (TypeError, ValueError):
-            quantity = 0
+            raise ValueError(f"Invalid price value: {price_raw}")
 
-    image_url = (row.get("image_url") or "").strip() or None
+        qty_raw = row.get("quantity_available")
+        quantity = 0
+        if qty_raw not in (None, ""):
+            try:
+                quantity = int(qty_raw)
+            except (TypeError, ValueError):
+                quantity = 0
 
-    raw_tags = row.get("tags") or ""
-    tags: List[str] = []
-    if raw_tags:
-        separator = ";" if ";" in raw_tags else ","
-        tags = [t.strip() for t in raw_tags.split(separator) if t.strip()]
+        image_url = (row.get("image_url") or "").strip() or None
 
-    # Simple completeness score for EPIC-4/6 visibility.
-    score = 0.0
-    if title:
-        score += 0.4
-    if image_url:
-        score += 0.2
-    if price > 0:
-        score += 0.2
-    if quantity > 0:
-        score += 0.2
-    score = round(score, 2)
+        raw_tags = row.get("tags") or ""
+        tags: List[str] = []
+        if raw_tags:
+            separator = ";" if ";" in raw_tags else ","
+            tags = [t.strip() for t in raw_tags.split(separator) if t.strip()]
 
-    variant = StandardProductVariant(
-        id=seller_sku,
-        title=title,
-        sku=seller_sku,
-        price=price,
-        inventory_quantity=quantity,
-        image_url=image_url,
-    )
+        # Simple completeness score for EPIC-4/6 visibility.
+        score = 0.0
+        if title:
+            score += 0.4
+        if image_url:
+            score += 0.2
+        if price > 0:
+            score += 0.2
+        if quantity > 0:
+            score += 0.2
+        score = round(score, 2)
 
-    product = StandardProduct(
-        id=asin,
-        platform="amazon",
-        merchant_id=merchant_id,
-        title=title,
-        description=None,
-        vendor=row.get("brand"),
-        product_type=row.get("product_type"),
-        tags=tags,
-        price=price,
-        compare_at_price=None,
-        currency=currency,
-        inventory_quantity=quantity,
-        sku=seller_sku,
-        barcode=None,
-        image_url=image_url,
-        images=[image_url] if image_url else [],
-        variants=[variant],
-        status=ProductStatus.ACTIVE,
-        published_at=None,
-        created_at=None,
-        updated_at=None,
-        data_completeness_score=score,
-        platform_metadata={"raw_report_row": row},
-    )
+        variant = StandardProductVariant(
+            id=seller_sku,
+            title=title,
+            sku=seller_sku,
+            price=price,
+            inventory_quantity=quantity,
+            image_url=image_url,
+        )
 
-    return product
+        product = StandardProduct(
+            id=asin,
+            platform="amazon",
+            merchant_id=merchant_id,
+            title=title,
+            description=None,
+            vendor=row.get("brand"),
+            product_type=row.get("product_type"),
+            tags=tags,
+            price=price,
+            compare_at_price=None,
+            currency=currency,
+            inventory_quantity=quantity,
+            sku=seller_sku,
+            barcode=None,
+            image_url=image_url,
+            images=[image_url] if image_url else [],
+            variants=[variant],
+            status=ProductStatus.ACTIVE,
+            published_at=None,
+            created_at=None,
+            updated_at=None,
+            data_completeness_score=score,
+            platform_metadata={"raw_report_row": row},
+        )
+
+        return product
+
+    # Temu mapping
+    if normalized_type == "temu":
+        product_id = (row.get("product_id") or "").strip()
+        variant_id = (row.get("variant_id") or "").strip()
+        name = (row.get("name") or "").strip()
+        price_raw = row.get("price")
+        currency = (row.get("currency") or "USD").strip() or "USD"
+
+        if not product_id or not variant_id or not name or price_raw in (None, ""):
+            raise ValueError("Missing required Temu report fields (product_id, variant_id, name, price)")
+
+        try:
+            price = float(price_raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid price value: {price_raw}")
+
+        stock_raw = row.get("stock")
+        stock = 0
+        if stock_raw not in (None, ""):
+            try:
+                stock = int(stock_raw)
+            except (TypeError, ValueError):
+                stock = 0
+
+        image_url = (row.get("image_url") or "").strip() or None
+
+        # Simple completeness score for EPIC-4/6 visibility.
+        score = 0.0
+        if name:
+            score += 0.4
+        if image_url:
+            score += 0.2
+        if price > 0:
+            score += 0.2
+        if stock > 0:
+            score += 0.2
+        score = round(score, 2)
+
+        variant = StandardProductVariant(
+            id=variant_id,
+            title=name,
+            sku=variant_id,
+            price=price,
+            inventory_quantity=stock,
+            image_url=image_url,
+        )
+
+        product = StandardProduct(
+            id=product_id,
+            platform="temu",
+            merchant_id=merchant_id,
+            title=name,
+            description=None,
+            vendor=row.get("brand"),
+            product_type=row.get("category"),
+            tags=[],
+            price=price,
+            compare_at_price=None,
+            currency=currency,
+            inventory_quantity=stock,
+            sku=variant_id,
+            barcode=None,
+            image_url=image_url,
+            images=[image_url] if image_url else [],
+            variants=[variant],
+            status=ProductStatus.ACTIVE,
+            published_at=None,
+            created_at=None,
+            updated_at=None,
+            data_completeness_score=score,
+            platform_metadata={"raw_report_row": row},
+        )
+
+        return product
+
+    raise ValueError(f"Unsupported report_type for mapping: {report_type}")
 
 
 def _get_shopify_config() -> Dict[str, Any]:
@@ -502,8 +581,8 @@ async def process_next_import_task() -> Dict[str, Any]:
                 },
             )
 
-        # Report-based import branch (EPIC-6 Phase 1 - Amazon CSV).
-        elif source_type == "report" and connector == "amazon_report":
+        # Report-based import branch (EPIC-6 - Amazon/Temu CSV).
+        elif source_type == "report" and connector in ("amazon_report", "temu_report"):
             started_at = datetime.utcnow()
             counts = {"total": 0, "succeeded": 0, "failed": 0}
 
@@ -533,6 +612,9 @@ async def process_next_import_task() -> Dict[str, Any]:
             succeeded = 0
             failed = 0
 
+            # Derive platform from connector name.
+            platform = "amazon" if connector == "amazon_report" else "temu"
+
             for row in reader:
                 total += 1
                 try:
@@ -543,7 +625,7 @@ async def process_next_import_task() -> Dict[str, Any]:
                     )
                     await upsert_product_cache(
                         merchant_id=merchant_id,
-                        platform="amazon",
+                        platform=platform,
                         platform_product_id=product.id,
                         product_data=product.dict(),
                         ttl_seconds=3600,
@@ -568,6 +650,7 @@ async def process_next_import_task() -> Dict[str, Any]:
             counts["duration_sec"] = duration
             counts["report_id"] = report_id
             counts["report_type"] = report.get("report_type")
+            counts["platform"] = platform
 
             logger.info(
                 "Platform report import completed",
@@ -576,6 +659,7 @@ async def process_next_import_task() -> Dict[str, Any]:
                     "merchant_id": merchant_id,
                     "report_id": report_id,
                     "report_type": report.get("report_type"),
+                    "platform": platform,
                     "rows_total": report.get("rows_total"),
                     "total": total,
                     "succeeded": succeeded,
