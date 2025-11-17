@@ -19,6 +19,8 @@ import re
 from urllib.parse import urlparse, parse_qs
 
 import httpx
+import csv
+import io
 
 from config.settings import settings
 from services.platform_import_service import (
@@ -34,6 +36,8 @@ from db.connector_credentials import (
 )
 from services.crypto_service import crypto_service
 from db.products import upsert_product_cache
+from db.platform_import_reports import get_platform_report
+from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +185,106 @@ async def _fetch_shopify_products(shop_domain: str, access_token: str, limit: in
     return products
 
 
+def _map_report_row_to_standard_product(
+    merchant_id: str,
+    report_type: str,
+    row: Dict[str, Any],
+) -> StandardProduct:
+    """
+    Map a single CSV report row into a StandardProduct instance.
+
+    Phase 1: supports only Amazon report rows, using the template from EPIC-6:
+    asin, seller_sku, title, price, currency, image_url, product_type, brand, quantity_available, tags
+    """
+
+    # Normalize report_type to a simple platform identifier.
+    normalized_type = (report_type or "").lower()
+    if normalized_type.endswith("_report"):
+        normalized_type = normalized_type[: -len("_report")]
+
+    if normalized_type != "amazon":
+        raise ValueError(f"Unsupported report_type for mapping: {report_type}")
+
+    asin = (row.get("asin") or "").strip()
+    seller_sku = (row.get("seller_sku") or "").strip()
+    title = (row.get("title") or "").strip()
+    price_raw = row.get("price")
+    currency = (row.get("currency") or "USD").strip() or "USD"
+
+    if not asin or not seller_sku or not title or price_raw in (None, ""):
+        raise ValueError("Missing required Amazon report fields (asin, seller_sku, title, price)")
+
+    try:
+        price = float(price_raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid price value: {price_raw}")
+
+    qty_raw = row.get("quantity_available")
+    quantity = 0
+    if qty_raw not in (None, ""):
+        try:
+            quantity = int(qty_raw)
+        except (TypeError, ValueError):
+            quantity = 0
+
+    image_url = (row.get("image_url") or "").strip() or None
+
+    raw_tags = row.get("tags") or ""
+    tags: List[str] = []
+    if raw_tags:
+        separator = ";" if ";" in raw_tags else ","
+        tags = [t.strip() for t in raw_tags.split(separator) if t.strip()]
+
+    # Simple completeness score for EPIC-4/6 visibility.
+    score = 0.0
+    if title:
+        score += 0.4
+    if image_url:
+        score += 0.2
+    if price > 0:
+        score += 0.2
+    if quantity > 0:
+        score += 0.2
+    score = round(score, 2)
+
+    variant = StandardProductVariant(
+        id=seller_sku,
+        title=title,
+        sku=seller_sku,
+        price=price,
+        inventory_quantity=quantity,
+        image_url=image_url,
+    )
+
+    product = StandardProduct(
+        id=asin,
+        platform="amazon",
+        merchant_id=merchant_id,
+        title=title,
+        description=None,
+        vendor=row.get("brand"),
+        product_type=row.get("product_type"),
+        tags=tags,
+        price=price,
+        compare_at_price=None,
+        currency=currency,
+        inventory_quantity=quantity,
+        sku=seller_sku,
+        barcode=None,
+        image_url=image_url,
+        images=[image_url] if image_url else [],
+        variants=[variant],
+        status=ProductStatus.ACTIVE,
+        published_at=None,
+        created_at=None,
+        updated_at=None,
+        data_completeness_score=score,
+        platform_metadata={"raw_report_row": row},
+    )
+
+    return product
+
+
 def _get_shopify_config() -> Dict[str, Any]:
     """Resolve Shopify configuration from settings/env."""
     shop_domain = (
@@ -272,7 +376,7 @@ async def process_next_import_task() -> Dict[str, Any]:
     counts: Dict[str, Any] = {"total": 0}
 
     try:
-        # Only handle Shopify connector for now; other tasks are no-ops.
+        # Shopify connector import branch.
         if source_type == "connector" and connector == "shopify":
             cfg = await _get_shopify_config_for_merchant(merchant_id)
             shop_domain = cfg["shop_domain"]
@@ -394,6 +498,88 @@ async def process_next_import_task() -> Dict[str, Any]:
                     "merchant_id": merchant_id,
                     "products_fetched": len(all_products),
                     "pages_fetched": pages_fetched,
+                    "duration_sec": duration,
+                },
+            )
+
+        # Report-based import branch (EPIC-6 Phase 1 - Amazon CSV).
+        elif source_type == "report" and connector == "amazon_report":
+            started_at = datetime.utcnow()
+            counts = {"total": 0, "succeeded": 0, "failed": 0}
+
+            saga_id = task.get("saga_id")
+            if not saga_id:
+                raise RuntimeError("ImportTask for report is missing saga_id (report_id)")
+
+            try:
+                report_id = int(saga_id)
+            except (TypeError, ValueError):
+                raise RuntimeError(f"Invalid saga_id for report ImportTask: {saga_id}")
+
+            report = await get_platform_report(report_id)
+            if not report:
+                raise RuntimeError(f"Platform report not found for report_id={report_id}")
+
+            raw_content = report.get("raw_content") or ""
+            if not raw_content:
+                raise RuntimeError(f"Platform report {report_id} has empty content")
+
+            try:
+                reader = csv.DictReader(io.StringIO(raw_content))
+            except Exception as exc:
+                raise RuntimeError(f"Failed to parse report CSV: {exc}") from exc
+
+            total = 0
+            succeeded = 0
+            failed = 0
+
+            for row in reader:
+                total += 1
+                try:
+                    product = _map_report_row_to_standard_product(
+                        merchant_id=merchant_id,
+                        report_type=report.get("report_type") or connector,
+                        row=row,
+                    )
+                    await upsert_product_cache(
+                        merchant_id=merchant_id,
+                        platform="amazon",
+                        platform_product_id=product.id,
+                        product_data=product.dict(),
+                        ttl_seconds=3600,
+                    )
+                    succeeded += 1
+                except Exception as row_exc:
+                    failed += 1
+                    logger.error(
+                        "Failed to import platform report row",
+                        extra={
+                            "task_id": task_id,
+                            "merchant_id": merchant_id,
+                            "report_id": report_id,
+                            "error": str(row_exc),
+                        },
+                    )
+
+            duration = (datetime.utcnow() - started_at).total_seconds()
+            counts["total"] = total
+            counts["succeeded"] = succeeded
+            counts["failed"] = failed
+            counts["duration_sec"] = duration
+            counts["report_id"] = report_id
+            counts["report_type"] = report.get("report_type")
+
+            logger.info(
+                "Platform report import completed",
+                extra={
+                    "task_id": task_id,
+                    "merchant_id": merchant_id,
+                    "report_id": report_id,
+                    "report_type": report.get("report_type"),
+                    "rows_total": report.get("rows_total"),
+                    "total": total,
+                    "succeeded": succeeded,
+                    "failed": failed,
                     "duration_sec": duration,
                 },
             )

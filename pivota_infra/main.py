@@ -100,6 +100,7 @@ from routes.admin_usage_debug import router as admin_usage_debug_router
 from routes.agent_analytics import router as agent_analytics_router
 from routes.admin_settlement_batch import router as admin_settlement_batch_router  # Phase 6 - Settlement Batch Processing
 from routes.admin_platform_import import router as admin_platform_import_router  # EPIC-2 Platform Import
+from routes.admin_platform_report_import import router as admin_platform_report_import_router  # EPIC-6 Platform Report Import
 from routes.admin_connector_credentials import router as admin_connector_credentials_router  # EPIC-3 Connector credentials
 from routes.admin_shopify_order_poc import router as admin_shopify_order_poc_router  # EPIC-5 Shopify order POC
 from routes.stripe_connect_integration import router as stripe_connect_router  # Phase 6.1 - Stripe Connect Payouts
@@ -485,6 +486,7 @@ app.include_router(admin_usage_debug_router)  # Admin usage logs debug
 app.include_router(agent_analytics_router)  # Agent analytics (funnel, queries)
 app.include_router(admin_settlement_batch_router)  # Phase 6 - Settlement batch processing
 app.include_router(admin_platform_import_router)  # EPIC-2 Platform Import worker trigger
+app.include_router(admin_platform_report_import_router)  # EPIC-6 Platform Report Import upload
 app.include_router(admin_connector_credentials_router)  # EPIC-3 Connector credentials management
 app.include_router(admin_shopify_order_poc_router)  # EPIC-5 Shopify order POC
 app.include_router(stripe_connect_router)  # Phase 6.1 - Stripe Connect integration
