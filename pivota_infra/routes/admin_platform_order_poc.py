@@ -42,6 +42,7 @@ class PlatformOrderPOCRequest(BaseModel):
 class PlatformOrderPOCResponse(BaseModel):
     status: str
     platform: str
+    poc_mode: Optional[str] = None  # "shopify_live" | "amazon_stub" | "temu_stub" | future variants
     platform_order_id: Optional[str] = None
     platform_order_name: Optional[str] = None
     platform_order_url: Optional[str] = None
@@ -221,6 +222,7 @@ async def _place_shopify_order_from_cache(
     return PlatformOrderPOCResponse(
         status="success",
         platform="shopify",
+        poc_mode="shopify_live",
         platform_order_id=str(order.get("id")) if order.get("id") is not None else None,
         platform_order_name=order.get("name"),
         platform_order_url=f"https://{shop_domain}/admin/orders/{order.get('id')}" if order.get("id") else None,
@@ -327,6 +329,7 @@ async def _place_amazon_order_from_cache(
     return PlatformOrderPOCResponse(
         status="success",
         platform="amazon",
+        poc_mode="amazon_stub",
         platform_order_id=synthetic_id,
         platform_order_name=synthetic_name,
         platform_order_url=None,
@@ -438,6 +441,7 @@ async def _place_temu_order_from_cache(
     return PlatformOrderPOCResponse(
         status="success",
         platform="temu",
+        poc_mode="temu_stub",
         platform_order_id=synthetic_id,
         platform_order_name=synthetic_name,
         platform_order_url=None,
