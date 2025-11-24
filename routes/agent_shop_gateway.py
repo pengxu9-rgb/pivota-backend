@@ -110,6 +110,7 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
 
     return {
         "id": p.product_id or p.id,
+        "merchant_id": p.merchant_id,
         "title": p.title,
         "description": p.description or "",
         "price": p.price,
