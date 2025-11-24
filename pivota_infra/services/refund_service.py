@@ -371,7 +371,7 @@ class RefundService:
             error_message,
             psp_refund_id,
             idempotency_key,
-            metadata,
+            raw_payload as metadata,
             CASE 
                 WHEN status = 'completed' THEN 'success'
                 WHEN status = 'failed' THEN 'error'
