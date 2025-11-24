@@ -212,24 +212,30 @@ async def create_new_order(
             agent_id = order_request.metadata.get("agent_id")
         
         # Determine PSP first (before creating order)
-        psp_type = order_request.preferred_psp
-        if not psp_type:
-            psp_type = merchant.get("psp_type")
+        # Source of truth is merchant_psps; merchant_onboarding.psp_type is legacy.
+        psp_type = (order_request.preferred_psp or merchant.get("psp_type")) or None
         
         # Always get psp_id for PSP metrics tracking (even if psp_type is known)
         psp_id_value = None
         try:
-            # Query for psp_id based on psp_type or get first active PSP
+            psp_row = None
             if psp_type:
+                # Try to get a matching active PSP for the requested type
                 psp_row = await database.fetch_one(
                     """
                     SELECT provider, psp_id FROM merchant_psps
                     WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+                    ORDER BY connected_at DESC
                     LIMIT 1
                     """,
-                    {"merchant_id": order_request.merchant_id, "provider": psp_type}
+                    {
+                        "merchant_id": order_request.merchant_id,
+                        "provider": psp_type,
+                    },
                 )
-            else:
+
+            # If no explicit type or no active PSP for that type, fall back to first active PSP
+            if not psp_row:
                 psp_row = await database.fetch_one(
                     """
                     SELECT provider, psp_id FROM merchant_psps
@@ -237,25 +243,26 @@ async def create_new_order(
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
-                    {"merchant_id": order_request.merchant_id}
+                    {"merchant_id": order_request.merchant_id},
                 )
-            
+
             if psp_row:
-                psp_type = psp_row["provider"]  # Update psp_type if not set
+                psp_type = psp_row["provider"]
                 psp_id_value = psp_row["psp_id"]
             else:
-                logger.error(f"No active PSP found for merchant {order_request.merchant_id}")
+                logger.error(
+                    f"No active PSP found for merchant {order_request.merchant_id}"
+                )
                 raise HTTPException(
                     status_code=400,
-                    detail="No active PSP configuration found for this merchant"
+                    detail="No active PSP configuration found for this merchant",
                 )
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Failed to get PSP configuration: {e}")
             raise HTTPException(
-                status_code=500,
-                detail=f"Failed to determine PSP: {str(e)}"
+                status_code=500, detail=f"Failed to determine PSP: {str(e)}"
             )
         
         # Ensure psp_type is lowercase for consistency

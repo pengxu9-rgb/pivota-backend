@@ -40,39 +40,91 @@ class MultiPSPOrchestrator:
         self.psp_configs: List[PSPConfig] = []
         
     async def load_psp_configs(self):
-        """Load all PSP configurations for this merchant"""
-        merchant = await get_merchant_onboarding(self.merchant_id)
-        if not merchant:
-            raise ValueError(f"Merchant {self.merchant_id} not found")
-        
-        # Primary PSP
-        if merchant.get("psp_connected"):
-            primary_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-            if primary_key:
-                self.psp_configs.append(PSPConfig(
-                    psp_type=merchant.get("psp_type", "stripe"),
-                    api_key=primary_key,
-                    priority=1,
+        """
+        Load all PSP configurations for this merchant.
+
+        New behavior:
+        - Primary source of truth is merchant_psps (one row per PSP).
+        - merchant_onboarding.psp_* fields are kept only as a legacy fallback
+          for very old merchants that don't have merchant_psps records yet.
+        """
+        self.psp_configs = []
+
+        # 1) Preferred source: merchant_psps table
+        try:
+            psps = await database.fetch_all(
+                """
+                SELECT provider, api_key, account_id, status, connected_at
+                FROM merchant_psps
+                WHERE merchant_id = :merchant_id AND status = 'active'
+                ORDER BY connected_at ASC
+                """,
+                {"merchant_id": self.merchant_id},
+            )
+        except Exception as e:
+            logger.error(f"Failed to load merchant_psps for {self.merchant_id}: {e}")
+            psps = []
+
+        for idx, psp in enumerate(psps, start=1):
+            api_key = psp.get("api_key")
+            provider = (psp.get("provider") or "").lower()
+            if not api_key or not provider:
+                continue
+
+            # Stripe should generally be treated as primary if present
+            base_priority = idx
+            priority = 1 if provider == "stripe" else base_priority + 1
+
+            merchant_account = psp.get("account_id") if provider == "adyen" else None
+
+            self.psp_configs.append(
+                PSPConfig(
+                    psp_type=provider,
+                    api_key=api_key,
+                    priority=priority,
                     is_active=True,
-                    merchant_account=merchant.get("adyen_merchant_account")
-                ))
-        
-        # Backup PSPs (from merchant settings)
-        backup_psps = merchant.get("backup_psps", [])
-        for i, backup in enumerate(backup_psps, start=2):
-            if backup.get("is_active"):
-                self.psp_configs.append(PSPConfig(
-                    psp_type=backup["psp_type"],
-                    api_key=backup["api_key"],
-                    priority=i,
-                    is_active=True,
-                    merchant_account=backup.get("merchant_account")
-                ))
-        
-        # Sort by priority
+                    merchant_account=merchant_account,
+                )
+            )
+
+        # 2) Legacy fallback: use merchant_onboarding.psp_* fields
+        if not self.psp_configs:
+            merchant = await get_merchant_onboarding(self.merchant_id)
+            if not merchant:
+                raise ValueError(f"Merchant {self.merchant_id} not found")
+
+            if merchant.get("psp_connected"):
+                primary_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
+                if primary_key:
+                    self.psp_configs.append(
+                        PSPConfig(
+                            psp_type=merchant.get("psp_type", "stripe"),
+                            api_key=primary_key,
+                            priority=1,
+                            is_active=True,
+                            merchant_account=merchant.get("adyen_merchant_account"),
+                        )
+                    )
+
+            backup_psps = merchant.get("backup_psps", [])
+            for i, backup in enumerate(backup_psps, start=2):
+                if backup.get("is_active"):
+                    self.psp_configs.append(
+                        PSPConfig(
+                            psp_type=backup["psp_type"],
+                            api_key=backup["api_key"],
+                            priority=i,
+                            is_active=True,
+                            merchant_account=backup.get("merchant_account"),
+                        )
+                    )
+
+        # Sort by priority so failover order is deterministic
         self.psp_configs.sort(key=lambda x: x.priority)
-        
-        logger.info(f"Loaded {len(self.psp_configs)} PSP configs for merchant {self.merchant_id}")
+
+        logger.info(
+            f"Loaded {len(self.psp_configs)} PSP configs for merchant {self.merchant_id}"
+        )
     
     async def create_payment_intent(
         self,
@@ -218,6 +270,5 @@ async def create_payment_with_failover(
     """
     orchestrator = MultiPSPOrchestrator(merchant_id)
     return await orchestrator.create_payment_intent(amount, currency, metadata)
-
 
 
