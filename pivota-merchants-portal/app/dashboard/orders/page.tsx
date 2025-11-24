@@ -4,7 +4,6 @@ import { useState, useEffect } from 'react';
 import { ShoppingBag, Download, Search, Filter, Truck, DollarSign } from 'lucide-react';
 import { apiClient } from '@/lib/api-client';
 import RefundDialog from '@/components/RefundDialog';
-import RefundHistoryTimeline from '@/components/RefundHistoryTimeline';
 
 export default function OrdersPage() {
   const [orders, setOrders] = useState<any[]>([]);
@@ -26,8 +25,6 @@ export default function OrdersPage() {
   // Refund state
   const [showRefundDialog, setShowRefundDialog] = useState(false);
   const [refundHistory, setRefundHistory] = useState<any[]>([]);
-  const [refundSummary, setRefundSummary] = useState<any>(null);
-  const [orderSummary, setOrderSummary] = useState<any>(null);
 
   useEffect(() => {
     loadOrders();
@@ -100,13 +97,9 @@ export default function OrdersPage() {
     try {
       const result = await apiClient.getOrderRefunds(orderId);
       setRefundHistory(result.refunds || []);
-      setRefundSummary(result.refund_summary || null);
-      setOrderSummary(result.order_summary || null);
     } catch (error: any) {
       console.error('Failed to load refund history:', error);
       setRefundHistory([]);
-      setRefundSummary(null);
-      setOrderSummary(null);
     }
   };
   
@@ -515,33 +508,35 @@ export default function OrdersPage() {
                     )}
                   </div>
                   
-                  {/* Refund History Timeline */}
-                  {(refundHistory.length > 0 || orderSummary) && (
-                    <div className="mt-6">
-                      <h4 className="text-lg font-semibold text-gray-900 mb-4">Refund History</h4>
-                      {orderSummary && refundSummary ? (
-                        <RefundHistoryTimeline
-                          refunds={refundHistory}
-                          refundSummary={refundSummary}
-                          orderSummary={orderSummary}
-                          onRetryRefund={async (refundId) => {
-                            if (confirm('Retry this refund?')) {
-                              // TODO: Implement retry logic
-                              console.log('Retry refund:', refundId);
-                              alert('Retry functionality coming soon!');
-                            }
-                          }}
-                          onDownloadReceipt={async (refundId) => {
-                            // TODO: Implement receipt download
-                            console.log('Download receipt:', refundId);
-                            alert('Receipt download coming soon!');
-                          }}
-                        />
-                      ) : (
-                        <div className="text-center py-4 text-gray-500">
-                          No refunds processed yet
+                  {/* Refund History */}
+                  {refundHistory.length > 0 && (
+                    <div className="space-y-2">
+                      <h4 className="text-sm font-medium text-gray-700">Refund History</h4>
+                      {refundHistory.map((refund: any, idx: number) => (
+                        <div key={idx} className="bg-white border rounded p-2 text-sm">
+                          <div className="flex justify-between">
+                            <span className="font-medium">${parseFloat(refund.amount).toFixed(2)}</span>
+                            <span className={`text-xs px-2 py-0.5 rounded ${
+                              refund.status === 'completed' ? 'bg-green-100 text-green-800' :
+                              refund.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                              'bg-red-100 text-red-800'
+                            }`}>
+                              {refund.status}
+                            </span>
+                          </div>
+                          <div className="text-xs text-gray-500 mt-1">
+                            {refund.reason && <span>Reason: {refund.reason}</span>}
+                            <span className="ml-2">
+                              {new Date(refund.created_at).toLocaleString()}
+                            </span>
+                          </div>
+                          {refund.error_message && (
+                            <div className="text-xs text-red-600 mt-1">
+                              Error: {refund.error_message}
+                            </div>
+                          )}
                         </div>
-                      )}
+                      ))}
                     </div>
                   )}
                 </div>
