@@ -4,6 +4,8 @@ from sqlalchemy import (
 )
 import datetime
 import os
+from typing import Optional
+import asyncpg
 from config.settings import settings
 
 # PostgreSQL ONLY - No SQLite support
@@ -36,6 +38,18 @@ if not any(x in lower_url for x in ["postgresql", "postgres"]):
 # Initialize PostgreSQL connection
 # Note: databases library handles connection pooling automatically
 database = Database(DATABASE_URL)
+# Lazy asyncpg pool for legacy helpers
+_asyncpg_pool: Optional[asyncpg.pool.Pool] = None
+
+async def get_db_pool() -> asyncpg.pool.Pool:
+    """
+    Backward-compatible helper for routes that still expect an asyncpg pool.
+    Lazily creates a shared pool using the configured DATABASE_URL.
+    """
+    global _asyncpg_pool
+    if _asyncpg_pool is None:
+        _asyncpg_pool = await asyncpg.create_pool(DATABASE_URL)
+    return _asyncpg_pool
 
 metadata = MetaData()
 
