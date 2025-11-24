@@ -277,14 +277,47 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-# CORS middleware - Allow Lovable origins
+# CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
+dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
+
+if dev_mode:
+    raw_cors_origins = ["*"]
+else:
+    raw_cors_origins = getattr(settings, "cors_origins", None)
+    if not raw_cors_origins:
+        raw_cors_origins = getattr(settings, "allowed_origins", [])
+
+if isinstance(raw_cors_origins, str):
+    cors_origins = [origin.strip() for origin in raw_cors_origins.split(",") if origin.strip()]
+else:
+    cors_origins = list(raw_cors_origins or [])
+
+if not cors_origins and not dev_mode:
+    cors_origins = [
+        "https://agents.pivota.cc",
+        "https://agent.pivota.cc",
+        "https://developer.pivota.cc",
+        "https://employee.pivota.cc",
+        "https://merchant.pivota.cc",
+        "https://admin.pivota.cc",
+        "https://pivota-agents-portal.vercel.app",
+    ]
+
+if "*" in cors_origins:
+    allow_origin_regex = ".*"
+    allow_origins = []
+else:
+    allow_origin_regex = None
+    allow_origins = cors_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],                # 不使用白名单
-    allow_origin_regex=".*",        # 允许任意来源
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-Id"],
+    expose_headers=["X-Request-Id", "X-Total-Count"],
 )
 
 # Add usage logging middleware (tracks Agent API calls)
