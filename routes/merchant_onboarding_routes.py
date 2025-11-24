@@ -285,10 +285,12 @@ async def register_merchant(
                 print(f"⚠️ User already exists for {merchant_data.contact_email}, skipping user creation")
                 user_created = True  # Already exists
             else:
-                result = await database.execute(
+                # New Postgres schema: users.id is SERIAL INTEGER, so we let the
+                # database generate it instead of inserting a UUID.
+                await database.execute(
                     """
-                    INSERT INTO users (id, email, password_hash, full_name, role, active, merchant_id)
-                    VALUES (gen_random_uuid(), :email, :password_hash, :full_name, :role, :active, :merchant_id)
+                    INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
+                    VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
                     """,
                     {
                         "email": merchant_data.contact_email,
@@ -296,11 +298,10 @@ async def register_merchant(
                         "full_name": merchant_data.business_name,
                         "role": "merchant",
                         "active": True,
-                        "merchant_id": merchant_id
-                    }
+                        "merchant_id": merchant_id,
+                    },
                 )
                 print(f"✅ User account created for {merchant_data.contact_email} with merchant_id {merchant_id}")
-                print(f"Insert result: {result}")
                 user_created = True
                 
                 # Store password in response if auto-generated
@@ -1030,4 +1031,3 @@ async def restore_merchant(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to restore merchant: {str(e)}")
-

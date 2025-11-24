@@ -2,7 +2,7 @@
 MCP (Model Context Protocol) Management Routes
 Provides endpoints for managing MCP connections and interactions
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from utils.auth import get_current_user
@@ -249,14 +249,23 @@ async def get_mcp_analytics(
 async def sync_all_stores(
     current_user: dict = Depends(get_current_user)
 ):
-    """Trigger sync for all active stores"""
+    """
+    Trigger real product sync for all active stores (MCP view).
+
+    Uses the same universal sync pipeline as the merchant-facing Shopify/Wix
+    sync endpoints, instead of just updating last_sync timestamps.
+    """
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
+        # Lazy import to avoid circular imports at module load time
+        from routes.product_sync import SyncRequest, sync_products
+
         # Get all active stores
         stores_query = """
-            SELECT store_id, platform, name FROM merchant_stores 
+            SELECT store_id, platform, name, merchant_id 
+            FROM merchant_stores 
             WHERE status = 'active'
         """
         stores = await database.fetch_all(stores_query)
@@ -265,30 +274,81 @@ async def sync_all_stores(
             return {
                 "status": "success",
                 "message": "No active stores to sync",
-                "synced": 0
+                "synced": 0,
+                "results": [],
             }
-        
-        # Update last_sync for all stores (simulated sync)
-        update_query = """
-            UPDATE merchant_stores
-            SET last_sync = :last_sync
-            WHERE status = 'active'
-        """
-        
-        await database.execute(update_query, {"last_sync": datetime.now()})
-        
+
+        results = []
+        success_count = 0
+        warning_count = 0
+        error_count = 0
+
+        for store in stores:
+            store_id = store["store_id"]
+            platform = store["platform"]
+            merchant_id = store["merchant_id"]
+
+            try:
+                sync_request = SyncRequest(
+                    merchant_id=merchant_id,
+                    force_refresh=True,
+                    limit=250,
+                    platform=platform,
+                )
+
+                sync_result = await sync_products(
+                    request=sync_request,
+                    background_tasks=BackgroundTasks(),
+                    current_user=current_user,
+                )
+
+                status = sync_result.status
+                if status == "success":
+                    success_count += 1
+                elif status == "warning":
+                    warning_count += 1
+                else:
+                    error_count += 1
+
+                results.append(
+                    {
+                        "store_id": store_id,
+                        "platform": platform,
+                        "merchant_id": merchant_id,
+                        "status": status,
+                        "message": sync_result.message,
+                        "products_synced": sync_result.products_synced,
+                        "sync_time": sync_result.sync_time,
+                    }
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                error_count += 1
+                results.append(
+                    {
+                        "store_id": store_id,
+                        "platform": platform,
+                        "merchant_id": merchant_id,
+                        "status": "error",
+                        "message": str(e),
+                        "products_synced": 0,
+                        "sync_time": datetime.now().isoformat(),
+                    }
+                )
+
         return {
             "status": "success",
-            "message": f"Successfully initiated sync for {len(stores)} stores",
-            "synced": len(stores),
-            "stores": [
-                {
-                    "store_id": s["store_id"],
-                    "platform": s["platform"],
-                    "name": s["name"]
-                }
-                for s in stores
-            ]
+            "message": (
+                f"Sync completed: success={success_count}, "
+                f"warnings={warning_count}, errors={error_count}"
+            ),
+            "synced": success_count,
+            "summary": {
+                "success": success_count,
+                "warnings": warning_count,
+                "errors": error_count,
+                "total_stores": len(stores),
+            },
+            "results": results,
         }
     
     except Exception as e:
@@ -337,7 +397,6 @@ async def get_mcp_logs(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get MCP logs: {str(e)}")
-
 
 
 

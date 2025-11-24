@@ -6,19 +6,26 @@ High-level, LLM/Agent-friendly operations on top of the existing product/order A
 Currently supports:
 - find_products
 - get_product_detail
+- create_order       (proxied to Agent API)
+- submit_payment     (proxied to Agent API)
 
 Path: POST /agent/shop/v1/invoke
 """
 
+import os
 from typing import Any, Dict, List, Optional
 
 from datetime import datetime
 
+import httpx
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from services.product_query_service import get_products_hybrid
 from models.standard_product import StandardProduct
+
+AGENT_API_BASE = os.getenv("AGENT_API_BASE", "https://web-production-fedb.up.railway.app").rstrip("/")
+AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API_KEY") or os.getenv("AGENT_API_KEY")
 
 
 router = APIRouter(prefix="/agent/shop/v1", tags=["Shopping Gateway"])
@@ -45,6 +52,48 @@ class ProductRef(BaseModel):
 
 class GetProductDetailPayload(BaseModel):
     product: ProductRef
+
+
+class OrderItem(BaseModel):
+    merchant_id: str
+    product_id: str
+    product_title: str
+    quantity: int
+    unit_price: float
+    subtotal: float
+
+
+class ShippingAddress(BaseModel):
+    name: str
+    address_line1: str
+    address_line2: Optional[str] = ""
+    city: str
+    country: str
+    postal_code: str
+    phone: Optional[str] = None
+
+
+class OrderPayloadBody(BaseModel):
+    merchant_id: str
+    customer_email: str
+    items: List[OrderItem]
+    shipping_address: ShippingAddress
+    customer_notes: Optional[str] = None
+
+
+class CreateOrderPayload(BaseModel):
+    order: OrderPayloadBody
+
+
+class PaymentPayloadBody(BaseModel):
+    order_id: str
+    expected_amount: float
+    currency: str
+    payment_method_hint: Optional[str] = None
+
+
+class SubmitPaymentPayload(BaseModel):
+    payment: PaymentPayloadBody
 
 
 class ShopGatewayRequest(BaseModel):
@@ -233,6 +282,83 @@ async def _handle_get_product_detail(
     }
 
 
+async def _proxy_agent_api(method: str, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
+    """Forward a request to the Agent API using a server-side API key."""
+    if not AGENT_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="SHOP_GATEWAY_AGENT_API_KEY / PIVOTA_API_KEY is not configured for agent payments",
+        )
+
+    url = f"{AGENT_API_BASE}{path}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": AGENT_API_KEY,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.request(method, url, json=json_body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream agent API error: {exc}") from exc
+
+    if resp.status_code >= 400:
+        # Propagate upstream error detail when available
+        try:
+            err_json = resp.json()
+        except Exception:
+            err_json = {"detail": resp.text}
+        raise HTTPException(status_code=resp.status_code, detail=err_json)
+
+    try:
+        return resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Invalid JSON from agent API")
+
+
+async def _handle_create_order(order: OrderPayloadBody) -> Dict[str, Any]:
+    """Proxy create_order to Agent API (/agent/v1/orders/create)."""
+    body = {
+        "merchant_id": order.merchant_id,
+        "customer_email": order.customer_email,
+        "items": [
+            {
+                "merchant_id": item.merchant_id,
+                "product_id": item.product_id,
+                "product_title": item.product_title,
+                "quantity": item.quantity,
+                "unit_price": item.unit_price,
+                "subtotal": item.subtotal,
+            }
+            for item in order.items
+        ],
+        "shipping_address": {
+            "recipient_name": order.shipping_address.name,
+            "address_line1": order.shipping_address.address_line1,
+            "address_line2": order.shipping_address.address_line2 or "",
+            "city": order.shipping_address.city,
+            "country": order.shipping_address.country,
+            "postal_code": order.shipping_address.postal_code,
+            "phone": order.shipping_address.phone or "",
+        },
+        "customer_notes": order.customer_notes or "",
+    }
+
+    return await _proxy_agent_api("POST", "/agent/v1/orders/create", body)
+
+
+async def _handle_submit_payment(payment: PaymentPayloadBody) -> Dict[str, Any]:
+    """Proxy submit_payment to Agent API (/agent/v1/payments)."""
+    body = {
+        "order_id": payment.order_id,
+        "payment_method": payment.payment_method_hint or "card",
+        "total_amount": payment.expected_amount,
+        "currency": payment.currency,
+    }
+
+    return await _proxy_agent_api("POST", "/agent/v1/payments", body)
+
+
 @router.post("/invoke")
 async def invoke_shop_operation(
     request: ShopGatewayRequest,
@@ -244,6 +370,8 @@ async def invoke_shop_operation(
     Supported operations:
     - find_products
     - get_product_detail
+    - create_order       (demo-only)
+    - submit_payment     (demo-only)
     """
     operation = (request.operation or "").strip()
 
@@ -255,10 +383,16 @@ async def invoke_shop_operation(
         payload = GetProductDetailPayload(**request.payload)
         return await _handle_get_product_detail(payload.product, background_tasks)
 
+    if operation == "create_order":
+        payload = CreateOrderPayload(**request.payload)
+        return await _handle_create_order(payload.order)
+
+    if operation == "submit_payment":
+        payload = SubmitPaymentPayload(**request.payload)
+        return await _handle_submit_payment(payload.payment)
+
     # For now we only support product operations here.
     raise HTTPException(
         status_code=400,
         detail=f"Unsupported operation: {operation}",
     )
-
-
