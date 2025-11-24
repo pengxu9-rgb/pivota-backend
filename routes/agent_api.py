@@ -1,0 +1,1055 @@
+"""
+Agent 专用 API 路由
+为 AI Agent 提供优化的电商接口
+"""
+
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from decimal import Decimal
+from datetime import datetime
+import json
+import time
+
+from models.order import CreateOrderRequest, OrderResponse
+from models.standard_product import StandardProduct
+from db.database import database
+from db.merchant_onboarding import get_merchant_onboarding
+from db.products import get_cached_products
+from db.orders import get_order, get_orders_by_merchant, update_payment_info
+from routes.refund_api import process_refund
+from routes.order_routes import cancel_order as admin_cancel_order
+from routes.fulfillment_api import track_order_fulfillment
+from routes.order_routes import create_new_order
+from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
+from utils.logger import logger
+
+
+router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
+    """Verify merchant exists and is not deleted"""
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    
+    if merchant.get("status") == "deleted":
+        raise HTTPException(
+            status_code=403, 
+            detail="Merchant account has been deactivated"
+        )
+    
+    return merchant
+
+
+# ============================================================================
+# 产品搜索和浏览
+# ============================================================================
+
+@router.get("/products/search")
+async def agent_search_products(
+    merchant_id: Optional[str] = None,  # Now optional for cross-merchant search
+    merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
+    query: Optional[str] = None,
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    in_stock_only: bool = True,
+    limit: int = Query(default=20, le=100),
+    offset: int = Query(default=0, ge=0),
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    智能产品搜索 - Cross-Merchant Support
+    
+    特点：
+    - ✨ NEW: Cross-merchant search (omit merchant_id to search all)
+    - 支持自然语言查询
+    - 自动过滤库存
+    - 价格区间筛选
+    - 分页支持
+    - 相关度评分
+    """
+    try:
+        # Determine which merchants to search
+        merchants_to_search = []
+        
+        if merchant_id:
+            # Single merchant search (backward compatible)
+            if not context.can_access_merchant(merchant_id):
+                raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+            merchants_to_search = [merchant_id]
+        elif merchant_ids:
+            # Multiple specific merchants
+            for mid in merchant_ids:
+                if not context.can_access_merchant(mid):
+                    raise HTTPException(status_code=403, detail=f"Not authorized for merchant {mid}")
+            merchants_to_search = merchant_ids
+        else:
+            # Search ALL merchants (cross-merchant search)
+            # Get all active merchants from database
+            query_merchants = """
+                SELECT merchant_id, business_name FROM merchant_onboarding 
+                WHERE status NOT IN ('deleted', 'rejected') 
+                AND psp_connected = true
+                LIMIT 100
+            """
+            merchant_rows = await database.fetch_all(query_merchants)
+            merchants_to_search = [row["merchant_id"] for row in merchant_rows]
+        
+        # Collect products from all target merchants
+        all_products = []
+        
+        for mid in merchants_to_search:
+            try:
+                # Verify merchant is active
+                merchant = await verify_merchant_active(mid)
+                
+                # Get cached products
+                cached_products = await get_cached_products(mid)
+                
+                if cached_products and cached_products.get("products"):
+                    # Add merchant info to each product
+                    for product in cached_products["products"]:
+                        product["merchant_id"] = mid
+                        product["merchant_name"] = merchant.get("business_name", "Unknown")
+                        all_products.append(product)
+            except Exception as e:
+                # Log but continue with other merchants
+                logger.warning(f"Failed to get products from {mid}: {e}")
+                continue
+        
+        # Apply filters and calculate relevance scores
+        filtered_products = []
+        
+        for product in all_products:
+            # 库存过滤
+            if in_stock_only and not product.get("in_stock", True):
+                continue
+            
+            # 价格过滤
+            price = float(product.get("price", 0))
+            if min_price and price < min_price:
+                continue
+            if max_price and price > max_price:
+                continue
+            
+            # 类别过滤
+            if category:
+                product_category = product.get("category", "").lower()
+                if category.lower() not in product_category:
+                    continue
+            
+            # 搜索查询 + 相关度评分
+            relevance_score = 1.0
+            if query:
+                query_lower = query.lower()
+                title = product.get("title", "").lower()
+                description = product.get("description", "").lower()
+                
+                # Calculate relevance
+                if query_lower in title:
+                    # Exact match in title = high score
+                    relevance_score = 1.0 if query_lower == title else 0.9
+                elif query_lower in description:
+                    relevance_score = 0.7
+                else:
+                    # Check for partial word matches
+                    query_words = query_lower.split()
+                    matches = sum(1 for word in query_words if word in title or word in description)
+                    if matches > 0:
+                        relevance_score = 0.5 + (matches / len(query_words)) * 0.3
+                    else:
+                        continue  # No match, skip product
+                
+                product["relevance_score"] = relevance_score
+            else:
+                product["relevance_score"] = 1.0
+            
+            filtered_products.append(product)
+        
+        # Sort by relevance score (highest first)
+        filtered_products.sort(key=lambda p: p.get("relevance_score", 0), reverse=True)
+        
+        # Pagination
+        total = len(filtered_products)
+        paginated_products = filtered_products[offset:offset + limit]
+        
+        # Record request
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=merchant_id or "cross_merchant_search"
+        )
+        
+        return {
+            "status": "success",
+            "products": paginated_products,
+            "pagination": {
+                "total_count": total,
+                "limit": limit,
+                "offset": offset,
+                "page": (offset // limit) + 1 if limit > 0 else 1,
+                "total_pages": (total + limit - 1) // limit if limit > 0 else 1,
+                "has_more": offset + limit < total
+            },
+            "search_context": {
+                "merchant_id": merchant_id,
+                "merchant_ids": merchant_ids,
+                "merchants_searched": len(merchants_to_search),
+                "cross_merchant_search": merchant_id is None and not merchant_ids
+            },
+            "filters_applied": {
+                "query": query,
+                "category": category,
+                "min_price": min_price,
+                "max_price": max_price,
+                "in_stock_only": in_stock_only
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent product search error: {e}")
+        await log_agent_request(
+            context=context,
+            status_code=500,
+            merchant_id=merchant_id,
+            error_message=str(e)
+        )
+        raise HTTPException(status_code=500, detail="Search failed")
+
+
+@router.get("/products/{merchant_id}/{product_id}")
+async def agent_get_product(
+    merchant_id: str,
+    product_id: str,
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """获取单个产品详情"""
+    try:
+        # 验证商户访问权限
+        if not context.can_access_merchant(merchant_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+        
+        # Special handling for Platform Orders products (SKU-xxx format)
+        # These are from Amazon/Temu and don't exist in Shopify/Wix cache
+        if product_id.startswith('SKU-'):
+            logger.info(f"Returning mock product for Platform Order SKU: {product_id}")
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id
+            )
+            return {
+                "status": "success",
+                "product": {
+                    "id": product_id,
+                    "title": f"Platform Order Product {product_id}",
+                    "price": 10.00,  # Default price, actual price is in order data
+                    "currency": "USD",
+                    "platform": "shopify",  # Mock as shopify for ACP compatibility
+                    "stock": 999,
+                    "available": True,
+                    "variants": [{
+                        "id": product_id,
+                        "title": "Default",
+                        "price": 10.00,
+                        "sku": product_id,
+                        "available": True
+                    }]
+                }
+            }
+        
+        # 从缓存获取产品
+        cached_products = await get_cached_products(merchant_id)
+        
+        if cached_products and cached_products.get("products"):
+            for product in cached_products["products"]:
+                if str(product.get("id")) == str(product_id):
+                    # 记录请求
+                    background_tasks.add_task(
+                        log_agent_request,
+                        context=context,
+                        status_code=200,
+                        merchant_id=merchant_id
+                    )
+                    return {
+                        "status": "success",
+                        "product": product
+                    }
+        
+        raise HTTPException(status_code=404, detail="Product not found")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent get product error: {e}")
+        await log_agent_request(
+            context=context,
+            status_code=500,
+            merchant_id=merchant_id,
+            error_message=str(e)
+        )
+        raise HTTPException(status_code=500, detail="Failed to get product")
+
+
+# ============================================================================
+# 购物车验证和价格计算
+# ============================================================================
+
+@router.post("/cart/validate")
+async def agent_validate_cart(
+    merchant_id: str,
+    items: List[Dict[str, Any]],
+    shipping_country: str = "US",
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    验证购物车并计算价格
+    
+    功能：
+    - 库存验证
+    - 价格更新
+    - 运费计算
+    - 税费估算
+    """
+    try:
+        # 验证商户访问权限
+        if not context.can_access_merchant(merchant_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+        
+        # 获取商户信息并验证状态（检查是否被软删除）
+        merchant = await verify_merchant_active(merchant_id)
+        
+        # 获取产品信息
+        cached_products = await get_cached_products(merchant_id)
+        product_map = {}
+        
+        if cached_products and cached_products.get("products"):
+            for product in cached_products["products"]:
+                product_map[str(product.get("id"))] = product
+        
+        # 验证每个商品
+        validated_items = []
+        validation_errors = []
+        subtotal = Decimal("0")
+        
+        for item in items:
+            product_id = str(item.get("product_id"))
+            quantity = item.get("quantity", 1)
+            
+            if product_id not in product_map:
+                validation_errors.append({
+                    "product_id": product_id,
+                    "error": "Product not found"
+                })
+                continue
+            
+            product = product_map[product_id]
+            
+            # 检查库存
+            if not product.get("in_stock", True):
+                validation_errors.append({
+                    "product_id": product_id,
+                    "error": "Out of stock"
+                })
+                continue
+            
+            # 计算价格
+            unit_price = Decimal(str(product.get("price", 0)))
+            item_subtotal = unit_price * quantity
+            subtotal += item_subtotal
+            
+            validated_items.append({
+                "product_id": product_id,
+                "product_title": product.get("title"),
+                "variant_id": product.get("variant_id"),
+                "sku": product.get("sku"),
+                "quantity": quantity,
+                "unit_price": str(unit_price),
+                "subtotal": str(item_subtotal),
+                "in_stock": True
+            })
+        
+        # 计算运费（简单示例）
+        shipping_fee = Decimal("10.00") if shipping_country == "US" else Decimal("25.00")
+        if subtotal > 100:
+            shipping_fee = Decimal("0")  # 免运费
+        
+        # 计算税费（简单示例）
+        tax_rate = Decimal("0.08") if shipping_country == "US" else Decimal("0.15")
+        tax = subtotal * tax_rate
+        
+        # 总计
+        total = subtotal + shipping_fee + tax
+        
+        # 记录请求
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=merchant_id
+        )
+        
+        return {
+            "status": "success",
+            "valid": len(validation_errors) == 0,
+            "items": validated_items,
+            "errors": validation_errors,
+            "pricing": {
+                "subtotal": str(subtotal),
+                "shipping_fee": str(shipping_fee),
+                "tax": str(tax),
+                "total": str(total),
+                "currency": "USD"
+            },
+            "shipping": {
+                "country": shipping_country,
+                "free_shipping_threshold": 100,
+                "estimated_delivery": "3-5 business days" if shipping_country == "US" else "7-14 business days"
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Cart validation error: {e}")
+        await log_agent_request(
+            context=context,
+            status_code=500,
+            merchant_id=merchant_id,
+            error_message=str(e)
+        )
+        raise HTTPException(status_code=500, detail="Cart validation failed")
+
+
+# ============================================================================
+# 订单管理
+# ============================================================================
+
+@router.post("/orders/create")
+async def agent_create_order(
+    order_request: CreateOrderRequest,
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    创建订单（代理标准订单创建流程）
+    
+    自动添加 Agent 追踪信息
+    集成 Agent Governance 治理检查
+    """
+    # STEP 1: Governance validation (before main logic)
+    from services.agent_governance import agent_governance
+    await agent_governance.validate_request(context.agent_id)
+    
+    start_time = time.time()
+    success = False
+    
+    try:
+        # 验证商户访问权限
+        if not context.can_access_merchant(order_request.merchant_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+        
+        # 添加 Agent 元数据
+        if not order_request.metadata:
+            order_request.metadata = {}
+        
+        order_request.metadata.update({
+            "agent_id": context.agent_id,
+            "agent_name": context.agent_name,
+            "created_via": "agent_api"
+        })
+        
+        # 设置 agent session ID
+        if not order_request.agent_session_id:
+            order_request.agent_session_id = f"{context.agent_id}_{int(datetime.utcnow().timestamp())}"
+        
+        # 调用标准订单创建
+        from routes.order_routes import create_new_order
+        order_response = await create_new_order(order_request, background_tasks)
+        
+        # 计算订单总额
+        order_amount = float(order_response.total)
+        
+        # 记录成功请求
+        await log_agent_request(
+            context=context,
+            status_code=200,
+            merchant_id=order_request.merchant_id,
+            order_id=order_response.order_id,
+            order_amount=order_amount
+        )
+        
+        # STEP 3: Record governance metrics (success)
+        success = True
+        
+        # 返回简化的响应给 Agent
+        response = {
+            "status": "success",
+            "order_id": order_response.order_id,
+            "total": str(order_response.total),  # 保留兼容 (deprecated)
+            "total_amount": float(order_response.total),  # 新增：标准字段
+            "currency": order_response.currency,
+            "payment": {
+                "client_secret": order_response.client_secret,
+                "payment_intent_id": order_response.payment_intent_id,
+                "instructions": "Use client_secret for Stripe payment confirmation"
+            },
+            "tracking": {
+                "agent_session_id": order_request.agent_session_id,
+                "created_at": order_response.created_at.isoformat()
+            }
+        }
+        
+        return response
+        
+    except HTTPException as e:
+        success = False
+        await log_agent_request(
+            context=context,
+            status_code=e.status_code,
+            merchant_id=order_request.merchant_id,
+            error_message=e.detail
+        )
+        raise
+    except Exception as e:
+        success = False
+        logger.error(f"Agent order creation error: {e}")
+        await log_agent_request(
+            context=context,
+            status_code=500,
+            merchant_id=order_request.merchant_id,
+            error_message=str(e)
+        )
+        raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
+    finally:
+        # STEP 3: Record governance metrics (always executed)
+        latency_ms = int((time.time() - start_time) * 1000)
+        await agent_governance.record_response(
+            agent_id=context.agent_id,
+            latency_ms=latency_ms,
+            success=success
+        )
+
+
+@router.post("/orders/{order_id}/confirm-payment")
+async def agent_confirm_payment(
+    order_id: str,
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """确认支付并触发 Shopify 订单创建（Agent 调用）"""
+    try:
+        from routes.order_routes import mark_order_paid, create_shopify_order, log_order_event, get_order
+        from routes.merchant_onboarding_routes import get_merchant_onboarding
+        
+        # 获取订单
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        # 验证访问权限
+        if not context.can_access_merchant(order["merchant_id"]):
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        
+        # 检查是否已支付
+        if order.get("payment_status") == "paid":
+            return {"status": "success", "message": "Order already paid"}
+        
+        # 标记订单已支付
+        await mark_order_paid(order_id)
+        
+        # [Phase 6.2] 自动触发 commission 计算
+        if order.get("agent_id"):
+            async def trigger_commission():
+                try:
+                    from services.order_commission_service import OrderCommissionService
+                    from db.database import database
+                    service = OrderCommissionService(database)
+                    await service.calculate_commission_for_order(order_id)
+                    logger.info(f"✅ Commission auto-calculated for order {order_id}")
+                except Exception as e:
+                    logger.error(f"Commission auto-calculation failed for {order_id}: {e}")
+            
+            background_tasks.add_task(trigger_commission)
+        
+        # 记录支付成功事件
+        await log_order_event(
+            event_type="payment_succeeded",
+            order_id=order_id,
+            merchant_id=order["merchant_id"],
+            metadata={
+                "payment_intent_id": order.get("payment_intent_id"),
+                "amount": float(order["total"]),
+                "currency": order["currency"],
+                "confirmed_by": "agent"
+            }
+        )
+        
+        # 获取商户信息用于 Shopify 同步
+        merchant = await get_merchant_onboarding(order["merchant_id"])
+        
+        # 后台任务：创建 Shopify 订单（直接调用，避免嵌套异步）
+        from services.merchant_store_service import get_primary_store
+        from routes.order_routes import create_shopify_order
+        
+        async def create_shopify_order_task():
+            """创建 Shopify 订单通知商户发货"""
+            try:
+                logger.info(f"[Background] Starting Shopify order creation for {order_id}")
+                
+                # 获取主店铺信息以决定是否同步到 Shopify
+                store_info = await get_primary_store(order["merchant_id"])
+                logger.info(f"[Background] Store info: platform={store_info.get('platform') if store_info else 'None'}, has_token={bool(store_info.get('api_key')) if store_info else False}")
+                
+                if not store_info:
+                    logger.warning(f"[Background] No store info found for merchant {order['merchant_id']}")
+                    return
+                    
+                if store_info.get("platform") != "shopify":
+                    logger.info(f"[Background] Merchant not connected to Shopify, skipping order sync")
+                    return
+                
+                logger.info(f"[Background] Calling create_shopify_order for {order_id}")
+                success = await create_shopify_order(order_id)
+                
+                if success:
+                    logger.info(f"[Background] ✅ Shopify order created successfully for {order_id}")
+                else:
+                    logger.error(f"[Background] ❌ Failed to create Shopify order for {order_id}")
+                    
+            except Exception as e:
+                logger.error(f"[Background] Error in Shopify order creation task: {type(e).__name__}: {e}", exc_info=True)
+        
+        background_tasks.add_task(create_shopify_order_task)
+        
+        # 记录请求
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=order["merchant_id"],
+            order_id=order_id
+        )
+        
+        return {
+            "status": "success",
+            "message": "Payment confirmed, Shopify order creation initiated",
+            "order_id": order_id,
+            "payment_intent_id": order.get("payment_intent_id"),
+            "shopify_sync": "initiated" if merchant and True else "not_configured"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent payment confirmation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Payment confirmation failed: {str(e)}")
+
+
+@router.get("/orders/{order_id}")
+async def agent_get_order(
+    order_id: str,
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """获取订单状态"""
+    try:
+        # 获取订单
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        # 验证商户访问权限
+        if not context.can_access_merchant(order["merchant_id"]):
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        
+        # 记录请求
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=order["merchant_id"],
+            order_id=order_id
+        )
+        
+        # 返回订单信息（包含必要字段用于 Shopify 同步）
+        return {
+            "status": "success",
+            "order": {
+                "order_id": order["order_id"],
+                "merchant_id": order["merchant_id"],
+                "customer_email": order["customer_email"],
+                "items": order.get("items", []),
+                "shipping_address": order.get("shipping_address"),
+                "status": order["status"],
+                "payment_status": order["payment_status"],
+                "fulfillment_status": order.get("fulfillment_status"),
+                "total": str(order["total"]),
+                "currency": order["currency"],
+                "shopify_order_id": order.get("shopify_order_id"),
+                "tracking_number": order.get("tracking_number"),
+                "created_at": order["created_at"],
+                "updated_at": order.get("updated_at"),
+                "confirmed_at": order.get("confirmed_at")
+            }
+        }
+        
+    except HTTPException as e:
+        await log_agent_request(
+            context=context,
+            status_code=e.status_code,
+            error_message=e.detail
+        )
+        raise
+    except Exception as e:
+        logger.error(f"Agent get order error: {e}")
+        await log_agent_request(
+            context=context,
+            status_code=500,
+            error_message=str(e)
+        )
+        raise HTTPException(status_code=500, detail="Failed to get order")
+
+
+@router.get("/orders")
+async def agent_list_orders(
+    merchant_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(default=20, le=100),
+    offset: int = Query(default=0, ge=0),
+    context: AgentContext = Depends(get_agent_context),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    列出 Agent 创建的订单
+    
+    可以按商户或状态过滤
+    """
+    try:
+        # 如果指定了商户，验证访问权限
+        if merchant_id and not context.can_access_merchant(merchant_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+        
+        # 构建查询 - use agent_id column directly
+        query = f"""
+            SELECT * FROM orders 
+            WHERE agent_id = :agent_id
+        """
+        params = {"agent_id": context.agent_id}
+        
+        if merchant_id:
+            query += " AND merchant_id = :merchant_id"
+            params["merchant_id"] = merchant_id
+        
+        if status:
+            query += " AND status = :status"
+            params["status"] = status
+        
+        query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+        params["limit"] = limit
+        params["offset"] = offset
+        
+        # 执行查询
+        from db.database import database
+        orders = await database.fetch_all(query, params)
+        
+        # 记录请求
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=merchant_id
+        )
+        
+        return {
+            "status": "success",
+            "total": len(orders),
+            "orders": [
+                {
+                    "order_id": order["order_id"],
+                    "merchant_id": order["merchant_id"],
+                    "status": order["status"],
+                    "payment_status": order["payment_status"],
+                    "total": str(order["total"]),
+                    "created_at": order["created_at"]
+                }
+                for order in orders
+            ]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent list orders error: {e}")
+        await log_agent_request(
+            context=context,
+            status_code=500,
+            error_message=str(e)
+        )
+        raise HTTPException(status_code=500, detail="Failed to list orders")
+
+
+# ----------------------------------------------------------------------------
+# Order actions for Agents (refund, cancel, track)
+# ----------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/refund")
+async def agent_refund_order(
+    order_id: str,
+    background_tasks: BackgroundTasks,
+    context: AgentContext = Depends(get_agent_context)
+):
+    """Proxy refund to admin refund API, but enforce agent ownership."""
+    try:
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order.get("agent_id") != context.agent_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # Build refund request (full refund)
+        class _Req(BaseModel):
+            order_id: str
+            amount: Optional[float] = None
+            reason: Optional[str] = None
+            restore_inventory: bool = True
+
+        req = _Req(order_id=order_id, amount=None, reason="Agent requested refund", restore_inventory=True)
+        result = await process_refund(order_id, req, background_tasks, current_user={"role": "admin"})
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent refund error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to refund order")
+
+
+@router.post("/orders/{order_id}/cancel")
+async def agent_cancel_order(
+    order_id: str,
+    context: AgentContext = Depends(get_agent_context)
+):
+    """Cancel an order owned by the agent (defensive - no optional columns)."""
+    try:
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order.get("agent_id") != context.agent_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # Block cancel if clearly paid/succeeded
+        paid_status = str(order.get("payment_status") or "").lower()
+        if paid_status in ("paid", "succeeded", "completed"):
+            raise HTTPException(status_code=400, detail="Cannot cancel a paid/completed order. Please refund instead.")
+
+        # If already cancelled, treat as idempotent success
+        current_status = str(order.get("status") or "")
+        if current_status.lower() == "cancelled":
+            return {"status": "success", "order_id": order_id, "message": "Order already cancelled"}
+
+        # Defensive update: only set status to avoid missing columns like cancelled_at
+        from db.database import database
+        try:
+            await database.execute(
+                """
+                UPDATE orders
+                SET status = 'cancelled'
+                WHERE order_id = :order_id
+                """,
+                {"order_id": order_id}
+            )
+        except Exception as e:
+            logger.error(f"Cancel update error: {e}")
+            raise HTTPException(status_code=500, detail="Cancel update failed")
+
+        # Some DB drivers return rowcount via different means; fetch again to verify
+        after = await get_order(order_id)
+        if not after:
+            raise HTTPException(status_code=500, detail="Cancel verification failed")
+        if str(after.get("status") or "").lower() != "cancelled":
+            raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+        return {"status": "success", "order_id": order_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent cancel error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+
+@router.get("/orders/{order_id}/track")
+async def agent_track_order(
+    order_id: str,
+    context: AgentContext = Depends(get_agent_context)
+):
+    """Return fulfillment tracking info for the order if owned by agent."""
+    try:
+        order = await get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order.get("agent_id") != context.agent_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        tracking = await track_order_fulfillment(order_id, context)
+        return tracking
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent track error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get tracking info")
+
+
+# ============================================================================
+# Agent 分析
+# ============================================================================
+
+@router.get("/analytics/summary")
+async def agent_get_analytics(
+    days: int = Query(default=30, le=365),
+    context: AgentContext = Depends(get_agent_context)
+):
+    """
+    获取 Agent 自己的分析数据
+    
+    包括：
+    - 请求统计
+    - 订单转化率
+    - GMV
+    - 热门商户
+    """
+    try:
+        from datetime import timedelta
+        from db.agents import get_agent_analytics
+        
+        start_date = datetime.utcnow() - timedelta(days=days)
+        analytics = await get_agent_analytics(
+            context.agent_id,
+            start_date=start_date
+        )
+        
+        return {
+            "status": "success",
+            "agent_id": context.agent_id,
+            "agent_name": context.agent_name,
+            "analytics": analytics
+        }
+        
+    except Exception as e:
+        logger.error(f"Agent analytics error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get analytics")
+
+
+# ============================================================================
+# 佣金查询
+# ============================================================================
+
+@router.get("/commissions")
+async def get_agent_commissions(
+    limit: int = Query(50, ge=1, le=200, description="返回数量"),
+    offset: int = Query(0, ge=0, description="偏移量"),
+    status: Optional[str] = Query(None, description="状态过滤: pending, paid"),
+    context: AgentContext = Depends(get_agent_context)
+):
+    """
+    获取 Agent 的佣金列表
+    
+    返回所有与此 Agent 相关的订单佣金
+    """
+    try:
+        # 构建查询条件
+        conditions = ["agent_id = :agent_id"]
+        params = {
+            "agent_id": context.agent_id,
+            "limit": limit,
+            "offset": offset
+        }
+        
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        
+        where_clause = " AND ".join(conditions)
+        
+        # 获取佣金总数
+        count_query = f"""
+            SELECT COUNT(*) as total
+            FROM commissions
+            WHERE {where_clause}
+        """
+        count_result = await database.fetch_one(count_query, params)
+        total = count_result["total"] if count_result else 0
+        
+        # 获取佣金列表
+        commissions_query = f"""
+            SELECT 
+                commission_id,
+                order_id,
+                merchant_id,
+                amount,
+                rate,
+                status,
+                matched,
+                created_at,
+                updated_at
+            FROM commissions
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """
+        
+        rows = await database.fetch_all(commissions_query, params)
+        commissions = [dict(row) for row in rows]
+        
+        # 格式化日期
+        for comm in commissions:
+            if comm.get('created_at'):
+                comm['created_at'] = comm['created_at'].isoformat() if hasattr(comm['created_at'], 'isoformat') else str(comm['created_at'])
+            if comm.get('updated_at'):
+                comm['updated_at'] = comm['updated_at'].isoformat() if hasattr(comm['updated_at'], 'isoformat') else str(comm['updated_at'])
+        
+        # 计算摘要
+        summary_query = """
+            SELECT 
+                COUNT(*) as total_count,
+                COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END), 0) as pending_amount,
+                COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) as paid_amount,
+                COALESCE(SUM(amount), 0) as total_amount
+            FROM commissions
+            WHERE agent_id = :agent_id
+        """
+        summary_result = await database.fetch_one(summary_query, {"agent_id": context.agent_id})
+        
+        return {
+            "status": "success",
+            "commissions": commissions,
+            "summary": {
+                "total_count": summary_result["total_count"] if summary_result else 0,
+                "pending_amount": float(summary_result["pending_amount"]) if summary_result else 0.0,
+                "paid_amount": float(summary_result["paid_amount"]) if summary_result else 0.0,
+                "total_amount": float(summary_result["total_amount"]) if summary_result else 0.0
+            },
+            "pagination": {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": (offset + limit) < total
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Get commissions error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get commissions: {str(e)}")
