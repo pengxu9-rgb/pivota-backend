@@ -191,6 +191,7 @@ if DEBUG_MODE:
 from routes.simulate_payments import router as simulate_payments_router
 from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
+from routes.agent_shop_gateway import router as agent_shop_gateway_router
 
 # Service routers (only include what exists)
 try:
@@ -468,6 +469,7 @@ app.include_router(product_monitoring_router)  # Product sync monitoring and met
 app.include_router(order_router)  # Order processing
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
+app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
 app.include_router(refund_api_router)  # Refund processing
