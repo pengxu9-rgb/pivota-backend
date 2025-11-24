@@ -1056,9 +1056,6 @@ async def config_check():
         "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
     }
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
 # Deploy trigger: 1761041007
 
 @app.get("/health")
@@ -1116,9 +1113,6 @@ async def config_check():
         },
         "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
     }
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
 
 @app.get("/health")
 async def health():
