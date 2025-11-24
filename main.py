@@ -956,6 +956,15 @@ async def startup():
         logger.info("🚀 Application startup complete!")
         logger.info("=" * 80)
         
+    except TimeoutError as e:
+        # Database connection timeout – log but allow app to start
+        logger.error("=" * 80)
+        logger.error("❌ CRITICAL ERROR during startup: database connection timed out")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        logger.error(f"❌ Error details: {str(e)}")
+        logger.error("=" * 80)
+        logger.error("🟡 Continuing startup with database in DISCONNECTED state")
+        logger.error("🟡 Most DB-backed endpoints will fail until the database is reachable again")
     except Exception as e:
         logger.error("=" * 80)
         logger.error(f"❌ CRITICAL ERROR during startup: {e}")
