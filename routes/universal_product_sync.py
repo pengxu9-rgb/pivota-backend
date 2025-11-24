@@ -20,6 +20,9 @@ class UniversalSyncRequest(BaseModel):
     merchant_id: str
     force_refresh: bool = False
     limit: int = 50
+    # Optional platform hint: shopify, wix, woocommerce, etc.
+    # When provided, we will try to sync that specific platform first.
+    platform: Optional[str] = None
 
 class UniversalSyncResponse(BaseModel):
     status: str
@@ -57,7 +60,11 @@ async def universal_product_sync(
         merchant = await get_merchant_onboarding(request.merchant_id)
         
         # 2. Find connected store (check all possible sources)
-        store_info = await find_connected_store(request.merchant_id, merchant)
+        store_info = await find_connected_store(
+            merchant_id=request.merchant_id,
+            merchant=merchant,
+            platform_hint=request.platform,
+        )
         
         # If both merchant record and store are missing, treat as hard error
         if not merchant and not store_info:
@@ -74,12 +81,24 @@ async def universal_product_sync(
             )
         
         if not store_info:
-            logger.info(f"No store connected for merchant {request.merchant_id}")
+            if request.platform:
+                msg = (
+                    f"No {request.platform} store connected. "
+                    f"Please connect your {request.platform.title()} store in Integrations."
+                )
+                logger.info(
+                    f"{msg} (merchant_id={request.merchant_id})"
+                )
+            else:
+                msg = "No store connected. Please connect your store in Integrations."
+                logger.info(
+                    f"No store connected for merchant {request.merchant_id}"
+                )
             return UniversalSyncResponse(
                 status="success",
-                message="No store connected. Please connect your store in Integrations.",
+                message=msg,
                 merchant_id=request.merchant_id,
-                platform="none",
+                platform=request.platform or "none",
                 products_synced=0,
                 sync_time=datetime.now().isoformat()
             )
@@ -165,10 +184,41 @@ async def universal_product_sync(
         )
 
 
-async def find_connected_store(merchant_id: str, merchant: Dict) -> Optional[Dict[str, Any]]:
-    """Find connected store from any source"""
-    
-    # Check merchant_stores table first (preferred)
+async def find_connected_store(
+    merchant_id: str,
+    merchant: Dict,
+    platform_hint: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Find connected store from any source.
+
+    If platform_hint is provided, prefer a store for that platform. This
+    is important when a merchant has multiple stores (e.g. both Wix and Shopify).
+    """
+
+    # Normalize hint
+    platform_hint_normalized = (
+        platform_hint.lower() if isinstance(platform_hint, str) else None
+    )
+
+    # 1) Prefer an exact platform match in merchant_stores when hint is provided
+    if platform_hint_normalized:
+        store_query_hint = """
+            SELECT store_id, platform, name, domain, api_key, status
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND status IN ('active', 'connected')
+            ORDER BY connected_at DESC
+            LIMIT 1
+        """
+        store = await database.fetch_one(
+            store_query_hint,
+            {"merchant_id": merchant_id, "platform": platform_hint_normalized},
+        )
+        if store:
+            return dict(store)
+
+    # 2) Fallback: any active/connected store for this merchant
     store_query = """
         SELECT store_id, platform, name, domain, api_key, status
         FROM merchant_stores 
@@ -178,7 +228,7 @@ async def find_connected_store(merchant_id: str, merchant: Dict) -> Optional[Dic
         LIMIT 1
     """
     store = await database.fetch_one(store_query, {"merchant_id": merchant_id})
-    
+
     if store:
         store_dict = dict(store)
         # If api_key is empty but legacy token exists, migrate it in-place for stability
@@ -197,17 +247,19 @@ async def find_connected_store(merchant_id: str, merchant: Dict) -> Optional[Dic
         except Exception as e:
             logger.warning(f"Could not migrate legacy token to merchant_stores: {e}")
         return store_dict
-    
-    # Fallback to merchant_onboarding for legacy MCP
+
+    # 3) Fallback to merchant_onboarding for legacy MCP (if platform matches or no hint)
     if merchant and merchant.get("mcp_platform"):
-        return {
-            "platform": merchant.get("mcp_platform"),
-            "domain": merchant.get("mcp_shop_domain"),
-            "api_key": merchant.get("mcp_access_token"),
-            "store_id": f"legacy_{merchant_id}",
-            "name": merchant.get("business_name")
-        }
-    
+        mcp_platform = str(merchant.get("mcp_platform")).lower()
+        if not platform_hint_normalized or platform_hint_normalized == mcp_platform:
+            return {
+                "platform": merchant.get("mcp_platform"),
+                "domain": merchant.get("mcp_shop_domain"),
+                "api_key": merchant.get("mcp_access_token"),
+                "store_id": f"legacy_{merchant_id}",
+                "name": merchant.get("business_name"),
+            }
+
     return None
 
 

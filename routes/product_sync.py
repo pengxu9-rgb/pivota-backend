@@ -76,6 +76,7 @@ async def sync_products(
         merchant_id=request.merchant_id,
         force_refresh=request.force_refresh,
         limit=request.limit,
+        platform=request.platform,
     )
 
     return await universal_product_sync(
