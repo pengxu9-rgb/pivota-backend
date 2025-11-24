@@ -60,7 +60,7 @@ async def sync_wix_products(
         if not merchant_id:
             raise HTTPException(status_code=400, detail="Merchant ID not found in store record")
         
-        # 调用真正的产品同步（和 Shopify 一样）
+        # 调用真正的产品同步（和 Shopify 一样，走 Universal Sync）
         from routes.product_sync import sync_products, SyncRequest
         from fastapi import BackgroundTasks
         
@@ -75,16 +75,23 @@ async def sync_wix_products(
         sync_result = await sync_products(
             request=sync_request,
             background_tasks=BackgroundTasks(),
-            current_user=current_user
+            current_user=current_user,
         )
+
+        if sync_result.status != "success":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Wix sync failed: {sync_result.message}",
+            )
         
         return {
             "status": "success",
-            "message": f"Successfully synced {sync_result.products_synced} products from Wix",
+            "message": sync_result.message,
             "store_id": store_dict["store_id"],
             "store_name": store_dict["name"],
             "product_count": sync_result.products_synced,
-            "synced_at": sync_result.sync_time
+            "platform": sync_result.platform,
+            "synced_at": sync_result.sync_time,
         }
     
     except HTTPException:
@@ -192,4 +199,3 @@ async def test_wix_connection(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Connection test failed: {str(e)}")
-

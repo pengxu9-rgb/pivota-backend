@@ -217,23 +217,32 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
             platform="shopify"  # 明确指定同步 Shopify
         )
         
-        # 执行真正的同步
+        # 执行真正的同步（调用 Universal Sync）
         sync_result = await sync_products(
             request=sync_request,
             background_tasks=BackgroundTasks(),
-            current_user=current_user
+            current_user=current_user,
         )
         
+        # 根据 universal sync 的状态返回更清晰的结果
+        if sync_result.status != "success":
+            # 透传 warning/error 给前端，而不是假装成功
+            raise HTTPException(
+                status_code=400,
+                detail=f"Shopify sync failed: {sync_result.message}",
+            )
+
         print(f"✅ Synced {sync_result.products_synced} Shopify products for merchant {merchant_id}")
 
         return {
             "status": "success",
-            "message": f"Successfully synced {sync_result.products_synced} products from {store_check['domain']}",
+            "message": sync_result.message,
             "data": {
                 "product_count": sync_result.products_synced,
-                "store_domain": store_check['domain'],
-                "synced_at": sync_result.sync_time
-            }
+                "store_domain": store_check["domain"],
+                "platform": sync_result.platform,
+                "synced_at": sync_result.sync_time,
+            },
         }
     except HTTPException:
         raise
