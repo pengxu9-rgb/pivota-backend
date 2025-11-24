@@ -1163,6 +1163,7 @@ async def config_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)# Deploy trigger: 1761041007
+    port = int(os.getenv("PORT", 8000))  # Railway auto-injects PORT
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)  # reload=False for production
 
 # Force redeploy: 1761914340
