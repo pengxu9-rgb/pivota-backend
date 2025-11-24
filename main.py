@@ -320,6 +320,11 @@ app.add_middleware(
     expose_headers=["X-Request-Id", "X-Total-Count"],
 )
 
+# Log CORS configuration for debugging
+import logging
+logger = logging.getLogger(__name__)
+logger.info(f"🌐 CORS configured: allow_origins={allow_origins}, allow_origin_regex={allow_origin_regex}")
+
 # Add usage logging middleware (tracks Agent API calls)
 app.add_middleware(UsageLoggerMiddleware)
 
