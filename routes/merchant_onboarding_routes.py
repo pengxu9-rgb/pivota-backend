@@ -118,26 +118,53 @@ async def validate_stripe_key(api_key: str) -> bool:
 async def validate_adyen_key(api_key: str) -> bool:
     """Validate Adyen API key by making a lightweight test request.
 
-    Notes:
-    - Adyen may return 401/403 for merchantAccount mismatch/permissions even if the key is structurally valid.
-    - 422 indicates the request shape is valid but data is not (still proves key/header accepted).
-    - Therefore, we accept 200, 401, 403, 422 as evidence that the key is recognized by Adyen.
+    Updated behavior:
+    - 200  => Treat as valid (key + merchantAccount OK).
+    - 422  => Treat as valid (request shape accepted, data needs refinement).
+    - 401/403 => Treat as invalid and surface clear error to the merchant
+                instead of silently accepting.
+    Any other status or network error => invalid.
     """
     try:
         from config.settings import settings
+
         merchant_account = settings.adyen_merchant_account or "TEST"
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://checkout-test.adyen.com/v70/paymentMethods",
                 headers={
                     "X-API-Key": api_key,
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 },
                 json={"merchantAccount": merchant_account},
-                timeout=10.0
+                timeout=10.0,
             )
-            # Accept 200/401/403/422 as evidence key is recognized; otherwise fail
-            return response.status_code in [200, 401, 403, 422]
+
+        status = response.status_code
+        body_snippet = response.text[:200]
+
+        if status == 200:
+            print("✅ Adyen key and merchantAccount validated successfully (200)")
+            return True
+
+        if status == 422:
+            # Request is well-formed and key/header accepted; treat as valid but log details.
+            print(
+                f"✅ Adyen key accepted (422 validation error) – treating as valid. Body={body_snippet}"
+            )
+            return True
+
+        if status in (401, 403):
+            # Explicitly reject bad credentials / merchantAccount mismatch
+            print(
+                f"❌ Adyen credentials rejected (status={status}). Response={body_snippet}"
+            )
+            return False
+
+        print(
+            f"⚠️ Adyen validation unexpected status={status}, body={body_snippet}"
+        )
+        return False
     except Exception as e:
         # Network or environment errors => treat as invalid to avoid false completion
         print(f"⚠️ Adyen validation error: {e}")

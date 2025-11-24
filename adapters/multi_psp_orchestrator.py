@@ -66,8 +66,10 @@ class MultiPSPOrchestrator:
             psps = []
 
         for idx, psp in enumerate(psps, start=1):
-            api_key = psp.get("api_key")
-            provider = (psp.get("provider") or "").lower()
+            # asyncpg returns Record objects; normalize to dict
+            psp_dict = dict(psp)
+            api_key = psp_dict.get("api_key")
+            provider = (psp_dict.get("provider") or "").lower()
             if not api_key or not provider:
                 continue
 
@@ -75,7 +77,9 @@ class MultiPSPOrchestrator:
             base_priority = idx
             priority = 1 if provider == "stripe" else base_priority + 1
 
-            merchant_account = psp.get("account_id") if provider == "adyen" else None
+            merchant_account = (
+                psp_dict.get("account_id") if provider == "adyen" else None
+            )
 
             self.psp_configs.append(
                 PSPConfig(
@@ -270,5 +274,4 @@ async def create_payment_with_failover(
     """
     orchestrator = MultiPSPOrchestrator(merchant_id)
     return await orchestrator.create_payment_intent(amount, currency, metadata)
-
 
