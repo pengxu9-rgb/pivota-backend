@@ -356,6 +356,9 @@ async def register_merchant(
             response_data["message"] += f"\n\n🔑 Your login credentials:\nEmail: {merchant_data.contact_email}\nPassword: {password}\n(Please change this password after first login)"
         
         return response_data
+    except HTTPException:
+        # Propagate FastAPI HTTP errors (e.g. 409 duplicate store URL)
+        raise
     except Exception as e:
         import traceback
         error_msg = str(e)
