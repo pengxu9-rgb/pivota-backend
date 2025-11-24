@@ -395,6 +395,13 @@ class RefundService:
         for r in results:
             refund = dict(r)
             
+            # Handle JSONB metadata field
+            if 'metadata' in refund and refund['metadata'] is not None:
+                # metadata is already parsed from JSONB, keep as is
+                pass
+            else:
+                refund['metadata'] = {}
+            
             # Add human-readable status messages
             if refund['status'] == 'completed':
                 refund['status_message'] = 'Refund successfully processed'
