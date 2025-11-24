@@ -81,7 +81,6 @@ async def register_platform_merchant_v2(
             "contact_email": contact_email or "noreply@pivota.cc",
             "created_at": now,
             "updated_at": now,
-            "platform_profile": None,  # Will be set below
         }
         
         query = merchant_onboarding.insert().values(**basic_record)

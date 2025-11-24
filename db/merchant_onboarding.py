@@ -245,13 +245,21 @@ async def update_platform_profile(merchant_id: str, profile: Dict[str, Any]) -> 
     from db.database import database
     import json
     
-    query = """
-        UPDATE merchant_onboarding 
-        SET platform_profile = :profile
-        WHERE merchant_id = :merchant_id
-    """
-    
     try:
+        # Ensure platform_profile column exists (Platform Onboarding v2)
+        await database.execute(
+            """
+            ALTER TABLE merchant_onboarding
+            ADD COLUMN IF NOT EXISTS platform_profile JSONB
+            """
+        )
+
+        query = """
+            UPDATE merchant_onboarding 
+            SET platform_profile = :profile
+            WHERE merchant_id = :merchant_id
+        """
+
         result = await database.execute(
             query,
             {"merchant_id": merchant_id, "profile": json.dumps(profile)}
@@ -260,4 +268,3 @@ async def update_platform_profile(merchant_id: str, profile: Dict[str, Any]) -> 
     except Exception as e:
         print(f"⚠️ Failed to update platform_profile for {merchant_id}: {e}")
         return False
-
