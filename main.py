@@ -45,6 +45,7 @@ from routes.agent_account import router as agent_account_router  # Agent account
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
+from routes.platform_onboarding_routes import router as platform_onboarding_router
 from routes.merchant_dashboard_routes import router as merchant_dashboard_router  # Original with fallback - STABLE
 from routes.merchant_analytics_routes import router as merchant_analytics_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
@@ -405,6 +406,11 @@ app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
+if settings.platform_onboarding_v2_enabled:
+    app.include_router(platform_onboarding_router)  # Platform Merchant Onboarding v2
+    logger.info("✅ Platform Onboarding v2 router registered successfully")
+else:
+    logger.info("⚠️ Platform Onboarding v2 is disabled (feature flag is false)")
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
 app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
