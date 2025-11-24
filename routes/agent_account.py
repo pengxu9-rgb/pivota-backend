@@ -76,8 +76,8 @@ async def register_agent(data: AgentRegisterRequest):
         
         await database.execute(
             """
-            INSERT INTO users (id, email, password_hash, full_name, role, active)
-            VALUES (gen_random_uuid(), :email, :password_hash, :full_name, :role, :active)
+            INSERT INTO users (email, password_hash, full_name, role, active)
+            VALUES (:email, :password_hash, :full_name, :role, :active)
             """,
             {
                 "email": data.email,
@@ -92,19 +92,41 @@ async def register_agent(data: AgentRegisterRequest):
         agent_id = f"agent_{secrets.token_hex(8)}"
         api_key_raw = secrets.token_bytes(32)
         api_key = f"ak_live_{api_key_raw.hex()}"
+        api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
         
-        # 4. Create agent record - using ONLY the columns we know exist
-        # Based on error messages: agents table has both 'email' (NOT NULL) and 'name' (NOT NULL)
+        # 4. Create agent record - aligned with current agents table schema
         await database.execute(
             """
-            INSERT INTO agents (agent_id, name, email, api_key)
-            VALUES (:agent_id, :name, :email, :api_key)
+            INSERT INTO agents (
+                agent_id,
+                agent_name,
+                owner_email,
+                description,
+                api_key,
+                api_key_hash,
+                is_active,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :agent_id,
+                :agent_name,
+                :owner_email,
+                :description,
+                :api_key,
+                :api_key_hash,
+                TRUE,
+                NOW(),
+                NOW()
+            )
             """,
             {
                 "agent_id": agent_id,
-                "name": data.agent_name,
-                "email": data.email,
-                "api_key": api_key
+                "agent_name": data.agent_name,
+                "owner_email": data.email,
+                "description": data.description or "",
+                "api_key": api_key,
+                "api_key_hash": api_key_hash,
             }
         )
         
@@ -166,7 +188,11 @@ async def login_agent(data: AgentLoginRequest):
         
         # 3. Get agent record
         agent = await database.fetch_one(
-            "SELECT agent_id, name, email, api_key FROM agents WHERE email = :email",
+            """
+            SELECT agent_id, agent_name, owner_email, api_key
+            FROM agents
+            WHERE owner_email = :email
+            """,
             {"email": data.email}
         )
         
@@ -191,8 +217,8 @@ async def login_agent(data: AgentLoginRequest):
         # Get agent name safely
         agent_name = "Agent"  # Default
         try:
-            if agent["name"]:
-                agent_name = agent["name"]
+            if agent["agent_name"]:
+                agent_name = agent["agent_name"]
         except (KeyError, TypeError):
             # Fallback to user's full name if available
             try:
@@ -207,7 +233,7 @@ async def login_agent(data: AgentLoginRequest):
             agent={
                 "agent_id": agent["agent_id"],
                 "agent_name": agent_name,
-                "email": agent["email"],
+                "email": agent["owner_email"],
                 "company": "",
                 "description": "",
                 "status": "active"
@@ -222,4 +248,3 @@ async def login_agent(data: AgentLoginRequest):
             status_code=500,
             detail=f"Login failed: {str(e)}"
         )
-
