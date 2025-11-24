@@ -50,21 +50,28 @@ async def universal_product_sync(
     try:
         logger.info(f"🔄 Universal sync request: merchant_id={request.merchant_id}")
         
-        # 1. Get merchant info
+        # 1. Get merchant info (best effort)
+        #    For legacy MCP merchants, we may have connected stores but no
+        #    merchant_onboarding row yet, so missing merchant should not
+        #    block sync as long as we can find a store.
         merchant = await get_merchant_onboarding(request.merchant_id)
-        if not merchant:
-            logger.warning(f"Merchant {request.merchant_id} not found")
+        
+        # 2. Find connected store (check all possible sources)
+        store_info = await find_connected_store(request.merchant_id, merchant)
+        
+        # If both merchant record and store are missing, treat as hard error
+        if not merchant and not store_info:
+            logger.warning(
+                f"Universal sync: merchant {request.merchant_id} not found and no store connected"
+            )
             return UniversalSyncResponse(
                 status="error",
                 message="Merchant account not found",
                 merchant_id=request.merchant_id,
                 platform="unknown",
                 products_synced=0,
-                sync_time=datetime.now().isoformat()
+                sync_time=datetime.now().isoformat(),
             )
-        
-        # 2. Find connected store (check all possible sources)
-        store_info = await find_connected_store(request.merchant_id, merchant)
         
         if not store_info:
             logger.info(f"No store connected for merchant {request.merchant_id}")
