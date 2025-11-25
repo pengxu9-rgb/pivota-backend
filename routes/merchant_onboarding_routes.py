@@ -131,7 +131,7 @@ async def validate_adyen_key(api_key: str) -> bool:
         merchant_account = settings.adyen_merchant_account or "TEST"
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://checkout-test.adyen.com/v70/paymentMethods",
+                "https://checkout-test.adyen.com/v71/paymentMethods",
                 headers={
                     "X-API-Key": api_key,
                     "Content-Type": "application/json",

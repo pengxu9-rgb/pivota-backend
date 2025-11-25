@@ -117,8 +117,8 @@ async def validate_adyen(api_key: str, merchant_account: str) -> dict:
             "Content-Type": "application/json"
         }
         
-        # Use payment methods endpoint as a simple test
-        url = "https://checkout-test.adyen.com/v70/paymentMethods"
+        # Use payment methods endpoint as a simple test (align with v71 used in manual curl)
+        url = "https://checkout-test.adyen.com/v71/paymentMethods"
         payload = {
             "merchantAccount": merchant_account or "PivotaTestMerchant"
         }
