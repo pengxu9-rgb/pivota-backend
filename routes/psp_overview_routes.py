@@ -43,7 +43,7 @@ async def get_psp_overview(
                 mp.provider as psp_name,
                 mp.status,
                 COUNT(DISTINCT mp.merchant_id) as merchant_count,
-                -- Count all orders joined for this PSP (via psp_id or psp_used)
+                -- Count only orders actually processed by this PSP (via psp_used/provider or psp_id)
                 COUNT(o.order_id) as transaction_count,
                 COUNT(
                     CASE 
@@ -74,6 +74,10 @@ async def get_psp_overview(
             LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
                 AND o.created_at >= :start_time
                 AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+                AND (
+                    (o.psp_id IS NOT NULL AND mp.psp_id IS NOT NULL AND o.psp_id = mp.psp_id)
+                    OR (o.psp_used IS NOT NULL AND LOWER(o.psp_used) = LOWER(mp.provider))
+                )
             WHERE mp.status = 'active'
             GROUP BY mp.provider, mp.status
         ),
