@@ -246,46 +246,52 @@ async def get_psp_detail(
         if not psp_info:
             raise HTTPException(status_code=404, detail=f"PSP {psp_id} not found")
         
-        # Get aggregated metrics
-        # Note: Using merchant_id to link orders to PSP, not psp_type
+        # Get aggregated metrics based on payment_attempts (attempt-level view)
         metrics_query = """
         SELECT 
-            COUNT(o.order_id) as total_transactions,
-            COUNT(CASE WHEN o.payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END) as successful_transactions,
-            COUNT(CASE WHEN o.payment_status = 'failed' THEN 1 END) as failed_transactions,
-            COUNT(CASE WHEN o.payment_status = 'pending' THEN 1 END) as pending_transactions,
-            COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refunded_transactions,
-            SUM(CASE WHEN o.payment_status IN ('paid', 'completed', 'succeeded') THEN o.total ELSE 0 END) as total_volume,
-            AVG(CASE WHEN o.payment_status IN ('paid', 'completed', 'succeeded') THEN o.total ELSE NULL END) as avg_transaction_size,
-            MIN(o.total) as min_transaction_size,
-            MAX(o.total) as max_transaction_size
-        FROM orders o
-        JOIN merchant_psps mp ON o.merchant_id = mp.merchant_id
-        WHERE mp.provider = :psp_id 
-            AND mp.status = 'active'
-            AND o.created_at >= :start_time
+            COUNT(pa.attempt_id) as total_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'success') as successful_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'failed') as failed_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'timeout') as timeout_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'cancelled') as cancelled_attempts,
+            COUNT(DISTINCT pa.order_id) as orders_touched,
+            COUNT(DISTINCT pa.order_id) FILTER (WHERE pa.status = 'success') as orders_succeeded,
+            SUM(CASE WHEN pa.status = 'success' THEN pa.amount ELSE 0 END) as total_volume,
+            AVG(CASE WHEN pa.status = 'success' THEN pa.amount ELSE NULL END) as avg_amount,
+            MIN(pa.amount) as min_amount,
+            MAX(pa.amount) as max_amount
+        FROM payment_attempts pa
+        WHERE LOWER(pa.psp_name) = LOWER(:psp_id)
+            AND pa.created_at >= :start_time
         """
         
         metrics = await database.fetch_one(metrics_query, {
             "psp_id": psp_id,
             "start_time": start_time
-        })
+        }) or {}
         
-        # Get merchant breakdown
+        # Get merchant breakdown (per-merchant attempt metrics)
         merchant_query = """
         SELECT 
             m.merchant_id,
             m.business_name as merchant_name,
-            COUNT(o.order_id) as transaction_count,
-            COUNT(CASE WHEN o.payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END) as success_count,
-            COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refund_count,
-            SUM(CASE WHEN o.payment_status IN ('paid', 'completed', 'succeeded') THEN o.total ELSE 0 END) as volume,
-            MAX(o.created_at) as last_transaction
+            COUNT(pa.attempt_id) as total_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'success') as successful_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'failed') as failed_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'timeout') as timeout_attempts,
+            COUNT(DISTINCT pa.order_id) as orders_touched,
+            COUNT(DISTINCT pa.order_id) FILTER (WHERE pa.status = 'success') as orders_succeeded,
+            SUM(CASE WHEN pa.status = 'success' THEN pa.amount ELSE 0 END) as volume,
+            MAX(pa.created_at) as last_attempt
         FROM merchant_onboarding m
         JOIN merchant_psps mp ON m.merchant_id = mp.merchant_id
-        LEFT JOIN orders o ON o.merchant_id = m.merchant_id 
-            AND o.created_at >= :start_time
-        WHERE mp.provider = :psp_id AND mp.status = 'active'
+        JOIN orders o ON o.merchant_id = m.merchant_id
+            AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+        JOIN payment_attempts pa ON pa.order_id = o.order_id
+        WHERE mp.provider = :psp_id 
+            AND mp.status = 'active'
+            AND LOWER(pa.psp_name) = LOWER(:psp_id)
+            AND pa.created_at >= :start_time
         GROUP BY m.merchant_id, m.business_name
         ORDER BY volume DESC
         LIMIT 50
@@ -296,18 +302,16 @@ async def get_psp_detail(
             "start_time": start_time
         })
         
-        # Get hourly trend data (last 24 hours)
+        # Get hourly trend data (last 24 hours) based on attempts
         trend_query = """
         SELECT 
-            DATE_TRUNC('hour', o.created_at) as hour,
-            COUNT(o.order_id) as transactions,
-            COUNT(CASE WHEN o.payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END) as successful,
-            SUM(CASE WHEN o.payment_status IN ('paid', 'completed', 'succeeded') THEN o.total ELSE 0 END) as volume
-        FROM orders o
-        JOIN merchant_psps mp ON o.merchant_id = mp.merchant_id
-        WHERE mp.provider = :psp_id 
-            AND mp.status = 'active'
-            AND o.created_at >= NOW() - INTERVAL '24 hours'
+            DATE_TRUNC('hour', pa.created_at) as hour,
+            COUNT(pa.attempt_id) as total_attempts,
+            COUNT(*) FILTER (WHERE pa.status = 'success') as successful_attempts,
+            SUM(CASE WHEN pa.status = 'success' THEN pa.amount ELSE 0 END) as volume
+        FROM payment_attempts pa
+        WHERE LOWER(pa.psp_name) = LOWER(:psp_id)
+            AND pa.created_at >= NOW() - INTERVAL '24 hours'
         GROUP BY hour
         ORDER BY hour DESC
         """
@@ -315,36 +319,37 @@ async def get_psp_detail(
         trends = await database.fetch_all(trend_query, {"psp_id": psp_id})
         
         # Calculate metrics
-        total_transactions = metrics["total_transactions"] or 0
-        successful_transactions = metrics["successful_transactions"] or 0
-        success_rate = round(successful_transactions / total_transactions * 100, 2) if total_transactions > 0 else 0
+        total_attempts = metrics.get("total_attempts") or 0
+        successful_attempts = metrics.get("successful_attempts") or 0
+        success_rate = round(successful_attempts / total_attempts * 100, 2) if total_attempts > 0 else 0
         
         # Format merchant stats
         merchant_stats = []
         for merchant in merchants:
-            tx_count = merchant["transaction_count"] or 0
-            success_count = merchant["success_count"] or 0
-            refund_count = merchant["refund_count"] or 0
+            attempts = merchant["total_attempts"] or 0
+            successful = merchant["successful_attempts"] or 0
             
             merchant_stats.append({
                 "merchant_id": merchant["merchant_id"],
                 "merchant_name": merchant["merchant_name"] or "Unknown",
                 "volume": float(merchant["volume"]) if merchant["volume"] else 0,
-                "transaction_count": tx_count,
-                "success_rate": round(success_count / tx_count * 100, 2) if tx_count > 0 else 0,
-                "refund_rate": round(refund_count / tx_count * 100, 2) if tx_count > 0 else 0,
-                "last_tx": merchant["last_transaction"].isoformat() if merchant["last_transaction"] else None
+                "transaction_count": attempts,
+                "success_rate": round(successful / attempts * 100, 2) if attempts > 0 else 0,
+                "refund_rate": 0,
+                "last_tx": merchant["last_attempt"].isoformat() if merchant["last_attempt"] else None
             })
         
         # Format trend data
         trend_data = []
         for trend in trends:
+            total = trend["total_attempts"] or 0
+            successful = trend["successful_attempts"] or 0
             trend_data.append({
                 "timestamp": trend["hour"].isoformat(),
-                "transactions": trend["transactions"],
-                "successful": trend["successful"],
+                "transactions": total,
+                "successful": successful,
                 "volume": float(trend["volume"]) if trend["volume"] else 0,
-                "success_rate": round(trend["successful"] / trend["transactions"] * 100, 2) if trend["transactions"] > 0 else 0
+                "success_rate": round(successful / total * 100, 2) if total > 0 else 0
             })
         
         return {
@@ -355,16 +360,16 @@ async def get_psp_detail(
             "first_connected": psp_info["first_connected"].isoformat() if psp_info["first_connected"] else None,
             "last_connected": psp_info["last_connected"].isoformat() if psp_info["last_connected"] else None,
             "metrics": {
-                "total_transactions": total_transactions,
-                "successful_transactions": successful_transactions,
-                "failed_transactions": metrics["failed_transactions"] or 0,
-                "pending_transactions": metrics["pending_transactions"] or 0,
-                "refunded_transactions": metrics["refunded_transactions"] or 0,
+                "total_transactions": total_attempts,
+                "successful_transactions": successful_attempts,
+                "failed_transactions": metrics.get("failed_attempts") or 0,
+                "pending_transactions": (metrics.get("timeout_attempts") or 0) + (metrics.get("cancelled_attempts") or 0),
+                "refunded_transactions": 0,
                 "success_rate": success_rate,
-                "total_volume": float(metrics["total_volume"]) if metrics["total_volume"] else 0,
-                "avg_transaction_size": float(metrics["avg_transaction_size"]) if metrics["avg_transaction_size"] else 0,
-                "min_transaction_size": float(metrics["min_transaction_size"]) if metrics["min_transaction_size"] else 0,
-                "max_transaction_size": float(metrics["max_transaction_size"]) if metrics["max_transaction_size"] else 0
+                "total_volume": float(metrics.get("total_volume") or 0),
+                "avg_transaction_size": float(metrics.get("avg_amount") or 0),
+                "min_transaction_size": float(metrics.get("min_amount") or 0),
+                "max_transaction_size": float(metrics.get("max_amount") or 0)
             },
             "merchant_stats": merchant_stats,
             "trend_data": trend_data,
