@@ -43,11 +43,11 @@ async def get_psp_overview(
                 mp.provider as psp_name,
                 mp.status,
                 COUNT(DISTINCT mp.merchant_id) as merchant_count,
-                COUNT(CASE WHEN LOWER(o.psp_used) = LOWER(mp.provider) THEN o.order_id END) as transaction_count,
+                -- Count all orders joined for this PSP (via psp_id or psp_used)
+                COUNT(o.order_id) as transaction_count,
                 COUNT(
                     CASE 
                         WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
-                            AND LOWER(o.psp_used) = LOWER(mp.provider)
                         THEN 1 
                     END
                 ) as success_count,
@@ -55,7 +55,6 @@ async def get_psp_overview(
                     SUM(
                         CASE 
                             WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
-                                AND LOWER(o.psp_used) = LOWER(mp.provider)
                             THEN o.total 
                             ELSE 0 
                         END
@@ -65,13 +64,12 @@ async def get_psp_overview(
                 AVG(
                     CASE 
                         WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
-                            AND LOWER(o.psp_used) = LOWER(mp.provider)
                         THEN o.total 
                         ELSE NULL 
                     END
                 ) as avg_transaction_size,
-                COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') AND LOWER(o.psp_used) = LOWER(mp.provider) THEN 1 END) as refund_count,
-                MAX(CASE WHEN LOWER(o.psp_used) = LOWER(mp.provider) THEN o.created_at END) as last_transaction
+                COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refund_count,
+                MAX(o.created_at) as last_transaction
             FROM merchant_psps mp
             LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
                 AND o.created_at >= :start_time
