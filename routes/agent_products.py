@@ -10,10 +10,13 @@ from typing import List, Optional, Dict, Any
 import httpx
 import logging
 import time
+import json
 
 from routes.agent_api import get_agent_context, AgentContext, log_agent_request
 from routes.merchant_onboarding_routes import get_merchant_onboarding
 from fastapi import BackgroundTasks
+from db.products import get_product_cache_row
+from models.standard_product import StandardProduct
 
 router = APIRouter(prefix="/agent/v1/products", tags=["Agent Products"])
 logger = logging.getLogger(__name__)
@@ -136,74 +139,167 @@ async def get_product_details(
         # Verify access
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized")
-        
+
         merchant = await get_merchant_onboarding(merchant_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        
-        # Get primary store for this merchant
+
+        # Get primary store for this merchant (may be Shopify, Wix, etc.)
         from services.merchant_store_service import get_primary_store
         store = await get_primary_store(merchant_id)
         if not store:
             raise HTTPException(
-                status_code=404, 
+                status_code=404,
                 detail="No connected stores found for this merchant",
-                headers={"X-Error-Code": "STORE_NOT_FOUND"}
+                headers={"X-Error-Code": "STORE_NOT_FOUND"},
             )
-        
-        # Only support Shopify for now
-        if store.get("platform") != "shopify":
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Product details only supported for Shopify (merchant uses {store.get('platform')})"
+
+        platform = store.get("platform")
+
+        # For non-Shopify platforms (e.g. Wix), serve details from cached StandardProduct
+        if platform != "shopify":
+            cache_row = await get_product_cache_row(
+                merchant_id=merchant_id,
+                platform=platform,
+                platform_product_id=product_id,
+                include_expired=False,
             )
-        
+
+            if not cache_row:
+                raise HTTPException(status_code=404, detail="Product not found")
+
+            product_data = cache_row.get("product_data") or {}
+            if isinstance(product_data, str):
+                try:
+                    product_data = json.loads(product_data)
+                except Exception:
+                    product_data = {}
+
+            try:
+                sp = StandardProduct(**product_data)
+                prod = sp.dict()
+            except Exception:
+                prod = product_data
+
+            product_id_out = str(prod.get("product_id") or prod.get("id") or product_id)
+            title = prod.get("title") or prod.get("name") or ""
+            description = prod.get("description") or ""
+            product_type = prod.get("product_type")
+            tags = prod.get("tags") or []
+
+            images = prod.get("images") or []
+            if isinstance(images, dict):
+                if images.get("image_url"):
+                    images = [images.get("image_url")]
+                else:
+                    images = []
+
+            image_url = prod.get("image_url")
+            if image_url and image_url not in images:
+                images = [image_url] + images
+
+            variants_raw = prod.get("variants") or []
+            variants: List[Dict[str, Any]] = []
+            for v in variants_raw:
+                vid = str(v.get("variant_id") or v.get("id") or product_id_out)
+                price = float(v.get("price") or prod.get("price") or 0)
+                inv_qty = int(v.get("inventory_quantity") or 0)
+                variants.append(
+                    {
+                        "variant_id": vid,
+                        "title": v.get("title") or "Default",
+                        "price": price,
+                        "sku": v.get("sku"),
+                        "inventory_quantity": inv_qty,
+                        "available": inv_qty > 0,
+                    }
+                )
+
+            if not variants:
+                inv_qty = int(prod.get("inventory_quantity") or 0)
+                variants.append(
+                    {
+                        "variant_id": product_id_out,
+                        "title": "Default",
+                        "price": float(prod.get("price") or 0),
+                        "sku": prod.get("sku"),
+                        "inventory_quantity": inv_qty,
+                        "available": inv_qty > 0,
+                    }
+                )
+
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id,
+            )
+
+            return {
+                "status": "success",
+                "product": {
+                    "id": product_id_out,
+                    "title": title,
+                    "description": description,
+                    "vendor": prod.get("vendor"),
+                    "product_type": product_type,
+                    "variants": variants,
+                    "images": images,
+                    "tags": tags,
+                },
+            }
+
+        # Shopify path: fetch fresh details from Shopify Admin API
         shop_domain = store.get("domain") or store.get("shop_domain")
         if not shop_domain:
             raise HTTPException(
                 status_code=400,
                 detail="Store configuration incomplete - missing domain",
-                headers={"X-Error-Code": "INVALID_STORE_CONFIG"}
+                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
             )
-        
+
         api_key_raw = store.get("api_key") or store.get("access_token")
-        
+
         # Parse JSON token if needed (same logic as product_sync)
         access_token = api_key_raw
         if api_key_raw and api_key_raw.strip().startswith("{"):
-            import json
             try:
                 token_data = json.loads(api_key_raw)
-                access_token = token_data.get("access_token") or token_data.get("token") or api_key_raw
-            except:
+                access_token = (
+                    token_data.get("access_token")
+                    or token_data.get("token")
+                    or api_key_raw
+                )
+            except Exception:
                 pass
-        
+
         if not access_token:
             raise HTTPException(
                 status_code=400,
                 detail="Store configuration incomplete - missing credentials",
-                headers={"X-Error-Code": "INVALID_STORE_CONFIG"}
+                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
             )
-        
+
         # Fetch product from Shopify
         url = f"https://{shop_domain}/admin/api/2024-01/products/{product_id}.json"
         headers = {
             "X-Shopify-Access-Token": access_token,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.get(url, headers=headers, timeout=10.0)
-            
-            if response.status_code != 200:
-                raise HTTPException(status_code=404, detail="Product not found")
-            
-            product = response.json()["product"]
-            
-            # Transform for agent
-            variants = []
-            for variant in product.get("variants", []):
-                variants.append({
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        product = response.json()["product"]
+
+        # Transform for agent
+        variants = []
+        for variant in product.get("variants", []):
+            variants.append(
+                {
                     "variant_id": str(variant["id"]),
                     "title": variant.get("title", "Default"),
                     "price": float(variant.get("price", 0)),
@@ -211,29 +307,32 @@ async def get_product_details(
                     "inventory_quantity": variant.get("inventory_quantity", 0),
                     "available": variant.get("inventory_quantity", 0) > 0,
                     "weight": variant.get("weight"),
-                    "weight_unit": variant.get("weight_unit")
-                })
-            
-            background_tasks.add_task(
-                log_agent_request,
-                context=context,
-                status_code=200,
-                merchant_id=merchant_id
-            )
-            
-            return {
-                "status": "success",
-                "product": {
-                    "id": str(product["id"]),
-                    "title": product["title"],
-                    "description": product.get("body_html", ""),
-                    "vendor": product.get("vendor"),
-                    "product_type": product.get("product_type"),
-                    "variants": variants,
-                    "images": [img.get("src") for img in product.get("images", [])],
-                    "tags": product.get("tags", "").split(",") if product.get("tags") else []
+                    "weight_unit": variant.get("weight_unit"),
                 }
-            }
+            )
+
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=merchant_id,
+        )
+
+        return {
+            "status": "success",
+            "product": {
+                "id": str(product["id"]),
+                "title": product["title"],
+                "description": product.get("body_html", ""),
+                "vendor": product.get("vendor"),
+                "product_type": product.get("product_type"),
+                "variants": variants,
+                "images": [img.get("src") for img in product.get("images", [])],
+                "tags": product.get("tags", "").split(",")
+                if product.get("tags")
+                else [],
+            },
+        }
             
     except HTTPException:
         raise
