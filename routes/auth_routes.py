@@ -214,18 +214,27 @@ async def signin(login_data: UserLogin):
                 "token": token,
                 "user": {"id": login_data.email, "email": login_data.email, "full_name": stored.get("full_name", login_data.email), "role": primary_role}
             }
-        # Check employees table first
-        employee_query = "SELECT employee_id, name, email, password, role FROM employees WHERE email = :email AND status = 'active'"
-        employee = await database.fetch_one(employee_query, {"email": login_data.email})
+        # Legacy employees table (optional). If the table doesn't exist in the new DB,
+        # swallow the error and fall back to demo accounts instead of returning 500.
+        employee = None
+        try:
+            employee_query = """
+                SELECT employee_id, name, email, password, role
+                FROM employees
+                WHERE email = :email AND status = 'active'
+            """
+            employee = await database.fetch_one(employee_query, {"email": login_data.email})
+        except Exception as e:
+            # Log and ignore missing legacy table or other DB errors
+            print(f"Employees lookup skipped: {e}")
+            employee = None
         
         if employee:
-            # Verify password
             import hashlib
             salt = "pivota_employee_salt_v1"
             hashed_input = hashlib.sha256(f"{login_data.password}{salt}".encode()).hexdigest()
             
             if employee["password"] and hashed_input == employee["password"]:
-                # Password matches
                 token = create_jwt_token(employee["employee_id"], employee["role"], employee["email"])
                 return {
                     "status": "success",
