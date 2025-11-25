@@ -266,7 +266,13 @@ async def get_merchant_psps(
                 SELECT 
                     COALESCE(psp_used, psp_id) AS psp_key,
                     COUNT(*) as total_orders,
-                    SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) as successful_orders,
+                    SUM(
+                        CASE 
+                            WHEN payment_status IN ('paid', 'completed', 'succeeded') 
+                            THEN 1 
+                            ELSE 0 
+                        END
+                    ) as successful_orders,
                     COALESCE(SUM(total), 0) as total_volume
                 FROM orders
                 WHERE merchant_id = :merchant_id 
