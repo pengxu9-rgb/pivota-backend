@@ -235,14 +235,16 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     """
     try:
         # Fetch fresh user data from database
+        # Tokens in this system use the email as the primary subject (`sub`)
+        # so we look up the user record by email instead of a numeric ID.
         query = """
             SELECT id, email, full_name, role, created_at, last_login
             FROM users
-            WHERE id = :user_id AND active = true
+            WHERE email = :email AND active = true
         """
         user = await database.fetch_one(
             query=query,
-            values={"user_id": current_user["sub"]}
+            values={"email": current_user["email"]}
         )
         
         if not user:
@@ -389,7 +391,9 @@ async def change_password(
     try:
         # Get user from database
         user = await database.fetch_one(
-            "SELECT user_id, email, password_hash FROM users WHERE email = :email",
+            # Some legacy deployments used `user_id`; the canonical column is `id`
+            # but we only need the email and password hash here.
+            "SELECT email, password_hash FROM users WHERE email = :email",
             {"email": current_user["email"]}
         )
         
@@ -434,8 +438,10 @@ async def forgot_password(data: ForgotPasswordRequest):
         from datetime import timedelta
         
         # Check if user exists
+        # Some deployments use `id` instead of `user_id`, but for this flow
+        # we only need to know whether an email exists, so select email only
         user = await database.fetch_one(
-            "SELECT user_id, email FROM users WHERE email = :email",
+            "SELECT email FROM users WHERE email = :email",
             {"email": data.email}
         )
         
@@ -543,4 +549,3 @@ async def reset_password(data: ResetPasswordRequest):
             status_code=500,
             detail=f"Failed to reset password: {str(e)}"
         )
-

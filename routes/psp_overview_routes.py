@@ -36,50 +36,38 @@ async def get_psp_overview(
             start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
         
         # Get PSP configurations and their stats
-        # Use psp_used column for accurate PSP attribution
+        # For the employee PSP overview we want an **attempt-level**
+        # view based on the payment_attempts table, not on final
+        # orders. Each payment_attempt row represents a concrete call
+        # to a PSP (including failover attempts).
         query = """
-        WITH psp_stats AS (
+        WITH psp_configs AS (
             SELECT 
-                mp.provider as psp_name,
-                mp.status,
-                COUNT(DISTINCT mp.merchant_id) as merchant_count,
-                -- Count only orders actually processed by this PSP (via psp_used/provider or psp_id)
-                COUNT(o.order_id) as transaction_count,
-                COUNT(
-                    CASE 
-                        WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
-                        THEN 1 
-                    END
-                ) as success_count,
-                COALESCE(
-                    SUM(
-                        CASE 
-                            WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
-                            THEN o.total 
-                            ELSE 0 
-                        END
-                    ),
-                    0
-                ) as total_volume,
-                AVG(
-                    CASE 
-                        WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
-                        THEN o.total 
-                        ELSE NULL 
-                    END
-                ) as avg_transaction_size,
-                COUNT(CASE WHEN o.payment_status IN ('refunded', 'partially_refunded') THEN 1 END) as refund_count,
-                MAX(o.created_at) as last_transaction
-            FROM merchant_psps mp
-            LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
-                AND o.created_at >= :start_time
-                AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
-                AND (
-                    (o.psp_id IS NOT NULL AND mp.psp_id IS NOT NULL AND o.psp_id = mp.psp_id)
-                    OR (o.psp_used IS NOT NULL AND LOWER(o.psp_used) = LOWER(mp.provider))
-                )
-            WHERE mp.status = 'active'
-            GROUP BY mp.provider, mp.status
+                LOWER(provider) AS psp_key,
+                provider AS psp_name,
+                -- A PSP is considered active if any linked merchant PSP record is active
+                CASE 
+                    WHEN BOOL_OR(status = 'active') THEN 'active'
+                    ELSE MAX(status)
+                END AS status,
+                COUNT(DISTINCT merchant_id) FILTER (WHERE status = 'active') AS merchant_count
+            FROM merchant_psps
+            GROUP BY LOWER(provider), provider
+        ),
+        attempt_stats AS (
+            SELECT 
+                LOWER(psp_name) AS psp_key,
+                COUNT(*) AS total_attempts,
+                COUNT(*) FILTER (WHERE status = 'success') AS successful_attempts,
+                COUNT(*) FILTER (WHERE status = 'failed') AS failed_attempts,
+                COUNT(*) FILTER (WHERE status = 'timeout') AS timeout_attempts,
+                COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_attempts,
+                SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END) AS total_volume,
+                AVG(CASE WHEN status = 'success' THEN amount ELSE NULL END) AS avg_transaction_size,
+                MAX(created_at) AS last_attempt
+            FROM payment_attempts
+            WHERE created_at >= :start_time
+            GROUP BY LOWER(psp_name)
         ),
         fee_stats AS (
             SELECT 
@@ -98,30 +86,33 @@ async def get_psp_overview(
             GROUP BY provider
         )
         SELECT 
-            ps.psp_name,
-            ps.status,
-            ps.merchant_count,
-            COALESCE(ps.transaction_count, 0) as transactions_today,
-            COALESCE(ps.success_count, 0) as successful_transactions,
+            pc.psp_name,
+            pc.status,
+            pc.merchant_count,
+            COALESCE(a.total_attempts, 0) AS transactions_today,
+            COALESCE(a.successful_attempts, 0) AS successful_transactions,
             CASE 
-                WHEN ps.transaction_count > 0 
-                THEN ROUND(ps.success_count::numeric / ps.transaction_count * 100, 2)
+                WHEN COALESCE(a.total_attempts, 0) > 0 
+                THEN ROUND(a.successful_attempts::numeric / NULLIF(a.total_attempts, 0) * 100, 2)
                 ELSE 0 
-            END as success_rate,
-            COALESCE(ps.total_volume, 0) as total_volume,
-            COALESCE(ps.avg_transaction_size, 0) as avg_transaction_size,
-            COALESCE(ps.refund_count, 0) as refund_count,
+            END AS success_rate,
+            COALESCE(a.total_volume, 0) AS total_volume,
+            COALESCE(a.avg_transaction_size, 0) AS avg_transaction_size,
+            -- We don't yet track refunds at attempt level; expose 0 for now
+            0 AS refund_count,
             fs.avg_fee_rate,
-            ps.last_transaction,
+            a.last_attempt,
             CASE 
-                WHEN ps.last_transaction IS NULL THEN 'Never'
-                WHEN ps.last_transaction > NOW() - INTERVAL '10 minutes' THEN 'Active'
-                WHEN ps.last_transaction > NOW() - INTERVAL '1 hour' THEN 'Recently Active'
+                WHEN a.last_attempt IS NULL THEN 'Never'
+                WHEN a.last_attempt > NOW() - INTERVAL '10 minutes' THEN 'Active'
+                WHEN a.last_attempt > NOW() - INTERVAL '1 hour' THEN 'Recently Active'
                 ELSE 'Inactive'
-            END as activity_status
-        FROM psp_stats ps
-        LEFT JOIN fee_stats fs ON ps.psp_name = fs.provider
-        ORDER BY ps.transaction_count DESC NULLS LAST
+            END AS activity_status
+        FROM psp_configs pc
+        LEFT JOIN attempt_stats a ON a.psp_key = pc.psp_key
+        LEFT JOIN fee_stats fs ON pc.psp_name = fs.provider
+        WHERE pc.status = 'active'
+        ORDER BY transactions_today DESC NULLS LAST
         """
         
         results = await database.fetch_all(query, {"start_time": start_time})
