@@ -44,6 +44,17 @@ class SearchFilters(BaseModel):
 class FindProductsPayload(BaseModel):
     search: SearchFilters
 
+class MultiSearchFilters(BaseModel):
+    query: str = Field("", description="Search query, empty string means 'all products'")
+    category: Optional[str] = Field(None, description="Optional category filter")
+    price_min: Optional[float] = Field(None, description="Minimum price filter")
+    price_max: Optional[float] = Field(None, description="Maximum price filter")
+    page: int = Field(1, ge=1, description="Page number (1-based)")
+    limit: int = Field(20, ge=1, le=100, description="Page size (max 100)")
+
+
+class FindProductsMultiPayload(BaseModel):
+    search: MultiSearchFilters
 
 class ProductRef(BaseModel):
     merchant_id: str
@@ -202,6 +213,143 @@ async def _handle_find_products(
         "metadata": {
             "query_source": query_source,
             "fetched_at": datetime.utcnow().isoformat(),
+        },
+    }
+
+
+async def _handle_find_products_multi(
+    filters: MultiSearchFilters,
+    background_tasks: BackgroundTasks,
+) -> Dict[str, Any]:
+    """
+    Cross-merchant implementation of the find_products operation.
+
+    Input:  { search: { query, category?, price_min?, price_max?, page?, limit? } }
+    Output: { products: [...], total, page, page_size }
+    """
+    from db.database import database
+    from db.products import get_cached_products
+    from db.merchant_onboarding import get_merchant_onboarding
+
+    page = filters.page or 1
+    limit = min(filters.limit or 20, 100)
+
+    # Fetch candidate merchants (active + PSP connected)
+    merchant_rows = await database.fetch_all(
+        """
+        SELECT merchant_id, business_name
+        FROM merchant_onboarding
+        WHERE status NOT IN ('deleted', 'rejected')
+        AND psp_connected = true
+        LIMIT 100
+        """
+    )
+    merchant_map = {row["merchant_id"]: row["business_name"] for row in merchant_rows}
+
+    all_products: list[dict[str, Any]] = []
+
+    # Collect cached products per merchant
+    for mid, name in merchant_map.items():
+        try:
+            cached = await get_cached_products(mid, platform="shopify", include_expired=False)
+            if cached:
+                # Convert cache rows into product dicts
+                for row in cached:
+                    data = row.get("product_data") or {}
+                    if not isinstance(data, dict):
+                        continue
+                    product = dict(data)
+                    product["merchant_id"] = mid
+                    product["merchant_name"] = name
+                    all_products.append(product)
+        except Exception:
+            # Ignore individual merchant failures
+            continue
+
+    # In-memory filtering and simple relevance scoring (reuse Agent API logic)
+    filtered_products: list[dict[str, Any]] = []
+    q = (filters.query or "").strip().lower()
+
+    for product in all_products:
+        # Price filter
+        price = float(product.get("price", 0) or 0)
+        if filters.price_min is not None and price < filters.price_min:
+            continue
+        if filters.price_max is not None and price > filters.price_max:
+            continue
+
+        # Category filter
+        if filters.category:
+            cat = filters.category.lower()
+            product_category = (product.get("category") or product.get("product_type") or "").lower()
+            if cat not in product_category:
+                continue
+
+        # Text relevance
+        relevance_score = 1.0
+        if q:
+            title = (product.get("title") or "").lower()
+            description = (product.get("description") or "").lower()
+
+            if q in title:
+                relevance_score = 1.0 if q == title else 0.9
+            elif q in description:
+                relevance_score = 0.7
+            else:
+                words = q.split()
+                matches = sum(1 for w in words if w in title or w in description)
+                if matches == 0:
+                    continue
+                relevance_score = 0.5 + (matches / len(words)) * 0.3
+
+        product["relevance_score"] = relevance_score
+        filtered_products.append(product)
+
+    # Sort by relevance
+    filtered_products.sort(key=lambda p: p.get("relevance_score", 0), reverse=True)
+
+    total = len(filtered_products)
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    page_items = filtered_products[start_idx:end_idx]
+
+    # Map to Shopping contract; inject merchant_id into result
+    out_products = []
+    for prod in page_items:
+        sp = StandardProduct(
+            id=str(prod.get("id") or prod.get("product_id")),
+            platform=str(prod.get("platform") or "unknown"),
+            merchant_id=str(prod.get("merchant_id")),
+            title=prod.get("title") or "",
+            description=prod.get("description"),
+            vendor=prod.get("vendor"),
+            product_type=prod.get("product_type"),
+            tags=prod.get("tags") or [],
+            price=float(prod.get("price") or 0),
+            compare_at_price=prod.get("compare_at_price"),
+            currency=prod.get("currency") or "USD",
+            inventory_quantity=int(prod.get("inventory_quantity") or 0),
+            in_stock=prod.get("in_stock"),
+            sku=prod.get("sku"),
+            barcode=prod.get("barcode"),
+            image_url=prod.get("image_url"),
+            images=prod.get("images") or [],
+            variants=prod.get("variants") or [],
+        )
+        item = _standard_to_shop_product(sp)
+        # add merchant name if we have it
+        item["merchant_name"] = prod.get("merchant_name")
+        out_products.append(item)
+
+    return {
+        "products": out_products,
+        "total": total,
+        "page": page,
+        "page_size": len(out_products),
+        "metadata": {
+            "query_source": "cache_multi",
+            "fetched_at": datetime.utcnow().isoformat(),
+            "merchants_searched": len(merchant_map),
         },
     }
 
@@ -387,6 +535,10 @@ async def invoke_shop_operation(
     if operation == "create_order":
         payload = CreateOrderPayload(**request.payload)
         return await _handle_create_order(payload.order)
+
+    if operation == "find_products_multi":
+        payload = FindProductsMultiPayload(**request.payload)
+        return await _handle_find_products_multi(payload.search, background_tasks)
 
     if operation == "submit_payment":
         payload = SubmitPaymentPayload(**request.payload)
