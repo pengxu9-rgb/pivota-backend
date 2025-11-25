@@ -275,17 +275,19 @@ class WixProductAdapter:
                         stock_data = wp.get("stock") if wp else {}
                         inventory = 0
                         if stock_data:
-                            # Wix 库存语义：
-                            # - trackQuantity = true → 使用 quantity
-                            # - trackQuantity = false 且 inStock = true → 无限库存（视为充足库存）
-                            #   此时 quantity 通常为 0，但前台仍显示 In stock
-                            track_quantity = stock_data.get("trackQuantity")
-                            in_stock_flag = stock_data.get("inStock")
+                            # Wix 库存语义（综合兼容）：
+                            # - 老字段：trackInventory
+                            # - 新字段：trackQuantity
+                            # - inStock: 是否展示为“有货”
+                            # - quantity: 仅在跟踪库存时有意义
                             raw_quantity = stock_data.get("quantity", 0) or 0
+                            in_stock_flag = stock_data.get("inStock")
+                            track_quantity = stock_data.get("trackQuantity")
+                            track_inventory = stock_data.get("trackInventory")
 
-                            if track_quantity is False:
-                                # 不跟踪数量，只要 inStock 为真，就当作“有货”
-                                inventory = raw_quantity if raw_quantity > 0 else 9999
+                            # 不跟踪库存但标记为 inStock：视为充足库存（Wix 前台会显示有货）
+                            if (track_quantity is False or track_inventory is False) and in_stock_flag is True and raw_quantity <= 0:
+                                inventory = 9999
                             else:
                                 # 正常按照数量来
                                 inventory = raw_quantity
