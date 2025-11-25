@@ -44,7 +44,7 @@ from db.orders import orders as orders_table
 from utils.auth import create_access_token, decode_token
 
 
-router = APIRouter(tags=["accounts-orders"])
+router = APIRouter(prefix="/accounts", tags=["accounts-orders"])
 
 
 # ---------------------------------------------------------------------------
