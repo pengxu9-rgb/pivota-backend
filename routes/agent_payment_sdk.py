@@ -194,7 +194,8 @@ async def create_payment(
             order_id=request.order_id,
             payment_intent_id=payment_intent.id,
             client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
-            payment_status="processing"
+            payment_status="processing",
+            psp_used=psp_used,
         )
         
         # 9. Log request
@@ -280,7 +281,6 @@ async def get_payment_status(
     except Exception as e:
         logger.error(f"Get payment status error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get payment status")
-
 
 
 

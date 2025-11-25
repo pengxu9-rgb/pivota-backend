@@ -260,26 +260,28 @@ async def get_merchant_psps(
         
         try:
             # Get metrics from real orders - grouped by PSP (simplified: just filter deleted, keep original payment_status logic)
+            # Prefer orders.psp_used when available (actual PSP used, e.g. from MultiPSP orchestrator),
+            # fall back to legacy psp_id for old records.
             metrics_query = """
                 SELECT 
-                    psp_id,
+                    COALESCE(psp_used, psp_id) AS psp_key,
                     COUNT(*) as total_orders,
                     SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) as successful_orders,
                     COALESCE(SUM(total), 0) as total_volume
                 FROM orders
                 WHERE merchant_id = :merchant_id 
-                AND psp_id IS NOT NULL
+                AND (psp_used IS NOT NULL OR psp_id IS NOT NULL)
                 AND (is_deleted IS NULL OR is_deleted = FALSE)
-                GROUP BY psp_id
+                GROUP BY COALESCE(psp_used, psp_id)
             """
             psp_metrics = await database.fetch_all(metrics_query, {
                 "merchant_id": merchant_id
             })
             
-            # Create a map of PSP metrics
+            # Create a map of PSP metrics keyed by psp_key
             psp_stats = {}
             for metric in psp_metrics:
-                psp_stats[metric["psp_id"]] = {
+                psp_stats[metric["psp_key"]] = {
                     "total_orders": metric["total_orders"] or 0,
                     "successful_orders": metric["successful_orders"] or 0,
                     "total_volume": float(metric["total_volume"] or 0),
@@ -296,14 +298,15 @@ async def get_merchant_psps(
             if row["capabilities"]:
                 capabilities = row["capabilities"].split(',')
             
-            # Get specific stats for this PSP, or use 0 if no transactions
             psp_id = row["psp_id"]
-            stats = psp_stats.get(psp_id, {
+            provider = row["provider"]
+            # Prefer metrics keyed by provider (psp_used), fall back to legacy psp_id
+            stats = psp_stats.get(provider) or psp_stats.get(psp_id) or {
                 "total_orders": 0,
                 "successful_orders": 0,
                 "total_volume": 0,
-                "success_rate": 0
-            })
+                "success_rate": 0,
+            }
             
             psps.append({
                 "id": psp_id,

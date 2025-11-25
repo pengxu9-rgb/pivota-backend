@@ -243,17 +243,24 @@ async def update_payment_info(
     order_id: str,
     payment_intent_id: str,
     client_secret: str,
-    payment_status: str = "processing"
+    payment_status: str = "processing",
+    psp_used: Optional[str] = None
 ) -> bool:
-    """更新支付信息"""
-    query = orders.update().where(
-        orders.c.order_id == order_id
-    ).values(
-        payment_intent_id=payment_intent_id,
-        client_secret=client_secret,
-        payment_status=payment_status,
-        updated_at=datetime.now()
-    )
+    """更新支付信息
+    
+    - payment_intent_id / client_secret / payment_status 按照原有逻辑更新
+    - 可选的 psp_used 用于记录实际使用的 PSP 提供方（如 'stripe' 或 'adyen'）
+    """
+    update_values = {
+        "payment_intent_id": payment_intent_id,
+        "client_secret": client_secret,
+        "payment_status": payment_status,
+        "updated_at": datetime.now(),
+    }
+    if psp_used:
+        update_values["psp_used"] = psp_used
+    
+    query = orders.update().where(orders.c.order_id == order_id).values(**update_values)
     
     result = await database.execute(query)
     # Handle None result from PostgreSQL
@@ -398,4 +405,3 @@ async def get_order_stats(merchant_id: str) -> Dict[str, Any]:
         "total_revenue": float(total_revenue),
         "currency": "USD"
     }
-

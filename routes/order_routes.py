@@ -410,7 +410,8 @@ async def create_new_order(
                         order_id=order_id,
                         payment_intent_id=payment_intent_id,
                         client_secret=client_secret,
-                        payment_status="awaiting_payment"
+                        payment_status="awaiting_payment",
+                        psp_used=psp_type,
                     )
                     await log_order_event(
                         event_type="order_created",

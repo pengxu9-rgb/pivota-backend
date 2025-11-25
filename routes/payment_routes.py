@@ -407,6 +407,7 @@ async def checkout_webhook(
             payment_intent_id=transaction_id or order.get("payment_intent_id"),
             client_secret=client_secret,
             payment_status="paid",
+            psp_used="checkout",
         )
         
         # Mark as paid
