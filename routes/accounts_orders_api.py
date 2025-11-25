@@ -11,7 +11,7 @@ Paths implemented here follow the contract in:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import (
@@ -472,7 +472,7 @@ async def start_login(request: Request, body: LoginStartRequest):
     ip = _get_client_ip(request)
 
     # Basic rate limiting using OTP table (per IP and per email)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     window_start = now - timedelta(minutes=1)
 
     try:
@@ -579,7 +579,7 @@ async def verify_login(body: VerifyRequest, request: Request):
             "Invalid or expired verification code",
         )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if otp_row["consumed_at"] is not None or otp_row["expires_at"] < now:
         raise _error(
             status.HTTP_400_BAD_REQUEST,
@@ -825,7 +825,7 @@ async def list_orders(
                 payment_status=payment_status_mapped,
                 fulfillment_status=fulfillment_status_mapped,
                 delivery_status=delivery_status,
-                created_at=(data.get("created_at") or datetime.utcnow()).isoformat(),
+                created_at=(data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
                 shipping_city=shipping.get("city"),
                 shipping_country=shipping.get("country"),
                 items_summary=_build_items_summary(items),
@@ -945,8 +945,8 @@ async def get_order_detail(
             "payment_status": payment_status_mapped,
             "fulfillment_status": fulfillment_status_mapped,
             "delivery_status": delivery_status,
-            "created_at": (order_data.get("created_at") or datetime.utcnow()).isoformat(),
-            "updated_at": (order_data.get("updated_at") or datetime.utcnow()).isoformat(),
+            "created_at": (order_data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
+            "updated_at": (order_data.get("updated_at") or datetime.now(timezone.utc)).isoformat(),
             "shipping_address": {
                 "name": shipping.get("name"),
                 "city": shipping.get("city"),
@@ -1050,7 +1050,7 @@ async def public_order_lookup(
         status=status_summary,
         currency=order_data.get("currency", "USD"),
         total_amount_minor=_amount_to_minor(order_data.get("total")),
-        created_at=(order_data.get("created_at") or datetime.utcnow()).isoformat(),
+        created_at=(order_data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         items_summary=_build_items_summary(items),
         shipping={
             "city": shipping.get("city"),
@@ -1120,7 +1120,7 @@ async def public_track(
     )
 
     timeline: List[PublicTrackEvent] = []
-    created_at = order_data.get("created_at") or datetime.utcnow()
+    created_at = order_data.get("created_at") or datetime.now(timezone.utc)
     timeline.append(
         PublicTrackEvent(
             status="ordered", timestamp=created_at.isoformat(), completed=True
