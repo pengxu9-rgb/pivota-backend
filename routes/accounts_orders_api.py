@@ -720,7 +720,7 @@ async def list_orders(
     """
     offset = int(cursor or 0)
 
-    where_clauses = [orders_table.c.is_deleted.is_(False)]
+    where_clauses = []
 
     # Access control
     if principal.primary_role == "customer":
@@ -843,10 +843,7 @@ async def get_order_detail(
     order_id: str, principal: AccountsPrincipal = Depends(get_accounts_principal)
 ):
     order = await database.fetch_one(
-        orders_table.select().where(
-            (orders_table.c.order_id == order_id)
-            & (orders_table.c.is_deleted.is_(False))
-        )
+        orders_table.select().where(orders_table.c.order_id == order_id)
     )
     if not order:
         raise _error(
@@ -1006,10 +1003,7 @@ async def public_order_lookup(
 
     # Lookup order
     order = await database.fetch_one(
-        orders_table.select().where(
-            (orders_table.c.order_id == order_id)
-            & (orders_table.c.is_deleted.is_(False))
-        )
+        orders_table.select().where(orders_table.c.order_id == order_id)
     )
     if not order:
         raise _error(
@@ -1089,10 +1083,7 @@ async def public_track(
         )
 
     order = await database.fetch_one(
-        orders_table.select().where(
-            (orders_table.c.order_id == order_id)
-            & (orders_table.c.is_deleted.is_(False))
-        )
+        orders_table.select().where(orders_table.c.order_id == order_id)
     )
     if not order:
         raise _error(
