@@ -275,7 +275,20 @@ class WixProductAdapter:
                         stock_data = wp.get("stock") if wp else {}
                         inventory = 0
                         if stock_data:
-                            inventory = stock_data.get("quantity", 0) or 0
+                            # Wix 库存语义：
+                            # - trackQuantity = true → 使用 quantity
+                            # - trackQuantity = false 且 inStock = true → 无限库存（视为充足库存）
+                            #   此时 quantity 通常为 0，但前台仍显示 In stock
+                            track_quantity = stock_data.get("trackQuantity")
+                            in_stock_flag = stock_data.get("inStock")
+                            raw_quantity = stock_data.get("quantity", 0) or 0
+
+                            if track_quantity is False:
+                                # 不跟踪数量，只要 inStock 为真，就当作“有货”
+                                inventory = raw_quantity if raw_quantity > 0 else 9999
+                            else:
+                                # 正常按照数量来
+                                inventory = raw_quantity
                         
                         # Check if product is orderable
                         is_orderable = (
@@ -394,4 +407,3 @@ async def fetch_merchant_products(
         )
     else:
         return [], None, f"Platform {platform} not implemented"
-
