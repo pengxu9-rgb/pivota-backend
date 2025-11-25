@@ -290,6 +290,10 @@ async def admin_connect_psp(
     if provider == "checkout" and not account_id:
         raise HTTPException(status_code=400, detail="Checkout.com requires processing_channel_id in account_id field")
 
+    # Validate Adyen requires merchantAccount
+    if provider == "adyen" and not account_id:
+        raise HTTPException(status_code=400, detail="Adyen requires merchantAccount in account_id field")
+
     # If updating existing PSP (has psp_id but no merchant_id)
     if psp_id and not merchant_id:
         # Fetch merchant_id from existing record
