@@ -38,7 +38,8 @@ class SearchFilters(BaseModel):
     price_min: Optional[float] = Field(None, description="Minimum price filter")
     price_max: Optional[float] = Field(None, description="Maximum price filter")
     page: int = Field(1, ge=1, description="Page number (1-based)")
-    limit: int = Field(20, ge=1, le=100, description="Page size (max 100)")
+    # Allow larger requested limits; internal logic will clamp to safe bounds.
+    limit: int = Field(20, ge=1, le=500, description="Page size (max 500; internally clamped)")
 
 
 class FindProductsPayload(BaseModel):
@@ -50,7 +51,8 @@ class MultiSearchFilters(BaseModel):
     price_min: Optional[float] = Field(None, description="Minimum price filter")
     price_max: Optional[float] = Field(None, description="Maximum price filter")
     page: int = Field(1, ge=1, description="Page number (1-based)")
-    limit: int = Field(20, ge=1, le=100, description="Page size (max 100)")
+    # Front-ends may request up to 500; we still clamp internally.
+    limit: int = Field(20, ge=1, le=500, description="Page size (max 500; internally clamped)")
 
 
 class FindProductsMultiPayload(BaseModel):
