@@ -718,124 +718,136 @@ async def list_orders(
     - Customers: only their own orders (by email).
     - Merchant staff: requires memberships (not yet populated in production).
     """
-    offset = int(cursor or 0)
+    try:
+        offset = int(cursor or 0)
 
-    where_clauses = []
+        where_clauses = []
 
-    # Access control
-    if principal.primary_role == "customer":
-        where_clauses.append(
-            func.lower(orders_table.c.customer_email) == principal.email_normalized
+        # Access control
+        if principal.primary_role == "customer":
+            where_clauses.append(
+                func.lower(orders_table.c.customer_email) == principal.email_normalized
+            )
+        else:
+            # For now, only customers are fully supported
+            raise _error(
+                status.HTTP_403_FORBIDDEN,
+                "FORBIDDEN",
+                "Only customer accounts can access orders via this API for now",
+            )
+
+        # Filters
+        if from_time:
+            dt_from = _parse_iso_datetime(from_time)
+            if not dt_from:
+                raise _error(
+                    status.HTTP_400_BAD_REQUEST,
+                    "INVALID_INPUT",
+                    "Invalid from datetime",
+                )
+            where_clauses.append(orders_table.c.created_at >= dt_from)
+        if to_time:
+            dt_to = _parse_iso_datetime(to_time)
+            if not dt_to:
+                raise _error(
+                    status.HTTP_400_BAD_REQUEST,
+                    "INVALID_INPUT",
+                    "Invalid to datetime",
+                )
+            where_clauses.append(orders_table.c.created_at <= dt_to)
+
+        if status_filter:
+            # Map summary status onto underlying fields; for now, best-effort simple mapping
+            if status_filter == "paid":
+                where_clauses.append(orders_table.c.payment_status == "paid")
+            elif status_filter == "cancelled":
+                where_clauses.append(orders_table.c.status == "cancelled")
+            elif status_filter == "refunded":
+                where_clauses.append(orders_table.c.status == "refunded")
+            # Other statuses are derived and filtered client-side for now
+
+        if payment_status:
+            where_clauses.append(
+                func.lower(orders_table.c.payment_status) == payment_status.lower()
+            )
+
+        if fulfillment_status:
+            where_clauses.append(
+                func.lower(orders_table.c.fulfillment_status)
+                == fulfillment_status.lower()
+            )
+
+        if q:
+            q_trimmed = q.strip()
+            pattern = f"%{q_trimmed}%"
+            where_clauses.append(
+                (
+                    orders_table.c.order_id.ilike(pattern)
+                    | orders_table.c.customer_email.ilike(pattern)
+                )
+            )
+
+        query = (
+            orders_table.select()
+            .where(and_(*where_clauses))
+            .order_by(orders_table.c.created_at.desc())
+            .limit(limit)
+            .offset(offset)
         )
-    else:
-        # For now, only customers are fully supported
+
+        rows = await database.fetch_all(query)
+        orders_list: List[OrdersListItem] = []
+
+        for row in rows:
+            data = dict(row)
+            payment_status_mapped = _map_payment_status(data.get("payment_status"))
+            fulfillment_status_mapped = _map_fulfillment_status(
+                data.get("fulfillment_status")
+            )
+            delivery_status = _derive_delivery_status(
+                data.get("fulfillment_status"), data.get("tracking_number")
+            )
+            status_summary = _derive_order_status(
+                payment_status_mapped,
+                fulfillment_status_mapped,
+                cancelled=(data.get("status") == "cancelled"),
+                refunded=(data.get("status") == "refunded"),
+            )
+
+            shipping = data.get("shipping_address") or {}
+            items = data.get("items") or []
+
+            orders_list.append(
+                OrdersListItem(
+                    order_id=data["order_id"],
+                    currency=data.get("currency", "USD"),
+                    total_amount_minor=_amount_to_minor(data.get("total")),
+                    status=status_summary,
+                    payment_status=payment_status_mapped,
+                    fulfillment_status=fulfillment_status_mapped,
+                    delivery_status=delivery_status,
+                    created_at=(data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
+                    shipping_city=shipping.get("city"),
+                    shipping_country=shipping.get("country"),
+                    items_summary=_build_items_summary(items),
+                    permissions=_compute_permissions(data, principal),
+                )
+            )
+
+        has_more = len(rows) == limit
+        next_cursor = str(offset + limit) if has_more else None
+        return OrdersListResponse(orders=orders_list, next_cursor=next_cursor, has_more=has_more)
+    except HTTPException:
+        raise
+    except Exception as e:
+        from utils.logger import logger as app_logger
+
+        app_logger.error(f"[AccountsOrders] list_orders failed: {type(e).__name__}: {e}")
         raise _error(
-            status.HTTP_403_FORBIDDEN,
-            "FORBIDDEN",
-            "Only customer accounts can access orders via this API for now",
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "SERVER_ERROR",
+            "list_orders failed",
         )
-
-    # Filters
-    if from_time:
-        dt_from = _parse_iso_datetime(from_time)
-        if not dt_from:
-            raise _error(
-                status.HTTP_400_BAD_REQUEST,
-                "INVALID_INPUT",
-                "Invalid from datetime",
-            )
-        where_clauses.append(orders_table.c.created_at >= dt_from)
-    if to_time:
-        dt_to = _parse_iso_datetime(to_time)
-        if not dt_to:
-            raise _error(
-                status.HTTP_400_BAD_REQUEST,
-                "INVALID_INPUT",
-                "Invalid to datetime",
-            )
-        where_clauses.append(orders_table.c.created_at <= dt_to)
-
-    if status_filter:
-        # Map summary status onto underlying fields; for now, best-effort simple mapping
-        if status_filter == "paid":
-            where_clauses.append(orders_table.c.payment_status == "paid")
-        elif status_filter == "cancelled":
-            where_clauses.append(orders_table.c.status == "cancelled")
-        elif status_filter == "refunded":
-            where_clauses.append(orders_table.c.status == "refunded")
-        # Other statuses are derived and filtered client-side for now
-
-    if payment_status:
-        where_clauses.append(
-            func.lower(orders_table.c.payment_status) == payment_status.lower()
-        )
-
-    if fulfillment_status:
-        where_clauses.append(
-            func.lower(orders_table.c.fulfillment_status)
-            == fulfillment_status.lower()
-        )
-
-    if q:
-        q_trimmed = q.strip()
-        pattern = f"%{q_trimmed}%"
-        where_clauses.append(
-            (
-                orders_table.c.order_id.ilike(pattern)
-                | orders_table.c.customer_email.ilike(pattern)
-            )
-        )
-
-    query = (
-        select([orders_table])
-        .where(and_(*where_clauses))
-        .order_by(orders_table.c.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-
-    rows = await database.fetch_all(query)
-    orders_list: List[OrdersListItem] = []
-
-    for row in rows:
-        data = dict(row)
-        payment_status_mapped = _map_payment_status(data.get("payment_status"))
-        fulfillment_status_mapped = _map_fulfillment_status(
-            data.get("fulfillment_status")
-        )
-        delivery_status = _derive_delivery_status(
-            data.get("fulfillment_status"), data.get("tracking_number")
-        )
-        status_summary = _derive_order_status(
-            payment_status_mapped,
-            fulfillment_status_mapped,
-            cancelled=(data.get("status") == "cancelled"),
-            refunded=(data.get("status") == "refunded"),
-        )
-
-        shipping = data.get("shipping_address") or {}
-        items = data.get("items") or []
-
-        orders_list.append(
-            OrdersListItem(
-                order_id=data["order_id"],
-                currency=data.get("currency", "USD"),
-                total_amount_minor=_amount_to_minor(data.get("total")),
-                status=status_summary,
-                payment_status=payment_status_mapped,
-                fulfillment_status=fulfillment_status_mapped,
-                delivery_status=delivery_status,
-                created_at=(data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
-                shipping_city=shipping.get("city"),
-                shipping_country=shipping.get("country"),
-                items_summary=_build_items_summary(items),
-                permissions=_compute_permissions(data, principal),
-            )
-        )
-
-    has_more = len(rows) == limit
-    next_cursor = str(offset + limit) if has_more else None
-    return OrdersListResponse(orders=orders_list, next_cursor=next_cursor, has_more=has_more)
 
 
 @router.get("/orders/{order_id}")
