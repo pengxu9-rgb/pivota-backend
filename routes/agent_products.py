@@ -239,6 +239,7 @@ async def get_product_details(
                 "status": "success",
                 "product": {
                     "id": product_id_out,
+                    "merchant_id": merchant_id,
                     "title": title,
                     "description": description,
                     "vendor": prod.get("vendor"),
@@ -322,6 +323,7 @@ async def get_product_details(
             "status": "success",
             "product": {
                 "id": str(product["id"]),
+                "merchant_id": merchant_id,
                 "title": product["title"],
                 "description": product.get("body_html", ""),
                 "vendor": product.get("vendor"),
