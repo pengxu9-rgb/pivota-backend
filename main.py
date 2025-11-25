@@ -193,6 +193,7 @@ from routes.simulate_payments import router as simulate_payments_router
 from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 from routes.agent_shop_gateway import router as agent_shop_gateway_router
+from routes.accounts_orders_api import router as accounts_orders_router
 
 # Service routers (only include what exists)
 try:
@@ -473,6 +474,7 @@ app.include_router(product_monitoring_router)  # Product sync monitoring and met
 # app.include_router(products_debug_router)  # Debug products endpoint (no auth)
 # app.include_router(public_products_router)  # Public test endpoint
 app.include_router(order_router)  # Order processing
+app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-facing)
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
@@ -632,6 +634,17 @@ async def startup():
             products_cache, api_call_events, order_events, merchant_analytics
         )
         from db.orders import orders
+        # Accounts & Orders API: customer-facing accounts tables
+        try:
+            from db.accounts import (
+                shop_users,
+                shop_user_memberships,
+                shop_login_otps,
+                public_order_lookup_logs,
+            )
+            logger.info("✅ Accounts tables imported for metadata creation")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not import accounts tables: {e}")
         
         # Create integration tables
         try:
@@ -793,6 +806,17 @@ async def startup():
         except Exception as e:
             logger.warning(f"⚠️ Could not create integration tables: {e}")
         from db.agents import agents, agent_usage_logs
+        # Ensure accounts tables are part of metadata when running create_all
+        try:
+            from db.accounts import (
+                shop_users,
+                shop_user_memberships,
+                shop_login_otps,
+                public_order_lookup_logs,
+            )
+            logger.info("✅ Accounts tables included in metadata.create_all")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not include accounts tables in metadata.create_all: {e}")
         from db.database import metadata, engine
         metadata.create_all(engine)
         logger.info("✅ Tables created:")
