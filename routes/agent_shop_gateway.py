@@ -228,8 +228,6 @@ async def _handle_find_products_multi(
     Output: { products: [...], total, page, page_size }
     """
     from db.database import database
-    from db.products import get_cached_products
-    from db.merchant_onboarding import get_merchant_onboarding
 
     page = filters.page or 1
     limit = min(filters.limit or 20, 100)
@@ -246,50 +244,62 @@ async def _handle_find_products_multi(
     )
     merchant_map = {row["merchant_id"]: row["business_name"] for row in merchant_rows}
 
-    all_products: list[dict[str, Any]] = []
+    if not merchant_map:
+        return {
+            "products": [],
+            "total": 0,
+            "page": page,
+            "page_size": 0,
+            "metadata": {
+                "query_source": "cache_multi",
+                "fetched_at": datetime.utcnow().isoformat(),
+                "merchants_searched": 0,
+            },
+        }
 
-    # Collect cached products per merchant
+    # How many products to fetch per merchant (before global filtering/pagination)
+    # We fetch a bit more than the requested page size to have headroom for filtering.
+    per_merchant_limit = min(max(limit * 2, 20), 200)
+
+    # Collect products as (StandardProduct, merchant_name) tuples
+    merchant_products: list[tuple[StandardProduct, str]] = []
     for mid, name in merchant_map.items():
         try:
-            cached = await get_cached_products(mid, platform="shopify", include_expired=False)
-            if cached:
-                # Convert cache rows into product dicts
-                for row in cached:
-                    data = row.get("product_data") or {}
-                    if not isinstance(data, dict):
-                        continue
-                    product = dict(data)
-                    product["merchant_id"] = mid
-                    product["merchant_name"] = name
-                    all_products.append(product)
+            products, _source, _error = await get_products_hybrid(
+                merchant_id=mid,
+                limit=per_merchant_limit,
+                agent_id="shopping_ai_multi",
+                background_tasks=background_tasks,
+            )
+            for p in products:
+                merchant_products.append((p, name))
         except Exception:
-            # Ignore individual merchant failures
+            # Ignore individual merchant failures to keep cross-merchant search robust
             continue
 
     # In-memory filtering and simple relevance scoring (reuse Agent API logic)
     filtered_products: list[dict[str, Any]] = []
     q = (filters.query or "").strip().lower()
 
-    for product in all_products:
+    for product, merchant_name in merchant_products:
         # Price filter
-        price = float(product.get("price", 0) or 0)
-        if filters.price_min is not None and price < filters.price_min:
+        if filters.price_min is not None and product.price < filters.price_min:
             continue
-        if filters.price_max is not None and price > filters.price_max:
+        if filters.price_max is not None and product.price > filters.price_max:
             continue
 
         # Category filter
         if filters.category:
             cat = filters.category.lower()
-            product_category = (product.get("category") or product.get("product_type") or "").lower()
+            product_category = (product.product_type or "").lower()
             if cat not in product_category:
                 continue
 
         # Text relevance
         relevance_score = 1.0
         if q:
-            title = (product.get("title") or "").lower()
-            description = (product.get("description") or "").lower()
+            title = (product.title or "").lower()
+            description = (product.description or "").lower()
 
             if q in title:
                 relevance_score = 1.0 if q == title else 0.9
@@ -302,11 +312,18 @@ async def _handle_find_products_multi(
                     continue
                 relevance_score = 0.5 + (matches / len(words)) * 0.3
 
-        product["relevance_score"] = relevance_score
-        filtered_products.append(product)
+        filtered_products.append(
+            {
+                "product": product,
+                "merchant_name": merchant_name,
+                "relevance_score": relevance_score,
+            }
+        )
 
     # Sort by relevance
-    filtered_products.sort(key=lambda p: p.get("relevance_score", 0), reverse=True)
+    filtered_products.sort(
+        key=lambda p: p.get("relevance_score", 0), reverse=True
+    )
 
     total = len(filtered_products)
     start_idx = (page - 1) * limit
@@ -315,30 +332,13 @@ async def _handle_find_products_multi(
 
     # Map to Shopping contract; inject merchant_id into result
     out_products = []
-    for prod in page_items:
-        sp = StandardProduct(
-            id=str(prod.get("id") or prod.get("product_id")),
-            platform=str(prod.get("platform") or "unknown"),
-            merchant_id=str(prod.get("merchant_id")),
-            title=prod.get("title") or "",
-            description=prod.get("description"),
-            vendor=prod.get("vendor"),
-            product_type=prod.get("product_type"),
-            tags=prod.get("tags") or [],
-            price=float(prod.get("price") or 0),
-            compare_at_price=prod.get("compare_at_price"),
-            currency=prod.get("currency") or "USD",
-            inventory_quantity=int(prod.get("inventory_quantity") or 0),
-            in_stock=prod.get("in_stock"),
-            sku=prod.get("sku"),
-            barcode=prod.get("barcode"),
-            image_url=prod.get("image_url"),
-            images=prod.get("images") or [],
-            variants=prod.get("variants") or [],
-        )
+    for item_wrapper in page_items:
+        sp: StandardProduct = item_wrapper["product"]
+        merchant_name = item_wrapper.get("merchant_name")
+
         item = _standard_to_shop_product(sp)
         # add merchant name if we have it
-        item["merchant_name"] = prod.get("merchant_name")
+        item["merchant_name"] = merchant_name
         out_products.append(item)
 
     return {
