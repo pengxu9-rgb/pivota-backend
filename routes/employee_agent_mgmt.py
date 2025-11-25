@@ -21,6 +21,34 @@ router = APIRouter(prefix="/employee", tags=["employee-agents"])
 
 # ============== Helpers ==============
 
+def resolve_agent_display_name(agent: dict) -> str:
+    """
+    Normalize agent display name across multiple historical schemas.
+
+    Prefers:
+    - name
+    - agent_name
+    - full_name
+    Then falls back to email/owner_email prefix, then agent_id.
+    """
+    for key in ("name", "agent_name", "full_name"):
+        value = agent.get(key)
+        if value:
+            return value
+
+    # Fallback to email-based name
+    email = agent.get("email") or agent.get("owner_email")
+    if email:
+        base = email.split("@")[0]
+        base = base.replace(".", " ").replace("_", " ")
+        return f"{base.title()} Agent"
+
+    if agent.get("agent_id"):
+        return agent["agent_id"]
+
+    return "Unknown Agent"
+
+
 def parse_json_field(value):
     """Safely parse JSON field - handles both string and already-parsed JSON"""
     if isinstance(value, list):
@@ -144,6 +172,11 @@ async def get_all_agents(
         for agent in agents:
             # Use direct dict() conversion - works with databases.Record
             agent_dict = dict(agent)
+
+            # Normalize core identity fields across schemas
+            display_name = resolve_agent_display_name(agent_dict)
+            primary_email = agent_dict.get("email") or agent_dict.get("owner_email")
+            owner_email = agent_dict.get("owner_email") or agent_dict.get("email")
             
             # Safe access with defaults
             api_key = agent_dict.get("api_key") or ""
@@ -151,8 +184,11 @@ async def get_all_agents(
             
             formatted_agents.append({
                 "agent_id": agent_dict.get("agent_id"),
-                "agent_name": agent_dict.get("name") or "Unknown Agent",
-                "owner_email": agent_dict.get("email"),
+                # Keep both fields for frontend compatibility
+                "agent_name": display_name,
+                "name": display_name,
+                "owner_email": owner_email,
+                "email": primary_email,
                 "agent_type": agent_dict.get("agent_type") or "Generic",
                 "company": agent_dict.get("company"),
                 "api_key_prefix": api_key_prefix,
@@ -198,6 +234,11 @@ async def get_agent_details(
         
         # Convert to dict
         agent = dict(agent_row)
+
+        # Normalize identity fields
+        display_name = resolve_agent_display_name(agent)
+        primary_email = agent.get("email") or agent.get("owner_email")
+        owner_email = agent.get("owner_email") or agent.get("email")
         
         # Get agent's merchant connections
         merchant_connections = await database.fetch_all(
@@ -237,8 +278,11 @@ async def get_agent_details(
             "status": "success",
             "agent": {
                 "agent_id": agent.get("agent_id"),
-                "name": agent.get("name"),
-                "email": agent.get("email"),
+                # Expose both normalized name/email and raw fields for compatibility
+                "agent_name": display_name,
+                "name": display_name,
+                "email": primary_email,
+                "owner_email": owner_email,
                 "company": agent.get("company"),
                 "use_case": agent.get("use_case") or "General integration",
                 "api_key": agent.get("api_key"),
@@ -1290,4 +1334,3 @@ async def get_agent_health_score(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to calculate health score: {str(e)}")
-
