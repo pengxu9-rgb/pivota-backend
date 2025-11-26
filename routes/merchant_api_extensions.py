@@ -1,6 +1,6 @@
 """Extended Merchant API Routes for Dashboard Features"""
 from fastapi import APIRouter, Depends, HTTPException, Body
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone
 from db.database import database
@@ -15,6 +15,10 @@ import os
 import random
 import string
 import time
+import json
+import hashlib
+
+from services.payment_routing_service import PaymentRoutingService
 
 router = APIRouter()
 
@@ -46,6 +50,14 @@ async def get_merchant_id_from_user(current_user: dict) -> str:
         raise HTTPException(status_code=404, detail="Merchant ID not found")
     
     return merchant_id
+
+
+class MerchantRoutingUpdate(BaseModel):
+    """Merchant-level PSP routing configuration"""
+    psp_priority: List[Dict[str, Any]]
+    routing_strategy: str = "priority"
+    max_retries: int = 2
+    timeout_ms: int = 30000
 
 @router.get("/merchant/dashboard/stats")
 async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
@@ -249,6 +261,167 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"❌ Sync failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
+
+
+@router.get("/merchant/integrations/routing")
+async def get_merchant_routing_config(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Get PSP routing configuration for the current merchant.
+
+    This surfaces the `payment_routes` configuration where `merchant_id` matches
+    the logged-in merchant. If no explicit route exists yet, a default route is
+    synthesized based on active merchant_psps (most recently connected first).
+    """
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    # Try to load existing route config
+    route = await database.fetch_one(
+        """
+        SELECT route_id, psp_priority, routing_strategy, is_active,
+               max_retries, timeout_ms, metadata, created_at, updated_at
+        FROM payment_routes
+        WHERE merchant_id = :merchant_id AND is_active = true
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        {"merchant_id": merchant_id},
+    )
+
+    if not route:
+        # No explicit route yet; synthesize default using PaymentRoutingService logic
+        routing_service = PaymentRoutingService(database)
+        default_config = await routing_service._create_default_route(
+            agent_id=merchant_id,
+            merchant_id=merchant_id,
+        )
+        psp_priority = default_config["psp_priority"]
+        routing_strategy = default_config["routing_strategy"]
+        max_retries = default_config.get("max_retries", 2)
+        timeout_ms = 30000
+        route_id = default_config["route_id"]
+        metadata_dict: Dict[str, Any] = {}
+        created_at = datetime.now(timezone.utc)
+        updated_at = created_at
+    else:
+        psp_priority = route["psp_priority"]
+        if isinstance(psp_priority, str):
+            psp_priority = json.loads(psp_priority)
+        routing_strategy = route["routing_strategy"]
+        max_retries = route.get("max_retries", 2)
+        timeout_ms = route.get("timeout_ms", 30000)
+        metadata_raw = route.get("metadata") or {}
+        metadata_dict = (
+            json.loads(metadata_raw)
+            if isinstance(metadata_raw, str)
+            else dict(metadata_raw)
+            if isinstance(metadata_raw, dict)
+            else {}
+        )
+        route_id = route["route_id"]
+        created_at = route["created_at"]
+        updated_at = route["updated_at"]
+
+    return {
+        "status": "success",
+        "data": {
+            "route_id": route_id,
+            "merchant_id": merchant_id,
+            "psp_priority": psp_priority,
+            "routing_strategy": routing_strategy,
+            "max_retries": max_retries,
+            "timeout_ms": timeout_ms,
+            "metadata": metadata_dict,
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else None,
+            "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else None,
+        },
+    }
+
+
+@router.put("/merchant/integrations/routing")
+async def update_merchant_routing_config(
+    update: MerchantRoutingUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Update PSP routing configuration for the current merchant.
+
+    This writes to `payment_routes` using merchant_id as the key so that
+    PaymentRoutingService.select_psp(agent_id, merchant_id, ...) will honor
+    the merchant's preferences for all agents.
+    """
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    # Find existing route for this merchant, if any
+    existing = await database.fetch_one(
+        """
+        SELECT route_id
+        FROM payment_routes
+        WHERE merchant_id = :merchant_id AND is_active = true
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        {"merchant_id": merchant_id},
+    )
+
+    if existing:
+        route_id = existing["route_id"]
+        await database.execute(
+            """
+            UPDATE payment_routes
+            SET psp_priority = :psp_priority,
+                routing_strategy = :routing_strategy,
+                max_retries = :max_retries,
+                timeout_ms = :timeout_ms,
+                updated_at = NOW()
+            WHERE route_id = :route_id
+            """,
+            {
+                "route_id": route_id,
+                "psp_priority": json.dumps(update.psp_priority),
+                "routing_strategy": update.routing_strategy,
+                "max_retries": update.max_retries,
+                "timeout_ms": update.timeout_ms,
+            },
+        )
+    else:
+        # Create new route row for this merchant
+        route_id = f"route_{hashlib.md5(f'{merchant_id}{datetime.utcnow()}'.encode()).hexdigest()[:12]}"
+        await database.execute(
+            """
+            INSERT INTO payment_routes (
+                route_id, agent_id, merchant_id, psp_priority,
+                routing_strategy, max_retries, timeout_ms, is_active, metadata
+            ) VALUES (
+                :route_id, :agent_id, :merchant_id, :psp_priority,
+                :routing_strategy, :max_retries, :timeout_ms, true, '{}'::jsonb
+            )
+            """,
+            {
+                "route_id": route_id,
+                "agent_id": merchant_id,
+                "merchant_id": merchant_id,
+                "psp_priority": json.dumps(update.psp_priority),
+                "routing_strategy": update.routing_strategy,
+                "max_retries": update.max_retries,
+                "timeout_ms": update.timeout_ms,
+            },
+        )
+
+    return {
+        "status": "success",
+        "data": {
+            "route_id": route_id,
+            "merchant_id": merchant_id,
+        },
+    }
 
 
 @router.get("/merchant/mcp/summary")
