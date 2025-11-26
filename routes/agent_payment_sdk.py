@@ -111,7 +111,6 @@ async def create_payment(
         # 3. Check idempotency
         if request.idempotency_key:
             # Check if payment with this key already exists
-            from db.database import database
             existing = await database.fetch_one(
                 """SELECT payment_id, payment_intent_id, status 
                    FROM payments 
