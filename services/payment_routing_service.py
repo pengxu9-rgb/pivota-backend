@@ -307,9 +307,50 @@ class PaymentRoutingService:
         return dict(result) if result else None
     
     async def _create_default_route(self, agent_id: str, merchant_id: Optional[str]) -> Dict:
-        """Create default routing configuration"""
+        """Create default routing configuration.
+
+        Behavior:
+        - If merchant_id is provided and merchant_psps has active entries,
+          use those PSPs in "last connected first" order for psp_priority.
+        - Otherwise fall back to a generic priority list (stripe > adyen > paypal).
+        """
+        psp_priority: List[Dict[str, Any]] = []
+
+        # Prefer merchant-specific PSP configuration when available
+        if merchant_id:
+            try:
+                psps = await self.database.fetch_all(
+                    """
+                    SELECT provider
+                    FROM merchant_psps
+                    WHERE merchant_id = :merchant_id AND status = 'active'
+                    ORDER BY connected_at DESC
+                    """,
+                    {"merchant_id": merchant_id},
+                )
+
+                seen: set[str] = set()
+                priority = 1
+                for row in psps:
+                    provider = (row["provider"] or "").lower()
+                    if not provider or provider in seen:
+                        continue
+                    psp_priority.append({"psp": provider, "priority": priority})
+                    seen.add(provider)
+                    priority += 1
+            except Exception as e:
+                logger.error(f"Failed to load merchant_psps for default route {merchant_id}: {e}")
+
+        # Fallback when no merchant-specific PSPs are found
+        if not psp_priority:
+            psp_priority = [
+                {"psp": "stripe", "priority": 1},
+                {"psp": "adyen", "priority": 2},
+                {"psp": "paypal", "priority": 3},
+            ]
+
         route_id = f"route_{hashlib.md5(f'{agent_id}{merchant_id}{datetime.utcnow()}'.encode()).hexdigest()[:12]}"
-        
+
         await self.database.execute(
             """
             INSERT INTO payment_routes (
@@ -322,23 +363,15 @@ class PaymentRoutingService:
                 "route_id": route_id,
                 "agent_id": agent_id,
                 "merchant_id": merchant_id,
-                "psp_priority": json.dumps([
-                    {"psp": "stripe", "priority": 1},
-                    {"psp": "adyen", "priority": 2},
-                    {"psp": "paypal", "priority": 3}
-                ])
-            }
+                "psp_priority": json.dumps(psp_priority),
+            },
         )
-        
+
         return {
             "route_id": route_id,
-            "psp_priority": [
-                {"psp": "stripe", "priority": 1},
-                {"psp": "adyen", "priority": 2},
-                {"psp": "paypal", "priority": 3}
-            ],
+            "psp_priority": psp_priority,
             "routing_strategy": "priority",
-            "max_retries": 2
+            "max_retries": 2,
         }
     
     async def _is_psp_available(self, psp_name: str) -> bool:
@@ -901,4 +934,3 @@ class PaymentRoutingService:
         return results
     
     # [Phase 4++] End of dual-routing extensions
-

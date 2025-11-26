@@ -13,6 +13,8 @@ from db.merchant_onboarding import get_merchant_onboarding
 from db.orders import get_order, update_payment_info
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import MultiPSPOrchestrator
+from services.payment_routing_service import PaymentRoutingService
+from db.database import database
 from utils.logger import logger
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-payments"])
@@ -128,126 +130,79 @@ async def create_payment(
                     created_at=datetime.now().isoformat()
                 )
 
-        # 4. Reuse existing PSP session when order already has a payment intent
-        #    This avoids creating a second Stripe intent when the order was
-        #    already provisioned with an Adyen / other PSP session during creation.
-        existing_psp = order.get("psp_used")
-        existing_intent_id = order.get("payment_intent_id")
-        existing_client_secret = order.get("client_secret")
+        # 4. Select PSP using routing rules (Integration / payment_routes)
+        routing_service = PaymentRoutingService(database)
+        currency_code = order.get("currency", "USD")
 
-        if existing_psp and existing_intent_id and existing_client_secret:
-            from db.database import database
+        selected_psp, route_config = await routing_service.select_psp(
+            agent_id=context.agent_id,
+            merchant_id=merchant_id,
+            amount=order_total,
+            currency=currency_code,
+        )
 
-            # Try to reuse an existing payments row if present
-            payment_row = await database.fetch_one(
-                """
-                SELECT payment_id, amount, currency, status, created_at
-                FROM payments
-                WHERE order_id = :order_id AND payment_intent_id = :intent_id
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                {"order_id": request.order_id, "intent_id": existing_intent_id},
-            )
+        logger.info(
+            f"[AgentPayments] Routing selected PSP '{selected_psp}' for order {request.order_id} "
+            f"(agent={context.agent_id}, merchant={merchant_id})"
+        )
 
-            if payment_row:
-                payment_dict = dict(payment_row)
-                payment_id = payment_dict.get("payment_id")
-                amount_val = float(payment_dict.get("amount") or order_total)
-                currency_val = payment_dict.get("currency") or order.get("currency", "USD")
-                status_val = payment_dict.get("status") or "processing"
-                created_at_val = (
-                    payment_dict["created_at"].isoformat()
-                    if payment_dict.get("created_at") is not None
-                    and hasattr(payment_dict.get("created_at"), "isoformat")
-                    else datetime.now().isoformat()
-                )
-            else:
-                payment_id = f"pay_{existing_intent_id}"
-                amount_val = order_total
-                currency_val = order.get("currency", "USD")
-                status_val = "processing"
-                await database.execute(
-                    """
-                    INSERT INTO payments 
-                       (payment_id, order_id, payment_intent_id, amount, currency, 
-                        psp_type, status, idempotency_key, created_at, agent_id)
-                       VALUES (:payment_id, :order_id, :intent_id, :amount, :currency,
-                               :psp, :status, :idem_key, :created_at, :agent_id)
-                    """,
-                    {
-                        "payment_id": payment_id,
-                        "order_id": request.order_id,
-                        "intent_id": existing_intent_id,
-                        "amount": amount_val,
-                        "currency": currency_val,
-                        "psp": existing_psp,
-                        "status": status_val,
-                        "idem_key": request.idempotency_key,
-                        "created_at": datetime.now(),
-                        "agent_id": context.agent_id,
-                    },
-                )
-                created_at_val = datetime.now().isoformat()
-
-            # Keep order payment info in sync; do not downgrade status if it already progressed
-            await update_payment_info(
-                order_id=request.order_id,
-                payment_intent_id=existing_intent_id,
-                client_secret=existing_client_secret,
-                payment_status=order.get("payment_status") or "processing",
-                psp_used=existing_psp,
-            )
-
-            background_tasks.add_task(
-                log_agent_request,
-                context=context,
-                status_code=200,
-                merchant_id=merchant_id,
-            )
-
-            logger.info(
-                f"Reusing existing payment intent {existing_intent_id} for order {request.order_id} via {existing_psp}"
-            )
-
-            return PaymentResponse(
-                status="processing",
-                payment_id=payment_id,
-                payment_intent_id=existing_intent_id,
-                client_secret=existing_client_secret,
-                amount=float(amount_val),
-                currency=currency_val,
-                psp_used=existing_psp,
-                psp=existing_psp,
-                payment_action=None,
-                next_action=None,
-                created_at=created_at_val,
-            )
-
-        # 5. Get merchant and PSP config
+        # 5. Resolve merchant config and create payment intent with the selected PSP
         merchant = await get_merchant_onboarding(merchant_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        
-        # 5. Create payment intent with PSP orchestrator (automatic failover)
-        orchestrator = MultiPSPOrchestrator(merchant_id)
-        
+
         amount = Decimal(str(order_total))
-        currency = order.get("currency", "USD")
-        
-        success, payment_intent, error, psp_used = await orchestrator.create_payment_intent(
-            amount=amount,
-            currency=currency,
-            metadata={
-                "order_id": request.order_id,
-                "agent_id": context.agent_id,
-                "payment_method_type": request.payment_method.type,
-                "idempotency_key": request.idempotency_key
-            }
-        )
-        
+        currency = currency_code
+
+        # Re-use MultiPSPOrchestrator config loading to resolve API keys,
+        # but execute only for the PSP chosen by routing.
+        orchestrator = MultiPSPOrchestrator(merchant_id)
+        await orchestrator.load_psp_configs()
+
+        target_config = None
+        for cfg in orchestrator.psp_configs:
+            if cfg.psp_type == selected_psp:
+                target_config = cfg
+                break
+
+        if not target_config:
+            logger.warning(
+                f"[AgentPayments] Selected PSP '{selected_psp}' not configured for merchant "
+                f"{merchant_id}; falling back to MultiPSPOrchestrator default ordering."
+            )
+            success, payment_intent, error, psp_used = await orchestrator.create_payment_intent(
+                amount=amount,
+                currency=currency,
+                metadata={
+                    "order_id": request.order_id,
+                    "agent_id": context.agent_id,
+                    "payment_method_type": request.payment_method.type,
+                    "idempotency_key": request.idempotency_key,
+                },
+            )
+        else:
+            psp_adapter = get_psp_adapter(
+                target_config.psp_type,
+                target_config.api_key,
+                merchant_account=target_config.merchant_account,
+            )
+
+            success, payment_intent, error = await psp_adapter.create_payment_intent(
+                amount=amount,
+                currency=currency,
+                metadata={
+                    "order_id": request.order_id,
+                    "agent_id": context.agent_id,
+                    "payment_method_type": request.payment_method.type,
+                    "idempotency_key": request.idempotency_key,
+                    "psp_type": target_config.psp_type,
+                    "psp_priority": target_config.priority,
+                },
+            )
+            psp_used = target_config.psp_type
+
         if not success:
-            logger.error(f"Payment intent creation failed: {error}")
+            logger.error(f"Payment intent creation failed via {psp_used}: {error}")
             raise HTTPException(status_code=500, detail=f"Payment failed: {error}")
         
         # 6. Determine if 3DS or other action required
@@ -266,7 +221,6 @@ async def create_payment(
             status = "succeeded"
         
         # 7. Store payment record
-        from db.database import database
         payment_id = f"pay_{payment_intent.id}"
         
         await database.execute(
@@ -383,4 +337,3 @@ async def get_payment_status(
     except Exception as e:
         logger.error(f"Get payment status error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get payment status")
-
