@@ -35,11 +35,11 @@ async def get_psp_overview(
         else:
             start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Get PSP configurations and their stats
-        # For the employee PSP overview we want an **attempt-level**
-        # view based on the payment_attempts table, not on final
-        # orders. Each payment_attempt row represents a concrete call
-        # to a PSP (including failover attempts).
+        # Get PSP configurations and their stats.
+        # Primary source of truth is payment_attempts (attempt-level).
+        # For PSPs/time ranges that don't yet have attempt logs, we
+        # gracefully fall back to orders-based aggregation so the
+        # dashboard still shows meaningful data.
         query = """
         WITH psp_configs AS (
             SELECT 
@@ -53,6 +53,51 @@ async def get_psp_overview(
                 COUNT(DISTINCT merchant_id) FILTER (WHERE status = 'active') AS merchant_count
             FROM merchant_psps
             GROUP BY LOWER(provider), provider
+        ),
+        order_stats AS (
+            SELECT 
+                LOWER(mp.provider) AS psp_key,
+                COUNT(o.order_id) AS transaction_count,
+                COUNT(
+                    CASE 
+                        WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
+                        THEN 1 
+                    END
+                ) AS success_count,
+                COALESCE(
+                    SUM(
+                        CASE 
+                            WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
+                            THEN o.total 
+                            ELSE 0 
+                        END
+                    ),
+                    0
+                ) AS total_volume,
+                AVG(
+                    CASE 
+                        WHEN o.payment_status IN ('paid', 'completed', 'succeeded')
+                        THEN o.total 
+                        ELSE NULL 
+                    END
+                ) AS avg_transaction_size,
+                COUNT(
+                    CASE 
+                        WHEN o.payment_status IN ('refunded', 'partially_refunded')
+                        THEN 1 
+                    END
+                ) AS refund_count,
+                MAX(o.created_at) AS last_transaction
+            FROM merchant_psps mp
+            LEFT JOIN orders o ON o.merchant_id = mp.merchant_id 
+                AND o.created_at >= :start_time
+                AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+                AND (
+                    (o.psp_id IS NOT NULL AND mp.psp_id IS NOT NULL AND o.psp_id = mp.psp_id)
+                    OR (o.psp_used IS NOT NULL AND LOWER(o.psp_used) = LOWER(mp.provider))
+                )
+            WHERE mp.status = 'active'
+            GROUP BY LOWER(mp.provider)
         ),
         attempt_stats AS (
             SELECT 
@@ -89,27 +134,33 @@ async def get_psp_overview(
             pc.psp_name,
             pc.status,
             pc.merchant_count,
-            COALESCE(a.total_attempts, 0) AS transactions_today,
-            COALESCE(a.successful_attempts, 0) AS successful_transactions,
+            COALESCE(a.total_attempts, os.transaction_count, 0) AS transactions_today,
+            COALESCE(a.successful_attempts, os.success_count, 0) AS successful_transactions,
             CASE 
-                WHEN COALESCE(a.total_attempts, 0) > 0 
-                THEN ROUND(a.successful_attempts::numeric / NULLIF(a.total_attempts, 0) * 100, 2)
+                WHEN COALESCE(a.total_attempts, os.transaction_count, 0) > 0 
+                THEN ROUND(
+                    COALESCE(a.successful_attempts, os.success_count, 0)::numeric 
+                    / NULLIF(COALESCE(a.total_attempts, os.transaction_count, 0), 0) 
+                    * 100, 
+                    2
+                )
                 ELSE 0 
             END AS success_rate,
-            COALESCE(a.total_volume, 0) AS total_volume,
-            COALESCE(a.avg_transaction_size, 0) AS avg_transaction_size,
-            -- We don't yet track refunds at attempt level; expose 0 for now
-            0 AS refund_count,
+            COALESCE(a.total_volume, os.total_volume, 0) AS total_volume,
+            COALESCE(a.avg_transaction_size, os.avg_transaction_size, 0) AS avg_transaction_size,
+            -- Refunds only available at order level for now
+            COALESCE(os.refund_count, 0) AS refund_count,
             fs.avg_fee_rate,
-            a.last_attempt,
+            COALESCE(a.last_attempt, os.last_transaction) AS last_transaction,
             CASE 
-                WHEN a.last_attempt IS NULL THEN 'Never'
-                WHEN a.last_attempt > NOW() - INTERVAL '10 minutes' THEN 'Active'
-                WHEN a.last_attempt > NOW() - INTERVAL '1 hour' THEN 'Recently Active'
+                WHEN COALESCE(a.last_attempt, os.last_transaction) IS NULL THEN 'Never'
+                WHEN COALESCE(a.last_attempt, os.last_transaction) > NOW() - INTERVAL '10 minutes' THEN 'Active'
+                WHEN COALESCE(a.last_attempt, os.last_transaction) > NOW() - INTERVAL '1 hour' THEN 'Recently Active'
                 ELSE 'Inactive'
             END AS activity_status
         FROM psp_configs pc
         LEFT JOIN attempt_stats a ON a.psp_key = pc.psp_key
+        LEFT JOIN order_stats os ON os.psp_key = pc.psp_key
         LEFT JOIN fee_stats fs ON pc.psp_name = fs.provider
         WHERE pc.status = 'active'
         ORDER BY transactions_today DESC NULLS LAST
@@ -256,10 +307,11 @@ async def get_psp_detail(
             AND pa.created_at >= :start_time
         """
         
-        metrics = await database.fetch_one(metrics_query, {
+        metrics_row = await database.fetch_one(metrics_query, {
             "psp_id": psp_id,
             "start_time": start_time
-        }) or {}
+        })
+        metrics = dict(metrics_row) if metrics_row is not None else {}
         
         # Get merchant breakdown (per-merchant attempt metrics)
         merchant_query = """
@@ -310,8 +362,8 @@ async def get_psp_detail(
         trends = await database.fetch_all(trend_query, {"psp_id": psp_id})
         
         # Calculate metrics
-        total_attempts = metrics.get("total_attempts") or 0
-        successful_attempts = metrics.get("successful_attempts") or 0
+        total_attempts = metrics.get("total_attempts", 0)
+        successful_attempts = metrics.get("successful_attempts", 0)
         success_rate = round(successful_attempts / total_attempts * 100, 2) if total_attempts > 0 else 0
         
         # Format merchant stats
@@ -353,14 +405,14 @@ async def get_psp_detail(
             "metrics": {
                 "total_transactions": total_attempts,
                 "successful_transactions": successful_attempts,
-                "failed_transactions": metrics.get("failed_attempts") or 0,
-                "pending_transactions": (metrics.get("timeout_attempts") or 0) + (metrics.get("cancelled_attempts") or 0),
+                "failed_transactions": metrics.get("failed_attempts", 0),
+                "pending_transactions": (metrics.get("timeout_attempts", 0) + metrics.get("cancelled_attempts", 0)),
                 "refunded_transactions": 0,
                 "success_rate": success_rate,
-                "total_volume": float(metrics.get("total_volume") or 0),
-                "avg_transaction_size": float(metrics.get("avg_amount") or 0),
-                "min_transaction_size": float(metrics.get("min_amount") or 0),
-                "max_transaction_size": float(metrics.get("max_amount") or 0)
+                "total_volume": float(metrics.get("total_volume", 0) or 0),
+                "avg_transaction_size": float(metrics.get("avg_amount", 0) or 0),
+                "min_transaction_size": float(metrics.get("min_amount", 0) or 0),
+                "max_transaction_size": float(metrics.get("max_amount", 0) or 0)
             },
             "merchant_stats": merchant_stats,
             "trend_data": trend_data,

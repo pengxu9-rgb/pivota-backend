@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal
 from datetime import datetime
+import time
+import hashlib
 import httpx
 import os
 import json
@@ -304,6 +306,9 @@ async def create_new_order(
         # 5. 同步创建 Payment Intent（立即返回结果）
         payment_intent_id = None
         client_secret = None
+        # For future monitoring: track a single payment_attempt row per order
+        # without changing routing or PSP behavior.
+        payment_attempt_id = None
         
         try:
             # PSP type already determined above when creating order_data
@@ -370,6 +375,42 @@ async def create_new_order(
             
             # Only create payment intent if we have a valid PSP key
             if psp_key:
+                # ------------------------------------------------------------------
+                # Safe logging: record a payment_attempt row (attempt_number=1)
+                # This is purely for observability; failures are logged but do
+                # NOT affect order creation or payment execution.
+                # ------------------------------------------------------------------
+                try:
+                    payment_attempt_id = f"att_{hashlib.md5(f'{order_id}1{datetime.utcnow().isoformat()}'.encode()).hexdigest()[:12]}"
+                    await database.execute(
+                        """
+                        INSERT INTO payment_attempts (
+                            attempt_id, order_id, route_id, agent_id,
+                            psp_name, attempt_number, status,
+                            amount, currency, created_at
+                        ) VALUES (
+                            :attempt_id, :order_id, NULL, :agent_id,
+                            :psp_name, :attempt_number, :status,
+                            :amount, :currency, NOW()
+                        )
+                        """,
+                        {
+                            "attempt_id": payment_attempt_id,
+                            "order_id": order_id,
+                            "agent_id": agent_id,
+                            "psp_name": psp_type,
+                            "attempt_number": 1,
+                            "status": "pending",
+                            "amount": float(total),
+                            "currency": order_request.currency,
+                        },
+                    )
+                except Exception as log_err:
+                    logger.warning(
+                        f"⚠️ Failed to log payment_attempt for order {order_id}: {log_err}"
+                    )
+                    payment_attempt_id = None
+                
                 # 创建支付意图（所有 PSP 统一处理）
                 adapter_kwargs = {}
                 if psp_type == "checkout" and psp_account_id:
@@ -386,21 +427,47 @@ async def create_new_order(
                 logger.info(f"📡 Creating {psp_type} payment intent for ${total} {order_request.currency}")
                 logger.info(f"   Using PSP key: {psp_key[:15]}... (mock={psp_key.startswith('sk_mock') if psp_key else False})")
                 psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
+                start_ts = time.monotonic()
                 success, payment_intent, error = await psp_adapter.create_payment_intent(
                     amount=total,
                     currency=order_request.currency,
                     metadata={
                         "order_id": order_id,
                         "merchant_id": order_request.merchant_id,
-                        "customer_email": order_request.customer_email
-                    }
+                        "customer_email": order_request.customer_email,
+                    },
                 )
+                response_ms = int((time.monotonic() - start_ts) * 1000)
                 logger.info(f"   Payment intent result: success={success}, has_intent={payment_intent is not None}, error={error}")
                 if success and payment_intent:
                     logger.info(f"   Intent ID: {payment_intent.id}, Secret: {payment_intent.client_secret[:20] if payment_intent.client_secret else 'None'}...")
                     payment_intent_id = payment_intent.id
                     client_secret = payment_intent.client_secret
                     logger.info(f"✅ Payment intent created: {payment_intent_id}")
+                    
+                    # Update payment_attempt as success (best-effort)
+                    if payment_attempt_id:
+                        try:
+                            await database.execute(
+                                """
+                                UPDATE payment_attempts
+                                SET status = :status,
+                                    response_time_ms = :response_time_ms,
+                                    error_code = NULL,
+                                    error_message = NULL,
+                                    completed_at = NOW()
+                                WHERE attempt_id = :attempt_id
+                                """,
+                                {
+                                    "status": "success",
+                                    "response_time_ms": response_ms,
+                                    "attempt_id": payment_attempt_id,
+                                },
+                            )
+                        except Exception as log_err:
+                            logger.warning(
+                                f"⚠️ Failed to update payment_attempt {payment_attempt_id} as success: {log_err}"
+                            )
                     
                     # For Checkout and PayPal, client_secret contains the redirect URL
                     if psp_type in ["checkout", "paypal"] and client_secret and client_secret.startswith("http"):
@@ -427,6 +494,29 @@ async def create_new_order(
                     )
                 else:
                     logger.error(f"Payment intent creation failed: {error}")
+                    # Update payment_attempt as failed (best-effort)
+                    if payment_attempt_id:
+                        try:
+                            await database.execute(
+                                """
+                                UPDATE payment_attempts
+                                SET status = :status,
+                                    response_time_ms = :response_time_ms,
+                                    error_message = :error_message,
+                                    completed_at = NOW()
+                                WHERE attempt_id = :attempt_id
+                                """,
+                                {
+                                    "status": "failed",
+                                    "response_time_ms": response_ms,
+                                    "error_message": str(error) if error else None,
+                                    "attempt_id": payment_attempt_id,
+                                },
+                            )
+                        except Exception as log_err:
+                            logger.warning(
+                                f"⚠️ Failed to update payment_attempt {payment_attempt_id} as failed: {log_err}"
+                            )
                     await log_order_event(
                         event_type="payment_intent_failed",
                         order_id=order_id,
@@ -435,12 +525,33 @@ async def create_new_order(
                     )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
+            # Mark attempt as failed if we managed to create one
+            if payment_attempt_id:
+                try:
+                    await database.execute(
+                        """
+                        UPDATE payment_attempts
+                        SET status = :status,
+                            error_message = :error_message,
+                            completed_at = NOW()
+                        WHERE attempt_id = :attempt_id
+                        """,
+                        {
+                            "status": "failed",
+                            "error_message": str(e),
+                            "attempt_id": payment_attempt_id,
+                        },
+                    )
+                except Exception as log_err:
+                    logger.warning(
+                        f"⚠️ Failed to update payment_attempt {payment_attempt_id} in exception handler: {log_err}"
+                    )
             await log_order_event(
-                    event_type="payment_intent_error",
-                    order_id=order_id,
-                    merchant_id=order_request.merchant_id,
-                    metadata={"error": str(e)}
-                )
+                event_type="payment_intent_error",
+                order_id=order_id,
+                merchant_id=order_request.merchant_id,
+                metadata={"error": str(e)},
+            )
 
         # 6. 返回订单信息（支付已同步创建）
         return OrderResponse(
