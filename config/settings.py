@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     amazon_sp_api_region: str = os.getenv("AMAZON_SP_API_REGION", "na")  # na, eu, fe
     enable_amazon_sp_api: bool = os.getenv("FEATURE_AMAZON_SP_API", "false").lower() == "true"
     
+    # Email / notifications
+    sendgrid_api_key: Optional[str] = os.getenv("SENDGRID_API_KEY")
+    from_email: str = os.getenv("FROM_EMAIL", "noreply@pivota.ai")
+    support_email: str = os.getenv("SUPPORT_EMAIL", "support@pivota.ai")
+    
     # AP2 Protocol (Phase 4++)
     enable_ap2_routes: bool = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"
     enable_admin_auth: bool = os.getenv("ENABLE_ADMIN_AUTH", "false").lower() == "true"

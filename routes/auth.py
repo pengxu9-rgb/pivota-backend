@@ -3,19 +3,25 @@ Authentication API Routes
 Clean and simple authentication system for Pivota
 """
 
+import logging
+from datetime import datetime
+from textwrap import dedent
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel, EmailStr, validator
-from typing import Optional
-from datetime import datetime
+
+from config.settings import settings
 from db.database import database
 from utils.auth import (
     hash_password,
     verify_password,
     create_access_token,
-    get_current_user
+    get_current_user,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
+logger = logging.getLogger("auth_routes")
 
 # Request/Response Models
 class RegisterRequest(BaseModel):
@@ -59,6 +65,77 @@ class UserResponse(BaseModel):
 class MessageResponse(BaseModel):
     success: bool
     message: str
+
+
+def _send_reset_password_email(email: str, reset_link: str) -> None:
+    """
+    Best-effort email sender for password reset links.
+
+    Uses SendGrid when SENDGRID_API_KEY / settings.sendgrid_api_key is configured.
+    Failures are logged but never propagated to the caller.
+    """
+    api_key = getattr(settings, "sendgrid_api_key", None)
+    if not api_key:
+        logger.info(
+            "[Auth] SENDGRID_API_KEY not configured; "
+            "skipping password reset email send"
+        )
+        return
+
+    from_email = getattr(settings, "from_email", "noreply@pivota.ai")
+
+    subject = "Reset your Pivota password"
+    text_content = (
+        "You requested to reset your password.\n\n"
+        f"Click the link below to choose a new password:\n{reset_link}\n\n"
+        "This link will expire in 1 hour. "
+        "If you did not request a password reset, you can ignore this email."
+    )
+    html_content = dedent(
+        f"""
+        <p>You requested to reset your password.</p>
+        <p>
+          Click the link below to choose a new password:<br/>
+          <a href="{reset_link}">{reset_link}</a>
+        </p>
+        <p>This link will expire in 1 hour.</p>
+        <p>If you did not request a password reset, you can ignore this email.</p>
+        """
+    ).strip()
+
+    try:
+        import requests
+
+        response = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "personalizations": [{"to": [{"email": email}]}],
+                "from": {"email": from_email, "name": "Pivota"},
+                "subject": subject,
+                "content": [
+                    {"type": "text/plain", "value": text_content},
+                    {"type": "text/html", "value": html_content},
+                ],
+            },
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            logger.error(
+                "[Auth] Failed to send reset-password email via SendGrid: "
+                "status=%s body=%s",
+                response.status_code,
+                response.text,
+            )
+        else:
+            logger.info("[Auth] Reset-password email sent via SendGrid to %s", email)
+    except Exception as exc:
+        logger.error(
+            "[Auth] Exception while sending reset-password email: %s", exc
+        )
 
 @router.post("/register", response_model=MessageResponse)
 async def register(data: RegisterRequest):
@@ -446,11 +523,44 @@ async def forgot_password(data: ForgotPasswordRequest):
         )
         
         if not user:
-            # Don't reveal if email exists or not (security best practice)
-            return MessageResponse(
-                success=True,
-                message="If the email exists, a password reset link has been sent"
+            # Legacy backfill: if this email matches a merchant contact_email but
+            # has no corresponding users row yet, create a login user on the fly
+            merchant = await database.fetch_one(
+                "SELECT merchant_id, business_name FROM merchant_onboarding WHERE contact_email = :email LIMIT 1",
+                {"email": data.email},
             )
+
+            if merchant:
+                from utils.auth import hash_password
+                import secrets
+
+                password = secrets.token_urlsafe(12)
+                password_hash = hash_password(password)
+
+                await database.execute(
+                    """
+                    INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
+                    VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
+                    """,
+                    {
+                        "email": data.email,
+                        "password_hash": password_hash,
+                        "full_name": merchant["business_name"] or data.email.split("@")[0],
+                        "role": "merchant",
+                        "active": True,
+                        "merchant_id": merchant["merchant_id"],
+                    },
+                )
+                logger.info(
+                    "[Auth] Auto-created merchant user for %s to support password reset",
+                    data.email,
+                )
+            else:
+                # Don't reveal if email exists or not (security best practice)
+                return MessageResponse(
+                    success=True,
+                    message="If the email exists, a password reset link has been sent",
+                )
         
         # Generate reset token (valid for 1 hour)
         reset_token = secrets.token_urlsafe(32)
@@ -479,11 +589,13 @@ async def forgot_password(data: ForgotPasswordRequest):
             {"token": reset_token, "email": data.email, "expires_at": expires_at}
         )
         
-        # TODO: Send email with reset link
-        # For now, just log the token (in production, send via email)
+        # Build reset link (merchant portal by default; can be customized later)
         reset_link = f"https://merchants.pivota.cc/reset-password?token={reset_token}"
         print(f"🔑 Password reset link for {data.email}: {reset_link}")
         print(f"   (Valid for 1 hour)")
+
+        # Best-effort email delivery via SendGrid; failures are logged only
+        _send_reset_password_email(data.email, reset_link)
         
         return MessageResponse(
             success=True,

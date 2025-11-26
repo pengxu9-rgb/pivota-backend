@@ -14,6 +14,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import logging
+from textwrap import dedent
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -45,6 +48,7 @@ from utils.auth import create_access_token, decode_token
 
 
 router = APIRouter(prefix="/accounts", tags=["accounts-orders"])
+logger = logging.getLogger("accounts_orders")
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +150,74 @@ async def get_accounts_principal(request: Request) -> AccountsPrincipal:
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
+
+def _send_login_otp_email(email: str, otp_code: str) -> None:
+    """
+    Best-effort email sender for login OTP codes.
+
+    Uses SendGrid when SENDGRID_API_KEY / settings.sendgrid_api_key is configured.
+    Failures are logged but never propagated to the caller, so login flow
+    still returns 200 even if email delivery fails.
+    """
+    api_key = getattr(settings, "sendgrid_api_key", None)
+    if not api_key:
+        logger.info(
+            "[AccountsAuth] SENDGRID_API_KEY not configured; "
+            "skipping OTP email send"
+        )
+        return
+
+    from_email = getattr(settings, "from_email", "noreply@pivota.ai")
+
+    subject = "Your login code for Pivota"
+    text_content = (
+        f"Your login code is {otp_code}. It will expire in 10 minutes.\n"
+        "If you did not request this code, you can ignore this email."
+    )
+    html_content = dedent(
+        f"""
+        <p>Your login code is <strong>{otp_code}</strong>.</p>
+        <p>It will expire in 10 minutes.</p>
+        <p>If you did not request this code, you can ignore this email.</p>
+        """
+    ).strip()
+
+    try:
+        import requests
+
+        response = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "personalizations": [{"to": [{"email": email}]}],
+                "from": {"email": from_email, "name": "Pivota"},
+                "subject": subject,
+                "content": [
+                    {"type": "text/plain", "value": text_content},
+                    {"type": "text/html", "value": html_content},
+                ],
+            },
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            logger.error(
+                "[AccountsAuth] Failed to send OTP email via SendGrid: "
+                "status=%s body=%s",
+                response.status_code,
+                response.text,
+            )
+        else:
+            logger.info(
+                "[AccountsAuth] OTP email sent via SendGrid to %s", email
+            )
+    except Exception as exc:
+        logger.error(
+            "[AccountsAuth] Exception while sending OTP email: %s", exc
+        )
 
 class LoginStartRequest(BaseModel):
     channel: str = Field(..., description="email | sms")
@@ -331,7 +403,10 @@ def _set_auth_cookies(
         expires_delta=timedelta(days=REFRESH_EXPIRE_DAYS),
     )
 
-    secure = not settings.dev_mode  # in dev, cookies can be non-secure
+    # For production (dev_mode=False), issue cross-site compatible cookies
+    # so that the Accounts API can be called from separate frontends
+    secure = not settings.dev_mode
+    samesite = "lax" if settings.dev_mode else "none"
 
     response.set_cookie(
         ACCESS_COOKIE_NAME,
@@ -339,7 +414,7 @@ def _set_auth_cookies(
         max_age=ACCESS_EXPIRE_MINUTES * 60,
         httponly=True,
         secure=secure,
-        samesite="lax",
+        samesite=samesite,
         path="/",
     )
     response.set_cookie(
@@ -348,13 +423,14 @@ def _set_auth_cookies(
         max_age=REFRESH_EXPIRE_DAYS * 24 * 60 * 60,
         httponly=True,
         secure=secure,
-        samesite="lax",
+        samesite=samesite,
         path="/",
     )
 
 
 def _clear_auth_cookies(response: JSONResponse) -> None:
     secure = not settings.dev_mode
+    samesite = "lax" if settings.dev_mode else "none"
     for name in (ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME):
         response.set_cookie(
             name,
@@ -363,7 +439,7 @@ def _clear_auth_cookies(response: JSONResponse) -> None:
             expires=0,
             httponly=True,
             secure=secure,
-            samesite="lax",
+            samesite=samesite,
             path="/",
         )
 
@@ -532,10 +608,11 @@ async def start_login(request: Request, body: LoginStartRequest):
         )
     )
 
-    # TODO: integrate real email provider; for now just log
-    from utils.logger import logger as app_logger
+    # Log OTP for observability (and dev environments)
+    logger.info("[AccountsAuth] OTP generated for %s", email)
 
-    app_logger.info(f"[AccountsAuth] OTP for {email}: {otp_code}")
+    # Best-effort email delivery; failures are logged but do not break the flow
+    _send_login_otp_email(email, otp_code)
 
     # In non-production, optionally echo the OTP for easier local testing
     payload: Dict[str, Any] = {"status": "sent"}
