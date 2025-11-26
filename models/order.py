@@ -71,6 +71,14 @@ class CreateOrderRequest(BaseModel):
     preferred_psp: Optional[str] = None  # 指定首选 PSP (stripe/adyen/checkout)
 
 
+class PaymentAction(BaseModel):
+    """统一支付动作抽象，供前端根据 type 分发"""
+    type: Optional[str] = None  # stripe_client_secret | adyen_session | redirect_url | hosted_page
+    client_secret: Optional[str] = None  # 当 type 需要 client_secret 时使用
+    url: Optional[str] = None  # 当 type 需要重定向/托管页面时使用
+    raw: Optional[Dict[str, Any]] = None  # 适配器原始 payload（可选，用于调试/扩展）
+
+
 class OrderResponse(BaseModel):
     """订单响应"""
     order_id: str
@@ -100,6 +108,8 @@ class OrderResponse(BaseModel):
     # 支付相关
     payment_intent_id: Optional[str] = None  # Stripe Payment Intent ID
     client_secret: Optional[str] = None  # Stripe 前端支付用
+    psp: Optional[str] = None  # 实际使用的 PSP 提供方（stripe/adyen/checkout/paypal）
+    payment_action: Optional[PaymentAction] = None  # 统一支付动作抽象
     
     # 履约相关
     shopify_order_id: Optional[str] = None  # Shopify 订单 ID
@@ -140,4 +150,3 @@ class OrderListResponse(BaseModel):
             Decimal: lambda v: str(v),
             datetime: lambda v: v.isoformat() if v else None
         }
-

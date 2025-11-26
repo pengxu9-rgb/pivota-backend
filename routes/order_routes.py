@@ -309,6 +309,8 @@ async def create_new_order(
         # For future monitoring: track a single payment_attempt row per order
         # without changing routing or PSP behavior.
         payment_attempt_id = None
+        # Unified payment action for frontends (optional, best-effort)
+        payment_action: Dict[str, Any] = {}
         
         try:
             # PSP type already determined above when creating order_data
@@ -445,6 +447,35 @@ async def create_new_order(
                     client_secret = payment_intent.client_secret
                     logger.info(f"✅ Payment intent created: {payment_intent_id}")
                     
+                    # Build unified payment_action for frontend routing
+                    try:
+                        if psp_type == "stripe" and client_secret:
+                            payment_action = {
+                                "type": "stripe_client_secret",
+                                "client_secret": client_secret,
+                                "raw": getattr(payment_intent, "raw_response", None),
+                            }
+                        elif psp_type == "adyen" and client_secret:
+                            payment_action = {
+                                "type": "adyen_session",
+                                "client_secret": client_secret,
+                                "raw": getattr(payment_intent, "raw_response", None),
+                            }
+                        elif psp_type in ["checkout", "paypal"] and client_secret and str(client_secret).startswith("http"):
+                            payment_action = {
+                                "type": "redirect_url",
+                                "url": client_secret,
+                                "raw": getattr(payment_intent, "raw_response", None),
+                            }
+                        else:
+                            # Fallback: expose minimal info; frontends can still use legacy fields
+                            payment_action = {
+                                "type": None,
+                                "client_secret": client_secret,
+                            }
+                    except Exception as pa_err:
+                        logger.warning(f"⚠️ Failed to build payment_action for order {order_id}: {pa_err}")
+                    
                     # Update payment_attempt as success (best-effort)
                     if payment_attempt_id:
                         try:
@@ -569,6 +600,8 @@ async def create_new_order(
             payment_status="awaiting_payment" if payment_intent_id else "pending",
             payment_intent_id=payment_intent_id,
             client_secret=client_secret,
+             psp=psp_type,
+             payment_action=payment_action or None,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
