@@ -310,13 +310,16 @@ async def get_merchant_routing_config(
         created_at = datetime.now(timezone.utc)
         updated_at = created_at
     else:
-        psp_priority = route["psp_priority"]
+        # databases.fetch_one returns a Record; normalize to dict for .get access
+        route_dict = dict(route)
+
+        psp_priority = route_dict["psp_priority"]
         if isinstance(psp_priority, str):
             psp_priority = json.loads(psp_priority)
-        routing_strategy = route["routing_strategy"]
-        max_retries = route.get("max_retries", 2)
-        timeout_ms = route.get("timeout_ms", 30000)
-        metadata_raw = route.get("metadata") or {}
+        routing_strategy = route_dict["routing_strategy"]
+        max_retries = route_dict.get("max_retries", 2)
+        timeout_ms = route_dict.get("timeout_ms", 30000)
+        metadata_raw = route_dict.get("metadata") or {}
         metadata_dict = (
             json.loads(metadata_raw)
             if isinstance(metadata_raw, str)
@@ -324,9 +327,9 @@ async def get_merchant_routing_config(
             if isinstance(metadata_raw, dict)
             else {}
         )
-        route_id = route["route_id"]
-        created_at = route["created_at"]
-        updated_at = route["updated_at"]
+        route_id = route_dict["route_id"]
+        created_at = route_dict.get("created_at")
+        updated_at = route_dict.get("updated_at")
 
     return {
         "status": "success",
