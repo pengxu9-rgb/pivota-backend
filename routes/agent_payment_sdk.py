@@ -51,6 +51,10 @@ class PaymentResponse(BaseModel):
     amount: float
     currency: str
     psp_used: str
+    # Optional unified PSP fields for frontend/gateway usage
+    # (kept flat for backward compatibility; Shopping Gateway may wrap into `payment` object)
+    psp: Optional[str] = None
+    payment_action: Optional[Dict[str, Any]] = None
     next_action: Optional[NextAction] = None
     error: Optional[str] = None
     created_at: str
@@ -123,8 +127,104 @@ async def create_payment(
                     psp_used="cached",
                     created_at=datetime.now().isoformat()
                 )
-        
-        # 4. Get merchant and PSP config
+
+        # 4. Reuse existing PSP session when order already has a payment intent
+        #    This avoids creating a second Stripe intent when the order was
+        #    already provisioned with an Adyen / other PSP session during creation.
+        existing_psp = order.get("psp_used")
+        existing_intent_id = order.get("payment_intent_id")
+        existing_client_secret = order.get("client_secret")
+
+        if existing_psp and existing_intent_id and existing_client_secret:
+            from db.database import database
+
+            # Try to reuse an existing payments row if present
+            payment_row = await database.fetch_one(
+                """
+                SELECT payment_id, amount, currency, status, created_at
+                FROM payments
+                WHERE order_id = :order_id AND payment_intent_id = :intent_id
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                {"order_id": request.order_id, "intent_id": existing_intent_id},
+            )
+
+            if payment_row:
+                payment_dict = dict(payment_row)
+                payment_id = payment_dict.get("payment_id")
+                amount_val = float(payment_dict.get("amount") or order_total)
+                currency_val = payment_dict.get("currency") or order.get("currency", "USD")
+                status_val = payment_dict.get("status") or "processing"
+                created_at_val = (
+                    payment_dict["created_at"].isoformat()
+                    if payment_dict.get("created_at") is not None
+                    and hasattr(payment_dict.get("created_at"), "isoformat")
+                    else datetime.now().isoformat()
+                )
+            else:
+                payment_id = f"pay_{existing_intent_id}"
+                amount_val = order_total
+                currency_val = order.get("currency", "USD")
+                status_val = "processing"
+                await database.execute(
+                    """
+                    INSERT INTO payments 
+                       (payment_id, order_id, payment_intent_id, amount, currency, 
+                        psp_type, status, idempotency_key, created_at, agent_id)
+                       VALUES (:payment_id, :order_id, :intent_id, :amount, :currency,
+                               :psp, :status, :idem_key, :created_at, :agent_id)
+                    """,
+                    {
+                        "payment_id": payment_id,
+                        "order_id": request.order_id,
+                        "intent_id": existing_intent_id,
+                        "amount": amount_val,
+                        "currency": currency_val,
+                        "psp": existing_psp,
+                        "status": status_val,
+                        "idem_key": request.idempotency_key,
+                        "created_at": datetime.now(),
+                        "agent_id": context.agent_id,
+                    },
+                )
+                created_at_val = datetime.now().isoformat()
+
+            # Keep order payment info in sync; do not downgrade status if it already progressed
+            await update_payment_info(
+                order_id=request.order_id,
+                payment_intent_id=existing_intent_id,
+                client_secret=existing_client_secret,
+                payment_status=order.get("payment_status") or "processing",
+                psp_used=existing_psp,
+            )
+
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id,
+            )
+
+            logger.info(
+                f"Reusing existing payment intent {existing_intent_id} for order {request.order_id} via {existing_psp}"
+            )
+
+            return PaymentResponse(
+                status="processing",
+                payment_id=payment_id,
+                payment_intent_id=existing_intent_id,
+                client_secret=existing_client_secret,
+                amount=float(amount_val),
+                currency=currency_val,
+                psp_used=existing_psp,
+                psp=existing_psp,
+                payment_action=None,
+                next_action=None,
+                created_at=created_at_val,
+            )
+
+        # 5. Get merchant and PSP config
         merchant = await get_merchant_onboarding(merchant_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
@@ -216,6 +316,8 @@ async def create_payment(
             amount=float(amount),
             currency=currency,
             psp_used=psp_used,
+            psp=psp_used,
+            payment_action=None,
             next_action=next_action,
             created_at=datetime.now().isoformat()
         )
@@ -281,8 +383,4 @@ async def get_payment_status(
     except Exception as e:
         logger.error(f"Get payment status error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get payment status")
-
-
-
-
 
