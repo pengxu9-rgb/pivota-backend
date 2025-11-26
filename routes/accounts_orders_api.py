@@ -58,8 +58,10 @@ logger = logging.getLogger("accounts_orders")
 ACCESS_COOKIE_NAME = "acc_access_token"
 REFRESH_COOKIE_NAME = "acc_refresh_token"
 
+# Access token lifetime: short-lived session (30 minutes)
 ACCESS_EXPIRE_MINUTES = 30
-REFRESH_EXPIRE_DAYS = 14
+# Refresh token lifetime: rolling 7-day window
+REFRESH_EXPIRE_DAYS = 7
 
 PUBLIC_LOOKUP_IP_LIMIT_PER_MINUTE = 10
 PUBLIC_LOOKUP_PAIR_LIMIT_PER_MINUTE = 3
