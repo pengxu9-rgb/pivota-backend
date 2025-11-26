@@ -297,23 +297,50 @@ class PaymentRoutingService:
     # Private helper methods
     
     async def _get_route_config(self, agent_id: str, merchant_id: Optional[str]) -> Optional[Dict]:
-        """Get routing configuration for agent/merchant"""
-        query = """
-            SELECT route_id, psp_priority, routing_strategy, max_retries, timeout_ms, metadata
-            FROM payment_routes
-            WHERE is_active = true
         """
-        params = {}
-        
+        Get routing configuration for agent / merchant.
+
+        Priority rules:
+        - If merchant_id is provided, prefer the most recent merchant-level route
+          (so that changes saved from the Merchant Portal Integrations UI always
+          take effect for all agents).
+        - If no merchant-level route is found, fall back to the latest agent-level
+          route for this agent (legacy behaviour).
+        """
+        # 1) Prefer merchant-specific route when merchant_id is known
         if merchant_id:
-            query += " AND merchant_id = :merchant_id"
-            params["merchant_id"] = merchant_id
-        else:
-            query += " AND agent_id = :agent_id"
-            params["agent_id"] = agent_id
-        
-        result = await self.database.fetch_one(query, params)
-        return dict(result) if result else None
+            merchant_route = await self.database.fetch_one(
+                """
+                SELECT route_id, psp_priority, routing_strategy, max_retries, timeout_ms, metadata
+                FROM payment_routes
+                WHERE is_active = true
+                  AND merchant_id = :merchant_id
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                {"merchant_id": merchant_id},
+            )
+            if merchant_route:
+                return dict(merchant_route)
+
+        # 2) Fallback to agent-specific route
+        if agent_id:
+            agent_route = await self.database.fetch_one(
+                """
+                SELECT route_id, psp_priority, routing_strategy, max_retries, timeout_ms, metadata
+                FROM payment_routes
+                WHERE is_active = true
+                  AND agent_id = :agent_id
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                {"agent_id": agent_id},
+            )
+            if agent_route:
+                return dict(agent_route)
+
+        # 3) No route found
+        return None
     
     async def _create_default_route(self, agent_id: str, merchant_id: Optional[str]) -> Dict:
         """Create default routing configuration.
