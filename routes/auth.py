@@ -589,8 +589,9 @@ async def forgot_password(data: ForgotPasswordRequest):
             {"token": reset_token, "email": data.email, "expires_at": expires_at}
         )
         
-        # Build reset link (merchant portal by default; can be customized later)
-        reset_link = f"https://merchants.pivota.cc/reset-password?token={reset_token}"
+        # Build reset link - use configured Merchant Portal base URL
+        base_url = getattr(settings, "merchant_portal_base_url", "https://merchant.pivota.cc").rstrip("/")
+        reset_link = f"{base_url}/reset-password?token={reset_token}"
         print(f"🔑 Password reset link for {data.email}: {reset_link}")
         print(f"   (Valid for 1 hour)")
 

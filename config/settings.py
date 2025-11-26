@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     sendgrid_api_key: Optional[str] = os.getenv("SENDGRID_API_KEY")
     from_email: str = os.getenv("FROM_EMAIL", "noreply@pivota.ai")
     support_email: str = os.getenv("SUPPORT_EMAIL", "support@pivota.ai")
+    # Merchant Portal base URL (used for password reset links)
+    merchant_portal_base_url: str = os.getenv("MERCHANT_PORTAL_BASE_URL", "https://merchant.pivota.cc")
     
     # AP2 Protocol (Phase 4++)
     enable_ap2_routes: bool = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"
