@@ -251,9 +251,20 @@ async def update_payment_info(
     - payment_intent_id / client_secret / payment_status 按照原有逻辑更新
     - 可选的 psp_used 用于记录实际使用的 PSP 提供方（如 'stripe' 或 'adyen'）
     """
+    # Protect against extremely long secrets (e.g. Adyen sessionData) exceeding
+    # the VARCHAR(500) limit on client_secret. We only need full secrets for
+    # PSP/frontends, not for the orders table, so truncation here is safe.
+    safe_secret = client_secret
+    try:
+        if client_secret and len(client_secret) > 480:
+            safe_secret = client_secret[:480]
+    except Exception:
+        # If length check fails for any reason, fall back to original value.
+        safe_secret = client_secret
+
     update_values = {
         "payment_intent_id": payment_intent_id,
-        "client_secret": client_secret,
+        "client_secret": safe_secret,
         "payment_status": payment_status,
         "updated_at": datetime.now(),
     }
