@@ -121,6 +121,9 @@ from routes.admin_data_consistency import router as admin_data_consistency_route
 from routes.admin_merchant_canonicalize import router as admin_merchant_canonicalize_router
 from routes.admin_merchant_reset import router as admin_merchant_reset_router
 from routes.admin_shopify_health import router as admin_shopify_health_router
+from routes.admin_amazon_oauth import router as admin_amazon_oauth_router
+from routes.admin_amazon_orders import router as admin_amazon_orders_router
+from routes.admin_amazon_fulfillment import router as admin_amazon_fulfillment_router
 from routes.products_cache_maintenance import router as products_cache_maintenance_router
 from routes.mcp_e2e_test import router as mcp_e2e_test_router
 from routes.admin_recover_psps import router as admin_recover_psps_router
@@ -354,6 +357,10 @@ app.include_router(admin_data_consistency_router)  # Admin data consistency chec
 app.include_router(admin_merchant_canonicalize_router)  # Admin merchant canonicalization
 app.include_router(admin_merchant_reset_router)  # Admin merchant reset
 app.include_router(admin_shopify_health_router)  # Admin Shopify health check
+if settings.enable_amazon_sp_api:
+    app.include_router(admin_amazon_oauth_router)  # Amazon SP-API OAuth (admin-only)
+    app.include_router(admin_amazon_orders_router)  # Amazon SP-API orders sync (admin-only)
+    app.include_router(admin_amazon_fulfillment_router)  # Amazon SP-API fulfillment feeds (admin-only)
 app.include_router(products_cache_maintenance_router)  # Products cache maintenance
 app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
 app.include_router(admin_recover_psps_router)  # Admin PSP recovery
