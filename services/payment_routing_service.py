@@ -51,6 +51,15 @@ class PaymentRoutingService:
         
         # Get PSP priority list
         psp_priority = route_config.get("psp_priority", [])
+        # Handle JSONB/text payloads where psp_priority may be a JSON string
+        if isinstance(psp_priority, str):
+            try:
+                psp_priority = json.loads(psp_priority)
+            except Exception:
+                logger.error(f"Failed to parse psp_priority JSON for route {route_config.get('route_id')}")
+                psp_priority = []
+            # Normalize back into route_config for downstream callers
+            route_config["psp_priority"] = psp_priority
         if not psp_priority:
             psp_priority = [
                 {"psp": "stripe", "priority": 1},
