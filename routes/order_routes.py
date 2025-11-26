@@ -30,6 +30,7 @@ from utils.auth import require_admin, get_current_user
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
 from utils.logger import logger
+from services.payment_routing_service import PaymentRoutingService
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -212,11 +213,31 @@ async def create_new_order(
         agent_id = None
         if order_request.metadata:
             agent_id = order_request.metadata.get("agent_id")
-        
-        # Determine PSP first (before creating order)
-        # Source of truth is merchant_psps; merchant_onboarding.psp_type is legacy.
-        psp_type = (order_request.preferred_psp or merchant.get("psp_type")) or None
-        
+
+        # Determine PSP using PaymentRoutingService (merchant routing UI),
+        # falling back to legacy hints only if routing config is missing.
+        routing_service = PaymentRoutingService(database)
+        selected_psp = None
+        route_config: Dict[str, Any] = {}
+        try:
+            selected_psp, route_config = await routing_service.select_psp(
+                agent_id=agent_id or "",
+                merchant_id=order_request.merchant_id,
+                amount=float(total),
+                currency=order_request.currency or "USD",
+            )
+            logger.info(
+                f"[OrderRoutes] Routing selected PSP '{selected_psp}' for order "
+                f"{order_request.merchant_id} via payment_routes config"
+            )
+        except Exception as e:
+            logger.error(f"[OrderRoutes] Routing selection failed, falling back to legacy PSP: {e}")
+            selected_psp = None
+
+        # Source of truth is routing config; merchant_onboarding.psp_type and
+        # preferred_psp are legacy hints.
+        psp_type = selected_psp or (order_request.preferred_psp or merchant.get("psp_type")) or None
+
         # Always get psp_id for PSP metrics tracking (even if psp_type is known)
         psp_id_value = None
         try:
@@ -309,6 +330,7 @@ async def create_new_order(
         # For future monitoring: track a single payment_attempt row per order
         # without changing routing or PSP behavior.
         payment_attempt_id = None
+        route_id_for_attempt = route_config.get("route_id") if isinstance(route_config, dict) else None
         # Unified payment action for frontends (optional, best-effort)
         payment_action: Dict[str, Any] = {}
         
@@ -391,7 +413,7 @@ async def create_new_order(
                             psp_name, attempt_number, status,
                             amount, currency, created_at
                         ) VALUES (
-                            :attempt_id, :order_id, NULL, :agent_id,
+                            :attempt_id, :order_id, :route_id, :agent_id,
                             :psp_name, :attempt_number, :status,
                             :amount, :currency, NOW()
                         )
@@ -399,6 +421,7 @@ async def create_new_order(
                         {
                             "attempt_id": payment_attempt_id,
                             "order_id": order_id,
+                            "route_id": route_id_for_attempt,
                             "agent_id": agent_id,
                             "psp_name": psp_type,
                             "attempt_number": 1,
