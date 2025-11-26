@@ -295,8 +295,10 @@ async def get_merchant_routing_config(
     if not route:
         # No explicit route yet; synthesize default using PaymentRoutingService logic
         routing_service = PaymentRoutingService(database)
+        # For merchant-level defaults we don't need an agent_id on the route;
+        # pass None so the FK constraint on payment_routes.agent_id is not violated.
         default_config = await routing_service._create_default_route(
-            agent_id=merchant_id,
+            agent_id=None,
             merchant_id=merchant_id,
         )
         psp_priority = default_config["psp_priority"]
