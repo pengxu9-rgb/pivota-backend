@@ -207,7 +207,7 @@ async def login(data: LoginRequest):
     try:
         # Find user by email
         query = """
-            SELECT id, email, password_hash, full_name, role, active
+            SELECT id, email, password_hash, full_name, role, active, merchant_id
             FROM users
             WHERE email = :email
         """
@@ -244,9 +244,11 @@ async def login(data: LoginRequest):
             values={"last_login": datetime.utcnow(), "user_id": user['id']}
         )
         
-        # For merchants, get their merchant_id from merchant_onboarding
-        merchant_id = None
-        if user['role'] == 'merchant':
+        # For merchants, resolve their merchant_id
+        # Prefer the explicit binding from users.merchant_id; fall back to
+        # merchant_onboarding.contact_email only when not set.
+        merchant_id = user["merchant_id"]
+        if user['role'] == 'merchant' and not merchant_id:
             merchant_record = await database.fetch_one(
                 "SELECT merchant_id FROM merchant_onboarding WHERE contact_email = :email",
                 {"email": user['email']}
