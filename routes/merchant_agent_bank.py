@@ -27,9 +27,9 @@ async def get_agent_bank_details(
     Only returns data if agent has enabled sharing (allow_share_with_merchants = true)
     """
     try:
-        # Get agent info (minimal columns to avoid missing column issues)
+        # Get agent info (only id; avoid missing column issues on name/email)
         agent = await database.fetch_one(
-            "SELECT agent_id, email FROM agents WHERE agent_id = :agent_id",
+            "SELECT agent_id FROM agents WHERE agent_id = :agent_id",
             {"agent_id": agent_id}
         )
         
@@ -138,7 +138,7 @@ async def get_agent_bank_details(
                 "agent_id": agent_id,
                 # Prefer stored agent name/email; fall back to account holder name for better UI
                 "name": bank_details.get("account_holder_name"),
-                "email": (agent or {}).get("email")
+                "email": None
             },
             "bank_details": bank_info,
             "sharing_enabled": True
