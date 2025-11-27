@@ -32,6 +32,7 @@ async def get_agent_bank_details(
             "SELECT agent_id FROM agents WHERE agent_id = :agent_id",
             {"agent_id": agent_id}
         )
+        agent = dict(agent) if agent else {}
         
         # Get bank details - only if sharing is enabled
         bank_details = await database.fetch_one(
@@ -63,6 +64,7 @@ async def get_agent_bank_details(
             """,
             {"agent_id": agent_id}
         )
+        bank_details = dict(bank_details) if bank_details else None
         
         if not bank_details:
             return {
@@ -86,8 +88,8 @@ async def get_agent_bank_details(
                 "message": "Agent has not enabled bank details sharing with merchants",
                 "agent": {
                     "agent_id": agent_id,
-                    "name": (agent or {}).get("name"),
-                    "email": (agent or {}).get("email")
+                    "name": agent.get("name"),
+                    "email": agent.get("email")
                 },
                 "bank_details": {
                     "configured": True,
@@ -96,7 +98,7 @@ async def get_agent_bank_details(
                     "verify_status": bank_details["verify_status"]
                 },
                 "sharing_enabled": False,
-                "instructions": f"Please contact {agent['email']} directly to obtain bank account details for payment."
+                "instructions": f"Please contact the agent directly to obtain bank account details for payment."
             }
         
         # Sharing is enabled - return FULL bank details
@@ -137,8 +139,8 @@ async def get_agent_bank_details(
             "agent": {
                 "agent_id": agent_id,
                 # Prefer stored agent name/email; fall back to account holder name for better UI
-                "name": bank_details.get("account_holder_name"),
-                "email": None
+                "name": agent.get("name") or bank_details.get("account_holder_name"),
+                "email": agent.get("email")
             },
             "bank_details": bank_info,
             "sharing_enabled": True
