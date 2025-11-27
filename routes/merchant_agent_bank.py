@@ -141,6 +141,12 @@ async def get_agent_bank_details(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get agent bank details: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve bank details")
-
+        # Graceful fallback: do not break merchant portal if bank table/data missing
+        logger.error(f"Failed to get agent bank details: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"Bank details unavailable: {str(e)}",
+            "agent": {"agent_id": agent_id},
+            "bank_details": None,
+            "sharing_enabled": False
+        }
