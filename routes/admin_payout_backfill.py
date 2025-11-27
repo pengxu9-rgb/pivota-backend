@@ -25,6 +25,24 @@ def _success(status: str, message: str, extra: Optional[Dict[str, Any]] = None) 
     return payload
 
 
+async def _ensure_commissions_schema():
+    """
+    Make sure commissions table has the columns expected by OrderCommissionService
+    and agent revenue endpoints (rate, matched, commission_id, currency).
+    """
+    ddl_statements = [
+        "ALTER TABLE commissions ADD COLUMN IF NOT EXISTS commission_id VARCHAR(50)",
+        "ALTER TABLE commissions ADD COLUMN IF NOT EXISTS rate DECIMAL(5,4)",
+        "ALTER TABLE commissions ADD COLUMN IF NOT EXISTS matched BOOLEAN DEFAULT true",
+        "ALTER TABLE commissions ADD COLUMN IF NOT EXISTS currency CHAR(3) DEFAULT 'USD'",
+    ]
+    for ddl in ddl_statements:
+        try:
+            await database.execute(ddl)
+        except Exception as e:
+            logger.error(f"Schema patch failed: {ddl} -> {e}")
+
+
 @router.post("/backfill")
 async def backfill_commissions_and_payouts(
     merchant_id: str,
@@ -46,6 +64,9 @@ async def backfill_commissions_and_payouts(
     period_start = period_end - timedelta(days=days)
 
     try:
+        # 0) Ensure commissions table has required columns
+        await _ensure_commissions_schema()
+
         # 1) Find eligible orders that have agent_id and are paid
         paid_statuses = ("paid", "captured", "succeeded", "completed", "fulfilled")
         orders = await database.fetch_all(
