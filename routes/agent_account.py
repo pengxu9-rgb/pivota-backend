@@ -6,7 +6,7 @@ Simplified and adapted to actual database schema
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, EmailStr, validator
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import secrets
 import hashlib
 
@@ -44,6 +44,8 @@ class AgentInfo(BaseModel):
     company: str
     description: str
     status: str
+    # [Phase 6.2] Agent tier (basic/premium)
+    agent_type: str = "basic"
 
 class AgentLoginResponse(BaseModel):
     success: bool
@@ -189,7 +191,7 @@ async def login_agent(data: AgentLoginRequest):
         # 3. Get agent record
         agent = await database.fetch_one(
             """
-            SELECT agent_id, agent_name, owner_email, api_key
+            SELECT agent_id, agent_name, owner_email, api_key, agent_type
             FROM agents
             WHERE owner_email = :email
             """,
@@ -206,13 +208,19 @@ async def login_agent(data: AgentLoginRequest):
         )
         
         # 5. Create JWT token
-        token = create_access_token({
-            "sub": user["email"],
-            "email": user["email"],  # Required by get_current_user
-            "user_id": str(user["id"]),
-            "role": "agent",
-            "agent_id": agent["agent_id"]
-        })
+        # Extend agent portal session to reduce unexpected logouts.
+        # Other roles keep the default (24h) expiry from utils.auth.
+        token = create_access_token(
+            {
+                "sub": user["email"],
+                "email": user["email"],  # Required by get_current_user
+                "user_id": str(user["id"]),
+                "role": "agent",
+                "agent_id": agent["agent_id"],
+            },
+            # Agent portal sessions: ~7 days
+            expires_delta=timedelta(days=7),
+        )
         
         # Get agent name safely
         agent_name = "Agent"  # Default
@@ -236,7 +244,8 @@ async def login_agent(data: AgentLoginRequest):
                 "email": agent["owner_email"],
                 "company": "",
                 "description": "",
-                "status": "active"
+                "status": "active",
+                "agent_type": agent.get("agent_type", "basic"),
             },
             api_key=agent["api_key"]
         )
