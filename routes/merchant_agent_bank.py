@@ -51,7 +51,8 @@ async def get_agent_bank_details(
                 bank_country,
                 verify_status,
                 allow_share_with_merchants,
-                updated_at
+                updated_at,
+                verified_at
             FROM agent_beneficiaries
             WHERE agent_id = :agent_id
             ORDER BY 
@@ -106,7 +107,15 @@ async def get_agent_bank_details(
             "bank_name": bank_details["bank_name"],
             "bank_country": bank_details["bank_country"],
             "verify_status": bank_details["verify_status"],
-            "last_updated": bank_details["updated_at"].isoformat() if bank_details["updated_at"] else None
+            "verified_at": bank_details["verified_at"].isoformat() if bank_details["verified_at"] else None,
+            "last_updated": bank_details["updated_at"].isoformat() if bank_details["updated_at"] else None,
+            # Include sensitive fields for merchant payout CSV/export
+            "iban": bank_details.get("iban"),
+            "iban_preview": bank_details.get("iban_preview"),
+            "swift_bic": bank_details.get("swift_bic"),
+            "account_number": bank_details.get("account_number"),
+            "routing_number": bank_details.get("routing_number"),
+            "account_number_last4": bank_details.get("account_number_last4"),
         }
         
         # Include full account details based on method
@@ -117,11 +126,10 @@ async def get_agent_bank_details(
         elif bank_details["method"] in ["ach", "wire"] and bank_details["account_number"]:
             bank_info["account_number"] = bank_details["account_number"]  # Full account number
             bank_info["routing_number"] = bank_details["routing_number"]
-            bank_info["account_number_last4"] = bank_details["account_number_last4"]
         else:
             # Fallback to preview versions
-            bank_info["iban_preview"] = bank_details["iban_preview"]
-            bank_info["account_number_last4"] = bank_details["account_number_last4"]
+            bank_info["iban_preview"] = bank_details.get("iban_preview") or bank_details.get("account_number_last4")
+            bank_info["account_number_last4"] = bank_details.get("account_number_last4")
         
         return {
             "status": "success",
