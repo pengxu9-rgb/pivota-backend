@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
 from db.database import database
+from db.payout_repo import PayoutRepo
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/employee/finance", tags=["Employee Finance"])
@@ -13,49 +14,25 @@ router = APIRouter(prefix="/employee/finance", tags=["Employee Finance"])
 
 async def get_uploaded_payouts() -> List[Dict[str, Any]]:
     """Get payouts that have been uploaded by merchants and await employee confirmation"""
+    repo = PayoutRepo()
     try:
-        rows = await database.fetch_all(
-            """
-            SELECT 
-                p.id,
-                p.merchant_id,
-                p.agent_id,
-                p.amount,
-                p.currency,
-                p.status,
-                p.payout_reference,
-                p.file_url,
-                p.method,
-                p.provider,
-                p.uploaded_at,
-                p.created_at,
-                'agent' as type,
-                a.name as agent_name,
-                a.email as agent_email
-            FROM agent_payouts p
-            LEFT JOIN agents a ON p.agent_id = a.agent_id
-            WHERE p.status = 'uploaded'
-            ORDER BY p.uploaded_at DESC
-            LIMIT 50
-            """
-        )
-        
-        return [
-            {
+        rows = await repo.list(status="uploaded", limit=50, offset=0)
+        formatted = []
+        for row in rows:
+            formatted.append({
                 "id": str(row["id"]),
-                "type": row["type"],
-                "name": row["agent_name"] or row["agent_id"],
-                "email": row["agent_email"],
+                "type": "agent",
+                "name": row.get("agent_id"),
+                "email": None,
                 "amount": float(row["amount"]),
                 "currency": row["currency"],
-                "date": row["uploaded_at"].isoformat() if row["uploaded_at"] else row["created_at"].isoformat(),
-                "reference": row["payout_reference"],
-                "file_url": row["file_url"],
-                "method": row["method"],
-                "provider": row["provider"]
-            }
-            for row in rows
-        ]
+                "date": row["uploaded_at"].isoformat() if row.get("uploaded_at") else row["created_at"].isoformat(),
+                "reference": row.get("payout_reference"),
+                "file_url": row.get("file_url"),
+                "method": row.get("method"),
+                "provider": row.get("provider")
+            })
+        return formatted
     except Exception as e:
         print(f"Error fetching uploaded payouts: {e}")
         return []
@@ -166,5 +143,4 @@ async def get_finance_summary(
             },
             "pending_payouts": []
         }
-
 
