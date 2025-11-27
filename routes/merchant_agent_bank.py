@@ -27,14 +27,11 @@ async def get_agent_bank_details(
     Only returns data if agent has enabled sharing (allow_share_with_merchants = true)
     """
     try:
-        # Get agent info
+        # Get agent info (allow missing name/email)
         agent = await database.fetch_one(
             "SELECT agent_id, name, email FROM agents WHERE agent_id = :agent_id",
             {"agent_id": agent_id}
         )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
         
         # Get bank details - only if sharing is enabled
         bank_details = await database.fetch_one(
@@ -71,9 +68,9 @@ async def get_agent_bank_details(
                 "status": "not_configured",
                 "message": "Agent has not set up bank account yet",
                 "agent": {
-                    "agent_id": agent["agent_id"],
-                    "name": agent["name"],
-                    "email": agent["email"]
+                    "agent_id": agent_id,
+                    "name": (agent or {}).get("name"),
+                    "email": (agent or {}).get("email")
                 },
                 "bank_details": None,
                 "sharing_enabled": False
@@ -87,9 +84,9 @@ async def get_agent_bank_details(
                 "status": "not_shared",
                 "message": "Agent has not enabled bank details sharing with merchants",
                 "agent": {
-                    "agent_id": agent["agent_id"],
-                    "name": agent["name"],
-                    "email": agent["email"]
+                    "agent_id": agent_id,
+                    "name": (agent or {}).get("name"),
+                    "email": (agent or {}).get("email")
                 },
                 "bank_details": {
                     "configured": True,
@@ -130,9 +127,10 @@ async def get_agent_bank_details(
             "status": "success",
             "message": "Bank details available",
             "agent": {
-                "agent_id": agent["agent_id"],
-                "name": agent["name"],
-                "email": agent["email"]
+                "agent_id": agent_id,
+                # Prefer stored agent name/email; fall back to account holder name for better UI
+                "name": (agent or {}).get("name") or bank_details.get("account_holder_name"),
+                "email": (agent or {}).get("email")
             },
             "bank_details": bank_info,
             "sharing_enabled": True
