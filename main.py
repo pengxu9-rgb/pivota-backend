@@ -171,6 +171,7 @@ from routes.merchant_commission_api import router as merchant_commission_api_rou
 from routes.agent_settlement_routes import router as agent_settlement_router
 from routes.merchant_payouts import router as merchant_payouts_router  # Merchant payout management
 from routes.agent_integration_status import router as agent_integration_router
+from routes.agent_payouts import router as agent_payouts_router  # Agent payout view
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -410,6 +411,7 @@ app.include_router(merchant_commission_api_router)  # Merchant commission offers
 # [Phase 5.6] Agent Portal - Settlement, Protocol, Integration
 app.include_router(agent_settlement_router)  # Agent settlements and payouts
 app.include_router(merchant_payouts_router)  # Merchant payout management
+app.include_router(agent_payouts_router)  # Agent payout view
 app.include_router(agent_integration_router)  # Agent integration status (aggregates existing data)
 
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
