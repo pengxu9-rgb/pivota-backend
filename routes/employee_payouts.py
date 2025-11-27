@@ -22,6 +22,11 @@ router = APIRouter(prefix="/employee/payouts", tags=["employee-payouts"])
 class ConfirmBulkRequest(BaseModel):
     payout_ids: List[int] = Field(..., min_items=1, max_items=1000)
 
+class ConfirmResponse(BaseModel):
+    status: str
+    updated: int
+    payout_ids: List[int]
+
 class PayoutDetailResponse(BaseModel):
     id: int
     merchant_id: str
@@ -186,6 +191,29 @@ async def list_all_payouts(
     except Exception as e:
         logger.error(f"Error listing payouts for employee: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list payouts: {e}")
+
+@router.patch("/{payout_id}/confirm", response_model=ConfirmResponse)
+async def confirm_single_payout(
+    payout_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Confirm a single payout (uploaded -> paid).
+    """
+    if current_user.get("role") not in ["employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Only employees can confirm payouts")
+    
+    try:
+        repo = PayoutRepo()
+        updated = await repo.confirm(payout_id)
+        if updated is False:
+            raise HTTPException(status_code=404, detail="Payout not found or not in uploaded status")
+        return ConfirmResponse(status="success", updated=1, payout_ids=[payout_id])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error confirming payout {payout_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to confirm payout")
 
 @router.post("/confirm-bulk", response_model=dict)
 async def confirm_bulk_payouts(
