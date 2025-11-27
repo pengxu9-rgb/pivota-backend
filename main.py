@@ -175,6 +175,7 @@ from routes.agent_payouts import router as agent_payouts_router  # Agent payout 
 from routes.admin_payout_backfill import router as admin_payout_backfill_router  # Admin backfill for payouts/commissions
 from routes.agent_bank import router as agent_bank_router  # Agent bank info
 from routes.employee_finance import router as employee_finance_router  # Employee finance dashboard
+from routes.merchant_agent_bank import router as merchant_agent_bank_router  # Merchant view agent bank info
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
@@ -418,6 +419,7 @@ app.include_router(agent_payouts_router)  # Agent payout view
 app.include_router(admin_payout_backfill_router)  # Admin backfill for payouts/commissions
 app.include_router(agent_integration_router)  # Agent integration status (aggregates existing data)
 app.include_router(agent_bank_router)  # Agent bank info
+app.include_router(merchant_agent_bank_router)  # Merchant view agent bank info
 
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
