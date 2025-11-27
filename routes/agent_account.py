@@ -201,6 +201,9 @@ async def login_agent(data: AgentLoginRequest):
         if not agent:
             raise HTTPException(status_code=404, detail="Agent record not found")
         
+        # databases.Record → plain dict for safe .get() usage
+        agent_dict = dict(agent)
+        
         # 4. Update last login
         await database.execute(
             "UPDATE users SET last_login = :last_login WHERE email = :email",
@@ -239,15 +242,15 @@ async def login_agent(data: AgentLoginRequest):
             success=True,
             token=token,
             agent={
-                "agent_id": agent["agent_id"],
+                "agent_id": agent_dict["agent_id"],
                 "agent_name": agent_name,
-                "email": agent["owner_email"],
+                "email": agent_dict["owner_email"],
                 "company": "",
                 "description": "",
                 "status": "active",
-                "agent_type": agent.get("agent_type", "basic"),
+                "agent_type": agent_dict.get("agent_type") or "basic",
             },
-            api_key=agent["api_key"]
+            api_key=agent_dict["api_key"]
         )
         
     except HTTPException:
