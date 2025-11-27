@@ -41,6 +41,7 @@ async def _ensure_commissions_schema():
             await database.execute(ddl)
         except Exception as e:
             logger.error(f"Schema patch failed: {ddl} -> {e}")
+            raise
 
 
 @router.post("/backfill")
@@ -190,3 +191,14 @@ async def backfill_commissions_and_payouts(
     except Exception as e:
         logger.error(f"Backfill payouts failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Backfill failed: {e}")
+
+
+@router.post("/patch-schema")
+async def patch_commissions_schema(current_user: dict = Depends(get_current_user)):
+    """
+    Explicitly patch commissions table schema for agent earnings/payout flow.
+    """
+    if current_user.get("role") not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    await _ensure_commissions_schema()
+    return {"status": "success", "message": "commissions schema patched"}
