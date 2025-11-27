@@ -119,6 +119,7 @@ async def get_finance_summary(
                 "total_revenue": float(total_revenue),
                 "merchant_payouts": float(merchant_payouts),
                 "agent_commissions": float(agent_commissions),
+                "estimated_psp_fees": round(estimated_fees, 2),
                 "platform_revenue": float(platform_revenue),
                 "pending_amount": sum(p["amount"] for p in pending_payouts),
                 "total_orders": total_orders,
@@ -137,10 +138,10 @@ async def get_finance_summary(
                 "total_revenue": 0,
                 "merchant_payouts": 0,
                 "agent_commissions": 0,
+                "estimated_psp_fees": 0,
                 "platform_revenue": 0,
                 "pending_amount": 0,
                 "total_orders": 0
             },
             "pending_payouts": []
         }
-
