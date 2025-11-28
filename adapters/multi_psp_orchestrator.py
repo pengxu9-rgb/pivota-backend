@@ -134,7 +134,8 @@ class MultiPSPOrchestrator:
         self,
         amount: Decimal,
         currency: str,
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
+        preferred_psps: Optional[List[str]] = None,
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
         """
         Create payment intent with automatic PSP failover
@@ -142,7 +143,22 @@ class MultiPSPOrchestrator:
         Returns: (success, payment_intent, error, psp_used)
         """
         await self.load_psp_configs()
-        
+
+        # Reorder configs based on preferred_psps (from routing UI) if provided
+        if preferred_psps:
+            order_map = {
+                name.lower(): idx for idx, name in enumerate(preferred_psps, start=1)
+            }
+            default_base = len(order_map) + 1
+            for cfg in self.psp_configs:
+                if cfg.psp_type in order_map:
+                    cfg.priority = order_map[cfg.psp_type]
+                else:
+                    # Push unspecified providers to the back, keeping relative order
+                    cfg.priority = default_base + cfg.priority
+
+            self.psp_configs.sort(key=lambda x: x.priority)
+
         if not self.psp_configs:
             return False, None, "No PSP configured for merchant", "none"
         
@@ -259,7 +275,8 @@ async def create_payment_with_failover(
     merchant_id: str,
     amount: Decimal,
     currency: str,
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any],
+    preferred_psps: Optional[List[str]] = None,
 ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
     """
     Convenience function to create payment with multi-PSP support
@@ -273,5 +290,6 @@ async def create_payment_with_failover(
     )
     """
     orchestrator = MultiPSPOrchestrator(merchant_id)
-    return await orchestrator.create_payment_intent(amount, currency, metadata)
-
+    return await orchestrator.create_payment_intent(
+        amount, currency, metadata, preferred_psps=preferred_psps
+    )
