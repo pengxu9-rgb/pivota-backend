@@ -168,8 +168,19 @@ class AdyenAdapter(PSPAdapter):
     """Adyen PSP 适配器"""
     
     def __init__(self, api_key: str, merchant_account: str = "PivotaTestMerchant"):
-        self.api_key = api_key
-        self.merchant_account = merchant_account
+        # Clean API key to avoid whitespace / newline pollution from DB or env
+        key_clean = (api_key or "").replace("\n", "").replace("\r", "").replace(" ", "").strip()
+        # If the key length looks wildly off, try to fall back to settings (env)
+        if len(key_clean) < 50 or len(key_clean) > 120:
+            fallback = getattr(settings, "adyen_api_key", key_clean)
+            key_clean = (fallback or "").replace("\n", "").replace("\r", "").replace(" ", "").strip()
+        self.api_key = key_clean
+
+        # Some records might accidentally store Stripe account ids (acct_...). Guard against that.
+        acct = (merchant_account or "").strip()
+        if acct.startswith("acct_"):
+            acct = getattr(settings, "adyen_merchant_account", "PivotaTestMerchant")
+        self.merchant_account = acct or "PivotaTestMerchant"
         self.base_url = "https://checkout-test.adyen.com/v70"  # Test environment
     
     async def create_payment_intent(
@@ -180,9 +191,11 @@ class AdyenAdapter(PSPAdapter):
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str]]:
         """创建 Adyen Payment"""
         try:
-            print(f"🔍 Adyen: Creating payment for {amount} {currency}")
-            print(f"   Merchant Account: {self.merchant_account}")
-            print(f"   API Key: {self.api_key[:15]}... (len={len(self.api_key)})")
+            # Debug info to verify which credentials are actually used in production
+            print(
+                f"🔍 Adyen: Creating payment for {amount} {currency} | "
+                f"merchant={self.merchant_account} | key_prefix={self.api_key[:12]} | len={len(self.api_key)}"
+            )
             
             headers = {
                 "X-API-Key": self.api_key,
@@ -375,4 +388,3 @@ def get_psp_adapter(psp_type: str, api_key: str, **kwargs) -> PSPAdapter:
         return PayPalAdapter(api_key, client_secret, is_sandbox)
     else:
         raise ValueError(f"Unsupported PSP type: {psp_type}")
-

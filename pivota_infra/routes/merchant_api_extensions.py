@@ -366,7 +366,11 @@ async def connect_psp(
     psp_data: Dict[str, Any] = Body(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """Connect a PSP provider"""
+    """Connect a PSP provider.
+
+    NOTE: This implementation is kept in sync with routes/merchant_api_extensions.py
+    so that all entrypoints treat provider-specific fields (especially Adyen) consistently.
+    """
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -388,10 +392,28 @@ async def connect_psp(
     if provider == "checkout":
         provided_account_id = (psp_data.get("account_id") or "").strip()
         if not provided_account_id:
-            raise HTTPException(status_code=400, detail="Checkout.com requires processing_channel_id in account_id field")
+            raise HTTPException(
+                status_code=400,
+                detail="Checkout.com requires processing_channel_id in account_id field",
+            )
+        account_id = provided_account_id
+    elif provider == "adyen":
+        # For Adyen, account_id should be the merchantAccount.
+        # Prefer explicit value from request, otherwise fall back to env.
+        from config.settings import settings
+
+        provided_account_id = (psp_data.get("account_id") or "").strip()
+        if not provided_account_id:
+            provided_account_id = getattr(settings, "adyen_merchant_account", "").strip()
+        if not provided_account_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Adyen requires merchantAccount (account_id) to be provided",
+            )
         account_id = provided_account_id
     else:
-        account_id = "acct_" + ''.join(random.choices(string.digits, k=10))
+        # For Stripe/others, accept optional account_id from request; do NOT generate fake acct_* IDs.
+        account_id = (psp_data.get("account_id") or "").strip() or None
 
     # Save to database
     # [Phase 6.2 Fix] Include provider in psp_id to match constraint: psp_{provider}_{12chars}
