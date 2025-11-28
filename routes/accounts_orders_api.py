@@ -25,6 +25,7 @@ from fastapi import (
     Request,
     Response,
     status,
+    Body,
 )
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, validator
@@ -58,8 +59,11 @@ logger = logging.getLogger("accounts_orders")
 ACCESS_COOKIE_NAME = "acc_access_token"
 REFRESH_COOKIE_NAME = "acc_refresh_token"
 
-# Access token lifetime: short-lived session (30 minutes)
-ACCESS_EXPIRE_MINUTES = 30
+# Access token lifetime for accounts UI sessions.
+# Previously this was 30 minutes, which caused shoppers to be logged out
+# during longer checkout flows. For the Shopping Agent / developer portal
+# we extend this to a full 7 days to match the refresh window.
+ACCESS_EXPIRE_MINUTES = 7 * 24 * 60  # 7 days
 # Refresh token lifetime: rolling 7-day window
 REFRESH_EXPIRE_DAYS = 7
 
@@ -322,6 +326,24 @@ class PublicTrackResponse(BaseModel):
     order_id: str
     delivery_status: str
     timeline: List[PublicTrackEvent]
+
+
+class CancelOrderRequest(BaseModel):
+    """Optional cancel payload from customer."""
+    reason: Optional[str] = Field(
+        default=None,
+        description="Optional free-form reason provided by the customer.",
+    )
+
+
+class CancelOrderResponse(BaseModel):
+    """Minimal order summary returned after cancellation."""
+    order_id: str
+    status: str
+    payment_status: str
+    fulfillment_status: str
+    delivery_status: str
+    updated_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1083,136 @@ async def get_order_detail(
     }
 
     return response_payload
+
+
+@router.post("/orders/{order_id}/cancel", response_model=CancelOrderResponse)
+async def cancel_order(
+    order_id: str,
+    payload: CancelOrderRequest = Body(default=None),
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
+):
+    """
+    Cancel an order for the logged-in customer.
+
+    Rules:
+    - Only the customer who placed the order can cancel via this API.
+    - Only pending & not-fulfilled orders can be cancelled.
+    - Orders already cancelled/refunded/fulfilled return INVALID_STATE.
+    """
+    try:
+        # Look up order
+        order = await database.fetch_one(
+            orders_table.select().where(orders_table.c.order_id == order_id)
+        )
+        if not order:
+            # Hide existence by default
+            raise _error(
+                status.HTTP_404_NOT_FOUND,
+                "NOT_FOUND",
+                "Order not found",
+            )
+
+        order_data = dict(order)
+
+        # Access control: only the customer who placed the order
+        if principal.primary_role == "customer":
+            if normalize_email(order_data.get("customer_email", "")) != principal.email_normalized:
+                # Hide existence from other customers
+                raise _error(
+                    status.HTTP_404_NOT_FOUND,
+                    "NOT_FOUND",
+                    "Order not found",
+                )
+        else:
+            # Accounts API currently only supports customer cancellations
+            raise _error(
+                status.HTTP_403_FORBIDDEN,
+                "FORBIDDEN",
+                "Only customer accounts can cancel orders via this API for now",
+            )
+
+        # Derive current statuses
+        payment_status_mapped = _map_payment_status(order_data.get("payment_status"))
+        fulfillment_status_mapped = _map_fulfillment_status(
+            order_data.get("fulfillment_status")
+        )
+
+        # Check current state
+        is_already_cancelled = (order_data.get("status") == "cancelled")
+        is_refunded = (order_data.get("status") == "refunded")
+
+        if is_already_cancelled or is_refunded:
+            raise _error(
+                status.HTTP_400_BAD_REQUEST,
+                "INVALID_STATE",
+                "Order is already cancelled or refunded",
+            )
+
+        # Only allow cancellation when payment is still pending and nothing fulfilled
+        if not (
+            payment_status_mapped == "pending"
+            and fulfillment_status_mapped == "not_fulfilled"
+        ):
+            raise _error(
+                status.HTTP_400_BAD_REQUEST,
+                "INVALID_STATE",
+                "Order cannot be cancelled in its current state",
+            )
+
+        # Build update payload
+        update_values: Dict[str, Any] = {
+            "status": "cancelled",
+            "cancelled_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+
+        # Attach cancel reason into metadata if provided
+        if payload and payload.reason:
+            try:
+                metadata = order_data.get("metadata") or {}
+                # Avoid overwriting existing reasons; keep last one
+                metadata["cancel_reason"] = payload.reason
+                update_values["metadata"] = metadata
+            except Exception:
+                # Metadata failure should not block cancellation
+                pass
+
+        await database.execute(
+            orders_table.update()
+            .where(
+                and_(
+                    orders_table.c.order_id == order_id,
+                    orders_table.c.is_deleted == False,  # noqa: E712
+                )
+            )
+            .values(**update_values)
+        )
+
+        # Recompute derived fields for response
+        delivery_status = _derive_delivery_status(
+            order_data.get("fulfillment_status"), order_data.get("tracking_number")
+        )
+        updated_at = update_values["updated_at"].isoformat()
+
+        return CancelOrderResponse(
+            order_id=order_id,
+            status="cancelled",
+            payment_status=payment_status_mapped,
+            fulfillment_status=fulfillment_status_mapped,
+            delivery_status=delivery_status,
+            updated_at=updated_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        from utils.logger import logger as app_logger
+
+        app_logger.error(f"[AccountsOrders] cancel_order failed: {type(e).__name__}: {e}")
+        raise _error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "SERVER_ERROR",
+            "cancel_order failed",
+        )
 
 
 # ---------------------------------------------------------------------------
