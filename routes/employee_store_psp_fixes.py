@@ -352,28 +352,70 @@ async def setup_merchant_psp(
         else:
             # Create new PSP connection
             psp_id = f"psp_{request.psp_type}_{uuid.uuid4().hex[:8]}"
-            
+
             # Determine capabilities based on PSP type
             capabilities = {
                 "stripe": ["payments", "refunds", "subscriptions", "payouts"],
                 "adyen": ["payments", "refunds", "payouts", "risk_management"],
                 "paypal": ["payments", "refunds", "payouts"],
-                "square": ["payments", "refunds", "inventory"]
+                "square": ["payments", "refunds", "inventory"],
             }.get(request.psp_type, ["payments"])
-            
+
+            # Normalise / validate account_id by PSP type.
+            # Important: do NOT auto-generate acct_* for Adyen, since Adyen requires
+            # the real merchantAccount string.
+            raw_account_id = (request.account_id or "").strip()
+            if request.psp_type == "adyen":
+                if not raw_account_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Adyen requires merchantAccount (account_id)",
+                    )
+                account_id = raw_account_id
+            elif request.psp_type == "checkout":
+                if not raw_account_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Checkout.com requires processing_channel_id (account_id)",
+                    )
+                account_id = raw_account_id
+            else:
+                # Stripe/others: keep provided account_id if present; otherwise NULL.
+                account_id = raw_account_id or None
+
             # Build insert query and params
-            insert_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
-            insert_values = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
+            insert_cols = [
+                "psp_id",
+                "merchant_id",
+                "provider",
+                "name",
+                "api_key",
+                "account_id",
+                "capabilities",
+                "status",
+                "connected_at",
+            ]
+            insert_values = [
+                ":psp_id",
+                ":merchant_id",
+                ":provider",
+                ":name",
+                ":api_key",
+                ":account_id",
+                ":capabilities",
+                ":status",
+                ":connected_at",
+            ]
             params = {
                 "psp_id": psp_id,
                 "merchant_id": request.merchant_id,
                 "provider": request.psp_type,
                 "name": f"{request.psp_type.capitalize()} Account",
                 "api_key": request.api_key,
-                "account_id": request.account_id or f"acct_{uuid.uuid4().hex[:12]}",
+                "account_id": account_id,
                 "capabilities": ",".join(capabilities),
                 "status": "active",
-                "connected_at": datetime.now()
+                "connected_at": datetime.now(),
             }
             
             # Add secret_key for PayPal
@@ -529,4 +571,3 @@ async def test_store_connection(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Connection test failed: {str(e)}")
-
