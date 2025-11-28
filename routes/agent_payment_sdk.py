@@ -12,7 +12,7 @@ from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from db.merchant_onboarding import get_merchant_onboarding
 from db.orders import get_order, update_payment_info
 from adapters.psp_adapter import get_psp_adapter
-from adapters.multi_psp_orchestrator import MultiPSPOrchestrator
+from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
 from services.payment_routing_service import PaymentRoutingService
 from db.database import database
 from utils.logger import logger
@@ -153,52 +153,43 @@ async def create_payment(
         amount = Decimal(str(order_total))
         currency = currency_code
 
-        # Re-use MultiPSPOrchestrator config loading to resolve API keys,
-        # but execute only for the PSP chosen by routing.
-        orchestrator = MultiPSPOrchestrator(merchant_id)
-        await orchestrator.load_psp_configs()
-
-        target_config = None
-        for cfg in orchestrator.psp_configs:
-            if cfg.psp_type == selected_psp:
-                target_config = cfg
-                break
-
-        if not target_config:
+        # Build preferred PSP ordering from routing config for MultiPSPOrchestrator
+        preferred_psps: Optional[List[str]] = None
+        try:
+            if isinstance(route_config, dict):
+                raw_priority = route_config.get("psp_priority") or []
+                if isinstance(raw_priority, str):
+                    try:
+                        raw_priority = json.loads(raw_priority)
+                    except Exception:
+                        raw_priority = []
+                if isinstance(raw_priority, list) and raw_priority:
+                    preferred_psps = [
+                        str(entry.get("psp", "")).lower()
+                        for entry in sorted(
+                            raw_priority, key=lambda e: e.get("priority", 999)
+                        )
+                        if entry.get("psp")
+                    ]
+        except Exception as pref_err:
             logger.warning(
-                f"[AgentPayments] Selected PSP '{selected_psp}' not configured for merchant "
-                f"{merchant_id}; falling back to MultiPSPOrchestrator default ordering."
+                f"[AgentPayments] Failed to build preferred_psps list from route_config: {pref_err}"
             )
-            success, payment_intent, error, psp_used = await orchestrator.create_payment_intent(
-                amount=amount,
-                currency=currency,
-                metadata={
-                    "order_id": request.order_id,
-                    "agent_id": context.agent_id,
-                    "payment_method_type": request.payment_method.type,
-                    "idempotency_key": request.idempotency_key,
-                },
-            )
-        else:
-            psp_adapter = get_psp_adapter(
-                target_config.psp_type,
-                target_config.api_key,
-                merchant_account=target_config.merchant_account,
-            )
+            preferred_psps = None
 
-            success, payment_intent, error = await psp_adapter.create_payment_intent(
-                amount=amount,
-                currency=currency,
-                metadata={
-                    "order_id": request.order_id,
-                    "agent_id": context.agent_id,
-                    "payment_method_type": request.payment_method.type,
-                    "idempotency_key": request.idempotency_key,
-                    "psp_type": target_config.psp_type,
-                    "psp_priority": target_config.priority,
-                },
-            )
-            psp_used = target_config.psp_type
+        # Use MultiPSPOrchestrator for real payment creation with failover
+        success, payment_intent, error, psp_used = await create_payment_with_failover(
+            merchant_id=merchant_id,
+            amount=amount,
+            currency=currency,
+            metadata={
+                "order_id": request.order_id,
+                "agent_id": context.agent_id,
+                "payment_method_type": request.payment_method.type,
+                "idempotency_key": request.idempotency_key,
+            },
+            preferred_psps=preferred_psps,
+        )
 
         if not success:
             logger.error(f"Payment intent creation failed via {psp_used}: {error}")
