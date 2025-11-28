@@ -29,6 +29,7 @@ from db.database import database
 from utils.auth import require_admin, get_current_user
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
+from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
 from services.payment_routing_service import PaymentRoutingService
 
@@ -397,186 +398,219 @@ async def create_new_order(
             else:
                 logger.info(f"✅ Using PSP key from database/environment for {psp_type}")
             
-            # Only create payment intent if we have a valid PSP key
-            if psp_key:
-                # ------------------------------------------------------------------
-                # Safe logging: record a payment_attempt row (attempt_number=1)
-                # This is purely for observability; failures are logged but do
-                # NOT affect order creation or payment execution.
-                # ------------------------------------------------------------------
-                try:
-                    payment_attempt_id = f"att_{hashlib.md5(f'{order_id}1{datetime.utcnow().isoformat()}'.encode()).hexdigest()[:12]}"
-                    await database.execute(
-                        """
-                        INSERT INTO payment_attempts (
-                            attempt_id, order_id, route_id, agent_id,
-                            psp_name, attempt_number, status,
-                            amount, currency, created_at
-                        ) VALUES (
-                            :attempt_id, :order_id, :route_id, :agent_id,
-                            :psp_name, :attempt_number, :status,
-                            :amount, :currency, NOW()
-                        )
-                        """,
-                        {
-                            "attempt_id": payment_attempt_id,
-                            "order_id": order_id,
-                            "route_id": route_id_for_attempt,
-                            "agent_id": agent_id,
-                            "psp_name": psp_type,
-                            "attempt_number": 1,
-                            "status": "pending",
-                            "amount": float(total),
-                            "currency": order_request.currency,
-                        },
+            # Build preferred PSP ordering from routing config (if available)
+            preferred_psps: Optional[List[str]] = None
+            try:
+                if isinstance(route_config, dict):
+                    raw_priority = route_config.get("psp_priority") or []
+                    if isinstance(raw_priority, str):
+                        try:
+                            raw_priority = json.loads(raw_priority)
+                        except Exception:
+                            raw_priority = []
+                    if isinstance(raw_priority, list) and raw_priority:
+                        preferred_psps = [
+                            str(entry.get("psp", "")).lower()
+                            for entry in sorted(
+                                raw_priority, key=lambda e: e.get("priority", 999)
+                            )
+                            if entry.get("psp")
+                        ]
+            except Exception as pref_err:
+                logger.warning(
+                    f"[OrderRoutes] Failed to build preferred_psps list from route_config: {pref_err}"
+                )
+                preferred_psps = None
+
+            # For observability, record a single payment_attempt row (attempt_number=1).
+            # We set initial PSP name to the first preferred PSP, or the selected type.
+            initial_psp_name = (
+                (preferred_psps[0] if preferred_psps else None)
+                or psp_type
+                or "stripe"
+            )
+            try:
+                payment_attempt_id = f"att_{hashlib.md5(f'{order_id}1{datetime.utcnow().isoformat()}'.encode()).hexdigest()[:12]}"
+                await database.execute(
+                    """
+                    INSERT INTO payment_attempts (
+                        attempt_id, order_id, route_id, agent_id,
+                        psp_name, attempt_number, status,
+                        amount, currency, created_at
+                    ) VALUES (
+                        :attempt_id, :order_id, :route_id, :agent_id,
+                        :psp_name, :attempt_number, :status,
+                        :amount, :currency, NOW()
                     )
-                except Exception as log_err:
-                    logger.warning(
-                        f"⚠️ Failed to log payment_attempt for order {order_id}: {log_err}"
-                    )
-                    payment_attempt_id = None
-                
-                # 创建支付意图（所有 PSP 统一处理）
-                adapter_kwargs = {}
-                if psp_type == "checkout" and psp_account_id:
-                    adapter_kwargs["public_key"] = psp_account_id
-                    logger.info(f"🔧 Creating Checkout adapter with processing_channel_id: {psp_account_id}")
-                elif psp_type == "adyen" and psp_account_id:
-                    adapter_kwargs["merchant_account"] = psp_account_id
-                    logger.info(f"🔧 Creating Adyen adapter with merchant_account: {psp_account_id}")
-                elif psp_type == "paypal" and psp_secret:
-                    adapter_kwargs["client_secret"] = psp_secret
-                    adapter_kwargs["is_sandbox"] = True  # Use sandbox for now
-                    logger.info(f"🔧 Creating PayPal adapter with client_secret")
-                
-                logger.info(f"📡 Creating {psp_type} payment intent for ${total} {order_request.currency}")
-                logger.info(f"   Using PSP key: {psp_key[:15]}... (mock={psp_key.startswith('sk_mock') if psp_key else False})")
-                psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
-                start_ts = time.monotonic()
-                success, payment_intent, error = await psp_adapter.create_payment_intent(
-                    amount=total,
-                    currency=order_request.currency,
-                    metadata={
+                    """,
+                    {
+                        "attempt_id": payment_attempt_id,
                         "order_id": order_id,
-                        "merchant_id": order_request.merchant_id,
-                        "customer_email": order_request.customer_email,
+                        "route_id": route_id_for_attempt,
+                        "agent_id": agent_id,
+                        "psp_name": initial_psp_name,
+                        "attempt_number": 1,
+                        "status": "pending",
+                        "amount": float(total),
+                        "currency": order_request.currency,
                     },
                 )
-                response_ms = int((time.monotonic() - start_ts) * 1000)
-                logger.info(f"   Payment intent result: success={success}, has_intent={payment_intent is not None}, error={error}")
-                if success and payment_intent:
-                    logger.info(f"   Intent ID: {payment_intent.id}, Secret: {payment_intent.client_secret[:20] if payment_intent.client_secret else 'None'}...")
-                    payment_intent_id = payment_intent.id
-                    client_secret = payment_intent.client_secret
-                    logger.info(f"✅ Payment intent created: {payment_intent_id}")
-                    
-                    # Build unified payment_action for frontend routing
-                    try:
-                        if psp_type == "stripe" and client_secret:
-                            payment_action = {
-                                "type": "stripe_client_secret",
-                                "client_secret": client_secret,
-                                "raw": getattr(payment_intent, "raw_response", None),
-                            }
-                        elif psp_type == "adyen" and client_secret:
-                            payment_action = {
-                                "type": "adyen_session",
-                                "client_secret": client_secret,
-                                "raw": getattr(payment_intent, "raw_response", None),
-                            }
-                        elif psp_type in ["checkout", "paypal"] and client_secret and str(client_secret).startswith("http"):
-                            payment_action = {
-                                "type": "redirect_url",
-                                "url": client_secret,
-                                "raw": getattr(payment_intent, "raw_response", None),
-                            }
-                        else:
-                            # Fallback: expose minimal info; frontends can still use legacy fields
-                            payment_action = {
-                                "type": None,
-                                "client_secret": client_secret,
-                            }
-                    except Exception as pa_err:
-                        logger.warning(f"⚠️ Failed to build payment_action for order {order_id}: {pa_err}")
-                    
-                    # Update payment_attempt as success (best-effort)
-                    if payment_attempt_id:
-                        try:
-                            await database.execute(
-                                """
-                                UPDATE payment_attempts
-                                SET status = :status,
-                                    response_time_ms = :response_time_ms,
-                                    error_code = NULL,
-                                    error_message = NULL,
-                                    completed_at = NOW()
-                                WHERE attempt_id = :attempt_id
-                                """,
-                                {
-                                    "status": "success",
-                                    "response_time_ms": response_ms,
-                                    "attempt_id": payment_attempt_id,
-                                },
-                            )
-                        except Exception as log_err:
-                            logger.warning(
-                                f"⚠️ Failed to update payment_attempt {payment_attempt_id} as success: {log_err}"
-                            )
-                    
-                    # For Checkout and PayPal, client_secret contains the redirect URL
-                    if psp_type in ["checkout", "paypal"] and client_secret and client_secret.startswith("http"):
-                        logger.info(f"🔗 {psp_type.capitalize()} redirect URL: {client_secret}")
-                        
-                    await update_payment_info(
-                        order_id=order_id,
-                        payment_intent_id=payment_intent_id,
-                        client_secret=client_secret,
-                        payment_status="awaiting_payment",
-                        psp_used=psp_type,
-                    )
-                    await log_order_event(
-                        event_type="order_created",
-                        order_id=order_id,
-                        merchant_id=order_request.merchant_id,
-                        metadata={
-                            "total": float(total),
-                            "currency": order_request.currency,
-                            "items_count": len(order_request.items),
-                            "payment_intent_id": payment_intent_id,
-                            "psp_type": psp_type
+            except Exception as log_err:
+                logger.warning(
+                    f"⚠️ Failed to log payment_attempt for order {order_id}: {log_err}"
+                )
+                payment_attempt_id = None
+
+            # 使用 MultiPSPOrchestrator，按路由配置的优先级（preferred_psps）
+            # 自动在 adyen → stripe → checkout 之间切换。
+            start_ts = time.monotonic()
+            success, payment_intent, error, psp_used = await create_payment_with_failover(
+                merchant_id=order_request.merchant_id,
+                amount=total,
+                currency=order_request.currency,
+                metadata={
+                    "order_id": order_id,
+                    "merchant_id": order_request.merchant_id,
+                    "customer_email": order_request.customer_email,
+                    "route_id": route_id_for_attempt,
+                    "agent_id": agent_id,
+                },
+                preferred_psps=preferred_psps,
+            )
+            response_ms = int((time.monotonic() - start_ts) * 1000)
+
+            # 最终实际使用的 PSP（如果 orchestrator 没返回，则回退到 initial_psp_name）
+            final_psp = (psp_used or initial_psp_name or psp_type or "stripe").lower()
+            logger.info(
+                f"[OrderRoutes] Payment intent result via MultiPSPOrchestrator: "
+                f"success={success}, psp_used={final_psp}, has_intent={payment_intent is not None}, error={error}"
+            )
+
+            if success and payment_intent:
+                payment_intent_id = payment_intent.id
+                client_secret = payment_intent.client_secret
+                psp_type = final_psp
+                logger.info(f"✅ Payment intent created via {psp_type}: {payment_intent_id}")
+
+                # Build unified payment_action for frontend routing
+                try:
+                    if psp_type == "stripe" and client_secret:
+                        payment_action = {
+                            "type": "stripe_client_secret",
+                            "client_secret": client_secret,
+                            "raw": getattr(payment_intent, "raw_response", None),
                         }
+                    elif psp_type == "adyen" and client_secret:
+                        payment_action = {
+                            "type": "adyen_session",
+                            "client_secret": client_secret,
+                            "raw": getattr(payment_intent, "raw_response", None),
+                        }
+                    elif psp_type in ["checkout", "paypal"] and client_secret and str(
+                        client_secret
+                    ).startswith("http"):
+                        payment_action = {
+                            "type": "redirect_url",
+                            "url": client_secret,
+                            "raw": getattr(payment_intent, "raw_response", None),
+                        }
+                    else:
+                        # Fallback: expose minimal info; frontends can still use legacy fields
+                        payment_action = {
+                            "type": None,
+                            "client_secret": client_secret,
+                        }
+                except Exception as pa_err:
+                    logger.warning(
+                        f"⚠️ Failed to build payment_action for order {order_id}: {pa_err}"
                     )
-                else:
-                    logger.error(f"Payment intent creation failed: {error}")
-                    # Update payment_attempt as failed (best-effort)
-                    if payment_attempt_id:
-                        try:
-                            await database.execute(
-                                """
-                                UPDATE payment_attempts
-                                SET status = :status,
-                                    response_time_ms = :response_time_ms,
-                                    error_message = :error_message,
-                                    completed_at = NOW()
-                                WHERE attempt_id = :attempt_id
-                                """,
-                                {
-                                    "status": "failed",
-                                    "response_time_ms": response_ms,
-                                    "error_message": str(error) if error else None,
-                                    "attempt_id": payment_attempt_id,
-                                },
-                            )
-                        except Exception as log_err:
-                            logger.warning(
-                                f"⚠️ Failed to update payment_attempt {payment_attempt_id} as failed: {log_err}"
-                            )
-                    await log_order_event(
-                        event_type="payment_intent_failed",
-                        order_id=order_id,
-                        merchant_id=order_request.merchant_id,
-                        metadata={"error": error, "psp_type": psp_type}
-                    )
+
+                # Update payment_attempt as success (best-effort)
+                if payment_attempt_id:
+                    try:
+                        await database.execute(
+                            """
+                            UPDATE payment_attempts
+                            SET status = :status,
+                                response_time_ms = :response_time_ms,
+                                error_code = NULL,
+                                error_message = NULL,
+                                psp_name = :psp_name,
+                                completed_at = NOW()
+                            WHERE attempt_id = :attempt_id
+                            """,
+                            {
+                                "status": "success",
+                                "response_time_ms": response_ms,
+                                "psp_name": final_psp,
+                                "attempt_id": payment_attempt_id,
+                            },
+                        )
+                    except Exception as log_err:
+                        logger.warning(
+                            f"⚠️ Failed to update payment_attempt {payment_attempt_id} as success: {log_err}"
+                        )
+
+                # For Checkout and PayPal, client_secret contains the redirect URL
+                if (
+                    psp_type in ["checkout", "paypal"]
+                    and client_secret
+                    and str(client_secret).startswith("http")
+                ):
+                    logger.info(f"🔗 {psp_type.capitalize()} redirect URL: {client_secret}")
+
+                await update_payment_info(
+                    order_id=order_id,
+                    payment_intent_id=payment_intent_id,
+                    client_secret=client_secret or "",
+                    payment_status="awaiting_payment",
+                    psp_used=psp_type,
+                )
+                await log_order_event(
+                    event_type="order_created",
+                    order_id=order_id,
+                    merchant_id=order_request.merchant_id,
+                    metadata={
+                        "total": float(total),
+                        "currency": order_request.currency,
+                        "items_count": len(order_request.items),
+                        "payment_intent_id": payment_intent_id,
+                        "psp_type": psp_type,
+                    },
+                )
+            else:
+                logger.error(f"Payment intent creation failed via MultiPSP: {error}")
+                # Update payment_attempt as failed (best-effort)
+                if payment_attempt_id:
+                    try:
+                        await database.execute(
+                            """
+                            UPDATE payment_attempts
+                            SET status = :status,
+                                response_time_ms = :response_time_ms,
+                                error_message = :error_message,
+                                psp_name = :psp_name,
+                                completed_at = NOW()
+                            WHERE attempt_id = :attempt_id
+                            """,
+                            {
+                                "status": "failed",
+                                "response_time_ms": response_ms,
+                                "error_message": str(error) if error else None,
+                                "psp_name": final_psp,
+                                "attempt_id": payment_attempt_id,
+                            },
+                        )
+                    except Exception as log_err:
+                        logger.warning(
+                            f"⚠️ Failed to update payment_attempt {payment_attempt_id} as failed: {log_err}"
+                        )
+                await log_order_event(
+                    event_type="payment_intent_failed",
+                    order_id=order_id,
+                    merchant_id=order_request.merchant_id,
+                    metadata={"error": error, "psp_type": final_psp},
+                )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
             # Mark attempt as failed if we managed to create one
