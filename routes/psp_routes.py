@@ -2,6 +2,8 @@ from fastapi import APIRouter, Request, Header, HTTPException, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from adapters.stripe_adapter import verify_webhook_signature
 from orchestrator.callback_handler import handle_psp_webhook
+from db.orders import get_order, mark_order_paid
+from db.products import log_order_event
 from config.settings import settings
 from utils.logger import logger
 import hmac
@@ -78,9 +80,70 @@ async def adyen_webhook(
                 
                 # Handle different event types
                 if event_code == "AUTHORISATION" and success == "true":
-                    await handle_psp_webhook(merchant_reference, "succeeded", "adyen", psp_reference)
+                    logger.info(
+                        f"[AdyenWebhook] handling success for {merchant_reference} psp_ref={psp_reference}"
+                    )
+                    # Try fetch order up-front to see if it exists
+                    try:
+                        fetched = await get_order(merchant_reference)
+                        logger.info(
+                            f"[AdyenWebhook] fetched order for {merchant_reference}: {fetched}"
+                        )
+                    except Exception as fetch_err:
+                        logger.error(
+                            f"[AdyenWebhook] get_order failed for {merchant_reference}: {fetch_err}"
+                        )
+
+                    # Update PSP transactions (legacy/prototype)
+                    await handle_psp_webhook(
+                        merchant_reference,
+                        "succeeded",
+                        "adyen",
+                        psp_reference,
+                    )
+
+                    # Also mark corresponding order as paid.
+                    # We treat merchantReference as our internal order_id.
+                    try:
+                        order_id = merchant_reference
+                        order = await get_order(order_id)
+                        if order and order.get("payment_status") != "paid":
+                            await mark_order_paid(order_id)
+                            await log_order_event(
+                                event_type="payment_confirmed_webhook",
+                                order_id=order_id,
+                                merchant_id=order["merchant_id"],
+                                metadata={
+                                    "psp": "adyen",
+                                    "payment_intent_id": psp_reference,
+                                    "amount": notification.get("amount", {}).get(
+                                        "value"
+                                    ),
+                                    "currency": notification.get("amount", {}).get(
+                                        "currency"
+                                    ),
+                                },
+                            )
+                            logger.info(
+                                f"Order {order_id} marked as paid via Adyen webhook"
+                            )
+                        elif not order:
+                            logger.error(
+                                f"[AdyenWebhook] no order found for {order_id}; cannot mark paid"
+                            )
+                        else:
+                            logger.info(
+                                f"[AdyenWebhook] order {order_id} already paid, skipping"
+                            )
+                    except Exception as order_err:
+                        logger.error(
+                            f"Adyen webhook order update failed for {merchant_reference}: {order_err}"
+                        )
+
                 elif event_code == "AUTHORISATION" and success == "false":
-                    await handle_psp_webhook(merchant_reference, "failed", "adyen", psp_reference)
+                    await handle_psp_webhook(
+                        merchant_reference, "failed", "adyen", psp_reference
+                    )
                 # Add more event types as needed
                 
         except Exception as e:
