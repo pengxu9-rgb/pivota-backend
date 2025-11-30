@@ -5,6 +5,7 @@ Allows agents to view merchant products via hybrid query (cache or realtime)
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from services.product_query_service import get_products_hybrid, log_query_source
+from services.agent_product_service import get_agent_product_view
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional, Dict, Any
 import httpx
@@ -70,22 +71,39 @@ async def get_merchant_products(
             product_count=len(products)
         )
         
-        # Transform StandardProduct to agent-friendly format
+        # Transform StandardProduct to agent-friendly format enriched via overlay
         agent_products = []
         for product in products:
+            # Try to build an enriched view; fall back to StandardProduct if needed
+            enriched = await get_agent_product_view(
+                merchant_id=merchant_id,
+                platform=product.platform,
+                platform_product_id=product.id,
+                geo_code="default",
+            )
+
+            display_title = (
+                enriched["title"] if enriched and enriched.get("title") else product.title
+            )
+            image_url = (
+                enriched["main_image_url"]
+                if enriched and enriched.get("main_image_url")
+                else product.image_url
+            )
+
             # Handle variants (if exists) or create default variant
             if product.variants and len(product.variants) > 0:
                 for variant in product.variants:
                     agent_products.append({
                         "product_id": product.id,
                         "variant_id": variant.id,
-                        "title": product.title,
+                        "title": display_title,
                         "variant_title": variant.title,
                         "price": variant.price,
                         "sku": variant.sku,
                         "inventory_quantity": variant.inventory_quantity,
                         "available": variant.inventory_quantity > 0,
-                        "image_url": variant.image_url or product.image_url,
+                        "image_url": variant.image_url or image_url,
                         "currency": product.currency
                     })
             else:
@@ -93,13 +111,13 @@ async def get_merchant_products(
                 agent_products.append({
                     "product_id": product.id,
                     "variant_id": product.id,  # Use product_id as variant_id
-                    "title": product.title,
+                    "title": display_title,
                     "variant_title": "Default",
                     "price": product.price,
                     "sku": product.sku,
                     "inventory_quantity": product.inventory_quantity,
                     "available": product.inventory_quantity > 0,
-                    "image_url": product.image_url,
+                    "image_url": image_url,
                     "currency": product.currency
                 })
         

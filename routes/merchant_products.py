@@ -1,0 +1,265 @@
+"""
+Merchant product optimization APIs.
+
+These endpoints expose a merged view of:
+- StandardProduct from products_cache
+- Pivota-specific enrichment from product_enrichment
+- Latest quality snapshot from product_quality_snapshot
+
+They are intended to power the Merchant Portal "Product Optimization"
+experience, not the public Agent API.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Any, Dict, List, Optional
+
+from db.database import database
+from db.products import products_cache
+from db.product_enrichment import get_enrichment, upsert_enrichment
+from db.product_quality import product_quality_snapshot
+from models.standard_product import StandardProduct
+from utils.auth import get_current_user
+
+router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
+
+
+async def _fetch_latest_quality_row(
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = """
+    SELECT *
+    FROM product_quality_snapshot
+    WHERE merchant_id = :merchant_id
+      AND platform = :platform
+      AND platform_product_id = :platform_product_id
+    ORDER BY snapshot_date DESC
+    LIMIT 1
+    """
+    row = await database.fetch_one(
+        query,
+        {
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+        },
+    )
+    return dict(row) if row else None
+
+
+def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract a lightweight standard view from products_cache row."""
+    product_json = cache_row.get("product_data") or {}
+    try:
+        # Validate via StandardProduct for safety, but don't raise on errors
+        product = StandardProduct.parse_obj(product_json)
+        title = product.title
+        price = {
+            "value": product.price,
+            "currency": product.currency,
+        }
+        main_image_url = product.image_url or (product.images[0] if product.images else None)
+    except Exception:
+        title = product_json.get("title")
+        price_value = product_json.get("price")
+        price_currency = product_json.get("currency") or "USD"
+        price = {"value": price_value, "currency": price_currency}
+        main_image_url = product_json.get("image_url")
+
+    return {
+        "title": title,
+        "price": price,
+        "main_image_url": main_image_url,
+        "last_synced_at": cache_row.get("cached_at"),
+    }
+
+
+@router.get("")
+async def list_merchant_products(
+    platform: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    List products for the current merchant with optional enrichment & quality.
+
+    This is a lightweight list view for the Merchant Portal.
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can list their products")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    offset = (page - 1) * page_size
+
+    # Base query from products_cache
+    base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
+    if platform:
+        base_query = base_query.where(products_cache.c.platform == platform)
+
+    query = (
+        base_query.order_by(products_cache.c.cached_at.desc())
+        .limit(page_size)
+        .offset(offset)
+    )
+    rows = await database.fetch_all(query)
+    # Simple total for now; can be optimized later with a dedicated COUNT(*)
+    total = len(rows)
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        cache_row = dict(row)
+        platform_val = cache_row.get("platform")
+        platform_product_id = cache_row.get("platform_product_id")
+
+        standard = _build_standard_summary(cache_row)
+
+        enrichment = await get_enrichment(
+            merchant_id=merchant_id,
+            platform=platform_val,
+            platform_product_id=platform_product_id,
+            geo_code="default",
+        )
+        quality = await _fetch_latest_quality_row(
+            merchant_id=merchant_id,
+            platform=platform_val,
+            platform_product_id=platform_product_id,
+        )
+
+        items.append({
+            "merchant_id": merchant_id,
+            "platform": platform_val,
+            "platform_product_id": platform_product_id,
+            "standard": standard,
+            "enrichment": enrichment or {},
+            "quality": {
+                "content_quality_score": quality.get("content_quality_score") if quality else None,
+                "model_readiness_score": quality.get("model_readiness_score") if quality else None,
+                "conversion_potential_score": quality.get("conversion_potential_score") if quality else None,
+                "last_evaluated_at": quality.get("snapshot_date") if quality else None,
+            },
+        })
+
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+    }
+
+
+@router.get("/{platform}/{platform_product_id}")
+async def get_merchant_product_detail(
+    platform: str,
+    platform_product_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Detailed view for a single product:
+    - StandardProduct (from products_cache)
+    - Enrichment overlay
+    - Latest quality snapshot
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can view their products")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    cache_row = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not cache_row:
+        raise HTTPException(status_code=404, detail="Product not found in cache")
+
+    cache_row = dict(cache_row)
+    product_json = cache_row.get("product_data") or {}
+    standard_full: Dict[str, Any]
+    try:
+        product = StandardProduct.parse_obj(product_json)
+        standard_full = product.dict()
+    except Exception:
+        standard_full = product_json
+
+    enrichment = await get_enrichment(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        geo_code="default",
+    )
+    quality = await _fetch_latest_quality_row(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+    )
+
+    return {
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "platform_product_id": platform_product_id,
+        "standard": standard_full,
+        "enrichment": enrichment or {},
+        "quality": quality or {},
+    }
+
+
+@router.put("/{platform}/{platform_product_id}/enrichment")
+async def update_product_enrichment(
+    platform: str,
+    platform_product_id: str,
+    body: Dict[str, Any],
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Update enrichment overlay for a product.
+
+    The body may contain any subset of enrichment fields:
+    - title_override, summary_short, bullet_points, usage_scenarios,
+      audience_tags, topic_tags, regulatory_disclaimer_local, extra_images
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can modify enrichment")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    # Ensure the product exists for this merchant
+    exists = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    await upsert_enrichment(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        geo_code="default",
+        data=body,
+    )
+
+    enrichment = await get_enrichment(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        geo_code="default",
+    )
+
+    return {
+        "status": "success",
+        "enrichment": enrichment or {},
+    }

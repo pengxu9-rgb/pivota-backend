@@ -175,6 +175,7 @@ from routes.agent_payouts import router as agent_payouts_router  # Agent payout 
 from routes.admin_payout_backfill import router as admin_payout_backfill_router  # Admin backfill for payouts/commissions
 from routes.agent_bank import router as agent_bank_router  # Agent bank info
 from routes.employee_finance import router as employee_finance_router  # Employee finance dashboard
+from routes.employee_payouts import router as employee_payouts_router  # Employee payout actions
 from routes.merchant_agent_bank import router as merchant_agent_bank_router  # Merchant view agent bank info
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
@@ -189,6 +190,8 @@ from routes.fix_orders_table import router as fix_orders_table_router
 from routes.agent_metrics import router as agent_metrics_router
 from routes.agent_keys import router as agent_keys_router
 from routes.init_agent_key import router as init_agent_key_router
+from routes.merchant_products import router as merchant_products_router
+from routes.product_quality_routes import router as product_quality_router
 if DEBUG_MODE:
     from routes.create_test_agent import router as create_test_agent_router
     from routes.debug_agent_key import router as debug_agent_key_router
@@ -416,6 +419,7 @@ app.include_router(merchant_commission_api_router)  # Merchant commission offers
 app.include_router(agent_settlement_router)  # Agent settlements and payouts
 app.include_router(merchant_payouts_router)  # Merchant payout management
 app.include_router(agent_payouts_router)  # Agent payout view
+app.include_router(employee_payouts_router)  # Employee payout approval endpoints
 app.include_router(admin_payout_backfill_router)  # Admin backfill for payouts/commissions
 app.include_router(agent_integration_router)  # Agent integration status (aggregates existing data)
 app.include_router(agent_bank_router)  # Agent bank info
@@ -505,6 +509,7 @@ app.include_router(fix_orders_table_router)  # Fix orders table structure
 app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(init_agent_key_router)  # Initialize test agent key
+app.include_router(merchant_products_router)  # Merchant product optimization APIs
 if DEBUG_MODE:
     app.include_router(create_test_agent_router)  # Create test agent account
     app.include_router(debug_agent_key_router)  # Debug agent key
@@ -526,6 +531,7 @@ app.include_router(demo_data_router)  # Demo data management
 # [DELETED] test_data_router router registration removed (file not in Git)
 app.include_router(simple_ws_router)  # Simple WebSocket
 # agent_metrics_router already included above on line 195
+app.include_router(product_quality_router)  # Internal product quality preview (Merchant Portal)
 
 if SIMPLE_MAPPING_AVAILABLE:
     app.include_router(simple_mapping_router)
@@ -652,6 +658,8 @@ async def startup():
         from db.products import (
             products_cache, api_call_events, order_events, merchant_analytics
         )
+        from db.product_quality import product_quality_snapshot
+        from db.product_enrichment import product_enrichment
         from db.orders import orders
         # Accounts & Orders API: customer-facing accounts tables
         try:
