@@ -18,6 +18,7 @@ from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
 from db.product_quality import product_quality_snapshot
 from models.standard_product import StandardProduct
+from services.product_enrichment_pipeline import run_enrichment_for_product
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
@@ -262,4 +263,77 @@ async def update_product_enrichment(
     return {
         "status": "success",
         "enrichment": enrichment or {},
+    }
+
+
+@router.post("/{platform}/{platform_product_id}/enrichment/run")
+async def run_product_enrichment(
+    platform: str,
+    platform_product_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Trigger the automated enrichment pipeline for a single product,
+    then return the updated combined detail view.
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can optimize products")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    # Ensure the product exists for this merchant
+    exists = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Product not found in cache")
+
+    # Run enrichment pipeline (heuristic AI + quality snapshot + event)
+    try:
+        await run_enrichment_for_product(
+            merchant_id=merchant_id,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            geo_code="default",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to run enrichment pipeline: {exc}",
+        )
+
+    # Build updated detail view (same shape as GET /merchant/products/{platform}/{platform_product_id})
+    cache_row = dict(exists)
+    product_json = cache_row.get("product_data") or {}
+    try:
+        product = StandardProduct.parse_obj(product_json)
+        standard_full: Dict[str, Any] = product.dict()
+    except Exception:
+        standard_full = product_json
+
+    enrichment = await get_enrichment(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        geo_code="default",
+    )
+    quality = await _fetch_latest_quality_row(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+    )
+
+    return {
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "platform_product_id": platform_product_id,
+        "standard": standard_full,
+        "enrichment": enrichment or {},
+        "quality": quality or {},
     }
