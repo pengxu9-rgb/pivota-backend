@@ -12,9 +12,12 @@ experience, not the public Agent API.
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional
+from datetime import datetime
+
+from pydantic import BaseModel
 
 from db.database import database
-from db.products import products_cache
+from db.products import products_cache, get_cached_products
 from db.product_enrichment import get_enrichment, upsert_enrichment
 from db.product_quality import product_quality_snapshot
 from models.standard_product import StandardProduct
@@ -22,6 +25,11 @@ from services.product_enrichment_pipeline import run_enrichment_for_product
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
+
+
+class EnrichmentBackfillRequest(BaseModel):
+    platform: Optional[str] = None
+    limit: Optional[int] = 100
 
 
 async def _fetch_latest_quality_row(
@@ -210,6 +218,88 @@ async def get_merchant_product_detail(
         "standard": standard_full,
         "enrichment": enrichment or {},
         "quality": quality or {},
+    }
+
+
+@router.post("/enrichment/backfill")
+async def backfill_product_enrichment(
+    body: EnrichmentBackfillRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Run enrichment + quality scoring for multiple products of the current merchant.
+
+    Body:
+    - platform: optional platform filter (e.g. "wix", "shopify")
+    - limit: optional max number of products to process (default 100)
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can optimize products")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    platform = body.platform
+    limit = body.limit or 100
+    if limit <= 0:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+
+    rows: List[Dict[str, Any]] = []
+
+    # If platform specified, use helper; otherwise query all platforms for this merchant.
+    if platform:
+        cached = await get_cached_products(
+            merchant_id=merchant_id,
+            platform=platform,
+            include_expired=False,
+        )
+        rows = cached[:limit]
+    else:
+        base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
+        base_query = base_query.where(products_cache.c.expires_at > datetime.now())
+        base_query = base_query.order_by(products_cache.c.cached_at.desc()).limit(limit)
+        records = await database.fetch_all(base_query)
+        rows = [dict(r) for r in records]
+
+    processed = 0
+    skipped = 0
+    errors: List[Dict[str, Any]] = []
+
+    for row in rows:
+        platform_val = row.get("platform")
+        platform_product_id = row.get("platform_product_id")
+        if not platform_product_id or not platform_val:
+            skipped += 1
+            continue
+        try:
+            await run_enrichment_for_product(
+                merchant_id=merchant_id,
+                platform=platform_val,
+                platform_product_id=platform_product_id,
+                geo_code="default",
+            )
+            processed += 1
+        except Exception as exc:
+            skipped += 1
+            errors.append(
+                {
+                    "platform": platform_val,
+                    "platform_product_id": platform_product_id,
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "status": "success",
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "limit": limit,
+        "processed": processed,
+        "skipped": skipped,
+        "errors": errors,
     }
 
 
