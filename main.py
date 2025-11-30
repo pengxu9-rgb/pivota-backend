@@ -192,6 +192,7 @@ from routes.agent_keys import router as agent_keys_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.merchant_products import router as merchant_products_router
 from routes.product_quality_routes import router as product_quality_router
+from routes.product_enrichment_routes import router as product_enrichment_router
 if DEBUG_MODE:
     from routes.create_test_agent import router as create_test_agent_router
     from routes.debug_agent_key import router as debug_agent_key_router
@@ -510,6 +511,7 @@ app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
+app.include_router(product_enrichment_router)  # Internal product enrichment trigger
 if DEBUG_MODE:
     app.include_router(create_test_agent_router)  # Create test agent account
     app.include_router(debug_agent_key_router)  # Debug agent key
