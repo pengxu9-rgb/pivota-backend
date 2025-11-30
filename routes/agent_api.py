@@ -16,7 +16,6 @@ from models.order import CreateOrderRequest, OrderResponse
 from models.standard_product import StandardProduct
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
-from db.products import get_cached_products
 from db.orders import get_order, get_orders_by_merchant, update_payment_info
 from routes.refund_api import process_refund
 from routes.order_routes import cancel_order as admin_cancel_order
@@ -24,6 +23,15 @@ from routes.fulfillment_api import track_order_fulfillment
 from routes.order_routes import create_new_order
 from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from utils.logger import logger
+from services.product_query_service import get_products_hybrid
+from services.agent_ranking_service import (
+    AgentRankingFeatures,
+    get_agent_ranking_config,
+    hydrate_quality_and_enrichment,
+    passes_agent_gating,
+    compute_agent_ranking_score,
+    serialize_features_for_log,
+)
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
@@ -105,30 +113,37 @@ async def agent_search_products(
             merchants_to_search = [row["merchant_id"] for row in merchant_rows]
         
         # Collect products from all target merchants
-        all_products = []
+        all_products: List[Dict[str, Any]] = []
         
         for mid in merchants_to_search:
             try:
                 # Verify merchant is active
                 merchant = await verify_merchant_active(mid)
-                
-                # Get cached products
-                cached_products = await get_cached_products(mid)
-                
-                if cached_products and cached_products.get("products"):
-                    # Add merchant info to each product
-                    for product in cached_products["products"]:
-                        product["merchant_id"] = mid
-                        product["merchant_name"] = merchant.get("business_name", "Unknown")
-                        all_products.append(product)
+
+                # Use hybrid query service (cache + realtime) to fetch products
+                products, query_source, _ = await get_products_hybrid(
+                    merchant_id=mid,
+                    limit=limit,
+                    agent_id=context.agent_id,
+                    background_tasks=background_tasks,
+                )
+
+                for sp in products:
+                    prod_dict = sp.dict()
+                    prod_dict["merchant_id"] = mid
+                    prod_dict["merchant_name"] = merchant.get("business_name", "Unknown")
+                    prod_dict["query_source"] = query_source
+                    all_products.append(prod_dict)
             except Exception as e:
                 # Log but continue with other merchants
                 logger.warning(f"Failed to get products from {mid}: {e}")
                 continue
-        
-        # Apply filters and calculate relevance scores
-        filtered_products = []
-        
+
+        ranking_config = get_agent_ranking_config()
+
+        # Apply filters, build features and calculate scores
+        ranked_candidates: List[Dict[str, Any]] = []
+
         for product in all_products:
             # 库存过滤
             if in_stock_only and not product.get("in_stock", True):
@@ -143,11 +158,15 @@ async def agent_search_products(
             
             # 类别过滤
             if category:
-                product_category = product.get("category", "").lower()
+                product_category = (
+                    product.get("category")
+                    or product.get("product_type")
+                    or ""
+                ).lower()
                 if category.lower() not in product_category:
                     continue
             
-            # 搜索查询 + 相关度评分
+            # 搜索查询 + 相关度评分（简单 keyword 匹配，可作为 rel_keyword）
             relevance_score = 1.0
             if query:
                 query_lower = query.lower()
@@ -172,15 +191,84 @@ async def agent_search_products(
                 product["relevance_score"] = relevance_score
             else:
                 product["relevance_score"] = 1.0
-            
-            filtered_products.append(product)
-        
-        # Sort by relevance score (highest first)
-        filtered_products.sort(key=lambda p: p.get("relevance_score", 0), reverse=True)
-        
+
+            # Build feature vector for ranking
+            platform = product.get("platform") or "unknown"
+            platform_product_id = str(
+                product.get("product_id") or product.get("id") or ""
+            )
+            if not platform_product_id:
+                # Skip products without a stable identifier
+                continue
+
+            features = AgentRankingFeatures(
+                merchant_id=product.get("merchant_id"),
+                platform=platform,
+                platform_product_id=platform_product_id,
+                rel_semantic=relevance_score,  # Placeholder until true semantic score
+                rel_keyword=relevance_score,
+                rel_category_match=1.0
+                if category
+                and category.lower()
+                in (product.get("product_type") or "").lower()
+                else 0.0,
+            )
+
+            # Enrich features with quality / enrichment data
+            await hydrate_quality_and_enrichment(features)
+
+            # Apply hard gating (quality / compliance)
+            if not passes_agent_gating(features, ranking_config):
+                continue
+
+            # Compute final ranking score
+            score = compute_agent_ranking_score(features, ranking_config)
+            product["ranking_score"] = score
+            product["ranking_features"] = serialize_features_for_log(
+                features, score
+            )
+
+            ranked_candidates.append(product)
+
+        # Sort by ranking score (fallback to relevance when missing)
+        ranked_candidates.sort(
+            key=lambda p: (p.get("ranking_score") is not None, p.get("ranking_score", p.get("relevance_score", 0))),
+            reverse=True,
+        )
+
         # Pagination
-        total = len(filtered_products)
-        paginated_products = filtered_products[offset:offset + limit]
+        total = len(ranked_candidates)
+        paginated_products = ranked_candidates[offset : offset + limit]
+
+        # Log a compact view of ranking features for top N
+        try:
+            top_sample = [
+                {
+                    "merchant_id": p.get("merchant_id"),
+                    "product_id": str(p.get("product_id") or p.get("id")),
+                    "score": p.get("ranking_score"),
+                    "rel": p.get("relevance_score"),
+                    "cq": (p.get("ranking_features") or {}).get(
+                        "quality_content_score"
+                    ),
+                    "mr": (p.get("ranking_features") or {}).get(
+                        "quality_model_readiness"
+                    ),
+                }
+                for p in paginated_products[:10]
+            ]
+            logger.info(
+                "agent_search_ranking",
+                extra={
+                    "event": "agent_search_ranking",
+                    "query": query,
+                    "merchant_ids": merchants_to_search,
+                    "sample": top_sample,
+                },
+            )
+        except Exception:
+            # Logging must never break the handler
+            logger.debug("Failed to log agent_search_ranking sample", exc_info=True)
         
         # Record request
         background_tasks.add_task(
@@ -497,6 +585,34 @@ async def agent_create_order(
         # STEP 3: Record governance metrics (success)
         success = True
         
+        # 返回简化的响应给 Agent（统一支付协议）
+        # 从标准 OrderResponse 中提取 PSP 信息和统一的 payment_action
+        psp_type = order_response.psp or "stripe"
+        payment_action_obj = order_response.payment_action
+        payment_action: Optional[dict] = None
+        if payment_action_obj is not None:
+            try:
+                # Pydantic model -> dict for JSON response
+                payment_action = payment_action_obj.dict()
+            except Exception:
+                # 防御性：即使序列化失败也不要影响下游
+                payment_action = None
+        
+        # 根据 PSP 类型生成说明文案，兼容旧的 Stripe 提示
+        if psp_type == "adyen":
+            payment_instructions = (
+                "Use payment_action.type='adyen_session' with payment_action.client_secret "
+                "(sessionData) to initialize Adyen Drop-in."
+            )
+        elif payment_action and payment_action.get("type") == "redirect_url":
+            payment_instructions = (
+                "Redirect the shopper to payment_action.url to complete the payment, then wait "
+                "for webhook/order status to update."
+            )
+        else:
+            # 默认保持 Stripe 风格，兼容已有客户端
+            payment_instructions = "Use client_secret for Stripe payment confirmation"
+        
         # 返回简化的响应给 Agent
         response = {
             "status": "success",
@@ -505,9 +621,11 @@ async def agent_create_order(
             "total_amount": float(order_response.total),  # 新增：标准字段
             "currency": order_response.currency,
             "payment": {
+                "psp": psp_type,
                 "client_secret": order_response.client_secret,
                 "payment_intent_id": order_response.payment_intent_id,
-                "instructions": "Use client_secret for Stripe payment confirmation"
+                "payment_action": payment_action,
+                "instructions": payment_instructions,
             },
             "tracking": {
                 "agent_session_id": order_request.agent_session_id,

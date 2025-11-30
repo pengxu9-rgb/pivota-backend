@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     support_email: str = os.getenv("SUPPORT_EMAIL", "support@pivota.ai")
     # Merchant Portal base URL (used for password reset links)
     merchant_portal_base_url: str = os.getenv("MERCHANT_PORTAL_BASE_URL", "https://merchant.pivota.cc")
+    # Agent/Developer Portal base URL (used for password reset links)
+    # Note: developer portal is the canonical hostname (e.g., https://developer.pivota.cc)
+    agent_portal_base_url: str = os.getenv("AGENT_PORTAL_BASE_URL", "https://developer.pivota.cc")
     
     # AP2 Protocol (Phase 4++)
     enable_ap2_routes: bool = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"
@@ -92,6 +95,16 @@ class Settings(BaseSettings):
     # Additional CORS settings
     cors_allow_credentials: bool = os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
     cors_expose_headers: list = ["X-Request-Id", "X-Total-Count"]
+
+    # Agent catalog quality thresholds (for gating/boosting in Agent product APIs)
+    cq_min_for_agent: float = float(os.getenv("CQ_MIN_FOR_AGENT", "0"))
+    mr_min_for_agent: float = float(os.getenv("MR_MIN_FOR_AGENT", "0"))
+
+    # Agent ranking weights (search / find_products)
+    ranking_w_rel: float = float(os.getenv("AGENT_RANK_W_REL", "0.6"))
+    ranking_w_quality: float = float(os.getenv("AGENT_RANK_W_QUALITY", "0.2"))
+    ranking_w_enrichment: float = float(os.getenv("AGENT_RANK_W_ENRICHMENT", "0.2"))
+    ranking_w_business: float = float(os.getenv("AGENT_RANK_W_BUSINESS", "0.0"))
     
     @property
     def cors_origins(self) -> list:
