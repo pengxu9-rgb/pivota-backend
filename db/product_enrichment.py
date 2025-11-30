@@ -1,6 +1,7 @@
 from sqlalchemy import Table, Column, String, DateTime, JSON, Float, Index
 from sqlalchemy.sql import func
 from typing import Optional, Dict, Any
+import json
 
 from db.database import metadata, database
 
@@ -82,6 +83,13 @@ async def upsert_enrichment(
     }
     clean_data = {k: v for k, v in data.items() if k in allowed_keys}
 
+    # JSON-like fields must be encoded as strings when using raw SQL with asyncpg.
+    # Postgres will parse the JSON text into the JSON column type.
+    def _encode_json(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return json.dumps(value)
+
     # Basic ON CONFLICT upsert
     query = f"""
     INSERT INTO product_enrichment (
@@ -118,15 +126,14 @@ async def upsert_enrichment(
         # Enrichment fields (may be missing)
         "title_override": clean_data.get("title_override"),
         "summary_short": clean_data.get("summary_short"),
-        "bullet_points": clean_data.get("bullet_points"),
-        "usage_scenarios": clean_data.get("usage_scenarios"),
-        "audience_tags": clean_data.get("audience_tags"),
-        "topic_tags": clean_data.get("topic_tags"),
+        "bullet_points": _encode_json(clean_data.get("bullet_points")),
+        "usage_scenarios": _encode_json(clean_data.get("usage_scenarios")),
+        "audience_tags": _encode_json(clean_data.get("audience_tags")),
+        "topic_tags": _encode_json(clean_data.get("topic_tags")),
         "regulatory_disclaimer_local": clean_data.get("regulatory_disclaimer_local"),
-        "extra_images": clean_data.get("extra_images"),
+        "extra_images": _encode_json(clean_data.get("extra_images")),
         "llm_readability_score": clean_data.get("llm_readability_score"),
-        "llm_safety_flags": clean_data.get("llm_safety_flags"),
+        "llm_safety_flags": _encode_json(clean_data.get("llm_safety_flags")),
     }
 
     await database.execute(query, params)
-
