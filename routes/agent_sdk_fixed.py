@@ -12,6 +12,15 @@ from utils.logger import logger
 import secrets
 import json
 
+from services.agent_ranking_service import (
+    AgentRankingFeatures,
+    get_agent_ranking_config,
+    hydrate_quality_and_enrichment,
+    passes_agent_gating,
+    compute_agent_ranking_score,
+    serialize_features_for_log,
+)
+
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
 # ============================================================================
@@ -236,8 +245,10 @@ async def search_products(
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context)
 ):
-    """Search products - supports cross-merchant search"""
+    """Search products - supports cross-merchant search with quality-aware ranking"""
     try:
+        logger.info("agent_sdk_fixed_search_entry")
+
         # Build WHERE clauses
         where_clauses = []
         params = {"limit": limit, "offset": offset}
@@ -313,8 +324,10 @@ async def search_products(
         count_params = {k: v for k, v in params.items() if k not in ['limit', 'offset']}
         total_result = await database.fetch_one(count_query, count_params)
         
-        # Extract product data from JSON and calculate relevance scores
-        product_list = []
+        # Extract product data from JSON and calculate relevance + ranking features
+        ranking_config = get_agent_ranking_config()
+        ranked_candidates: List[Dict[str, Any]] = []
+
         for p in products:
             try:
                 # Convert Row to dict safely
@@ -331,6 +344,7 @@ async def search_products(
                 # Build response object - merge product_info with metadata
                 product_dict = {
                     **product_info,  # Spread all product fields
+                    "platform_product_id": p_dict["platform_product_id"],
                     "merchant_id": p_dict["merchant_id"],
                     "merchant_name": p_dict.get("merchant_name"),
                     "platform": p_dict["platform"],
@@ -352,15 +366,56 @@ async def search_products(
                         score += 3
                     
                     product_dict["relevance_score"] = score
-                
-                product_list.append(product_dict)
+
+                # Build ranking features and enrich with quality/enrichment data
+                platform_product_id = str(
+                    product_dict.get("platform_product_id")
+                    or product_dict.get("id")
+                    or product_dict.get("product_id")
+                    or ""
+                )
+                if not platform_product_id:
+                    continue
+
+                features = AgentRankingFeatures(
+                    merchant_id=product_dict.get("merchant_id"),
+                    platform=product_dict.get("platform") or "unknown",
+                    platform_product_id=platform_product_id,
+                    rel_semantic=float(product_dict.get("relevance_score") or 1.0),
+                    rel_keyword=float(product_dict.get("relevance_score") or 1.0),
+                    rel_category_match=1.0
+                    if category
+                    and isinstance(product_dict.get("category"), str)
+                    and category.lower()
+                    in product_dict.get("category", "").lower()
+                    else 0.0,
+                )
+
+                await hydrate_quality_and_enrichment(features)
+
+                if not passes_agent_gating(features, ranking_config):
+                    continue
+
+                score = compute_agent_ranking_score(features, ranking_config)
+                product_dict["ranking_score"] = score
+                product_dict["ranking_features"] = serialize_features_for_log(
+                    features, score
+                )
+
+                ranked_candidates.append(product_dict)
             except Exception as e:
                 logger.error(f"Error processing product: {e}")
                 continue
-        
-        # Sort by relevance if query provided
-        if query:
-            product_list.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+
+        # Sort by ranking score (fallback to relevance if needed)
+        ranked_candidates.sort(
+            key=lambda x: (
+                x.get("ranking_score") is not None,
+                x.get("ranking_score", x.get("relevance_score", 0)),
+            ),
+            reverse=True,
+        )
+        product_list = ranked_candidates
         
         return {
             "status": "success",
