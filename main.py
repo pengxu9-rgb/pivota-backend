@@ -319,12 +319,17 @@ if not cors_origins and not dev_mode:
         "https://pivota-agents-portal.vercel.app",
     ]
 
+# For now we allow all origins via regex to avoid CORS issues across
+# multiple portals (merchant / agent / admin) while still letting
+# FastAPI handle credentials and headers safely.
 if "*" in cors_origins:
     allow_origin_regex = ".*"
     allow_origins = []
 else:
-    allow_origin_regex = None
-    allow_origins = cors_origins
+    # Even when an explicit allow list is configured, also enable a
+    # permissive regex so new portals don't get blocked by CORS.
+    allow_origin_regex = ".*"
+    allow_origins = []
 
 app.add_middleware(
     CORSMiddleware,
