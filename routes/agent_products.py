@@ -6,6 +6,15 @@ Allows agents to view merchant products via hybrid query (cache or realtime)
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from services.product_query_service import get_products_hybrid, log_query_source
 from services.agent_product_service import get_agent_product_view
+from services.agent_ranking_service import (
+    AgentRankingFeatures,
+    get_agent_ranking_config,
+    hydrate_quality_and_enrichment,
+    passes_agent_gating,
+    compute_agent_ranking_score,
+    serialize_features_for_log,
+)
+from db.agent_ranking_log import log_ranking_batch
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional, Dict, Any
 import httpx
@@ -18,9 +27,54 @@ from routes.merchant_onboarding_routes import get_merchant_onboarding
 from fastapi import BackgroundTasks
 from db.products import get_product_cache_row
 from models.standard_product import StandardProduct
+from db.product_quality import product_quality_snapshot
+from config.settings import settings
 
 router = APIRouter(prefix="/agent/v1/products", tags=["Agent Products"])
 logger = logging.getLogger(__name__)
+
+
+def _get_quality_thresholds() -> Dict[str, float]:
+    """
+    Read CQ/MR thresholds from settings; fall back to sensible defaults.
+    """
+    try:
+        cq_min = float(getattr(settings, "cq_min_for_agent", 0.0) or 0.0)
+    except Exception:
+        cq_min = 0.0
+    try:
+        mr_min = float(getattr(settings, "mr_min_for_agent", 0.0) or 0.0)
+    except Exception:
+        mr_min = 0.0
+    return {"cq_min": cq_min, "mr_min": mr_min}
+
+
+async def _fetch_latest_quality(
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch latest product_quality_snapshot row for gating/sorting.
+    """
+    query = """
+    SELECT content_quality_score, model_readiness_score
+    FROM product_quality_snapshot
+    WHERE merchant_id = :merchant_id
+      AND platform = :platform
+      AND platform_product_id = :platform_product_id
+    ORDER BY snapshot_date DESC
+    LIMIT 1
+    """
+    row = await database.fetch_one(
+        query,
+        {
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+        },
+    )
+    return dict(row) if row else None
 
 
 @router.get("/merchants/{merchant_id}")
@@ -71,8 +125,14 @@ async def get_merchant_products(
             product_count=len(products)
         )
         
-        # Transform StandardProduct to agent-friendly format enriched via overlay
-        agent_products = []
+        thresholds = _get_quality_thresholds()
+        cq_min = thresholds["cq_min"]
+        mr_min = thresholds["mr_min"]
+        ranking_config = get_agent_ranking_config()
+
+        # Transform StandardProduct to agent-friendly format enriched via overlay,
+        # then apply quality-based gating + ranking helpers.
+        enriched_list: List[Dict[str, Any]] = []
         for product in products:
             # Try to build an enriched view; fall back to StandardProduct if needed
             enriched = await get_agent_product_view(
@@ -94,8 +154,11 @@ async def get_merchant_products(
             # Handle variants (if exists) or create default variant
             if product.variants and len(product.variants) > 0:
                 for variant in product.variants:
-                    agent_products.append({
+                    enriched_list.append({
                         "product_id": product.id,
+                        "platform_product_id": product.id,
+                        "platform": product.platform,
+                        "merchant_id": merchant_id,
                         "variant_id": variant.id,
                         "title": display_title,
                         "variant_title": variant.title,
@@ -108,8 +171,11 @@ async def get_merchant_products(
                     })
             else:
                 # No variants - single product
-                agent_products.append({
+                enriched_list.append({
                     "product_id": product.id,
+                    "platform_product_id": product.id,
+                    "platform": product.platform,
+                    "merchant_id": merchant_id,
                     "variant_id": product.id,  # Use product_id as variant_id
                     "title": display_title,
                     "variant_title": "Default",
@@ -120,7 +186,52 @@ async def get_merchant_products(
                     "image_url": image_url,
                     "currency": product.currency
                 })
-        
+        # Quality-aware ranking using the same helper as /agent/v1/products/search
+        ranked_candidates: List[Dict[str, Any]] = []
+
+        for item in enriched_list:
+            platform_product_id = str(
+                item.get("platform_product_id")
+                or item.get("product_id")
+                or ""
+            )
+            if not platform_product_id:
+                continue
+
+            features = AgentRankingFeatures(
+                merchant_id=item.get("merchant_id"),
+                platform=item.get("platform") or "unknown",
+                platform_product_id=platform_product_id,
+                # 浏览场景没有 query，相关度统一视为 1
+                rel_semantic=1.0,
+                rel_keyword=1.0,
+                rel_category_match=1.0,
+            )
+
+            await hydrate_quality_and_enrichment(features)
+
+            # CQ/MR gating 仍然由 ranking_config 控制
+            if not passes_agent_gating(features, ranking_config):
+                continue
+
+            score = compute_agent_ranking_score(features, ranking_config)
+            item["ranking_score"] = score
+            item["ranking_features"] = serialize_features_for_log(features, score)
+            ranked_candidates.append(item)
+
+        # 如果全部被 gating 掉，就回退到 enriched_list；否则使用排序结果
+        if ranked_candidates:
+            ranked_candidates.sort(
+                key=lambda x: (
+                    x.get("ranking_score") is not None,
+                    x.get("ranking_score", 0.0),
+                ),
+                reverse=True,
+            )
+            agent_products = ranked_candidates
+        else:
+            agent_products = enriched_list
+
         # Log request for analytics
         background_tasks.add_task(
             log_agent_request,
@@ -129,7 +240,7 @@ async def get_merchant_products(
             merchant_id=merchant_id
         )
         
-        return {
+        response = {
             "status": "success",
             "merchant_id": merchant_id,
             "query_source": query_source,  # NEW: indicate data source
@@ -137,6 +248,21 @@ async def get_merchant_products(
             "products": agent_products,
             "response_time_ms": response_time_ms  # NEW: performance metric
         }
+        # Persist ranking features for browse-by-merchant as well (best-effort).
+        try:
+            await log_ranking_batch(
+                agent_id=getattr(context, "agent_id", None),
+                endpoint="/agent/v1/products/merchants/{merchant_id}",
+                query=None,
+                products=agent_products,
+                max_rows=50,
+            )
+        except Exception as e:
+            logger.debug(
+                f"Failed to log merchant browse ranking batch: {e}", exc_info=True
+            )
+
+        return response
             
     except HTTPException:
         raise
