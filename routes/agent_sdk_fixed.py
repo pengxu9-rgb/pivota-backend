@@ -20,6 +20,7 @@ from services.agent_ranking_service import (
     compute_agent_ranking_score,
     serialize_features_for_log,
 )
+from db.agent_ranking_log import log_ranking_batch
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
@@ -417,7 +418,7 @@ async def search_products(
         )
         product_list = ranked_candidates
         
-        return {
+        response = {
             "status": "success",
             "products": product_list,
             "pagination": {
@@ -427,6 +428,19 @@ async def search_products(
                 "has_more": (total_result["total"] if total_result else 0) > offset + limit
             }
         }
+        # Persist ranking features for LTR / reranker training (best-effort).
+        try:
+            await log_ranking_batch(
+                agent_id=getattr(context, "agent_id", None),
+                endpoint="/agent/v1/products/search",
+                query=query,
+                products=product_list,
+                max_rows=50,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to log agent ranking batch: {e}", exc_info=True)
+
+        return response
     
     except HTTPException:
         raise
