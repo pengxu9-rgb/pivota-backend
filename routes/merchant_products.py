@@ -161,6 +161,83 @@ async def list_merchant_products(
     }
 
 
+@router.get("/quality/summary")
+async def get_product_quality_summary(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Lightweight catalog quality summary for the current merchant.
+
+    Returns:
+    - total_products: products in cache
+    - scored_products: products that have at least one quality snapshot
+    - avg_content_quality
+    - avg_model_readiness
+    - low_cq_count: products with CQ below threshold
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can view quality summary")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    # Load all cached products (current merchant, all platforms, non-expired)
+    base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
+    base_query = base_query.where(products_cache.c.expires_at > datetime.now())
+    records = await database.fetch_all(base_query)
+    rows = [dict(r) for r in records]
+
+    total_products = len(rows)
+    scored_products = 0
+    sum_cq = 0.0
+    sum_mr = 0.0
+    low_cq_count = 0
+    low_cq_threshold = 60.0
+
+    for row in rows:
+        platform_val = row.get("platform")
+        platform_product_id = row.get("platform_product_id")
+        if not platform_val or not platform_product_id:
+            continue
+
+        quality = await _fetch_latest_quality_row(
+            merchant_id=merchant_id,
+            platform=platform_val,
+            platform_product_id=platform_product_id,
+        )
+        if not quality:
+            continue
+
+        cq = quality.get("content_quality_score")
+        mr = quality.get("model_readiness_score")
+        if cq is None and mr is None:
+            continue
+
+        scored_products += 1
+        if isinstance(cq, (int, float)):
+            sum_cq += float(cq)
+            if cq < low_cq_threshold:
+                low_cq_count += 1
+        if isinstance(mr, (int, float)):
+            sum_mr += float(mr)
+
+    avg_cq = sum_cq / scored_products if scored_products and sum_cq > 0 else None
+    avg_mr = sum_mr / scored_products if scored_products and sum_mr > 0 else None
+
+    return {
+        "status": "success",
+        "data": {
+            "total_products": total_products,
+            "scored_products": scored_products,
+            "avg_content_quality": avg_cq,
+            "avg_model_readiness": avg_mr,
+            "low_cq_threshold": low_cq_threshold,
+            "low_cq_count": low_cq_count,
+        },
+    }
+
+
 @router.get("/{platform}/{platform_product_id}")
 async def get_merchant_product_detail(
     platform: str,
@@ -294,12 +371,14 @@ async def backfill_product_enrichment(
 
     return {
         "status": "success",
-        "merchant_id": merchant_id,
-        "platform": platform,
-        "limit": limit,
-        "processed": processed,
-        "skipped": skipped,
-        "errors": errors,
+        "data": {
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "limit": limit,
+            "processed": processed,
+            "skipped": skipped,
+            "errors": errors,
+        },
     }
 
 
