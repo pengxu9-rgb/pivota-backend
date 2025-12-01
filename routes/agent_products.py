@@ -15,6 +15,7 @@ from services.agent_ranking_service import (
     serialize_features_for_log,
 )
 from db.agent_ranking_log import log_ranking_batch
+from db.agent_product_events import log_product_events
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional, Dict, Any
 import httpx
@@ -262,6 +263,42 @@ async def get_merchant_products(
                 f"Failed to log merchant browse ranking batch: {e}", exc_info=True
             )
 
+        # Log impression events for browsing by merchant.
+        try:
+            events = []
+            for idx, p in enumerate(agent_products[:50]):
+                feat = (p.get("ranking_features") or {}) if isinstance(
+                    p.get("ranking_features"), dict
+                ) else {}
+                events.append(
+                    {
+                        "agent_id": getattr(context, "agent_id", None),
+                        "session_id": getattr(context, "session_id", None),
+                        "event_type": "impression",
+                        "endpoint": "/agent/v1/products/merchants/{merchant_id}",
+                        "query": None,
+                        "merchant_id": merchant_id,
+                        "platform": p.get("platform"),
+                        "platform_product_id": str(
+                            p.get("platform_product_id")
+                            or p.get("product_id")
+                            or ""
+                        )
+                            or None,
+                        "ranking_score": p.get("ranking_score"),
+                        "position": idx,
+                        "quality_content_score": feat.get("quality_content_score"),
+                        "quality_model_readiness": feat.get(
+                            "quality_model_readiness"
+                        ),
+                    }
+                )
+            await log_product_events(events)
+        except Exception as e:
+            logger.debug(
+                f"Failed to log merchant browse product events: {e}", exc_info=True
+            )
+
         return response
             
     except HTTPException:
@@ -462,6 +499,28 @@ async def get_product_details(
             status_code=200,
             merchant_id=merchant_id,
         )
+        # Log a click event for this product (best-effort; independent of response)
+        try:
+            await log_product_events(
+                [
+                    {
+                        "agent_id": getattr(context, "agent_id", None),
+                        "session_id": getattr(context, "session_id", None),
+                        "event_type": "click",
+                        "endpoint": "/agent/v1/products/merchants/{merchant_id}/product/{product_id}",
+                        "query": None,
+                        "merchant_id": merchant_id,
+                        "platform": platform,
+                        "platform_product_id": str(product_id),
+                        "ranking_score": None,
+                        "position": None,
+                        "quality_content_score": None,
+                        "quality_model_readiness": None,
+                    }
+                ]
+            )
+        except Exception as e:
+            logger.debug(f"Failed to log product click event: {e}", exc_info=True)
 
         return {
             "status": "success",

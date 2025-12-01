@@ -668,6 +668,8 @@ async def startup():
         from db.product_quality import product_quality_snapshot
         from db.product_enrichment import product_enrichment
         from db.agent_ranking_log import agent_ranking_log
+        from db.agent_product_events import agent_product_events
+        from db.agent_ranking_log import agent_ranking_log
         from db.orders import orders
         # Accounts & Orders API: customer-facing accounts tables
         try:

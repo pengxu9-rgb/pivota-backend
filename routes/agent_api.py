@@ -581,6 +581,40 @@ async def agent_create_order(
             order_id=order_response.order_id,
             order_amount=order_amount
         )
+        # 记录购买事件（best-effort，与业务逻辑解耦）
+        try:
+            # Try to infer basic product identifiers from order items metadata
+            from db.agent_product_events import log_product_events
+
+            events = []
+            for item in order_request.items or []:
+                meta = item.metadata or {}
+                platform = meta.get("platform")
+                platform_product_id = meta.get("platform_product_id") or meta.get(
+                    "product_id"
+                )
+                if not platform_product_id:
+                    continue
+                events.append(
+                    {
+                        "agent_id": getattr(context, "agent_id", None),
+                        "session_id": getattr(context, "session_id", None),
+                        "event_type": "purchase",
+                        "endpoint": "/agent/v1/orders/create",
+                        "query": None,
+                        "merchant_id": order_request.merchant_id,
+                        "platform": platform,
+                        "platform_product_id": str(platform_product_id),
+                        "ranking_score": None,
+                        "position": None,
+                        "quality_content_score": None,
+                        "quality_model_readiness": None,
+                    }
+                )
+            if events:
+                await log_product_events(events)
+        except Exception as e:
+            logger.debug(f"Failed to log purchase events: {e}", exc_info=True)
         
         # STEP 3: Record governance metrics (success)
         success = True

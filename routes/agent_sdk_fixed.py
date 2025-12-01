@@ -21,6 +21,7 @@ from services.agent_ranking_service import (
     serialize_features_for_log,
 )
 from db.agent_ranking_log import log_ranking_batch
+from db.agent_product_events import log_product_events
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
@@ -439,6 +440,41 @@ async def search_products(
             )
         except Exception as e:
             logger.debug(f"Failed to log agent ranking batch: {e}", exc_info=True)
+
+        # Log impression events for the returned products (top N).
+        try:
+            events = []
+            for idx, p in enumerate(product_list[:50]):
+                feat = (p.get("ranking_features") or {}) if isinstance(
+                    p.get("ranking_features"), dict
+                ) else {}
+                events.append(
+                    {
+                        "agent_id": getattr(context, "agent_id", None),
+                        "session_id": getattr(context, "session_id", None),
+                        "event_type": "impression",
+                        "endpoint": "/agent/v1/products/search",
+                        "query": query,
+                        "merchant_id": p.get("merchant_id"),
+                        "platform": p.get("platform"),
+                        "platform_product_id": str(
+                            p.get("platform_product_id")
+                            or p.get("product_id")
+                            or p.get("id")
+                            or ""
+                        )
+                            or None,
+                        "ranking_score": p.get("ranking_score"),
+                        "position": idx,
+                        "quality_content_score": feat.get("quality_content_score"),
+                        "quality_model_readiness": feat.get(
+                            "quality_model_readiness"
+                        ),
+                    }
+                )
+            await log_product_events(events)
+        except Exception as e:
+            logger.debug(f"Failed to log agent product events: {e}", exc_info=True)
 
         return response
     
