@@ -13,6 +13,8 @@ from sqlalchemy import func, select, desc, and_
 import os
 import logging
 
+from pydantic import BaseModel
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -260,6 +262,122 @@ async def get_psp_list(current_user: dict = Depends(require_admin)):
     return {
         "status": "success",
         "psps": list(psps.values())
+    }
+
+
+# ============================================================================
+# Agent ranking configuration (CQ/MR thresholds & weights)
+# ============================================================================
+
+@router.get("/agent-ranking/config")
+async def get_agent_ranking_config(current_user: dict = Depends(require_admin)):
+    """
+    Return the current Agent ranking configuration as seen by the backend.
+
+    仅用于内部/Admin 调试：方便查看 CQ/MR 阈值和排序权重。
+    """
+    config = {
+        "cq_min_for_agent": settings.cq_min_for_agent,
+        "mr_min_for_agent": settings.mr_min_for_agent,
+        "ranking_w_rel": settings.ranking_w_rel,
+        "ranking_w_quality": settings.ranking_w_quality,
+        "ranking_w_enrichment": settings.ranking_w_enrichment,
+        "ranking_w_business": settings.ranking_w_business,
+        "source": "env",
+    }
+    return {"status": "success", "config": config}
+
+
+class AgentRankingConfigUpdate(BaseModel):
+    """
+    Partial config update payload for Agent ranking.
+
+    V1 只是返回“你应该如何修改环境变量”，真正生效仍需要更新 Railway env + 重新部署。
+    """
+
+    cq_min_for_agent: Optional[float] = None
+    mr_min_for_agent: Optional[float] = None
+    ranking_w_rel: Optional[float] = None
+    ranking_w_quality: Optional[float] = None
+    ranking_w_enrichment: Optional[float] = None
+    ranking_w_business: Optional[float] = None
+
+
+@router.put("/agent-ranking/config")
+async def update_agent_ranking_config(
+    payload: AgentRankingConfigUpdate,
+    current_user: dict = Depends(require_admin),
+):
+    """
+    接收一份“期望的 Agent 排序配置”，做基础校验，并返回对应的 ENV 建议值。
+
+    实际生效仍然需要你在 Railway 上更新环境变量，然后重新部署。
+    """
+
+    def _check_weight(name: str, value: Optional[float]) -> None:
+        if value is None:
+            return
+        if value < 0.0 or value > 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be between 0 and 1",
+            )
+
+    def _check_threshold(name: str, value: Optional[float]) -> None:
+        if value is None:
+            return
+        if value < 0.0 or value > 100.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be between 0 and 100",
+            )
+
+    _check_threshold("cq_min_for_agent", payload.cq_min_for_agent)
+    _check_threshold("mr_min_for_agent", payload.mr_min_for_agent)
+    _check_weight("ranking_w_rel", payload.ranking_w_rel)
+    _check_weight("ranking_w_quality", payload.ranking_w_quality)
+    _check_weight("ranking_w_enrichment", payload.ranking_w_enrichment)
+    _check_weight("ranking_w_business", payload.ranking_w_business)
+
+    new_config = {
+        "cq_min_for_agent": payload.cq_min_for_agent
+        if payload.cq_min_for_agent is not None
+        else settings.cq_min_for_agent,
+        "mr_min_for_agent": payload.mr_min_for_agent
+        if payload.mr_min_for_agent is not None
+        else settings.mr_min_for_agent,
+        "ranking_w_rel": payload.ranking_w_rel
+        if payload.ranking_w_rel is not None
+        else settings.ranking_w_rel,
+        "ranking_w_quality": payload.ranking_w_quality
+        if payload.ranking_w_quality is not None
+        else settings.ranking_w_quality,
+        "ranking_w_enrichment": payload.ranking_w_enrichment
+        if payload.ranking_w_enrichment is not None
+        else settings.ranking_w_enrichment,
+        "ranking_w_business": payload.ranking_w_business
+        if payload.ranking_w_business is not None
+        else settings.ranking_w_business,
+    }
+
+    env_suggestions = {
+        "CQ_MIN_FOR_AGENT": str(new_config["cq_min_for_agent"]),
+        "MR_MIN_FOR_AGENT": str(new_config["mr_min_for_agent"]),
+        "AGENT_RANK_W_REL": str(new_config["ranking_w_rel"]),
+        "AGENT_RANK_W_QUALITY": str(new_config["ranking_w_quality"]),
+        "AGENT_RANK_W_ENRICHMENT": str(new_config["ranking_w_enrichment"]),
+        "AGENT_RANK_W_BUSINESS": str(new_config["ranking_w_business"]),
+    }
+
+    return {
+        "status": "success",
+        "config": new_config,
+        "env_overrides": env_suggestions,
+        "note": (
+            "Config is currently read from environment variables. "
+            "To apply these changes, update the corresponding ENV keys "
+            "in Railway and redeploy the service."
+        ),
     }
 
 

@@ -205,9 +205,14 @@ def compute_agent_ranking_score(
     # --- Quality -----------------------------------------------------------
     cq = float(features.quality_content_score or 0.0)
     mr = float(features.quality_model_readiness or 0.0)
+    cp = float(features.quality_conversion_potential or 0.0)
+
     cq_norm = max(0.0, min(1.0, cq / 100.0)) if cq > 0 else 0.0
     mr_norm = max(0.0, min(1.0, mr / 100.0)) if mr > 0 else 0.0
-    quality_score = 0.6 * cq_norm + 0.4 * mr_norm
+    cp_norm = max(0.0, min(1.0, cp / 100.0)) if cp > 0 else 0.0
+
+    # 基础质量仍以 CQ/MR 为主，CP 提供额外区分度
+    quality_score = 0.5 * cq_norm + 0.3 * mr_norm + 0.2 * cp_norm
 
     # --- Enrichment --------------------------------------------------------
     enrichment_score = 0.0
@@ -258,4 +263,3 @@ def serialize_features_for_log(
     data = asdict(features)
     data["ranking_score"] = score
     return data
-
