@@ -32,6 +32,7 @@ from services.agent_ranking_service import (
     compute_agent_ranking_score,
     serialize_features_for_log,
 )
+from db.agent_product_events import log_product_events
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
@@ -269,6 +270,44 @@ async def agent_search_products(
         except Exception:
             # Logging must never break the handler
             logger.debug("Failed to log agent_search_ranking sample", exc_info=True)
+
+        # Log impression events for cross-merchant search (best-effort).
+        try:
+            events = []
+            for idx, p in enumerate(paginated_products[:50]):
+                feats = p.get("ranking_features") or {}
+                if not isinstance(feats, dict):
+                    feats = {}
+                events.append(
+                    {
+                        "agent_id": getattr(context, "agent_id", None),
+                        "session_id": getattr(context, "session_id", None),
+                        "event_type": "impression",
+                        "endpoint": "/agent/v1/products/search",
+                        "query": query,
+                        "merchant_id": p.get("merchant_id"),
+                        "platform": p.get("platform"),
+                        "platform_product_id": str(
+                            p.get("product_id") or p.get("id") or ""
+                        )
+                            or None,
+                        "ranking_score": p.get("ranking_score"),
+                        "position": idx,
+                        "quality_content_score": feats.get(
+                            "quality_content_score"
+                        ),
+                        "quality_model_readiness": feats.get(
+                            "quality_model_readiness"
+                        ),
+                    }
+                )
+            if events:
+                await log_product_events(events)
+        except Exception:
+            logger.debug(
+                "Failed to log agent product events from agent_search_products",
+                exc_info=True,
+            )
         
         # Record request
         background_tasks.add_task(
