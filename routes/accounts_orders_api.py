@@ -292,6 +292,10 @@ class OrdersListItem(BaseModel):
     fulfillment_status: Optional[str]
     delivery_status: str
     created_at: str
+    # Optional creator metadata, flattened from orders.metadata for Creator Agent views
+    creator_id: Optional[str] = None
+    creator_name: Optional[str] = None
+    creator_slug: Optional[str] = None
     shipping_city: Optional[str]
     shipping_country: Optional[str]
     items_summary: str
@@ -901,6 +905,21 @@ async def list_orders(
 
         for row in rows:
             data = dict(row)
+            metadata = data.get("metadata") or {}
+            creator_id = None
+            creator_name = None
+            creator_slug = None
+            try:
+                if isinstance(metadata, dict):
+                    creator_id = metadata.get("creator_id") or metadata.get("creatorId")
+                    creator_name = metadata.get("creator_name") or metadata.get("creatorName")
+                    creator_slug = metadata.get("creator_slug") or metadata.get("creatorSlug")
+            except Exception:
+                # Metadata is best-effort; never break listing on parse errors.
+                creator_id = None
+                creator_name = None
+                creator_slug = None
+
             payment_status_mapped = _map_payment_status(data.get("payment_status"))
             fulfillment_status_mapped = _map_fulfillment_status(
                 data.get("fulfillment_status")
@@ -928,6 +947,9 @@ async def list_orders(
                     fulfillment_status=fulfillment_status_mapped,
                     delivery_status=delivery_status,
                     created_at=(data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
+                    creator_id=creator_id,
+                    creator_name=creator_name,
+                    creator_slug=creator_slug,
                     shipping_city=shipping.get("city"),
                     shipping_country=shipping.get("country"),
                     items_summary=_build_items_summary(items),
@@ -999,6 +1021,19 @@ async def get_order_detail(
 
     shipping = order_data.get("shipping_address") or {}
     items = order_data.get("items") or []
+    metadata = order_data.get("metadata") or {}
+    creator_id = None
+    creator_name = None
+    creator_slug = None
+    try:
+        if isinstance(metadata, dict):
+            creator_id = metadata.get("creator_id") or metadata.get("creatorId")
+            creator_name = metadata.get("creator_name") or metadata.get("creatorName")
+            creator_slug = metadata.get("creator_slug") or metadata.get("creatorSlug")
+    except Exception:
+        creator_id = None
+        creator_name = None
+        creator_slug = None
 
     # Payments (from payments table, if present)
     payment_records: List[Dict[str, Any]] = []
@@ -1057,6 +1092,9 @@ async def get_order_detail(
             "delivery_status": delivery_status,
             "created_at": (order_data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
             "updated_at": (order_data.get("updated_at") or datetime.now(timezone.utc)).isoformat(),
+            "creator_id": creator_id,
+            "creator_name": creator_name,
+            "creator_slug": creator_slug,
             "shipping_address": {
                 "name": shipping.get("name"),
                 "city": shipping.get("city"),
