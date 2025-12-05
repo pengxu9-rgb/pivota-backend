@@ -464,6 +464,13 @@ async def create_new_order(
             # 使用 MultiPSPOrchestrator，按路由配置的优先级（preferred_psps）
             # 自动在 adyen → stripe → checkout 之间切换。
             start_ts = time.monotonic()
+            # Agent / 对话场景下，如果前端传了 preferred_psp = "stripe_checkout"，
+            # 则通过 metadata.psp_mode 告诉 Stripe 适配器走 Checkout Session 流程，
+            # 但 PSP provider 仍然是 "stripe"（由 routing 决定）。
+            psp_mode = None
+            if (order_request.preferred_psp or "").lower() == "stripe_checkout":
+                psp_mode = "stripe_checkout"
+
             success, payment_intent, error, psp_used = await create_payment_with_failover(
                 merchant_id=order_request.merchant_id,
                 amount=total,
@@ -474,6 +481,7 @@ async def create_new_order(
                     "customer_email": order_request.customer_email,
                     "route_id": route_id_for_attempt,
                     "agent_id": agent_id,
+                    **({"psp_mode": psp_mode} if psp_mode else {}),
                 },
                 preferred_psps=preferred_psps,
             )
@@ -488,23 +496,32 @@ async def create_new_order(
 
             if success and payment_intent:
                 payment_intent_id = payment_intent.id
-                client_secret = payment_intent.client_secret
+                client_secret = getattr(payment_intent, "client_secret", None)
                 psp_type = final_psp
                 logger.info(f"✅ Payment intent created via {psp_type}: {payment_intent_id}")
 
-                # Build unified payment_action for frontend routing
+                # Build unified payment_action for frontend / Agent
                 try:
-                    if psp_type == "stripe" and client_secret:
+                    redirect_url = getattr(payment_intent, "redirect_url", None)
+                    raw = getattr(payment_intent, "raw_response", None)
+
+                    if redirect_url:
+                        payment_action = {
+                            "type": "redirect_url",
+                            "url": redirect_url,
+                            "raw": raw,
+                        }
+                    elif psp_type == "stripe" and client_secret:
                         payment_action = {
                             "type": "stripe_client_secret",
                             "client_secret": client_secret,
-                            "raw": getattr(payment_intent, "raw_response", None),
+                            "raw": raw,
                         }
                     elif psp_type == "adyen" and client_secret:
                         payment_action = {
                             "type": "adyen_session",
                             "client_secret": client_secret,
-                            "raw": getattr(payment_intent, "raw_response", None),
+                            "raw": raw,
                         }
                     elif psp_type in ["checkout", "paypal"] and client_secret and str(
                         client_secret
@@ -512,10 +529,10 @@ async def create_new_order(
                         payment_action = {
                             "type": "redirect_url",
                             "url": client_secret,
-                            "raw": getattr(payment_intent, "raw_response", None),
+                            "raw": raw,
                         }
                     else:
-                        # Fallback: expose minimal info; frontends can still use legacy fields
+                        # Fallback: expose minimal info; frontends can仍然使用 legacy 字段
                         payment_action = {
                             "type": None,
                             "client_secret": client_secret,
@@ -551,13 +568,18 @@ async def create_new_order(
                             f"⚠️ Failed to update payment_attempt {payment_attempt_id} as success: {log_err}"
                         )
 
-                # For Checkout and PayPal, client_secret contains the redirect URL
+                # Log redirect URL when available（Checkout / PayPal / Stripe Checkout）
+                redirect_url = getattr(payment_intent, "redirect_url", None)
                 if (
-                    psp_type in ["checkout", "paypal"]
+                    not redirect_url
+                    and psp_type in ["checkout", "paypal"]
                     and client_secret
-                    and str(client_secret).startswith("http")
+                    and isinstance(client_secret, str)
+                    and client_secret.startswith("http")
                 ):
-                    logger.info(f"🔗 {psp_type.capitalize()} redirect URL: {client_secret}")
+                    redirect_url = client_secret
+                if redirect_url:
+                    logger.info(f"🔗 {psp_type.capitalize()} redirect URL: {redirect_url}")
 
                 await update_payment_info(
                     order_id=order_id,

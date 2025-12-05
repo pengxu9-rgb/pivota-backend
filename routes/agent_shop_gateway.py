@@ -99,10 +99,26 @@ class CreateOrderPayload(BaseModel):
 
 
 class PaymentPayloadBody(BaseModel):
+    """
+    Payload for submit_payment operation.
+
+    约定（供 LLM/前端使用）：
+    {
+      "payment": {
+        "order_id": "ORD_xxx",
+        "expected_amount": 59.0,  # 可选，主要用于前端自检
+        "currency": "USD",        # 可选
+        "payment_method": "stripe_checkout" | "card" | ...
+      }
+    }
+
+    其中 payment_method 只是一个 hint，Gateway 会将其映射为
+    Agent Payment API 需要的 PaymentMethod.type 字段。
+    """
     order_id: str
     expected_amount: float
     currency: str
-    payment_method_hint: Optional[str] = None
+    payment_method: Optional[str] = None  # e.g. "stripe_checkout", "card"
 
 
 class SubmitPaymentPayload(BaseModel):
@@ -500,10 +516,17 @@ async def _handle_create_order(order: OrderPayloadBody) -> Dict[str, Any]:
 
 async def _handle_submit_payment(payment: PaymentPayloadBody) -> Dict[str, Any]:
     """Proxy submit_payment to Agent API (/agent/v1/payments)."""
+    # 将简单的 payment_method 字符串映射为 Agent Payment API 的结构化字段
+    method_type = (payment.payment_method or "").strip() or "card"
+
     body = {
         "order_id": payment.order_id,
-        "payment_method": payment.payment_method_hint or "card",
-        "total_amount": payment.expected_amount,
+        "payment_method": {
+            "type": method_type
+        },
+        # expected_amount / currency 目前仅用于前端自检，Agent Payments 会根据订单记录金额
+        # 接收端的 Pydantic 模型不会使用这些字段，但保留在 body 中也无妨。
+        "expected_amount": payment.expected_amount,
         "currency": payment.currency,
     }
 

@@ -16,12 +16,13 @@ class PaymentIntent:
     def __init__(
         self,
         id: str,
-        client_secret: str,
+        client_secret: Optional[str],
         amount: int,
         currency: str,
         status: str,
         psp_type: str,
-        raw_response: Dict[str, Any]
+        raw_response: Dict[str, Any],
+        redirect_url: Optional[str] = None,
     ):
         self.id = id
         self.client_secret = client_secret
@@ -30,6 +31,9 @@ class PaymentIntent:
         self.status = status
         self.psp_type = psp_type
         self.raw_response = raw_response
+        # 对于基于重定向的支付方式（如 Stripe Checkout、PayPal 等），返回可直接跳转的支付 URL
+        # 非重定向方式则为 None
+        self.redirect_url = redirect_url
 
 
 class PSPAdapter(ABC):
@@ -86,18 +90,66 @@ class StripeAdapter(PSPAdapter):
         currency: str,
         metadata: Dict[str, Any]
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str]]:
-        """创建 Stripe Payment Intent"""
+        """
+        创建 Stripe 支付意图。
+
+        默认使用 PaymentIntent + client_secret 流程（兼容现有前端）。
+        当 metadata.psp_mode == "stripe_checkout" 时，改走 Stripe Checkout Session，
+        返回 redirect_url，方便 Agent / 外部前端直接跳转支付页。
+        """
         try:
+            psp_mode = (metadata.get("psp_mode") or "").lower()
+
+            # Agent / Checkout 场景：返回可跳转的支付链接
+            if psp_mode == "stripe_checkout":
+                session = stripe.checkout.Session.create(
+                    mode="payment",
+                    line_items=[
+                        {
+                            "quantity": 1,
+                            "price_data": {
+                                "currency": currency.lower(),
+                                "unit_amount": int(amount * 100),
+                                "product_data": {
+                                    # 尽量给一个可读名称，避免为空
+                                    "name": metadata.get("description")
+                                    or metadata.get("order_id")
+                                    or "Order",
+                                },
+                            },
+                        }
+                    ],
+                    success_url="https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
+                    cancel_url="https://merchant.pivota.cc/payment/cancel",
+                    metadata=metadata,
+                )
+
+                return (
+                    True,
+                    PaymentIntent(
+                        id=session.id,
+                        client_secret=None,
+                        amount=int(amount * 100),
+                        currency=currency,
+                        status="requires_action",
+                        psp_type="stripe_checkout",
+                        raw_response=session,
+                        redirect_url=session.url,
+                    ),
+                    None,
+                )
+
+            # 默认：PaymentIntent + client_secret（传统前端使用）
             payment_intent = stripe.PaymentIntent.create(
                 amount=int(amount * 100),  # Stripe 使用分为单位
                 currency=currency.lower(),
                 metadata=metadata,
                 automatic_payment_methods={
                     "enabled": True,
-                    "allow_redirects": "never"  # Avoid requiring return_url for test payments
+                    "allow_redirects": "never"  # 避免测试环境强依赖 return_url
                 }
             )
-            
+
             return (
                 True,
                 PaymentIntent(
@@ -107,9 +159,10 @@ class StripeAdapter(PSPAdapter):
                     currency=payment_intent.currency,
                     status=payment_intent.status,
                     psp_type="stripe",
-                    raw_response=payment_intent
+                    raw_response=payment_intent,
+                    redirect_url=None,
                 ),
-                None
+                None,
             )
         except Exception as e:
             # Fall back to generic exception to avoid dependency on stripe.error namespace
