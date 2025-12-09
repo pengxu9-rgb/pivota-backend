@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import httpx
 import logging
+from urllib.parse import urlparse, parse_qs
 
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 
@@ -65,8 +66,27 @@ class ShopifyProductAdapter:
             next_page_token = None
             link_header = response.headers.get("Link", "")
             if "rel=\"next\"" in link_header:
-                # 简化实现：暂不解析 Link header
-                next_page_token = "has_next"
+                try:
+                    # Link header example:
+                    # <https://shop.myshopify.com/admin/api/2024-07/products.json?page_info=abc&limit=250>; rel="next"
+                    parts = [p.strip() for p in link_header.split(",")]
+                    for part in parts:
+                        if 'rel="next"' in part:
+                            start = part.find("<")
+                            end = part.find(">")
+                            if start != -1 and end != -1:
+                                url_part = part[start + 1 : end]
+                                parsed = urlparse(url_part)
+                                qs = parse_qs(parsed.query)
+                                token = qs.get("page_info", [None])[0]
+                                if token:
+                                    next_page_token = token
+                                    break
+                    # Fallback: if parsing fails but rel=next exists, keep a simple flag
+                    if not next_page_token:
+                        next_page_token = "has_next"
+                except Exception:
+                    next_page_token = "has_next"
             
             logger.info(f"✅ Fetched {len(standard_products)} products from Shopify for merchant {merchant_id}")
             return standard_products, next_page_token, None
@@ -224,7 +244,8 @@ class WixProductAdapter:
         site_id: str,
         api_key: str,
         merchant_id: str,
-        limit: int = 50
+        limit: int = 50,
+        page_token: Optional[str] = None
     ) -> Tuple[List[StandardProduct], Optional[str], Optional[str]]:
         """实时从 Wix 拉取产品"""
         import httpx
@@ -343,7 +364,8 @@ class WooCommerceProductAdapter:
         consumer_key: str,
         consumer_secret: str,
         merchant_id: str,
-        limit: int = 50
+        limit: int = 50,
+        page_token: Optional[str] = None
     ) -> Tuple[List[StandardProduct], Optional[str], Optional[str]]:
         """实时从 WooCommerce 拉取产品"""
         # TODO: 实现 WooCommerce API 调用
@@ -363,7 +385,8 @@ async def fetch_merchant_products(
     merchant_id: str,
     platform: str,
     credentials: Dict[str, str],
-    limit: int = 50
+    limit: int = 50,
+    page_token: Optional[str] = None
 ) -> Tuple[List[StandardProduct], Optional[str], Optional[str]]:
     """
     通用产品获取函数（根据平台自动选择适配器）
@@ -390,14 +413,16 @@ async def fetch_merchant_products(
             shop_domain=credentials.get("shop_domain"),
             access_token=credentials.get("access_token"),
             merchant_id=merchant_id,
-            limit=limit
+            limit=limit,
+            page_info=page_token
         )
     elif platform == "wix":
         return await adapter_class.fetch_products(
             site_id=credentials.get("site_id"),
             api_key=credentials.get("api_key"),
             merchant_id=merchant_id,
-            limit=limit
+            limit=limit,
+            page_token=page_token
         )
     elif platform == "woocommerce":
         return await adapter_class.fetch_products(
@@ -405,7 +430,8 @@ async def fetch_merchant_products(
             consumer_key=credentials.get("consumer_key"),
             consumer_secret=credentials.get("consumer_secret"),
             merchant_id=merchant_id,
-            limit=limit
+            limit=limit,
+            page_token=page_token
         )
     else:
         return [], None, f"Platform {platform} not implemented"

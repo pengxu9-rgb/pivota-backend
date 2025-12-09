@@ -123,41 +123,53 @@ async def universal_product_sync(
             )
         
         # 4. Fetch products using the universal adapter
-        products_obj, next_page_token, error = await fetch_merchant_products(
-            merchant_id=request.merchant_id,
-            platform=platform,
-            credentials=credentials,
-            limit=request.limit
-        )
-        
-        if error:
-            logger.error(f"Platform API error: {error}")
-            # Still return success with helpful message
-            return UniversalSyncResponse(
-                status="warning",
-                message=f"Could not fetch from {platform}: {error}. Please verify your store connection.",
+        # 4.1 Paginate through all pages (Shopify limit=250/page). Guard with max_pages.
+        synced_count = 0
+        page_token: Optional[str] = None
+        max_pages = 20  # safety guard: 20 * 250 = 5000 items
+        pages = 0
+
+        while pages < max_pages:
+            products_obj, next_page_token, error = await fetch_merchant_products(
                 merchant_id=request.merchant_id,
                 platform=platform,
-                products_synced=0,
-                sync_time=datetime.now().isoformat()
+                credentials=credentials,
+                limit=request.limit,
+                page_token=page_token,
             )
-        
-        # 5. Cache products
-        synced_count = 0
-        if products_obj:
-            for product in products_obj:
-                try:
-                    product_data = json.loads(product.json())
-                    await upsert_product_cache(
-                        merchant_id=request.merchant_id,
-                        platform=platform,
-                        platform_product_id=product.id,
-                        product_data=product_data,
-                        ttl_seconds=604800  # 7 days
-                    )
-                    synced_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to cache product {product.id}: {e}")
+
+            if error:
+                logger.error(f"Platform API error: {error}")
+                # Still return success with helpful message
+                return UniversalSyncResponse(
+                    status="warning",
+                    message=f"Could not fetch from {platform}: {error}. Please verify your store connection.",
+                    merchant_id=request.merchant_id,
+                    platform=platform,
+                    products_synced=synced_count,
+                    sync_time=datetime.now().isoformat()
+                )
+
+            if products_obj:
+                for product in products_obj:
+                    try:
+                        product_data = json.loads(product.json())
+                        await upsert_product_cache(
+                            merchant_id=request.merchant_id,
+                            platform=platform,
+                            platform_product_id=product.id,
+                            product_data=product_data,
+                            ttl_seconds=604800  # 7 days
+                        )
+                        synced_count += 1
+                    except Exception as e:
+                        logger.error(f"Failed to cache product {product.id}: {e}")
+
+            pages += 1
+            if next_page_token:
+                page_token = next_page_token
+            else:
+                break
         
         # 6. Update store sync status
         await update_sync_status(store_info.get("store_id"), synced_count)
