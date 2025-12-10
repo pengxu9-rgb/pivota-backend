@@ -1364,6 +1364,10 @@ async def _handle_get_product_detail(
             break
 
     if not match:
+        # Fallback: try loading directly from products cache by product_id
+        match = await _load_base_product(product_id)
+
+    if not match:
         # Strong contract: this should not happen if product comes from find_products,
         # so treat it as PRODUCT_NOT_FOUND.
         raise HTTPException(
