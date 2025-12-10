@@ -1230,8 +1230,22 @@ async def invoke_shop_operation(
     - get_product_detail
     - create_order       (demo-only)
     - submit_payment     (demo-only)
+    - find_similar_products
     """
     operation = (request.operation or "").strip()
+
+    # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
+    normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
+    if not normalized_metadata.get("creator_id"):
+        for k in ("creatorId", "creator_id"):
+            if k in request.payload:
+                normalized_metadata["creator_id"] = request.payload.get(k)
+                break
+    if not normalized_metadata.get("creator_name"):
+        for k in ("creatorName", "creator_name"):
+            if k in request.payload:
+                normalized_metadata["creator_name"] = request.payload.get(k)
+                break
 
     if operation == "find_products":
         payload = FindProductsPayload(**request.payload)
@@ -1247,11 +1261,11 @@ async def invoke_shop_operation(
 
     if operation == "find_products_multi":
         payload = FindProductsMultiPayload(**request.payload)
-        return await _handle_find_products_multi(payload, request.metadata, background_tasks)
+        return await _handle_find_products_multi(payload, normalized_metadata, background_tasks)
 
     if operation == "find_similar_products":
         payload = FindSimilarProductsPayload(**request.payload)
-        return await _handle_find_similar_products(payload, request.metadata)
+        return await _handle_find_similar_products(payload, normalized_metadata)
 
     if operation == "submit_payment":
         payload = SubmitPaymentPayload(**request.payload)
