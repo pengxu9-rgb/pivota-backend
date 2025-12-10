@@ -104,6 +104,7 @@ class SimilarUserContext(BaseModel):
 
 class FindSimilarProductsPayload(BaseModel):
     product_id: str = Field(..., description="Base product id to find similar products for")
+    merchant_id: Optional[str] = Field(None, description="Optional merchant id for the base product")
     creator_id: Optional[str] = Field(None, description="Optional creator context to scope results")
     limit: int = Field(6, ge=1, le=30, description="Max similar products to return (default 6, max 30)")
     strategy: Optional[SimilarityStrategy] = Field(None, description="Similarity strategy to use; defaults to auto")
@@ -1008,9 +1009,33 @@ async def _handle_find_similar_products(
     """
     limit = min(payload.limit or 6, 30)
 
+    # Try loading base product from cache first
     base_product = await _load_product_by_id(payload.product_id)
-    if not base_product:
-        raise HTTPException(status_code=404, detail="Base product not found")
+
+    # If not found in cache but we know the merchant, fall back to the
+    # hybrid path so products that only exist in the realtime slice can
+    # still be used as a similarity anchor.
+    if not base_product and payload.merchant_id:
+        try:
+            products, _, _ = await get_products_hybrid(
+                merchant_id=payload.merchant_id,
+                limit=500,
+                agent_id="shopping_ai_similar",
+                background_tasks=background_tasks,
+            )
+            for p in products:
+                if p.product_id == payload.product_id or p.id == payload.product_id:
+                    base_product = p
+                    break
+        except Exception as e:
+            logger.error(
+                "similar.base.hybrid_failed",
+                extra={
+                    "product_id": payload.product_id,
+                    "merchant_id": payload.merchant_id,
+                    "error": str(e),
+                },
+            )
 
     # Merge creator context (payload overrides metadata)
     creator_id = payload.creator_id
@@ -1036,26 +1061,32 @@ async def _handle_find_similar_products(
     # Decide strategy
     desired_strategy = payload.strategy or "auto"
     strategy_used: SimilarityStrategy = desired_strategy
-    if desired_strategy == "auto":
+    if desired_strategy == "auto" and base_product:
         try:
             has_coview = await similarity_service.hasCoViewData(payload.product_id)
         except Exception:
             has_coview = False
         strategy_used = "co_view" if has_coview else "content_embedding"
+    elif desired_strategy == "auto":
+        # Without a concrete base product we still default to content-based
+        # similarity semantics, but will rely entirely on fallback below.
+        strategy_used = "content_embedding"
 
     overfetch = min(limit * 3, 90)
-    try:
-        candidates = await similarity_service.findSimilar(
-            {
-                "baseProductId": payload.product_id,
-                "limit": overfetch,
-                "strategy": strategy_used,
-                "userId": payload.user.id if payload.user else None,
-            }
-        )
-    except Exception as e:
-        logger.error(f"[similar] similarity_service failed: {e}")
-        candidates = []
+    candidates: List[SimilarCandidate] = []
+    if base_product:
+        try:
+            candidates = await similarity_service.findSimilar(
+                {
+                    "baseProductId": payload.product_id,
+                    "limit": overfetch,
+                    "strategy": strategy_used,
+                    "userId": payload.user.id if payload.user else None,
+                }
+            )
+        except Exception as e:
+            logger.error(f"[similar] similarity_service failed: {e}")
+            candidates = []
 
     def _personalization_score(prod: StandardProduct) -> float:
         """Lightweight personalization using recent query tokens."""
@@ -1072,90 +1103,60 @@ async def _handle_find_similar_products(
         return min(1.0, overlap / max(len(q_tokens), 1))
 
     filtered: List[Dict[str, Any]] = []
-    raw_products = []
+    raw_products: List[Any] = []
     seen_ids: set[str] = set()
-    candidate_ids = [c.productId for c in candidates if c.productId]
-    product_map = await _load_products_by_ids(candidate_ids)
-
-    for cand in candidates:
-        pid = cand.productId
-        if not pid or pid in seen_ids:
-            continue
-
-        sp = product_map.get(pid)
-        if not sp:
-            continue
-
-        if sp.status and sp.status != ProductStatus.ACTIVE:
-            continue
-        raw_products.append((pid, sp, cand))
-
     strict_candidates: List[Dict[str, Any]] = []
     relaxed_candidates: List[Dict[str, Any]] = []
 
-    def _score(sp: StandardProduct, cand_obj):
-        similarity_score = max(0.0, float(getattr(cand_obj, "score", 0.0) or 0.0))
-        price_score = 0.0
-        base_price = base_product.price or 0.0
-        if base_price > 0:
-            price_score = max(0.0, 1.0 - abs(sp.price - base_price) / base_price)
-        merchant_score = 1.0 if strategy_used == "same_merchant_first" and sp.merchant_id == base_product.merchant_id else 0.0
-        personalization_score = _personalization_score(sp)
-        weights = get_similarity_scoring_weights()
-        final_score = (
-            weights["similarity"] * similarity_score
-            + weights["price"] * price_score
-            + weights["merchant"] * merchant_score
-            + weights["personalization"] * personalization_score
-        )
-        return similarity_score, personalization_score, final_score
+    if base_product and candidates:
+        candidate_ids = [c.productId for c in candidates if c.productId]
+        product_map = await _load_products_by_ids(candidate_ids)
 
-    # First pass: strict
-    for pid, sp, cand_obj in raw_products:
-        if pid in seen_ids:
-            continue
-        if sp.in_stock is False or (sp.inventory_quantity is not None and sp.inventory_quantity <= 0):
-            continue
-        if creator_id:
-            cand_creator = None
-            if sp.platform_metadata:
-                cand_creator = sp.platform_metadata.get("creator_id") or sp.platform_metadata.get("creatorId")
-            if cand_creator and cand_creator != creator_id:
+        for cand in candidates:
+            pid = cand.productId
+            if not pid or pid in seen_ids:
                 continue
-        similarity_score, personalization_score, final_score = _score(sp, cand_obj)
-        seen_ids.add(pid)
-        strict_candidates.append(
-            {
-                "product": sp,
-                "scores": {
-                    "similarity": round(similarity_score, 3),
-                    "personalization": round(personalization_score, 3) if personalization_score else None,
-                },
-                "debug_scores": {
-                    "price": round(price_score, 3),
-                    "merchant": round(merchant_score, 3),
-                    "personalization": round(personalization_score, 3),
-                },
-                "final_score": final_score,
-            }
-        )
 
-    chosen_candidates = strict_candidates
-
-    # Relaxed pass if needed
-    if not strict_candidates:
-        seen_ids.clear()
-        for pid, sp, cand_obj in raw_products:
-            if pid in seen_ids:
+            sp = product_map.get(pid)
+            if not sp:
                 continue
-            similarity_score, personalization_score, final_score = _score(sp, cand_obj)
+
+            if sp.status and sp.status != ProductStatus.ACTIVE:
+                continue
+            raw_products.append((pid, sp, cand))
+
+        def _score(sp: StandardProduct, cand_obj):
+            similarity_score = max(0.0, float(getattr(cand_obj, "score", 0.0) or 0.0))
             price_score = 0.0
             base_price = base_product.price or 0.0
             if base_price > 0:
                 price_score = max(0.0, 1.0 - abs(sp.price - base_price) / base_price)
             merchant_score = 1.0 if strategy_used == "same_merchant_first" and sp.merchant_id == base_product.merchant_id else 0.0
+            personalization_score = _personalization_score(sp)
+            weights = get_similarity_scoring_weights()
+            final_score = (
+                weights["similarity"] * similarity_score
+                + weights["price"] * price_score
+                + weights["merchant"] * merchant_score
+                + weights["personalization"] * personalization_score
+            )
+            return similarity_score, price_score, merchant_score, personalization_score, final_score
+
+        # First pass: strict
+        for pid, sp, cand_obj in raw_products:
+            if pid in seen_ids:
+                continue
+            if sp.in_stock is False or (sp.inventory_quantity is not None and sp.inventory_quantity <= 0):
+                continue
+            if creator_id:
+                cand_creator = None
+                if sp.platform_metadata:
+                    cand_creator = sp.platform_metadata.get("creator_id") or sp.platform_metadata.get("creatorId")
+                if cand_creator and cand_creator != creator_id:
+                    continue
+            similarity_score, price_score, merchant_score, personalization_score, final_score = _score(sp, cand_obj)
             seen_ids.add(pid)
-            relaxed_candidates.append(
+            strict_candidates.append(
                 {
                     "product": sp,
                     "scores": {
@@ -1170,15 +1171,40 @@ async def _handle_find_similar_products(
                     "final_score": final_score,
                 }
             )
-        if relaxed_candidates:
-            logger.info(
-                "similar.filter.relax",
-                extra={
-                    "base_product_id": base_product.product_id or payload.product_id,
-                    "raw_count": len(raw_products),
-                },
-            )
-            chosen_candidates = relaxed_candidates
+
+        # Relaxed pass if needed
+        if not strict_candidates:
+            seen_ids.clear()
+            for pid, sp, cand_obj in raw_products:
+                if pid in seen_ids:
+                    continue
+                similarity_score, price_score, merchant_score, personalization_score, final_score = _score(sp, cand_obj)
+                seen_ids.add(pid)
+                relaxed_candidates.append(
+                    {
+                        "product": sp,
+                        "scores": {
+                            "similarity": round(similarity_score, 3),
+                            "personalization": round(personalization_score, 3) if personalization_score else None,
+                        },
+                        "debug_scores": {
+                            "price": round(price_score, 3),
+                            "merchant": round(merchant_score, 3),
+                            "personalization": round(personalization_score, 3),
+                        },
+                        "final_score": final_score,
+                    }
+                )
+            if relaxed_candidates:
+                logger.info(
+                    "similar.filter.relax",
+                    extra={
+                        "base_product_id": base_product.product_id or payload.product_id,
+                        "raw_count": len(raw_products),
+                    },
+                )
+
+    chosen_candidates = strict_candidates or relaxed_candidates
 
     # Rank and trim
     chosen_candidates.sort(key=lambda x: x["final_score"], reverse=True)
@@ -1250,10 +1276,16 @@ async def _handle_find_similar_products(
     # Fallback: if similarity pipeline produced no items, reuse multi search
     if not items:
         try:
-            # First attempt: use the base product title as query.
+            # First attempt: use the base product title as query (when available).
+            primary_query = ""
+            primary_category = None
+            if base_product:
+                primary_query = (base_product.title or "") or ""
+                primary_category = base_product.product_type
+
             primary_search = MultiSearchFilters(
-                query=(base_product.title or "") or "",
-                category=base_product.product_type,
+                query=primary_query,
+                category=primary_category,
                 price_min=None,
                 price_max=None,
                 page=1,
@@ -1324,7 +1356,7 @@ async def _handle_find_similar_products(
             )
 
     return {
-        "base_product_id": base_product.product_id or payload.product_id,
+        "base_product_id": (base_product.product_id if base_product else None) or payload.product_id,
         "strategy_used": strategy_used,
         "items": items,
     }
