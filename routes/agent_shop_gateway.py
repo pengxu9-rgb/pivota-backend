@@ -90,6 +90,10 @@ class FindProductsMultiPayload(BaseModel):
     search: MultiSearchFilters
     user: Optional[UserIntent] = None
     metadata: Optional[RequestMetadata] = None
+    creator_id: Optional[str] = Field(None, alias="creatorId", description="Optional creator context to scope results")
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 class SimilarUserContext(BaseModel):
@@ -709,6 +713,37 @@ async def _handle_find_products_multi(
             item = _standard_to_shop_product(prod)
             item["merchant_name"] = merchant_map.get(prod.merchant_id)
             mapped.append(item)
+
+        # If still empty (no creator/global top sellers), fall back to recent cached products
+        if not mapped:
+            rows = await database.fetch_all(
+                """
+                SELECT merchant_id, product_data
+                FROM products_cache
+                ORDER BY cached_at DESC
+                LIMIT :limit
+                """,
+                {"limit": max(limit * max(page, 1) * 2, 20)},
+            )
+            source = "cache_global_fallback"
+            for row in rows:
+                merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
+                product_data = row.get("product_data") if isinstance(row, dict) else None
+                if isinstance(product_data, str):
+                    try:
+                        product_data = json.loads(product_data)
+                    except Exception:
+                        continue
+                if not isinstance(product_data, dict):
+                    continue
+                try:
+                    prod = StandardProduct(**product_data)
+                    prod.merchant_id = prod.merchant_id or merchant_id
+                    item = _standard_to_shop_product(prod)
+                    item["merchant_name"] = merchant_map.get(prod.merchant_id)
+                    mapped.append(item)
+                except Exception:
+                    continue
 
         start_idx = (page - 1) * limit
         page_items = mapped[start_idx : start_idx + limit]
