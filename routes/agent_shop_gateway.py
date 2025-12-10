@@ -553,6 +553,116 @@ async def _handle_find_products_multi(
                 break
         return products
 
+    async def _load_global_top_sellers(max_candidates: int = 50) -> List[StandardProduct]:
+        """Global popular products as a fallback when creator context is missing."""
+        rows = await database.fetch_all(
+            """
+            SELECT merchant_id, items
+            FROM orders
+            WHERE is_deleted IS NOT TRUE
+            ORDER BY created_at DESC
+            LIMIT 800
+            """
+        )
+
+        popularity = Counter()
+        for row in rows:
+            merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
+            raw_items = row.get("items") if isinstance(row, dict) else None
+            if not merchant_id:
+                continue
+            if isinstance(raw_items, str):
+                try:
+                    raw_items = json.loads(raw_items)
+                except Exception:
+                    raw_items = None
+            if not isinstance(raw_items, list):
+                continue
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                pid = str(
+                    item.get("product_id")
+                    or item.get("id")
+                    or item.get("platform_product_id")
+                    or ""
+                ).strip()
+                if not pid:
+                    continue
+                qty = int(item.get("quantity") or 1)
+                popularity[(merchant_id, pid)] += max(qty, 1)
+
+        products: List[StandardProduct] = []
+
+        async def _fetch_product(merchant_id: str, product_id: str) -> Optional[StandardProduct]:
+            row = await database.fetch_one(
+                """
+                SELECT product_data
+                FROM products_cache
+                WHERE merchant_id = :merchant_id
+                  AND (
+                    platform_product_id = :pid
+                    OR product_data->>'id' = :pid
+                    OR product_data->>'product_id' = :pid
+                  )
+                ORDER BY cached_at DESC
+                LIMIT 1
+                """,
+                {"merchant_id": merchant_id, "pid": product_id},
+            )
+            if not row:
+                return None
+            product_data = row.get("product_data") if isinstance(row, dict) else None
+            if isinstance(product_data, str):
+                try:
+                    product_data = json.loads(product_data)
+                except Exception:
+                    return None
+            if not isinstance(product_data, dict):
+                return None
+            try:
+                product = StandardProduct(**product_data)
+                product.merchant_id = merchant_id
+                return product
+            except Exception:
+                return None
+
+        if popularity:
+            for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
+                prod = await _fetch_product(m_id, pid)
+                if prod:
+                    products.append(prod)
+                if len(products) >= max_candidates:
+                    break
+            if products:
+                return products
+
+        # Final fallback: recent cached products
+        rows = await database.fetch_all(
+            """
+            SELECT product_data
+            FROM products_cache
+            ORDER BY cached_at DESC
+            LIMIT :limit
+            """,
+            {"limit": max_candidates},
+        )
+        for row in rows:
+            product_data = row.get("product_data") if isinstance(row, dict) else None
+            if isinstance(product_data, str):
+                try:
+                    product_data = json.loads(product_data)
+                except Exception:
+                    continue
+            if not isinstance(product_data, dict):
+                continue
+            try:
+                products.append(StandardProduct(**product_data))
+            except Exception:
+                continue
+
+        return products
+
     history_product_ids, history_titles = await _load_user_history_signals()
     history_terms = set()
     if user_ctx and user_ctx.recent_queries:
@@ -589,7 +699,11 @@ async def _handle_find_products_multi(
     # Cold start: empty query falls back to creator top sellers.
     q = (filters.query or "").strip()
     if not q:
+        source = "creator_top_sellers"
         top_sellers = await _load_creator_top_sellers(max_candidates=limit * 2)
+        if not top_sellers:
+            top_sellers = await _load_global_top_sellers(max_candidates=limit * 2)
+            source = "global_top_sellers"
         mapped = []
         for prod in top_sellers[: limit * page]:
             item = _standard_to_shop_product(prod)
@@ -605,7 +719,7 @@ async def _handle_find_products_multi(
             "page_size": len(page_items),
             "reply": None,
             "metadata": {
-                "query_source": "creator_top_sellers",
+                "query_source": source,
                 "fetched_at": datetime.utcnow().isoformat(),
                 "merchants_searched": len(merchant_map),
                 "creator_id": creator_id,
