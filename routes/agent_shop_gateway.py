@@ -1250,7 +1250,8 @@ async def _handle_find_similar_products(
     # Fallback: if similarity pipeline produced no items, reuse multi search
     if not items:
         try:
-            fallback_search = MultiSearchFilters(
+            # First attempt: use the base product title as query.
+            primary_search = MultiSearchFilters(
                 query=(base_product.title or "") or "",
                 category=base_product.product_type,
                 price_min=None,
@@ -1259,18 +1260,44 @@ async def _handle_find_similar_products(
                 limit=limit,
                 in_stock_only=False,
             )
-            multi_payload = FindProductsMultiPayload(
-                search=fallback_search,
+            primary_payload = FindProductsMultiPayload(
+                search=primary_search,
                 user=None,
                 metadata=None,
                 creator_id=creator_id,
             )
-            multi_result = await _handle_find_products_multi(
-                multi_payload,
+            primary_result = await _handle_find_products_multi(
+                primary_payload,
                 request_metadata or {},
                 background_tasks,
             )
-            fallback_products = multi_result.get("products", []) or []
+            fallback_products = primary_result.get("products", []) or []
+
+            # If a title-based query still yields nothing, fall back to a broad
+            # creator/global top-sellers style search by using an empty query.
+            if not fallback_products:
+                broad_search = MultiSearchFilters(
+                    query="",
+                    category=None,
+                    price_min=None,
+                    price_max=None,
+                    page=1,
+                    limit=limit,
+                    in_stock_only=False,
+                )
+                broad_payload = FindProductsMultiPayload(
+                    search=broad_search,
+                    user=None,
+                    metadata=None,
+                    creator_id=creator_id,
+                )
+                broad_result = await _handle_find_products_multi(
+                    broad_payload,
+                    request_metadata or {},
+                    background_tasks,
+                )
+                fallback_products = broad_result.get("products", []) or []
+
             items = [
                 {
                     "product": prod,
@@ -1365,7 +1392,10 @@ async def _handle_get_product_detail(
 
     if not match:
         # Fallback: try loading directly from products cache by product_id
-        match = await _load_base_product(product_id)
+        match = await _load_product_by_id(product_id)
+        # When we hit the cache directly, make the source explicit for observability.
+        if match:
+            query_source = "product_cache_fallback"
 
     if not match:
         # Strong contract: this should not happen if product comes from find_products,
