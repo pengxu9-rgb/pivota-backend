@@ -77,10 +77,13 @@ class UserIntent(BaseModel):
 
 
 class RequestMetadata(BaseModel):
-    creator_id: Optional[str] = Field(None, description="Creator id for contextual recommendations")
-    creator_name: Optional[str] = Field(None, description="Human friendly creator name")
+    creator_id: Optional[str] = Field(None, alias="creatorId", description="Creator id for contextual recommendations")
+    creator_name: Optional[str] = Field(None, alias="creatorName", description="Human friendly creator name")
     source: Optional[str] = Field(None, description="Calling surface (e.g. creator-agent-ui)")
-    trace_id: Optional[str] = Field(None, description="Optional trace id for observability")
+    trace_id: Optional[str] = Field(None, alias="traceId", description="Optional trace id for observability")
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 class FindProductsMultiPayload(BaseModel):
