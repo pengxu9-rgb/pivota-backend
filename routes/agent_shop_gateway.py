@@ -736,63 +736,63 @@ async def _handle_find_products_multi(
                         continue
                 if not isinstance(product_data, dict):
                     continue
-                    try:
-                        prod = StandardProduct(**product_data)
-                        prod.merchant_id = prod.merchant_id or merchant_id
-                        item = _standard_to_shop_product(prod)
-                            item["merchant_name"] = merchant_map.get(prod.merchant_id)
-                            mapped.append(item)
-                        except Exception:
-                            # Fallback: tolerate partially invalid cache rows
-                            pid = (
-                            product_data.get("id")
-                            or product_data.get("product_id")
-                            or product_data.get("platform_product_id")
-                            or None
+                try:
+                    prod = StandardProduct(**product_data)
+                    prod.merchant_id = prod.merchant_id or merchant_id
+                    item = _standard_to_shop_product(prod)
+                    item["merchant_name"] = merchant_map.get(prod.merchant_id)
+                    mapped.append(item)
+                except Exception:
+                    # Fallback: tolerate partially invalid cache rows
+                    pid = (
+                        product_data.get("id")
+                        or product_data.get("product_id")
+                        or product_data.get("platform_product_id")
+                        or None
+                    )
+                    title = product_data.get("title") or product_data.get("name") or ""
+                    price = product_data.get("price") or product_data.get("compare_at_price") or 0
+                    currency = product_data.get("currency") or "USD"
+                    image_url = (
+                        product_data.get("image_url")
+                        or (product_data.get("images") or [{}])[0].get("src")
+                        if isinstance(product_data.get("images"), list)
+                        else None
+                    )
+                    if pid and title and price is not None:
+                        mapped.append(
+                            {
+                                "id": pid,
+                                "platform": product_data.get("platform") or product_data.get("source") or "",
+                                "merchant_id": merchant_id,
+                                "product_id": pid,
+                                "title": title,
+                                "description": product_data.get("description") or "",
+                                "vendor": product_data.get("vendor"),
+                                "product_type": product_data.get("product_type"),
+                                "tags": product_data.get("tags") or [],
+                                "price": price,
+                                "compare_at_price": product_data.get("compare_at_price"),
+                                "currency": currency,
+                                "inventory_quantity": product_data.get("inventory_quantity") or 0,
+                                "in_stock": bool(product_data.get("inventory_quantity", 0) > 0)
+                                if product_data.get("inventory_quantity") is not None
+                                else True,
+                                "sku": product_data.get("sku") or "",
+                                "barcode": product_data.get("barcode"),
+                                "image_url": image_url,
+                                "images": product_data.get("images") or [],
+                                "variants": product_data.get("variants") or [],
+                                "status": product_data.get("status") or "active",
+                                "published_at": product_data.get("published_at"),
+                                "created_at": product_data.get("created_at"),
+                                "updated_at": product_data.get("updated_at"),
+                                "data_completeness_score": product_data.get("data_completeness_score"),
+                                "platform_metadata": product_data.get("platform_metadata"),
+                                "orderable": product_data.get("orderable", True),
+                                "merchant_name": merchant_map.get(merchant_id),
+                            }
                         )
-                        title = product_data.get("title") or product_data.get("name") or ""
-                        price = product_data.get("price") or product_data.get("compare_at_price") or 0
-                        currency = product_data.get("currency") or "USD"
-                        image_url = (
-                            product_data.get("image_url")
-                            or (product_data.get("images") or [{}])[0].get("src")
-                            if isinstance(product_data.get("images"), list)
-                            else None
-                        )
-                        if pid and title and price is not None:
-                            mapped.append(
-                                {
-                                    "id": pid,
-                                    "platform": product_data.get("platform") or product_data.get("source") or "",
-                                    "merchant_id": merchant_id,
-                                    "product_id": pid,
-                                    "title": title,
-                                    "description": product_data.get("description") or "",
-                                    "vendor": product_data.get("vendor"),
-                                    "product_type": product_data.get("product_type"),
-                                    "tags": product_data.get("tags") or [],
-                                    "price": price,
-                                    "compare_at_price": product_data.get("compare_at_price"),
-                                    "currency": currency,
-                                    "inventory_quantity": product_data.get("inventory_quantity") or 0,
-                                    "in_stock": bool(product_data.get("inventory_quantity", 0) > 0)
-                                    if product_data.get("inventory_quantity") is not None
-                                    else True,
-                                    "sku": product_data.get("sku") or "",
-                                    "barcode": product_data.get("barcode"),
-                                    "image_url": image_url,
-                                    "images": product_data.get("images") or [],
-                                    "variants": product_data.get("variants") or [],
-                                    "status": product_data.get("status") or "active",
-                                    "published_at": product_data.get("published_at"),
-                                    "created_at": product_data.get("created_at"),
-                                    "updated_at": product_data.get("updated_at"),
-                                    "data_completeness_score": product_data.get("data_completeness_score"),
-                                    "platform_metadata": product_data.get("platform_metadata"),
-                                    "orderable": product_data.get("orderable", True),
-                                    "merchant_name": merchant_map.get(merchant_id),
-                                }
-                            )
 
         # Last resort: fetch live from merchants if cache is still empty
         if not mapped and merchant_map:
