@@ -986,6 +986,7 @@ async def _handle_find_products_multi(
 async def _handle_find_similar_products(
     payload: FindSimilarProductsPayload,
     request_metadata: Optional[Dict[str, Any]],
+    background_tasks: BackgroundTasks,
 ) -> Dict[str, Any]:
     """
     Find similar products for a given base product.
@@ -1246,6 +1247,55 @@ async def _handle_find_similar_products(
         },
     )
 
+    # Fallback: if similarity pipeline produced no items, reuse multi search
+    if not items:
+        try:
+            fallback_search = MultiSearchFilters(
+                query=(base_product.title or "") or "",
+                category=base_product.product_type,
+                price_min=None,
+                price_max=None,
+                page=1,
+                limit=limit,
+                in_stock_only=False,
+            )
+            multi_payload = FindProductsMultiPayload(
+                search=fallback_search,
+                user=None,
+                metadata=None,
+                creator_id=creator_id,
+            )
+            multi_result = await _handle_find_products_multi(
+                multi_payload,
+                request_metadata or {},
+                background_tasks,
+            )
+            fallback_products = multi_result.get("products", []) or []
+            items = [
+                {
+                    "product": prod,
+                    "best_deal": prod.get("best_deal"),
+                    "all_deals": prod.get("all_deals", []),
+                    "scores": None,
+                    "reason": "fallback_from_multi_search",
+                }
+                for prod in fallback_products[:limit]
+            ]
+            logger.info(
+                "similar.fallback.multi_search",
+                extra={
+                    "base_product_id": payload.product_id,
+                    "strategy_used": strategy_used,
+                    "fallback_count": len(items),
+                    "creator_id": creator_id,
+                },
+            )
+        except Exception as e:
+            logger.error(
+                "similar.fallback.failed",
+                extra={"base_product_id": payload.product_id, "error": str(e)},
+            )
+
     return {
         "base_product_id": base_product.product_id or payload.product_id,
         "strategy_used": strategy_used,
@@ -1269,7 +1319,11 @@ if DEV_MODE:
             strategy=strategy,
             debug=True,
         )
-        result = await _handle_find_similar_products(payload, request_metadata={})
+        result = await _handle_find_similar_products(
+            payload,
+            request_metadata={},
+            background_tasks=BackgroundTasks(),
+        )
         return result
 
 
@@ -1482,7 +1536,7 @@ async def invoke_shop_operation(
 
     if operation == "find_similar_products":
         payload = FindSimilarProductsPayload(**request.payload)
-        return await _handle_find_similar_products(payload, normalized_metadata)
+        return await _handle_find_similar_products(payload, normalized_metadata, background_tasks)
 
     if operation == "submit_payment":
         payload = SubmitPaymentPayload(**request.payload)
