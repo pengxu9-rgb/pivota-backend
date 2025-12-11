@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from enum import Enum
 
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import and_, desc, func, select, update
@@ -8,7 +9,7 @@ from sqlalchemy import and_, desc, func, select, update
 from db.database import database, promotions
 
 
-class PromotionStatus(str):
+class PromotionStatus(str, Enum):
     ACTIVE = "ACTIVE"
     UPCOMING = "UPCOMING"
     ENDED = "ENDED"
@@ -334,4 +335,3 @@ async def soft_delete_promotion(promo_id: str) -> bool:
     # so we re-fetch to see if the promotion is now marked deleted.
     row = await database.fetch_one(promotions.select().where(promotions.c.id == promo_id))
     return bool(row and row["deleted_at"] is not None)
-
