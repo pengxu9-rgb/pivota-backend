@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 
@@ -7,6 +7,19 @@ from pydantic import BaseModel, Field, validator
 from sqlalchemy import and_, desc, func, select, update
 
 from db.database import database, promotions
+
+
+def _normalize_dt(dt: datetime) -> datetime:
+    """
+    Ensure datetimes stored in the DB are offset-naive UTC.
+    Asyncpg cannot adapt offset-aware datetimes (it subtracts a naive epoch),
+    so we normalize everything to UTC and drop tzinfo.
+    """
+    if dt is None:
+        return dt
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 class PromotionStatus(str, Enum):
@@ -39,11 +52,23 @@ class PromotionBase(BaseModel):
         if not v:
             raise ValueError("channels must be a non-empty array")
         return v
+    
+    @validator("startAt", pre=False, always=True)
+    def normalize_start_at(cls, start_at: datetime) -> datetime:
+        if isinstance(start_at, datetime):
+            return _normalize_dt(start_at)
+        return start_at
 
-    @validator("endAt")
-    def validate_time_window(cls, end_at: datetime, values: Dict[str, Any]) -> datetime:
+    @validator("endAt", pre=False, always=True)
+    def normalize_and_validate_end_at(
+        cls, end_at: datetime, values: Dict[str, Any]
+    ) -> datetime:
+        if isinstance(end_at, datetime):
+            end_at = _normalize_dt(end_at)
         start_at = values.get("startAt")
-        if start_at and end_at <= start_at:
+        if isinstance(start_at, datetime):
+            start_at = _normalize_dt(start_at)
+        if start_at and end_at and end_at <= start_at:
             raise ValueError("endAt must be after startAt")
         return end_at
 
