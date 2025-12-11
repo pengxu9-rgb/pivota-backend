@@ -83,6 +83,13 @@ async def create_promotion_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "INVALID_PROMOTION", "message": str(e)},
         )
+    except Exception as e:
+        # Surface internal error details for admin/debug callers so we can
+        # see the real DB/validation issue instead of a generic 500.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "INTERNAL_ERROR", "message": str(e)},
+        )
     return {"promotion": promo.dict()}
 
 
@@ -99,6 +106,11 @@ async def update_promotion_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "INVALID_PROMOTION", "message": str(e)},
         )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "INTERNAL_ERROR", "message": str(e)},
+        )
     if not promo:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
     return {"promotion": promo.dict()}
@@ -113,4 +125,3 @@ async def delete_promotion_endpoint(
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
     return {"ok": True}
-
