@@ -9,7 +9,7 @@ import logging
 import time
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
 # Database
-from db.database import database
+from db.database import database, metadata, engine
 import subprocess
 import os
 
@@ -208,6 +208,7 @@ from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.accounts_orders_api import router as accounts_orders_router
+from routes.merchant_promotions_api import router as merchant_promotions_router
 
 # Service routers (only include what exists)
 try:
@@ -239,6 +240,7 @@ from utils.logger import logger
 from config.settings import settings
 
 from openapi_config import get_custom_openapi_schema
+from services.promotions_service import ensure_promotions_table
 
 app = FastAPI(
     title="Pivota Infra Dashboard", 
@@ -293,6 +295,28 @@ def custom_openapi():
     return app.openapi_schema
 
 app.openapi = custom_openapi
+
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Initialize database connections and ensure core tables exist.
+    """
+    await database.connect()
+    try:
+        # Create all tables defined in db.database (transactions, promotions, etc.)
+        metadata.create_all(engine)
+    except Exception as exc:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"⚠️ Failed to run metadata.create_all: {exc}")
+
+    # Run any additional promotions-specific initialization (kept lightweight for now)
+    await ensure_promotions_table()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await database.disconnect()
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
 dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -518,6 +542,7 @@ app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
+app.include_router(merchant_promotions_router)  # Merchant/agent promotions API (DB-backed)
 app.include_router(product_enrichment_router)  # Internal product enrichment trigger
 if DEBUG_MODE:
     app.include_router(create_test_agent_router)  # Create test agent account
@@ -1089,6 +1114,22 @@ async def root():
 async def health_check():
     """Dedicated health check endpoint"""
     return {"status": "ok", "timestamp": time.time()}
+
+# Catch-all OPTIONS to satisfy permissive CORS preflight checks (even when Access-Control-Request-Method is missing).
+@app.options("/{full_path:path}")
+async def options_passthrough(full_path: str, request: Request):
+    origin = request.headers.get("Origin", "*")
+    allow_headers = "Content-Type, Authorization, X-API-Key, X-Request-Id"
+    allow_methods = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Headers": allow_headers,
+            "Access-Control-Allow-Methods": allow_methods,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
 
 @app.get("/operations", response_class=HTMLResponse)
 async def operations_dashboard():

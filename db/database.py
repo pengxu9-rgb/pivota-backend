@@ -1,7 +1,18 @@
 from databases import Database
 from sqlalchemy import (
-    MetaData, Table, Column, Integer, String, Float, DateTime, JSON, create_engine
+    MetaData,
+    Table,
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+    JSON,
+    Boolean,
+    CheckConstraint,
+    create_engine,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 import datetime
 import os
 from typing import Optional
@@ -41,6 +52,7 @@ database = Database(DATABASE_URL)
 # Lazy asyncpg pool for legacy helpers
 _asyncpg_pool: Optional[asyncpg.pool.Pool] = None
 
+
 async def get_db_pool() -> asyncpg.pool.Pool:
     """
     Backward-compatible helper for routes that still expect an asyncpg pool.
@@ -50,6 +62,7 @@ async def get_db_pool() -> asyncpg.pool.Pool:
     if _asyncpg_pool is None:
         _asyncpg_pool = await asyncpg.create_pool(DATABASE_URL)
     return _asyncpg_pool
+
 
 metadata = MetaData()
 
@@ -65,7 +78,30 @@ transactions = Table(
     Column("psp", String(32), nullable=True),
     Column("psp_txn_id", String(128), nullable=True),
     Column("created_at", DateTime, default=datetime.datetime.utcnow),
-    Column("meta", JSON, nullable=True)
+    Column("meta", JSON, nullable=True),
+)
+
+
+promotions = Table(
+    "promotions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("merchant_id", String, index=True, nullable=False),
+    Column("name", String, nullable=False),
+    Column("type", String, nullable=False),  # FLASH_SALE | MULTI_BUY_DISCOUNT
+    Column("description", String, nullable=True),
+    Column("start_at", DateTime, nullable=False),
+    Column("end_at", DateTime, nullable=False),
+    Column("channels", JSONB, nullable=False),
+    Column("scope", JSONB, nullable=False),
+    Column("config", JSONB, nullable=False),
+    Column("expose_to_creators", Boolean, nullable=False, default=True),
+    Column("allowed_creator_ids", JSONB, nullable=True),
+    Column("human_readable_rule", String, nullable=True),
+    Column("created_at", DateTime, default=datetime.datetime.utcnow, nullable=False),
+    Column("updated_at", DateTime, default=datetime.datetime.utcnow, nullable=False),
+    Column("deleted_at", DateTime, nullable=True),
+    CheckConstraint("start_at < end_at", name="ck_promotions_time_window"),
 )
 
 # Create synchronous engine for table creation
