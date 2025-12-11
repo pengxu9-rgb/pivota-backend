@@ -6,7 +6,7 @@ Pivota 核心业务流程：Agent 下单 → 支付 → 履约
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, List, Dict, Any, Tuple
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 import time
 import hashlib
@@ -32,8 +32,123 @@ from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
 from services.payment_routing_service import PaymentRoutingService
+from services.promotions_service import list_promotions, PromotionStatus
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+
+
+# ============================================================================
+# 促销折扣应用（多件折扣）
+# ============================================================================
+
+async def compute_order_discount_from_promotions(
+    merchant_id: str,
+    items: List[OrderItem],
+    channel: str = "creator_agents",
+) -> Tuple[Decimal, List[Dict[str, Any]]]:
+    """
+    根据当前订单和促销配置计算订单级折扣金额。
+
+    当前 v0 仅支持：
+    - type = MULTI_BUY_DISCOUNT
+    - scope.global = true 或 scope.productIds 精确匹配 product_id
+    - channel 包含 creator_agents
+    """
+    discount_total = Decimal("0")
+    applied: List[Dict[str, Any]] = []
+
+    try:
+        promotions, _ = await list_promotions(
+            merchant_id=merchant_id,
+            status=PromotionStatus.ACTIVE,
+            channel=channel,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[OrderRoutes] Failed to load promotions for merchant {merchant_id}: {e}"
+        )
+        return discount_total, applied
+
+    if not promotions:
+        return discount_total, applied
+
+    for promo in promotions:
+        try:
+            if promo.type != "MULTI_BUY_DISCOUNT":
+                continue
+
+            scope = promo.scope or {}
+            cfg = promo.config or {}
+
+            threshold = int(
+                cfg.get("thresholdQuantity")
+                or cfg.get("threshold_quantity")
+                or 0
+            )
+            discount_percent_raw = (
+                cfg.get("discountPercent") or cfg.get("discount_percent") or 0
+            )
+            discount_percent = Decimal(str(discount_percent_raw))
+
+            if threshold <= 0 or discount_percent <= 0:
+                continue
+
+            # 收集满足 scope 的每一件商品的单价（按件展开）
+            unit_prices: List[Decimal] = []
+            for item in items:
+                eligible = False
+                product_id = item.product_id
+                if scope.get("global"):
+                    eligible = True
+                else:
+                    product_ids = scope.get("productIds") or scope.get("product_ids") or []
+                    if product_id in product_ids:
+                        eligible = True
+
+                if not eligible:
+                    continue
+
+                # 将每件商品按数量展开成单价列表
+                for _ in range(item.quantity):
+                    unit_prices.append(Decimal(item.unit_price))
+
+            total_qty = len(unit_prices)
+            if total_qty < threshold:
+                continue
+
+            # 优先对价格较高的商品进行折扣
+            unit_prices.sort(reverse=True)
+            discountable_qty = (total_qty // threshold) * threshold
+            discount_base = sum(unit_prices[:discountable_qty])
+
+            if discount_base <= 0:
+                continue
+
+            promo_discount = (
+                discount_base * discount_percent / Decimal("100")
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            if promo_discount <= 0:
+                continue
+
+            discount_total += promo_discount
+            applied.append(
+                {
+                    "id": promo.id,
+                    "label": promo.humanReadableRule,
+                    "type": promo.type,
+                    "thresholdQuantity": threshold,
+                    "discountPercent": float(discount_percent),
+                    "discountAmount": float(promo_discount),
+                }
+            )
+        except Exception as promo_err:
+            logger.warning(
+                f"[OrderRoutes] Failed to apply promotion {getattr(promo, 'id', None)}: {promo_err}"
+            )
+            continue
+
+    return discount_total, applied
 
 
 # ============================================================================
@@ -203,8 +318,32 @@ async def create_new_order(
                 }
             )
 
-        # 3. 计算订单金额
+        # 3. 计算订单金额（含促销折扣）
         subtotal = sum(item.subtotal for item in order_request.items)
+
+        # 应用促销折扣（目前主要用于 Creator Agents 的多件折扣）
+        discount_total = Decimal("0")
+        applied_promos: List[Dict[str, Any]] = []
+        try:
+            discount_total, applied_promos = await compute_order_discount_from_promotions(
+                merchant_id=order_request.merchant_id,
+                items=order_request.items,
+                channel="creator_agents",
+            )
+        except Exception as promo_err:
+            logger.warning(
+                f"[OrderRoutes] Failed to compute promotions for order: {promo_err}"
+            )
+            discount_total = Decimal("0")
+            applied_promos = []
+
+        if discount_total > 0:
+            logger.info(
+                f"[OrderRoutes] Applied promotions for merchant {order_request.merchant_id}: "
+                f"discount_total={discount_total}"
+            )
+            subtotal = max(Decimal("0"), subtotal - discount_total)
+
         shipping_fee = Decimal("0")
         tax = Decimal("0")
         total = subtotal + shipping_fee + tax
@@ -303,6 +442,17 @@ async def create_new_order(
         
         logger.info(f"✅ PSP determined: {psp_type} (ID: {psp_id_value})")
         
+        # 合并订单元数据并记录促销信息（如果有）
+        order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
+        if discount_total > 0:
+            promo_meta = {
+                "discount_total": float(discount_total),
+                "applied_promotions": applied_promos,
+            }
+            existing_promos = order_metadata.get("promotions") or {}
+            # 促销信息统一挂在 metadata.promotions 下
+            order_metadata["promotions"] = {**existing_promos, **promo_meta}
+
         order_data = {
             "merchant_id": order_request.merchant_id,
             "customer_email": order_request.customer_email,
@@ -316,7 +466,7 @@ async def create_new_order(
             "currency": order_request.currency,
             "agent_id": agent_id,  # Extract from metadata
             "agent_session_id": order_request.agent_session_id,
-            "metadata": order_request.metadata or {},
+            "metadata": order_metadata,
             "psp_used": psp_type,  # Record which PSP provider is used (lowercase)
             # Legacy fields (optional, can be null)
             "store_id": None,
