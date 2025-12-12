@@ -300,6 +300,9 @@ class OrdersListItem(BaseModel):
     shipping_country: Optional[str]
     items_summary: str
     permissions: Dict[str, bool]
+    # Optional preview image for the first item in the order, used by
+    # frontends to render a thumbnail on the orders list.
+    first_item_image_url: Optional[str] = None
 
 
 class OrdersListResponse(BaseModel):
@@ -403,6 +406,30 @@ async def _build_user_session(user_row: dict) -> UserSessionPayload:
         is_new_user=bool(user_row.get("is_new_user", False)),
         has_claimable_orders=has_claimable_orders,
     )
+
+
+def _derive_first_item_image_url(items: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Best-effort extraction of a preview image URL from the first order item.
+
+    The shape of items is flexible (different flows may store slightly different
+    keys), so we try a small set of common fields and fall back gracefully.
+    """
+    if not items:
+        return None
+
+    first = items[0] or {}
+    image_url = (
+        first.get("image_url")
+        or first.get("main_image_url")
+        or (first.get("images") or [None])[0]
+    )
+
+    if isinstance(image_url, str):
+        image_url = image_url.strip()
+        if image_url:
+            return image_url
+    return None
 
 
 def _set_auth_cookies(
@@ -954,6 +981,7 @@ async def list_orders(
                     shipping_country=shipping.get("country"),
                     items_summary=_build_items_summary(items),
                     permissions=_compute_permissions(data, principal),
+                    first_item_image_url=_derive_first_item_image_url(items),
                 )
             )
 
