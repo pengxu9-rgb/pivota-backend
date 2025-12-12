@@ -229,7 +229,7 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
     # Prefer explicit image_url, then first image in list
     image_url = p.image_url or (p.images[0] if p.images else None)
 
-    base = {
+    base: Dict[str, Any] = {
         "id": p.product_id or p.id,
         "merchant_id": p.merchant_id,
         "title": p.title,
@@ -242,6 +242,27 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
         "sku": p.sku,
         "platform": p.platform,
     }
+
+    # Expose full image gallery so frontends can render multi-image carousels.
+    if p.images:
+        base["images"] = p.images
+
+    # Surface variant summary for size/color selection and inventory checks.
+    if p.variants:
+        base["variants"] = [
+            {
+                "variant_id": v.variant_id or v.id,
+                "id": v.variant_id or v.id,
+                "title": v.title,
+                "price": v.price,
+                "compare_at_price": v.compare_at_price,
+                "sku": v.sku,
+                "inventory_quantity": v.inventory_quantity,
+                "options": v.options or {},
+                "image_url": v.image_url,
+            }
+            for v in p.variants
+        ]
 
     best_deal = getattr(p, "best_deal", None)
     all_deals = getattr(p, "all_deals", None)
