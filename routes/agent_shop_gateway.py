@@ -187,6 +187,41 @@ class ShopGatewayRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+def _build_options_from_variants(p: StandardProduct) -> List[Dict[str, Any]]:
+    """
+    Derive a simple options structure from StandardProduct.variants.
+
+    We aggregate unique values per option name (e.g. Color / Size) so that
+    frontends can render structured selectors without caring about the
+    underlying platform (Shopify, Wix, etc.).
+    """
+    buckets: Dict[str, set] = {}
+
+    for v in p.variants or []:
+        if not v.options:
+            continue
+        for raw_name, raw_value in v.options.items():
+            if raw_name is None or raw_value is None:
+                continue
+            name = str(raw_name).strip()
+            value = str(raw_value).strip()
+            if not name or not value:
+                continue
+            if name not in buckets:
+                buckets[name] = set()
+            buckets[name].add(value)
+
+    options: List[Dict[str, Any]] = []
+    for name, values in buckets.items():
+        options.append(
+            {
+                "name": name,
+                "values": sorted(values),
+            }
+        )
+    return options
+
+
 def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
     """
     Map internal StandardProduct to Shopping AI product contract.
@@ -1458,10 +1493,23 @@ async def _handle_get_product_detail(
             for v in match.variants
         ]
 
+    # Structured options for frontend (Color / Size / etc.).
+    # Creator Agent UI expects:
+    # - product.options: [{ name, values[] }]
+    # - and optionally product.product_options for legacy naming.
+    options = _build_options_from_variants(match)
+    legacy_product_options = (
+        [{"label": opt["name"], "values": opt["values"]} for opt in options]
+        if options
+        else None
+    )
+
     return {
         "product": {
             **base,
             "attributes": attributes or None,
+            "options": options or None,
+            "product_options": legacy_product_options,
         },
         "metadata": {
             "query_source": query_source,
