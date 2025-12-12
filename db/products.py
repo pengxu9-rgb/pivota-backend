@@ -268,6 +268,45 @@ async def cleanup_expired_cache():
     return deleted
 
 
+async def delete_missing_products_from_cache(
+    merchant_id: str,
+    platform: str,
+    valid_platform_product_ids: List[str],
+) -> int:
+    """
+    删除在上游平台已经不存在的产品缓存。
+
+    用于「全量同步」场景：同步任务会拉取当前平台上的全部产品 ID，
+    然后调用本函数把 products_cache 中该商户 + 平台下、但不在本次
+    同步结果里的产品行删除，避免 Merchant Portal 继续展示已下架 /
+    已删除的商品。
+
+    - merchant_id: 商户 ID
+    - platform: 平台标识（shopify / wix 等）
+    - valid_platform_product_ids: 本次同步得到的 platform_product_id 列表
+      如果列表为空，表示上游一个产品都没有了，此时会删除该商户此平台下
+      的所有缓存行。
+    """
+    base_filter = (products_cache.c.merchant_id == merchant_id) & (
+        products_cache.c.platform == platform
+    )
+
+    delete_query = products_cache.delete().where(base_filter)
+
+    # 如果还有有效产品，则只清理「不在列表内」的那些
+    if valid_platform_product_ids:
+        delete_query = delete_query.where(
+            ~products_cache.c.platform_product_id.in_(valid_platform_product_ids)
+        )
+
+    deleted = await database.execute(delete_query)
+    logger.info(
+        f"🧹 Product cache cleanup: removed {deleted} stale products "
+        f"for merchant {merchant_id} on platform {platform}"
+    )
+    return deleted
+
+
 # ============================================================================
 # EVENT OPERATIONS (事件层操作 - 只追加)
 # ============================================================================

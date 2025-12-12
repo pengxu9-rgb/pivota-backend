@@ -12,6 +12,7 @@ import json
 import logging
 from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
+from db.products import delete_missing_products_from_cache
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products", tags=["product-sync-v2"])
@@ -125,6 +126,7 @@ async def universal_product_sync(
         # 4. Fetch products using the universal adapter
         # 4.1 Paginate through all pages (Shopify limit=250/page). Guard with max_pages.
         synced_count = 0
+        synced_platform_ids = set()
         page_token: Optional[str] = None
         max_pages = 20  # safety guard: 20 * 250 = 5000 items
         pages = 0
@@ -161,6 +163,7 @@ async def universal_product_sync(
                             product_data=product_data,
                             ttl_seconds=604800  # 7 days
                         )
+                        synced_platform_ids.add(str(product.id))
                         synced_count += 1
                     except Exception as e:
                         logger.error(f"Failed to cache product {product.id}: {e}")
@@ -170,7 +173,25 @@ async def universal_product_sync(
                 page_token = next_page_token
             else:
                 break
-        
+
+        # 5. Cleanup products that no longer exist upstream for this merchant/platform
+        try:
+            deleted_stale = await delete_missing_products_from_cache(
+                merchant_id=request.merchant_id,
+                platform=platform,
+                valid_platform_product_ids=list(synced_platform_ids),
+            )
+            logger.info(
+                f"Universal sync cleanup: removed {deleted_stale} stale "
+                f"products for merchant={request.merchant_id}, platform={platform}"
+            )
+        except Exception as cleanup_error:
+            # 清理失败不应该影响整体同步结果，只记录日志以便后续排查
+            logger.error(
+                f"Failed to cleanup stale products after sync for "
+                f"merchant={request.merchant_id}, platform={platform}: {cleanup_error}"
+            )
+
         # 6. Update store sync status
         await update_sync_status(store_info.get("store_id"), synced_count)
         
