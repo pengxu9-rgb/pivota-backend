@@ -1456,34 +1456,43 @@ async def _handle_get_product_detail(
     merchant_id = ref.merchant_id
     product_id = ref.product_id
 
-    # Fetch a reasonably large slice of the catalog to locate the product.
-    # For typical merchants this is sufficient and keeps latency low.
-    agent_id = "shopping_ai_frontend"
-    products, query_source, error = await get_products_hybrid(
-        merchant_id=merchant_id,
-        limit=500,
-        agent_id=agent_id,
-        background_tasks=background_tasks,
-    )
+    # Fast path: try loading directly from products cache by product_id.
+    # 对于已经通过产品列表曝光过的商品，这条路径通常是命中缓存的，
+    # 能避免为单个商品再去拉整页 catalog，显著降低详情页延迟。
+    match: Optional[StandardProduct] = await _load_product_by_id(product_id)
+    query_source: str = "product_cache_direct" if match else "unknown"
 
-    if error and not products:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch products for merchant {merchant_id}: {error}",
-        )
-
-    match: Optional[StandardProduct] = None
-    for p in products:
-        if p.product_id == product_id or p.id == product_id:
-            match = p
-            break
+    products: List[StandardProduct] = []
+    error: Optional[str] = None
 
     if not match:
-        # Fallback: try loading directly from products cache by product_id
-        match = await _load_product_by_id(product_id)
-        # When we hit the cache directly, make the source explicit for observability.
-        if match:
-            query_source = "product_cache_fallback"
+        # Fallback: fetch a reasonably large slice of the catalog and locate the product.
+        # For typical merchants this is sufficient and keeps latency acceptable.
+        agent_id = "shopping_ai_frontend"
+        products, query_source, error = await get_products_hybrid(
+            merchant_id=merchant_id,
+            limit=500,
+            agent_id=agent_id,
+            background_tasks=background_tasks,
+        )
+
+        if error and not products:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to fetch products for merchant {merchant_id}: {error}",
+            )
+
+        for p in products:
+            if p.product_id == product_id or p.id == product_id:
+                match = p
+                break
+
+        if not match:
+            # Second chance: if hybrid layer couldn't find it, try cache again in case
+            # the product was recently synced but not yet surfaced in the hybrid slice.
+            match = await _load_product_by_id(product_id)
+            if match:
+                query_source = "product_cache_fallback"
 
     if not match:
         # Strong contract: this should not happen if product comes from find_products,
