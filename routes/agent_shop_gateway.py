@@ -937,17 +937,61 @@ async def _handle_find_products_multi(
         if q_lower:
             title = (product.title or "").lower()
             description = (product.description or "").lower()
+            product_type = (product.product_type or "").lower()
+            blob = " ".join([title, description, product_type]).strip()
+            blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
+            q_compact = re.sub(r"[^a-z0-9]+", "", q_lower)
+
+            tee_intent = bool(
+                q_compact == "tee"
+                or "tshirt" in q_compact
+                or re.search(r"\btees?\b", q_lower)
+                or re.search(r"\bt\s*-?\s*shirts?\b", q_lower)
+                or "t恤" in q_lower
+                or "t 恤" in q_lower
+            )
+
+            if tee_intent:
+                has_tee_marker = bool(
+                    "tshirt" in blob_compact
+                    or re.search(r"\btees?\b", blob)
+                    or re.search(r"\bt\s*-?\s*shirts?\b", blob)
+                    or "t恤" in blob
+                    or "t 恤" in blob
+                )
+                if not has_tee_marker:
+                    continue
 
             if q_lower in title:
                 relevance_score = 1.0 if q_lower == title else 0.9
             elif q_lower in description:
                 relevance_score = 0.7
+            elif q_compact and len(q_compact) >= 4 and q_compact in blob_compact:
+                # Handle queries like "t-shirt" vs "tshirt" or "te e" vs "tee"
+                relevance_score = 0.8
             else:
-                words = q_lower.split()
-                matches = sum(1 for w in words if w in title or w in description)
+                # Token-based matching with short-token guard (prevents "te e" -> ["te","e"] over-matching).
+                query_terms = _tokenize(q_lower)
+
+                if not query_terms and q_compact and len(q_compact) > 2:
+                    query_terms = [q_compact]
+
+                if tee_intent:
+                    for t in ("tee", "tshirt", "t-shirt"):
+                        if t not in query_terms:
+                            query_terms.append(t)
+
+                if not query_terms:
+                    continue
+
+                matches = sum(
+                    1
+                    for term in query_terms
+                    if term and (term in blob or term in blob_compact)
+                )
                 if matches == 0:
                     continue
-                relevance_score = 0.5 + (matches / len(words)) * 0.3
+                relevance_score = 0.5 + (matches / len(query_terms)) * 0.3
 
         # User intent boost based on history and recency
         pid = str(product.product_id or product.id or "")
