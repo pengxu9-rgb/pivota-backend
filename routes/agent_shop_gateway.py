@@ -765,7 +765,7 @@ async def _handle_find_products_multi(
     # Detect special intents for downstream filtering/UX.
     look_intent = False
     if "nina studio" in q_lower and any(
-        token in q_lower for token in ["exact outfit", "shop", "look", "wear", "ropa"]
+        token in q_lower for token in ["exact outfit", "shop", "look", "wear", "ropa", "outfit"]
     ):
         look_intent = True
 
