@@ -757,8 +757,39 @@ async def _handle_find_products_multi(
             },
         }
 
-    # Cold start: empty query falls back to creator top sellers.
-    q = (filters.query or "").strip()
+    # Cold start & intent detection.
+    q_raw = filters.query or ""
+    q = q_raw.strip()
+    q_lower = q.lower()
+
+    # Detect special intents for downstream filtering/UX.
+    look_intent = False
+    if "nina studio" in q_lower and any(
+        token in q_lower for token in ["exact outfit", "shop", "look", "wear", "ropa"]
+    ):
+        look_intent = True
+
+    # Detect negative lingerie constraint (e.g. "no lingerie", "sin lenceria").
+    exclude_lingerie = False
+    if (
+        "no lingerie" in q_lower
+        or "without lingerie" in q_lower
+        or "sin lenceria" in q_lower
+        or "sin lencer\u00eda" in q_lower
+        or "sin ropa interior" in q_lower
+    ):
+        exclude_lingerie = True
+
+    # Construct reply for look-intent queries: similar items + disclaimer/prompt.
+    reply_text: Optional[str] = None
+    if look_intent:
+        reply_text = (
+            "I can’t guarantee an exact match for that outfit, "
+            "but here are similar items inspired by Nina Studio’s looks. "
+            "If you share a link or photo of the outfit, I can refine these suggestions."
+        )
+
+    # Cold start: empty query falls back to creator/global top sellers and cache/live fallbacks.
     if not q:
         source = "creator_top_sellers"
         top_sellers = await _load_creator_top_sellers(max_candidates=limit * 2)
@@ -877,7 +908,7 @@ async def _handle_find_products_multi(
             "total": len(mapped),
             "page": page,
             "page_size": len(page_items),
-            "reply": None,
+            "reply": reply_text,
             "metadata": {
                 "query_source": source,
                 "fetched_at": datetime.utcnow().isoformat(),
@@ -909,7 +940,6 @@ async def _handle_find_products_multi(
 
     # In-memory filtering and simple relevance scoring (reuse Agent API logic)
     filtered_products: list[dict[str, Any]] = []
-    q_lower = q.lower()
 
     for product, merchant_name in merchant_products:
         # Price filter
@@ -930,6 +960,29 @@ async def _handle_find_products_multi(
             in_stock_flag = getattr(product, "in_stock", None)
             inventory_qty = product.inventory_quantity or 0
             if in_stock_flag is False or (in_stock_flag is None and inventory_qty <= 0):
+                continue
+
+        # Explicit lingerie exclusion when user asks for "no lingerie" (or equivalents).
+        if exclude_lingerie:
+            blob_for_lingerie = " ".join(
+                [
+                    (product.title or "").lower(),
+                    (product.description or "").lower(),
+                    (product.product_type or "").lower(),
+                ]
+            )
+            lingerie_tokens = [
+                "lingerie",
+                "lenceria",
+                "lencer\u00eda",
+                "underwear",
+                "bra",
+                "panties",
+                "ropa interior",
+                "sujetador",
+                "bragas",
+            ]
+            if any(tok in blob_for_lingerie for tok in lingerie_tokens):
                 continue
 
         # Text relevance
@@ -1044,6 +1097,15 @@ async def _handle_find_products_multi(
     # Fallback: if primary query returned nothing, surface creator top-sellers instead
     if not out_products and creator_id:
         top_sellers = await _load_creator_top_sellers(max_candidates=limit * 2)
+        source = "creator_top_sellers_fallback"
+
+        # For special look-intent queries (e.g. "exact outfit on a date"),
+        # fall back to global top sellers when creator history is empty,
+        # so we can still propose similar/inspired items.
+        if not top_sellers and look_intent:
+            top_sellers = await _load_global_top_sellers(max_candidates=limit * 2)
+            source = "global_top_sellers_fallback"
+
         mapped = []
         for prod in top_sellers[: limit * page]:
             item = _standard_to_shop_product(prod)
@@ -1056,9 +1118,9 @@ async def _handle_find_products_multi(
             "total": len(mapped),
             "page": page,
             "page_size": len(fallback_items),
-            "reply": None,
+            "reply": reply_text,
             "metadata": {
-                "query_source": "creator_top_sellers_fallback",
+                "query_source": source,
                 "fetched_at": datetime.utcnow().isoformat(),
                 "merchants_searched": len(merchant_map),
                 "creator_id": creator_id,
@@ -1073,6 +1135,7 @@ async def _handle_find_products_multi(
         "total": total,
         "page": page,
         "page_size": len(out_products),
+        "reply": reply_text,
         "metadata": {
             "query_source": "cache_multi_intent",
             "fetched_at": datetime.utcnow().isoformat(),
