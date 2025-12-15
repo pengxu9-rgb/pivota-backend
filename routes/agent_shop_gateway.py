@@ -761,6 +761,21 @@ async def _handle_find_products_multi(
     q_raw = filters.query or ""
     q = q_raw.strip()
     q_lower = q.lower()
+    q_compact = re.sub(r"[^a-z0-9]+", "", q_lower)
+
+    # Query-level tee intent (including Spanish synonyms).
+    tee_intent_query = bool(
+        q_compact == "tee"
+        or "tshirt" in q_compact
+        or re.search(r"\btees?\b", q_lower)
+        or re.search(r"\bt\s*-?\s*shirts?\b", q_lower)
+        or "t恤" in q_lower
+        or "t 恤" in q_lower
+        or "camiseta" in q_lower
+        or "camisetas" in q_lower
+        or "playera" in q_lower
+        or "playeras" in q_lower
+    )
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -779,6 +794,61 @@ async def _handle_find_products_multi(
         or "sin ropa interior" in q_lower
     ):
         exclude_lingerie = True
+
+    # Detect negative hoodie constraint (e.g. "no hoodies").
+    exclude_hoodies = False
+    if (
+        "no hoodie" in q_lower
+        or "no hoodies" in q_lower
+        or "without hoodie" in q_lower
+        or "without hoodies" in q_lower
+        or "sin sudadera" in q_lower
+        or "sin sudaderas" in q_lower
+        or "no sudadera" in q_lower
+        or "no sudaderas" in q_lower
+    ):
+        exclude_hoodies = True
+
+    # Detect negative joggers constraint.
+    exclude_joggers = False
+    if (
+        "no joggers" in q_lower
+        or "no jogger" in q_lower
+        or "sin jogger" in q_lower
+        or "sin joggers" in q_lower
+        or "sin pantalones jogger" in q_lower
+        or "no pantalones jogger" in q_lower
+    ):
+        exclude_joggers = True
+
+    # Detect negative underwear constraint, while still allowing lingerie when requested.
+    exclude_underwear = False
+    if (
+        "no underwear" in q_lower
+        or "without underwear" in q_lower
+        or "no panties" in q_lower
+        or "no panty" in q_lower
+        or "no briefs" in q_lower
+        or "no thong" in q_lower
+        or "sin ropa interior" in q_lower
+        or "sin bragas" in q_lower
+        or "sin calzoncillos" in q_lower
+    ):
+        exclude_underwear = True
+
+    # Detect positive-only skirts intent (e.g. "only skirts", "solo faldas").
+    only_skirts = False
+    if any(
+        trigger in q_lower
+        for trigger in [
+            "only skirt",
+            "only skirts",
+            "skirts only",
+            "solo faldas",
+            "solo falda",
+        ]
+    ):
+        only_skirts = True
 
     # Construct reply for look-intent queries: similar items + disclaimer/prompt.
     reply_text: Optional[str] = None
@@ -962,27 +1032,69 @@ async def _handle_find_products_multi(
             if in_stock_flag is False or (in_stock_flag is None and inventory_qty <= 0):
                 continue
 
-        # Explicit lingerie exclusion when user asks for "no lingerie" (or equivalents).
-        if exclude_lingerie:
-            blob_for_lingerie = " ".join(
-                [
-                    (product.title or "").lower(),
-                    (product.description or "").lower(),
-                    (product.product_type or "").lower(),
-                ]
-            )
-            lingerie_tokens = [
-                "lingerie",
-                "lenceria",
-                "lencer\u00eda",
-                "underwear",
-                "bra",
-                "panties",
-                "ropa interior",
-                "sujetador",
-                "bragas",
+        # Explicit exclusion / inclusion based on user constraints.
+        blob_for_filters = " ".join(
+            [
+                (product.title or "").lower(),
+                (product.description or "").lower(),
+                (product.product_type or "").lower(),
             ]
-            if any(tok in blob_for_lingerie for tok in lingerie_tokens):
+        )
+
+        if exclude_lingerie or exclude_hoodies or exclude_joggers or exclude_underwear:
+            if exclude_lingerie:
+                lingerie_tokens = [
+                    "lingerie",
+                    "lenceria",
+                    "lencer\u00eda",
+                    "underwear",
+                    "bra",
+                    "panties",
+                    "ropa interior",
+                    "sujetador",
+                    "bragas",
+                ]
+                if any(tok in blob_for_filters for tok in lingerie_tokens):
+                    continue
+            if exclude_hoodies:
+                hoodie_tokens = [
+                    "hoodie",
+                    "hoodies",
+                    "sweatshirt",
+                    "sudadera",
+                ]
+                if any(tok in blob_for_filters for tok in hoodie_tokens):
+                    continue
+            if exclude_joggers:
+                jogger_tokens = [
+                    "joggers",
+                    "jogger",
+                    "pantalones jogger",
+                ]
+                if any(tok in blob_for_filters for tok in jogger_tokens):
+                    continue
+            if exclude_underwear:
+                underwear_tokens = [
+                    "underwear",
+                    "panties",
+                    "panty",
+                    "briefs",
+                    "thong",
+                    "ropa interior",
+                    "calzoncillos",
+                    "bragas",
+                ]
+                if any(tok in blob_for_filters for tok in underwear_tokens):
+                    continue
+
+        if only_skirts:
+            skirt_tokens = [
+                "skirt",
+                "skirts",
+                "falda",
+                "faldas",
+            ]
+            if not any(tok in blob_for_filters for tok in skirt_tokens):
                 continue
 
         # Text relevance
@@ -995,6 +1107,7 @@ async def _handle_find_products_multi(
             blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
             q_compact = re.sub(r"[^a-z0-9]+", "", q_lower)
 
+            # Detect tee intent, including Spanish tee synonyms (camiseta/playera).
             tee_intent = bool(
                 q_compact == "tee"
                 or "tshirt" in q_compact
@@ -1002,6 +1115,10 @@ async def _handle_find_products_multi(
                 or re.search(r"\bt\s*-?\s*shirts?\b", q_lower)
                 or "t恤" in q_lower
                 or "t 恤" in q_lower
+                or "camiseta" in q_lower
+                or "camisetas" in q_lower
+                or "playera" in q_lower
+                or "playeras" in q_lower
             )
 
             if tee_intent:
@@ -1011,6 +1128,10 @@ async def _handle_find_products_multi(
                     or re.search(r"\bt\s*-?\s*shirts?\b", blob)
                     or "t恤" in blob
                     or "t 恤" in blob
+                    or "camiseta" in blob
+                    or "camisetas" in blob
+                    or "playera" in blob
+                    or "playeras" in blob
                 )
                 if not has_tee_marker:
                     continue
@@ -1030,7 +1151,7 @@ async def _handle_find_products_multi(
                     query_terms = [q_compact]
 
                 if tee_intent:
-                    for t in ("tee", "tshirt", "t-shirt"):
+                    for t in ("tee", "tshirt", "t-shirt", "camiseta", "camisetas", "playera", "playeras"):
                         if t not in query_terms:
                             query_terms.append(t)
 
@@ -1094,39 +1215,118 @@ async def _handle_find_products_multi(
         item["merchant_name"] = merchant_name
         out_products.append(item)
 
-    # Fallback: if primary query returned nothing, surface creator top-sellers instead
-    if not out_products and creator_id:
-        top_sellers = await _load_creator_top_sellers(max_candidates=limit * 2)
-        source = "creator_top_sellers_fallback"
+    # Fallback: if primary query returned nothing, surface top-sellers instead
+    # - For general queries: only when creator_id is present (as before)
+    # - For tee intent queries: also allow a global tee-only fallback so we don't
+    #   respond with an empty list for strong tee intent (e.g. Spanish camisetas).
+    if not out_products:
+        # Creator-scoped fallback (original behavior), now also respecting tee intent.
+        if creator_id:
+            top_sellers = await _load_creator_top_sellers(max_candidates=limit * 2)
+            source = "creator_top_sellers_fallback"
 
-        # For special look-intent queries (e.g. "exact outfit on a date"),
-        # fall back to global top sellers when creator history is empty,
-        # so we can still propose similar/inspired items.
-        if not top_sellers and look_intent:
+            # For special look-intent queries (e.g. "exact outfit on a date"),
+            # fall back to global top sellers when creator history is empty,
+            # so we can still propose similar/inspired items.
+            if not top_sellers and look_intent:
+                top_sellers = await _load_global_top_sellers(max_candidates=limit * 2)
+                source = "global_top_sellers_fallback"
+
+            mapped: list[dict[str, Any]] = []
+            for prod in top_sellers[: limit * page]:
+                # If this is a tee intent query, enforce tee-like products here as well.
+                if tee_intent_query:
+                    blob = " ".join(
+                        [
+                            (prod.title or "").lower(),
+                            (prod.description or "").lower(),
+                            (prod.product_type or "").lower(),
+                        ]
+                    ).strip()
+                    blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
+                    has_tee_marker = bool(
+                        "tshirt" in blob_compact
+                        or re.search(r"\btees?\b", blob)
+                        or re.search(r"\bt\s*-?\s*shirts?\b", blob)
+                        or "t恤" in blob
+                        or "t 恤" in blob
+                        or "camiseta" in blob
+                        or "camisetas" in blob
+                        or "playera" in blob
+                        or "playeras" in blob
+                    )
+                    if not has_tee_marker:
+                        continue
+
+                item = _standard_to_shop_product(prod)
+                item["merchant_name"] = merchant_map.get(prod.merchant_id)
+                mapped.append(item)
+
+            fallback_items = mapped[start_idx:end_idx]
+            if mapped:
+                return {
+                    "products": fallback_items,
+                    "total": len(mapped),
+                    "page": page,
+                    "page_size": len(fallback_items),
+                    "reply": reply_text,
+                    "metadata": {
+                        "query_source": source,
+                        "fetched_at": datetime.utcnow().isoformat(),
+                        "merchants_searched": len(merchant_map),
+                        "creator_id": creator_id,
+                        "creator_name": creator_name,
+                    },
+                }
+
+        # Tee-intent global fallback when there is no creator context.
+        if tee_intent_query:
             top_sellers = await _load_global_top_sellers(max_candidates=limit * 2)
-            source = "global_top_sellers_fallback"
+            source = "global_top_sellers_tee_fallback"
+            mapped: list[dict[str, Any]] = []
+            for prod in top_sellers[: limit * page]:
+                blob = " ".join(
+                    [
+                        (prod.title or "").lower(),
+                        (prod.description or "").lower(),
+                        (prod.product_type or "").lower(),
+                    ]
+                ).strip()
+                blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
+                has_tee_marker = bool(
+                    "tshirt" in blob_compact
+                    or re.search(r"\btees?\b", blob)
+                    or re.search(r"\bt\s*-?\s*shirts?\b", blob)
+                    or "t恤" in blob
+                    or "t 恤" in blob
+                    or "camiseta" in blob
+                    or "camisetas" in blob
+                    or "playera" in blob
+                    or "playeras" in blob
+                )
+                if not has_tee_marker:
+                    continue
 
-        mapped = []
-        for prod in top_sellers[: limit * page]:
-            item = _standard_to_shop_product(prod)
-            item["merchant_name"] = merchant_map.get(prod.merchant_id)
-            mapped.append(item)
+                item = _standard_to_shop_product(prod)
+                item["merchant_name"] = merchant_map.get(prod.merchant_id)
+                mapped.append(item)
 
-        fallback_items = mapped[start_idx:end_idx]
-        return {
-            "products": fallback_items,
-            "total": len(mapped),
-            "page": page,
-            "page_size": len(fallback_items),
-            "reply": reply_text,
-            "metadata": {
-                "query_source": source,
-                "fetched_at": datetime.utcnow().isoformat(),
-                "merchants_searched": len(merchant_map),
-                "creator_id": creator_id,
-                "creator_name": creator_name,
-            },
-        }
+            fallback_items = mapped[start_idx:end_idx]
+            if mapped:
+                return {
+                    "products": fallback_items,
+                    "total": len(mapped),
+                    "page": page,
+                    "page_size": len(fallback_items),
+                    "reply": reply_text,
+                    "metadata": {
+                        "query_source": source,
+                        "fetched_at": datetime.utcnow().isoformat(),
+                        "merchants_searched": len(merchant_map),
+                        "creator_id": creator_id,
+                        "creator_name": creator_name,
+                    },
+                }
 
     history_used = bool(history_product_ids or history_terms)
 
