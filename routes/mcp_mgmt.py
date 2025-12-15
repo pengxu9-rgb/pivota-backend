@@ -145,7 +145,7 @@ async def get_mcp_merchants(
             SELECT 
                 m.merchant_id,
                 m.business_name,
-                m.email,
+                m.contact_email,
                 m.status,
                 COUNT(s.store_id) as connected_stores,
                 STRING_AGG(DISTINCT s.platform, ', ') as platforms
@@ -164,7 +164,7 @@ async def get_mcp_merchants(
                 {
                     "merchant_id": m["merchant_id"],
                     "business_name": m["business_name"],
-                    "email": m["email"],
+                    "email": m["contact_email"],
                     "mcp_status": "connected" if m["connected_stores"] > 0 else "not_connected",
                     "connected_stores": m["connected_stores"],
                     "platforms": m["platforms"].split(", ") if m["platforms"] else [],
@@ -397,7 +397,6 @@ async def get_mcp_logs(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get MCP logs: {str(e)}")
-
 
 
 

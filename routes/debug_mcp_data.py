@@ -14,14 +14,14 @@ async def check_mcp_tables(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
-        # Check merchant_store_integrations
-        msi_count = await database.fetch_one(
-            "SELECT COUNT(*) as count FROM merchant_store_integrations"
+        # Check merchant_stores (new MCP store system)
+        stores_count = await database.fetch_one(
+            "SELECT COUNT(*) as count FROM merchant_stores"
         )
         
-        msi_sample = await database.fetch_all(
-            """SELECT merchant_id, platform, store_name, status 
-               FROM merchant_store_integrations 
+        stores_sample = await database.fetch_all(
+            """SELECT merchant_id, platform, name as store_name, status
+               FROM merchant_stores
                LIMIT 5"""
         )
         
@@ -52,9 +52,9 @@ async def check_mcp_tables(current_user: dict = Depends(get_current_user)):
         return {
             "status": "success",
             "data": {
-                "merchant_store_integrations": {
-                    "total": dict(msi_count).get("count", 0) if msi_count else 0,
-                    "sample": [dict(r) for r in msi_sample]
+                "merchant_stores": {
+                    "total": dict(stores_count).get("count", 0) if stores_count else 0,
+                    "sample": [dict(r) for r in stores_sample]
                 },
                 "merchant_psps": {
                     "total": dict(psp_count).get("count", 0) if psp_count else 0,
@@ -90,9 +90,9 @@ async def get_merchant_full_data(
             {"merchant_id": merchant_id}
         )
         
-        # Get stores
+        # Get stores (new system)
         stores = await database.fetch_all(
-            "SELECT * FROM merchant_store_integrations WHERE merchant_id = :merchant_id",
+            "SELECT * FROM merchant_stores WHERE merchant_id = :merchant_id",
             {"merchant_id": merchant_id}
         )
         
@@ -280,4 +280,3 @@ async def get_merchant_full_data(
     except Exception as e:
         logger.error(f"Error getting merchant full data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
