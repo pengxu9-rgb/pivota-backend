@@ -279,6 +279,43 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
     return base
 
 
+def _is_status_active(status: Any) -> bool:
+    """
+    Normalize and check product status.
+
+    We accept both the ProductStatus enum and raw string values.
+    """
+    if isinstance(status, ProductStatus):
+        return status == ProductStatus.ACTIVE
+    if isinstance(status, str):
+        return status.lower() == ProductStatus.ACTIVE.value
+    return False
+
+
+def _is_product_sellable(product: Any) -> bool:
+    """
+    Shared visibility rule used across all search paths:
+    - status must be ACTIVE
+    - orderable must not be explicitly False
+    """
+    status = getattr(product, "status", ProductStatus.ACTIVE)
+    if not _is_status_active(status):
+        return False
+    orderable = getattr(product, "orderable", None)
+    if orderable is False:
+        return False
+    return True
+
+
+def _is_dict_sellable(data: Dict[str, Any]) -> bool:
+    """
+    Sellable check for raw dict rows (e.g. cache fallbacks).
+    """
+    status = data.get("status") or ProductStatus.ACTIVE.value
+    orderable = data.get("orderable")
+    return _is_status_active(status) and orderable is not False
+
+
 async def _load_product_by_id(product_id: str) -> Optional[StandardProduct]:
     """
     Load a single product from cache by product_id/platform_product_id.
@@ -382,13 +419,10 @@ async def _handle_find_products(
             detail=f"Failed to fetch products for merchant {merchant_id}: {error}",
         )
 
-    # Visibility: only surface active + orderable products to the agent front-end.
+    # Visibility: only surface sellable products to the agent front-end.
     visible: List[StandardProduct] = []
     for p in products:
-        status = getattr(p, "status", ProductStatus.ACTIVE)
-        if status != ProductStatus.ACTIVE:
-            continue
-        if getattr(p, "orderable", True) is False:
+        if not _is_product_sellable(p):
             continue
         visible.append(p)
 
@@ -687,10 +721,7 @@ async def _handle_find_products_multi(
             prod = await _fetch_product(m_id, pid)
             if not prod:
                 continue
-            status = getattr(prod, "status", ProductStatus.ACTIVE)
-            if status != ProductStatus.ACTIVE:
-                continue
-            if getattr(prod, "orderable", True) is False and not is_creator_surface:
+            if not _is_product_sellable(prod):
                 continue
             products.append(prod)
             if len(products) >= max_candidates:
@@ -776,10 +807,7 @@ async def _handle_find_products_multi(
                 prod = await _fetch_product(m_id, pid)
                 if not prod:
                     continue
-                status = getattr(prod, "status", ProductStatus.ACTIVE)
-                if status != ProductStatus.ACTIVE:
-                    continue
-                if getattr(prod, "orderable", True) is False and not is_creator_surface:
+                if not _is_product_sellable(prod):
                     continue
                 products.append(prod)
                 if len(products) >= max_candidates:
@@ -808,10 +836,7 @@ async def _handle_find_products_multi(
                 continue
             try:
                 prod = StandardProduct(**product_data)
-                status = getattr(prod, "status", ProductStatus.ACTIVE)
-                if status != ProductStatus.ACTIVE:
-                    continue
-                if getattr(prod, "orderable", True) is False and not is_creator_surface:
+                if not _is_product_sellable(prod):
                     continue
                 products.append(prod)
             except Exception:
@@ -999,10 +1024,7 @@ async def _handle_find_products_multi(
             source = "global_top_sellers"
         mapped = []
         for prod in top_sellers[: limit * page]:
-            status = getattr(prod, "status", ProductStatus.ACTIVE)
-            if status != ProductStatus.ACTIVE:
-                continue
-            if getattr(prod, "orderable", True) is False:
+            if not _is_product_sellable(prod):
                 continue
             item = _standard_to_shop_product(prod)
             item["merchant_name"] = merchant_map.get(prod.merchant_id)
@@ -1033,6 +1055,8 @@ async def _handle_find_products_multi(
                 try:
                     prod = StandardProduct(**product_data)
                     prod.merchant_id = prod.merchant_id or merchant_id
+                    if not _is_product_sellable(prod):
+                        continue
                     item = _standard_to_shop_product(prod)
                     item["merchant_name"] = merchant_map.get(prod.merchant_id)
                     mapped.append(item)
@@ -1053,6 +1077,8 @@ async def _handle_find_products_multi(
                         if isinstance(product_data.get("images"), list)
                         else None
                     )
+                    if not _is_dict_sellable(product_data):
+                        continue
                     if pid and title and price is not None:
                         mapped.append(
                             {
@@ -1101,10 +1127,7 @@ async def _handle_find_products_multi(
                         background_tasks=background_tasks,
                     )
                     for p in products:
-                        status = getattr(p, "status", ProductStatus.ACTIVE)
-                        if status != ProductStatus.ACTIVE:
-                            continue
-                        if getattr(p, "orderable", True) is False:
+                        if not _is_product_sellable(p):
                             continue
                         item = _standard_to_shop_product(p)
                         item["merchant_name"] = name
@@ -1153,14 +1176,8 @@ async def _handle_find_products_multi(
     filtered_products: list[dict[str, Any]] = []
 
     for product, merchant_name in merchant_products:
-        # Visibility: only surface active products to the agent front-end.
-        # For generic agent surfaces we also require orderable=true; for
-        # creator surfaces we keep non-orderable products so that the
-        # creator experience matches the merchant catalog more closely.
-        status = getattr(product, "status", ProductStatus.ACTIVE)
-        if status != ProductStatus.ACTIVE:
-            continue
-        if getattr(product, "orderable", True) is False and not is_creator_surface:
+        # Visibility: only surface sellable products to the agent front-end.
+        if not _is_product_sellable(product):
             continue
 
         # Price filter
@@ -1710,7 +1727,7 @@ async def _handle_find_similar_products(
             if not sp:
                 continue
 
-            if sp.status and sp.status != ProductStatus.ACTIVE:
+            if not _is_product_sellable(sp):
                 continue
             raw_products.append((pid, sp, cand))
 
