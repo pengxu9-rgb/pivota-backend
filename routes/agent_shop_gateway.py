@@ -1019,19 +1019,41 @@ async def _handle_find_products_multi(
     if not q:
         source = "creator_top_sellers"
         top_sellers = await _load_creator_top_sellers(max_candidates=limit * 2)
-        if not top_sellers:
-            top_sellers = await _load_global_top_sellers(max_candidates=limit * 2)
-            source = "global_top_sellers"
-        mapped = []
+        mapped: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
         for prod in top_sellers[: limit * page]:
             if not _is_product_sellable(prod):
                 continue
             item = _standard_to_shop_product(prod)
             item["merchant_name"] = merchant_map.get(prod.merchant_id)
             mapped.append(item)
+            key = (str(prod.merchant_id), str(item["id"]))
+            seen_keys.add(key)
 
-        # If still empty (no creator/global top sellers), fall back to recent cached products
-        if not mapped:
+        # If creator-specific history is thin, blend in global top sellers
+        # so that the "Featured for you" surface can still show a richer
+        # cross-merchant pool rather than stopping at a small handful of
+        # previously ordered items.
+        if len(mapped) < limit:
+            global_top = await _load_global_top_sellers(max_candidates=limit * 2)
+            if global_top:
+                source = "creator_plus_global_top_sellers"
+                for prod in global_top:
+                    if not _is_product_sellable(prod):
+                        continue
+                    key = (str(prod.merchant_id), str(prod.product_id or prod.id))
+                    if key in seen_keys:
+                        continue
+                    item = _standard_to_shop_product(prod)
+                    item["merchant_name"] = merchant_map.get(prod.merchant_id)
+                    mapped.append(item)
+                    seen_keys.add(key)
+                    if len(mapped) >= limit * page:
+                        break
+
+        # If still below the desired pool size, fall back to recent cached products
+        if len(mapped) < limit:
             rows = await database.fetch_all(
                 """
                 SELECT merchant_id, product_data
@@ -1059,6 +1081,9 @@ async def _handle_find_products_multi(
                         continue
                     item = _standard_to_shop_product(prod)
                     item["merchant_name"] = merchant_map.get(prod.merchant_id)
+                    key = (str(prod.merchant_id), str(item["id"]))
+                    if key in seen_keys:
+                        continue
                     mapped.append(item)
                 except Exception:
                     # Fallback: tolerate partially invalid cache rows
@@ -1080,6 +1105,9 @@ async def _handle_find_products_multi(
                     if not _is_dict_sellable(product_data):
                         continue
                     if pid and title and price is not None:
+                        key = (str(merchant_id), str(pid))
+                        if key in seen_keys:
+                            continue
                         mapped.append(
                             {
                                 "id": pid,
