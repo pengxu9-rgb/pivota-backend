@@ -461,9 +461,16 @@ async def _handle_find_products_multi(
 
     creator_id = None
     creator_name = None
+    source: Optional[str] = None
     if creator_meta:
         creator_id = creator_meta.creator_id
         creator_name = creator_meta.creator_name
+        source = creator_meta.source
+
+    # Creator surfaces (creator-agent UI + creator category service) are
+    # allowed to use a broader cross-merchant pool and should not be
+    # artificially limited to PSP-connected merchants only.
+    is_creator_surface = source in ("creator-agent-ui", "creator-category-service")
 
     page = filters.page or 1
     limit = min(filters.limit or 20, 100)
@@ -819,16 +826,28 @@ async def _handle_find_products_multi(
     for title in history_titles:
         history_terms.update(_tokenize(title))
 
-    # Fetch candidate merchants (active + PSP connected)
-    merchant_rows = await database.fetch_all(
-        """
-        SELECT merchant_id, business_name
-        FROM merchant_onboarding
-        WHERE status NOT IN ('deleted', 'rejected')
-        AND psp_connected = true
-        LIMIT 100
-        """
-    )
+    # Fetch candidate merchants. For generic agent surfaces we restrict to
+    # PSP-connected merchants; for creator surfaces we allow all active
+    # merchants so that creator experiences can span multiple brands.
+    if is_creator_surface:
+        merchant_rows = await database.fetch_all(
+            """
+            SELECT merchant_id, business_name
+            FROM merchant_onboarding
+            WHERE status NOT IN ('deleted', 'rejected')
+            LIMIT 100
+            """
+        )
+    else:
+        merchant_rows = await database.fetch_all(
+            """
+            SELECT merchant_id, business_name
+            FROM merchant_onboarding
+            WHERE status NOT IN ('deleted', 'rejected')
+            AND psp_connected = true
+            LIMIT 100
+            """
+        )
     merchant_map = {row["merchant_id"]: row["business_name"] for row in merchant_rows}
 
     if not merchant_map:
