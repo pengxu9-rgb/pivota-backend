@@ -33,12 +33,13 @@ class ShopifyProductAdapter:
             (products, next_page_token, error_message)
         """
         url = f"https://{shop_domain}/admin/api/2024-07/products.json"
-        # Use published_status=any so that both published and unpublished
-        # products are synced into products_cache for the merchant portal.
-        # Agent-facing surfaces still gate on StandardProduct.status/orderable.
-        params = {"limit": min(limit, 250), "published_status": "any"}
+        # Use published_status=any only on the first page. Shopify does not
+        # allow published_status together with page_info pagination.
+        params = {"limit": min(limit, 250)}
         if page_info:
             params["page_info"] = page_info
+        else:
+            params["published_status"] = "any"
         
         headers = {"X-Shopify-Access-Token": access_token}
         
