@@ -33,10 +33,10 @@ class ShopifyProductAdapter:
             (products, next_page_token, error_message)
         """
         url = f"https://{shop_domain}/admin/api/2024-07/products.json"
-        # Use status=any so that draft/unlisted/archived products are also
-        # synced into products_cache for the merchant portal. Agent-facing
-        # surfaces still gate on StandardProduct.status/orderable.
-        params = {"limit": min(limit, 250), "status": "any"}
+        # Use published_status=any so that both published and unpublished
+        # products are synced into products_cache for the merchant portal.
+        # Agent-facing surfaces still gate on StandardProduct.status/orderable.
+        params = {"limit": min(limit, 250), "published_status": "any"}
         if page_info:
             params["page_info"] = page_info
         
