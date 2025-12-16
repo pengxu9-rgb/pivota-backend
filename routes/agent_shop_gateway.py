@@ -468,8 +468,9 @@ async def _handle_find_products_multi(
         source = creator_meta.source
 
     # Creator surfaces (creator-agent UI + creator category service) are
-    # allowed to use a broader cross-merchant pool and should not be
-    # artificially limited to PSP-connected merchants only.
+    # allowed to use a broader cross-merchant pool and slightly more
+    # permissive visibility rules (do not drop products solely because
+    # orderable is false).
     is_creator_surface = source in ("creator-agent-ui", "creator-category-service")
 
     page = filters.page or 1
@@ -689,7 +690,7 @@ async def _handle_find_products_multi(
             status = getattr(prod, "status", ProductStatus.ACTIVE)
             if status != ProductStatus.ACTIVE:
                 continue
-            if getattr(prod, "orderable", True) is False:
+            if getattr(prod, "orderable", True) is False and not is_creator_surface:
                 continue
             products.append(prod)
             if len(products) >= max_candidates:
@@ -778,7 +779,7 @@ async def _handle_find_products_multi(
                 status = getattr(prod, "status", ProductStatus.ACTIVE)
                 if status != ProductStatus.ACTIVE:
                     continue
-                if getattr(prod, "orderable", True) is False:
+                if getattr(prod, "orderable", True) is False and not is_creator_surface:
                     continue
                 products.append(prod)
                 if len(products) >= max_candidates:
@@ -810,7 +811,7 @@ async def _handle_find_products_multi(
                 status = getattr(prod, "status", ProductStatus.ACTIVE)
                 if status != ProductStatus.ACTIVE:
                     continue
-                if getattr(prod, "orderable", True) is False:
+                if getattr(prod, "orderable", True) is False and not is_creator_surface:
                     continue
                 products.append(prod)
             except Exception:
@@ -1152,11 +1153,14 @@ async def _handle_find_products_multi(
     filtered_products: list[dict[str, Any]] = []
 
     for product, merchant_name in merchant_products:
-        # Visibility: only surface active + orderable products to the agent front-end.
+        # Visibility: only surface active products to the agent front-end.
+        # For generic agent surfaces we also require orderable=true; for
+        # creator surfaces we keep non-orderable products so that the
+        # creator experience matches the merchant catalog more closely.
         status = getattr(product, "status", ProductStatus.ACTIVE)
         if status != ProductStatus.ACTIVE:
             continue
-        if getattr(product, "orderable", True) is False:
+        if getattr(product, "orderable", True) is False and not is_creator_surface:
             continue
 
         # Price filter
