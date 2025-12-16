@@ -130,7 +130,27 @@ def validate_orderable(product: StandardProduct) -> Tuple[bool, Dict[str, Any]]:
     for field_name, present in required_fields_present.items():
         if not present:
             errors.append(f"missing_or_invalid_{field_name}")
-    orderable = len(errors) == 0
+    # Structural validity: required fields are present and well-formed.
+    structural_ok = len(errors) == 0
+
+    # Respect explicit platform-level orderable flags when provided.
+    # Examples:
+    # - Shopify/Wix adapters set product.orderable based on publish/visibility.
+    # - Amazon/Temu imports do NOT set orderable and rely purely on structure.
+    explicit_fields = getattr(product, "__fields_set__", set())
+    has_explicit_orderable = "orderable" in explicit_fields
+
+    if has_explicit_orderable:
+        # When an adapter provided a platform-aware flag, combine it with the
+        # structural checks so that "not published / not visible" products
+        # never become orderable just because required fields are present.
+        explicit_flag = bool(getattr(product, "orderable", False))
+        orderable = bool(structural_ok and explicit_flag)
+    else:
+        # Legacy/aggregated products without an explicit orderable flag keep
+        # the previous semantics: structural validity alone decides.
+        orderable = structural_ok
+
     validation = {
         "orderable": orderable,
         "required_fields_present": required_fields_present,
