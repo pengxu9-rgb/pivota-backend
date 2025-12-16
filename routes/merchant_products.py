@@ -60,6 +60,8 @@ async def _fetch_latest_quality_row(
 def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
     """Extract a lightweight standard view from products_cache row."""
     product_json = cache_row.get("product_data") or {}
+    status = None
+    orderable = None
     try:
         # Validate via StandardProduct for safety, but don't raise on errors
         product = StandardProduct.parse_obj(product_json)
@@ -69,17 +71,23 @@ def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
             "currency": product.currency,
         }
         main_image_url = product.image_url or (product.images[0] if product.images else None)
+        status = getattr(product, "status", None)
+        orderable = getattr(product, "orderable", None)
     except Exception:
         title = product_json.get("title")
         price_value = product_json.get("price")
         price_currency = product_json.get("currency") or "USD"
         price = {"value": price_value, "currency": price_currency}
         main_image_url = product_json.get("image_url")
+        status = product_json.get("status")
+        orderable = product_json.get("orderable")
 
     return {
         "title": title,
         "price": price,
         "main_image_url": main_image_url,
+        "status": status,
+        "orderable": orderable,
         "last_synced_at": cache_row.get("cached_at"),
     }
 

@@ -382,8 +382,18 @@ async def _handle_find_products(
             detail=f"Failed to fetch products for merchant {merchant_id}: {error}",
         )
 
+    # Visibility: only surface active + orderable products to the agent front-end.
+    visible: List[StandardProduct] = []
+    for p in products:
+        status = getattr(p, "status", ProductStatus.ACTIVE)
+        if status != ProductStatus.ACTIVE:
+            continue
+        if getattr(p, "orderable", True) is False:
+            continue
+        visible.append(p)
+
     # In-memory filtering based on query/category/price
-    filtered: List[StandardProduct] = products
+    filtered: List[StandardProduct] = visible
 
     q = (filters.query or "").strip().lower()
     if q:
@@ -664,14 +674,20 @@ async def _handle_find_products_multi(
             except Exception:
                 return None
 
-        products: List[StandardProduct] = []
-        for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
-            prod = await _fetch_product(m_id, pid)
-            if prod:
-                products.append(prod)
-            if len(products) >= max_candidates:
-                break
-        return products
+    products: List[StandardProduct] = []
+    for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
+        prod = await _fetch_product(m_id, pid)
+        if not prod:
+            continue
+        status = getattr(prod, "status", ProductStatus.ACTIVE)
+        if status != ProductStatus.ACTIVE:
+            continue
+        if getattr(prod, "orderable", True) is False:
+            continue
+        products.append(prod)
+        if len(products) >= max_candidates:
+            break
+    return products
 
     async def _load_global_top_sellers(max_candidates: int = 50) -> List[StandardProduct]:
         """Global popular products as a fallback when creator context is missing."""
@@ -750,8 +766,14 @@ async def _handle_find_products_multi(
         if popularity:
             for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
                 prod = await _fetch_product(m_id, pid)
-                if prod:
-                    products.append(prod)
+                if not prod:
+                    continue
+                status = getattr(prod, "status", ProductStatus.ACTIVE)
+                if status != ProductStatus.ACTIVE:
+                    continue
+                if getattr(prod, "orderable", True) is False:
+                    continue
+                products.append(prod)
                 if len(products) >= max_candidates:
                     break
             if products:
@@ -777,7 +799,13 @@ async def _handle_find_products_multi(
             if not isinstance(product_data, dict):
                 continue
             try:
-                products.append(StandardProduct(**product_data))
+                prod = StandardProduct(**product_data)
+                status = getattr(prod, "status", ProductStatus.ACTIVE)
+                if status != ProductStatus.ACTIVE:
+                    continue
+                if getattr(prod, "orderable", True) is False:
+                    continue
+                products.append(prod)
             except Exception:
                 continue
 
@@ -951,6 +979,11 @@ async def _handle_find_products_multi(
             source = "global_top_sellers"
         mapped = []
         for prod in top_sellers[: limit * page]:
+            status = getattr(prod, "status", ProductStatus.ACTIVE)
+            if status != ProductStatus.ACTIVE:
+                continue
+            if getattr(prod, "orderable", True) is False:
+                continue
             item = _standard_to_shop_product(prod)
             item["merchant_name"] = merchant_map.get(prod.merchant_id)
             mapped.append(item)
@@ -1048,6 +1081,11 @@ async def _handle_find_products_multi(
                         background_tasks=background_tasks,
                     )
                     for p in products:
+                        status = getattr(p, "status", ProductStatus.ACTIVE)
+                        if status != ProductStatus.ACTIVE:
+                            continue
+                        if getattr(p, "orderable", True) is False:
+                            continue
                         item = _standard_to_shop_product(p)
                         item["merchant_name"] = name
                         mapped.append(item)
@@ -1095,6 +1133,13 @@ async def _handle_find_products_multi(
     filtered_products: list[dict[str, Any]] = []
 
     for product, merchant_name in merchant_products:
+        # Visibility: only surface active + orderable products to the agent front-end.
+        status = getattr(product, "status", ProductStatus.ACTIVE)
+        if status != ProductStatus.ACTIVE:
+            continue
+        if getattr(product, "orderable", True) is False:
+            continue
+
         # Price filter
         if filters.price_min is not None and product.price < filters.price_min:
             continue
