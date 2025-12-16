@@ -316,24 +316,41 @@ class WixProductAdapter:
                                 # 正常按照数量来
                                 inventory = raw_quantity
                         
-                        # Check if product is orderable
+                        name = str(wp.get("name", "Unnamed Product"))
+                        price = float(price_data.get("price", 0))
+                        sku = str(wp.get("sku", "")) or None
+
+                        # Check if product is orderable from a Wix perspective:
+                        # visible + has a positive price.
                         is_orderable = (
-                            wp.get("visible", True) and  # Product is visible
-                            float(price_data.get("price", 0)) > 0  # Has valid price
+                            wp.get("visible", True) and
+                            price > 0
+                        )
+
+                        # Build a synthetic default variant so that validate_orderable
+                        # can succeed for structurally valid Wix products.
+                        variant = StandardProductVariant(
+                            id=str(wp.get("id", "") or sku or "default"),
+                            title=name,
+                            sku=sku,
+                            price=price,
+                            inventory_quantity=int(inventory),
+                            image_url=image_url,
                         )
                         
                         product = StandardProduct(
                             id=str(wp.get("id", "")),
-                            title=str(wp.get("name", "Unnamed Product")),
+                            title=name,
                             description=str(wp.get("description", "")),
-                            price=float(price_data.get("price", 0)),
+                            price=price,
                             currency=str(price_data.get("currency", "USD")),
                             inventory_quantity=int(inventory),
-                            sku=str(wp.get("sku", "")),
+                            sku=sku,
                             image_url=image_url,
                             platform="wix",
                             merchant_id=merchant_id,
                             status=ProductStatus.ACTIVE,
+                            variants=[variant],
                             orderable=is_orderable,
                             created_at=wp.get("dateCreated"),
                             updated_at=wp.get("lastUpdated")
