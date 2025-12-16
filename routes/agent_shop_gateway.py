@@ -674,20 +674,20 @@ async def _handle_find_products_multi(
             except Exception:
                 return None
 
-    products: List[StandardProduct] = []
-    for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
-        prod = await _fetch_product(m_id, pid)
-        if not prod:
-            continue
-        status = getattr(prod, "status", ProductStatus.ACTIVE)
-        if status != ProductStatus.ACTIVE:
-            continue
-        if getattr(prod, "orderable", True) is False:
-            continue
-        products.append(prod)
-        if len(products) >= max_candidates:
-            break
-    return products
+        products: List[StandardProduct] = []
+        for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
+            prod = await _fetch_product(m_id, pid)
+            if not prod:
+                continue
+            status = getattr(prod, "status", ProductStatus.ACTIVE)
+            if status != ProductStatus.ACTIVE:
+                continue
+            if getattr(prod, "orderable", True) is False:
+                continue
+            products.append(prod)
+            if len(products) >= max_candidates:
+                break
+        return products
 
     async def _load_global_top_sellers(max_candidates: int = 50) -> List[StandardProduct]:
         """Global popular products as a fallback when creator context is missing."""
