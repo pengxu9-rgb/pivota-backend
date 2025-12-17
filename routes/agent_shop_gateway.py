@@ -92,6 +92,10 @@ class FindProductsMultiPayload(BaseModel):
     user: Optional[UserIntent] = None
     metadata: Optional[RequestMetadata] = None
     creator_id: Optional[str] = Field(None, alias="creatorId", description="Optional creator context to scope results")
+    intent_safety: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Optional structured intent safety hints from upstream (e.g. high_level_intent, forbid/filter adult).",
+    )
 
     class Config:
         allow_population_by_field_name = True
@@ -952,6 +956,22 @@ async def _handle_find_products_multi(
     for title in history_titles:
         history_terms.update(_tokenize(title))
 
+    # Optional: normalized intent safety hints from upstream (LLM or gateway).
+    # Shape is intentionally flexible, but we expect fields like:
+    # - high_level_intent: "toys_kids_collectibles" | "adult_toys_lingerie" | ...
+    # - forbid_adult_and_lingerie: bool
+    # - filter_out_adult_and_lingerie: bool
+    intent_safety: Dict[str, Any] = {}
+    if payload.intent_safety:
+        try:
+            intent_safety = dict(payload.intent_safety)
+        except Exception:
+            intent_safety = {}
+    elif request_metadata:
+        raw = request_metadata.get("intent_safety")
+        if isinstance(raw, dict):
+            intent_safety = raw
+
     # Fetch candidate merchants. For generic agent surfaces we restrict to
     # PSP-connected merchants; for creator surfaces we allow all active
     # merchants so that creator experiences can span multiple brands.
@@ -1111,6 +1131,58 @@ async def _handle_find_products_multi(
     ):
         exclude_underwear = True
 
+    # Intent safety overrides from upstream (when provided).
+    # This allows LLM/frontends to explicitly declare that adult/lingerie
+    # products must be excluded even if the raw query is ambiguous.
+    try:
+        high_level_intent = str(intent_safety.get("high_level_intent") or "").lower()
+        forbid_adult = bool(intent_safety.get("forbid_adult_and_lingerie"))
+        filter_adult = bool(intent_safety.get("filter_out_adult_and_lingerie"))
+        outerwear_prefs = intent_safety.get("outerwear_preferences") or {}
+        beauty_prefs = intent_safety.get("beauty_preferences") or {}
+    except Exception:
+        high_level_intent = ""
+        forbid_adult = False
+        filter_adult = False
+        outerwear_prefs = {}
+        beauty_prefs = {}
+
+    # If upstream explicitly says "kids/collectibles toys" and does not allow
+    # adult/lingerie, we respect that by:
+    # - Disabling lingerie intent
+    # - Enabling exclusion flags
+    if high_level_intent == "toys_kids_collectibles" and (forbid_adult or filter_adult):
+        lingerie_intent_query = False
+        # Strong negative constraint: do not surface lingerie/underwear at all.
+        exclude_lingerie = True
+        exclude_underwear = True
+
+    # Outerwear preferences (minimal wiring for hoodies):
+    # - if exclude_types includes "hoodie", force exclude_hoodies.
+    # - if only_types is exactly ["hoodie"], we will later filter to hoodie-like items.
+    only_hoodies = False
+    try:
+        exclude_types = [str(t).lower() for t in (outerwear_prefs.get("exclude_types") or [])]
+        only_types = [str(t).lower() for t in (outerwear_prefs.get("only_types") or [])]
+    except Exception:
+        exclude_types = []
+        only_types = []
+    if "hoodie" in exclude_types:
+        exclude_hoodies = True
+    if only_types and all(t == "hoodie" for t in only_types):
+        only_hoodies = True
+
+    # Beauty preferences are consumed later in per-product filtering; we just
+    # normalize them here for reuse.
+    beauty_primary_category = ""
+    beauty_exclude_tags: list[str] = []
+    try:
+        beauty_primary_category = str(beauty_prefs.get("primary_category") or "").lower()
+        beauty_exclude_tags = [str(t).lower() for t in (beauty_prefs.get("exclude_tags") or [])]
+    except Exception:
+        beauty_primary_category = ""
+        beauty_exclude_tags = []
+
     # Detect positive-only skirts intent (e.g. "only skirts", "solo faldas").
     only_skirts = False
     if any(
@@ -1124,6 +1196,46 @@ async def _handle_find_products_multi(
         ]
     ):
         only_skirts = True
+
+    # Generic cold-weather clothing intent: for creator surfaces, when the user
+    # asks for "clothes" in a cold context (e.g. temperature dropping), we
+    # default to excluding lingerie/underwear unless explicitly requested.
+    generic_clothes = False
+    cold_hint = False
+    if q_lower:
+        if any(
+            token in q_lower
+            for token in [
+                "衣服",
+                "穿点",
+                "穿些",
+                "外套",
+                "大衣",
+                "羽绒服",
+                "clothes",
+                "coat",
+                "jacket",
+                "sweater",
+            ]
+        ):
+            generic_clothes = True
+        if any(
+            token in q_lower
+            for token in [
+                "冷",
+                "降温",
+                "变冷",
+                "很冷",
+                "temperature",
+                "degrees",
+                "度",
+            ]
+        ):
+            cold_hint = True
+
+    if is_creator_surface and generic_clothes and cold_hint and not lingerie_intent_query:
+        exclude_lingerie = True
+        exclude_underwear = True
 
     # Construct reply for look-intent queries: similar items + disclaimer/prompt.
     reply_text: Optional[str] = None
@@ -1493,6 +1605,24 @@ async def _handle_find_products_multi(
                 ]
                 if any(tok in blob_for_filters for tok in underwear_tokens):
                     continue
+
+        # "Only hoodie" constraint from outerwear preferences: if set,
+        # keep only hoodie-like products in the pool.
+        if only_hoodies:
+            hoodie_markers = [
+                "hoodie",
+                "hoodies",
+                "sweatshirt",
+                "sudadera",
+            ]
+            if not any(tok in blob_for_filters for tok in hoodie_markers):
+                continue
+
+        # Beauty preference exclusions: when exclude_tags are present, drop
+        # products whose text contains those markers (best-effort).
+        if beauty_exclude_tags:
+            if any(tag in blob_for_filters_ascii for tag in beauty_exclude_tags):
+                continue
 
         if only_skirts:
             skirt_tokens = [
