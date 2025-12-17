@@ -97,7 +97,8 @@ async def get_products_hybrid(
     merchant_id: str,
     limit: int,
     agent_id: str,
-    background_tasks: Optional[BackgroundTasks] = None
+    background_tasks: Optional[BackgroundTasks] = None,
+    force_cache_only: bool = False,
 ) -> Tuple[List[StandardProduct], str, Optional[str]]:
     """
     Hybrid product query - decides between cache and realtime
@@ -125,7 +126,7 @@ async def get_products_hybrid(
             return products, "cache", None
         
         # Step 2: Decide query path
-        if config.realtime_enabled and config.api_endpoint:
+        if config.realtime_enabled and config.api_endpoint and not force_cache_only:
             # Realtime path
             logger.info(f"[REALTIME] Querying merchant API for {merchant_id}")
             query_source = "realtime"
@@ -320,4 +321,3 @@ def log_query_source(
     
     # TODO: Also write to structured logging table or metrics system
     # await log_to_database(log_entry)
-

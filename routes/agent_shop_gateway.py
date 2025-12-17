@@ -1155,7 +1155,10 @@ async def _handle_find_products_multi(
                             }
                         )
 
-        # Last resort: fetch live from merchants if cache is still empty
+        # Last resort: fetch from merchants if cache is still empty. For
+        # creator-agent surfaces we prefer a cache-only view so that the
+        # Featured grid can reflect the broader catalog instead of being
+        # constrained by realtime API limits.
         if not mapped and merchant_map:
             source = "live_merchant_fallback"
             per_merchant = min(max(limit * 2, 10), 50)
@@ -1166,6 +1169,7 @@ async def _handle_find_products_multi(
                         limit=per_merchant,
                         agent_id="shopping_ai_multi_live",
                         background_tasks=background_tasks,
+                        force_cache_only=True,
                     )
                     for p in products:
                         if not _is_product_sellable(p):
