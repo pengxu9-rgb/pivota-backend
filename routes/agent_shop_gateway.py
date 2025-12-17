@@ -274,6 +274,18 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
     if p.platform_metadata:
         best_deal = best_deal or p.platform_metadata.get("best_deal")
         all_deals = all_deals or p.platform_metadata.get("all_deals")
+        # Surface creator pick metadata when available so that UIs can
+        # implement a "Creator picks" filter without separate calls.
+        creator_pick = p.platform_metadata.get("creator_pick")
+        creator_pick_rank = p.platform_metadata.get("creator_pick_rank")
+        if creator_pick is not None:
+            base["creator_pick"] = bool(creator_pick)
+        if creator_pick_rank is not None:
+            try:
+                base["creator_pick_rank"] = int(creator_pick_rank)
+            except Exception:
+                # If rank is not an int, skip rather than raising.
+                pass
 
     if best_deal is not None:
         base["best_deal"] = best_deal
@@ -711,7 +723,7 @@ async def _handle_find_products_multi(
 
         pick_rows = await database.fetch_all(
             """
-            SELECT product_id
+            SELECT product_id, rank
             FROM creator_picks
             WHERE creator_id = :creator_id
             ORDER BY rank ASC
@@ -721,11 +733,12 @@ async def _handle_find_products_multi(
         )
 
         for row in pick_rows:
-            pid = (
-                str(row.get("product_id"))  # type: ignore[union-attr]
-                if isinstance(row, dict)
-                else str(getattr(row, "product_id", "") or "")
-            ).strip()
+            if isinstance(row, dict):
+                pid = str(row.get("product_id") or "").strip()  # type: ignore[union-attr]
+                rank = row.get("rank")
+            else:
+                pid = str(getattr(row, "product_id", "") or "").strip()
+                rank = getattr(row, "rank", None)
             if not pid:
                 continue
             prod = await _fetch_product_any_merchant(pid)
@@ -734,6 +747,16 @@ async def _handle_find_products_multi(
             key = _product_key(prod)
             if key in seen_keys:
                 continue
+            # Mark as explicit creator pick so downstream UIs can filter.
+            meta = getattr(prod, "platform_metadata", None) or {}
+            try:
+                meta = dict(meta)
+            except Exception:
+                meta = {}
+            meta["creator_pick"] = True
+            if rank is not None:
+                meta["creator_pick_rank"] = int(rank)
+            prod.platform_metadata = meta  # type: ignore[attr-defined]
             seen_keys.add(key)
             pick_products.append(prod)
             if len(pick_products) >= max_candidates:
