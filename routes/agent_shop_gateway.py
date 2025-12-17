@@ -448,7 +448,16 @@ async def _handle_find_products(
             title = (prod.title or "").lower()
             desc = (prod.description or "").lower()
             ptype = (prod.product_type or "").lower()
-            return q in title or q in desc or q in ptype
+            sku = (getattr(prod, "sku", None) or "").lower()
+            variant_skus = []
+            try:
+                for v in getattr(prod, "variants", None) or []:
+                    vs = getattr(v, "sku", None)
+                    if vs:
+                        variant_skus.append(str(vs).lower())
+            except Exception:
+                variant_skus = []
+            return q in title or q in desc or q in ptype or (sku and q in sku) or any(q in s for s in variant_skus)
 
         filtered = [p for p in filtered if matches_query(p)]
 
@@ -910,6 +919,9 @@ async def _handle_find_products_multi(
     q_tokens = _tokenize(q_ascii)
     q_compact = re.sub(r"[^a-z0-9]+", "", q_lower)
 
+    # SKU-like queries: often numeric or short alphanumerics; we treat them as strong anchors for recall.
+    sku_like_query = bool(re.fullmatch(r"[a-z0-9\\-]{6,}", q_ascii) and any(ch.isdigit() for ch in q_ascii))
+
     # Query-level tee intent (including Spanish synonyms).
     tee_intent_query = bool(
         q_compact == "tee"
@@ -944,6 +956,22 @@ async def _handle_find_products_multi(
         or "designer toys" in q_ascii
         or "labubu" in q_ascii
         or _fuzzy_token_match(q_tokens, ["doll", "dolls", "toys"], max_dist=1)
+    )
+
+    # Query-level toy outfit/accessory intent (e.g. "clothes for my Labubu", "doll outfit").
+    toy_outfit_intent_query = bool(
+        toys_intent_query
+        and (
+            re.search(r"\bclothes\b", q_ascii)
+            or re.search(r"\bclothing\b", q_ascii)
+            or re.search(r"\boutfit\b", q_ascii)
+            or re.search(r"\bdoll\s+outfit\b", q_ascii)
+            or re.search(r"\bdoll\s+clothes\b", q_ascii)
+            or re.search(r"\baccessor(?:y|ies)\b", q_ascii)
+            or re.search(r"\bhat\b", q_ascii)
+            or "衣服" in q_lower
+            or "穿" in q_lower
+        )
     )
 
     # Detect special intents for downstream filtering/UX.
@@ -1217,6 +1245,84 @@ async def _handle_find_products_multi(
             # Ignore individual merchant failures to keep cross-merchant search robust
             continue
 
+    # Recall boost: when the user asks a specific query (e.g. a character name),
+    # searching only a small "top-N" slice per merchant can miss relevant items.
+    # Pull additional candidates directly from products_cache using cheap text matching.
+    try:
+        anchor_terms: List[str] = []
+        if "labubu" in q_ascii:
+            anchor_terms = ["labubu"]
+        elif q_tokens:
+            anchor_terms = [q_tokens[0]]
+            if len(q_tokens) > 1 and len(q_tokens[1]) >= 4:
+                anchor_terms.append(q_tokens[1])
+        elif len(q_compact) >= 4:
+            anchor_terms = [q_compact]
+
+        if anchor_terms:
+            likes = [f"%{t.lower()}%" for t in anchor_terms if t]
+            # Clamp so we don't overfetch too much from cache.
+            cache_limit = min(max(limit * max(page, 1) * 6, 120), 900)
+
+            where_clauses: List[str] = []
+            params: Dict[str, Any] = {
+                "merchant_ids": list(merchant_map.keys()),
+                "cache_limit": cache_limit,
+            }
+            for idx, like in enumerate(likes):
+                key = f"like_{idx}"
+                params[key] = like
+                where_clauses.append(
+                    "("
+                    "LOWER(COALESCE(product_data->>'title','')) LIKE :" + key
+                    + " OR LOWER(COALESCE(product_data->>'description','')) LIKE :" + key
+                    + " OR LOWER(COALESCE(product_data->>'product_type','')) LIKE :" + key
+                    + " OR LOWER(COALESCE(product_data->>'sku','')) LIKE :" + key
+                    + ")"
+                )
+                # Variant SKUs are nested; for SKU-like queries we allow a bounded JSON text scan.
+                if sku_like_query:
+                    where_clauses.append("LOWER(CAST(product_data AS TEXT)) LIKE :" + key)
+
+            rows = await database.fetch_all(
+                """
+                SELECT merchant_id, product_data
+                FROM products_cache
+                WHERE (expires_at IS NULL OR expires_at > NOW())
+                  AND merchant_id = ANY(:merchant_ids)
+                  AND ("""
+                + " OR ".join(where_clauses)
+                + """)
+                ORDER BY cached_at DESC
+                LIMIT :cache_limit
+                """,
+                params,
+            )
+
+            for row in rows:
+                mid = row.get("merchant_id") if isinstance(row, dict) else None
+                if not mid:
+                    continue
+                product_data = row.get("product_data") if isinstance(row, dict) else None
+                if isinstance(product_data, str):
+                    try:
+                        product_data = json.loads(product_data)
+                    except Exception:
+                        continue
+                if not isinstance(product_data, dict):
+                    continue
+                try:
+                    prod = StandardProduct(**product_data)
+                    prod.merchant_id = prod.merchant_id or str(mid)
+                    merchant_products.append((prod, merchant_map.get(str(mid), "")))
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.info(
+            "multi.cache_query_boost.failed",
+            extra={"query": q, "error": str(e)},
+        )
+
     # In-memory filtering and simple relevance scoring (reuse Agent API logic)
     filtered_products: list[dict[str, Any]] = []
 
@@ -1252,6 +1358,14 @@ async def _handle_find_products_multi(
                 (product.description or "").lower(),
                 (product.product_type or "").lower(),
                 " ".join(getattr(product, "tags", None) or []),
+                (getattr(product, "sku", None) or "").lower(),
+                " ".join(
+                    [
+                        str(getattr(v, "sku", "")).lower()
+                        for v in (getattr(product, "variants", None) or [])
+                        if getattr(v, "sku", None)
+                    ]
+                ),
             ]
         )
         blob_for_filters_ascii = _strip_accents(blob_for_filters)
@@ -1318,7 +1432,16 @@ async def _handle_find_products_multi(
             title = (product.title or "").lower()
             description = (product.description or "").lower()
             product_type = (product.product_type or "").lower()
-            blob = " ".join([title, description, product_type]).strip()
+            sku = (getattr(product, "sku", None) or "").lower()
+            variant_skus = []
+            try:
+                for v in getattr(product, "variants", None) or []:
+                    vs = getattr(v, "sku", None)
+                    if vs:
+                        variant_skus.append(str(vs).lower())
+            except Exception:
+                variant_skus = []
+            blob = " ".join([title, description, product_type, sku, " ".join(variant_skus)]).strip()
             blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
             q_compact = re.sub(r"[^a-z0-9]+", "", q_lower)
 
@@ -1440,6 +1563,38 @@ async def _handle_find_products_multi(
                 relevance_score += 0.4
 
         if toys_intent_query:
+            # Keep underwear/lingerie out of toy queries unless the user explicitly asked for lingerie.
+            underwear_tokens_for_flags = [
+                "lingerie",
+                "underwear",
+                "bra",
+                "panties",
+                "panty",
+                "briefs",
+                "thong",
+                "sleepwear",
+                "night dress",
+                "nightdress",
+                "nightgown",
+                "sexy",
+                "lace",
+                "push-up",
+                "push up",
+                "backless",
+                "ropa interior",
+                "sujetador",
+                "bragas",
+                "calzoncillos",
+            ]
+            is_underwear_like = any(tok in blob_for_filters_ascii for tok in underwear_tokens_for_flags)
+
+            # Character anchors: for queries like "clothes for my Labubu",
+            # allow character-matched items as toy-like (but still apply underwear exclusion above).
+            character_anchors: List[str] = []
+            if "labubu" in q_ascii:
+                character_anchors.append("labubu")
+            is_character_match = any(a in blob_for_filters_ascii for a in character_anchors) if character_anchors else False
+
             toys_tokens = [
                 "toy",
                 "toys",
@@ -1457,9 +1612,12 @@ async def _handle_find_products_multi(
                 "collectible",
                 "designer toy",
                 "art toy",
-                "labubu",
             ]
             is_toy_like = any(tok in blob_for_filters_ascii for tok in toys_tokens)
+            if not is_toy_like and is_character_match and toy_outfit_intent_query and not lingerie_intent_query:
+                is_toy_like = True
+            if is_toy_like and is_underwear_like and not lingerie_intent_query:
+                is_toy_like = False
             if is_toy_like:
                 relevance_score += 0.45
 
@@ -1709,6 +1867,87 @@ async def _handle_find_similar_products(
         source = source or meta.source
         trace_id = trace_id or meta.trace_id
 
+    def _strip_accents_text(text: str) -> str:
+        if not text:
+            return ""
+        return "".join(
+            c
+            for c in unicodedata.normalize("NFKD", text)
+            if not unicodedata.combining(c)
+        )
+
+    def _product_blob_ascii(prod: Optional[StandardProduct]) -> str:
+        if not prod:
+            return ""
+        tags = getattr(prod, "tags", None) or []
+        if not isinstance(tags, list):
+            tags = []
+        raw = " ".join(
+            [
+                (prod.title or ""),
+                (prod.description or ""),
+                (prod.product_type or ""),
+                " ".join([str(t) for t in tags if t]),
+            ]
+        ).lower()
+        return _strip_accents_text(raw)
+
+    def _is_underwear_like_blob(blob_ascii: str) -> bool:
+        if not blob_ascii:
+            return False
+        tokens = [
+            "lingerie",
+            "underwear",
+            "bra",
+            "panties",
+            "panty",
+            "briefs",
+            "thong",
+            "sleepwear",
+            "night dress",
+            "nightdress",
+            "nightgown",
+            "sexy",
+            "lace",
+            "push-up",
+            "push up",
+            "backless",
+            "ropa interior",
+            "sujetador",
+            "bragas",
+            "calzoncillos",
+        ]
+        return any(tok in blob_ascii for tok in tokens)
+
+    def _is_toy_context_blob(blob_ascii: str) -> bool:
+        if not blob_ascii:
+            return False
+        tokens = [
+            "toy",
+            "toys",
+            "doll",
+            "dolls",
+            "plush",
+            "plushie",
+            "peluche",
+            "figure",
+            "figures",
+            "vinyl",
+            "blind box",
+            "collectible",
+            "designer toy",
+            "art toy",
+            "labubu",
+        ]
+        return any(tok in blob_ascii for tok in tokens)
+
+    base_blob_ascii = _product_blob_ascii(base_product)
+    base_is_toy_context = _is_toy_context_blob(base_blob_ascii)
+    base_is_underwear_like = _is_underwear_like_blob(base_blob_ascii)
+    exclude_underwear_candidates = bool(
+        source == "creator-agent-ui" and base_is_toy_context and not base_is_underwear_like
+    )
+
     # Decide strategy
     desired_strategy = payload.strategy or "auto"
     strategy_used: SimilarityStrategy = desired_strategy
@@ -1774,6 +2013,10 @@ async def _handle_find_similar_products(
 
             if not _is_product_sellable(sp):
                 continue
+            if exclude_underwear_candidates:
+                cand_blob = _product_blob_ascii(sp)
+                if _is_underwear_like_blob(cand_blob):
+                    continue
             raw_products.append((pid, sp, cand))
 
         def _score(sp: StandardProduct, cand_obj):

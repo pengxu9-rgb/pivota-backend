@@ -220,34 +220,60 @@ async def merchant_sync_shopify_products(
         if not access_token:
             raise HTTPException(status_code=400, detail="Shopify access token not found")
         
-        # Fetch products from Shopify API
-        products, next_page, error = await ShopifyProductAdapter.fetch_products(
-            shop_domain=store["domain"],
-            access_token=access_token,
-            merchant_id=target_merchant_id,
-            limit=250
-        )
-        
-        if error:
-            raise HTTPException(status_code=400, detail=f"Shopify API error: {error}")
-        
-        # Cache products
+        # Fetch products from Shopify API (paginated).
         synced_count = 0
-        for product in products:
-            try:
-                product_data = json.loads(product.json())
-                await upsert_product_cache(
-                    merchant_id=target_merchant_id,
-                    platform="shopify",
-                    platform_product_id=product.id,
-                    product_data=product_data,
-                    ttl_seconds=604800  # 7 days
+        page_info = None
+        pages_fetched = 0
+        max_pages = 40  # Safety cap (40 * 250 = 10,000 products)
+
+        while pages_fetched < max_pages:
+            products, next_page, error = await ShopifyProductAdapter.fetch_products(
+                shop_domain=store["domain"],
+                access_token=access_token,
+                merchant_id=target_merchant_id,
+                limit=250,
+                page_info=page_info,
+            )
+
+            if error:
+                raise HTTPException(status_code=400, detail=f"Shopify API error: {error}")
+
+            if not products:
+                break
+
+            pages_fetched += 1
+
+            # Cache products
+            for product in products:
+                try:
+                    product_data = json.loads(product.json())
+                    await upsert_product_cache(
+                        merchant_id=target_merchant_id,
+                        platform="shopify",
+                        platform_product_id=product.id,
+                        product_data=product_data,
+                        ttl_seconds=604800  # 7 days
+                    )
+                    synced_count += 1
+                except Exception as cache_err:
+                    logger.error(f"Failed to cache product {product.id}: {cache_err}")
+                    continue
+
+            # Stop if there's no next page token.
+            if not next_page:
+                break
+
+            # Defensive: adapter sometimes returns a sentinel token when Link parsing fails.
+            if next_page == "has_next":
+                logger.warning(
+                    "Shopify pagination indicated next page but page_info token could not be parsed; stopping early",
+                    extra={"merchant_id": target_merchant_id, "domain": store.get("domain")},
                 )
-                synced_count += 1
-            except Exception as cache_err:
-                logger.error(f"Failed to cache product {product.id}: {cache_err}")
-                continue
-        
+                break
+
+            # Continue pagination.
+            page_info = next_page
+
         # Update store product_count
         await database.execute(
             """UPDATE merchant_stores 
@@ -262,6 +288,7 @@ async def merchant_sync_shopify_products(
             "data": {
                 "product_count": synced_count,
                 "store_domain": store["domain"],
+                "pages_fetched": pages_fetched,
                 "synced_at": datetime.now().isoformat()
             }
         }
@@ -619,5 +646,3 @@ async def merchant_connect_prestashop(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to connect PrestaShop: {str(e)}")
-
-
