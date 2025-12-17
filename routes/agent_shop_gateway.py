@@ -656,10 +656,86 @@ async def _handle_find_products_multi(
         return product_ids, titles
 
     async def _load_creator_top_sellers(max_candidates: int = 50) -> List[StandardProduct]:
-        """Fetch top-selling products for a creator by mining order metadata."""
+        """Fetch creator-curated picks plus top-selling products for a creator."""
         if not creator_id:
             return []
 
+        # Helper: build a stable dedupe key for a product.
+        def _product_key(prod: StandardProduct) -> tuple[str, str]:
+            return (
+                str(getattr(prod, "merchant_id", "") or ""),
+                str(getattr(prod, "product_id", None) or getattr(prod, "id", "") or ""),
+            )
+
+        # First, try to load explicit creator_picks (manual curation).
+        pick_products: List[StandardProduct] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        async def _fetch_product_any_merchant(product_id: str) -> Optional[StandardProduct]:
+            row = await database.fetch_one(
+                """
+                SELECT merchant_id, product_data
+                FROM products_cache
+                WHERE (
+                  platform_product_id = :pid
+                  OR product_data->>'id' = :pid
+                  OR product_data->>'product_id' = :pid
+                )
+                ORDER BY cached_at DESC
+                LIMIT 1
+                """,
+                {"pid": product_id},
+            )
+            if not row:
+                return None
+            merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
+            product_data = row.get("product_data") if isinstance(row, dict) else None
+            if isinstance(product_data, str):
+                try:
+                    product_data = json.loads(product_data)
+                except Exception:
+                    return None
+            if not isinstance(product_data, dict):
+                return None
+            try:
+                product = StandardProduct(**product_data)
+                if merchant_id:
+                    product.merchant_id = merchant_id
+                return product
+            except Exception:
+                return None
+
+        pick_rows = await database.fetch_all(
+            """
+            SELECT product_id
+            FROM creator_picks
+            WHERE creator_id = :creator_id
+            ORDER BY rank ASC
+            LIMIT :limit
+            """,
+            {"creator_id": creator_id, "limit": max_candidates},
+        )
+
+        for row in pick_rows:
+            pid = (
+                str(row.get("product_id"))  # type: ignore[union-attr]
+                if isinstance(row, dict)
+                else str(getattr(row, "product_id", "") or "")
+            ).strip()
+            if not pid:
+                continue
+            prod = await _fetch_product_any_merchant(pid)
+            if not prod or not _is_product_sellable(prod):
+                continue
+            key = _product_key(prod)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            pick_products.append(prod)
+            if len(pick_products) >= max_candidates:
+                break
+
+        # Then, mine historical orders for additional popular products.
         rows = await database.fetch_all(
             """
             SELECT merchant_id, items
@@ -702,9 +778,6 @@ async def _handle_find_products_multi(
                 qty = int(item.get("quantity") or 1)
                 popularity[(merchant_id, pid)] += max(qty, 1)
 
-        if not popularity:
-            return []
-
         async def _fetch_product(merchant_id: str, product_id: str) -> Optional[StandardProduct]:
             row = await database.fetch_one(
                 """
@@ -738,17 +811,22 @@ async def _handle_find_products_multi(
             except Exception:
                 return None
 
-        products: List[StandardProduct] = []
-        for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
-            prod = await _fetch_product(m_id, pid)
-            if not prod:
-                continue
-            if not _is_product_sellable(prod):
-                continue
-            products.append(prod)
-            if len(products) >= max_candidates:
-                break
-        return products
+        order_products: List[StandardProduct] = []
+        if popularity:
+            for (m_id, pid), _count in popularity.most_common(max_candidates * 2):
+                prod = await _fetch_product(m_id, pid)
+                if not prod or not _is_product_sellable(prod):
+                    continue
+                key = _product_key(prod)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                order_products.append(prod)
+                if len(pick_products) + len(order_products) >= max_candidates:
+                    break
+
+        # Creator picks first, then historical top sellers.
+        return pick_products + order_products
 
     async def _load_global_top_sellers(max_candidates: int = 50) -> List[StandardProduct]:
         """Global popular products as a fallback when creator context is missing."""
