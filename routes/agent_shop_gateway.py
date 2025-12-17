@@ -297,13 +297,26 @@ def _is_product_sellable(product: Any) -> bool:
     Shared visibility rule used across all search paths:
     - status must be ACTIVE
     - orderable must not be explicitly False
+
+    Important nuance: for StandardProduct objects we only treat
+    orderable=False as a hard block when the field was explicitly
+    set by the ingestion pipeline. If the field is missing and the
+    Pydantic default False is used, we consider it "unspecified" and
+    allow the product to surface (status gating still applies).
     """
     status = getattr(product, "status", ProductStatus.ACTIVE)
     if not _is_status_active(status):
         return False
     orderable = getattr(product, "orderable", None)
-    if orderable is False:
-        return False
+
+    # Detect whether orderable was explicitly provided on the model.
+    explicit_fields = getattr(product, "__fields_set__", None)
+    if isinstance(explicit_fields, set) and "orderable" in explicit_fields:
+        if orderable is False:
+            return False
+
+    # When orderable is unspecified (field not set), we follow the
+    # "orderable != false" contract and allow the product through.
     return True
 
 
