@@ -13,6 +13,7 @@ Currently supports:
 Path: POST /agent/shop/v1/invoke
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from services.product_query_service import get_products_hybrid
@@ -35,15 +36,18 @@ from services.similarity_service import (
 )
 from services.similarity_config import get_similarity_scoring_weights
 from models.standard_product import StandardProduct, ProductStatus
+from services.agent_task_manager import AgentTaskManager
 
 AGENT_API_BASE = os.getenv("AGENT_API_BASE", "https://web-production-fedb.up.railway.app").rstrip("/")
 AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API_KEY") or os.getenv("AGENT_API_KEY")
 
 logger = logging.getLogger(__name__)
 
-
 router = APIRouter(prefix="/agent/shop/v1", tags=["Shopping Gateway"])
 DEV_MODE = os.getenv("APP_ENV", "dev") != "production"
+
+# Bounded queue + worker pool for heavy agent work.
+agent_task_manager = AgentTaskManager.from_env()
 
 
 class SearchFilters(BaseModel):
@@ -190,6 +194,86 @@ class ShopGatewayRequest(BaseModel):
     operation: str
     payload: Dict[str, Any]
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreatorTaskCreateRequest(ShopGatewayRequest):
+    """
+    Request body for async creator tasks.
+
+    - operation / payload / metadata mirror ShopGatewayRequest
+    - request_id: optional idempotency key supplied by caller
+    - session_id: optional explicit session identifier; when omitted,
+      the gateway derives a session id from metadata and payload.
+    """
+
+    request_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class CreatorTaskStatus(BaseModel):
+    task_id: str
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+def _derive_session_id_for_multi(
+    payload: "FindProductsMultiPayload",
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Build a stable per-conversation/session identifier for cross-merchant search.
+
+    Priority:
+    - Explicit trace_id when provided by upstream callers.
+    - Creator + user tuple (creator_id + user.id) for Creator Agent UI.
+    """
+    trace_id = metadata.get("trace_id") or metadata.get("traceId")
+    if trace_id:
+        return f"multi:{trace_id}"
+
+    creator_id: Optional[str] = None
+    if payload.creator_id:
+        creator_id = payload.creator_id
+    elif payload.metadata and payload.metadata.creator_id:
+        creator_id = payload.metadata.creator_id
+    elif metadata.get("creator_id"):
+        creator_id = str(metadata["creator_id"])
+
+    user_id = payload.user.id if payload.user and payload.user.id else None
+
+    parts: List[str] = ["multi"]
+    if creator_id:
+        parts.append(f"creator={creator_id}")
+    if user_id:
+        parts.append(f"user={user_id}")
+
+    if len(parts) == 1:
+        return None
+    return "|".join(parts)
+
+
+def _derive_session_id_for_similar(
+    payload: "FindSimilarProductsPayload",
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Build a stable session identifier for similar-products operations.
+    """
+    trace_id = metadata.get("trace_id") or metadata.get("traceId")
+    if trace_id:
+        return f"similar:{trace_id}"
+
+    creator_id = (
+        payload.creator_id
+        or (payload.metadata.creator_id if payload.metadata else None)
+        or metadata.get("creator_id")
+    )
+
+    parts: List[str] = ["similar", f"product={payload.product_id}"]
+    if creator_id:
+        parts.append(f"creator={creator_id}")
+    return "|".join(parts)
 
 
 def _build_options_from_variants(p: StandardProduct) -> List[Dict[str, Any]]:
@@ -2511,6 +2595,126 @@ if DEV_MODE:
         return result
 
 
+if DEV_MODE:
+    @router.get("/dev/queue-status")
+    async def debug_queue_status() -> Dict[str, Any]:
+        """
+        Dev-only endpoint to inspect the agent task queue state.
+        """
+        return await agent_task_manager.snapshot()
+
+
+@router.post("/creator/tasks", response_model=CreatorTaskStatus)
+async def create_creator_task(
+    request: CreatorTaskCreateRequest,
+    background_tasks: BackgroundTasks,
+) -> CreatorTaskStatus:
+    """
+    Async task creation endpoint for Creator Agent workloads.
+
+    This provides an explicit queue-based API:
+      - POST /agent/shop/v1/creator/tasks -> {task_id, status="queued"}
+      - GET  /agent/shop/v1/creator/tasks/{task_id} -> status + result/error
+    """
+    operation = (request.operation or "").strip()
+    normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
+    if not normalized_metadata.get("creator_id"):
+        for k in ("creatorId", "creator_id"):
+            if k in request.payload:
+                normalized_metadata["creator_id"] = request.payload.get(k)
+                break
+    if not normalized_metadata.get("creator_name"):
+        for k in ("creatorName", "creator_name"):
+            if k in request.payload:
+                normalized_metadata["creator_name"] = request.payload.get(k)
+                break
+
+    # For now we support async tasks for the heavy operations only.
+    if operation == "find_products_multi":
+        payload = FindProductsMultiPayload(**request.payload)
+        session_id = request.session_id or _derive_session_id_for_multi(payload, normalized_metadata)
+        creator_id_for_hash = (
+            payload.creator_id
+            or (payload.metadata.creator_id if payload.metadata else None)
+            or normalized_metadata.get("creator_id")
+        )
+        payload_key = {
+            "query": payload.search.query,
+            "category": payload.search.category,
+            "price_min": payload.search.price_min,
+            "price_max": payload.search.price_max,
+            "in_stock_only": payload.search.in_stock_only,
+            "creator_id": creator_id_for_hash,
+        }
+        payload_hash = AgentTaskManager.compute_payload_hash("find_products_multi", payload_key)
+        task_id, _ = await agent_task_manager.enqueue(
+            operation="find_products_multi",
+            session_id=session_id,
+            payload_hash=payload_hash,
+            coro_factory=lambda: _handle_find_products_multi(
+                payload, normalized_metadata, background_tasks
+            ),
+            request_id=request.request_id,
+        )
+        return CreatorTaskStatus(task_id=task_id, status="queued")
+
+    if operation == "find_similar_products":
+        payload = FindSimilarProductsPayload(**request.payload)
+        session_id = request.session_id or _derive_session_id_for_similar(payload, normalized_metadata)
+        creator_id_for_hash = (
+            payload.creator_id
+            or (payload.metadata.creator_id if payload.metadata else None)
+            or normalized_metadata.get("creator_id")
+        )
+        payload_key = {
+            "product_id": payload.product_id,
+            "creator_id": creator_id_for_hash,
+            "strategy": payload.strategy,
+            "limit": payload.limit,
+        }
+        payload_hash = AgentTaskManager.compute_payload_hash("find_similar_products", payload_key)
+        task_id, _ = await agent_task_manager.enqueue(
+            operation="find_similar_products",
+            session_id=session_id,
+            payload_hash=payload_hash,
+            coro_factory=lambda: _handle_find_similar_products(
+                payload, normalized_metadata, background_tasks
+            ),
+            request_id=request.request_id,
+        )
+        return CreatorTaskStatus(task_id=task_id, status="queued")
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported async operation for creator task: {operation}",
+    )
+
+
+@router.get("/creator/tasks/{task_id}", response_model=CreatorTaskStatus)
+async def get_creator_task_status(task_id: str) -> CreatorTaskStatus:
+    """
+    Poll task status and (when ready) result for creator tasks.
+    """
+    # We intentionally keep this light-weight: it only introspects the in-memory
+    # TaskRecord and does not perform any heavy operations.
+    async with agent_task_manager._lock:  # type: ignore[attr-defined]
+        # Internal use only; safe within this process.
+        record = agent_task_manager._tasks.get(task_id)  # type: ignore[attr-defined]
+        if not record:
+            raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+
+        status = record.state.value
+        result = record.result if record.state == record.state.SUCCEEDED else None
+        error = record.error
+
+    return CreatorTaskStatus(
+        task_id=task_id,
+        status=status,
+        result=result,
+        error=error,
+    )
+
+
 async def _handle_get_product_detail(
     ref: ProductRef,
     background_tasks: BackgroundTasks,
@@ -2701,10 +2905,20 @@ async def _handle_submit_payment(payment: PaymentPayloadBody) -> Dict[str, Any]:
     return await _proxy_agent_api("POST", "/agent/v1/payments", body)
 
 
+INVOKE_SHORT_WAIT_SECONDS_RAW = os.getenv("AGENT_SHOP_INVOKE_MAX_WAIT_SECONDS")
+try:
+    INVOKE_SHORT_WAIT_SECONDS = float(INVOKE_SHORT_WAIT_SECONDS_RAW) if INVOKE_SHORT_WAIT_SECONDS_RAW else 0.0
+    if INVOKE_SHORT_WAIT_SECONDS < 0:
+        INVOKE_SHORT_WAIT_SECONDS = 0.0
+except ValueError:
+    INVOKE_SHORT_WAIT_SECONDS = 0.0
+
+
 @router.post("/invoke")
 async def invoke_shop_operation(
     request: ShopGatewayRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> Dict[str, Any]:
     """
     Unified entrypoint for Shopping AI frontend & LLM agents.
@@ -2745,11 +2959,85 @@ async def invoke_shop_operation(
 
     if operation == "find_products_multi":
         payload = FindProductsMultiPayload(**request.payload)
-        return await _handle_find_products_multi(payload, normalized_metadata, background_tasks)
+        session_id = _derive_session_id_for_multi(payload, normalized_metadata)
+        creator_id_for_hash = (
+            payload.creator_id
+            or (payload.metadata.creator_id if payload.metadata else None)
+            or normalized_metadata.get("creator_id")
+        )
+        payload_key = {
+            "query": payload.search.query,
+            "category": payload.search.category,
+            "price_min": payload.search.price_min,
+            "price_max": payload.search.price_max,
+            "in_stock_only": payload.search.in_stock_only,
+            "creator_id": creator_id_for_hash,
+        }
+        payload_hash = AgentTaskManager.compute_payload_hash(
+            "find_products_multi", payload_key
+        )
+        task_id, future = await agent_task_manager.enqueue(
+            operation="find_products_multi",
+            session_id=session_id,
+            payload_hash=payload_hash,
+            coro_factory=lambda: _handle_find_products_multi(
+                payload, normalized_metadata, background_tasks
+            ),
+        )
+        try:
+            if INVOKE_SHORT_WAIT_SECONDS > 0:
+                try:
+                    return await asyncio.wait_for(future, timeout=INVOKE_SHORT_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    # Short-wait budget exceeded; keep task running in the background.
+                    return {
+                        "status": "pending",
+                        "task_id": task_id,
+                    }
+            return await future
+        except asyncio.CancelledError:
+            # Client disconnected; best-effort cancellation.
+            await agent_task_manager.cancel(task_id, reason="client_disconnect")
+            raise
 
     if operation == "find_similar_products":
         payload = FindSimilarProductsPayload(**request.payload)
-        return await _handle_find_similar_products(payload, normalized_metadata, background_tasks)
+        session_id = _derive_session_id_for_similar(payload, normalized_metadata)
+        creator_id_for_hash = (
+            payload.creator_id
+            or (payload.metadata.creator_id if payload.metadata else None)
+            or normalized_metadata.get("creator_id")
+        )
+        payload_key = {
+            "product_id": payload.product_id,
+            "creator_id": creator_id_for_hash,
+            "strategy": payload.strategy,
+            "limit": payload.limit,
+        }
+        payload_hash = AgentTaskManager.compute_payload_hash(
+            "find_similar_products", payload_key
+        )
+        task_id, future = await agent_task_manager.enqueue(
+            operation="find_similar_products",
+            session_id=session_id,
+            payload_hash=payload_hash,
+            coro_factory=lambda: _handle_find_similar_products(
+                payload, normalized_metadata, background_tasks
+            ),
+        )
+        try:
+            if INVOKE_SHORT_WAIT_SECONDS > 0:
+                try:
+                    return await asyncio.wait_for(future, timeout=INVOKE_SHORT_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    return {
+                        "status": "pending",
+                        "task_id": task_id,
+                    }
+            return await future
+        except asyncio.CancelledError:
+            await agent_task_manager.cancel(task_id, reason="client_disconnect")
+            raise
 
     if operation == "submit_payment":
         payload = SubmitPaymentPayload(**request.payload)
