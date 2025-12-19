@@ -1423,17 +1423,33 @@ async def _handle_find_products_multi(
                     if len(mapped) >= limit * page:
                         break
 
-        # If still below the desired pool size, fall back to recent cached products
+        # If still below the desired pool size, fall back to recent cached products.
+        # For Creator Featured surfaces we explicitly bias toward ACTIVE + in-stock
+        # products across all merchants so that the initial grid has a richer pool.
         if len(mapped) < limit:
-            rows = await database.fetch_all(
-                """
-                SELECT merchant_id, product_data
-                FROM products_cache
-                ORDER BY cached_at DESC
-                LIMIT :limit
-                """,
-                {"limit": max(limit * max(page, 1) * 2, 20)},
-            )
+            cache_limit = max(limit * max(page, 1) * 2, 20)
+            if creator_featured_mode:
+                rows = await database.fetch_all(
+                    """
+                    SELECT merchant_id, product_data
+                    FROM products_cache
+                    WHERE (product_data->>'status') = 'active'
+                      AND COALESCE((product_data->>'inventory_quantity')::int, 0) > 0
+                    ORDER BY cached_at DESC
+                    LIMIT :limit
+                    """,
+                    {"limit": cache_limit},
+                )
+            else:
+                rows = await database.fetch_all(
+                    """
+                    SELECT merchant_id, product_data
+                    FROM products_cache
+                    ORDER BY cached_at DESC
+                    LIMIT :limit
+                    """,
+                    {"limit": cache_limit},
+                )
             source = "cache_global_fallback"
             for row in rows:
                 merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
