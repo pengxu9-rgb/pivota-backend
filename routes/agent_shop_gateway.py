@@ -429,6 +429,26 @@ def _is_dict_sellable(data: Dict[str, Any]) -> bool:
     return _is_status_active(status) and orderable is not False
 
 
+def _is_product_visible_for_creator_featured(product: Any) -> bool:
+    """
+    Relaxed visibility for the Creator Featured surface.
+
+    For the home "Featured for you" grid we still require ACTIVE
+    status but do not treat orderable=False as a hard block so that
+    the pool can include a broader set of inspirational products.
+    """
+    status = getattr(product, "status", ProductStatus.ACTIVE)
+    return _is_status_active(status)
+
+
+def _is_dict_visible_for_creator_featured(data: Dict[str, Any]) -> bool:
+    """
+    Relaxed visibility for raw dict rows in Creator Featured surfaces.
+    """
+    status = data.get("status") or ProductStatus.ACTIVE.value
+    return _is_status_active(status)
+
+
 async def _load_product_by_id(product_id: str) -> Optional[StandardProduct]:
     """
     Load a single product from cache by product_id/platform_product_id.
@@ -1353,6 +1373,9 @@ async def _handle_find_products_multi(
             "If you share a link or photo of the outfit, I can refine these suggestions."
         )
 
+    # Whether we are serving the Creator Featured grid: creator surface + empty query.
+    creator_featured_mode = is_creator_surface and not q
+
     # Cold start: empty query falls back to creator/global top sellers and cache/live fallbacks.
     if not q:
         source = "creator_top_sellers"
@@ -1360,8 +1383,18 @@ async def _handle_find_products_multi(
         mapped: list[dict[str, Any]] = []
         seen_keys: set[tuple[str, str]] = set()
 
+        def _creator_featured_visible_product(prod: StandardProduct) -> bool:
+            if creator_featured_mode:
+                return _is_product_visible_for_creator_featured(prod)
+            return _is_product_sellable(prod)
+
+        def _creator_featured_visible_dict(data: Dict[str, Any]) -> bool:
+            if creator_featured_mode:
+                return _is_dict_visible_for_creator_featured(data)
+            return _is_dict_sellable(data)
+
         for prod in top_sellers[: limit * page]:
-            if not _is_product_sellable(prod):
+            if not _creator_featured_visible_product(prod):
                 continue
             item = _standard_to_shop_product(prod)
             item["merchant_name"] = merchant_map.get(prod.merchant_id)
@@ -1378,7 +1411,7 @@ async def _handle_find_products_multi(
             if global_top:
                 source = "creator_plus_global_top_sellers"
                 for prod in global_top:
-                    if not _is_product_sellable(prod):
+                    if not _creator_featured_visible_product(prod):
                         continue
                     key = (str(prod.merchant_id), str(prod.product_id or prod.id))
                     if key in seen_keys:
@@ -1415,7 +1448,7 @@ async def _handle_find_products_multi(
                 try:
                     prod = StandardProduct(**product_data)
                     prod.merchant_id = prod.merchant_id or merchant_id
-                    if not _is_product_sellable(prod):
+                    if not _creator_featured_visible_product(prod):
                         continue
                     item = _standard_to_shop_product(prod)
                     item["merchant_name"] = merchant_map.get(prod.merchant_id)
@@ -1440,7 +1473,7 @@ async def _handle_find_products_multi(
                         if isinstance(product_data.get("images"), list)
                         else None
                     )
-                    if not _is_dict_sellable(product_data):
+                    if not _creator_featured_visible_dict(product_data):
                         continue
                     if pid and title and price is not None:
                         key = (str(merchant_id), str(pid))
@@ -1497,7 +1530,7 @@ async def _handle_find_products_multi(
                         force_cache_only=True,
                     )
                     for p in products:
-                        if not _is_product_sellable(p):
+                        if not _creator_featured_visible_product(p):
                             continue
                         item = _standard_to_shop_product(p)
                         item["merchant_name"] = name
