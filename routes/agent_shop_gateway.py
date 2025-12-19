@@ -1364,6 +1364,9 @@ async def _handle_find_products_multi(
         exclude_lingerie = True
         exclude_underwear = True
 
+    # Whether we are serving the Creator Featured grid: creator surface + empty query.
+    creator_featured_mode = is_creator_surface and not q
+
     # Construct reply for look-intent queries: similar items + disclaimer/prompt.
     reply_text: Optional[str] = None
     if look_intent:
@@ -1373,8 +1376,121 @@ async def _handle_find_products_multi(
             "If you share a link or photo of the outfit, I can refine these suggestions."
         )
 
-    # Whether we are serving the Creator Featured grid: creator surface + empty query.
-    creator_featured_mode = is_creator_surface and not q
+    # Special-case: Creator Featured cold-start grid.
+    # For this surface we want a broad, cache-first view of ACTIVE + in-stock
+    # products across merchants so that the initial grid is rich enough, even
+    # when there is little or no creator-specific history.
+    if creator_featured_mode:
+        cache_limit = max(limit * max(page, 1) * 2, 20)
+        rows = await database.fetch_all(
+            """
+            SELECT merchant_id, product_data
+            FROM products_cache
+            WHERE (product_data->>'status') = 'active'
+              AND COALESCE((product_data->>'inventory_quantity')::int, 0) > 0
+            ORDER BY cached_at DESC
+            LIMIT :limit
+            """,
+            {"limit": cache_limit},
+        )
+        mapped: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        for row in rows:
+            merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
+            product_data = row.get("product_data") if isinstance(row, dict) else None
+            if isinstance(product_data, str):
+                try:
+                    product_data = json.loads(product_data)
+                except Exception:
+                    continue
+            if not isinstance(product_data, dict):
+                continue
+            try:
+                prod = StandardProduct(**product_data)
+                prod.merchant_id = prod.merchant_id or merchant_id
+                if not _is_product_visible_for_creator_featured(prod):
+                    continue
+                item = _standard_to_shop_product(prod)
+                item["merchant_name"] = merchant_map.get(prod.merchant_id)
+                key = (str(prod.merchant_id), str(item["id"]))
+                if key in seen_keys:
+                    continue
+                mapped.append(item)
+                seen_keys.add(key)
+            except Exception:
+                pid = (
+                    product_data.get("id")
+                    or product_data.get("product_id")
+                    or product_data.get("platform_product_id")
+                    or None
+                )
+                title = product_data.get("title") or product_data.get("name") or ""
+                price = product_data.get("price") or product_data.get("compare_at_price") or 0
+                currency = product_data.get("currency") or "USD"
+                image_url = (
+                    product_data.get("image_url")
+                    or (product_data.get("images") or [{}])[0].get("src")
+                    if isinstance(product_data.get("images"), list)
+                    else None
+                )
+                if not _is_dict_visible_for_creator_featured(product_data):
+                    continue
+                if pid and title and price is not None:
+                    key = (str(merchant_id), str(pid))
+                    if key in seen_keys:
+                        continue
+                    mapped.append(
+                        {
+                            "id": pid,
+                            "platform": product_data.get("platform") or product_data.get("source") or "",
+                            "merchant_id": merchant_id,
+                            "product_id": pid,
+                            "title": title,
+                            "description": product_data.get("description") or "",
+                            "vendor": product_data.get("vendor"),
+                            "product_type": product_data.get("product_type"),
+                            "tags": product_data.get("tags") or [],
+                            "price": price,
+                            "compare_at_price": product_data.get("compare_at_price"),
+                            "currency": currency,
+                            "inventory_quantity": product_data.get("inventory_quantity") or 0,
+                            "in_stock": bool(product_data.get("inventory_quantity", 0) > 0)
+                            if product_data.get("inventory_quantity") is not None
+                            else True,
+                            "sku": product_data.get("sku") or "",
+                            "barcode": product_data.get("barcode"),
+                            "image_url": image_url,
+                            "images": product_data.get("images") or [],
+                            "variants": product_data.get("variants") or [],
+                            "status": product_data.get("status") or "active",
+                            "published_at": product_data.get("published_at"),
+                            "created_at": product_data.get("created_at"),
+                            "updated_at": product_data.get("updated_at"),
+                            "data_completeness_score": product_data.get("data_completeness_score"),
+                            "platform_metadata": product_data.get("platform_metadata"),
+                            "orderable": product_data.get("orderable", True),
+                            "merchant_name": merchant_map.get(merchant_id),
+                        }
+                    )
+
+        if mapped:
+            start_idx = (page - 1) * limit
+            page_items = mapped[start_idx : start_idx + limit]
+            return {
+                "products": page_items,
+                "total": len(mapped),
+                "page": page,
+                "page_size": len(page_items),
+                "reply": reply_text,
+                "metadata": {
+                    "query_source": "creator_featured_cache",
+                    "fetched_at": datetime.utcnow().isoformat(),
+                    "merchants_searched": len(merchant_map),
+                    "creator_id": creator_id,
+                    "creator_name": creator_name,
+                },
+            }
 
     # Cold start: empty query falls back to creator/global top sellers and cache/live fallbacks.
     if not q:
@@ -1535,7 +1651,7 @@ async def _handle_find_products_multi(
         # constrained by realtime API limits.
         if not mapped and merchant_map:
             source = "live_merchant_fallback"
-            per_merchant = min(max(limit * 2, 10), 50)
+            per_merchant = min(max(limit * 2, 10), 200)
             for mid, name in merchant_map.items():
                 try:
                     products, _src, _err = await get_products_hybrid(
