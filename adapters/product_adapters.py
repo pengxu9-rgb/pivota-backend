@@ -119,6 +119,7 @@ class ShopifyProductAdapter:
         
         # 解析变体
         variants = []
+        variant_prices: List[float] = []
         default_price = 0.0
         default_inventory = 0
         default_sku = None
@@ -142,20 +143,24 @@ class ShopifyProductAdapter:
                     barcode=sv.get("barcode"),
                     price=float(sv.get("price", 0)),
                     compare_at_price=float(sv["compare_at_price"]) if sv.get("compare_at_price") else None,
-                    inventory_quantity=sv.get("inventory_quantity", 0),
+                    inventory_quantity=int(sv.get("inventory_quantity") or 0),
                     weight=sv.get("weight"),
                     weight_unit=sv.get("weight_unit"),
                     options=options_dict if options_dict else None,
                     image_url=None  # Shopify 变体图片需要匹配 images 数组
                 )
                 variants.append(variant)
-                
-                # 第一个变体作为默认值
-                if idx == 0:
-                    default_price = variant.price
-                    default_inventory = variant.inventory_quantity
+
+                default_inventory += variant.inventory_quantity
+                if variant.price and variant.price > 0:
+                    variant_prices.append(variant.price)
+                if default_sku is None and variant.sku:
                     default_sku = variant.sku
+                if default_barcode is None and variant.barcode:
                     default_barcode = variant.barcode
+
+            if variant_prices:
+                default_price = min(variant_prices)
         
         # 解析时间
         published_at = None

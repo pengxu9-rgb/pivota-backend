@@ -48,6 +48,7 @@ from services.amazon_sp_api_service import (
     fetch_order_items,
     convert_amazon_order_to_platform_format,
 )
+from adapters.product_adapters import ShopifyProductAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -610,11 +611,22 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                         dto = ShopifyProductDTO.from_shopify_api(p)
                         platform_product_id = dto.shopify_id
 
+                        # Store full StandardProduct payload (includes variants/price/sku/inventory),
+                        # otherwise downstream consumers will treat missing fields as zeros.
+                        standard_product = ShopifyProductAdapter.convert_to_standard(p, merchant_id)
+                        product_payload = standard_product.dict()
+
+                        # Optional enrichment: recommendation_meta is used by agent ranking/retrieval.
+                        try:
+                            product_payload["recommendation_meta"] = derive_recommendation_meta(standard_product)
+                        except Exception:
+                            pass
+
                         await upsert_product_cache(
                             merchant_id=merchant_id,
                             platform="shopify",
                             platform_product_id=platform_product_id,
-                            product_data=dto.to_cache_payload(),
+                            product_data=product_payload,
                             ttl_seconds=3600,
                         )
                         succeeded += 1
