@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from db.database import database
 from db.orders import mark_order_shipped
 from db.products import log_order_event
@@ -246,6 +246,35 @@ async def sync_shopify_products(
             existing_task = dict(existing_task_row)
             existing_task_id = int(existing_task["id"])
             existing_status = (existing_task.get("status") or "").lower()
+            stale_recovered = False
+
+            # If a task is stuck in `running` (e.g., process restarted mid-sync),
+            # allow it to be recovered automatically by flipping it back to
+            # retry_scheduled so the background worker can pick it up again.
+            if existing_status == "running":
+                updated_at = existing_task.get("updated_at")
+                try:
+                    now = datetime.now(timezone.utc)
+                    # updated_at from DB might be naive; treat as UTC.
+                    if isinstance(updated_at, datetime) and updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    if isinstance(updated_at, datetime) and now - updated_at > timedelta(minutes=5):
+                        await database.execute(
+                            """
+                            UPDATE platform_import_tasks
+                            SET status = 'retry_scheduled',
+                                next_run_at = NOW(),
+                                error = 'stale_running_recovered',
+                                updated_at = NOW()
+                            WHERE id = :task_id
+                            """,
+                            {"task_id": existing_task_id},
+                        )
+                        existing_status = "retry_scheduled"
+                        stale_recovered = True
+                except Exception:
+                    # If recovery fails, fall back to returning the task as-is.
+                    pass
 
             # Best-effort: kick it off if it's ready, otherwise just return its status.
             if existing_status in ("pending", "retry_scheduled"):
@@ -258,6 +287,7 @@ async def sync_shopify_products(
                     "task_id": existing_task_id,
                     "scheduled": existing_status in ("pending", "retry_scheduled"),
                     "already_running": existing_status == "running",
+                    "stale_recovered": stale_recovered,
                     "task_status": existing_task.get("status"),
                     "counts": existing_task.get("counts"),
                     "product_count": store_check.get("product_count"),
