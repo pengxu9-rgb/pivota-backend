@@ -121,17 +121,21 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
             reverse=True
         )[:5]
         
-        # Format recent orders
+        # Format recent orders (use total column; amount is not selected)
         recent_orders = []
         for order in orders[:5]:
+            total_value = order["total"]
+            customer_email = order.get("customer_email", "") if hasattr(order, "get") else getattr(order, "customer_email", "")
+            created_at = order.get("created_at") if hasattr(order, "get") else getattr(order, "created_at", None)
+
             recent_orders.append({
                 "order_id": order["order_id"],
-                "amount": float(order["amount"]),
+                "amount": float(total_value or 0),
                 "status": order["status"],
                 "customer": {
-                    "email": order.get("customer_email", "")
+                    "email": customer_email
                 },
-                "created_at": order["created_at"].isoformat() if order.get("created_at") else None
+                "created_at": created_at.isoformat() if created_at else None
             })
         
         return {
