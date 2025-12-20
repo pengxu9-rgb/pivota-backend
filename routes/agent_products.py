@@ -149,7 +149,12 @@ def _extract_product_card(
         or raw.get("title")
         or ""
     )
-    handle = product_data.get("handle") or raw.get("handle")
+    platform_metadata = product_data.get("platform_metadata") or {}
+    handle = (
+        product_data.get("handle")
+        or raw.get("handle")
+        or (platform_metadata.get("handle") if isinstance(platform_metadata, dict) else None)
+    )
 
     # Main image: prefer raw.image.src, then first images[x].src, then DTO hint.
     image_url = None

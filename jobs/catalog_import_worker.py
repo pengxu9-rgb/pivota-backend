@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import asyncio
+import json
 from urllib.parse import urlparse, parse_qs
 
 import httpx
@@ -42,6 +43,7 @@ from db.products import upsert_product_cache
 from db.platform_import_reports import get_platform_report
 from db.platform_orders import insert_platform_order
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus, validate_orderable
+from adapters.product_adapters import ShopifyProductAdapter
 
 # Amazon SP-API imports
 from services.amazon_sp_api_service import (
@@ -128,6 +130,37 @@ class ShopifyProductDTO:
         if self.raw is not None:
             payload["raw"] = self.raw
         return payload
+
+
+def _build_shopify_cache_payload(
+    *,
+    merchant_id: str,
+    raw_shopify_product: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any], StandardProduct]:
+    """
+    Build a StandardProduct-shaped cache payload for Shopify products.
+
+    This is important because many downstream endpoints assume products_cache.product_data
+    can be parsed as StandardProduct. We still keep `raw` and other additive keys for
+    debugging and recommendation_meta derivation.
+    """
+    standard_product = ShopifyProductAdapter.convert_to_standard(raw_shopify_product, merchant_id)
+    product_data: Dict[str, Any] = json.loads(standard_product.json())
+
+    platform_product_id = str(raw_shopify_product.get("id") or standard_product.id or "")
+    if not platform_product_id:
+        raise ValueError("Shopify product missing id")
+
+    # Additive/compat fields for easier consumption/debugging.
+    product_data["raw"] = raw_shopify_product
+    product_data["shopify_id"] = platform_product_id
+    product_data["handle"] = (
+        raw_shopify_product.get("handle")
+        or (standard_product.platform_metadata or {}).get("handle")
+        or ""
+    )
+
+    return platform_product_id, product_data, standard_product
 
 
 def _parse_shopify_next_page_info(link_header: Optional[str]) -> Optional[str]:
@@ -669,18 +702,16 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
 
                 for p in products_page:
                     try:
-                        dto = ShopifyProductDTO.from_shopify_api(p)
-                        platform_product_id = dto.shopify_id
+                        platform_product_id, product_data, standard_product = _build_shopify_cache_payload(
+                            merchant_id=merchant_id,
+                            raw_shopify_product=p,
+                        )
 
-                        # Build product_data payload and enrich with recommendation_meta.
-                        product_data = dto.to_cache_payload()
+                        # Enrich with recommendation_meta (best-effort; never blocks import).
                         recommendation_meta = None
                         try:
-                            # StandardProduct is not stored in products_cache for Shopify
-                            # imports today, but the helper accepts None and relies on
-                            # raw Shopify product tags.
                             recommendation_meta = derive_recommendation_meta(
-                                standard_product=None,
+                                standard_product=standard_product,
                                 raw_shopify_product=p,
                             )
                         except Exception as meta_exc:
