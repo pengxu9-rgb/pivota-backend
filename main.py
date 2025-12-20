@@ -209,6 +209,7 @@ from routes.quick_index_setup import router as quick_index_setup_router
 from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.accounts_orders_api import router as accounts_orders_router
 from routes.merchant_promotions_api import router as merchant_promotions_router
+from routes.shopify_promotions_sync_api import router as shopify_promotions_sync_router
 
 # Service routers (only include what exists)
 try:
@@ -543,6 +544,7 @@ app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
 app.include_router(merchant_promotions_router)  # Merchant/agent promotions API (DB-backed)
+app.include_router(shopify_promotions_sync_router)  # Sync Shopify promotions into DB-backed promotions
 app.include_router(product_enrichment_router)  # Internal product enrichment trigger
 if DEBUG_MODE:
     app.include_router(create_test_agent_router)  # Create test agent account

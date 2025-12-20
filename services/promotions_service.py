@@ -31,7 +31,7 @@ class PromotionStatus(str, Enum):
 class PromotionBase(BaseModel):
     merchantId: str
     name: str
-    type: str  # 'FLASH_SALE' | 'MULTI_BUY_DISCOUNT'
+    type: str  # 'FLASH_SALE' | 'MULTI_BUY_DISCOUNT' | 'FREE_SHIPPING'
     description: Optional[str] = ""
     startAt: datetime
     endAt: datetime
@@ -43,8 +43,8 @@ class PromotionBase(BaseModel):
 
     @validator("type")
     def validate_type(cls, v: str) -> str:
-        if v not in ("FLASH_SALE", "MULTI_BUY_DISCOUNT"):
-            raise ValueError("type must be FLASH_SALE or MULTI_BUY_DISCOUNT")
+        if v not in ("FLASH_SALE", "MULTI_BUY_DISCOUNT", "FREE_SHIPPING"):
+            raise ValueError("type must be FLASH_SALE, MULTI_BUY_DISCOUNT, or FREE_SHIPPING")
         return v
 
     @validator("channels")
@@ -119,16 +119,21 @@ def _compute_human_readable_rule(promo: Dict[str, Any]) -> str:
 
     cfg = promo.get("config") or {}
     ptype = promo.get("type")
-    if ptype == "MULTI_BUY_DISCOUNT":
+    if ptype == "MULTI_BUY_DISCOUNT" or cfg.get("kind") == "MULTI_BUY_DISCOUNT":
         t = cfg.get("thresholdQuantity") or cfg.get("threshold_quantity")
         d = cfg.get("discountPercent") or cfg.get("discount_percent")
         if t and d:
             return f"Buy {int(t)}, get {int(d)}% off"
         return "Bundle & save"
-    if ptype == "FLASH_SALE":
+    if ptype == "FLASH_SALE" or cfg.get("kind") == "FLASH_SALE":
         if cfg.get("flashPrice") or cfg.get("flash_price"):
             return "Flash deal"
         return "Flash deal"
+    if ptype == "FREE_SHIPPING" or cfg.get("kind") == "FREE_SHIPPING":
+        min_subtotal = cfg.get("minSubtotal") or cfg.get("min_subtotal")
+        if min_subtotal:
+            return "Free shipping over minimum order"
+        return "Free shipping"
     return promo.get("name") or "Deal"
 
 
@@ -249,8 +254,8 @@ async def create_promotion(data: PromotionCreate) -> PromotionOut:
     # Basic config validation according to type
     cfg = payload.get("config") or {}
     ptype = payload["type"]
+    # Normalize config.kind so downstream consumers can depend on it.
     if cfg.get("kind") not in (ptype,):
-        # Normalize kind to match type
         cfg["kind"] = ptype
     if ptype == "MULTI_BUY_DISCOUNT":
         if not cfg.get("thresholdQuantity"):
@@ -260,6 +265,11 @@ async def create_promotion(data: PromotionCreate) -> PromotionOut:
     elif ptype == "FLASH_SALE":
         if cfg.get("flashPrice") is None:
             raise ValueError("flashPrice is required for FLASH_SALE")
+    elif ptype == "FREE_SHIPPING":
+        # For FREE_SHIPPING we keep validation minimal: at least mark freeShipping flag
+        # so downstream code can recognize this deal type.
+        if cfg.get("freeShipping") is not True:
+            cfg["freeShipping"] = True
 
     promo_id = payload.get("id") or os.urandom(16).hex()
     now = datetime.utcnow()

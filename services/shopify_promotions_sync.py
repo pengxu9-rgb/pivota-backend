@@ -1,0 +1,407 @@
+"""
+Shopify promotions → Pivota promotions sync.
+
+MVP scope:
+- Fetch Shopify price rules for a given merchant (using existing connector credentials).
+- Normalize them into PromotionCreate objects (FLASH_SALE | MULTI_BUY_DISCOUNT | FREE_SHIPPING-like).
+- Upsert into the DB-backed promotions table via promotions_service.
+
+This keeps Pivota as the source of truth for promotions, while reusing
+Shopify's richer discount model as much as possible.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+import logging
+import os
+
+import httpx
+
+from config.settings import settings
+from db.connector_credentials import (
+    get_latest_connector_credential_for_merchant,
+    mark_credential_used,
+)
+from services.crypto_service import crypto_service
+from services.promotions_service import (
+    PromotionCreate,
+    PromotionUpdate,
+    create_promotion,
+    get_promotion,
+    update_promotion,
+)
+
+logger = logging.getLogger(__name__)
+
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-07")
+SHOPIFY_PRICE_RULE_PAGE_LIMIT = 250
+
+
+class ShopifyPromotionsError(Exception):
+    """Base exception for Shopify promotions sync errors."""
+
+
+class ShopifyPromotionsConfigError(ShopifyPromotionsError):
+    """Raised when Shopify credentials/config are missing."""
+
+
+class ShopifyPromotionsAuthError(ShopifyPromotionsError):
+    """Raised when Shopify rejects our credentials (401/403)."""
+
+
+class ShopifyPromotionsRateLimitError(ShopifyPromotionsError):
+    """Raised when Shopify rate limits our requests (429)."""
+
+
+@dataclass
+class ShopifyStoreConfig:
+    shop_domain: str
+    access_token: str
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.shop_domain and self.access_token)
+
+
+async def _get_shopify_config_from_env() -> ShopifyStoreConfig:
+    """
+    Global Shopify configuration fallback from settings/env.
+
+    This is primarily used for single-store setups or when per-merchant
+    connector credentials are not yet configured.
+    """
+    shop_domain = (
+        getattr(settings, "shopify_store_url", None)
+        or os.getenv("SHOPIFY_STORE_URL")
+        or os.getenv("SHOPIFY_SHOP_DOMAIN")
+        or ""
+    ).strip()
+    access_token = (
+        getattr(settings, "shopify_access_token", None)
+        or os.getenv("SHOPIFY_ACCESS_TOKEN")
+        or ""
+    ).strip()
+    return ShopifyStoreConfig(shop_domain=shop_domain, access_token=access_token)
+
+
+async def get_shopify_config_for_merchant(merchant_id: str) -> ShopifyStoreConfig:
+    """
+    Resolve Shopify configuration for a given merchant.
+
+    Order of precedence:
+    1) Per-merchant encrypted connector_credentials (connector='shopify').
+    2) Global settings/env fallback.
+    """
+    # Try per-merchant encrypted credentials first
+    try:
+        credential = await get_latest_connector_credential_for_merchant(merchant_id, "shopify")
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.error(
+            "Failed to load Shopify connector credentials for merchant",
+            extra={
+                "merchant_id": merchant_id,
+                "connector": "shopify",
+                "error": str(exc),
+            },
+        )
+        credential = None
+
+    if credential:
+        try:
+            decrypted = crypto_service.decrypt_json_secret(credential["credentials_encrypted"])
+            shop_domain = (decrypted.get("shop_domain") or "").strip()
+            access_token = (decrypted.get("access_token") or "").strip()
+            if shop_domain and access_token:
+                await mark_credential_used(credential["id"])
+                return ShopifyStoreConfig(shop_domain=shop_domain, access_token=access_token)
+            logger.warning(
+                "Shopify connector credentials missing required fields; falling back to env",
+                extra={"merchant_id": merchant_id, "credential_id": credential["id"]},
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(
+                "Failed to decrypt Shopify connector credentials; falling back to env",
+                extra={
+                    "merchant_id": merchant_id,
+                    "credential_id": credential.get("id"),
+                    "error": str(exc),
+                },
+            )
+
+    # Fallback to global configuration
+    return await _get_shopify_config_from_env()
+
+
+def _parse_shopify_next_page_info(link_header: Optional[str]) -> Optional[str]:
+    """
+    Parse Shopify Link header to extract `page_info` cursor for pagination.
+    Example:
+      <https://shop.myshopify.com/admin/api/2024-07/price_rules.json?limit=250&page_info=XYZ>; rel=\"next\"
+    """
+    if not link_header:
+        return None
+
+    parts = link_header.split(",")
+    for part in parts:
+        if 'rel=\"next\"' not in part and "rel='next'" not in part:
+            continue
+        start = part.find("<")
+        end = part.find(">")
+        if start == -1 or end == -1 or end <= start + 1:
+            continue
+        url = part[start + 1 : end]
+        # Avoid importing urlparse to keep this helper small; a lightweight parse works.
+        query_start = url.find("?")
+        if query_start == -1:
+            continue
+        query_str = url[query_start + 1 :]
+        for kv in query_str.split("&"):
+            if not kv:
+                continue
+            key, _, value = kv.partition("=")
+            if key == "page_info" and value:
+                return value
+    return None
+
+
+async def _fetch_price_rules_page(
+    cfg: ShopifyStoreConfig,
+    limit: int,
+    page_info: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Fetch a single page of price rules from Shopify Admin API.
+    Returns (price_rules, next_page_info_cursor).
+    """
+    if not cfg.is_configured:
+        raise ShopifyPromotionsConfigError("Shopify store config is missing shop_domain or access_token")
+
+    url = f"https://{cfg.shop_domain}/admin/api/{SHOPIFY_API_VERSION}/price_rules.json"
+    params: Dict[str, Any] = {"limit": limit}
+    if page_info:
+        params["page_info"] = page_info
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url,
+                params=params,
+                headers={"X-Shopify-Access-Token": cfg.access_token},
+            )
+    except httpx.RequestError as exc:
+        raise ShopifyPromotionsError(f"Shopify price_rules request error: {exc}") from exc
+
+    if resp.status_code == 429:
+        raise ShopifyPromotionsRateLimitError("Shopify price_rules rate limit exceeded (status=429)")
+    if resp.status_code in (401, 403):
+        raise ShopifyPromotionsAuthError(f"Shopify price_rules auth failed (status={resp.status_code})")
+    if resp.status_code != 200:
+        raise ShopifyPromotionsError(f"Shopify price_rules fetch failed (status={resp.status_code})")
+
+    data = resp.json()
+    rules = data.get("price_rules", []) or []
+    next_cursor = _parse_shopify_next_page_info(resp.headers.get("Link"))
+    return rules, next_cursor
+
+
+async def fetch_all_price_rules(cfg: ShopifyStoreConfig) -> List[Dict[str, Any]]:
+    """Fetch all price rules for a store with basic pagination."""
+    all_rules: List[Dict[str, Any]] = []
+    page_info: Optional[str] = None
+
+    while True:
+        rules, next_cursor = await _fetch_price_rules_page(
+            cfg,
+            limit=SHOPIFY_PRICE_RULE_PAGE_LIMIT,
+            page_info=page_info,
+        )
+        all_rules.extend(rules)
+        if not next_cursor:
+            break
+        page_info = next_cursor
+
+    return all_rules
+
+
+def _safe_datetime(value: Optional[str], fallback: Optional[datetime] = None) -> Optional[datetime]:
+    if not value:
+        return fallback
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:  # pragma: no cover - defensive
+        return fallback
+
+
+def _build_promotion_id(prefix: str, price_rule_id: Any, merchant_id: str) -> str:
+    return f"{prefix}_{merchant_id}_{price_rule_id}"
+
+
+def _map_price_rule_to_promotion(
+    rule: Dict[str, Any],
+    merchant_id: str,
+    channel: str = "creator_agents",
+) -> Optional[PromotionCreate]:
+    """
+    Map a Shopify price rule into a PromotionCreate.
+    Focuses on the common cases:
+      - Percentage / fixed amount discounts on line items or orders.
+      - Free shipping discounts on shipping lines.
+    """
+    rule_id = rule.get("id")
+    if not rule_id:
+        return None
+
+    title = (rule.get("title") or "").strip() or "Shopify promotion"
+    target_type = rule.get("target_type") or "line_item"
+    value_type = (rule.get("value_type") or "").lower()  # 'percentage' | 'fixed_amount'
+    value_raw = rule.get("value")
+    try:
+        value_num = float(value_raw) if value_raw is not None else None
+    except (TypeError, ValueError):
+        value_num = None
+
+    prerequisite_qty = None
+    qty_range = rule.get("prerequisite_quantity_range") or {}
+    if isinstance(qty_range, dict):
+        prerequisite_qty = qty_range.get("greater_than_or_equal_to") or qty_range.get("greater_than")
+
+    prerequisite_subtotal = None
+    subtotal_range = rule.get("prerequisite_subtotal_range") or {}
+    if isinstance(subtotal_range, dict):
+        prerequisite_subtotal = subtotal_range.get("greater_than_or_equal_to") or subtotal_range.get("greater_than")
+
+    scope: Dict[str, Any] = {}
+    target_selection = (rule.get("target_selection") or "all").lower()
+    if target_selection == "all":
+        scope["global"] = True
+    else:
+        product_ids = rule.get("entitled_product_ids") or []
+        collection_ids = rule.get("entitled_collection_ids") or []
+        variant_ids = rule.get("entitled_variant_ids") or []
+        if product_ids:
+            scope["productIds"] = [str(pid) for pid in product_ids]
+        if collection_ids:
+            scope["collectionIds"] = [str(cid) for cid in collection_ids]
+        if variant_ids:
+            scope["variantIds"] = [str(vid) for vid in variant_ids]
+
+    start_at = _safe_datetime(rule.get("starts_at"), fallback=datetime.utcnow())
+    # Shopify price rules can be open-ended; promotions table requires an endAt.
+    end_at = _safe_datetime(rule.get("ends_at"))
+    if end_at is None and start_at is not None:
+        end_at = start_at + timedelta(days=365)
+    if end_at is None:
+        # Fallback safety: 1 year from now
+        end_at = datetime.utcnow() + timedelta(days=365)
+
+    # Determine promotion type and config
+    cfg: Dict[str, Any] = {
+        "source": "shopify_price_rule",
+        "priceRuleId": str(rule_id),
+    }
+
+    if target_type == "shipping_line":
+        promo_type = "FREE_SHIPPING"
+        cfg["kind"] = "FREE_SHIPPING"
+        cfg["freeShipping"] = True
+        if prerequisite_subtotal is not None:
+            cfg["minSubtotal"] = prerequisite_subtotal
+    else:
+        # Treat all non-shipping rules as multi-buy / percent-off style.
+        promo_type = "MULTI_BUY_DISCOUNT"
+        cfg["kind"] = "MULTI_BUY_DISCOUNT"
+        if prerequisite_qty is not None:
+            try:
+                cfg["thresholdQuantity"] = int(prerequisite_qty)
+            except (TypeError, ValueError):
+                pass
+
+        if value_type == "percentage" and value_num is not None:
+            # Shopify stores percentage discounts as negative numbers (e.g. -20.0).
+            cfg["discountPercent"] = abs(int(round(value_num)))
+        elif value_type == "fixed_amount" and value_num is not None:
+            # Fixed amount discounts don't map cleanly to a percentage without basket context.
+            # We still surface a label, but leave discountPercent unset.
+            cfg["discountAmount"] = abs(value_num)
+
+    promo_id = _build_promotion_id("shopify_rule", rule_id, merchant_id)
+
+    return PromotionCreate(
+        id=promo_id,
+        merchantId=merchant_id,
+        name=title,
+        type=promo_type,
+        description=(rule.get("description") or "").strip() if rule.get("description") else "",
+        startAt=start_at,
+        endAt=end_at,
+        channels=[channel],
+        scope=scope,
+        config=cfg,
+        exposeToCreators=True,
+        allowedCreatorIds=None,
+    )
+
+
+async def sync_shopify_promotions_for_merchant(
+    merchant_id: str,
+    channel: str = "creator_agents",
+) -> Dict[str, Any]:
+    """
+    Fetch Shopify price rules for a merchant and upsert them into the promotions table.
+
+    Returns a summary dict: { "merchantId", "rulesFetched", "created", "updated", "skipped" }.
+    """
+    cfg = await get_shopify_config_for_merchant(merchant_id)
+    if not cfg.is_configured:
+        raise ShopifyPromotionsConfigError(
+            f"Shopify configuration not found for merchant_id={merchant_id}"
+        )
+
+    rules = await fetch_all_price_rules(cfg)
+    logger.info(
+        "Fetched Shopify price rules",
+        extra={"merchant_id": merchant_id, "count": len(rules)},
+    )
+
+    created = 0
+    updated = 0
+    skipped = 0
+
+    for rule in rules:
+        promo = _map_price_rule_to_promotion(rule, merchant_id=merchant_id, channel=channel)
+        if not promo:
+            skipped += 1
+            continue
+
+        # Upsert by promo.id
+        existing = await get_promotion(promo.id)
+        if existing:
+            # Update mutable fields (name, description, dates, channels, scope, config, exposure).
+            update_payload = PromotionUpdate(
+                name=promo.name,
+                description=promo.description,
+                startAt=promo.startAt,
+                endAt=promo.endAt,
+                channels=promo.channels,
+                scope=promo.scope,
+                config=promo.config,
+                exposeToCreators=promo.exposeToCreators,
+                allowedCreatorIds=promo.allowedCreatorIds,
+            )
+            await update_promotion(promo.id, update_payload)
+            updated += 1
+        else:
+            await create_promotion(promo)
+            created += 1
+
+    return {
+        "merchantId": merchant_id,
+        "rulesFetched": len(rules),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+    }
