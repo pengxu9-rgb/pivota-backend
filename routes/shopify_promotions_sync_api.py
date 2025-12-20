@@ -36,20 +36,9 @@ async def require_shopify_promotions_admin(
         )
 
 
-@router.post(
-    "/sync/{merchant_id}",
-    response_model=Dict[str, Any],
-    status_code=status.HTTP_200_OK,
-)
-async def sync_shopify_promotions_endpoint(
-    merchant_id: str = Path(..., description="Internal merchant ID"),
-    _: None = Depends(require_shopify_promotions_admin),
-) -> Dict[str, Any]:
+async def _sync_shopify_promotions_or_raise(merchant_id: str) -> Dict[str, Any]:
     """
-    Sync Shopify price rules for a merchant into the promotions table.
-
-    This endpoint is admin-only and is intended to be called from internal
-    tools or one-off scripts (not from public frontends).
+    Shared implementation for both POST and GET sync endpoints.
     """
     try:
         summary = await sync_shopify_promotions_for_merchant(merchant_id=merchant_id)
@@ -59,21 +48,6 @@ async def sync_shopify_promotions_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "SHOPIFY_CONFIG_ERROR", "message": str(exc)},
         )
-
-
-@router.get(
-    "/sync/{merchant_id}",
-    response_model=Dict[str, Any],
-    status_code=status.HTTP_200_OK,
-)
-async def sync_shopify_promotions_get(
-    merchant_id: str = Path(..., description="Internal merchant ID"),
-    _: None = Depends(require_shopify_promotions_admin),
-) -> Dict[str, Any]:
-    """
-    GET alias for sync endpoint to make it easy to trigger from a browser.
-    """
-    return await sync_shopify_promotions_endpoint(merchant_id=merchant_id)  # type: ignore[arg-type]
     except ShopifyPromotionsAuthError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -94,3 +68,36 @@ async def sync_shopify_promotions_get(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "INTERNAL_ERROR", "message": str(exc)},
         )
+
+
+@router.post(
+    "/sync/{merchant_id}",
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+)
+async def sync_shopify_promotions_endpoint(
+    merchant_id: str = Path(..., description="Internal merchant ID"),
+    _: None = Depends(require_shopify_promotions_admin),
+) -> Dict[str, Any]:
+    """
+    Sync Shopify price rules for a merchant into the promotions table.
+
+    This endpoint is admin-only and is intended to be called from internal
+    tools or one-off scripts (not from public frontends).
+    """
+    return await _sync_shopify_promotions_or_raise(merchant_id)
+
+
+@router.get(
+    "/sync/{merchant_id}",
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+)
+async def sync_shopify_promotions_get(
+    merchant_id: str = Path(..., description="Internal merchant ID"),
+    _: None = Depends(require_shopify_promotions_admin),
+) -> Dict[str, Any]:
+    """
+    GET alias for sync endpoint to make it easy to trigger from a browser.
+    """
+    return await _sync_shopify_promotions_or_raise(merchant_id)
