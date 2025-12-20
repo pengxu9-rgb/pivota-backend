@@ -30,6 +30,7 @@ from services.platform_import_service import (
     mark_import_task_failed,
     mark_import_task_retry_scheduled,
 )
+from db.platform_import_tasks import get_import_task
 from db.connector_credentials import (
     get_latest_connector_credential_for_merchant,
     mark_credential_used,
@@ -532,19 +533,7 @@ async def _ingest_orders_report_csv(
     return counts
 
 
-async def process_next_import_task() -> Dict[str, Any]:
-    """
-    Process the next ready ImportTask, if any.
-
-    - Picks the oldest `pending` task
-    - For Shopify connector tasks, fetches a small batch of products and records counts
-    - For other tasks, simply marks as succeeded with zero counts
-    """
-
-    task = await get_next_ready_task()
-    if not task:
-        return {"processed": False, "reason": "no_pending_tasks"}
-
+async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
     task_id = task["id"]
     attempt = int(task.get("attempt", 0)) + 1
     merchant_id = task.get("merchant_id")
@@ -1054,3 +1043,40 @@ async def process_next_import_task() -> Dict[str, Any]:
             "error": str(exc),
             "counts": counts,
         }
+
+
+async def process_next_import_task() -> Dict[str, Any]:
+    """
+    Process the next ready ImportTask, if any.
+
+    - Picks the oldest `pending`/`retry_scheduled` task
+    - For Shopify connector tasks, fetches a small batch of products and records counts
+    - For other tasks, performs the corresponding import and marks status
+    """
+    task = await get_next_ready_task()
+    if not task:
+        return {"processed": False, "reason": "no_pending_tasks"}
+    return await _process_import_task_record(task)
+
+
+async def process_import_task_by_id(task_id: int) -> Dict[str, Any]:
+    """
+    Process a specific ImportTask by ID (best-effort).
+
+    Intended for APIs that want to schedule a task and immediately kick off processing
+    without relying on an external worker.
+    """
+    task = await get_import_task(task_id)
+    if not task:
+        return {"processed": False, "reason": "task_not_found", "task_id": task_id}
+
+    status = (task.get("status") or "").lower()
+    if status not in ("pending", "retry_scheduled"):
+        return {
+            "processed": False,
+            "reason": "task_not_ready",
+            "task_id": task_id,
+            "status": task.get("status"),
+        }
+
+    return await _process_import_task_record(task)

@@ -1,5 +1,5 @@
 """Extended Merchant API Routes for Dashboard Features"""
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone
@@ -184,8 +184,11 @@ async def update_merchant_profile(
     }
 
 @router.post("/merchant/integrations/shopify/sync")
-async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
-    """Sync products from Shopify store - 真正同步产品，不只是读缓存"""
+async def sync_shopify_products(
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
+    """Sync products from Shopify store - schedule an async import task (do not block request)."""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -218,42 +221,36 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
                 detail=f"Store is {store_check['status']}. Please reconnect your store."
             )
         
-        # 2. 调用真正的产品同步（会从 Shopify API 拉取产品并更新 products_cache）
-        from routes.product_sync import sync_products, SyncRequest
-        from fastapi import BackgroundTasks
-        
-        sync_request = SyncRequest(
-            merchant_id=merchant_id,
-            force_refresh=True,  # 强制刷新
-            limit=250,
-            platform="shopify"  # 明确指定同步 Shopify
-        )
-        
-        # 执行真正的同步（调用 Universal Sync）
-        sync_result = await sync_products(
-            request=sync_request,
-            background_tasks=BackgroundTasks(),
-            current_user=current_user,
-        )
-        
-        # 根据 universal sync 的状态返回更清晰的结果
-        if sync_result.status != "success":
-            # 透传 warning/error 给前端，而不是假装成功
-            raise HTTPException(
-                status_code=400,
-                detail=f"Shopify sync failed: {sync_result.message}",
-            )
+        # 2) Schedule a background import task instead of running a long sync in-request.
+        #    This prevents browser net::ERR_CONNECTION_CLOSED due to proxy/request timeouts.
+        from services.platform_import_service import schedule_import_task
+        from jobs.catalog_import_worker import process_import_task_by_id
 
-        print(f"✅ Synced {sync_result.products_synced} Shopify products for merchant {merchant_id}")
+        task_id = await schedule_import_task(
+            merchant_id=merchant_id,
+            source_type="connector",
+            connector="shopify",
+        )
+
+        # Kick off processing in the background (best effort). If a dedicated worker is running,
+        # it can also pick up the pending task later.
+        background_tasks.add_task(process_import_task_by_id, task_id)
+
+        logger.info(
+            "✅ Scheduled Shopify sync import task",
+            extra={"merchant_id": merchant_id, "task_id": task_id, "store_domain": store_check.get("domain")},
+        )
 
         return {
             "status": "success",
-            "message": sync_result.message,
+            "message": "Shopify sync scheduled. It may take a few minutes to finish.",
             "data": {
-                "product_count": sync_result.products_synced,
+                "task_id": task_id,
+                "scheduled": True,
+                "product_count": store_check.get("product_count"),
                 "store_domain": store_check["domain"],
-                "platform": sync_result.platform,
-                "synced_at": sync_result.sync_time,
+                "platform": "shopify",
+                "synced_at": datetime.now(timezone.utc).isoformat(),
             },
         }
     except HTTPException:
@@ -261,6 +258,35 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"❌ Sync failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
+
+
+@router.get("/merchant/integrations/shopify/sync/status")
+async def get_shopify_sync_status(current_user: dict = Depends(get_current_user)):
+    """Return recent Shopify import tasks for the current merchant."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    from services.platform_import_service import list_import_tasks
+
+    try:
+        tasks = await list_import_tasks(merchant_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load import tasks: {str(e)}")
+
+    shopify_tasks = [
+        t for t in tasks
+        if (t.get("source_type") == "connector" and (t.get("connector") or "").lower() == "shopify")
+    ]
+
+    return {
+        "status": "success",
+        "data": {
+            "merchant_id": merchant_id,
+            "tasks": shopify_tasks[:20],
+        },
+    }
 
 
 @router.get("/merchant/integrations/routing")
