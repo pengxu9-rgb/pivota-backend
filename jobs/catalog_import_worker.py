@@ -36,6 +36,7 @@ from db.connector_credentials import (
     mark_credential_used,
 )
 from services.crypto_service import crypto_service
+from catalog.recommendation_meta import derive_recommendation_meta
 from db.products import upsert_product_cache
 from db.platform_import_reports import get_platform_report
 from db.platform_orders import insert_platform_order
@@ -48,7 +49,6 @@ from services.amazon_sp_api_service import (
     fetch_order_items,
     convert_amazon_order_to_platform_format,
 )
-from adapters.product_adapters import ShopifyProductAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -409,7 +409,8 @@ async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
 
     Order of precedence:
     1) Per-merchant encrypted connector_credentials (if available and decryptable).
-    2) Global settings/env fallback via _get_shopify_config().
+    2) Per-merchant merchant_stores primary store (domain/api_key), when available.
+    3) Global settings/env fallback via _get_shopify_config().
     """
     # Try per-merchant encrypted credentials first.
     try:
@@ -438,6 +439,24 @@ async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
                 "Failed to decrypt connector credentials; falling back to env",
                 extra={"merchant_id": merchant_id, "credential_id": credential.get('id'), "error": str(e)},
             )
+
+    # Try per-merchant store connection (merchant_stores / legacy mcp) before env fallback.
+    try:
+        from services.merchant_store_service import get_merchant_active_stores
+
+        stores = await get_merchant_active_stores(merchant_id)
+        for store in stores:
+            if (store.get("platform") or "").lower() != "shopify":
+                continue
+            shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip()
+            access_token = (store.get("api_key") or store.get("access_token") or "").strip()
+            if shop_domain and access_token:
+                return {"shop_domain": shop_domain, "access_token": access_token}
+    except Exception as e:
+        logger.error(
+            "Failed to resolve Shopify config from merchant store; falling back to env",
+            extra={"merchant_id": merchant_id, "error": str(e)},
+        )
 
     # Fallback to global configuration.
     return _get_shopify_config()
@@ -611,25 +630,47 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                         dto = ShopifyProductDTO.from_shopify_api(p)
                         platform_product_id = dto.shopify_id
 
-                        # Store full StandardProduct payload (includes variants/price/sku/inventory),
-                        # otherwise downstream consumers will treat missing fields as zeros.
-                        standard_product = ShopifyProductAdapter.convert_to_standard(p, merchant_id)
-                        product_payload = standard_product.dict()
-
-                        # Optional enrichment: recommendation_meta is used by agent ranking/retrieval.
+                        # Build product_data payload and enrich with recommendation_meta.
+                        product_data = dto.to_cache_payload()
+                        recommendation_meta = None
                         try:
-                            product_payload["recommendation_meta"] = derive_recommendation_meta(
-                                standard_product=standard_product,
+                            # StandardProduct is not stored in products_cache for Shopify
+                            # imports today, but the helper accepts None and relies on
+                            # raw Shopify product tags.
+                            recommendation_meta = derive_recommendation_meta(
+                                standard_product=None,
                                 raw_shopify_product=p,
                             )
-                        except Exception:
-                            pass
+                        except Exception as meta_exc:
+                            # Parsing recommendation metadata must never break catalog
+                            # imports. Log a structured error and continue with an
+                            # explicit empty meta structure so downstream code can
+                            # rely on the field existing.
+                            logger.exception(
+                                "Failed to derive recommendation_meta for Shopify product",
+                                extra={
+                                    "task_id": task_id,
+                                    "merchant_id": merchant_id,
+                                    "platform_product_id": platform_product_id,
+                                    "raw_tags": p.get("tags"),
+                                },
+                            )
+                            recommendation_meta = {
+                                "version": 1,
+                                "group_id": None,
+                                "tags_raw": [],
+                                "tags": [],
+                                "facets": {},
+                                "parse_error": True,
+                            }
+
+                        product_data["recommendation_meta"] = recommendation_meta
 
                         await upsert_product_cache(
                             merchant_id=merchant_id,
                             platform="shopify",
                             platform_product_id=platform_product_id,
-                            product_data=product_payload,
+                            product_data=product_data,
                             ttl_seconds=3600,
                         )
                         succeeded += 1

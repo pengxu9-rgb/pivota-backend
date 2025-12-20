@@ -22,10 +22,12 @@ import httpx
 import logging
 import time
 import json
+from datetime import datetime
 
 from routes.agent_api import get_agent_context, AgentContext, log_agent_request
 from routes.merchant_onboarding_routes import get_merchant_onboarding
 from fastapi import BackgroundTasks
+from db.database import database
 from db.products import get_product_cache_row
 from models.standard_product import StandardProduct
 from db.product_quality import product_quality_snapshot
@@ -48,6 +50,278 @@ def _get_quality_thresholds() -> Dict[str, float]:
     except Exception:
         mr_min = 0.0
     return {"cq_min": cq_min, "mr_min": mr_min}
+
+
+def _normalize_recommendation_meta(product_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize recommendation_meta into a stable structure.
+
+    Older rows may not have this field; in that case, return an empty meta
+    with version=1 so downstream logic can rely on the shape.
+    """
+    meta = (product_data or {}).get("recommendation_meta") or {}
+    return {
+        "version": meta.get("version", 1),
+        "group_id": meta.get("group_id"),
+        "tags_raw": meta.get("tags_raw") or [],
+        "tags": meta.get("tags") or [],
+        "facets": meta.get("facets") or {},
+        "parse_error": bool(meta.get("parse_error")),
+    }
+
+
+def _build_secondary_tag_tokens(meta: Dict[str, Any], max_tokens: int = 6) -> List[str]:
+    """
+    Build a small set of tag tokens for secondary candidate prefiltering.
+
+    Tokens map back to recommendation_meta.tags entries, e.g. "use:blush".
+    Priority: use > area > cat > material > hair > feature > series > color.
+    """
+    facets = meta.get("facets") or {}
+    tokens: List[str] = []
+
+    for val in facets.get("use", []):
+        tokens.append(f"use:{val}")
+    for val in facets.get("area", []):
+        tokens.append(f"area:{val}")
+
+    cat = facets.get("cat")
+    if cat:
+        tokens.append(f"cat:{cat}")
+
+    for val in facets.get("material", []):
+        tokens.append(f"material:{val}")
+    for val in facets.get("hair", []):
+        tokens.append(f"hair:{val}")
+    for val in facets.get("feature", []):
+        tokens.append(f"feature:{val}")
+    for val in facets.get("series", []):
+        tokens.append(f"series:{val}")
+    for val in facets.get("color", []):
+        tokens.append(f"color:{val}")
+
+    # Preserve order but clamp to a safe upper bound.
+    seen = set()
+    result: List[str] = []
+    for t in tokens:
+        if t in seen:
+            continue
+        seen.add(t)
+        result.append(t)
+        if len(result) >= max_tokens:
+            break
+
+    # Fallback: if facets are empty, use normalized tags directly so we can still
+    # prefilter candidates by generic Shopify tags (e.g. "concealer").
+    if not result:
+        for t in (meta.get("tags") or []):
+            if not isinstance(t, str):
+                continue
+            tok = t.strip()
+            if not tok:
+                continue
+            if tok.startswith("group-") or tok.startswith("group:"):
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            result.append(tok)
+            if len(result) >= max_tokens:
+                break
+    return result
+
+
+def _extract_product_card(
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+    product_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build a minimal product card from products_cache.product_data.
+
+    For Shopify, this uses the DTO fields plus raw payload when available.
+    """
+    raw = (product_data or {}).get("raw") or {}
+
+    title = (
+        product_data.get("title")
+        or raw.get("title")
+        or ""
+    )
+    handle = product_data.get("handle") or raw.get("handle")
+
+    # Main image: prefer raw.image.src, then first images[x].src, then DTO hint.
+    image_url = None
+    try:
+        image_url = (raw.get("image") or {}).get("src") or None
+    except Exception:
+        image_url = None
+
+    if not image_url:
+        try:
+            images = raw.get("images") or []
+            if isinstance(images, list):
+                for img in images:
+                    if isinstance(img, dict) and img.get("src"):
+                        image_url = img.get("src")
+                        break
+        except Exception:
+            image_url = None
+
+    if not image_url:
+        image_url = product_data.get("image_url")
+
+    # Derive simple price / inventory signals from raw variants when possible.
+    price: Optional[float] = None
+    currency: str = "USD"
+    in_stock = False
+    inventory_quantity = 0
+    variants = raw.get("variants") or []
+    if isinstance(variants, list) and variants:
+        # Aggregate inventory and pick a reasonable price.
+        for v in variants:
+            try:
+                qty = v.get("inventory_quantity")
+                if qty is not None:
+                    qty_int = int(qty)
+                    inventory_quantity += max(qty_int, 0)
+                    if qty_int > 0:
+                        in_stock = True
+            except Exception:
+                continue
+        try:
+            first = variants[0]
+            p_raw = first.get("price")
+            if p_raw is not None and p_raw != "":
+                price = float(p_raw)
+            currency = (
+                first.get("currency")
+                or raw.get("presentment_currency")
+                or currency
+            )
+        except Exception:
+            # Keep defaults
+            pass
+
+    status = (product_data.get("status") or raw.get("status") or "").lower()
+
+    # Prefer explicit orderable flag when present on product_data; otherwise
+    # fall back to a simple heuristic based on status + inventory.
+    explicit_orderable = product_data.get("orderable")
+    if explicit_orderable is not None:
+        orderable = bool(explicit_orderable)
+    else:
+        orderable = bool(status == "active" and (in_stock or inventory_quantity > 0))
+
+    return {
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "platform_product_id": platform_product_id,
+        "title": title,
+        "handle": handle,
+        "image_url": image_url,
+        "price": price,
+        "currency": currency,
+        "in_stock": in_stock,
+        "orderable": orderable,
+        "status": status or None,
+    }
+
+
+def _compute_similarity_score(
+    target_meta: Dict[str, Any],
+    candidate_meta: Dict[str, Any],
+    is_primary: bool,
+    is_sellable: bool,
+    candidate_price: Optional[float],
+    target_price: Optional[float],
+) -> float:
+    """
+    Compute a simple similarity score between target and candidate.
+
+    Heuristics:
+    - Primary (same group_id) gets a large base boost.
+    - use/area overlap is strongest, then cat/material, then other facets.
+    - Sellable (in stock + orderable) gets a small boost.
+    - Price distance is penalized when both prices are known.
+    """
+    score = 0.0
+
+    if is_primary:
+        score += 1000.0
+
+    t_facets = target_meta.get("facets") or {}
+    c_facets = candidate_meta.get("facets") or {}
+
+    def _set(name: str) -> set:
+        vals = (t_facets.get(name) or []) if isinstance(t_facets.get(name), list) else t_facets.get(name)
+        cand_vals = (c_facets.get(name) or []) if isinstance(c_facets.get(name), list) else c_facets.get(name)
+        if isinstance(vals, list):
+            s1 = set(vals)
+        elif vals:
+            s1 = {vals}
+        else:
+            s1 = set()
+        if isinstance(cand_vals, list):
+            s2 = set(cand_vals)
+        elif cand_vals:
+            s2 = {cand_vals}
+        else:
+            s2 = set()
+        return s1, s2
+
+    # use: strongest signal
+    t_use, c_use = _set("use")
+    use_overlap = len(t_use & c_use)
+    score += use_overlap * 50.0
+
+    # area: face/eyes/etc.
+    t_area, c_area = _set("area")
+    area_overlap = len(t_area & c_area)
+    score += area_overlap * 20.0
+
+    # cat: single-valued category
+    t_cat = t_facets.get("cat")
+    c_cat = c_facets.get("cat")
+    if t_cat and c_cat and t_cat == c_cat:
+        score += 15.0
+
+    # material
+    t_mat, c_mat = _set("material")
+    score += len(t_mat & c_mat) * 10.0
+
+    # hair/feature/series/color: weaker but still useful
+    for name in ["hair", "feature", "series", "color"]:
+        t_set, c_set = _set(name)
+        score += len(t_set & c_set) * 3.0
+
+    # ships: very weak tie-breaker
+    t_ships, c_ships = _set("ships")
+    score += len(t_ships & c_ships) * 2.0
+
+    # Generic tag overlap (helps when facets are sparse).
+    try:
+        t_tags = {t for t in (target_meta.get("tags") or []) if isinstance(t, str)}
+        c_tags = {t for t in (candidate_meta.get("tags") or []) if isinstance(t, str)}
+        group_filtered = {t for t in (t_tags & c_tags) if not (t.startswith("group-") or t.startswith("group:"))}
+        score += len(group_filtered) * 2.0
+    except Exception:
+        pass
+
+    if is_sellable:
+        score += 5.0
+
+    if (
+        candidate_price is not None
+        and target_price is not None
+        and target_price > 0
+    ):
+        price_diff_ratio = abs(candidate_price - target_price) / float(target_price)
+        # Penalize large price deviations; cap penalty to avoid dominating other signals.
+        score -= min(price_diff_ratio * 10.0, 30.0)
+
+    return score
 
 
 async def _fetch_latest_quality(
@@ -76,6 +350,96 @@ async def _fetch_latest_quality(
         },
     )
     return dict(row) if row else None
+
+
+async def _fetch_group_candidates(
+    merchant_id: str,
+    platform_product_id: str,
+    group_id: Optional[str],
+    platform: str = "shopify",
+    limit: int = 24,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch primary candidates sharing the same recommendation group_id.
+    """
+    if not group_id:
+        return []
+
+    query = """
+    SELECT platform_product_id, product_data, cached_at
+    FROM products_cache
+    WHERE merchant_id = :merchant_id
+      AND platform = :platform
+      AND platform_product_id != :platform_product_id
+      AND expires_at > NOW()
+      AND (cache_status IS NULL OR cache_status = 'fresh')
+      AND product_data::jsonb -> 'recommendation_meta' ->> 'group_id' = :group_id
+    ORDER BY cached_at DESC
+    LIMIT :limit
+    """
+    rows = await database.fetch_all(
+        query,
+        {
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+            "group_id": group_id,
+            "limit": limit,
+        },
+    )
+    return [dict(r) for r in rows]
+
+
+async def _fetch_secondary_candidates(
+    merchant_id: str,
+    platform_product_id: str,
+    tokens: List[str],
+    platform: str = "shopify",
+    limit: int = 80,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch secondary candidates for facet-based similarity.
+
+    Uses a light JSON filter on recommendation_meta.tags when tokens are provided,
+    otherwise falls back to most recently cached products for the merchant.
+    """
+    params: Dict[str, Any] = {
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "platform_product_id": platform_product_id,
+        "limit": limit,
+    }
+
+    base_where = """
+    WHERE merchant_id = :merchant_id
+      AND platform = :platform
+      AND platform_product_id != :platform_product_id
+      AND expires_at > NOW()
+      AND (cache_status IS NULL OR cache_status = 'fresh')
+    """
+
+    tag_clauses: List[str] = []
+    for idx, tok in enumerate(tokens):
+        key = f"tag_{idx}"
+        params[key] = tok
+        tag_clauses.append(
+            "(product_data::jsonb #> '{recommendation_meta,tags}') ? :" + key
+        )
+
+    where_sql = base_where
+    if tag_clauses:
+        where_sql += "\n      AND (" + " OR ".join(tag_clauses) + ")"
+
+    query = (
+        "SELECT platform_product_id, product_data, cached_at\n"
+        "FROM products_cache\n"
+        f"{where_sql}\n"
+        "ORDER BY cached_at DESC\n"
+        "LIMIT :limit"
+    )
+
+    rows = await database.fetch_all(query, params)
+    return [dict(r) for r in rows]
 
 
 @router.get("/merchants/{merchant_id}")
@@ -689,3 +1053,240 @@ async def get_related_products(
     except Exception as e:
         logger.error(f"Related products error: {e}")
         raise HTTPException(status_code=500, detail="Failed to compute related products")
+
+
+@router.get("/recommendations")
+async def get_product_recommendations(
+    merchant_id: str,
+    platform_product_id: str,
+    background_tasks: BackgroundTasks,
+    limit: int = Query(default=8, ge=1, le=20),
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Recommend related products for a given Shopify product.
+
+    Strategy:
+    - Target is resolved from products_cache (platform='shopify').
+    - Primary candidates: same recommendation_meta.group_id.
+    - Secondary candidates: facet-similar products from products_cache using
+      recommendation_meta.tags prefilter + Python reranking.
+    """
+    start_time = time.time()
+
+    # Verify agent has access to this merchant
+    if not context.can_access_merchant(merchant_id):
+        raise HTTPException(
+            status_code=403, detail="Not authorized for this merchant"
+        )
+
+    platform = "shopify"
+
+    try:
+        # 1. Load target product from products_cache
+        target_row = await get_product_cache_row(
+            merchant_id=merchant_id,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            include_expired=False,
+        )
+
+        if not target_row:
+            raise HTTPException(status_code=404, detail="Target product not found")
+
+        product_data = target_row.get("product_data") or {}
+        if isinstance(product_data, str):
+            try:
+                product_data = json.loads(product_data)
+            except Exception:
+                product_data = {}
+
+        target_meta = _normalize_recommendation_meta(product_data)
+        target_group_id = target_meta.get("group_id")
+        target_price: Optional[float] = None
+
+        # Build a unified target card for response and scoring.
+        target_card = _extract_product_card(
+            merchant_id=merchant_id,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            product_data=product_data,
+        )
+        target_price = target_card.get("price")
+
+        # 2. Fetch primary (same-group) candidates.
+        primary_fetch_limit = min(limit * 3, 48)
+        primary_rows = await _fetch_group_candidates(
+            merchant_id=merchant_id,
+            platform_product_id=platform_product_id,
+            group_id=target_group_id,
+            platform=platform,
+            limit=primary_fetch_limit,
+        )
+
+        # 3. Fetch secondary (facet-similar) candidates.
+        tokens = _build_secondary_tag_tokens(target_meta, max_tokens=6)
+        secondary_fetch_limit = min(max(limit * 10, 40), 200)
+        if tokens:
+            secondary_rows = await _fetch_secondary_candidates(
+                merchant_id=merchant_id,
+                platform_product_id=platform_product_id,
+                tokens=tokens,
+                platform=platform,
+                limit=secondary_fetch_limit,
+            )
+        else:
+            secondary_rows = []
+
+        candidates: Dict[str, Dict[str, Any]] = {}
+
+        # Helper to ingest rows into the candidate map.
+        def _ingest_rows(
+            rows: List[Dict[str, Any]],
+            source: str,
+            is_primary: bool,
+        ) -> None:
+            for row in rows:
+                pid = str(row.get("platform_product_id") or "")
+                if not pid or pid == platform_product_id:
+                    continue
+                if pid in candidates:
+                    # Prefer primary metadata when duplicate appears.
+                    if is_primary and not candidates[pid].get("is_primary"):
+                        candidates[pid]["is_primary"] = True
+                    continue
+
+                pdata = row.get("product_data") or {}
+                if isinstance(pdata, str):
+                    try:
+                        pdata = json.loads(pdata)
+                    except Exception:
+                        pdata = {}
+
+                meta = _normalize_recommendation_meta(pdata)
+                card = _extract_product_card(
+                    merchant_id=merchant_id,
+                    platform=platform,
+                    platform_product_id=pid,
+                    product_data=pdata,
+                )
+                candidates[pid] = {
+                    "platform_product_id": pid,
+                    "product_data": pdata,
+                    "meta": meta,
+                    "card": card,
+                    "cached_at": row.get("cached_at"),
+                    "source": source,
+                    "is_primary": is_primary,
+                }
+
+        _ingest_rows(primary_rows, source="primary_group", is_primary=True)
+        _ingest_rows(secondary_rows, source="secondary_facets", is_primary=False)
+
+        # 4. Compute scores and build final recommendation list.
+        ranked: List[Dict[str, Any]] = []
+
+        for pid, item in candidates.items():
+            card = item["card"]
+            meta = item["meta"]
+            is_primary = bool(item.get("is_primary"))
+            is_sellable = bool(card.get("orderable")) and bool(
+                card.get("in_stock") or card.get("inventory_quantity", 0) > 0
+            )
+            candidate_price = card.get("price")
+            score = _compute_similarity_score(
+                target_meta=target_meta,
+                candidate_meta=meta,
+                is_primary=is_primary,
+                is_sellable=is_sellable,
+                candidate_price=candidate_price,
+                target_price=target_price,
+            )
+            item["score"] = score
+            ranked.append(item)
+
+        # Sort by score, then sellability, then recency.
+        def _sort_key(it: Dict[str, Any]):
+            card = it.get("card") or {}
+            cached_at = it.get("cached_at")
+            if isinstance(cached_at, str):
+                try:
+                    cached_at_dt = datetime.fromisoformat(cached_at)
+                except Exception:
+                    cached_at_dt = datetime.min
+            elif isinstance(cached_at, datetime):
+                cached_at_dt = cached_at
+            else:
+                cached_at_dt = datetime.min
+
+            return (
+                it.get("score", 0.0),
+                cached_at_dt,
+            )
+
+        ranked.sort(key=_sort_key, reverse=True)
+        top_ranked = ranked[:limit]
+
+        recommendations = [it["card"] | {"score": it.get("score")} for it in top_ranked]
+
+        response_time_ms = int((time.time() - start_time) * 1000)
+
+        primary_count = len(primary_rows)
+        secondary_count = len(secondary_rows)
+
+        # Log query source and performance.
+        log_query_source(
+            agent_id=context.agent_id,
+            merchant_id=merchant_id,
+            endpoint="/agent/v1/products/recommendations",
+            query_source="cache_only",
+            response_time_ms=response_time_ms,
+            product_count=len(recommendations),
+        )
+
+        logger.info(
+            "agent_product_recommendations",
+            extra={
+                "event": "agent_product_recommendations",
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+                "group_id": target_group_id,
+                "tokens_used": tokens,
+                "primary_count": primary_count,
+                "secondary_count": secondary_count,
+                "returned": len(recommendations),
+                "response_time_ms": response_time_ms,
+            },
+        )
+
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=merchant_id,
+        )
+
+        return {
+            "status": "success",
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+            "target": target_card,
+            "recommendations": recommendations,
+            "debug": {
+                "group_id": target_group_id,
+                "primary_count": primary_count,
+                "secondary_count": secondary_count,
+                "parse_error": bool(target_meta.get("parse_error")),
+            },
+            "response_time_ms": response_time_ms,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to compute product recommendations: {e}")
+        raise HTTPException(
+            status_code=500, detail="Failed to compute product recommendations"
+        )
