@@ -618,7 +618,10 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
 
                         # Optional enrichment: recommendation_meta is used by agent ranking/retrieval.
                         try:
-                            product_payload["recommendation_meta"] = derive_recommendation_meta(standard_product)
+                            product_payload["recommendation_meta"] = derive_recommendation_meta(
+                                standard_product=standard_product,
+                                raw_shopify_product=p,
+                            )
                         except Exception:
                             pass
 
