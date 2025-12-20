@@ -19,8 +19,8 @@ router = APIRouter(prefix="/agent/v1/fulfillment", tags=["agent-fulfillment"])
 @router.get("/track/{order_id}")
 async def track_order_fulfillment(
     order_id: str,
+    background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Get fulfillment and tracking information for an order
@@ -184,4 +184,3 @@ async def get_in_transit_orders(
     except Exception as e:
         logger.error(f"Error getting in-transit orders: {e}")
         raise HTTPException(status_code=500, detail="Failed to get in-transit orders")
-

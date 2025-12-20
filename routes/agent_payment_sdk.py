@@ -68,8 +68,8 @@ class PaymentResponse(BaseModel):
 @router.post("/payments", response_model=PaymentResponse)
 async def create_payment(
     request: PaymentRequest,
+    background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Create payment for an order

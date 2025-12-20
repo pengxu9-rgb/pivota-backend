@@ -23,6 +23,7 @@ from routes.fulfillment_api import track_order_fulfillment
 from routes.order_routes import create_new_order
 from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from utils.logger import logger
+from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
 from services.agent_ranking_service import (
     AgentRankingFeatures,
@@ -63,8 +64,13 @@ async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
 
 @router.get("/products/search")
 async def agent_search_products(
+    background_tasks: BackgroundTasks,
     merchant_id: Optional[str] = None,  # Now optional for cross-merchant search
     merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
+    search_all_merchants: bool = Query(
+        default=False,
+        description="Opt-in cross-merchant search (requires explicit intent to avoid irrelevant results)",
+    ),
     query: Optional[str] = None,
     category: Optional[str] = None,
     min_price: Optional[float] = None,
@@ -73,7 +79,6 @@ async def agent_search_products(
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     智能产品搜索 - Cross-Merchant Support
@@ -87,6 +92,11 @@ async def agent_search_products(
     - 相关度评分
     """
     try:
+        overrides = infer_query_overrides(query=query, category=category)
+        query = overrides["query"]
+        category = overrides["category"]
+        query_terms: List[str] = overrides["terms"]
+
         # Determine which merchants to search
         merchants_to_search = []
         
@@ -102,17 +112,30 @@ async def agent_search_products(
                     raise HTTPException(status_code=403, detail=f"Not authorized for merchant {mid}")
             merchants_to_search = merchant_ids
         else:
-            # Search ALL merchants (cross-merchant search)
-            # Get all active merchants from database
-            query_merchants = """
-                SELECT merchant_id, business_name FROM merchant_onboarding 
-                WHERE status NOT IN ('deleted', 'rejected') 
-                AND psp_connected = true
-                LIMIT 100
-            """
-            merchant_rows = await database.fetch_all(query_merchants)
-            merchants_to_search = [row["merchant_id"] for row in merchant_rows]
-        
+            # No explicit merchant scope.
+            #
+            # Prefer searching within the agent's allowed merchants when set,
+            # otherwise fall back to cross-merchant search (legacy behavior).
+            if isinstance(getattr(context, "allowed_merchants", None), list):
+                allowed = [m for m in context.allowed_merchants if m]
+                if len(allowed) == 1:
+                    merchants_to_search = allowed
+                    merchant_id = allowed[0]
+                elif allowed:
+                    merchants_to_search = allowed
+
+            if not merchants_to_search:
+                # Cross-merchant search (legacy behavior). `search_all_merchants`
+                # is kept for client-side explicitness but is not required.
+                query_merchants = """
+                    SELECT merchant_id, business_name FROM merchant_onboarding
+                    WHERE status NOT IN ('deleted', 'rejected')
+                    AND psp_connected = true
+                    LIMIT 100
+                """
+                merchant_rows = await database.fetch_all(query_merchants)
+                merchants_to_search = [row["merchant_id"] for row in merchant_rows]
+
         # Collect products from all target merchants
         all_products: List[Dict[str, Any]] = []
         
@@ -160,9 +183,13 @@ async def agent_search_products(
             # 类别过滤
             if category:
                 product_category = (
-                    product.get("category")
-                    or product.get("product_type")
-                    or ""
+                    " ".join(
+                        [
+                            str(product.get("category") or ""),
+                            str(product.get("product_type") or ""),
+                            " ".join(product.get("tags") or []),
+                        ]
+                    )
                 ).lower()
                 if category.lower() not in product_category:
                     continue
@@ -173,6 +200,9 @@ async def agent_search_products(
                 query_lower = query.lower()
                 title = product.get("title", "").lower()
                 description = product.get("description", "").lower()
+                tags = " ".join(product.get("tags") or []).lower()
+                product_type = (product.get("product_type") or "").lower()
+                haystack = " ".join([title, description, tags, product_type]).strip()
                 
                 # Calculate relevance
                 if query_lower in title:
@@ -180,10 +210,12 @@ async def agent_search_products(
                     relevance_score = 1.0 if query_lower == title else 0.9
                 elif query_lower in description:
                     relevance_score = 0.7
+                elif query_lower in tags or query_lower in product_type:
+                    relevance_score = 0.75
                 else:
                     # Check for partial word matches
-                    query_words = query_lower.split()
-                    matches = sum(1 for word in query_words if word in title or word in description)
+                    query_words = query_terms or query_lower.split()
+                    matches = sum(1 for word in query_words if word and word in haystack)
                     if matches > 0:
                         relevance_score = 0.5 + (matches / len(query_words)) * 0.3
                     else:
@@ -360,8 +392,8 @@ async def agent_search_products(
 async def agent_get_product(
     merchant_id: str,
     product_id: str,
+    background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """获取单个产品详情"""
     try:
@@ -440,9 +472,9 @@ async def agent_get_product(
 async def agent_validate_cart(
     merchant_id: str,
     items: List[Dict[str, Any]],
+    background_tasks: BackgroundTasks,
     shipping_country: str = "US",
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     验证购物车并计算价格
@@ -570,8 +602,8 @@ async def agent_validate_cart(
 @router.post("/orders/create")
 async def agent_create_order(
     order_request: CreateOrderRequest,
+    background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     创建订单（代理标准订单创建流程）
@@ -740,8 +772,8 @@ async def agent_create_order(
 @router.post("/orders/{order_id}/confirm-payment")
 async def agent_confirm_payment(
     order_id: str,
+    background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """确认支付并触发 Shopify 订单创建（Agent 调用）"""
     try:
@@ -855,8 +887,8 @@ async def agent_confirm_payment(
 @router.get("/orders/{order_id}")
 async def agent_get_order(
     order_id: str,
+    background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """获取订单状态"""
     try:
@@ -919,12 +951,12 @@ async def agent_get_order(
 
 @router.get("/orders")
 async def agent_list_orders(
+    background_tasks: BackgroundTasks,
     merchant_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     列出 Agent 创建的订单

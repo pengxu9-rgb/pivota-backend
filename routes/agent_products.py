@@ -450,9 +450,9 @@ async def _fetch_secondary_candidates(
 @router.get("/merchants/{merchant_id}")
 async def get_merchant_products(
     merchant_id: str,
+    background_tasks: BackgroundTasks,
     limit: int = Query(default=50, le=250),
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Get merchant products via hybrid query (cache or realtime merchant API)
@@ -681,8 +681,8 @@ async def get_merchant_products(
 async def get_product_details(
     merchant_id: str,
     product_id: str,
+    background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """Get detailed information about a specific product"""
     try:
@@ -920,9 +920,9 @@ async def get_product_details(
 async def get_related_products(
     merchant_id: str,
     product_id: str,
+    background_tasks: BackgroundTasks,
     limit: int = Query(default=10, ge=1, le=50),
     context: AgentContext = Depends(get_agent_context),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Recommend related products for a given product.
