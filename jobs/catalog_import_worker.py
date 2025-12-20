@@ -152,7 +152,9 @@ def _build_shopify_cache_payload(
         raise ValueError("Shopify product missing id")
 
     # Additive/compat fields for easier consumption/debugging.
-    product_data["raw"] = raw_shopify_product
+    # Raw Shopify payload can be large; allow disabling it to save DB cost.
+    if os.getenv("SHOPIFY_CACHE_INCLUDE_RAW", "true").lower() in ("1", "true", "yes", "y"):
+        product_data["raw"] = raw_shopify_product
     product_data["shopify_id"] = platform_product_id
     product_data["handle"] = (
         raw_shopify_product.get("handle")
@@ -644,12 +646,15 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 shopify_cache_ttl_seconds = 86400
 
+            sync_only_orderable = os.getenv("SHOPIFY_SYNC_ONLY_ORDERABLE", "false").lower() in ("1", "true", "yes", "y")
+
             started_at = datetime.utcnow()
             all_products: List[Dict[str, Any]] = []
             page_info: Optional[str] = None
             pages_fetched = 0
             succeeded = 0
             failed = 0
+            skipped = 0
 
             # Running progress snapshot for UI/status polling.
             counts.update(
@@ -657,6 +662,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                     "total": 0,
                     "succeeded": 0,
                     "failed": 0,
+                    "skipped": 0,
                     "pages_fetched": 0,
                     "page_size": page_size,
                     "max_pages_limit": max_pages,
@@ -706,6 +712,10 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                             merchant_id=merchant_id,
                             raw_shopify_product=p,
                         )
+
+                        if sync_only_orderable and not bool(getattr(standard_product, "orderable", False)):
+                            skipped += 1
+                            continue
 
                         # Enrich with recommendation_meta (best-effort; never blocks import).
                         recommendation_meta = None
@@ -769,6 +779,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                 counts["total"] = len(all_products)
                 counts["succeeded"] = succeeded
                 counts["failed"] = failed
+                counts["skipped"] = skipped
                 counts["pages_fetched"] = pages_fetched
                 counts["has_next_page"] = next_page_info is not None
 
@@ -813,6 +824,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             counts["total"] = len(all_products)
             counts["succeeded"] = succeeded
             counts["failed"] = failed
+            counts["skipped"] = skipped
             counts["duration_sec"] = duration
             counts["pages_fetched"] = pages_fetched
             counts["page_size"] = page_size
