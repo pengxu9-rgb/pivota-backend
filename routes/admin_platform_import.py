@@ -39,28 +39,6 @@ async def run_import_once(current_user: dict = Depends(require_admin)) -> Dict[s
         )
 
 
-@router.post("/run-once")
-async def run_import_once(current_user: dict = Depends(require_admin)) -> Dict[str, Any]:
-    """
-    Process the next pending Platform ImportTask, if any.
-
-    This is an admin-only endpoint and is safe to call repeatedly.
-    """
-    try:
-        result = await process_next_import_task()
-        return {
-            "status": "success",
-            "result": result,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process import task: {str(exc)}",
-        )
-
-
 @router.post("/tasks/{task_id}/retry")
 async def retry_import_task(
     task_id: int,
@@ -155,4 +133,3 @@ async def skip_import_task(
             status_code=500,
             detail=f"Failed to skip task: {str(exc)}"
         )
-

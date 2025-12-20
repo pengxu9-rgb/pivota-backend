@@ -133,22 +133,17 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
             reverse=True
         )[:5]
         
-        # Format recent orders (use total column; amount is not selected)
+        # Format recent orders
         recent_orders = []
         for order in orders[:5]:
-            # database rows are usually Record objects; support both dict-like and attribute access
-            total_value = order["total"]
-            customer_email = order.get("customer_email", "") if hasattr(order, "get") else getattr(order, "customer_email", "")
-            created_at = order.get("created_at") if hasattr(order, "get") else getattr(order, "created_at", None)
-
             recent_orders.append({
                 "order_id": order["order_id"],
-                "amount": float(total_value or 0),
+                "amount": float(order.get("total") or 0),
                 "status": order["status"],
                 "customer": {
-                    "email": customer_email
+                    "email": order.get("customer_email", "")
                 },
-                "created_at": created_at.isoformat() if created_at else None
+                "created_at": order["created_at"].isoformat() if order.get("created_at") else None
             })
         
         return {
@@ -230,6 +225,47 @@ async def sync_shopify_products(
         #    This prevents browser net::ERR_CONNECTION_CLOSED due to proxy/request timeouts.
         from services.platform_import_service import schedule_import_task
         from jobs.catalog_import_worker import process_import_task_by_id
+
+        # De-dupe: if there's already an active Shopify import task, return it instead of
+        # creating another. This prevents "Sync" button spam from spawning concurrent jobs.
+        existing_task_row = await database.fetch_one(
+            """
+            SELECT id, status, counts, error, created_at, updated_at
+            FROM platform_import_tasks
+            WHERE merchant_id = :merchant_id
+              AND source_type = 'connector'
+              AND connector = 'shopify'
+              AND status IN ('pending', 'running', 'retry_scheduled')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id},
+        )
+
+        if existing_task_row:
+            existing_task = dict(existing_task_row)
+            existing_task_id = int(existing_task["id"])
+            existing_status = (existing_task.get("status") or "").lower()
+
+            # Best-effort: kick it off if it's ready, otherwise just return its status.
+            if existing_status in ("pending", "retry_scheduled"):
+                background_tasks.add_task(process_import_task_by_id, existing_task_id)
+
+            return {
+                "status": "success",
+                "message": "Shopify sync already scheduled / in progress.",
+                "data": {
+                    "task_id": existing_task_id,
+                    "scheduled": existing_status in ("pending", "retry_scheduled"),
+                    "already_running": existing_status == "running",
+                    "task_status": existing_task.get("status"),
+                    "counts": existing_task.get("counts"),
+                    "product_count": store_check.get("product_count"),
+                    "store_domain": store_check["domain"],
+                    "platform": "shopify",
+                    "synced_at": datetime.now(timezone.utc).isoformat(),
+                },
+            }
 
         task_id = await schedule_import_task(
             merchant_id=merchant_id,
