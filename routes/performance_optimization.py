@@ -139,8 +139,10 @@ async def create_indexes(current_user: dict = Depends(require_admin)):
         ("idx_orders_merchant_id", "CREATE INDEX IF NOT EXISTS idx_orders_merchant_id ON orders(merchant_id)"),
         ("idx_orders_merchant_created_at", "CREATE INDEX IF NOT EXISTS idx_orders_merchant_created_at ON orders(merchant_id, created_at DESC)"),
         ("idx_orders_agent_id", "CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id)"),
+        ("idx_orders_agent_created_at", "CREATE INDEX IF NOT EXISTS idx_orders_agent_created_at ON orders(agent_id, created_at DESC)"),
         ("idx_orders_status", "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)"),
         ("idx_agent_usage_logs_agent_id", "CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_agent_id ON agent_usage_logs(agent_id)"),
+        ("idx_agent_usage_logs_agent_timestamp", "CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_agent_timestamp ON agent_usage_logs(agent_id, timestamp DESC)"),
         ("idx_agent_usage_logs_timestamp", "CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_timestamp ON agent_usage_logs(timestamp DESC)"),
         ("idx_merchant_onboarding_status", "CREATE INDEX IF NOT EXISTS idx_merchant_onboarding_status ON merchant_onboarding(status)"),
         ("idx_agents_api_key", "CREATE INDEX IF NOT EXISTS idx_agents_api_key ON agents(api_key)"),
@@ -233,7 +235,6 @@ async def get_connection_pool_status(current_user: dict = Depends(require_admin)
             "status": "error",
             "error": str(e)
         }
-
 
 
 

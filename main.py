@@ -62,14 +62,12 @@ from routes.cleanup_all_duplicates import router as cleanup_all_duplicates_route
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.init_orders_table import router as init_orders_router
 from routes.employee_dashboard_routes import router as employee_dashboard_router
-from routes.agents_mgmt import router as agents_router
 from routes.employees_security import router as employees_security_router
 from routes.mcp_mgmt import router as mcp_mgmt_router
 from routes.employee_missing_endpoints import router as employee_missing_router
 from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
-from routes.employee_agent_mgmt import router as emp_agent_mgmt_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.debug_psp_insert import router as debug_psp_router
 from routes.debug_psp_validation import router as debug_psp_validation_router
@@ -483,14 +481,12 @@ app.include_router(admin_cleanup_router)  # Admin cleanup (no auth)
 app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
 app.include_router(employee_finance_router)  # Employee finance endpoints
-app.include_router(agents_router)  # Agents management
 app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
 app.include_router(employee_missing_router)  # Missing employee endpoints
 # app.include_router(agent_sdk_router)  # Replaced with fixed version
 app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
 app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
-app.include_router(emp_agent_mgmt_router)  # Employee agent management - RE-ENABLED (simpler version)
 app.include_router(fix_agents_router)  # Fix agents table schema
 app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing

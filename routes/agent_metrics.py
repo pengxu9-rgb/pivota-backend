@@ -22,14 +22,10 @@ async def get_metrics_summary(
     Available to agents and admins
     """
     try:
-        # For now, return mock data to avoid table issues
-        # TODO: Implement real metrics from agent_usage_logs table
-        
         # Time ranges
         now = datetime.now()
         last_hour = now - timedelta(hours=1)
         last_24h = now - timedelta(hours=24)
-        last_7d = now - timedelta(days=7)
         last_30d = now - timedelta(days=30)
         
         # Resolve agent_id from JWT or X-API-Key
@@ -50,34 +46,27 @@ async def get_metrics_summary(
         if not agent_id:
             raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
         
-        # Query real data from agent_usage_logs for this agent
-        total_requests = await database.fetch_val(
-            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        ) or 0
-        
-        hour_requests = await database.fetch_val(
-            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since",
-            {"agent_id": agent_id, "since": last_hour}
-        ) or 0
-        
-        day_requests = await database.fetch_val(
-            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since",
-            {"agent_id": agent_id, "since": last_24h}
-        ) or 0
-        
-        # Success rate (last 24h)
-        success_count = await database.fetch_val(
-            "SELECT COUNT(*) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since AND status_code < 400",
-            {"agent_id": agent_id, "since": last_24h}
-        ) or 0
+        # Query real data from agent_usage_logs for this agent (single aggregate query)
+        usage_row = await database.fetch_one(
+            """
+            SELECT
+                COUNT(*)::bigint as total_requests,
+                SUM(CASE WHEN timestamp >= :last_hour THEN 1 ELSE 0 END)::bigint as requests_last_hour,
+                SUM(CASE WHEN timestamp >= :last_24h THEN 1 ELSE 0 END)::bigint as requests_last_24h,
+                SUM(CASE WHEN timestamp >= :last_24h AND status_code < 400 THEN 1 ELSE 0 END)::bigint as success_last_24h,
+                AVG(CASE WHEN timestamp >= :last_24h THEN response_time_ms END) as avg_response_time_ms
+            FROM agent_usage_logs
+            WHERE agent_id = :agent_id
+            """,
+            {"agent_id": agent_id, "last_hour": last_hour, "last_24h": last_24h}
+        )
+        usage = dict(usage_row) if usage_row else {}
+        total_requests = int(usage.get("total_requests") or 0)
+        hour_requests = int(usage.get("requests_last_hour") or 0)
+        day_requests = int(usage.get("requests_last_24h") or 0)
+        success_count = int(usage.get("success_last_24h") or 0)
         success_rate = (success_count / day_requests * 100) if day_requests > 0 else 100.0
-        
-        # Average response time (last 24h)
-        avg_response_time = await database.fetch_val(
-            "SELECT AVG(response_time_ms) FROM agent_usage_logs WHERE agent_id = :agent_id AND timestamp >= :since AND response_time_ms IS NOT NULL",
-            {"agent_id": agent_id, "since": last_24h}
-        ) or 0
+        avg_response_time = usage.get("avg_response_time_ms") or 0
         
         # Top endpoints (last 24h)
         top_endpoint_rows = await database.fetch_all(
@@ -93,68 +82,31 @@ async def get_metrics_summary(
         
         active_agents = 1
         errors = []
-        # Orders created (last 24h) for this agent
-        orders_count_24h = await database.fetch_val(
-            """SELECT COUNT(*) FROM orders 
-               WHERE created_at >= :since 
-                 AND (is_deleted IS NULL OR is_deleted = FALSE)
-                 AND agent_id = :agent_id""",
-            {"since": last_24h, "agent_id": agent_id}
-        ) or 0
-        
-        # Revenue (last 24h) for this agent (paid only)
-        revenue_24h = await database.fetch_val(
-            """SELECT COALESCE(SUM(total), 0) FROM orders 
-               WHERE created_at >= :since 
-                 AND (is_deleted IS NULL OR is_deleted = FALSE)
-                 AND payment_status = 'paid'
-                 AND agent_id = :agent_id""",
-            {"since": last_24h, "agent_id": agent_id}
-        ) or 0
-        
-        # Revenue (last 30d) for this agent (paid only)
-        revenue_30d = await database.fetch_val(
-            """SELECT COALESCE(SUM(total), 0) FROM orders 
-               WHERE created_at >= :since 
-                 AND (is_deleted IS NULL OR is_deleted = FALSE)
-                 AND payment_status = 'paid'
-                 AND agent_id = :agent_id""",
-            {"since": last_30d, "agent_id": agent_id}
-        ) or 0
-        
-        # Total orders (all time) for this agent
-        total_orders = await database.fetch_val(
-            """SELECT COUNT(*) FROM orders 
-               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
-                 AND agent_id = :agent_id""",
-            {"agent_id": agent_id}
-        ) or 0
-        
-        # Total paid orders (all time)
-        total_paid_orders = await database.fetch_val(
-            """SELECT COUNT(*) FROM orders 
-               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
-                 AND payment_status = 'paid'
-                 AND agent_id = :agent_id""",
-            {"agent_id": agent_id}
-        ) or 0
-        
-        # Total revenue (all time, paid only) for this agent
-        total_revenue = await database.fetch_val(
-            """SELECT COALESCE(SUM(total), 0) FROM orders 
-               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
-                 AND payment_status = 'paid'
-                 AND agent_id = :agent_id""",
-            {"agent_id": agent_id}
-        ) or 0
-        
-        # Count unique merchants for this agent
-        merchant_count = await database.fetch_val(
-            """SELECT COUNT(DISTINCT merchant_id) FROM orders 
-               WHERE (is_deleted IS NULL OR is_deleted = FALSE)
-                 AND agent_id = :agent_id""",
-            {"agent_id": agent_id}
-        ) or 0
+
+        orders_row = await database.fetch_one(
+            """
+            SELECT
+                SUM(CASE WHEN created_at >= :last_24h THEN 1 ELSE 0 END)::bigint as count_last_24h,
+                COALESCE(SUM(CASE WHEN created_at >= :last_24h AND payment_status = 'paid' THEN total ELSE 0 END), 0) as revenue_last_24h,
+                COALESCE(SUM(CASE WHEN created_at >= :last_30d AND payment_status = 'paid' THEN total ELSE 0 END), 0) as revenue_last_30d,
+                COUNT(*)::bigint as total_orders,
+                SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END)::bigint as total_paid_orders,
+                COALESCE(SUM(CASE WHEN payment_status = 'paid' THEN total ELSE 0 END), 0) as total_revenue,
+                COUNT(DISTINCT merchant_id)::bigint as merchant_count
+            FROM orders
+            WHERE (is_deleted IS NULL OR is_deleted = FALSE)
+              AND agent_id = :agent_id
+            """,
+            {"agent_id": agent_id, "last_24h": last_24h, "last_30d": last_30d}
+        )
+        orders = dict(orders_row) if orders_row else {}
+        orders_count_24h = int(orders.get("count_last_24h") or 0)
+        revenue_24h = float(orders.get("revenue_last_24h") or 0)
+        revenue_30d = float(orders.get("revenue_last_30d") or 0)
+        total_orders = int(orders.get("total_orders") or 0)
+        total_paid_orders = int(orders.get("total_paid_orders") or 0)
+        total_revenue = float(orders.get("total_revenue") or 0)
+        merchant_count = int(orders.get("merchant_count") or 0)
         
         return {
             "status": "healthy",
@@ -542,4 +494,3 @@ async def get_recent_activity(
             "activities": [],
             "count": 0
         }
-
