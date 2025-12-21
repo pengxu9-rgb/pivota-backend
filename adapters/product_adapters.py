@@ -196,15 +196,48 @@ class ShopifyProductAdapter:
         elif sp.get("status") == "archived":
             status = ProductStatus.ARCHIVED
         
-        # Determine if product is orderable
-        # Product is orderable if it's active/published and has at least one variant with price > 0
-        is_orderable = (
-            status == ProductStatus.ACTIVE and 
-            published_at is not None and
-            len(variants) > 0 and
-            default_price > 0
-        )
-        
+        def _is_variant_sellable(raw_variant: Dict[str, Any]) -> bool:
+            """
+            Shopify inventory semantics:
+            - If inventory is NOT tracked (inventory_management is null), the variant can be sold.
+            - If inventory is tracked, the variant is sellable when inventory_quantity > 0,
+              OR when inventory_policy == "continue" (backorders allowed).
+            """
+            try:
+                price_value = float(raw_variant.get("price") or 0)
+            except Exception:
+                price_value = 0.0
+            if price_value <= 0:
+                return False
+
+            inventory_management = raw_variant.get("inventory_management")
+            inventory_policy = (raw_variant.get("inventory_policy") or "").lower()
+            try:
+                inventory_quantity = int(raw_variant.get("inventory_quantity") or 0)
+            except Exception:
+                inventory_quantity = 0
+
+            if inventory_management in (None, "", False):
+                return True
+            if inventory_quantity > 0:
+                return True
+            if inventory_policy == "continue":
+                return True
+            return False
+
+        raw_variants = sp.get("variants") or []
+        sellable_variant_count = 0
+        if isinstance(raw_variants, list):
+            for v in raw_variants:
+                if isinstance(v, dict) and _is_variant_sellable(v):
+                    sellable_variant_count += 1
+
+        # Determine if product is orderable/sellable.
+        # We intentionally do NOT require published_at to be present because many Shopify
+        # stores sell products without an Online Store "published_at" timestamp (e.g. other channels).
+        is_orderable = bool(status == ProductStatus.ACTIVE and sellable_variant_count > 0)
+        is_in_stock = is_orderable
+
         product = StandardProduct(
             id=str(sp["id"]),
             platform="shopify",
@@ -227,6 +260,7 @@ class ShopifyProductAdapter:
             published_at=published_at,
             created_at=created_at,
             updated_at=updated_at,
+            in_stock=is_in_stock,
             orderable=is_orderable,
             platform_metadata={
                 "shopify_id": sp["id"],
