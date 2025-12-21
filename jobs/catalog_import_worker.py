@@ -202,9 +202,11 @@ async def _fetch_shopify_products_page(
     params: Dict[str, Any] = {"limit": limit}
     if page_info:
         params["page_info"] = page_info
-    published_status = (os.getenv("SHOPIFY_PUBLISHED_STATUS", "any") or "").strip()
-    if published_status:
-        params["published_status"] = published_status
+    else:
+        # Shopify does not allow published_status together with page_info pagination.
+        published_status = (os.getenv("SHOPIFY_PUBLISHED_STATUS", "any") or "").strip()
+        if published_status:
+            params["published_status"] = published_status
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
