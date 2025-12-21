@@ -227,16 +227,28 @@ class ShopifyProductAdapter:
 
         raw_variants = sp.get("variants") or []
         sellable_variant_count = 0
+        min_sellable_price: Optional[float] = None
         if isinstance(raw_variants, list):
             for v in raw_variants:
-                if isinstance(v, dict) and _is_variant_sellable(v):
-                    sellable_variant_count += 1
+                if not isinstance(v, dict):
+                    continue
+                if not _is_variant_sellable(v):
+                    continue
+                sellable_variant_count += 1
+                try:
+                    v_price = float(v.get("price") or 0)
+                except Exception:
+                    v_price = 0.0
+                if v_price > 0 and (min_sellable_price is None or v_price < min_sellable_price):
+                    min_sellable_price = v_price
 
         # Determine if product is orderable/sellable.
         # We intentionally do NOT require published_at to be present because many Shopify
         # stores sell products without an Online Store "published_at" timestamp (e.g. other channels).
         is_orderable = bool(status == ProductStatus.ACTIVE and sellable_variant_count > 0)
         is_in_stock = is_orderable
+        if min_sellable_price is not None and min_sellable_price > 0:
+            default_price = float(min_sellable_price)
 
         product = StandardProduct(
             id=str(sp["id"]),

@@ -141,11 +141,10 @@ def validate_orderable(product: StandardProduct) -> Tuple[bool, Dict[str, Any]]:
     has_explicit_orderable = "orderable" in explicit_fields
 
     if has_explicit_orderable:
-        # When an adapter provided a platform-aware flag, combine it with the
-        # structural checks so that "not published / not visible" products
-        # never become orderable just because required fields are present.
-        explicit_flag = bool(getattr(product, "orderable", False))
-        orderable = bool(structural_ok and explicit_flag)
+        # Platform authoritative: do not flip the platform-provided flag.
+        # Structural issues are still surfaced in `orderable_validation` so
+        # order-creation endpoints can block unsafe purchases.
+        orderable = bool(getattr(product, "orderable", False))
     else:
         # Legacy/aggregated products without an explicit orderable flag keep
         # the previous semantics: structural validity alone decides.
@@ -153,6 +152,8 @@ def validate_orderable(product: StandardProduct) -> Tuple[bool, Dict[str, Any]]:
 
     validation = {
         "orderable": orderable,
+        "structural_ok": structural_ok,
+        "has_explicit_orderable": has_explicit_orderable,
         "required_fields_present": required_fields_present,
         "errors": errors,
     }

@@ -67,16 +67,20 @@ def _map_cache_row_to_standard_product(
 
     raw_variants = raw.get("variants") or []
     if isinstance(raw_variants, list) and raw_variants:
+        min_positive_price: Optional[float] = None
         for idx, v in enumerate(raw_variants):
             if not isinstance(v, dict):
                 continue
             try:
+                v_price = float(v.get("price") or 0)
+                if v_price > 0 and (min_positive_price is None or v_price < min_positive_price):
+                    min_positive_price = v_price
                 variant = StandardProductVariant(
                     id=str(v.get("id") or ""),
                     title=v.get("title", "Default"),
                     sku=v.get("sku"),
                     barcode=v.get("barcode"),
-                    price=float(v.get("price") or 0),
+                    price=v_price,
                     compare_at_price=float(v["compare_at_price"]) if v.get("compare_at_price") else None,
                     inventory_quantity=int(v.get("inventory_quantity") or 0),
                     weight=v.get("weight"),
@@ -87,16 +91,13 @@ def _map_cache_row_to_standard_product(
                 variants.append(variant)
                 inventory_quantity += max(int(variant.inventory_quantity or 0), 0)
                 if idx == 0:
-                    price = float(variant.price or 0)
                     sku = variant.sku
                     barcode = variant.barcode
-                    currency = (
-                        v.get("currency")
-                        or raw.get("presentment_currency")
-                        or currency
-                    )
+                    currency = v.get("currency") or raw.get("presentment_currency") or currency
             except Exception:
                 continue
+        if min_positive_price is not None:
+            price = float(min_positive_price)
 
     image_url = None
     images: List[str] = []
@@ -336,4 +337,3 @@ async def get_merchant_platforms(
         "merchant_id": merchant_id,
         "platforms": platforms,
     }
-

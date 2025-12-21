@@ -355,7 +355,8 @@ async def _place_amazon_order_from_cache(
             detail=f"Failed to parse StandardProduct for amazon: {exc}",
         )
 
-    if not product.orderable:
+    structural_ok = bool((product.orderable_validation or {}).get("structural_ok", True))
+    if (not product.orderable) or (not structural_ok):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -467,7 +468,8 @@ async def _place_temu_order_from_cache(
             detail=f"Failed to parse StandardProduct for temu: {exc}",
         )
 
-    if not product.orderable:
+    structural_ok = bool((product.orderable_validation or {}).get("structural_ok", True))
+    if (not product.orderable) or (not structural_ok):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={

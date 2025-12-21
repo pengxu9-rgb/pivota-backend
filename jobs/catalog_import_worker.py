@@ -208,8 +208,12 @@ async def _fetch_shopify_products_page(
         if published_status:
             params["published_status"] = published_status
 
+    timeout_seconds = float(os.getenv("SHOPIFY_HTTP_TIMEOUT_SECONDS", "30"))
+    if timeout_seconds < 5:
+        timeout_seconds = 5.0
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             resp = await client.get(url, params=params, headers={"X-Shopify-Access-Token": access_token})
     except httpx.RequestError as exc:
         raise ShopifyAPIError(f"Shopify products request error: {exc}") from exc
@@ -1250,6 +1254,60 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
         backoff_seconds = min(60 * (2 ** max(attempt - 1, 0)), 3600)
         next_run_at = datetime.utcnow() + timedelta(seconds=backoff_seconds)
 
+        await mark_import_task_retry_scheduled(
+            task_id,
+            error=str(exc),
+            counts=counts,
+            next_run_at=next_run_at,
+        )
+        return {
+            "processed": True,
+            "task_id": task_id,
+            "status": "retry_scheduled",
+            "attempt": attempt,
+            "error": str(exc),
+            "counts": counts,
+            "next_run_at": next_run_at.isoformat(),
+        }
+    except ShopifyAPIError as exc:
+        # Retry transient upstream failures (timeouts, 5xx, etc) but fail fast for
+        # auth/config issues which won't be resolved by retries.
+        logger.warning(
+            "Shopify import failed; handling retry decision",
+            extra={
+                "task_id": task_id,
+                "merchant_id": merchant_id,
+                "attempt": attempt,
+                "max_attempts": SHOPIFY_MAX_RETRY_ATTEMPTS,
+                "error_type": type(exc).__name__,
+            },
+        )
+
+        counts["error_type"] = "shopify_import"
+        if isinstance(exc, ShopifyAuthError):
+            counts["error_category"] = "auth"
+        elif isinstance(exc, ShopifyConfigError):
+            counts["error_category"] = "config"
+        else:
+            counts["error_category"] = "upstream"
+
+        if isinstance(exc, (ShopifyAuthError, ShopifyConfigError)) or attempt >= SHOPIFY_MAX_RETRY_ATTEMPTS:
+            await mark_import_task_failed(
+                task_id,
+                error=str(exc),
+                counts=counts,
+            )
+            return {
+                "processed": True,
+                "task_id": task_id,
+                "status": "failed",
+                "attempt": attempt,
+                "error": str(exc),
+                "counts": counts,
+            }
+
+        backoff_seconds = min(30 * (2 ** max(attempt - 1, 0)), 1800)
+        next_run_at = datetime.utcnow() + timedelta(seconds=backoff_seconds)
         await mark_import_task_retry_scheduled(
             task_id,
             error=str(exc),
