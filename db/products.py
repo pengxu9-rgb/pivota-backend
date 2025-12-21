@@ -247,6 +247,36 @@ async def upsert_product_cache(
         return await database.execute(insert_query)
 
 
+async def touch_products_cache_ttl(
+    merchant_id: str,
+    platform: str,
+    ttl_seconds: int,
+    *,
+    include_expired: bool = True,
+) -> int:
+    """
+    Extend TTL for all cached products for a given merchant + platform.
+
+    This is a safety valve for partial/interruptible imports: even if a sync
+    run doesn't re-fetch the full catalog, we can keep the existing cache rows
+    from expiring and "disappearing" from downstream category/product listings.
+    """
+    now = datetime.now()
+    expires_at = now + timedelta(seconds=ttl_seconds)
+
+    where_clause = (products_cache.c.merchant_id == merchant_id) & (products_cache.c.platform == platform)
+    if not include_expired:
+        where_clause = where_clause & (products_cache.c.expires_at > now)
+
+    query = products_cache.update().where(where_clause).values(
+        expires_at=expires_at,
+        ttl_seconds=ttl_seconds,
+        cache_status="fresh",
+    )
+    updated = await database.execute(query)
+    return int(updated or 0)
+
+
 async def mark_cache_accessed(cache_id: int):
     """记录缓存访问（用于统计）"""
     query = products_cache.update().where(

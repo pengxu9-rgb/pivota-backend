@@ -39,7 +39,7 @@ from db.connector_credentials import (
 )
 from services.crypto_service import crypto_service
 from catalog.recommendation_meta import derive_recommendation_meta
-from db.products import upsert_product_cache
+from db.products import upsert_product_cache, touch_products_cache_ttl
 from db.platform_import_reports import get_platform_report
 from db.platform_orders import insert_platform_order
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus, validate_orderable
@@ -56,7 +56,7 @@ from services.amazon_sp_api_service import (
 logger = logging.getLogger(__name__)
 
 SHOPIFY_API_VERSION = "2024-07"
-SHOPIFY_IMPORT_LIMIT = 50
+SHOPIFY_IMPORT_LIMIT = 250
 SHOPIFY_MAX_RETRY_ATTEMPTS = int(os.getenv("SHOPIFY_MAX_RETRY_ATTEMPTS", "5"))
 ORDERS_REQUIRED_COLUMNS = {
     "amazon": {"order_id", "order_item_id", "sku", "quantity", "price", "currency"},
@@ -202,6 +202,9 @@ async def _fetch_shopify_products_page(
     params: Dict[str, Any] = {"limit": limit}
     if page_info:
         params["page_info"] = page_info
+    published_status = (os.getenv("SHOPIFY_PUBLISHED_STATUS", "any") or "").strip()
+    if published_status:
+        params["published_status"] = published_status
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -608,8 +611,10 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
 
     await mark_import_task_running(task_id, attempt)
 
-    # Default counts (JSON; safe to add keys over time).
-    counts: Dict[str, Any] = {"total": 0}
+    # Counts are stored as JSON; if the task is retry_scheduled we may resume from prior progress.
+    existing_counts = task.get("counts") if isinstance(task.get("counts"), dict) else {}
+    counts: Dict[str, Any] = dict(existing_counts or {})
+    counts.setdefault("total", 0)
 
     try:
         # Shopify connector import branch.
@@ -621,8 +626,10 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                 raise ShopifyConfigError("Shopify configuration missing (SHOPIFY_STORE_URL/SHOPIFY_ACCESS_TOKEN)")
 
             # Pagination-aware import: fetch up to SHOPIFY_MAX_PAGES_PER_RUN pages.
-            # NOTE: We keep the public constant SHOPIFY_IMPORT_LIMIT as the default page size.
-            page_size = SHOPIFY_IMPORT_LIMIT
+            page_size = int(os.getenv("SHOPIFY_IMPORT_LIMIT", str(SHOPIFY_IMPORT_LIMIT)))
+            if page_size < 1 or page_size > 250:
+                logger.warning("Invalid SHOPIFY_IMPORT_LIMIT=%s, falling back to %s", page_size, SHOPIFY_IMPORT_LIMIT)
+                page_size = SHOPIFY_IMPORT_LIMIT
             max_pages = int(os.getenv("SHOPIFY_MAX_PAGES_PER_RUN", "50"))
             if max_pages < 1:
                 logger.warning("Invalid SHOPIFY_MAX_PAGES_PER_RUN=%s, falling back to 50", max_pages)
@@ -633,44 +640,80 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                 logger.warning("Invalid SHOPIFY_MAX_PRODUCTS_PER_RUN=%s, falling back to 5000", max_products)
                 max_products = 5000
 
-            max_runtime_seconds = int(os.getenv("SHOPIFY_MAX_RUNTIME_SECONDS", "240"))
+            max_runtime_seconds = int(os.getenv("SHOPIFY_MAX_RUNTIME_SECONDS", "600"))
             if max_runtime_seconds < 10:
-                logger.warning("Invalid SHOPIFY_MAX_RUNTIME_SECONDS=%s, falling back to 240", max_runtime_seconds)
-                max_runtime_seconds = 240
+                logger.warning("Invalid SHOPIFY_MAX_RUNTIME_SECONDS=%s, falling back to 600", max_runtime_seconds)
+                max_runtime_seconds = 600
 
-            shopify_cache_ttl_seconds = int(os.getenv("SHOPIFY_PRODUCTS_CACHE_TTL_SECONDS", "86400"))
-            if shopify_cache_ttl_seconds < 60:
+            shopify_cache_ttl_seconds = int(os.getenv("SHOPIFY_PRODUCTS_CACHE_TTL_SECONDS", "604800"))
+            min_ttl_seconds = int(os.getenv("SHOPIFY_PRODUCTS_CACHE_TTL_MIN_SECONDS", "86400"))
+            if shopify_cache_ttl_seconds < min_ttl_seconds:
                 logger.warning(
-                    "Invalid SHOPIFY_PRODUCTS_CACHE_TTL_SECONDS=%s, falling back to 86400",
+                    "SHOPIFY_PRODUCTS_CACHE_TTL_SECONDS=%s is below minimum=%s; using minimum",
                     shopify_cache_ttl_seconds,
+                    min_ttl_seconds,
                 )
-                shopify_cache_ttl_seconds = 86400
+                shopify_cache_ttl_seconds = min_ttl_seconds
 
             sync_only_orderable = os.getenv("SHOPIFY_SYNC_ONLY_ORDERABLE", "false").lower() in ("1", "true", "yes", "y")
 
+            touch_existing_cache = os.getenv("SHOPIFY_TOUCH_EXISTING_CACHE", "true").lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+            )
+            if touch_existing_cache:
+                try:
+                    touched = await touch_products_cache_ttl(
+                        merchant_id=merchant_id,
+                        platform="shopify",
+                        ttl_seconds=shopify_cache_ttl_seconds,
+                        include_expired=True,
+                    )
+                    counts["touched_existing_cache_rows"] = touched
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to extend TTL for existing Shopify cache rows",
+                        extra={
+                            "task_id": task_id,
+                            "merchant_id": merchant_id,
+                            "error": str(exc),
+                        },
+                    )
+
+            # Resume cursor if this task previously stopped mid-pagination.
+            page_info_value = counts.get("shopify_next_page_info")
+            page_info: Optional[str] = str(page_info_value) if page_info_value else None
+
             started_at = datetime.utcnow()
-            all_products: List[Dict[str, Any]] = []
-            page_info: Optional[str] = None
-            pages_fetched = 0
-            succeeded = 0
-            failed = 0
-            skipped = 0
+            total = int(counts.get("total", 0) or 0)
+            succeeded = int(counts.get("succeeded", 0) or 0)
+            failed = int(counts.get("failed", 0) or 0)
+            skipped = int(counts.get("skipped", 0) or 0)
+            pages_fetched_total = int(counts.get("pages_fetched", 0) or 0)
+
+            run_total = 0
+            run_pages_fetched = 0
+            stop_reason: Optional[str] = None
 
             # Running progress snapshot for UI/status polling.
             counts.update(
                 {
-                    "total": 0,
-                    "succeeded": 0,
-                    "failed": 0,
-                    "skipped": 0,
-                    "pages_fetched": 0,
+                    "total": total,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "pages_fetched": pages_fetched_total,
                     "page_size": page_size,
                     "max_pages_limit": max_pages,
                     "max_products_limit": max_products,
+                    "has_next_page": page_info is not None,
+                    "shopify_next_page_info": page_info,
                 }
             )
 
-            while pages_fetched < max_pages and len(all_products) < max_products:
+            while run_pages_fetched < max_pages and run_total < max_products:
                 runtime_seconds = (datetime.utcnow() - started_at).total_seconds()
                 if runtime_seconds >= max_runtime_seconds:
                     logger.info(
@@ -680,10 +723,12 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                             "merchant_id": merchant_id,
                             "max_runtime_seconds": max_runtime_seconds,
                             "runtime_seconds": runtime_seconds,
-                            "total_so_far": len(all_products),
-                            "pages_fetched": pages_fetched,
+                            "total_so_far": total,
+                            "run_pages_fetched": run_pages_fetched,
+                            "has_next_page": page_info is not None,
                         },
                     )
+                    stop_reason = "max_runtime_seconds"
                     break
 
                 logger.info(
@@ -691,7 +736,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                     extra={
                         "task_id": task_id,
                         "merchant_id": merchant_id,
-                        "page": pages_fetched + 1,
+                        "page": run_pages_fetched + 1,
                         "page_info_present": bool(page_info),
                     },
                 )
@@ -704,6 +749,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
                 if not products_page:
+                    page_info = None
                     break
 
                 for p in products_page:
@@ -773,15 +819,20 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                         else:
                             logger.error("Failed to cache Shopify product", extra=extra)
 
-                all_products.extend(products_page)
-                pages_fetched += 1
+                run_total += len(products_page)
+                total += len(products_page)
+                run_pages_fetched += 1
+                pages_fetched_total += 1
 
-                counts["total"] = len(all_products)
+                counts["total"] = total
                 counts["succeeded"] = succeeded
                 counts["failed"] = failed
                 counts["skipped"] = skipped
-                counts["pages_fetched"] = pages_fetched
+                counts["pages_fetched"] = pages_fetched_total
+                counts["run_total"] = run_total
+                counts["run_pages_fetched"] = run_pages_fetched
                 counts["has_next_page"] = next_page_info is not None
+                counts["shopify_next_page_info"] = next_page_info or None
 
                 # Best-effort progress update so the merchant portal can show activity.
                 await update_import_task_status(
@@ -796,19 +847,20 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                     extra={
                         "task_id": task_id,
                         "merchant_id": merchant_id,
-                        "page": pages_fetched,
+                        "page": run_pages_fetched,
                         "products_in_page": len(products_page),
-                        "total_so_far": len(all_products),
+                        "total_so_far": total,
                         "has_next_page": next_page_info is not None,
                     },
                 )
 
                 if not next_page_info:
+                    page_info = None
                     break
 
                 page_info = next_page_info
 
-                if len(all_products) >= max_products:
+                if run_total >= max_products:
                     logger.info(
                         "Reached SHOPIFY_MAX_PRODUCTS_PER_RUN limit; stopping pagination",
                         extra={
@@ -817,29 +869,69 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                             "max_products": max_products,
                         },
                     )
+                    stop_reason = "max_products_per_run"
                     break
 
             duration = (datetime.utcnow() - started_at).total_seconds()
 
-            counts["total"] = len(all_products)
+            counts["total"] = total
             counts["succeeded"] = succeeded
             counts["failed"] = failed
             counts["skipped"] = skipped
             counts["duration_sec"] = duration
-            counts["pages_fetched"] = pages_fetched
+            counts["pages_fetched"] = pages_fetched_total
+            counts["run_total"] = run_total
+            counts["run_pages_fetched"] = run_pages_fetched
             counts["page_size"] = page_size
             counts["max_pages_limit"] = max_pages
+            counts["has_next_page"] = page_info is not None
+            counts["shopify_next_page_info"] = page_info or None
 
             logger.info(
                 "Shopify import completed",
                 extra={
                     "task_id": task_id,
                     "merchant_id": merchant_id,
-                    "products_fetched": len(all_products),
-                    "pages_fetched": pages_fetched,
+                    "products_fetched": total,
+                    "pages_fetched": pages_fetched_total,
+                    "run_products_fetched": run_total,
+                    "run_pages_fetched": run_pages_fetched,
                     "duration_sec": duration,
+                    "has_next_page": page_info is not None,
                 },
             )
+
+            # If we still have a cursor, we didn't finish; schedule a continuation run.
+            if page_info:
+                if stop_reason is None:
+                    if run_pages_fetched >= max_pages:
+                        stop_reason = "max_pages_per_run"
+                    else:
+                        stop_reason = "page_limit"
+
+                counts["partial_import"] = True
+                counts["stop_reason"] = stop_reason
+
+                continuation_delay = int(os.getenv("SHOPIFY_CONTINUATION_DELAY_SECONDS", "30"))
+                if continuation_delay < 5:
+                    continuation_delay = 5
+
+                next_run_at = datetime.utcnow() + timedelta(seconds=continuation_delay)
+                await update_import_task_status(
+                    task_id=task_id,
+                    status="retry_scheduled",
+                    counts=counts,
+                    attempt=attempt,
+                    next_run_at=next_run_at,
+                )
+
+                return {
+                    "processed": True,
+                    "task_id": task_id,
+                    "status": "retry_scheduled",
+                    "attempt": attempt,
+                    "counts": counts,
+                }
 
         # Amazon SP-API orders sync
         elif source_type == "amazon_orders":
