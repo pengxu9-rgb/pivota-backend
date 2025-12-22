@@ -131,4 +131,3 @@ async def ingest_shopify_webhook(
         "idempotency_key": idempotency_key,
         "payload_sha256": payload_sha,
     }
-

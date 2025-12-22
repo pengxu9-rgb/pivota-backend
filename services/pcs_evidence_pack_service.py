@@ -61,7 +61,7 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
 
     # Prefer using already stored policy snapshots to avoid adding latency on payment/webhook paths.
     latest_policy_rows = await get_latest_policy_hashes(merchant_id)
-    if (not latest_policy_rows) and store_info and store_info.get("platform") == "shopify":
+    if (not latest_policy_rows) and store_info and (store_info.get("platform") or "").lower() == "shopify":
         try:
             await fetch_and_store_shop_policies(
                 merchant_id=merchant_id,
@@ -180,4 +180,3 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
         logger.debug("PCS order metadata writeback failed order=%s: %s", order_id, e)
 
     return {"order_id": order_id, "merchant_id": merchant_id, "manifest_sha256": manifest_sha, "pack_version": pack_version}
-

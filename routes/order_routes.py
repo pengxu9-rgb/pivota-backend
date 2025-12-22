@@ -1301,6 +1301,8 @@ async def create_shopify_order(order_id: str) -> bool:
             }
         }
         
+        # NOTE: Shopify REST Admin API is on a legacy track; keep as-is for v0.1,
+        # but plan migration to GraphQL Admin Orders API if you intend to ship as a public app.
         # 调用 Shopify API
         url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
         headers = {

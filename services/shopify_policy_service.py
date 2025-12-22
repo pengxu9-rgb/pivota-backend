@@ -109,4 +109,3 @@ async def get_latest_policy_hashes(merchant_id: str) -> List[Dict[str, Any]]:
         {"merchant_id": merchant_id},
     )
     return [dict(r) for r in rows]
-

@@ -29,6 +29,12 @@ class ShopifySyncRequest(BaseModel):
     merchant_id: Optional[str] = None
 
 
+class VerifyShopifyIntegrationRequest(BaseModel):
+    merchant_id: str
+    callback_base_url: str
+    api_version: Optional[str] = None
+
+
 class ConnectWixRequest(BaseModel):
     merchant_id: str
     site_id: str
@@ -98,25 +104,35 @@ async def merchant_connect_shopify(
             raise HTTPException(status_code=400, detail="Invalid Shopify response")
         
         shop_info = shop_data["shop"]
-        logger.info(f"✅ Shopify credentials verified for {request.shop_domain}")
+        canonical_myshopify_domain = shop_info.get("myshopify_domain") or request.shop_domain
+        logger.info(f"✅ Shopify credentials verified for {canonical_myshopify_domain}")
         
         # Check if store already exists
         existing = await database.fetch_one(
             """SELECT store_id FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'shopify' 
-               AND domain = :domain""",
-            {"merchant_id": request.merchant_id, "domain": request.shop_domain}
+               AND (domain = :domain_input OR domain = :domain_canonical)""",
+            {
+                "merchant_id": request.merchant_id,
+                "domain_input": request.shop_domain,
+                "domain_canonical": canonical_myshopify_domain,
+            }
         )
         
         if existing:
             # Update existing store - store token as JSON for consistency
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :token, 
+                   SET domain = :domain,
+                       api_key = :token,
                        status = 'active',
                        last_sync = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"token": '{"access_token":"' + request.access_token + '"}', "store_id": existing["store_id"]}
+                {
+                    "domain": canonical_myshopify_domain,
+                    "token": '{"access_token":"' + request.access_token + '"}',
+                    "store_id": existing["store_id"],
+                }
             )
             store_id = existing["store_id"]
         else:
@@ -129,8 +145,8 @@ async def merchant_connect_shopify(
                 {
                     "store_id": store_id,
                     "merchant_id": request.merchant_id,
-                    "domain": request.shop_domain,
-                    "name": shop_info.get("name", request.shop_domain),
+                    "domain": canonical_myshopify_domain,
+                    "name": shop_info.get("name", canonical_myshopify_domain),
                     "token": '{"access_token":"' + request.access_token + '"}'
                 }
             )
@@ -143,7 +159,7 @@ async def merchant_connect_shopify(
             "message": "Shopify store connected successfully",
             "store_id": store_id,
             "shop_name": shop_info.get("name"),
-            "shop_domain": request.shop_domain
+            "shop_domain": canonical_myshopify_domain
         }
         
     except HTTPException:
@@ -153,6 +169,45 @@ async def merchant_connect_shopify(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to connect Shopify: {str(e)}")
+
+
+@router.post("/shopify/verify")
+async def merchant_verify_shopify_integration(
+    request: VerifyShopifyIntegrationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Verify Shopify integration at onboarding time:
+    - token validity + canonical myshopify domain
+    - access scopes (REST access_scopes)
+    - webhook registration (best-effort)
+    - policies snapshot (best-effort)
+    - capability probes (Shopify Payments / Returns)
+    Persists a snapshot to pcs_merchant_capabilities when available.
+    """
+    if current_user["role"] not in ["merchant", "employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    if current_user["role"] == "merchant" and current_user.get("merchant_id") != request.merchant_id:
+        raise HTTPException(status_code=403, detail="Can only verify your own store")
+
+    if not request.callback_base_url or not request.callback_base_url.strip():
+        raise HTTPException(status_code=400, detail="callback_base_url is required")
+
+    try:
+        from services.shopify_integration_verify import verify_shopify_integration
+
+        report = await verify_shopify_integration(
+            merchant_id=request.merchant_id,
+            callback_base_url=request.callback_base_url,
+            api_version=request.api_version or "2024-07",
+        )
+        return {"status": "success", "report": report}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Shopify integration verify failed merchant={request.merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to verify Shopify integration")
 
 
 @router.post("/shopify/products/sync")

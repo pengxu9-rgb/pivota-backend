@@ -7,6 +7,7 @@ from typing import Optional
 import hmac
 import hashlib
 import json
+import os
 
 from db.database import database
 from db.orders import get_order
@@ -14,6 +15,7 @@ from db.products import log_order_event
 from services.platform_refund_adapter import platform_refund_adapter, PlatformRefundEvent
 from services.refund_service import refund_service
 from config.feature_flags import is_feature_enabled
+from config.settings import settings
 from utils.logger import logger
 
 router = APIRouter(prefix="/webhooks/refunds", tags=["refund-webhooks"])
@@ -184,8 +186,19 @@ async def handle_shopify_refund_webhook(
         payload = await request.body()
         event_data = json.loads(payload)
         
-        # Verify webhook signature (TODO: get merchant's webhook secret)
-        # For now, we'll skip verification in development
+        # Verify Shopify webhook signature using raw request body + app secret.
+        # We keep this strict to avoid accepting forged refund events.
+        app_env = os.getenv("APP_ENV", "dev").lower()
+        shopify_secret = getattr(settings, "shopify_client_secret", None) or ""
+        if app_env == "production":
+            if not shopify_secret or not x_shopify_hmac_sha256:
+                raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
+
+        calculated_hmac = hmac.new(shopify_secret.encode("utf-8"), payload, hashlib.sha256).digest()
+        import base64
+        expected = base64.b64encode(calculated_hmac).decode()
+        if x_shopify_hmac_sha256 and not hmac.compare_digest(expected, x_shopify_hmac_sha256):
+            raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
         
         logger.info(f"Received Shopify refund webhook for merchant {merchant_id}")
         
@@ -269,4 +282,3 @@ async def handle_amazon_refund_notification(
     except Exception as e:
         logger.error(f"Error handling Amazon refund notification: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-

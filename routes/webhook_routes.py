@@ -209,8 +209,14 @@ async def handle_shopify_webhook(
             or os.getenv("ENVIRONMENT", "").lower() == "production"
             or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
         )
-        shopify_secret = getattr(settings, "shopify_client_secret", None) or ""
+        shopify_secret = (
+            merchant.get("shopify_webhook_secret")
+            or getattr(settings, "shopify_client_secret", None)
+            or ""
+        )
         if is_production:
+            if not x_shopify_shop_domain:
+                raise HTTPException(status_code=401, detail="Missing Shopify shop domain")
             if not shopify_secret:
                 logger.error("SHOPIFY_CLIENT_SECRET is not configured; cannot verify Shopify webhooks in production")
                 raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
@@ -271,11 +277,12 @@ async def handle_shopify_webhook(
             if is_dup:
                 return {"status": "success", "topic": topic, "duplicate": True}
         except Exception as e:
-            # Do not skip verification even when persistence fails; we already verified above.
+            # In production, fail so Shopify will retry and we don't lose the audit trail.
             logger.warning(f"PCS webhook event persistence failed merchant={merchant_id} topic={topic}: {e}")
+            if is_production:
+                raise HTTPException(status_code=500, detail="Webhook event persistence unavailable")
 
         logger.info(f"Received Shopify webhook for {merchant_id}: {topic}")
-
         if topic in ("orders/fulfilled", "fulfillments/create", "fulfillments/update"):
             # 履约更新（订单级 or fulfillment 级）
             tracking_numbers = []
@@ -292,7 +299,6 @@ async def handle_shopify_webhook(
                 shopify_order_id = str(data.get("id"))
                 for fulfillment in data.get("fulfillments", []) or []:
                     tracking_numbers.extend(fulfillment.get("tracking_numbers", []) or [])
-
             # 更新 Pivota 订单
             query = "SELECT * FROM orders WHERE shopify_order_id = :shopify_order_id"
             from db.database import database
@@ -315,6 +321,7 @@ async def handle_shopify_webhook(
                 logger.info(f"Order {order_id} marked as shipped via webhook")
 
         elif topic in ("orders/create", "orders/paid"):
+            # Best-effort linkage: map Shopify order id -> Pivota order by orders.shopify_order_id
             shopify_order_id = str(data.get("id"))
             from db.database import database
             result = await database.fetch_one(
@@ -357,13 +364,13 @@ async def handle_shopify_webhook(
             shopify_order_id = str(data.get("id"))
             financial_status = data.get("financial_status")
             fulfillment_status = data.get("fulfillment_status")
-
             from db.database import database
-            result = await database.fetch_one(
+
+            pivota = await database.fetch_one(
                 "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
                 {"shopify_order_id": shopify_order_id},
             )
-            pivota_order_id = result["order_id"] if result else f"shopify_{shopify_order_id}"
+            pivota_order_id = pivota["order_id"] if pivota else f"shopify_{shopify_order_id}"
 
             await log_order_event(
                 event_type="order_updated_webhook",
@@ -378,31 +385,85 @@ async def handle_shopify_webhook(
             logger.info(f"Shopify order {shopify_order_id} updated")
 
         elif topic in ("refunds/create", "orders/refunded"):
-            shopify_order_id = str((data.get("order_id") or {}).get("id") or data.get("order_id") or data.get("id") or "unknown")
+            platform_order_id = str(data.get("order_id") or data.get("id") or "")
+            from db.database import database
+
+            pivota = None
+            if platform_order_id:
+                pivota = await database.fetch_one(
+                    "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
+                    {"shopify_order_id": platform_order_id},
+                )
+            pivota_order_id = (
+                pivota["order_id"]
+                if pivota
+                else (f"shopify_{platform_order_id}" if platform_order_id else f"shopify_refund_{datetime.utcnow().timestamp()}")
+            )
+
             await log_order_event(
                 event_type="refund_webhook",
-                order_id=f"shopify_{shopify_order_id}",
+                order_id=pivota_order_id,
                 merchant_id=merchant_id,
-                metadata={"topic": topic, "shopify_order_id": shopify_order_id},
+                metadata={"topic": topic, "shopify_order_id": platform_order_id or None},
             )
+
+            # Best-effort normalize using existing adapter.
+            try:
+                from routes.refund_webhook_routes import process_platform_refund
+                from services.platform_refund_adapter import platform_refund_adapter
+
+                refund_event = platform_refund_adapter.normalize_refund_event("shopify", data)
+                result = await process_platform_refund(refund_event, merchant_id)
+                logger.info(f"Processed Shopify refund webhook for merchant {merchant_id}: {result.get('status')}")
+            except Exception as e:
+                logger.warning(f"Failed to process Shopify refund webhook merchant={merchant_id}: {e}")
 
         elif topic == "tender_transactions/create":
+            # Money movement signal (payment/refund). Best-effort: record as immutable event; do not assume state transitions.
+            platform_order_id = str(data.get("order_id") or "")
+            from db.database import database
+
+            pivota = None
+            if platform_order_id:
+                pivota = await database.fetch_one(
+                    "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
+                    {"shopify_order_id": platform_order_id},
+                )
+            pivota_order_id = pivota["order_id"] if pivota else (f"shopify_{platform_order_id}" if platform_order_id else f"shopify_tender_{datetime.utcnow().timestamp()}")
             await log_order_event(
                 event_type="tender_transaction_webhook",
-                order_id=f"shopify_{data.get('order_id') or 'unknown'}",
-                merchant_id=merchant_id,
-                metadata={"topic": topic, "payload_keys": list((data or {}).keys())},
-            )
-
-        elif topic in ("disputes/create", "disputes/update"):
-            platform_order_id = data.get("order_id") or data.get("orderId") or "unknown"
-            await log_order_event(
-                event_type="dispute_webhook",
-                order_id=f"shopify_{platform_order_id}",
+                order_id=pivota_order_id,
                 merchant_id=merchant_id,
                 metadata={
                     "topic": topic,
-                    "shopify_order_id": platform_order_id,
+                    "shopify_order_id": platform_order_id or None,
+                    "kind": data.get("kind"),
+                    "amount": data.get("amount"),
+                    "currency": data.get("currency"),
+                    "status": data.get("status"),
+                    "tender_transaction_id": data.get("id"),
+                },
+            )
+
+        elif topic in ("disputes/create", "disputes/update"):
+            # Dispute signals are critical for tiering/risk; store event and best-effort link to order_id.
+            platform_order_id = str(data.get("order_id") or "")
+            from db.database import database
+
+            pivota = None
+            if platform_order_id:
+                pivota = await database.fetch_one(
+                    "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
+                    {"shopify_order_id": platform_order_id},
+                )
+            pivota_order_id = pivota["order_id"] if pivota else (f"shopify_{platform_order_id}" if platform_order_id else "shopify_dispute_unknown")
+            await log_order_event(
+                event_type="dispute_webhook",
+                order_id=pivota_order_id,
+                merchant_id=merchant_id,
+                metadata={
+                    "topic": topic,
+                    "shopify_order_id": platform_order_id or None,
                     "dispute_id": data.get("id"),
                     "status": data.get("status"),
                     "reason": data.get("reason"),
@@ -450,7 +511,7 @@ async def register_shopify_webhooks(
             raise HTTPException(status_code=404, detail="Merchant not found")
 
         store_info = await get_primary_store(merchant_id)
-        if not store_info or store_info.get("platform") != "shopify":
+        if not store_info or (store_info.get("platform") or "").lower() != "shopify":
             raise HTTPException(status_code=400, detail="Primary store is not Shopify")
 
         shop_domain = store_info.get("domain")
@@ -473,26 +534,28 @@ async def register_shopify_webhooks(
             "orders/fulfilled",
             # Refunds (preferred)
             "refunds/create",
-            # Money movement
+            # Money movement (refund funds settled / payment settled signals)
             "tender_transactions/create",
             # Disputes (Shopify Payments)
             "disputes/create",
             "disputes/update",
-            # GDPR compliance
+            # GDPR compliance (required when accessing customer/order data)
             "customers/data_request",
             "customers/redact",
             "shop/redact",
         ]
         
         registered = []
+        already_exists = []
+        failed = []
         import httpx
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             for topic in topics:
                 webhook_data = {
                     "webhook": {
                         "topic": topic,
-                        "address": f"{callback_base_url}/webhooks/shopify/{merchant_id}",
+                        "address": f"{callback_base_url.rstrip('/')}/webhooks/shopify/{merchant_id}",
                         "format": "json"
                     }
                 }
@@ -513,12 +576,39 @@ async def register_shopify_webhooks(
                     })
                     logger.info(f"Registered webhook for {topic} on {shop_domain}")
                 else:
-                    logger.warning(f"Failed to register webhook for {topic}: {response.text}")
+                    # Common idempotency response: address already taken
+                    if response.status_code == 422:
+                        try:
+                            body = response.json() or {}
+                            errors = body.get("errors") or {}
+                            addr_errs = errors.get("address") or []
+                            if isinstance(addr_errs, list) and any("already" in str(x).lower() for x in addr_errs):
+                                already_exists.append(topic)
+                                continue
+                        except Exception:
+                            pass
+
+                    failed.append(
+                        {
+                            "topic": topic,
+                            "status_code": response.status_code,
+                            "body": (response.text or "")[:800],
+                        }
+                    )
+                    logger.warning(f"Failed to register webhook for {topic}: {response.status_code} {response.text}")
         
         return {
             "status": "success",
             "merchant_id": merchant_id,
-            "registered_webhooks": registered
+            "registered_webhooks": registered,
+            "already_exists": already_exists,
+            "failed_webhooks": failed,
+            "summary": {
+                "requested": len(topics),
+                "created": len(registered),
+                "already_exists": len(already_exists),
+                "failed": len(failed),
+            },
         }
         
     except HTTPException:

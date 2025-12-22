@@ -39,7 +39,13 @@ class ShopifyRefundAdapter:
     @staticmethod
     def normalize(event_data: Dict[str, Any]) -> PlatformRefundEvent:
         """
-        Normalize Shopify orders/refunded webhook
+        Normalize Shopify refund webhook.
+
+        Supports two common shapes:
+        1) Topic: refunds/create
+           Payload is a Refund object containing order_id + transactions + refund_line_items.
+        2) Legacy: orders/refunded
+           Payload is an Order object with refunds[] array.
         
         Shopify event structure:
         {
@@ -69,27 +75,52 @@ class ShopifyRefundAdapter:
         }
         """
         try:
+            # Shape A: refunds/create (refund object)
+            if event_data.get("order_id") and event_data.get("transactions") is not None:
+                order_id = str(event_data.get("order_id"))
+                refund_id = str(event_data.get("id"))
+                transactions = event_data.get("transactions", []) or []
+                total_amount = sum(
+                    float(t.get("amount", 0))
+                    for t in transactions
+                    if str(t.get("kind")).lower() == "refund"
+                )
+                currency = (
+                    (transactions[0].get("currency") if transactions else None)
+                    or event_data.get("currency")
+                    or "USD"
+                )
+                reason = event_data.get("note") or event_data.get("reason") or "Shopify refund"
+                return PlatformRefundEvent(
+                    platform_type="shopify",
+                    platform_order_id=order_id,
+                    platform_refund_id=refund_id,
+                    amount=total_amount,
+                    currency=currency,
+                    reason=reason,
+                    status="completed",
+                    line_items=event_data.get("refund_line_items", []) or [],
+                    raw_event=event_data,
+                )
+
+            # Shape B: orders/refunded (order object with refunds[])
             order_id = str(event_data.get("id"))
-            refunds = event_data.get("refunds", [])
-            
+            refunds = event_data.get("refunds", []) or []
+
             if not refunds:
                 raise ValueError("No refunds found in Shopify event")
-            
-            # Take the latest refund
+
             latest_refund = refunds[-1]
             refund_id = str(latest_refund.get("id"))
-            
-            # Calculate total refund amount from transactions
-            transactions = latest_refund.get("transactions", [])
+            transactions = latest_refund.get("transactions", []) or []
             total_amount = sum(
-                float(t.get("amount", 0)) 
-                for t in transactions 
-                if t.get("kind") == "refund"
+                float(t.get("amount", 0))
+                for t in transactions
+                if str(t.get("kind")).lower() == "refund"
             )
-            
-            currency = transactions[0].get("currency", "USD") if transactions else "USD"
+            currency = (transactions[0].get("currency", "USD") if transactions else "USD")
             reason = latest_refund.get("note") or "Shopify refund"
-            
+
             return PlatformRefundEvent(
                 platform_type="shopify",
                 platform_order_id=order_id,
@@ -98,8 +129,8 @@ class ShopifyRefundAdapter:
                 currency=currency,
                 reason=reason,
                 status="completed",
-                line_items=latest_refund.get("refund_line_items", []),
-                raw_event=event_data
+                line_items=latest_refund.get("refund_line_items", []) or [],
+                raw_event=event_data,
             )
         except Exception as e:
             logger.error(f"Failed to normalize Shopify refund event: {e}")
@@ -270,4 +301,3 @@ class PlatformRefundAdapter:
 
 # Export main adapter
 platform_refund_adapter = PlatformRefundAdapter()
-

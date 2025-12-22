@@ -25,4 +25,3 @@ def chain_hash(prev_chain_hash: Optional[str], payload_sha256: str, idempotency_
     prev = prev_chain_hash or ""
     raw = (prev + payload_sha256 + idempotency_key + occurred_at_iso).encode("utf-8")
     return sha256_hex(raw)
-
