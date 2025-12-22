@@ -8,7 +8,11 @@ import httpx
 from db.database import database
 from services.merchant_store_service import get_primary_store
 from services.shopify_graphql_client import ShopifyGraphQLError, shopify_admin_graphql
-from services.shopify_policy_service import fetch_and_store_shop_policies, get_latest_policy_hashes
+from services.shopify_policy_service import (
+    fetch_and_store_shop_policies,
+    get_latest_policy_hashes,
+    summarize_policies_rest_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +42,7 @@ OPTIONAL_SCOPES = [
 SHOP_QUERY_REST = "https://{shop_domain}/admin/api/{api_version}/shop.json"
 ACCESS_SCOPES_REST = "https://{shop_domain}/admin/oauth/access_scopes.json"
 WEBHOOKS_CREATE_REST = "https://{shop_domain}/admin/api/{api_version}/webhooks.json"
+POLICIES_REST = "https://{shop_domain}/admin/api/{api_version}/policies.json"
 
 
 async def _shopify_get_json(*, url: str, access_token: str, timeout_s: float = 12.0) -> Dict[str, Any]:
@@ -46,6 +51,30 @@ async def _shopify_get_json(*, url: str, access_token: str, timeout_s: float = 1
         if resp.status_code >= 400:
             raise RuntimeError(f"Shopify HTTP {resp.status_code}")
         return resp.json()
+
+
+async def _shopify_get_json_with_diag(
+    *, url: str, access_token: str, timeout_s: float = 12.0
+) -> Dict[str, Any]:
+    """
+    Return a safe diagnostics wrapper: status + minimal JSON shape info (no raw body leakage).
+    """
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.get(url, headers={"X-Shopify-Access-Token": access_token})
+        out: Dict[str, Any] = {"status_code": resp.status_code}
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            out["json_keys"] = sorted(list(data.keys()))[:25]
+        else:
+            out["json_type"] = type(data).__name__
+        if resp.status_code >= 400:
+            out["error"] = (resp.text or "")[:200]
+        else:
+            out["summary"] = summarize_policies_rest_response(data)
+        return out
 
 
 async def fetch_access_scopes(
@@ -293,13 +322,23 @@ async def verify_shopify_integration(
     policies_report: Dict[str, Any] = {"skipped": True, "reason": "missing policy read scope"}
     if _policy_scope_present(scopes):
         try:
-            await fetch_and_store_shop_policies(
+            fetched = await fetch_and_store_shop_policies(
                 merchant_id=merchant_id,
                 shop_domain=shop_domain,
                 access_token=access_token,
                 api_version=api_version,
             )
-            policies_report = {"skipped": False, "latest_hashes": await get_latest_policy_hashes(merchant_id)}
+            # Extra safe diagnostics: help distinguish "no policies configured" vs parsing/permission issues.
+            policies_diag = await _shopify_get_json_with_diag(
+                url=POLICIES_REST.format(shop_domain=shop_domain, api_version=api_version),
+                access_token=access_token,
+            )
+            policies_report = {
+                "skipped": False,
+                "latest_hashes": await get_latest_policy_hashes(merchant_id),
+                "fetched_types": sorted(list((fetched or {}).keys())),
+                "policies_rest_diag": policies_diag,
+            }
         except ShopifyGraphQLError as e:
             # Surface GraphQL errors for actionable onboarding debugging.
             policies_report = {

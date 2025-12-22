@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -53,6 +53,77 @@ def _normalize_policy_type(raw: Optional[str]) -> Optional[str]:
     if "terms" in v or "tos" in v or "service" in v:
         return "terms"
     return None
+
+
+def _extract_policies_from_rest(rest: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Normalize Shopify REST policies response into a list of dicts.
+
+    Shopify returns different shapes across versions/app types:
+    - {"policies": [ {...}, ... ]}
+    - {"policies": { "refund_policy": {...}, ... }}
+    - [ {...}, ... ]
+    """
+    debug: Dict[str, Any] = {"rest_type": type(rest).__name__}
+
+    if isinstance(rest, list):
+        items = [x for x in rest if isinstance(x, dict)]
+        debug.update({"shape": "list_root", "items_count": len(items)})
+        return items, debug
+
+    if not isinstance(rest, dict):
+        debug.update({"shape": "unknown", "items_count": 0})
+        return [], debug
+
+    policies = rest.get("policies")
+    debug["top_keys"] = sorted(list(rest.keys()))[:25]
+
+    if isinstance(policies, list):
+        items = [x for x in policies if isinstance(x, dict)]
+        debug.update({"shape": "dict.policies_list", "items_count": len(items)})
+        return items, debug
+
+    if isinstance(policies, dict):
+        items: List[Dict[str, Any]] = []
+        for key, value in policies.items():
+            if isinstance(value, dict):
+                merged = dict(value)
+                # Preserve the dict key as a hint for type inference.
+                merged.setdefault("_policy_key", key)
+                items.append(merged)
+            else:
+                items.append({"_policy_key": key, "value": value})
+        debug.update({"shape": "dict.policies_dict", "items_count": len(items)})
+        return items, debug
+
+    debug.update({"shape": "dict.policies_missing_or_unknown", "items_count": 0})
+    return [], debug
+
+
+def summarize_policies_rest_response(rest: Any, *, max_items: int = 6) -> Dict[str, Any]:
+    """
+    Return a safe diagnostics summary (no body content) for onboarding/debugging.
+    """
+    items, debug = _extract_policies_from_rest(rest)
+    preview: List[Dict[str, Any]] = []
+    for item in items[: max(0, max_items)]:
+        if not isinstance(item, dict):
+            continue
+        body = item.get("body") or item.get("body_html") or item.get("bodyHtml") or ""
+        preview.append(
+            {
+                "policy_key": item.get("_policy_key"),
+                "type": item.get("type"),
+                "handle": item.get("handle"),
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "updated_at": item.get("updatedAt") or item.get("updated_at"),
+                "body_len": len(str(body)) if body else 0,
+                "keys": sorted(list(item.keys()))[:20],
+            }
+        )
+    debug["preview"] = preview
+    return debug
 
 
 async def _fetch_policies_rest(
@@ -129,9 +200,7 @@ async def fetch_and_store_shop_policies(
             rest = await _fetch_policies_rest(
                 shop_domain=shop_domain, access_token=access_token, api_version=api_version
             )
-            raw_list = (rest or {}).get("policies")
-            if not isinstance(raw_list, list):
-                raw_list = []
+            raw_list, _debug = _extract_policies_from_rest(rest)
 
             for item in raw_list:
                 if not isinstance(item, dict):
@@ -140,6 +209,7 @@ async def fetch_and_store_shop_policies(
                 policy_type = (
                     _normalize_policy_type(item.get("type"))
                     or _normalize_policy_type(item.get("handle"))
+                    or _normalize_policy_type(item.get("_policy_key"))
                     or _normalize_policy_type(item.get("name"))
                     or _normalize_policy_type(item.get("title"))
                     or _normalize_policy_type(item.get("url"))
