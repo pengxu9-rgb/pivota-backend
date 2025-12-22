@@ -1,9 +1,21 @@
 import logging
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ShopifyGraphQLError(RuntimeError):
+    message: str
+    errors: List[Dict[str, Any]]
+    request_id: Optional[str] = None
+
+    def __str__(self) -> str:
+        rid = f" request_id={self.request_id}" if self.request_id else ""
+        return f"{self.message}{rid}"
 
 
 async def shopify_admin_graphql(
@@ -39,8 +51,9 @@ async def shopify_admin_graphql(
 
         data = resp.json()
         if "errors" in data and data["errors"]:
-            logger.warning("Shopify GraphQL top-level errors: %s", str(data["errors"])[:800])
-            raise RuntimeError("Shopify GraphQL errors")
+            errors = data.get("errors") or []
+            request_id = resp.headers.get("x-request-id") or resp.headers.get("x-shopify-request-id")
+            logger.warning("Shopify GraphQL top-level errors request_id=%s: %s", request_id, str(errors)[:800])
+            raise ShopifyGraphQLError(message="Shopify GraphQL errors", errors=errors, request_id=request_id)
 
         return data.get("data") or {}
-

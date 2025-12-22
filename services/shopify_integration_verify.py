@@ -7,7 +7,7 @@ import httpx
 
 from db.database import database
 from services.merchant_store_service import get_primary_store
-from services.shopify_graphql_client import shopify_admin_graphql
+from services.shopify_graphql_client import ShopifyGraphQLError, shopify_admin_graphql
 from services.shopify_policy_service import fetch_and_store_shop_policies, get_latest_policy_hashes
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,6 @@ DEFAULT_API_VERSION = "2024-07"
 # v0.1 minimal required scopes for PCS ingestion + webhook registration.
 REQUIRED_SCOPES = [
     "read_orders",
-    "write_webhooks",
 ]
 
 # Optional scopes that raise the ceiling (disputes/payouts/returns/policies).
@@ -273,10 +272,12 @@ async def verify_shopify_integration(
         "customers/redact",
         "shop/redact",
     ]
-    webhook_report: Dict[str, Any] = {"skipped": True, "reason": "missing write_webhooks scope"}
-    if "write_webhooks" in set(scopes):
-        try:
-            webhook_report = await register_webhooks_best_effort(
+    # Shopify access scopes UI is inconsistent across app types; instead of hard-gating on scopes,
+    # we attempt registration and report failures (401/403/422) to make onboarding deterministic.
+    webhook_report: Dict[str, Any] = {"attempted": True}
+    try:
+        webhook_report.update(
+            await register_webhooks_best_effort(
                 shop_domain=shop_domain,
                 access_token=access_token,
                 merchant_id=merchant_id,
@@ -284,8 +285,9 @@ async def verify_shopify_integration(
                 topics=topics,
                 api_version=api_version,
             )
-        except Exception as e:
-            webhook_report = {"skipped": False, "error": str(e)}
+        )
+    except Exception as e:
+        webhook_report.update({"error": str(e)})
 
     # 4) Policies snapshot (best-effort; requires policy scope).
     policies_report: Dict[str, Any] = {"skipped": True, "reason": "missing policy read scope"}
@@ -298,6 +300,14 @@ async def verify_shopify_integration(
                 api_version=api_version,
             )
             policies_report = {"skipped": False, "latest_hashes": await get_latest_policy_hashes(merchant_id)}
+        except ShopifyGraphQLError as e:
+            # Surface GraphQL errors for actionable onboarding debugging.
+            policies_report = {
+                "skipped": False,
+                "error": e.message,
+                "graphql_errors": e.errors[:5],
+                "request_id": e.request_id,
+            }
         except Exception as e:
             policies_report = {"skipped": False, "error": str(e)}
 
@@ -365,4 +375,3 @@ async def verify_shopify_integration(
             "has_returns_api": has_returns_api,
         },
     }
-
