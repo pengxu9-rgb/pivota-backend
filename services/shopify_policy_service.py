@@ -25,6 +25,21 @@ query ShopPolicies {
 POLICIES_REST_PATH = "/admin/api/{api_version}/policies.json"
 
 
+_POLICY_URL_PATH_BY_TYPE = {
+    "refund": "/policies/refund-policy",
+    "shipping": "/policies/shipping-policy",
+    "privacy": "/policies/privacy-policy",
+    "terms": "/policies/terms-of-service",
+}
+
+
+def _derived_policy_url(shop_domain: str, policy_type: str) -> Optional[str]:
+    path = _POLICY_URL_PATH_BY_TYPE.get(policy_type)
+    if not shop_domain or not path:
+        return None
+    return f"https://{shop_domain}{path}"
+
+
 def _normalize_policy_type(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
@@ -133,9 +148,10 @@ async def fetch_and_store_shop_policies(
                     continue
 
                 body = item.get("body") or item.get("body_html") or item.get("bodyHtml")
+                url = item.get("url") or _derived_policy_url(shop_domain, policy_type)
                 policies[policy_type] = {
                     "title": item.get("title"),
-                    "url": item.get("url"),
+                    "url": url,
                     "body_html": body,
                     "updated_at": item.get("updatedAt") or item.get("updated_at"),
                     "hash_sha256": _hash_policy_body(body),
@@ -145,6 +161,12 @@ async def fetch_and_store_shop_policies(
 
     if not policies:
         return {}
+
+    # Ensure url is always present to satisfy pcs_shop_policies.url NOT NULL (best-effort derived url).
+    for policy_type, p in list(policies.items()):
+        if not p.get("url"):
+            p["url"] = _derived_policy_url(shop_domain, policy_type)
+        policies[policy_type] = p
 
     # Append-only inserts; duplicates are ignored by unique constraint.
     for policy_type, p in policies.items():
