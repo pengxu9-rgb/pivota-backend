@@ -21,6 +21,11 @@ FEATURE_FLAGS = {
     # Additional flags
     "enable_refund_auto_retry": os.getenv("FF_ENABLE_REFUND_AUTO_RETRY", "true").lower() == "true",
     "enable_refund_notifications": os.getenv("FF_ENABLE_REFUND_NOTIFICATIONS", "false").lower() == "true",
+
+    # Quote-first rollout (pricing lock)
+    # When enabled, /agent/v1/orders/create requires quote_id and uses quote snapshot as source of truth.
+    # Default false for staged rollout.
+    "enable_quote_first_order_create": os.getenv("FF_ENABLE_QUOTE_FIRST_ORDER_CREATE", "false").lower() == "true",
 }
 
 
@@ -60,4 +65,4 @@ ENABLE_INTERNAL_REFUND = FEATURE_FLAGS["enable_internal_refund"]
 ENABLE_PLATFORM_WEBHOOK_REFUND = FEATURE_FLAGS["enable_platform_webhook_refund"]
 ENABLE_PLATFORM_SYNC_OUTBOUND = FEATURE_FLAGS["enable_platform_sync_outbound"]
 ENABLE_DISPUTE_MANAGEMENT = FEATURE_FLAGS["enable_dispute_management"]
-
+ENABLE_QUOTE_FIRST_ORDER_CREATE = FEATURE_FLAGS["enable_quote_first_order_create"]

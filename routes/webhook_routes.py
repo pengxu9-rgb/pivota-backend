@@ -7,6 +7,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from fastapi import APIRouter, Request, HTTPException, Header
 from typing import Optional, Dict, Any
 import stripe
+import os
 import hmac
 import hashlib
 import json
@@ -17,6 +18,8 @@ from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from config.settings import settings
 from utils.logger import logger
+from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
+from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -90,13 +93,20 @@ async def handle_stripe_webhook(
                     }
                 )
                 logger.info(f"Order {order_id} marked as paid via webhook")
+
+                # PCS: freeze order snapshot evidence (best-effort; does not block payment success)
+                try:
+                    await create_order_snapshot_evidence_pack(order_id, triggered_by="stripe_webhook")
+                except Exception as e:
+                    logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
                 
                 # 触发 Shopify 订单创建
                 from routes.merchant_onboarding_routes import get_merchant_onboarding
                 from routes.order_routes import create_shopify_order
                 
                 merchant = await get_merchant_onboarding(merchant_id)
-                if merchant and True and store_info.get("platform") == "shopify":
+                store_info = await get_primary_store(merchant_id)
+                if merchant and store_info and store_info.get("platform") == "shopify":
                     logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
                     try:
                         success = await create_shopify_order(order_id)
@@ -172,15 +182,18 @@ async def handle_shopify_webhook(
     merchant_id: str,
     request: Request,
     x_shopify_hmac_sha256: Optional[str] = Header(None),
-    x_shopify_topic: Optional[str] = Header(None)
+    x_shopify_topic: Optional[str] = Header(None),
+    x_shopify_shop_domain: Optional[str] = Header(None),
+    x_shopify_webhook_id: Optional[str] = Header(None),
+    x_shopify_triggered_at: Optional[str] = Header(None),
 ):
     """
     处理 Shopify 事件
     
     支持的事件：
-    - orders/fulfilled: 订单履约完成
-    - orders/cancelled: 订单取消
-    - orders/updated: 订单更新
+    - orders/create, orders/updated, orders/paid, orders/cancelled
+    - fulfillments/create, fulfillments/update, orders/fulfilled (legacy)
+    - refunds/create (preferred) / orders/refunded (legacy)
     """
     try:
         payload = await request.body()
@@ -189,46 +202,106 @@ async def handle_shopify_webhook(
         merchant = await get_merchant_onboarding(merchant_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        
-        # 验证 webhook（如果有 webhook secret）
-        webhook_secret = merchant.get("shopify_webhook_secret")
-        if webhook_secret and x_shopify_hmac_sha256:
-            calculated_hmac = hmac.new(
-                webhook_secret.encode('utf-8'),
-                payload,
-                hashlib.sha256
-            ).digest()
-            import base64
-            calculated_hmac_base64 = base64.b64encode(calculated_hmac).decode()
-            
-            if calculated_hmac_base64 != x_shopify_hmac_sha256:
-                logger.error(f"Invalid Shopify webhook signature for merchant {merchant_id}")
-                raise HTTPException(status_code=401, detail="Invalid signature")
-        
-        # 解析事件
+
+        # Verify signature (strict in production; must use raw request body).
+        is_production = (
+            os.getenv("APP_ENV", "").lower() == "production"
+            or os.getenv("ENVIRONMENT", "").lower() == "production"
+            or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+        )
+        shopify_secret = getattr(settings, "shopify_client_secret", None) or ""
+        if is_production:
+            if not shopify_secret:
+                logger.error("SHOPIFY_CLIENT_SECRET is not configured; cannot verify Shopify webhooks in production")
+                raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
+            if not x_shopify_hmac_sha256:
+                raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
+
+        signature_verified = verify_shopify_hmac(
+            secret=shopify_secret,
+            payload=payload,
+            header_hmac_base64=x_shopify_hmac_sha256,
+        )
+        if is_production and not signature_verified:
+            raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
+
+        # Parse event
         data = json.loads(payload)
         topic = x_shopify_topic or "unknown"
-        
+        shop_domain = x_shopify_shop_domain or merchant.get("mcp_shop_domain") or "unknown"
+
+        # Anti-cross-tenant poisoning: validate shop_domain matches primary store domain (when available).
+        try:
+            store_info = await get_primary_store(merchant_id)
+            expected_domain = (store_info or {}).get("domain")
+            if is_production and expected_domain and x_shopify_shop_domain:
+                if expected_domain.strip().lower() != x_shopify_shop_domain.strip().lower():
+                    logger.error(
+                        "Shopify webhook shop_domain mismatch merchant=%s expected=%s got=%s topic=%s",
+                        merchant_id,
+                        expected_domain,
+                        x_shopify_shop_domain,
+                        topic,
+                    )
+                    raise HTTPException(status_code=403, detail="Shop domain mismatch")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Shop domain validation skipped merchant={merchant_id}: {e}")
+
+        # Occurred_at is best-effort; Shopify may provide X-Shopify-Triggered-At.
+        occurred_at: Optional[datetime] = None
+        if x_shopify_triggered_at:
+            try:
+                occurred_at = datetime.fromisoformat(x_shopify_triggered_at.replace("Z", "+00:00"))
+            except Exception:
+                occurred_at = None
+
+        # Persist event (append-only) with idempotency guard
+        try:
+            is_dup, _row = await ingest_shopify_webhook(
+                merchant_id=merchant_id,
+                topic=topic,
+                payload=payload,
+                shop_domain=shop_domain,
+                webhook_id=x_shopify_webhook_id,
+                occurred_at=occurred_at,
+                signature_verified=signature_verified,
+            )
+            if is_dup:
+                return {"status": "success", "topic": topic, "duplicate": True}
+        except Exception as e:
+            # Do not skip verification even when persistence fails; we already verified above.
+            logger.warning(f"PCS webhook event persistence failed merchant={merchant_id} topic={topic}: {e}")
+
         logger.info(f"Received Shopify webhook for {merchant_id}: {topic}")
-        
-        if topic == "orders/fulfilled":
-            # 订单履约完成
-            shopify_order_id = str(data.get("id"))
+
+        if topic in ("orders/fulfilled", "fulfillments/create", "fulfillments/update"):
+            # 履约更新（订单级 or fulfillment 级）
             tracking_numbers = []
-            
-            # 提取跟踪号
-            for fulfillment in data.get("fulfillments", []):
-                tracking_numbers.extend(fulfillment.get("tracking_numbers", []))
-            
+
+            # fulfillments/* 通常是 fulfillment object，包含 order_id + tracking_numbers
+            if topic.startswith("fulfillments/") and data.get("order_id"):
+                shopify_order_id = str(data.get("order_id"))
+                if isinstance(data.get("tracking_numbers"), list):
+                    tracking_numbers.extend([str(x) for x in data.get("tracking_numbers") if x])
+                if data.get("tracking_number"):
+                    tracking_numbers.append(str(data.get("tracking_number")))
+            else:
+                # orders/fulfilled 通常是 order object，包含 fulfillments[]
+                shopify_order_id = str(data.get("id"))
+                for fulfillment in data.get("fulfillments", []) or []:
+                    tracking_numbers.extend(fulfillment.get("tracking_numbers", []) or [])
+
             # 更新 Pivota 订单
             query = "SELECT * FROM orders WHERE shopify_order_id = :shopify_order_id"
             from db.database import database
             result = await database.fetch_one(query, {"shopify_order_id": shopify_order_id})
-            
+
             if result:
                 order_id = result["order_id"]
                 tracking_number = ", ".join(tracking_numbers) if tracking_numbers else None
-                
+
                 await mark_order_shipped(order_id, tracking_number)
                 await log_order_event(
                     event_type="fulfillment_webhook",
@@ -240,16 +313,31 @@ async def handle_shopify_webhook(
                     }
                 )
                 logger.info(f"Order {order_id} marked as shipped via webhook")
-                
+
+        elif topic in ("orders/create", "orders/paid"):
+            shopify_order_id = str(data.get("id"))
+            from db.database import database
+            result = await database.fetch_one(
+                "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
+                {"shopify_order_id": shopify_order_id},
+            )
+            pivota_order_id = result["order_id"] if result else f"shopify_{shopify_order_id}"
+            await log_order_event(
+                event_type="shopify_order_webhook",
+                order_id=pivota_order_id,
+                merchant_id=merchant_id,
+                metadata={"shopify_order_id": shopify_order_id, "topic": topic},
+            )
+
         elif topic == "orders/cancelled":
             # 订单取消
             shopify_order_id = str(data.get("id"))
             cancel_reason = data.get("cancel_reason")
-            
+
             query = "SELECT * FROM orders WHERE shopify_order_id = :shopify_order_id"
             from db.database import database
             result = await database.fetch_one(query, {"shopify_order_id": shopify_order_id})
-            
+
             if result:
                 order_id = result["order_id"]
                 await update_order_status(order_id, "cancelled")
@@ -263,16 +351,23 @@ async def handle_shopify_webhook(
                     }
                 )
                 logger.info(f"Order {order_id} cancelled via webhook: {cancel_reason}")
-                
+
         elif topic == "orders/updated":
             # 订单更新
             shopify_order_id = str(data.get("id"))
             financial_status = data.get("financial_status")
             fulfillment_status = data.get("fulfillment_status")
-            
+
+            from db.database import database
+            result = await database.fetch_one(
+                "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
+                {"shopify_order_id": shopify_order_id},
+            )
+            pivota_order_id = result["order_id"] if result else f"shopify_{shopify_order_id}"
+
             await log_order_event(
                 event_type="order_updated_webhook",
-                order_id=f"shopify_{shopify_order_id}",
+                order_id=pivota_order_id,
                 merchant_id=merchant_id,
                 metadata={
                     "shopify_order_id": shopify_order_id,
@@ -281,6 +376,48 @@ async def handle_shopify_webhook(
                 }
             )
             logger.info(f"Shopify order {shopify_order_id} updated")
+
+        elif topic in ("refunds/create", "orders/refunded"):
+            shopify_order_id = str((data.get("order_id") or {}).get("id") or data.get("order_id") or data.get("id") or "unknown")
+            await log_order_event(
+                event_type="refund_webhook",
+                order_id=f"shopify_{shopify_order_id}",
+                merchant_id=merchant_id,
+                metadata={"topic": topic, "shopify_order_id": shopify_order_id},
+            )
+
+        elif topic == "tender_transactions/create":
+            await log_order_event(
+                event_type="tender_transaction_webhook",
+                order_id=f"shopify_{data.get('order_id') or 'unknown'}",
+                merchant_id=merchant_id,
+                metadata={"topic": topic, "payload_keys": list((data or {}).keys())},
+            )
+
+        elif topic in ("disputes/create", "disputes/update"):
+            platform_order_id = data.get("order_id") or data.get("orderId") or "unknown"
+            await log_order_event(
+                event_type="dispute_webhook",
+                order_id=f"shopify_{platform_order_id}",
+                merchant_id=merchant_id,
+                metadata={
+                    "topic": topic,
+                    "shopify_order_id": platform_order_id,
+                    "dispute_id": data.get("id"),
+                    "status": data.get("status"),
+                    "reason": data.get("reason"),
+                    "amount": data.get("amount"),
+                    "currency": data.get("currency"),
+                },
+            )
+
+        elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
+            await log_order_event(
+                event_type="gdpr_webhook",
+                order_id=f"gdpr_{merchant_id}",
+                merchant_id=merchant_id,
+                metadata={"topic": topic, "payload_keys": list((data or {}).keys())},
+            )
         
         return {"status": "success", "topic": topic}
         
@@ -309,9 +446,13 @@ async def register_shopify_webhooks(
     """
     try:
         merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant or not True:
-            raise HTTPException(status_code=400, detail="Merchant not connected to Shopify")
-        
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+
+        store_info = await get_primary_store(merchant_id)
+        if not store_info or store_info.get("platform") != "shopify":
+            raise HTTPException(status_code=400, detail="Primary store is not Shopify")
+
         shop_domain = store_info.get("domain")
         access_token = store_info.get("api_key")
         
@@ -320,9 +461,27 @@ async def register_shopify_webhooks(
         
         # 要注册的 webhook topics
         topics = [
-            "orders/fulfilled",
+            # Orders
+            "orders/create",
+            "orders/updated",
+            "orders/paid",
             "orders/cancelled",
-            "orders/updated"
+            # Fulfillments
+            "fulfillments/create",
+            "fulfillments/update",
+            # Legacy support
+            "orders/fulfilled",
+            # Refunds (preferred)
+            "refunds/create",
+            # Money movement
+            "tender_transactions/create",
+            # Disputes (Shopify Payments)
+            "disputes/create",
+            "disputes/update",
+            # GDPR compliance
+            "customers/data_request",
+            "customers/redact",
+            "shop/redact",
         ]
         
         registered = []
@@ -338,7 +497,7 @@ async def register_shopify_webhooks(
                     }
                 }
                 
-                url = f"https://{shop_domain}/admin/api/2024-01/webhooks.json"
+                url = f"https://{shop_domain}/admin/api/2024-07/webhooks.json"
                 headers = {
                     "X-Shopify-Access-Token": access_token,
                     "Content-Type": "application/json"

@@ -34,6 +34,7 @@ from services.agent_ranking_service import (
     serialize_features_for_log,
 )
 from db.agent_product_events import log_product_events
+from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
@@ -622,6 +623,13 @@ async def agent_create_order(
         # 验证商户访问权限
         if not context.can_access_merchant(order_request.merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+        # Quote-first staged rollout: only enforce when FF enabled
+        if ENABLE_QUOTE_FIRST_ORDER_CREATE and not order_request.quote_id:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "QUOTE_REQUIRED", "message": "quote_id is required"},
+            )
         
         # 添加 Agent 元数据
         if not order_request.metadata:
@@ -737,6 +745,27 @@ async def agent_create_order(
                 "created_at": order_response.created_at.isoformat()
             }
         }
+
+        # If quote-first snapshot is present in order metadata, return it to client for UI rendering.
+        try:
+            from db.orders import get_order
+
+            raw = await get_order(order_response.order_id)
+            meta = (raw or {}).get("metadata") or {}
+            pricing_quote = meta.get("pricing_quote")
+            if pricing_quote:
+                response["pricing"] = pricing_quote.get("pricing")
+                response["promotion_lines"] = pricing_quote.get("promotion_lines") or []
+                response["line_items"] = pricing_quote.get("line_items") or []
+                response["quote"] = {
+                    "quote_id": pricing_quote.get("quote_id"),
+                    "expires_at": pricing_quote.get("expires_at"),
+                    "engine": pricing_quote.get("engine"),
+                    "engine_ref": pricing_quote.get("engine_ref"),
+                }
+        except Exception:
+            # Best-effort: do not break order creation if quote metadata read fails.
+            pass
         
         return response
         
@@ -779,6 +808,7 @@ async def agent_confirm_payment(
     try:
         from routes.order_routes import mark_order_paid, create_shopify_order, log_order_event, get_order
         from routes.merchant_onboarding_routes import get_merchant_onboarding
+        from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
         
         # 获取订单
         order = await get_order(order_id)
@@ -795,6 +825,12 @@ async def agent_confirm_payment(
         
         # 标记订单已支付
         await mark_order_paid(order_id)
+
+        # PCS: freeze order snapshot evidence (best-effort; does not block confirm)
+        try:
+            await create_order_snapshot_evidence_pack(order_id, triggered_by="agent_confirm_payment")
+        except Exception as e:
+            logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
         
         # [Phase 6.2] 自动触发 commission 计算
         if order.get("agent_id"):

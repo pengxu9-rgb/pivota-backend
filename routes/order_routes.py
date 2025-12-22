@@ -33,6 +33,13 @@ from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
 from services.payment_routing_service import PaymentRoutingService
 from services.promotions_service import list_promotions, PromotionStatus
+from services.quote_service import (
+    QuoteError,
+    QuoteService,
+    compute_request_fingerprint,
+    normalize_discount_codes,
+    parse_decimal_money,
+)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -318,35 +325,106 @@ async def create_new_order(
                 }
             )
 
-        # 3. 计算订单金额（含促销折扣）
-        subtotal = sum(item.subtotal for item in order_request.items)
+        # 3. 计算订单金额
+        # Quote-first path: if quote_id is provided, amounts come from quote snapshot.
+        pricing_quote_meta: Optional[Dict[str, Any]] = None
+        if order_request.quote_id:
+            quote_service = QuoteService()
+            try:
+                quote = await quote_service.load_active_quote_or_raise(
+                    quote_id=order_request.quote_id
+                )
 
-        # 应用促销折扣（目前主要用于 Creator Agents 的多件折扣）
-        discount_total = Decimal("0")
-        applied_promos: List[Dict[str, Any]] = []
-        try:
-            discount_total, applied_promos = await compute_order_discount_from_promotions(
-                merchant_id=order_request.merchant_id,
-                items=order_request.items,
-                channel="creator_agents",
-            )
-        except Exception as promo_err:
-            logger.warning(
-                f"[OrderRoutes] Failed to compute promotions for order: {promo_err}"
-            )
+                if quote.merchant_id != order_request.merchant_id:
+                    raise QuoteError(
+                        "QUOTE_MISMATCH",
+                        "quote merchant_id mismatch",
+                        debug_id=quote.debug_id,
+                    )
+
+                fingerprint = compute_request_fingerprint(
+                    merchant_id=order_request.merchant_id,
+                    items=[
+                        {
+                            "product_id": it.product_id,
+                            "variant_id": it.variant_id or "",
+                            "quantity": it.quantity,
+                        }
+                        for it in (order_request.items or [])
+                    ],
+                    discount_codes=normalize_discount_codes(order_request.discount_codes),
+                    shipping_address={
+                        "country": order_request.shipping_address.country,
+                        "postal_code": order_request.shipping_address.postal_code,
+                        "city": order_request.shipping_address.city,
+                        "state": order_request.shipping_address.state,
+                    }
+                    if order_request.shipping_address
+                    else None,
+                    selected_delivery_option=order_request.selected_delivery_option,
+                )
+
+                if fingerprint != quote.request_fingerprint:
+                    raise QuoteError(
+                        "QUOTE_MISMATCH",
+                        "order request does not match quote snapshot",
+                        debug_id=quote.debug_id,
+                    )
+
+                snap = quote.snapshot_json or {}
+                pricing = (snap.get("pricing") or {}) if isinstance(snap, dict) else {}
+
+                subtotal = parse_decimal_money(pricing.get("subtotal"))
+                discount_total = parse_decimal_money(pricing.get("discount_total"))
+                shipping_fee = parse_decimal_money(pricing.get("shipping_fee"))
+                tax = parse_decimal_money(pricing.get("tax"))
+                total = parse_decimal_money(pricing.get("total"))
+
+                pricing_quote_meta = {
+                    "quote_id": quote.quote_id,
+                    "expires_at": quote.expires_at.isoformat() if quote.expires_at else None,
+                    "engine": quote.engine,
+                    "engine_ref": quote.engine_ref,
+                    "request_fingerprint": quote.request_fingerprint,
+                    "pricing": pricing,
+                    "promotion_lines": snap.get("promotion_lines") or [],
+                    "line_items": snap.get("line_items") or [],
+                }
+            except QuoteError as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": e.code, "message": e.message, "debug_id": e.debug_id},
+                )
+
+        else:
+            subtotal = sum(item.subtotal for item in order_request.items)
+
+            # Legacy promotions (multi-buy) for non-quote orders.
             discount_total = Decimal("0")
-            applied_promos = []
+            applied_promos: List[Dict[str, Any]] = []
+            try:
+                discount_total, applied_promos = await compute_order_discount_from_promotions(
+                    merchant_id=order_request.merchant_id,
+                    items=order_request.items,
+                    channel="creator_agents",
+                )
+            except Exception as promo_err:
+                logger.warning(
+                    f"[OrderRoutes] Failed to compute promotions for order: {promo_err}"
+                )
+                discount_total = Decimal("0")
+                applied_promos = []
 
-        if discount_total > 0:
-            logger.info(
-                f"[OrderRoutes] Applied promotions for merchant {order_request.merchant_id}: "
-                f"discount_total={discount_total}"
-            )
-            subtotal = max(Decimal("0"), subtotal - discount_total)
+            if discount_total > 0:
+                logger.info(
+                    f"[OrderRoutes] Applied promotions for merchant {order_request.merchant_id}: "
+                    f"discount_total={discount_total}"
+                )
+                subtotal = max(Decimal("0"), subtotal - discount_total)
 
-        shipping_fee = Decimal("0")
-        tax = Decimal("0")
-        total = subtotal + shipping_fee + tax
+            shipping_fee = Decimal("0")
+            tax = Decimal("0")
+            total = subtotal + shipping_fee + tax
 
         # 4. 创建订单
         # Extract agent_id from metadata if present
@@ -444,7 +522,9 @@ async def create_new_order(
         
         # 合并订单元数据并记录促销信息（如果有）
         order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
-        if discount_total > 0:
+        if pricing_quote_meta:
+            order_metadata["pricing_quote"] = pricing_quote_meta
+        elif discount_total > 0:
             promo_meta = {
                 "discount_total": float(discount_total),
                 "applied_promotions": applied_promos,
@@ -474,6 +554,14 @@ async def create_new_order(
             "payment_method": None
         }
         order_id = await create_order(order_data)
+
+        # Consume quote best-effort after order creation succeeds.
+        if order_request.quote_id:
+            try:
+                quote_service = QuoteService()
+                await quote_service.consume_quote_best_effort(order_request.quote_id)
+            except Exception:
+                pass
 
         # 5. 同步创建 Payment Intent（立即返回结果）
         payment_intent_id = None

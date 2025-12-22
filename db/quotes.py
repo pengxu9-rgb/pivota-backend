@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
+from sqlalchemy import Column, DateTime, String, Table, Text
+from sqlalchemy.dialects.postgresql import JSONB
+
+from db.database import database, metadata
+
+
+quotes = Table(
+    "quotes",
+    metadata,
+    Column("quote_id", String(64), primary_key=True),
+    Column("merchant_id", String(64), index=True, nullable=False),
+    Column("agent_id", String(64), index=True, nullable=True),
+    Column("engine", String(64), nullable=False),
+    Column("engine_ref", String(256), nullable=False),
+    Column("request_fingerprint", String(128), index=True, nullable=False),
+    Column("request_json", JSONB, nullable=False),
+    Column("snapshot_json", JSONB, nullable=False),
+    Column("status", String(32), index=True, nullable=False),  # active | consumed | expired
+    Column("expires_at", DateTime(timezone=True), index=True, nullable=False),
+    Column("consumed_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("debug_id", String(64), nullable=True),
+    Column("notes", Text, nullable=True),
+)
+
+
+async def ensure_quotes_table() -> None:
+    """
+    Best-effort defensive DDL. Production normally relies on metadata.create_all(engine)
+    during startup, but this avoids hard failures if that import ordering changes.
+    """
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quotes (
+              quote_id VARCHAR(64) PRIMARY KEY,
+              merchant_id VARCHAR(64) NOT NULL,
+              agent_id VARCHAR(64),
+              engine VARCHAR(64) NOT NULL,
+              engine_ref VARCHAR(256) NOT NULL,
+              request_fingerprint VARCHAR(128) NOT NULL,
+              request_json JSONB NOT NULL,
+              snapshot_json JSONB NOT NULL,
+              status VARCHAR(32) NOT NULL,
+              expires_at TIMESTAMPTZ NOT NULL,
+              consumed_at TIMESTAMPTZ,
+              created_at TIMESTAMPTZ NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL,
+              debug_id VARCHAR(64),
+              notes TEXT
+            );
+            """,
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quotes_merchant_id ON quotes(merchant_id);"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quotes_status ON quotes(status);"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quotes_expires_at ON quotes(expires_at);"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quotes_request_fingerprint ON quotes(request_fingerprint);"
+        )
+    except Exception:
+        # Best-effort; if this fails, inserts will surface the error with context.
+        return
+
+
+async def insert_quote(row: Dict[str, Any]) -> None:
+    await ensure_quotes_table()
+    await database.execute(quotes.insert().values(**row))
+
+
+async def get_quote(quote_id: str) -> Optional[Dict[str, Any]]:
+    await ensure_quotes_table()
+    q = quotes.select().where(quotes.c.quote_id == quote_id)
+    rec = await database.fetch_one(q)
+    return dict(rec) if rec else None
+
+
+async def mark_quote_consumed(quote_id: str) -> bool:
+    await ensure_quotes_table()
+    now = datetime.now(timezone.utc)
+    q = (
+        quotes.update()
+        .where(quotes.c.quote_id == quote_id)
+        .where(quotes.c.status == "active")
+        .values(status="consumed", consumed_at=now, updated_at=now)
+    )
+    rows = await database.execute(q)
+    return bool(rows is not None)
+
+
+async def expire_quote_if_needed(quote_id: str) -> None:
+    await ensure_quotes_table()
+    now = datetime.now(timezone.utc)
+    q = (
+        quotes.update()
+        .where(quotes.c.quote_id == quote_id)
+        .where(quotes.c.status == "active")
+        .where(quotes.c.expires_at < now)
+        .values(status="expired", updated_at=now)
+    )
+    await database.execute(q)
+
+
+def compute_expires_at(ttl_seconds: int) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=max(1, int(ttl_seconds)))

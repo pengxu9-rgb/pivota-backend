@@ -63,6 +63,9 @@ class CreateOrderRequest(BaseModel):
     merchant_id: str
     customer_email: str
     customer_name: Optional[str] = None  # Customer name (optional)
+    quote_id: Optional[str] = None  # Quote-first: lock pricing snapshot
+    discount_codes: Optional[List[str]] = None  # Optional; used for quote fingerprint validation
+    selected_delivery_option: Optional[Dict[str, Any]] = None  # Optional; used for quote fingerprint validation
     items: List[OrderItem]
     shipping_address: ShippingAddress
     currency: str = "USD"

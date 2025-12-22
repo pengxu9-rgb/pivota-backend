@@ -19,11 +19,13 @@ from fastapi.responses import HTMLResponse
 
 # Database
 from db.database import database, metadata, engine
+import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import subprocess
 import os
 
 # Core routers (only include what exists)
 from routes.agent_routes import router as agent_router
+from routes.quote_routes import router as quote_router
 from routes.psp_routes import router as psp_router
 from routes.payment_routes import router as payment_router
 
@@ -381,6 +383,7 @@ app.add_middleware(StructuredLoggingMiddleware)
 
 # Include available routers
 app.include_router(agent_router)
+app.include_router(quote_router)
 app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
