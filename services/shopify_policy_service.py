@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -146,6 +147,36 @@ def _hash_policy_body(body_html: Optional[str]) -> str:
     return sha256_hex(body)
 
 
+def _parse_shopify_datetime(value: Any) -> Optional[datetime]:
+    """
+    Shopify timestamps are typically ISO-8601 strings (e.g. 2025-12-22T16:35:29+01:00).
+    asyncpg expects a Python datetime for TIMESTAMPTZ parameters.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        # Interpret as unix seconds (best-effort).
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    if not isinstance(value, str):
+        return None
+
+    v = value.strip()
+    if not v:
+        return None
+    # Normalize Zulu suffix.
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
+
+
 def _normalize_policy(policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not policy:
         return {"title": None, "url": None, "body_html": None, "updated_at": None, "hash_sha256": _hash_policy_body(None)}
@@ -154,7 +185,7 @@ def _normalize_policy(policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "title": policy.get("title"),
         "url": policy.get("url"),
         "body_html": body,
-        "updated_at": policy.get("updatedAt"),
+        "updated_at": _parse_shopify_datetime(policy.get("updatedAt")),
         "hash_sha256": _hash_policy_body(body),
     }
 
@@ -223,7 +254,7 @@ async def fetch_and_store_shop_policies(
                     "title": item.get("title"),
                     "url": url,
                     "body_html": body,
-                    "updated_at": item.get("updatedAt") or item.get("updated_at"),
+                    "updated_at": _parse_shopify_datetime(item.get("updatedAt") or item.get("updated_at")),
                     "hash_sha256": _hash_policy_body(body),
                 }
         else:
