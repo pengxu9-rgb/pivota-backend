@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -240,6 +241,7 @@ async def verify_shopify_integration(
     callback_base_url: str,
     api_version: str = DEFAULT_API_VERSION,
 ) -> Dict[str, Any]:
+    run_id = str(uuid.uuid4())
     store_info = await get_primary_store(merchant_id)
     if not store_info or (store_info.get("platform") or "").lower() != "shopify":
         raise ValueError("Primary store is not Shopify")
@@ -368,6 +370,7 @@ async def verify_shopify_integration(
         has_returns_api = False
 
     scopes_json = {
+        "run_id": run_id,
         "checked_at": checked_at,
         "shop_domain": shop_domain,
         "access_scopes": scopes,
@@ -392,6 +395,7 @@ async def verify_shopify_integration(
         logger.warning("Failed to upsert pcs_merchant_capabilities merchant=%s: %s", merchant_id, e)
 
     return {
+        "run_id": run_id,
         "merchant_id": merchant_id,
         "checked_at": checked_at,
         "shop": {
