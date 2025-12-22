@@ -60,6 +60,83 @@ async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
 
 
 # ============================================================================
+# PCS / Shopify Webhook Debug (metadata-only)
+# ============================================================================
+
+@router.get("/debug/shopify/webhooks/events")
+async def agent_get_shopify_webhook_events(
+    merchant_id: str,
+    limit: int = Query(default=20, ge=1, le=200),
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Metadata-only view of ingested Shopify webhook events for a merchant.
+
+    Why this exists:
+    - Production debugging often has no easy way to obtain a Bearer login token.
+    - Agent API keys already have merchant scoping via AgentContext.
+
+    Security:
+    - Requires X-API-Key (AgentContext).
+    - Enforces merchant access via context.can_access_merchant().
+    - Never returns raw payload_json / PII.
+    """
+    if not context.can_access_merchant(merchant_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+    try:
+        query = """
+            SELECT
+                id,
+                merchant_id,
+                shop_domain,
+                topic,
+                signature_verified,
+                occurred_at,
+                received_at,
+                payload_sha256,
+                prev_chain_hash,
+                chain_hash,
+                idempotency_key
+            FROM pcs_shopify_webhook_events
+            WHERE merchant_id = :merchant_id
+            ORDER BY received_at DESC, id DESC
+            LIMIT :limit
+        """
+        rows = await database.fetch_all(query=query, values={"merchant_id": merchant_id, "limit": limit})
+
+        events = []
+        for row in rows:
+            events.append(
+                {
+                    "id": row["id"],
+                    "merchant_id": row["merchant_id"],
+                    "shop_domain": row["shop_domain"],
+                    "topic": row["topic"],
+                    "signature_verified": row["signature_verified"],
+                    "occurred_at": row["occurred_at"].isoformat() if row["occurred_at"] else None,
+                    "received_at": row["received_at"].isoformat() if row["received_at"] else None,
+                    "payload_sha256": row["payload_sha256"],
+                    "prev_chain_hash": row["prev_chain_hash"],
+                    "chain_hash": row["chain_hash"],
+                    "idempotency_key": row["idempotency_key"],
+                }
+            )
+
+        return {"status": "success", "merchant_id": merchant_id, "events": events}
+    except Exception as e:
+        message = str(e)
+        if "pcs_shopify_webhook_events" in message and ("does not exist" in message or "relation" in message):
+            return {
+                "status": "success",
+                "merchant_id": merchant_id,
+                "events": [],
+                "warning": "pcs_shopify_webhook_events table not found (migration not applied)",
+            }
+        raise
+
+
+# ============================================================================
 # 产品搜索和浏览
 # ============================================================================
 
