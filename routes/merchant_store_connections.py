@@ -35,6 +35,21 @@ class VerifyShopifyIntegrationRequest(BaseModel):
     api_version: Optional[str] = None
 
 
+class ShopifyWebhookEventOut(BaseModel):
+    id: int
+    merchant_id: str
+    shop_domain: Optional[str] = None
+    topic: str
+    webhook_id: Optional[str] = None
+    idempotency_key: str
+    signature_verified: bool
+    received_at: Optional[str] = None
+    occurred_at: Optional[str] = None
+    payload_sha256: str
+    prev_chain_hash: Optional[str] = None
+    chain_hash: str
+
+
 class ConnectWixRequest(BaseModel):
     merchant_id: str
     site_id: str
@@ -208,6 +223,67 @@ async def merchant_verify_shopify_integration(
     except Exception as e:
         logger.error(f"Shopify integration verify failed merchant={request.merchant_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to verify Shopify integration")
+
+
+@router.get("/shopify/webhooks/events")
+async def list_shopify_webhook_events(
+    merchant_id: Optional[str] = None,
+    limit: int = 20,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Read-only debug: list latest ingested Shopify webhook events for a merchant.
+    Does NOT return payload_json (to avoid leaking PII).
+    """
+    if current_user["role"] not in ["merchant", "employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    target_merchant_id = merchant_id or current_user.get("merchant_id")
+    if not target_merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+
+    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+        raise HTTPException(status_code=403, detail="Can only access your own merchant")
+
+    safe_limit = max(1, min(int(limit or 20), 200))
+
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT
+              id,
+              merchant_id,
+              shop_domain,
+              topic,
+              webhook_id,
+              idempotency_key,
+              signature_verified,
+              received_at,
+              occurred_at,
+              payload_sha256,
+              prev_chain_hash,
+              chain_hash
+            FROM pcs_shopify_webhook_events
+            WHERE merchant_id = :merchant_id
+            ORDER BY received_at DESC
+            LIMIT :limit
+            """,
+            {"merchant_id": target_merchant_id, "limit": safe_limit},
+        )
+    except Exception as e:
+        logger.error(f"Failed to query pcs_shopify_webhook_events merchant={target_merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load webhook events")
+
+    events = []
+    for row in rows:
+        d = dict(row)
+        # ISO stringify datetimes for JSON stability (FastAPI will also handle, but be explicit)
+        for k in ("received_at", "occurred_at"):
+            if d.get(k) is not None:
+                d[k] = d[k].isoformat()
+        events.append(d)
+
+    return {"status": "success", "merchant_id": target_merchant_id, "events": events}
 
 
 @router.post("/shopify/products/sync")
