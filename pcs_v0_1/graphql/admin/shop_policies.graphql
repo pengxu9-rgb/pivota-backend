@@ -1,0 +1,16 @@
+# Admin GraphQL - Shop policies snapshot (v0.1)
+# Mapping:
+#   shop.refundPolicy -> OPS.policies.refund_policy
+
+query ShopPolicies {
+  shop {
+    id
+    name
+    primaryDomain { host url }
+    refundPolicy { title url body updatedAt }
+    shippingPolicy { title url body updatedAt }
+    privacyPolicy { title url body updatedAt }
+    termsOfService { title url body updatedAt }
+  }
+}
+

@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pivota.ai/schemas/pcs/ops/0.1.json",
+  "title": "OPS@0.1 (Offer/Product/Policy Snapshot)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "effective_from",
+    "source",
+    "last_updated_at",
+    "merchant",
+    "policies",
+    "products"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "0.1" },
+    "effective_from": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "string",
+      "enum": ["shopify", "metafield", "metaobject", "external", "pivota_derived"]
+    },
+    "last_updated_at": { "type": "string", "format": "date-time" },
+    "merchant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["merchant_id", "platform", "shop_domain", "shop_gid"],
+      "properties": {
+        "merchant_id": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "enum": ["shopify"] },
+        "shop_domain": { "type": "string", "minLength": 1 },
+        "shop_gid": { "type": "string", "minLength": 1 },
+        "shopify_api_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["refund_policy", "shipping_policy", "privacy_policy", "terms_of_service"],
+      "properties": {
+        "refund_policy": { "$ref": "#/$defs/shop_policy" },
+        "shipping_policy": { "$ref": "#/$defs/shop_policy" },
+        "privacy_policy": { "$ref": "#/$defs/shop_policy" },
+        "terms_of_service": { "$ref": "#/$defs/shop_policy" }
+      }
+    },
+    "products": {
+      "type": "array",
+      "minItems": 0,
+      "items": { "$ref": "#/$defs/product" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": { "type": "string", "pattern": "^-?\\d+(\\.\\d{1,6})?$" },
+        "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
+      }
+    },
+    "shop_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "updated_at", "hash_sha256"],
+      "properties": {
+        "title": { "type": "string" },
+        "url": { "type": "string", "minLength": 1 },
+        "body_html": { "type": "string" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "hash_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "body_html": { "type": "string", "minLength": 1 } }, "required": ["body_html"] },
+          "then": { "required": ["hash_sha256"] }
+        }
+      ]
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["product_gid", "title", "status", "updated_at", "variants"],
+      "properties": {
+        "product_gid": { "type": "string", "minLength": 1 },
+        "product_legacy_id": { "type": "integer", "minimum": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "handle": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "ARCHIVED", "DRAFT"] },
+        "vendor": { "type": "string" },
+        "product_type": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "pcs_metafields": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+        },
+        "variants": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/variant" } }
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant_gid", "title", "price", "inventory", "requires_shipping", "updated_at"],
+      "properties": {
+        "variant_gid": { "type": "string", "minLength": 1 },
+        "variant_legacy_id": { "type": "integer", "minimum": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "sku": { "type": "string" },
+        "barcode": { "type": "string" },
+        "price": { "$ref": "#/$defs/money" },
+        "compare_at_price": { "$ref": "#/$defs/money" },
+        "available_for_sale": { "type": "boolean" },
+        "requires_shipping": { "type": "boolean" },
+        "taxable": { "type": "boolean" },
+        "tax_code": { "type": "string" },
+        "customs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hs_code": { "type": "string" },
+            "country_of_origin": { "type": "string", "minLength": 2, "maxLength": 2 },
+            "province_of_origin": { "type": "string" },
+            "weight_grams": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tracked", "by_location"],
+          "properties": {
+            "tracked": { "type": "boolean" },
+            "by_location": {
+              "type": "array",
+              "minItems": 0,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["location_gid", "available"],
+                "properties": {
+                  "location_gid": { "type": "string", "minLength": 1 },
+                  "available": { "type": "integer" },
+                  "location_label": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "pcs_metafields": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+        },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
+

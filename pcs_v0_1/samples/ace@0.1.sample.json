@@ -1,0 +1,45 @@
+{
+  "schema_version": "0.1",
+  "effective_from": "2025-01-01T00:00:00Z",
+  "source": "pivota_derived",
+  "last_updated_at": "2025-12-22T00:00:00Z",
+  "merchant": {
+    "merchant_id": "m_demo_001",
+    "platform": "shopify",
+    "shop_domain": "demo-shop.myshopify.com"
+  },
+  "authorization": {
+    "max_amount_per_order": { "amount": "300.00", "currency": "USD" },
+    "max_orders_per_day": 200,
+    "allow_partial_capture": true,
+    "allow_retry": true,
+    "authorization_window_minutes": 4320,
+    "allowed_transaction_kinds": ["AUTHORIZATION", "CAPTURE", "VOID", "REFUND", "SALE"]
+  },
+  "step_up": {
+    "triggers": [
+      {
+        "trigger_type": "amount_over",
+        "threshold_amount": { "amount": "200.00", "currency": "USD" },
+        "action": "require_manual_review"
+      },
+      {
+        "trigger_type": "high_refund_rate",
+        "threshold_rate": 0.25,
+        "action": "block"
+      }
+    ]
+  },
+  "audit": {
+    "record_actor": true,
+    "record_reason_code": true,
+    "append_only": true,
+    "retention_days": 2555
+  },
+  "shopify_order_metafield_keys": {
+    "pivota_mandate_id": "pcs.pivota_mandate_id",
+    "pivota_agent_id": "pcs.pivota_agent_id",
+    "authorization_audit_ref": "pcs.authorization_audit_ref"
+  }
+}
+

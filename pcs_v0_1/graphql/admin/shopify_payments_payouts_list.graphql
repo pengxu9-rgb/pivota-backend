@@ -1,0 +1,17 @@
+# Admin GraphQL - Shopify Payments payouts list (v0.1, optional)
+# Variables:
+#   $first: Int! (e.g. 50)
+#   $after: String
+
+query ShopifyPaymentsPayoutsList($first: Int!, $after: String) {
+  shopifyPaymentsPayouts(first: $first, after: $after) {
+    nodes {
+      id
+      status
+      date
+      currency
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+

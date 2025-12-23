@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pivota.ai/schemas/pcs/pcs/0.1.json",
+  "title": "PCS@0.1 (Fulfillment/Returns/Support/Dispute Parameters)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "effective_from",
+    "source",
+    "last_updated_at",
+    "merchant",
+    "fulfillment",
+    "returns",
+    "support",
+    "duties",
+    "reserve_policy",
+    "evidence_policy"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "0.1" },
+    "effective_from": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "string",
+      "enum": ["shopify", "metafield", "metaobject", "external", "pivota_derived"]
+    },
+    "last_updated_at": { "type": "string", "format": "date-time" },
+    "merchant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["merchant_id", "platform", "shop_domain"],
+      "properties": {
+        "merchant_id": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "enum": ["shopify"] },
+        "shop_domain": { "type": "string", "minLength": 1 }
+      }
+    },
+    "fulfillment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "ship_within_hours", "late_shipment_grace_hours"],
+      "properties": {
+        "model": { "type": "string", "enum": ["ship_from_merchant_location"] },
+        "ship_within_hours": { "type": "integer", "minimum": 1, "maximum": 720 },
+        "late_shipment_grace_hours": { "type": "integer", "minimum": 0, "maximum": 168 },
+        "allowed_carriers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "returns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "return_window_days", "refund_sla_days", "workflow"],
+      "properties": {
+        "model": { "type": "string", "enum": ["mail_in_return"] },
+        "return_window_days": { "type": "integer", "minimum": 0, "maximum": 365 },
+        "warranty_days": { "type": "integer", "minimum": 0, "maximum": 3650 },
+        "refund_sla_days": { "type": "integer", "minimum": 0, "maximum": 60 },
+        "restricted_regions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "description": "ISO country codes or region codes where returns are not supported."
+        },
+        "workflow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["refund_trigger", "required_events"],
+          "properties": {
+            "refund_trigger": {
+              "type": "string",
+              "enum": ["on_request", "on_label_scan", "on_receive", "on_inspection_pass"]
+            },
+            "required_events": {
+              "type": "array",
+              "minItems": 0,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "rma_created",
+                  "label_issued",
+                  "return_in_transit",
+                  "rma_received",
+                  "inspection_passed",
+                  "refund_initiated"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "workflow": { "properties": { "refund_trigger": { "const": "on_receive" } }, "required": ["refund_trigger"] } }, "required": ["workflow"] },
+          "then": {
+            "properties": {
+              "workflow": {
+                "properties": {
+                  "required_events": { "contains": { "const": "rma_received" } }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "support": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["support_sla_hours", "channels"],
+      "properties": {
+        "support_sla_hours": { "type": "integer", "minimum": 1, "maximum": 168 },
+        "channels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["email", "chat", "phone", "helpdesk"] }
+        },
+        "external_system_refs": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "duties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["incoterms_default", "duty_responsibility"],
+      "properties": {
+        "incoterms_default": { "type": "string", "enum": ["DDP", "DDU"] },
+        "duty_responsibility": { "type": "string", "enum": ["merchant", "customer"] }
+      }
+    },
+    "reserve_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["holdback_rate", "holdback_days"],
+      "properties": {
+        "holdback_rate": { "type": "number", "minimum": 0, "maximum": 0.5 },
+        "holdback_days": { "type": "integer", "minimum": 0, "maximum": 180 },
+        "triggers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["chargeback_spike", "refund_spike", "late_shipment_spike", "policy_mismatch"]
+          }
+        }
+      }
+    },
+    "evidence_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_disclosure_required", "pod_required_over_amount", "required_artifacts"],
+      "properties": {
+        "policy_disclosure_required": { "type": "boolean" },
+        "pod_required_over_amount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["amount", "currency"],
+          "properties": {
+            "amount": { "type": "string", "pattern": "^\\d+(\\.\\d{1,2})?$" },
+            "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
+          }
+        },
+        "required_artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "authorization_ref",
+              "policy_snapshot",
+              "fulfillment_tracking",
+              "delivered_event",
+              "proof_of_delivery",
+              "support_timeline_hash"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+

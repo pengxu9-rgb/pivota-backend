@@ -1,0 +1,31 @@
+# Admin GraphQL - Orders incremental sync (v0.1)
+# Variables:
+#   $first: Int!   (e.g. 50)
+#   $after: String (cursor)
+#   $query: String (e.g. "updated_at:>=2025-12-01T00:00:00Z")
+
+query OrdersList($first: Int!, $after: String, $query: String) {
+  orders(first: $first, after: $after, query: $query, sortKey: UPDATED_AT, reverse: true) {
+    nodes {
+      id
+      legacyResourceId
+      name
+      processedAt
+      updatedAt
+      currencyCode
+      displayFinancialStatus
+      displayFulfillmentStatus
+      paymentGatewayNames
+      canceledAt
+      cancelReason
+
+      totalPriceSet { shopMoney { amount currencyCode } }
+      totalReceivedSet { shopMoney { amount currencyCode } }
+      totalRefundedSet { shopMoney { amount currencyCode } }
+
+      metafields(first: 50, namespace: "pcs") { nodes { key type value updatedAt } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+

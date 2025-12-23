@@ -1,0 +1,22 @@
+# Admin GraphQL - Shopify Payments balance transactions (v0.1, optional)
+# Variables:
+#   $first: Int! (e.g. 100)
+#   $after: String
+#   $query: String (e.g. "created_at:>=2025-12-01 created_at:<2026-01-01")
+
+query ShopifyPaymentsBalanceTransactionsList($first: Int!, $after: String, $query: String) {
+  shopifyPaymentsBalanceTransactions(first: $first, after: $after, query: $query) {
+    nodes {
+      id
+      type
+      createdAt
+      amount { amount currencyCode }
+      fee { amount currencyCode }
+      net { amount currencyCode }
+      payout { id }
+      order { id name legacyResourceId }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+

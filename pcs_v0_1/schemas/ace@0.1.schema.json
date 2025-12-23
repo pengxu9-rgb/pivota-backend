@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pivota.ai/schemas/pcs/ace/0.1.json",
+  "title": "ACE@0.1 (Authorized Checkout & Risk Policy)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "effective_from",
+    "source",
+    "last_updated_at",
+    "merchant",
+    "authorization",
+    "step_up",
+    "audit",
+    "shopify_order_metafield_keys"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "0.1" },
+    "effective_from": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "string",
+      "enum": ["shopify", "metafield", "metaobject", "external", "pivota_derived"]
+    },
+    "last_updated_at": { "type": "string", "format": "date-time" },
+    "merchant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["merchant_id", "platform", "shop_domain"],
+      "properties": {
+        "merchant_id": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "enum": ["shopify"] },
+        "shop_domain": { "type": "string", "minLength": 1 }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_amount_per_order",
+        "max_orders_per_day",
+        "allow_partial_capture",
+        "allow_retry",
+        "authorization_window_minutes"
+      ],
+      "properties": {
+        "max_amount_per_order": { "$ref": "#/$defs/money" },
+        "max_orders_per_day": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "allow_partial_capture": { "type": "boolean" },
+        "allow_retry": { "type": "boolean" },
+        "authorization_window_minutes": { "type": "integer", "minimum": 1, "maximum": 10080 },
+        "allowed_transaction_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["AUTHORIZATION", "SALE", "CAPTURE", "VOID", "REFUND"] }
+        }
+      }
+    },
+    "step_up": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["triggers"],
+      "properties": {
+        "triggers": {
+          "type": "array",
+          "minItems": 0,
+          "items": { "$ref": "#/$defs/step_up_trigger" }
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_actor", "record_reason_code", "append_only"],
+      "properties": {
+        "record_actor": { "type": "boolean" },
+        "record_reason_code": { "type": "boolean" },
+        "append_only": { "type": "boolean", "const": true },
+        "retention_days": { "type": "integer", "minimum": 30, "maximum": 3650 }
+      }
+    },
+    "shopify_order_metafield_keys": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pivota_mandate_id", "pivota_agent_id", "authorization_audit_ref"],
+      "properties": {
+        "pivota_mandate_id": { "type": "string", "const": "pcs.pivota_mandate_id" },
+        "pivota_agent_id": { "type": "string", "const": "pcs.pivota_agent_id" },
+        "authorization_audit_ref": { "type": "string", "const": "pcs.authorization_audit_ref" }
+      }
+    }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": { "type": "string", "pattern": "^\\d+(\\.\\d{1,2})?$" },
+        "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
+      }
+    },
+    "step_up_trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger_type", "action"],
+      "properties": {
+        "trigger_type": {
+          "type": "string",
+          "enum": [
+            "amount_over",
+            "high_refund_rate",
+            "address_mismatch",
+            "shipping_unavailable",
+            "inventory_mismatch"
+          ]
+        },
+        "action": { "type": "string", "enum": ["require_manual_review", "require_requote", "block"] },
+        "threshold_amount": { "$ref": "#/$defs/money" },
+        "threshold_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "trigger_type": { "const": "amount_over" } }, "required": ["trigger_type"] },
+          "then": { "required": ["threshold_amount"] }
+        },
+        {
+          "if": { "properties": { "trigger_type": { "const": "high_refund_rate" } }, "required": ["trigger_type"] },
+          "then": { "required": ["threshold_rate"] }
+        }
+      ]
+    }
+  }
+}
+

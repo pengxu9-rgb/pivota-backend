@@ -1,0 +1,23 @@
+# Admin GraphQL - Shopify Payments disputes list (v0.1, optional)
+# Variables:
+#   $first: Int! (e.g. 50)
+#   $after: String
+#
+# Mapping:
+#   dispute.id -> Ledger.disputes[].shopify_dispute_gid
+
+query ShopifyPaymentsDisputesList($first: Int!, $after: String) {
+  shopifyPaymentsDisputes(first: $first, after: $after) {
+    nodes {
+      id
+      status
+      reason
+      initiatedAt
+      evidenceDueBy
+      finalizedAt
+      order { id name legacyResourceId }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+

@@ -1,0 +1,88 @@
+{
+  "schema_version": "0.1",
+  "effective_from": "2025-01-01T00:00:00Z",
+  "source": "pivota_derived",
+  "last_updated_at": "2025-12-22T00:00:00Z",
+  "pack_type": "dispute_pack",
+  "pack_version": 1,
+  "status": "frozen",
+  "generated_at": "2025-12-22T01:00:00Z",
+  "frozen_at": "2025-12-22T01:05:00Z",
+  "merchant": {
+    "merchant_id": "m_demo_001",
+    "platform": "shopify",
+    "shop_domain": "demo-shop.myshopify.com"
+  },
+  "order_ref": {
+    "order_gid": "gid://shopify/Order/999",
+    "order_name": "#1009",
+    "placed_at": "2025-12-21T12:00:00Z",
+    "currency": "USD",
+    "order_total": { "amount": "36.46", "currency": "USD" },
+    "pcs_ledger_ref": "ledger:order:gid://shopify/Order/999"
+  },
+  "dispute_ref": {
+    "dispute_id": "disp_local_01",
+    "shopify_dispute_gid": "gid://shopify/ShopifyPaymentsDispute/abc",
+    "opened_at": "2025-12-22T00:30:00Z",
+    "evidence_due_by": "2025-12-29T00:30:00Z",
+    "reason": "fraudulent"
+  },
+  "mandate_evidence": {
+    "pivota_mandate_id": "mand_001",
+    "pivota_agent_id": "agent_001",
+    "authorization_audit_ref": "audit://pivota/authz/evt_stream_123",
+    "audit_events_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "policy_snapshot": {
+    "captured_at": "2025-12-21T12:00:00Z",
+    "policies": [
+      {
+        "policy_type": "refund",
+        "url": "https://demo-shop.myshopify.com/policies/refund-policy",
+        "hash_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "updated_at": "2025-12-20T10:00:00Z"
+      },
+      {
+        "policy_type": "shipping",
+        "url": "https://demo-shop.myshopify.com/policies/shipping-policy",
+        "hash_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "updated_at": "2025-12-20T10:00:00Z"
+      }
+    ],
+    "policy_disclosure_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "fulfillment_proof": {
+    "tracking": [
+      {
+        "tracking_number": "1Z999AA10123456784",
+        "carrier": "UPS",
+        "tracking_url": "https://www.ups.com/track?loc=en_US&tracknum=1Z999AA10123456784"
+      }
+    ],
+    "delivered_evidence": {
+      "status": "unknown",
+      "source": "shopify"
+    },
+    "pod_assets": []
+  },
+  "support_timeline": {
+    "source_system": "helpdesk",
+    "external_ticket_ids": ["gorgias:ticket:777"],
+    "timeline_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "assets": [
+    {
+      "asset_type": "pdf",
+      "object_key": "evidence/m_demo_001/orders/999/policy_snapshot_v1.pdf",
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "content_type": "application/pdf",
+      "size_bytes": 120394,
+      "obtained_at": "2025-12-22T01:02:00Z",
+      "source": "pivota"
+    }
+  ],
+  "manifest_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "manifest_signature": "hmac-sha256:base64:..."
+}
+

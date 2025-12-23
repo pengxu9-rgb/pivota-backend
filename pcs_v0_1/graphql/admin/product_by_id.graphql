@@ -1,0 +1,61 @@
+# Admin GraphQL - Product by id (backfill/debug) (v0.1)
+# Variables:
+#   $id: ID!
+
+query ProductById($id: ID!) {
+  product(id: $id) {
+    id
+    legacyResourceId
+    title
+    handle
+    status
+    vendor
+    productType
+    tags
+    descriptionHtml
+    createdAt
+    updatedAt
+
+    metafields(first: 50, namespace: "pcs") {
+      nodes { key type value updatedAt }
+    }
+
+    variants(first: 100) {
+      nodes {
+        id
+        legacyResourceId
+        title
+        sku
+        barcode
+        price
+        compareAtPrice
+        availableForSale
+        taxable
+        taxCode
+        inventoryPolicy
+        selectedOptions { name value }
+        createdAt
+        updatedAt
+
+        inventoryItem {
+          id
+          tracked
+          requiresShipping
+          countryCodeOfOrigin
+          provinceCodeOfOrigin
+          harmonizedSystemCode
+          measurement { weight { unit value } }
+          unitCost { amount currencyCode }
+          inventoryLevels(first: 50) {
+            nodes { available location { id name } }
+          }
+        }
+
+        metafields(first: 50, namespace: "pcs") {
+          nodes { key type value updatedAt }
+        }
+      }
+    }
+  }
+}
+

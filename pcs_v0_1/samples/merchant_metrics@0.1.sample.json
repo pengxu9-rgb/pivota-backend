@@ -1,0 +1,39 @@
+{
+  "schema_version": "0.1",
+  "effective_from": "2025-01-01T00:00:00Z",
+  "source": "pivota_derived",
+  "last_updated_at": "2025-12-22T00:00:00Z",
+  "computed_at": "2025-12-22T00:05:00Z",
+  "merchant": {
+    "merchant_id": "m_demo_001",
+    "platform": "shopify",
+    "shop_domain": "demo-shop.myshopify.com"
+  },
+  "windows": {
+    "d28": {
+      "window_days": 28,
+      "orders_count": 48,
+      "gmv": { "amount": "7820.00", "currency": "USD" },
+      "refund_rate": 0.0625,
+      "return_rate": 0.1042,
+      "chargeback_rate": 0.0,
+      "late_shipment_rate": 0.0417,
+      "mttr_hours": 21.2,
+      "evidence_completeness": 0.83,
+      "samples": { "refunds_count": 3, "returns_count": 5, "chargebacks_count": 0, "late_shipments_count": 2 }
+    },
+    "d90": {
+      "window_days": 90,
+      "orders_count": 132,
+      "gmv": { "amount": "22310.00", "currency": "USD" },
+      "refund_rate": 0.0682,
+      "return_rate": 0.1212,
+      "chargeback_rate": 0.0038,
+      "late_shipment_rate": 0.0530,
+      "mttr_hours": 32.5,
+      "evidence_completeness": 0.86,
+      "samples": { "refunds_count": 9, "returns_count": 16, "chargebacks_count": 1, "late_shipments_count": 7 }
+    }
+  }
+}
+

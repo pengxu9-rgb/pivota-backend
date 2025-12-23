@@ -1,0 +1,51 @@
+{
+  "schema_version": "0.1",
+  "effective_from": "2025-01-01T00:00:00Z",
+  "source": "metaobject",
+  "last_updated_at": "2025-12-22T00:00:00Z",
+  "merchant": {
+    "merchant_id": "m_demo_001",
+    "platform": "shopify",
+    "shop_domain": "demo-shop.myshopify.com"
+  },
+  "fulfillment": {
+    "model": "ship_from_merchant_location",
+    "ship_within_hours": 48,
+    "late_shipment_grace_hours": 12,
+    "allowed_carriers": ["UPS", "USPS"]
+  },
+  "returns": {
+    "model": "mail_in_return",
+    "return_window_days": 30,
+    "warranty_days": 90,
+    "refund_sla_days": 5,
+    "restricted_regions": [],
+    "workflow": {
+      "refund_trigger": "on_receive",
+      "required_events": ["rma_created", "label_issued", "return_in_transit", "rma_received", "refund_initiated"]
+    }
+  },
+  "support": {
+    "support_sla_hours": 24,
+    "channels": ["email", "chat"],
+    "external_system_refs": {
+      "helpdesk_vendor": "gorgias",
+      "helpdesk_account_id": "acct_123"
+    }
+  },
+  "duties": {
+    "incoterms_default": "DDP",
+    "duty_responsibility": "merchant"
+  },
+  "reserve_policy": {
+    "holdback_rate": 0.05,
+    "holdback_days": 14,
+    "triggers": ["chargeback_spike", "late_shipment_spike", "refund_spike"]
+  },
+  "evidence_policy": {
+    "policy_disclosure_required": true,
+    "pod_required_over_amount": { "amount": "150.00", "currency": "USD" },
+    "required_artifacts": ["authorization_ref", "policy_snapshot", "fulfillment_tracking", "delivered_event", "support_timeline_hash"]
+  }
+}
+

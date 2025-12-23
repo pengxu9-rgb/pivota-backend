@@ -1,0 +1,93 @@
+# Admin GraphQL - Order detail aggregation (v0.1)
+# Variables:
+#   $id: ID!
+#
+# Mapping:
+#   Order.transactions.nodes[] -> Ledger.payments[]
+#   Order.fulfillments.nodes[] -> Ledger.fulfillments[]
+#   Order.refunds.nodes[] -> Ledger.refunds[]
+#   Order.displayFinancialStatus -> Ledger.order.shopify_financial_status
+
+query OrderDetail($id: ID!) {
+  order(id: $id) {
+    id
+    legacyResourceId
+    name
+    processedAt
+    updatedAt
+    currencyCode
+    displayFinancialStatus
+    displayFulfillmentStatus
+    paymentGatewayNames
+    canceledAt
+    cancelReason
+
+    totalPriceSet { shopMoney { amount currencyCode } }
+    subtotalPriceSet { shopMoney { amount currencyCode } }
+    totalShippingPriceSet { shopMoney { amount currencyCode } }
+    totalTaxSet { shopMoney { amount currencyCode } }
+    totalDiscountsSet { shopMoney { amount currencyCode } }
+
+    metafields(first: 50, namespace: "pcs") { nodes { key type value updatedAt } }
+
+    transactions(first: 50) {
+      nodes {
+        id
+        legacyResourceId
+        processedAt
+        status
+        kind
+        gateway
+        authorizationCode
+        amountSet { shopMoney { amount currencyCode } }
+        parentTransaction { id }
+        receiptJson
+      }
+    }
+
+    fulfillments(first: 50) {
+      nodes {
+        id
+        status
+        createdAt
+        deliveredAt
+        trackingInfo(first: 10) {
+          number
+          company
+          url
+        }
+      }
+    }
+
+    refunds(first: 50) {
+      nodes {
+        id
+        createdAt
+        note
+        totalRefundedSet { shopMoney { amount currencyCode } }
+        refundLineItems(first: 100) {
+          nodes {
+            quantity
+            restockType
+            lineItem {
+              id
+              sku
+              title
+              variantTitle
+            }
+          }
+        }
+        transactions(first: 50) {
+          nodes {
+            id
+            kind
+            status
+            processedAt
+            amountSet { shopMoney { amount currencyCode } }
+          }
+        }
+      }
+    }
+  }
+}
+

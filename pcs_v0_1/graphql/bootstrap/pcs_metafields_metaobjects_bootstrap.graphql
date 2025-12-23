@@ -1,0 +1,303 @@
+# PCS v0.1 bootstrap (Admin GraphQL)
+# - Creates Metafield Definitions (namespace=pcs)
+# - Creates Metaobject Definitions for versioned rulesets
+#
+# Notes:
+# - Some ownerTypes/types may vary by API version; run in GraphiQL and adjust if Shopify returns userErrors.
+# - For list types, Shopify uses e.g. "list.single_line_text_field".
+
+############################
+# Metafield Definitions
+############################
+
+mutation PCSMetafieldDef_Shop_ShipWithinHours {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Ship Within Hours"
+      namespace: "pcs"
+      key: "ship_within_hours"
+      ownerType: SHOP
+      type: "number_integer"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Shop_ReturnWindowDays {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Return Window Days"
+      namespace: "pcs"
+      key: "return_window_days"
+      ownerType: SHOP
+      type: "number_integer"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Shop_RefundSlaDays {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Refund SLA Days"
+      namespace: "pcs"
+      key: "refund_sla_days"
+      ownerType: SHOP
+      type: "number_integer"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Shop_SupportSlaHours {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Support SLA Hours"
+      namespace: "pcs"
+      key: "support_sla_hours"
+      ownerType: SHOP
+      type: "number_integer"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Shop_IncotermsDefault {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Incoterms Default"
+      namespace: "pcs"
+      key: "incoterms_default"
+      ownerType: SHOP
+      type: "single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Shop_DutyResponsibility {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Duty Responsibility"
+      namespace: "pcs"
+      key: "duty_responsibility"
+      ownerType: SHOP
+      type: "single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Product_WarrantyTerms {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Warranty Terms"
+      namespace: "pcs"
+      key: "warranty_terms"
+      ownerType: PRODUCT
+      type: "multi_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Product_WarrantyDays {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Warranty Days"
+      namespace: "pcs"
+      key: "warranty_days"
+      ownerType: PRODUCT
+      type: "number_integer"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Variant_RestrictedRegions {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Restricted Regions"
+      namespace: "pcs"
+      key: "restricted_regions"
+      ownerType: PRODUCTVARIANT
+      type: "list.single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Order_PolicyDisclosureHash {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Policy Disclosure Hash"
+      namespace: "pcs"
+      key: "policy_disclosure_hash"
+      ownerType: ORDER
+      type: "single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Order_PivotaMandateId {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "Pivota Mandate ID"
+      namespace: "pcs"
+      key: "pivota_mandate_id"
+      ownerType: ORDER
+      type: "single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Order_PivotaAgentId {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "Pivota Agent ID"
+      namespace: "pcs"
+      key: "pivota_agent_id"
+      ownerType: ORDER
+      type: "single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Order_AuthorizationAuditRef {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Authorization Audit Ref"
+      namespace: "pcs"
+      key: "authorization_audit_ref"
+      ownerType: ORDER
+      type: "single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+mutation PCSMetafieldDef_Order_LedgerRef {
+  metafieldDefinitionCreate(
+    definition: {
+      name: "PCS Ledger Ref"
+      namespace: "pcs"
+      key: "ledger_ref"
+      ownerType: ORDER
+      type: "single_line_text_field"
+      pin: true
+    }
+  ) { createdDefinition { id } userErrors { field message } }
+}
+
+############################
+# Metaobject Definitions (Versioned Rulesets)
+############################
+
+mutation PCSDefine_ReturnPolicyBundle {
+  metaobjectDefinitionCreate(
+    definition: {
+      type: "pcs_return_policy_bundle"
+      name: "PCS Return Policy Bundle"
+      access: { storefront: PUBLIC_READ }
+      fieldDefinitions: [
+        { key: "schema_version", name: "Schema Version", type: "single_line_text_field", required: true }
+        { key: "window_days", name: "Return Window Days", type: "number_integer", required: true }
+        { key: "refund_sla_days", name: "Refund SLA Days", type: "number_integer", required: true }
+        { key: "refund_trigger", name: "Refund Trigger", type: "single_line_text_field", required: true }
+        { key: "restricted_regions_json", name: "Restricted Regions JSON", type: "json" }
+        { key: "effective_from", name: "Effective From", type: "date_time", required: true }
+        { key: "effective_to", name: "Effective To", type: "date_time" }
+        { key: "source", name: "Source", type: "single_line_text_field" }
+      ]
+    }
+  ) { metaobjectDefinition { id type } userErrors { field message } }
+}
+
+mutation PCSDefine_DeliveryPromisePolicy {
+  metaobjectDefinitionCreate(
+    definition: {
+      type: "pcs_delivery_promise_policy"
+      name: "PCS Delivery Promise Policy"
+      access: { storefront: PUBLIC_READ }
+      fieldDefinitions: [
+        { key: "schema_version", name: "Schema Version", type: "single_line_text_field", required: true }
+        { key: "ship_within_hours", name: "Ship Within Hours", type: "number_integer", required: true }
+        { key: "late_shipment_grace_hours", name: "Late Shipment Grace Hours", type: "number_integer", required: true }
+        { key: "allowed_carriers_json", name: "Allowed Carriers JSON", type: "json" }
+        { key: "effective_from", name: "Effective From", type: "date_time", required: true }
+        { key: "effective_to", name: "Effective To", type: "date_time" }
+        { key: "source", name: "Source", type: "single_line_text_field" }
+      ]
+    }
+  ) { metaobjectDefinition { id type } userErrors { field message } }
+}
+
+mutation PCSDefine_ReservePolicy {
+  metaobjectDefinitionCreate(
+    definition: {
+      type: "pcs_reserve_policy"
+      name: "PCS Reserve Policy"
+      access: { storefront: PUBLIC_READ }
+      fieldDefinitions: [
+        { key: "schema_version", name: "Schema Version", type: "single_line_text_field", required: true }
+        { key: "holdback_rate", name: "Holdback Rate", type: "number_decimal", required: true }
+        { key: "holdback_days", name: "Holdback Days", type: "number_integer", required: true }
+        { key: "triggers_json", name: "Triggers JSON", type: "json" }
+        { key: "effective_from", name: "Effective From", type: "date_time", required: true }
+        { key: "effective_to", name: "Effective To", type: "date_time" }
+        { key: "source", name: "Source", type: "single_line_text_field" }
+      ]
+    }
+  ) { metaobjectDefinition { id type } userErrors { field message } }
+}
+
+mutation PCSDefine_ACEPolicy {
+  metaobjectDefinitionCreate(
+    definition: {
+      type: "pcs_ace_policy"
+      name: "PCS ACE Policy"
+      access: { storefront: PRIVATE }
+      fieldDefinitions: [
+        { key: "schema_version", name: "Schema Version", type: "single_line_text_field", required: true }
+        { key: "max_amount_json", name: "Max Amount JSON", type: "json", required: true }
+        { key: "max_orders_per_day", name: "Max Orders Per Day", type: "number_integer", required: true }
+        { key: "allow_partial_capture", name: "Allow Partial Capture", type: "boolean", required: true }
+        { key: "allow_retry", name: "Allow Retry", type: "boolean", required: true }
+        { key: "authorization_window_minutes", name: "Authorization Window Minutes", type: "number_integer", required: true }
+        { key: "step_up_triggers_json", name: "Step-up Triggers JSON", type: "json" }
+        { key: "effective_from", name: "Effective From", type: "date_time", required: true }
+        { key: "effective_to", name: "Effective To", type: "date_time" }
+        { key: "source", name: "Source", type: "single_line_text_field" }
+      ]
+    }
+  ) { metaobjectDefinition { id type } userErrors { field message } }
+}
+
+############################
+# Default Records (optional)
+############################
+
+# v0.1 default return policy bundle:
+# - return_window_days=30
+# - refund_sla_days=5
+# - refund_trigger=on_receive
+mutation PCSDefault_ReturnPolicyBundle {
+  metaobjectCreate(
+    metaobject: {
+      type: "pcs_return_policy_bundle"
+      fields: [
+        { key: "schema_version", value: "0.1" }
+        { key: "window_days", value: "30" }
+        { key: "refund_sla_days", value: "5" }
+        { key: "refund_trigger", value: "on_receive" }
+        { key: "restricted_regions_json", value: "[]" }
+        { key: "effective_from", value: "2025-01-01T00:00:00Z" }
+        { key: "source", value: "default_v0_1" }
+      ]
+    }
+  ) { metaobject { id type handle } userErrors { field message } }
+}
+

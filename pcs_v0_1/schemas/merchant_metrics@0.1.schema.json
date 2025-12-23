@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pivota.ai/schemas/pcs/merchant-metrics/0.1.json",
+  "title": "MerchantMetrics@0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "effective_from",
+    "source",
+    "last_updated_at",
+    "merchant",
+    "computed_at",
+    "windows"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "0.1" },
+    "effective_from": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "string",
+      "enum": ["shopify", "metafield", "metaobject", "external", "pivota_derived"]
+    },
+    "last_updated_at": { "type": "string", "format": "date-time" },
+    "computed_at": { "type": "string", "format": "date-time" },
+    "merchant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["merchant_id", "platform", "shop_domain"],
+      "properties": {
+        "merchant_id": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "enum": ["shopify"] },
+        "shop_domain": { "type": "string", "minLength": 1 }
+      }
+    },
+    "windows": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["d28", "d90"],
+      "properties": {
+        "d28": { "$ref": "#/$defs/window_metrics" },
+        "d90": { "$ref": "#/$defs/window_metrics" }
+      }
+    }
+  },
+  "$defs": {
+    "window_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "window_days",
+        "orders_count",
+        "gmv",
+        "refund_rate",
+        "return_rate",
+        "chargeback_rate",
+        "late_shipment_rate",
+        "mttr_hours",
+        "evidence_completeness"
+      ],
+      "properties": {
+        "window_days": { "type": "integer", "enum": [28, 90] },
+        "orders_count": { "type": "integer", "minimum": 0 },
+        "gmv": { "$ref": "#/$defs/money" },
+        "refund_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "return_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "chargeback_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "late_shipment_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mttr_hours": { "type": "number", "minimum": 0, "maximum": 8760 },
+        "evidence_completeness": { "type": "number", "minimum": 0, "maximum": 1 },
+        "samples": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "refunds_count": { "type": "integer", "minimum": 0 },
+            "returns_count": { "type": "integer", "minimum": 0 },
+            "chargebacks_count": { "type": "integer", "minimum": 0 },
+            "late_shipments_count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "orders_count": { "const": 0 } }, "required": ["orders_count"] },
+          "then": {
+            "properties": {
+              "refund_rate": { "const": 0 },
+              "return_rate": { "const": 0 },
+              "chargeback_rate": { "const": 0 },
+              "late_shipment_rate": { "const": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": { "type": "string", "pattern": "^-?\\d+(\\.\\d{1,2})?$" },
+        "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
+      }
+    }
+  }
+}
+

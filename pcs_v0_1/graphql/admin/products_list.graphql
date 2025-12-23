@@ -1,0 +1,82 @@
+# Admin GraphQL - Products incremental sync (v0.1)
+# Variables:
+#   $first: Int!   (e.g. 50)
+#   $after: String (cursor)
+#   $query: String (e.g. "updated_at:>=2025-12-01T00:00:00Z")
+#
+# Mapping:
+#   Product.id -> OPS.products[].product_gid
+#   Product.legacyResourceId -> OPS.products[].product_legacy_id
+#   Variant.id -> OPS.products[].variants[].variant_gid
+#   InventoryLevel.available -> OPS.products[].variants[].inventory.by_location[].available
+
+query ProductsList($first: Int!, $after: String, $query: String) {
+  products(first: $first, after: $after, query: $query, sortKey: UPDATED_AT, reverse: true) {
+    nodes {
+      id
+      legacyResourceId
+      title
+      handle
+      status
+      vendor
+      productType
+      tags
+      updatedAt
+
+      metafields(first: 50, namespace: "pcs") {
+        nodes {
+          key
+          type
+          value
+          updatedAt
+        }
+      }
+
+      variants(first: 100) {
+        nodes {
+          id
+          legacyResourceId
+          title
+          sku
+          barcode
+          price
+          compareAtPrice
+          availableForSale
+          taxable
+          taxCode
+
+          inventoryItem {
+            id
+            tracked
+            requiresShipping
+            countryCodeOfOrigin
+            provinceCodeOfOrigin
+            harmonizedSystemCode
+            measurement { weight { unit value } }
+            unitCost { amount currencyCode }
+
+            inventoryLevels(first: 50) {
+              nodes {
+                available
+                location { id name }
+              }
+            }
+          }
+
+          metafields(first: 50, namespace: "pcs") {
+            nodes {
+              key
+              type
+              value
+              updatedAt
+            }
+          }
+
+          updatedAt
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+

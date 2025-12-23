@@ -1,0 +1,86 @@
+{
+  "schema_version": "0.1",
+  "effective_from": "2025-01-01T00:00:00Z",
+  "source": "shopify",
+  "last_updated_at": "2025-12-22T00:00:00Z",
+  "merchant": {
+    "merchant_id": "m_demo_001",
+    "platform": "shopify",
+    "shop_domain": "demo-shop.myshopify.com",
+    "shop_gid": "gid://shopify/Shop/123456789",
+    "shopify_api_version": "2024-07"
+  },
+  "policies": {
+    "refund_policy": {
+      "title": "Refund Policy",
+      "url": "https://demo-shop.myshopify.com/policies/refund-policy",
+      "body_html": "<p>Returns accepted within 30 days.</p>",
+      "updated_at": "2025-12-20T10:00:00Z",
+      "hash_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "shipping_policy": {
+      "title": "Shipping Policy",
+      "url": "https://demo-shop.myshopify.com/policies/shipping-policy",
+      "body_html": "<p>Ships within 48 hours.</p>",
+      "updated_at": "2025-12-20T10:00:00Z",
+      "hash_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "privacy_policy": {
+      "title": "Privacy Policy",
+      "url": "https://demo-shop.myshopify.com/policies/privacy-policy",
+      "body_html": "<p>We respect your privacy.</p>",
+      "updated_at": "2025-12-20T10:00:00Z",
+      "hash_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "terms_of_service": {
+      "title": "Terms of Service",
+      "url": "https://demo-shop.myshopify.com/policies/terms-of-service",
+      "body_html": "<p>By purchasing you agree...</p>",
+      "updated_at": "2025-12-20T10:00:00Z",
+      "hash_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  },
+  "products": [
+    {
+      "product_gid": "gid://shopify/Product/111",
+      "product_legacy_id": 111,
+      "title": "Demo Tee",
+      "handle": "demo-tee",
+      "status": "ACTIVE",
+      "vendor": "DemoBrand",
+      "product_type": "Apparel",
+      "tags": ["tee", "cotton"],
+      "updated_at": "2025-12-21T09:00:00Z",
+      "pcs_metafields": {
+        "warranty_terms": "90-day limited warranty"
+      },
+      "variants": [
+        {
+          "variant_gid": "gid://shopify/ProductVariant/222",
+          "variant_legacy_id": 222,
+          "title": "Small / Black",
+          "sku": "TEE-BLK-S",
+          "barcode": "0123456789012",
+          "price": { "amount": "29.00", "currency": "USD" },
+          "compare_at_price": { "amount": "39.00", "currency": "USD" },
+          "available_for_sale": true,
+          "requires_shipping": true,
+          "taxable": true,
+          "tax_code": "PC040100",
+          "customs": { "hs_code": "610910", "country_of_origin": "US", "weight_grams": 250 },
+          "inventory": {
+            "tracked": true,
+            "by_location": [
+              { "location_gid": "gid://shopify/Location/1", "available": 42, "location_label": "Main Warehouse" }
+            ]
+          },
+          "pcs_metafields": {
+            "restricted_countries": ["RU", "IR"]
+          },
+          "updated_at": "2025-12-21T09:00:00Z"
+        }
+      ]
+    }
+  ]
+}
+

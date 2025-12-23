@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pivota.ai/schemas/pcs/evidence-pack/0.1.json",
+  "title": "EvidencePack@0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "effective_from",
+    "source",
+    "last_updated_at",
+    "pack_type",
+    "pack_version",
+    "status",
+    "generated_at",
+    "merchant",
+    "order_ref",
+    "mandate_evidence",
+    "policy_snapshot",
+    "fulfillment_proof",
+    "support_timeline",
+    "assets",
+    "manifest_sha256"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "0.1" },
+    "effective_from": { "type": "string", "format": "date-time" },
+    "source": { "type": "string", "enum": ["shopify", "metafield", "metaobject", "external", "pivota_derived"] },
+    "last_updated_at": { "type": "string", "format": "date-time" },
+
+    "pack_type": { "type": "string", "enum": ["order_snapshot", "dispute_pack"] },
+    "pack_version": { "type": "integer", "minimum": 1 },
+    "status": { "type": "string", "enum": ["draft", "frozen"] },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "frozen_at": { "type": "string", "format": "date-time" },
+
+    "merchant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["merchant_id", "platform", "shop_domain"],
+      "properties": {
+        "merchant_id": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "enum": ["shopify"] },
+        "shop_domain": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "order_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["order_gid", "order_name", "placed_at", "currency", "order_total"],
+      "properties": {
+        "order_gid": { "type": "string", "minLength": 1 },
+        "order_name": { "type": "string", "minLength": 1 },
+        "placed_at": { "type": "string", "format": "date-time" },
+        "currency": { "type": "string", "minLength": 3, "maxLength": 3 },
+        "order_total": { "$ref": "#/$defs/money" },
+        "pcs_ledger_ref": { "type": "string" }
+      }
+    },
+
+    "dispute_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dispute_id", "opened_at"],
+      "properties": {
+        "dispute_id": { "type": "string", "minLength": 1 },
+        "shopify_dispute_gid": { "type": "string" },
+        "opened_at": { "type": "string", "format": "date-time" },
+        "evidence_due_by": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string" }
+      }
+    },
+
+    "mandate_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pivota_mandate_id", "pivota_agent_id", "authorization_audit_ref"],
+      "properties": {
+        "pivota_mandate_id": { "type": "string", "minLength": 1 },
+        "pivota_agent_id": { "type": "string", "minLength": 1 },
+        "authorization_audit_ref": { "type": "string", "minLength": 1 },
+        "audit_events_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+
+    "policy_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["captured_at", "policies"],
+      "properties": {
+        "captured_at": { "type": "string", "format": "date-time" },
+        "policies": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["policy_type", "url", "hash_sha256", "updated_at"],
+            "properties": {
+              "policy_type": { "type": "string", "enum": ["refund", "shipping", "privacy", "terms"] },
+              "url": { "type": "string", "minLength": 1 },
+              "hash_sha256": { "$ref": "#/$defs/sha256" },
+              "updated_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        },
+        "policy_disclosure_hash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+
+    "fulfillment_proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tracking", "delivered_evidence"],
+      "properties": {
+        "tracking": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tracking_number"],
+            "properties": {
+              "tracking_number": { "type": "string", "minLength": 1 },
+              "carrier": { "type": "string" },
+              "tracking_url": { "type": "string" }
+            }
+          }
+        },
+        "delivered_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "type": "string", "enum": ["unknown", "in_transit", "delivered"] },
+            "delivered_at": { "type": "string", "format": "date-time" },
+            "source": { "type": "string", "enum": ["shopify", "carrier", "aftership", "manual"] }
+          }
+        },
+        "pod_assets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/asset_ref" }
+        }
+      }
+    },
+
+    "support_timeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_system", "timeline_sha256"],
+      "properties": {
+        "source_system": { "type": "string", "enum": ["none", "email", "chat", "helpdesk", "manual"] },
+        "external_ticket_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "timeline_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+
+    "assets": {
+      "type": "array",
+      "minItems": 0,
+      "items": { "$ref": "#/$defs/asset_ref" }
+    },
+
+    "manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "manifest_signature": { "type": "string" }
+  },
+
+  "allOf": [
+    {
+      "if": { "properties": { "pack_type": { "const": "dispute_pack" } }, "required": ["pack_type"] },
+      "then": { "required": ["dispute_ref"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "frozen" } }, "required": ["status"] },
+      "then": { "required": ["frozen_at"] }
+    }
+  ],
+
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+    "money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": { "type": "string", "pattern": "^-?\\d+(\\.\\d{1,2})?$" },
+        "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
+      }
+    },
+    "asset_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_type", "object_key", "sha256", "obtained_at", "source"],
+      "properties": {
+        "asset_type": { "type": "string", "enum": ["pdf", "image", "html", "json", "signature", "text"] },
+        "object_key": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "content_type": { "type": "string" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "obtained_at": { "type": "string", "format": "date-time" },
+        "source": { "type": "string", "enum": ["shopify", "carrier", "aftership", "helpdesk", "pivota", "manual"] }
+      }
+    }
+  }
+}
+

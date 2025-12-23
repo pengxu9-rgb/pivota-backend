@@ -1,0 +1,92 @@
+{
+  "schema_version": "0.1",
+  "effective_from": "2025-01-01T00:00:00Z",
+  "source": "pivota_derived",
+  "last_updated_at": "2025-12-22T00:00:00Z",
+  "merchant": {
+    "merchant_id": "m_demo_001",
+    "platform": "shopify",
+    "shop_domain": "demo-shop.myshopify.com"
+  },
+  "order": {
+    "order_gid": "gid://shopify/Order/999",
+    "order_name": "#1009",
+    "placed_at": "2025-12-21T12:00:00Z",
+    "currency": "USD",
+    "order_state": "shipped",
+    "payment_state": "captured",
+    "shopify_financial_status": "PAID",
+    "shopify_fulfillment_status": "FULFILLED",
+    "totals": {
+      "subtotal": { "amount": "29.00", "currency": "USD" },
+      "discount_total": { "amount": "0.00", "currency": "USD" },
+      "shipping_fee": { "amount": "5.00", "currency": "USD" },
+      "tax": { "amount": "2.46", "currency": "USD" },
+      "total": { "amount": "36.46", "currency": "USD" }
+    }
+  },
+  "payments": [
+    {
+      "transaction_gid": "gid://shopify/OrderTransaction/tx_1",
+      "kind": "CAPTURE",
+      "status": "success",
+      "gateway": "shopify_payments",
+      "authorization_code": "auth_abc",
+      "processed_at": "2025-12-21T12:00:05Z",
+      "amount": { "amount": "36.46", "currency": "USD" }
+    }
+  ],
+  "fulfillments": [
+    {
+      "fulfillment_gid": "gid://shopify/Fulfillment/f_1",
+      "status": "success",
+      "created_at": "2025-12-21T18:00:00Z",
+      "tracking": [
+        { "number": "1Z999AA10123456784", "company": "UPS", "url": "https://www.ups.com/track?loc=en_US&tracknum=1Z999AA10123456784" }
+      ]
+    }
+  ],
+  "refunds": [],
+  "returns": [],
+  "disputes": [],
+  "events": [
+    {
+      "event_id": "evt_01",
+      "occurred_at": "2025-12-21T12:00:00Z",
+      "received_at": "2025-12-21T12:00:10Z",
+      "source": "shopify_webhook",
+      "topic": "orders/paid",
+      "idempotency_key": "demo-shop.myshopify.com:orders/paid:wh_123",
+      "payload_ref": {
+        "raw_event_table": "shopify_webhook_events",
+        "raw_event_id": "wh_123",
+        "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "entity_refs": [{ "entity_type": "order", "entity_id": "gid://shopify/Order/999" }]
+    },
+    {
+      "event_id": "evt_02",
+      "occurred_at": "2025-12-21T18:00:00Z",
+      "received_at": "2025-12-21T18:00:05Z",
+      "source": "shopify_webhook",
+      "topic": "fulfillments/create",
+      "idempotency_key": "demo-shop.myshopify.com:fulfillments/create:wh_124",
+      "payload_ref": {
+        "raw_event_table": "shopify_webhook_events",
+        "raw_event_id": "wh_124",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "entity_refs": [
+        { "entity_type": "order", "entity_id": "gid://shopify/Order/999" },
+        { "entity_type": "fulfillment", "entity_id": "gid://shopify/Fulfillment/f_1" }
+      ]
+    }
+  ],
+  "transitions": {
+    "order": [
+      { "from": "placed", "to": "shipped", "via_event": "fulfillments/create" },
+      { "from": "proposed", "to": "placed", "via_event": "orders/paid" }
+    ]
+  }
+}
+
