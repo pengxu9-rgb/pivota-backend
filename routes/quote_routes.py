@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from models.quote import QuotePreviewRequest, QuotePreviewResponse
 from routes.agent_auth import AgentContext, get_agent_context
 from services.quote_service import QuoteError, QuoteService, parse_decimal_money
+from mvp.constants import EVENT_OFFER_GENERATED, SURFACE_BACKEND
+from mvp.events import emit_best_effort
 
 
 router = APIRouter(prefix="/agent/v1/quotes", tags=["agent-quotes"])
@@ -37,7 +39,7 @@ async def preview_quote(
         )
 
     pricing = result["pricing"]
-    return {
+    response = {
         "quote_id": result["quote_id"],
         "expires_at": result["expires_at"],
         "engine": "shopify_rest_checkout",
@@ -55,3 +57,40 @@ async def preview_quote(
         "delivery_options": result.get("delivery_options"),
     }
 
+    # MVP measurement scaffolding (best-effort): offer/quote generated.
+    # Note: do not emit PII; keep only minimal geo fields + quote refs.
+    geo = None
+    try:
+        addr = req.shipping_address or {}
+        if isinstance(addr, dict):
+            geo = {
+                "country": (addr.get("country") or "").upper() or None,
+                "postal_code": addr.get("postal_code") or addr.get("zip"),
+                "city": addr.get("city"),
+                "state": addr.get("state") or addr.get("province"),
+            }
+    except Exception:
+        geo = None
+
+    emit_best_effort(
+        event_type=EVENT_OFFER_GENERATED,
+        payload={
+            "merchant_id": req.merchant_id,
+            "quote_id": response["quote_id"],
+            "expires_at": str(response["expires_at"]),
+            "engine": response["engine"],
+            "engine_ref": response["engine_ref"],
+            "currency": response["currency"],
+            "pricing": response["pricing"],
+            "items_count": len(req.items or []),
+            "delivery_options_count": len(response.get("delivery_options") or []),
+        },
+        merchant_id=req.merchant_id,
+        geo=geo,
+        surface=SURFACE_BACKEND,
+        adapter="quote_preview",
+        risk_tier="unknown",
+        idempotency_key=str(response["quote_id"]),
+    )
+
+    return response

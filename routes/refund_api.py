@@ -28,6 +28,7 @@ class RefundRequest(BaseModel):
     amount: Optional[float] = None  # None = full refund
     reason: Optional[str] = None
     restore_inventory: bool = True  # Whether to restore Shopify inventory
+    idempotency_key: Optional[str] = None  # Best-effort duplicate protection
 
 
 @router.post("/{order_id}/refund")
@@ -83,6 +84,64 @@ async def process_refund(
         )
     
     try:
+        # Idempotency (best-effort): if key is provided and we've already processed this request,
+        # return the cached response and do not attempt side effects again.
+        if refund_request.idempotency_key:
+            try:
+                from mvp.idempotency import PostgresIdempotencyStore
+
+                idem = PostgresIdempotencyStore()
+                existing = await idem.get(scope="refund", key=refund_request.idempotency_key)
+                if existing:
+                    return existing.value
+            except Exception:
+                pass
+
+        # MVP measurement scaffolding: refund requested (metadata-only).
+        try:
+            from mvp.constants import EVENT_REFUND_REQUESTED, SURFACE_BACKEND
+            from mvp.events import emit_best_effort
+
+            emit_best_effort(
+                event_type=EVENT_REFUND_REQUESTED,
+                payload={
+                    "order_id": order_id,
+                    "merchant_id": order.get("merchant_id"),
+                    "amount": str(refund_amount),
+                    "currency": order.get("currency"),
+                    "reason": refund_request.reason,
+                    "idempotency_key": refund_request.idempotency_key,
+                },
+                merchant_id=order.get("merchant_id"),
+                geo=None,
+                surface=SURFACE_BACKEND,
+                adapter="refund_api",
+                risk_tier="unknown",
+                idempotency_key=refund_request.idempotency_key,
+            )
+        except Exception:
+            pass
+
+        # MVP ledger event (best-effort): refund requested.
+        try:
+            from mvp.ledger_events import emit_ledger_event_best_effort
+
+            emit_ledger_event_best_effort(
+                merchant_id=str(order.get("merchant_id")),
+                event_type="refund_requested",
+                order_id=str(order_id),
+                source={"type": "backend"},
+                amount={"value": float(refund_amount), "currency": str(order.get("currency") or "USD")},
+                refs={"payment_intent_id": order.get("payment_intent_id")},
+                geo=None,
+                surface="backend",
+                adapter="refund_api",
+                risk_tier="unknown",
+                idempotency_key=refund_request.idempotency_key,
+            )
+        except Exception:
+            pass
+
         # Get PSP adapter
         psp_type = merchant.get("psp_type", "stripe")
         psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
@@ -137,6 +196,26 @@ async def process_refund(
                 "reason": refund_request.reason
             }
         )
+
+        # MVP ledger event (best-effort): refund completed.
+        try:
+            from mvp.ledger_events import emit_ledger_event_best_effort
+
+            emit_ledger_event_best_effort(
+                merchant_id=str(order.get("merchant_id")),
+                event_type="refund_completed",
+                order_id=str(order_id),
+                source={"type": "psp", "psp": psp_type, "external_event_id": refund_id},
+                amount={"value": float(refund_amount), "currency": str(order.get("currency") or "USD")},
+                refs={"payment_intent_id": order.get("payment_intent_id"), "psp_transaction_id": refund_id},
+                geo=None,
+                surface="backend",
+                adapter="refund_api",
+                risk_tier="unknown",
+                idempotency_key=refund_request.idempotency_key,
+            )
+        except Exception:
+            pass
         
         # Background task: Cancel/update Shopify order
         async def update_shopify_order_task():
@@ -181,8 +260,8 @@ async def process_refund(
                 logger.error(f"Error updating Shopify order after refund: {e}")
         
         background_tasks.add_task(update_shopify_order_task)
-        
-        return {
+
+        response = {
             "status": "success",
             "message": f"{'Partial refund' if is_partial else 'Full refund'} processed successfully",
             "order_id": order_id,
@@ -192,6 +271,18 @@ async def process_refund(
             "is_partial": is_partial,
             "new_order_status": new_status
         }
+
+        # Best-effort idempotency record
+        if refund_request.idempotency_key:
+            try:
+                from mvp.idempotency import PostgresIdempotencyStore
+
+                idem = PostgresIdempotencyStore()
+                await idem.put(scope="refund", key=refund_request.idempotency_key, value=response)
+            except Exception:
+                pass
+
+        return response
         
     except HTTPException:
         raise
@@ -235,4 +326,3 @@ async def get_refund_status(
         "status": "success",
         "refund": refund_info
     }
-

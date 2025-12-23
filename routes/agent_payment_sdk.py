@@ -2,7 +2,9 @@
 Unified Payment Endpoint for Agent SDK
 Provides production-ready payment processing with PSP integration
 """
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
@@ -70,6 +72,7 @@ async def create_payment(
     request: PaymentRequest,
     background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
+    x_hil_approval: Optional[str] = Header(None, alias="X-HIL-Approval"),
 ):
     """
     Create payment for an order
@@ -107,6 +110,134 @@ async def create_payment(
         # 2. Verify agent has access to merchant
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+        # MVP governance (ACE v0.1): risk-tier evaluation + optional HIL enforcement (configurable).
+        # Always emits immutable audit events for intent → approval → execution → receipt (best-effort).
+        decision = None
+        geo = None
+        try:
+            from mvp.governance import PolicyInput, governance
+
+            ship = order.get("shipping_address") or {}
+            if isinstance(ship, dict):
+                geo = {
+                    "country": (ship.get("country") or "").upper()[:2] or None,
+                    "postal_code": ship.get("postal_code") or ship.get("zip"),
+                    "city": ship.get("city"),
+                    "state": ship.get("state") or ship.get("province"),
+                }
+
+            decision = governance.evaluate(
+                PolicyInput(
+                    merchant_id=str(merchant_id),
+                    actor_type="agent",
+                    actor_ref=str(getattr(context, "agent_id", "")) or None,
+                    action="submit_payment",
+                    amount=float(order_total),
+                    currency=str(order.get("currency") or "USD"),
+                    geo=geo,
+                    consent_scopes=[],
+                    approval_id=x_hil_approval,
+                )
+            )
+
+            # Intent is immutable, even if later blocked.
+            try:
+                governance.record_audit_event(
+                    merchant_id=str(merchant_id),
+                    actor_type="agent",
+                    actor_ref=str(getattr(context, "agent_id", "")) or None,
+                    action="submit_payment.intent",
+                    subject={"order_id": request.order_id},
+                    request_context={
+                        "request_id": request.idempotency_key,
+                        "session_id": getattr(context, "session_id", None),
+                        "surface": "backend",
+                        "adapter": "agent_payments",
+                        "geo": geo,
+                    },
+                    consent={"scope": decision.required_scopes, "nonce": None, "consent_token_ref": None},
+                    payload={
+                        "decision": decision.decision,
+                        "reason_codes": decision.reason_codes,
+                        "amount": float(order_total),
+                        "currency": str(order.get("currency") or "USD"),
+                        "idempotency_key": request.idempotency_key,
+                    },
+                    risk_tier=decision.risk_tier,
+                )
+            except Exception:
+                pass
+
+            if x_hil_approval:
+                try:
+                    governance.record_audit_event(
+                        merchant_id=str(merchant_id),
+                        actor_type="agent",
+                        actor_ref=str(getattr(context, "agent_id", "")) or None,
+                        action="submit_payment.approval",
+                        subject={"order_id": request.order_id},
+                        request_context={
+                            "request_id": request.idempotency_key,
+                            "session_id": getattr(context, "session_id", None),
+                            "surface": "backend",
+                            "adapter": "agent_payments",
+                            "geo": geo,
+                        },
+                        consent={"scope": decision.required_scopes, "nonce": None, "consent_token_ref": None},
+                        payload={
+                            "approval_id": x_hil_approval,
+                            "decision": "approved",
+                        },
+                        risk_tier=decision.risk_tier,
+                    )
+                except Exception:
+                    pass
+
+            if decision.decision == "require_hil":
+                approval = governance.request_hil(
+                    intent={
+                        "action": "submit_payment",
+                        "order_id": request.order_id,
+                        "merchant_id": merchant_id,
+                        "amount": float(order_total),
+                        "currency": str(order.get("currency") or "USD"),
+                        "geo": geo,
+                    }
+                )
+                try:
+                    governance.record_audit_event(
+                        merchant_id=str(merchant_id),
+                        actor_type="agent",
+                        actor_ref=str(getattr(context, "agent_id", "")) or None,
+                        action="submit_payment.hil_requested",
+                        subject={"order_id": request.order_id},
+                        request_context={
+                            "request_id": request.idempotency_key,
+                            "session_id": getattr(context, "session_id", None),
+                            "surface": "backend",
+                            "adapter": "agent_payments",
+                            "geo": geo,
+                        },
+                        consent={"scope": decision.required_scopes, "nonce": None, "consent_token_ref": None},
+                        payload={"approval": approval},
+                        risk_tier=decision.risk_tier,
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "HIL_REQUIRED",
+                        "message": "Step-up approval required before submitting payment",
+                        "approval": approval,
+                        "required_scopes": decision.required_scopes,
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         
         # 3. Check idempotency
         if request.idempotency_key:
@@ -128,6 +259,41 @@ async def create_payment(
                     psp_used="cached",
                     created_at=datetime.now().isoformat()
                 )
+
+        # MVP measurement scaffolding: checkout attempted (payment stage).
+        try:
+            from mvp.constants import EVENT_CHECKOUT_ATTEMPTED, SURFACE_BACKEND
+            from mvp.events import emit_best_effort
+
+            ship = order.get("shipping_address") or {}
+            geo = None
+            if isinstance(ship, dict):
+                geo = {
+                    "country": (ship.get("country") or "").upper()[:2] or None,
+                    "postal_code": ship.get("postal_code") or ship.get("zip"),
+                    "city": ship.get("city"),
+                    "state": ship.get("state") or ship.get("province"),
+                }
+
+            emit_best_effort(
+                event_type=EVENT_CHECKOUT_ATTEMPTED,
+                payload={
+                    "stage": "payment",
+                    "order_id": request.order_id,
+                    "merchant_id": merchant_id,
+                    "amount": float(order_total),
+                    "currency": str(order.get("currency") or "USD"),
+                    "idempotency_key": request.idempotency_key,
+                },
+                merchant_id=str(merchant_id) if merchant_id else None,
+                geo=geo,
+                surface=SURFACE_BACKEND,
+                adapter="agent_payments",
+                risk_tier=(getattr(decision, "risk_tier", None) or "unknown"),
+                idempotency_key=request.idempotency_key,
+            )
+        except Exception:
+            pass
 
         # 4. Select PSP using routing rules (Integration / payment_routes)
         routing_service = PaymentRoutingService(database)
@@ -178,6 +344,35 @@ async def create_payment(
             preferred_psps = None
 
         # Use MultiPSPOrchestrator for real payment creation with failover
+        try:
+            from mvp.governance import governance
+
+            if decision is not None:
+                governance.record_audit_event(
+                    merchant_id=str(merchant_id),
+                    actor_type="agent",
+                    actor_ref=str(getattr(context, "agent_id", "")) or None,
+                    action="submit_payment.execution",
+                    subject={"order_id": request.order_id},
+                    request_context={
+                        "request_id": request.idempotency_key,
+                        "session_id": getattr(context, "session_id", None),
+                        "surface": "backend",
+                        "adapter": "agent_payments",
+                        "geo": geo,
+                    },
+                    consent={"scope": getattr(decision, "required_scopes", []) or [], "nonce": None, "consent_token_ref": None},
+                    payload={
+                        "selected_psp": selected_psp,
+                        "route_config": route_config,
+                        "amount": float(order_total),
+                        "currency": currency_code,
+                    },
+                    risk_tier=getattr(decision, "risk_tier", "unknown"),
+                )
+        except Exception:
+            pass
+
         success, payment_intent, error, psp_used = await create_payment_with_failover(
             merchant_id=merchant_id,
             amount=amount,
@@ -251,6 +446,102 @@ async def create_payment(
         )
         
         logger.info(f"Payment created: {payment_id} for order {request.order_id} via {psp_used}")
+
+        # MVP ledger event (best-effort): payment timeline entry.
+        try:
+            from mvp.ledger_events import emit_ledger_event_best_effort
+
+            ledger_type = (
+                "payment_succeeded"
+                if status == "succeeded"
+                else "payment_requires_action"
+                if status == "requires_action"
+                else "payment_processing"
+            )
+
+            emit_ledger_event_best_effort(
+                merchant_id=str(merchant_id),
+                event_type=ledger_type,
+                order_id=str(request.order_id),
+                source={"type": "psp", "psp": psp_used, "external_event_id": payment_intent.id},
+                amount={"value": float(amount), "currency": str(currency)},
+                refs={"payment_intent_id": payment_intent.id},
+                geo=geo,
+                surface="backend",
+                adapter="agent_payments",
+                risk_tier=(getattr(decision, "risk_tier", None) or "unknown"),
+                idempotency_key=request.idempotency_key,
+                signature_verified=False,
+            )
+        except Exception:
+            pass
+
+        # Receipt audit event (best-effort).
+        try:
+            from mvp.governance import governance
+
+            if decision is not None:
+                governance.record_audit_event(
+                    merchant_id=str(merchant_id),
+                    actor_type="agent",
+                    actor_ref=str(getattr(context, "agent_id", "")) or None,
+                    action="submit_payment.receipt",
+                    subject={"order_id": request.order_id},
+                    request_context={
+                        "request_id": request.idempotency_key,
+                        "session_id": getattr(context, "session_id", None),
+                        "surface": "backend",
+                        "adapter": "agent_payments",
+                        "geo": geo,
+                    },
+                    consent={"scope": getattr(decision, "required_scopes", []) or [], "nonce": None, "consent_token_ref": None},
+                    payload={
+                        "payment_id": payment_id,
+                        "payment_intent_id": payment_intent.id,
+                        "psp_used": psp_used,
+                        "status": status,
+                    },
+                    risk_tier=getattr(decision, "risk_tier", "unknown"),
+                )
+        except Exception:
+            pass
+
+        # MVP measurement scaffolding: checkout result (payment stage).
+        try:
+            from mvp.constants import EVENT_CHECKOUT_FAILED, EVENT_CHECKOUT_SUCCEEDED, SURFACE_BACKEND
+            from mvp.events import emit_best_effort
+
+            ship = order.get("shipping_address") or {}
+            geo = None
+            if isinstance(ship, dict):
+                geo = {
+                    "country": (ship.get("country") or "").upper()[:2] or None,
+                    "postal_code": ship.get("postal_code") or ship.get("zip"),
+                    "city": ship.get("city"),
+                    "state": ship.get("state") or ship.get("province"),
+                }
+
+            evt = EVENT_CHECKOUT_SUCCEEDED if status == "succeeded" else EVENT_CHECKOUT_FAILED
+            emit_best_effort(
+                event_type=evt,
+                payload={
+                    "stage": "payment",
+                    "order_id": request.order_id,
+                    "merchant_id": merchant_id,
+                    "payment_id": payment_id,
+                    "payment_intent_id": payment_intent.id,
+                    "psp_used": psp_used,
+                    "status": status,
+                },
+                merchant_id=str(merchant_id) if merchant_id else None,
+                geo=geo,
+                surface=SURFACE_BACKEND,
+                adapter="agent_payments",
+                risk_tier=(getattr(decision, "risk_tier", None) or "unknown"),
+                idempotency_key=request.idempotency_key,
+            )
+        except Exception:
+            pass
         
         return PaymentResponse(
             status=status,
@@ -266,7 +557,45 @@ async def create_payment(
             created_at=datetime.now().isoformat()
         )
     
-    except HTTPException:
+    except HTTPException as e:
+        # MVP measurement scaffolding: ensure we emit a failure event even on early exits.
+        try:
+            from mvp.constants import EVENT_CHECKOUT_FAILED, SURFACE_BACKEND
+            from mvp.events import emit_best_effort
+
+            ship = None
+            try:
+                ship = (order or {}).get("shipping_address") if isinstance(order, dict) else None
+            except Exception:
+                ship = None
+
+            geo = None
+            if isinstance(ship, dict):
+                geo = {
+                    "country": (ship.get("country") or "").upper()[:2] or None,
+                    "postal_code": ship.get("postal_code") or ship.get("zip"),
+                    "city": ship.get("city"),
+                    "state": ship.get("state") or ship.get("province"),
+                }
+
+            emit_best_effort(
+                event_type=EVENT_CHECKOUT_FAILED,
+                payload={
+                    "stage": "payment",
+                    "order_id": getattr(request, "order_id", None),
+                    "merchant_id": merchant_id if "merchant_id" in locals() else None,
+                    "error_status": getattr(e, "status_code", None),
+                    "error": str(getattr(e, "detail", ""))[:500],
+                },
+                merchant_id=str(merchant_id) if "merchant_id" in locals() else None,
+                geo=geo,
+                surface=SURFACE_BACKEND,
+                adapter="agent_payments",
+                risk_tier=(getattr(decision, "risk_tier", None) or "unknown"),
+                idempotency_key=getattr(request, "idempotency_key", None),
+            )
+        except Exception:
+            pass
         raise
     except Exception as e:
         logger.error(f"Payment creation error: {e}", exc_info=True)

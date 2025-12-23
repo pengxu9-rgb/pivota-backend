@@ -1,0 +1,30 @@
+{
+  "playbook_id": "default_d2c_us_v0.1",
+  "vertical": "d2c",
+  "geo": {
+    "country": "US"
+  },
+  "risk": {
+    "hil_amount_threshold": 250.0,
+    "hard_hil_amount_threshold": 5000.0
+  },
+  "ops": {
+    "required_fields_validated": [
+      "recommendations[].title",
+      "recommendations[].narrative",
+      "recommendations[].claims[].evidence[]"
+    ],
+    "authorized_signal_allowlist": [
+      "creator_pick",
+      "merchant_provided_testimonial",
+      "verified_review_pointer",
+      "ugc_permission_granted",
+      "affiliate_code"
+    ]
+  },
+  "fallback": {
+    "quote_near_expiry_seconds": 60,
+    "preflight_default_inventory_status": "unknown"
+  }
+}
+

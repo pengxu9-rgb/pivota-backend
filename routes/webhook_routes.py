@@ -282,20 +282,35 @@ async def handle_shopify_webhook(
         topic = x_shopify_topic or "unknown"
         shop_domain = x_shopify_shop_domain or merchant.get("mcp_shop_domain") or "unknown"
 
-        # Anti-cross-tenant poisoning: validate shop_domain matches primary store domain (when available).
+        # Anti-cross-tenant poisoning: validate shop_domain matches a connected Shopify store domain.
+        #
+        # NOTE: Do NOT rely on "primary store" being Shopify. Many merchants can have multiple
+        # stores/platforms; primary is merely the newest connected store in our DB.
         try:
-            store_info = await get_primary_store(merchant_id)
-            expected_domain = (store_info or {}).get("domain")
-            if is_production and expected_domain and x_shopify_shop_domain:
-                expected_canon = _canonicalize_shop_domain(expected_domain)
+            stores = await get_merchant_active_stores(merchant_id)
+            allowed_domains = set()
+            for store in stores or []:
+                if (store.get("platform") or "").lower() != "shopify":
+                    continue
+                dom = _canonicalize_shop_domain(store.get("domain"))
+                if dom:
+                    allowed_domains.add(dom)
+
+            if is_production:
                 got_canon = _canonicalize_shop_domain(x_shopify_shop_domain)
-                if expected_canon and got_canon and expected_canon != got_canon:
+                if not allowed_domains:
                     logger.error(
-                        "Shopify webhook shop_domain mismatch merchant=%s expected=%s(expected=%s) got=%s(got=%s) topic=%s",
+                        "Shopify webhook rejected: no Shopify store configured merchant=%s topic=%s got=%s",
                         merchant_id,
-                        expected_domain,
-                        expected_canon,
-                        x_shopify_shop_domain,
+                        topic,
+                        got_canon,
+                    )
+                    raise HTTPException(status_code=400, detail="No Shopify store connected")
+                if got_canon and got_canon not in allowed_domains:
+                    logger.error(
+                        "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",
+                        merchant_id,
+                        sorted(list(allowed_domains)),
                         got_canon,
                         topic,
                     )
@@ -522,6 +537,82 @@ async def handle_shopify_webhook(
                 },
             )
 
+            # MVP measurement scaffolding: dispute opened/resolved (metadata-only).
+            try:
+                from mvp.constants import EVENT_DISPUTE_OPENED, EVENT_DISPUTE_RESOLVED, SURFACE_BACKEND
+                from mvp.events import emit_best_effort
+
+                raw_status = (data.get("status") or "").lower()
+                is_resolved = raw_status in {"won", "lost", "resolved", "closed"}
+                evt = EVENT_DISPUTE_RESOLVED if is_resolved else EVENT_DISPUTE_OPENED
+
+                emit_best_effort(
+                    event_type=evt,
+                    payload={
+                        "merchant_id": merchant_id,
+                        "order_id": pivota_order_id,
+                        "shopify_order_id": platform_order_id or None,
+                        "dispute_id": data.get("id"),
+                        "status": data.get("status"),
+                        "reason": data.get("reason"),
+                        "amount": data.get("amount"),
+                        "currency": data.get("currency"),
+                    },
+                    merchant_id=merchant_id,
+                    geo=None,
+                    surface=SURFACE_BACKEND,
+                    adapter="shopify_webhook",
+                    risk_tier="unknown",
+                    idempotency_key=str(data.get("id") or "") or None,
+                )
+            except Exception:
+                pass
+
+            # PCS: best-effort dispute evidence pack builder (draft on open, frozen on resolution).
+            try:
+                from services.pcs_evidence_pack_service import create_dispute_evidence_pack
+
+                raw_status = (data.get("status") or "").lower()
+                is_resolved = raw_status in {"won", "lost", "resolved", "closed"}
+                await create_dispute_evidence_pack(
+                    merchant_id=str(merchant_id),
+                    dispute_ref=str(data.get("id") or ""),
+                    order_id=str(pivota_order_id) if pivota_order_id else None,
+                    dispute_payload=dict(data or {}),
+                    status="frozen" if is_resolved else "draft",
+                    triggered_by=f"shopify_webhook:{topic}",
+                )
+            except Exception:
+                pass
+
+            # MVP ledger event (best-effort): dispute timeline entry.
+            try:
+                from mvp.ledger_events import emit_ledger_event_best_effort
+
+                raw_status = (data.get("status") or "").lower()
+                is_resolved = raw_status in {"won", "lost", "resolved", "closed"}
+                emit_ledger_event_best_effort(
+                    merchant_id=str(merchant_id),
+                    event_type="dispute_resolved" if is_resolved else "dispute_opened",
+                    order_id=str(pivota_order_id) if pivota_order_id else None,
+                    source={"type": "shopify_webhook", "external_event_id": str(data.get("id") or "")},
+                    amount={
+                        "value": float(data.get("amount") or 0.0),
+                        "currency": str(data.get("currency") or "USD"),
+                    }
+                    if (data.get("amount") is not None)
+                    else None,
+                    refs={"shopify_order_id": platform_order_id or None},
+                    geo=None,
+                    surface="backend",
+                    adapter="shopify_webhook",
+                    risk_tier="unknown",
+                    idempotency_key=str(data.get("id") or "") or None,
+                    signature_verified=True,
+                )
+            except Exception:
+                pass
+
         elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
             await log_order_event(
                 event_type="gdpr_webhook",
@@ -560,12 +651,19 @@ async def register_shopify_webhooks(
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
 
-        store_info = await get_primary_store(merchant_id)
-        if not store_info or (store_info.get("platform") or "").lower() != "shopify":
-            raise HTTPException(status_code=400, detail="Primary store is not Shopify")
+        stores = await get_merchant_active_stores(merchant_id)
+        shopify_store = None
+        for store in stores or []:
+            if (store.get("platform") or "").lower() != "shopify":
+                continue
+            if store.get("domain") and store.get("api_key"):
+                shopify_store = store
+                break
+        if not shopify_store:
+            raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-        shop_domain = store_info.get("domain")
-        access_token = store_info.get("api_key")
+        shop_domain = shopify_store.get("domain")
+        access_token = shopify_store.get("api_key")
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Missing Shopify credentials")
