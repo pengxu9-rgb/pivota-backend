@@ -204,6 +204,46 @@ def _policy_scope_present(scopes: List[str]) -> bool:
     return ("read_legal_policies" in present) or ("read_content" in present)
 
 
+def _isoformat_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return None
+    return None
+
+
+def _policies_report_json_safe(policies_report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Make policies_report safe for JSONB storage (no datetime objects).
+    """
+    if not isinstance(policies_report, dict):
+        return {"skipped": False, "error": "invalid policies_report type"}
+
+    out = dict(policies_report)
+
+    latest_hashes_safe: List[Dict[str, Any]] = []
+    for row in (policies_report.get("latest_hashes") or []):
+        if not isinstance(row, dict):
+            continue
+        latest_hashes_safe.append(
+            {
+                "policy_type": row.get("policy_type"),
+                "url": row.get("url"),
+                "updated_at": _isoformat_or_none(row.get("updated_at")),
+                "hash_sha256": row.get("hash_sha256"),
+                "fetched_at": _isoformat_or_none(row.get("fetched_at")),
+            }
+        )
+    if "latest_hashes" in out:
+        out["latest_hashes"] = latest_hashes_safe
+    return out
+
+
 async def upsert_merchant_capabilities(
     *,
     merchant_id: str,
@@ -212,6 +252,13 @@ async def upsert_merchant_capabilities(
     has_shopify_payments: bool,
     has_returns_api: bool,
 ) -> None:
+    scopes_payload: Any = scopes_json
+    # Accept legacy callers that pass a JSON string.
+    if isinstance(scopes_payload, str):
+        try:
+            scopes_payload = json.loads(scopes_payload)
+        except Exception:
+            scopes_payload = {"raw": scopes_payload}
     await database.execute(
         """
         INSERT INTO pcs_merchant_capabilities
@@ -228,7 +275,7 @@ async def upsert_merchant_capabilities(
         {
             "merchant_id": merchant_id,
             "shopify_api_version": shopify_api_version,
-            "scopes_json": json.dumps(scopes_json),
+            "scopes_json": scopes_payload,
             "has_shopify_payments": has_shopify_payments,
             "has_returns_api": has_returns_api,
         },
@@ -379,7 +426,8 @@ async def verify_shopify_integration(
         "scopes_error": scopes_error,
         "domain_canonicalized": {"from": domain_updated[0], "to": domain_updated[1]} if domain_updated else None,
         "webhooks": webhook_report,
-        "policies": policies_report,
+        # Ensure JSON-safe types for DB storage (no datetimes).
+        "policies": _policies_report_json_safe(policies_report),
     }
 
     # Persist latest snapshot for onboarding gating / tier ceiling.

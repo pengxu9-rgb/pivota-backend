@@ -1,4 +1,5 @@
 import logging
+import json
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,6 +24,21 @@ class OpsResubscribeRequest(BaseModel):
     callback_base_url: str = Field(..., min_length=4)
     api_version: Optional[str] = None
     topics: Optional[List[str]] = None
+
+
+def _decode_scopes_json(value: Any) -> Any:
+    """
+    Backward-compatible: older versions stored scopes_json as a JSON string.
+    Normalize to a dict when possible.
+    """
+    if isinstance(value, dict) or value is None:
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return {"raw": value}
+    return {"raw": str(value)}
 
 
 @router.post("/merchants/{merchant_id}/integrations/shopify/verify")
@@ -60,7 +76,9 @@ async def ops_get_latest_shopify_capability_report(
     )
     if not row:
         raise HTTPException(status_code=404, detail="No capability report found for merchant")
-    return {"status": "success", "report": dict(row), "requested_by": current_user.get("sub")}
+    report = dict(row)
+    report["scopes_json"] = _decode_scopes_json(report.get("scopes_json"))
+    return {"status": "success", "report": report, "requested_by": current_user.get("sub")}
 
 
 @router.post("/merchants/{merchant_id}/integrations/shopify/resubscribe")
@@ -115,4 +133,3 @@ async def ops_resubscribe_shopify_webhooks(
         raise HTTPException(status_code=500, detail="Failed to resubscribe webhooks")
 
     return {"status": "success", "webhooks": report, "requested_by": current_user.get("sub")}
-

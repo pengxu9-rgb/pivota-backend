@@ -1,4 +1,5 @@
 import logging
+import json
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,6 +17,20 @@ router = APIRouter(prefix="/merchant/v1", tags=["merchant:onboarding-shopify"])
 class MerchantVerifyRequest(BaseModel):
     callback_base_url: str = Field(..., min_length=4)
     api_version: Optional[str] = None
+
+
+def _decode_scopes_json(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"raw": parsed}
+        except Exception:
+            return {"raw": value}
+    return {}
 
 
 def _redact_ops_webhook_report(webhooks: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,7 +127,7 @@ async def merchant_get_latest_shopify_capability_report(
     if not row:
         raise HTTPException(status_code=404, detail="No capability report found for merchant")
 
-    scopes_json = dict(row)["scopes_json"] or {}
+    scopes_json = _decode_scopes_json(dict(row).get("scopes_json"))
     return {
         "status": "success",
         "report": {
@@ -125,4 +140,3 @@ async def merchant_get_latest_shopify_capability_report(
             "last_checked_at": dict(row).get("last_checked_at").isoformat() if dict(row).get("last_checked_at") else None,
         },
     }
-
