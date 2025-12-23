@@ -95,7 +95,7 @@ async def ingest_shopify_webhook(
                occurred_at, payload_json, payload_sha256, prev_chain_hash, chain_hash)
             VALUES
               (:merchant_id, :shop_domain, :topic, :webhook_id, :idempotency_key, :signature_verified,
-               :occurred_at, :payload_json::jsonb, :payload_sha256, :prev_chain_hash, :chain_hash)
+               :occurred_at, CAST(:payload_json AS jsonb), :payload_sha256, :prev_chain_hash, :chain_hash)
             ON CONFLICT (merchant_id, idempotency_key)
             DO NOTHING
             RETURNING *

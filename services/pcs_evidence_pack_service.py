@@ -141,7 +141,7 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
            manifest_json, manifest_sha256, signature, assets_json)
         VALUES
           (:merchant_id, :order_id, NULL, 'order_snapshot', :pack_version, 'frozen', NOW(), NOW(),
-           :manifest_json::jsonb, :manifest_sha256, NULL, '[]'::jsonb)
+           CAST(:manifest_json AS jsonb), :manifest_sha256, NULL, '[]'::jsonb)
         ON CONFLICT (merchant_id, pack_type, order_id, dispute_ref, pack_version) DO NOTHING
         """,
         {
@@ -168,7 +168,7 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
         await database.execute(
             """
             UPDATE orders
-            SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || :patch::jsonb
+            SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || CAST(:patch AS jsonb)
             WHERE order_id = :order_id
             """,
             {

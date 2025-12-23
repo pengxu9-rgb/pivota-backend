@@ -268,7 +268,7 @@ async def upsert_merchant_capabilities(
         INSERT INTO pcs_merchant_capabilities
           (merchant_id, shopify_api_version, scopes_json, has_shopify_payments, has_returns_api, last_checked_at)
         VALUES
-          (:merchant_id, :shopify_api_version, :scopes_json::jsonb, :has_shopify_payments, :has_returns_api, NOW())
+          (:merchant_id, :shopify_api_version, CAST(:scopes_json AS jsonb), :has_shopify_payments, :has_returns_api, NOW())
         ON CONFLICT (merchant_id) DO UPDATE SET
           shopify_api_version = EXCLUDED.shopify_api_version,
           scopes_json = EXCLUDED.scopes_json,
