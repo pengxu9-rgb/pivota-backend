@@ -113,6 +113,54 @@ async def update_store(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update store: {str(e)}")
 
+@router.post("/merchant/integrations/store/{store_id}/primary")
+async def set_primary_store(
+    store_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Mark a store as the merchant's primary store.
+
+    Current system derives "primary" from recency (ORDER BY connected_at DESC).
+    We implement "set primary" by bumping the target store's connected_at to CURRENT_TIMESTAMP,
+    so it becomes the top candidate for get_primary_store and /merchant/{merchant_id}/integrations.
+    """
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    store = await database.fetch_one(
+        """
+        SELECT store_id, status, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id AND merchant_id = :merchant_id
+        """,
+        {"store_id": store_id, "merchant_id": merchant_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found or not owned by this merchant")
+
+    status = (store.get("status") or "").lower()
+    api_key = store.get("api_key") or ""
+    if status not in ("active", "connected"):
+        raise HTTPException(status_code=400, detail=f"Store status is '{status}'. Please reconnect the store first.")
+    if not api_key.strip():
+        raise HTTPException(status_code=400, detail="Store credentials missing. Please reconnect the store first.")
+
+    try:
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET connected_at = CURRENT_TIMESTAMP
+            WHERE store_id = :store_id AND merchant_id = :merchant_id
+            """,
+            {"store_id": store_id, "merchant_id": merchant_id},
+        )
+        return {"status": "success", "message": "Primary store updated", "store_id": store_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set primary store: {str(e)}")
+
 # ============================================================================
 # PSP Management
 # ============================================================================
@@ -235,7 +283,6 @@ async def cleanup_integrations(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup: {str(e)}")
-
 
 
 

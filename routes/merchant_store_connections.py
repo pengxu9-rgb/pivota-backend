@@ -141,6 +141,7 @@ async def merchant_connect_shopify(
                    SET domain = :domain,
                        api_key = :token,
                        status = 'active',
+                       connected_at = CURRENT_TIMESTAMP,
                        last_sync = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {
@@ -309,7 +310,8 @@ async def merchant_sync_shopify_products(
         """
         SELECT store_id, platform, domain, status
         FROM merchant_stores
-        WHERE merchant_id = :merchant_id AND platform = 'shopify'
+        WHERE merchant_id = :merchant_id AND platform = 'shopify' AND status IN ('active', 'connected')
+        ORDER BY connected_at DESC NULLS LAST
         LIMIT 1
         """,
         {"merchant_id": target_merchant_id}
