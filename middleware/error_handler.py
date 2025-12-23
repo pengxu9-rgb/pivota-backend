@@ -39,7 +39,13 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         """Process request and handle any exceptions"""
         try:
             response = await call_next(request)
-            return response
+            # FastAPI handles HTTPException / RequestValidationError internally and
+            # returns a JSONResponse (e.g. {"detail": ...}) without raising.
+            # To provide a unified error format, normalize these responses here.
+            if response.status_code < 400:
+                return response
+
+            return await self._normalize_error_response(request, response)
             
         except PivotaAPIError as e:
             # Our custom API errors
@@ -60,6 +66,86 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             # Unexpected errors
             logger.exception(f"Unexpected error: {e}")
             return self._handle_unexpected_error(request, e)
+
+    async def _normalize_error_response(self, request: Request, response):
+        """
+        Convert FastAPI-produced error responses (HTTPException, validation errors)
+        into the unified error shape.
+        """
+        # Avoid double-wrapping if it's already in our canonical format.
+        try:
+            content_type = response.headers.get("content-type", "")
+            if "application/json" not in content_type.lower():
+                return response
+
+            body_bytes = b""
+            if hasattr(response, "body") and response.body is not None:
+                body_bytes = response.body
+            else:
+                # StreamingResponse: consume iterator and rebuild response.
+                chunks = []
+                async for chunk in response.body_iterator:
+                    chunks.append(chunk)
+                body_bytes = b"".join(chunks)
+
+            import json
+
+            payload = json.loads(body_bytes.decode("utf-8") or "{}")
+            if isinstance(payload, dict) and payload.get("status") == "error" and "error" in payload:
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content=payload,
+                    headers=dict(response.headers),
+                )
+
+            # Validation errors (FastAPI default: 422 + detail list)
+            if response.status_code == 422 and isinstance(payload, dict) and isinstance(payload.get("detail"), list):
+                fake_exc = RequestValidationError(payload.get("detail"))
+                return self._handle_validation_error(request, fake_exc)
+
+            # HTTPException default (detail can be str or dict)
+            detail = payload.get("detail") if isinstance(payload, dict) else None
+            headers = dict(response.headers)
+            error_code = self._map_status_to_error_code(response.status_code)
+
+            header_code = headers.get("x-error-code") or headers.get("X-Error-Code")
+            if header_code:
+                try:
+                    error_code = ErrorCode[header_code]
+                except Exception:
+                    pass
+
+            details = {}
+            message = error_code.default_message
+            if isinstance(detail, dict):
+                details = detail
+                message = error_code.default_message
+            elif isinstance(detail, str):
+                details = {"error": detail}
+                message = detail
+
+            error_dict = create_error_response(
+                error_code=error_code,
+                message=message,
+                details=details,
+                request_id=getattr(request.state, "request_id", None),
+            )
+
+            # Preserve existing headers (including X-Error-Code) where possible.
+            out_headers = {}
+            for k, v in headers.items():
+                if k.lower() in {"content-length", "content-type"}:
+                    continue
+                out_headers[k] = v
+
+            return JSONResponse(
+                status_code=response.status_code,
+                content=error_dict,
+                headers=out_headers,
+            )
+        except Exception:
+            # If normalization fails, return the original response.
+            return response
     
     def _create_error_response(self, request: Request, error: PivotaAPIError) -> JSONResponse:
         """Create error response from PivotaAPIError"""

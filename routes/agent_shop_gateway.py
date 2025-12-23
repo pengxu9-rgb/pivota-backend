@@ -2276,7 +2276,7 @@ async def _handle_find_products_multi(
 async def _handle_find_similar_products(
     payload: FindSimilarProductsPayload,
     request_metadata: Optional[Dict[str, Any]],
-    background_tasks: BackgroundTasks,
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> Dict[str, Any]:
     """
     Find similar products for a given base product.
@@ -2297,6 +2297,7 @@ async def _handle_find_similar_products(
       }'
     """
     limit = min(payload.limit or 6, 30)
+    background_tasks = background_tasks or BackgroundTasks()
 
     # Try loading base product from cache first
     base_product = await _load_product_by_id(payload.product_id)

@@ -3,7 +3,7 @@ from typing import Any, Dict
 
 import pytest
 from fastapi.testclient import TestClient
-from httpx import AsyncClient
+import httpx
 
 from main import app
 from routes import agent_shop_gateway
@@ -52,7 +52,8 @@ async def test_invoke_find_products_multi_uses_queue_and_returns_payload(monkeyp
 
     monkeypatch.setattr(agent_shop_gateway, "_handle_find_products_multi", fake_handler)
 
-    async with AsyncClient(app=app, base_url="http://test") as async_client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
         resp = await async_client.post("/agent/shop/v1/invoke", json=_base_multi_body())
 
     assert resp.status_code == 200
@@ -88,7 +89,8 @@ async def test_queue_backpressure_returns_429(monkeypatch: pytest.MonkeyPatch) -
     body["metadata"] = {}
     body["payload"].pop("user", None)
 
-    async with AsyncClient(app=app, base_url="http://test") as async_client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
         first = async_client.post("/agent/shop/v1/invoke", json=body)
         second = async_client.post("/agent/shop/v1/invoke", json=body)
         resp1, resp2 = await asyncio.gather(first, second)
@@ -125,7 +127,8 @@ async def test_loop_detection_returns_429(monkeypatch: pytest.MonkeyPatch) -> No
     }
     body["payload"]["user"] = {"id": "user-loop", "recent_queries": ["test"]}
 
-    async with AsyncClient(app=app, base_url="http://test") as async_client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
         resp1 = await async_client.post("/agent/shop/v1/invoke", json=body)
         resp2 = await async_client.post("/agent/shop/v1/invoke", json=body)
         resp3 = await async_client.post("/agent/shop/v1/invoke", json=body)
@@ -134,4 +137,3 @@ async def test_loop_detection_returns_429(monkeypatch: pytest.MonkeyPatch) -> No
     assert resp2.status_code == 200
     assert resp3.status_code == 429
     assert resp3.json()["detail"] == "TOOL_LOOP_DETECTED"
-

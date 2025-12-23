@@ -25,6 +25,7 @@ import json
 from datetime import datetime
 
 from routes.agent_api import get_agent_context, AgentContext, log_agent_request
+from services.merchant_store_service import get_primary_store
 from routes.merchant_onboarding_routes import get_merchant_onboarding
 from fastapi import BackgroundTasks
 from db.database import database
@@ -695,12 +696,11 @@ async def get_product_details(
             raise HTTPException(status_code=404, detail="Merchant not found")
 
         # Get primary store for this merchant (may be Shopify, Wix, etc.)
-        from services.merchant_store_service import get_primary_store
         store = await get_primary_store(merchant_id)
         if not store:
             raise HTTPException(
                 status_code=404,
-                detail="No connected stores found for this merchant",
+                detail="No connected stores found for merchant",
                 headers={"X-Error-Code": "STORE_NOT_FOUND"},
             )
 

@@ -18,10 +18,15 @@ from utils.auth import (
     verify_password,
     create_access_token,
     get_current_user,
+    require_admin,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 logger = logging.getLogger("auth_routes")
+
+# Backward-compat shim for tests and historical imports.
+# Some code/tests patch `routes.auth.require_admin_user`.
+require_admin_user = require_admin
 
 # Request/Response Models
 class RegisterRequest(BaseModel):

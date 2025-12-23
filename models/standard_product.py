@@ -4,7 +4,7 @@ Pivota 的核心价值：将多平台产品数据转换为统一标准格式
 供 AI Agent 调用，无需关心底层平台差异
 """
 
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, validator, field_validator, model_validator
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
@@ -64,7 +64,7 @@ class StandardProduct(BaseModel):
     price: float
     compare_at_price: Optional[float] = None
     currency: str = "USD"
-    inventory_quantity: int = 0
+    inventory_quantity: Optional[int] = 0
     in_stock: Optional[bool] = None  # 简化库存判断 (inventory_quantity > 0 && orderable)
     
     # SKU 和条形码
@@ -90,7 +90,7 @@ class StandardProduct(BaseModel):
     # 元数据（保留原始平台特定数据）
     platform_metadata: Optional[Dict[str, Any]] = None
     # 是否可下单及校验结果（EPIC-7 准备）
-    orderable: bool = False
+    orderable: Optional[bool] = False
     orderable_validation: Optional[Dict[str, Any]] = None
     
     @validator('product_id', always=True)
@@ -98,19 +98,35 @@ class StandardProduct(BaseModel):
         """Ensure product_id always equals id for backward compatibility"""
         return values.get('id', v)
     
-    @validator('in_stock', always=True)
-    def calculate_in_stock(cls, v, values):
-        """Calculate in_stock based on inventory_quantity and orderable"""
-        # If explicitly set, use that value
-        if v is not None:
-            return v
-        
-        # Otherwise calculate based on inventory and orderable status
-        inventory_quantity = values.get('inventory_quantity', 0) or 0
-        orderable = values.get('orderable', False)
-        
-        # Product is in stock if it has inventory > 0 AND is orderable
-        return bool(inventory_quantity > 0 and orderable is True)
+    @field_validator("inventory_quantity", mode="before")
+    @classmethod
+    def normalize_inventory_quantity(cls, v):
+        """Treat None inventory as 0 for backward compatibility."""
+        if v is None:
+            return 0
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+    @field_validator("orderable", mode="before")
+    @classmethod
+    def normalize_orderable(cls, v):
+        if v is None:
+            return False
+        return bool(v)
+
+    @model_validator(mode="after")
+    def calculate_in_stock(self):
+        """
+        Calculate in_stock based on inventory_quantity and orderable.
+
+        Run as a model-level validator so `orderable` is available.
+        """
+        if self.in_stock is None:
+            inv = self.inventory_quantity or 0
+            self.in_stock = bool(inv > 0 and self.orderable is True)
+        return self
     
     class Config:
         json_encoders = {

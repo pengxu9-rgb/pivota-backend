@@ -292,7 +292,9 @@ class AgentTaskManager:
                     duplicate_count = sum(
                         1 for h in budget.recent_hashes if h == payload_hash
                     )
-                    if duplicate_count >= self._max_duplicate_payloads:
+                    # Allow up to `max_duplicate_payloads` identical calls, and
+                    # reject on the next one (i.e. "max + 1").
+                    if duplicate_count > self._max_duplicate_payloads:
                         self._metrics["rejected"] += 1
                         logger.warning(
                             "agent_queue.reject_loop_detected",

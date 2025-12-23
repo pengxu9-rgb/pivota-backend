@@ -1,23 +1,48 @@
 #!/usr/bin/env python3
 """
-Test refund API directly
+Refund DB debug helper (manual run only).
+
+This file used to contain a hard-coded production DB URL and a `test_*` function.
+It is now a safe CLI tool:
+- No secrets in source (read from env)
+- No DB connection at import-time
 """
+from __future__ import annotations
+
+import argparse
 import asyncio
-import asyncpg
+import os
 
-DATABASE_URL = "postgresql://postgres:dkDuBgsfeuvwxkiRssSEQsBjsvcAuMjN@metro.proxy.rlwy.net:19541/railway"
 
-async def test_refund_query():
-    print("🔧 Connecting to database...")
-    conn = await asyncpg.connect(DATABASE_URL)
-    
+async def main() -> int:
+    parser = argparse.ArgumentParser(description="Query refunds for an order (debug helper).")
+    parser.add_argument(
+        "--order-id",
+        default=os.getenv("REFUND_TEST_ORDER_ID"),
+        help="Order id to query (or set REFUND_TEST_ORDER_ID).",
+    )
+    args = parser.parse_args()
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        print("Missing DATABASE_URL.")
+        return 2
+
+    if not args.order_id:
+        print("Missing --order-id (or set REFUND_TEST_ORDER_ID).")
+        return 2
+
+    import asyncpg
+
+    print("Connecting to database...")
+    conn = await asyncpg.connect(database_url)
+
     try:
-        order_id = "ORD_EF2D82FAE417D1A2"
-        
-        # Test the exact query from refund_service
-        print(f"\n📋 Testing refund query for order: {order_id}")
+        order_id = args.order_id
+
+        print(f"\nTesting refund query for order: {order_id}")
         query = """
-        SELECT 
+        SELECT
             refund_id,
             amount,
             currency,
@@ -31,14 +56,14 @@ async def test_refund_query():
             psp_refund_id,
             idempotency_key,
             raw_payload as metadata,
-            CASE 
+            CASE
                 WHEN status = 'completed' THEN 'success'
                 WHEN status = 'failed' THEN 'error'
                 WHEN status = 'pending' THEN 'warning'
                 ELSE 'info'
             END as status_type,
             CASE
-                WHEN processed_at IS NOT NULL 
+                WHEN processed_at IS NOT NULL
                 THEN EXTRACT(EPOCH FROM (processed_at - created_at))
                 ELSE NULL
             END as processing_time_seconds
@@ -46,48 +71,46 @@ async def test_refund_query():
         WHERE order_id = $1
         ORDER BY created_at DESC
         """
-        
+
         refunds = await conn.fetch(query, order_id)
-        
-        print(f"✅ Query executed successfully!")
-        print(f"📊 Found {len(refunds)} refund(s)")
-        
+
+        print("Query executed successfully.")
+        print(f"Found {len(refunds)} refund(s)")
+
         if refunds:
             for i, refund in enumerate(refunds, 1):
-                print(f"\n  Refund {i}:")
-                print(f"    - ID: {refund['refund_id']}")
-                print(f"    - Amount: {refund['amount']} {refund['currency']}")
-                print(f"    - Status: {refund['status']}")
-                print(f"    - Metadata: {refund['metadata']}")
+                print(f"\nRefund {i}:")
+                print(f"  id: {refund['refund_id']}")
+                print(f"  amount: {refund['amount']} {refund['currency']}")
+                print(f"  status: {refund['status']}")
+                print(f"  metadata: {refund['metadata']}")
         else:
-            print("  ℹ️  No refunds found for this order")
-        
-        # Check order details
-        print(f"\n📦 Checking order details...")
+            print("No refunds found for this order.")
+
+        print("\nChecking order details...")
         order_query = """
         SELECT order_id, total, total_refunded, payment_status, currency
-        FROM orders 
+        FROM orders
         WHERE order_id = $1
         """
         order = await conn.fetchrow(order_query, order_id)
-        
+
         if order:
-            print(f"  ✅ Order found:")
-            print(f"    - Total: {order['total']}")
-            print(f"    - Total Refunded: {order['total_refunded']}")
-            print(f"    - Payment Status: {order['payment_status']}")
-            print(f"    - Currency: {order['currency']}")
+            print("Order found:")
+            print(f"  total: {order['total']}")
+            print(f"  total_refunded: {order['total_refunded']}")
+            print(f"  payment_status: {order['payment_status']}")
+            print(f"  currency: {order['currency']}")
         else:
-            print(f"  ❌ Order not found!")
-            
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+            print("Order not found.")
+            return 1
+
     finally:
         await conn.close()
-        print("\n🔌 Database connection closed")
+        print("\nDatabase connection closed.")
+
+    return 0
+
 
 if __name__ == "__main__":
-    asyncio.run(test_refund_query())
-
+    raise SystemExit(asyncio.run(main()))
