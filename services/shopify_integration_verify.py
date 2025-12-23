@@ -259,12 +259,16 @@ async def upsert_merchant_capabilities(
             scopes_payload = json.loads(scopes_payload)
         except Exception:
             scopes_payload = {"raw": scopes_payload}
+    # NOTE: The `databases` + `asyncpg` stack expects JSON/JSONB bind params as `str`,
+    # not Python `dict`. Serialize explicitly to avoid silent upsert failures.
+    if not isinstance(scopes_payload, str):
+        scopes_payload = json.dumps(scopes_payload, ensure_ascii=False)
     await database.execute(
         """
         INSERT INTO pcs_merchant_capabilities
           (merchant_id, shopify_api_version, scopes_json, has_shopify_payments, has_returns_api, last_checked_at)
         VALUES
-          (:merchant_id, :shopify_api_version, :scopes_json, :has_shopify_payments, :has_returns_api, NOW())
+          (:merchant_id, :shopify_api_version, :scopes_json::jsonb, :has_shopify_payments, :has_returns_api, NOW())
         ON CONFLICT (merchant_id) DO UPDATE SET
           shopify_api_version = EXCLUDED.shopify_api_version,
           scopes_json = EXCLUDED.scopes_json,

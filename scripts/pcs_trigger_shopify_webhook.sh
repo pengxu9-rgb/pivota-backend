@@ -58,13 +58,13 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 if [[ -z "${SHOPIFY_ACCESS_TOKEN:-}" ]]; then
-  read -s "SHOPIFY_ACCESS_TOKEN?Shopify Admin access token: "
+  read -r -s -p "Shopify Admin access token: " SHOPIFY_ACCESS_TOKEN
   echo
   export SHOPIFY_ACCESS_TOKEN
 fi
 
 echo "Checking registered webhooks that point to: ${API_BASE}/webhooks/shopify/${MERCHANT_ID}"
-curl -sS "https://${SHOP_DOMAIN}/admin/api/2024-07/webhooks.json?limit=250" \
+curl -sS --max-time 20 "https://${SHOP_DOMAIN}/admin/api/2024-07/webhooks.json?limit=250" \
   -H "X-Shopify-Access-Token: ${SHOPIFY_ACCESS_TOKEN}" \
   | jq -r --arg addr "${API_BASE}/webhooks/shopify/${MERCHANT_ID}" \
     '.webhooks[] | select(.address==$addr) | "\(.id)\t\(.topic)\t\(.address)"' \
@@ -73,7 +73,7 @@ curl -sS "https://${SHOP_DOMAIN}/admin/api/2024-07/webhooks.json?limit=250" \
 if [[ -z "${ORDER_ID}" ]]; then
   echo "Fetching a recent order (status=any)..."
   ORDER_ID="$(
-    curl -sS "https://${SHOP_DOMAIN}/admin/api/2024-07/orders.json?status=any&limit=1&fields=id,name,updated_at,note,financial_status,fulfillment_status" \
+    curl -sS --max-time 20 "https://${SHOP_DOMAIN}/admin/api/2024-07/orders.json?status=any&limit=1&fields=id,name,updated_at,note,financial_status,fulfillment_status" \
       -H "X-Shopify-Access-Token: ${SHOPIFY_ACCESS_TOKEN}" \
     | jq -r '.orders[0].id // empty'
   )"
@@ -86,7 +86,7 @@ fi
 
 echo "Using order_id=${ORDER_ID}"
 ORDER_BEFORE="$(
-  curl -sS "https://${SHOP_DOMAIN}/admin/api/2024-07/orders/${ORDER_ID}.json?fields=id,name,updated_at,note" \
+  curl -sS --max-time 20 "https://${SHOP_DOMAIN}/admin/api/2024-07/orders/${ORDER_ID}.json?fields=id,name,updated_at,note" \
     -H "X-Shopify-Access-Token: ${SHOPIFY_ACCESS_TOKEN}" \
   | jq -c '.order'
 )"
@@ -96,7 +96,7 @@ NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 NEW_NOTE="PCS webhook test @ ${NOW_ISO} (trigger orders/updated)"
 
 echo "Updating order note to trigger orders/updated webhook..."
-curl -sS "https://${SHOP_DOMAIN}/admin/api/2024-07/orders/${ORDER_ID}.json" \
+curl -sS --max-time 20 "https://${SHOP_DOMAIN}/admin/api/2024-07/orders/${ORDER_ID}.json" \
   -X PUT \
   -H "X-Shopify-Access-Token: ${SHOPIFY_ACCESS_TOKEN}" \
   -H "Content-Type: application/json" \

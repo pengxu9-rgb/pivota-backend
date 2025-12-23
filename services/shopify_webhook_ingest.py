@@ -69,6 +69,9 @@ async def ingest_shopify_webhook(
         payload_json = json.loads(payload.decode("utf-8"))
     except Exception:
         payload_json = {"_raw": payload.decode("utf-8", errors="replace")}
+    # NOTE: The `databases` + `asyncpg` stack expects JSON/JSONB bind params as `str`,
+    # not Python `dict`. Serialize explicitly to avoid runtime 500s (and Shopify retries).
+    payload_json_str = json.dumps(payload_json, ensure_ascii=False)
 
     async with database.transaction():
         # Prevent hash-chain forks by serializing per merchant within the transaction.
@@ -92,7 +95,7 @@ async def ingest_shopify_webhook(
                occurred_at, payload_json, payload_sha256, prev_chain_hash, chain_hash)
             VALUES
               (:merchant_id, :shop_domain, :topic, :webhook_id, :idempotency_key, :signature_verified,
-               :occurred_at, :payload_json, :payload_sha256, :prev_chain_hash, :chain_hash)
+               :occurred_at, :payload_json::jsonb, :payload_sha256, :prev_chain_hash, :chain_hash)
             ON CONFLICT (merchant_id, idempotency_key)
             DO NOTHING
             RETURNING *
@@ -105,7 +108,7 @@ async def ingest_shopify_webhook(
                 "idempotency_key": idempotency_key,
                 "signature_verified": signature_verified,
                 "occurred_at": occurred_at,
-                "payload_json": payload_json,
+                "payload_json": payload_json_str,
                 "payload_sha256": payload_sha,
                 "prev_chain_hash": prev,
                 "chain_hash": chash,

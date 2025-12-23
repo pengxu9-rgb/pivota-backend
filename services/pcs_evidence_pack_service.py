@@ -141,14 +141,14 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
            manifest_json, manifest_sha256, signature, assets_json)
         VALUES
           (:merchant_id, :order_id, NULL, 'order_snapshot', :pack_version, 'frozen', NOW(), NOW(),
-           :manifest_json, :manifest_sha256, NULL, '[]'::jsonb)
+           :manifest_json::jsonb, :manifest_sha256, NULL, '[]'::jsonb)
         ON CONFLICT (merchant_id, pack_type, order_id, dispute_ref, pack_version) DO NOTHING
         """,
         {
             "merchant_id": merchant_id,
             "order_id": order_id,
             "pack_version": pack_version,
-            "manifest_json": manifest,
+            "manifest_json": json.dumps(manifest, ensure_ascii=False),
             "manifest_sha256": manifest_sha,
         },
     )
