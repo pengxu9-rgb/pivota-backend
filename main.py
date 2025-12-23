@@ -244,6 +244,7 @@ from config.settings import settings
 
 from openapi_config import get_custom_openapi_schema
 from services.promotions_service import ensure_promotions_table
+from services.webhook_service import WebhookService
 
 app = FastAPI(
     title="Pivota Infra Dashboard", 
@@ -315,6 +316,9 @@ async def startup_event():
 
     # Run any additional promotions-specific initialization (kept lightweight for now)
     await ensure_promotions_table()
+
+    # Ensure webhook audit/idempotency table exists (best-effort; does not raise)
+    await WebhookService.ensure_webhook_events_table()
 
 
 @app.on_event("shutdown")
