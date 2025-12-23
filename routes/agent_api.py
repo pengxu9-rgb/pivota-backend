@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
 import json
+import os
 import time
 
 from models.order import CreateOrderRequest, OrderResponse
@@ -25,6 +26,7 @@ from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
+from services.quote_service import QuoteError
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -692,6 +694,40 @@ async def agent_create_order(
     # STEP 1: Governance validation (before main logic)
     from services.agent_governance import agent_governance
     await agent_governance.validate_request(context.agent_id)
+
+    # MVP measurement scaffolding: record checkout attempt (order creation stage).
+    try:
+        from mvp.constants import EVENT_CHECKOUT_ATTEMPTED, SURFACE_BACKEND
+        from mvp.events import emit_best_effort
+
+        addr = getattr(order_request, "shipping_address", None)
+        geo = None
+        if addr is not None:
+            geo = {
+                "country": getattr(addr, "country", None),
+                "postal_code": getattr(addr, "postal_code", None),
+                "city": getattr(addr, "city", None),
+                "state": getattr(addr, "state", None),
+            }
+
+        emit_best_effort(
+            event_type=EVENT_CHECKOUT_ATTEMPTED,
+            payload={
+                "stage": "order_create",
+                "merchant_id": getattr(order_request, "merchant_id", None),
+                "quote_id": getattr(order_request, "quote_id", None),
+                "items_count": len(getattr(order_request, "items", None) or []),
+                "agent_id": getattr(context, "agent_id", None),
+            },
+            merchant_id=getattr(order_request, "merchant_id", None),
+            geo=geo,
+            surface=SURFACE_BACKEND,
+            adapter="agent_orders_create",
+            risk_tier="unknown",
+            idempotency_key=getattr(order_request, "quote_id", None) or getattr(order_request, "agent_session_id", None),
+        )
+    except Exception:
+        pass
     
     start_time = time.time()
     success = False
@@ -707,6 +743,149 @@ async def agent_create_order(
                 status_code=400,
                 detail={"error": "QUOTE_REQUIRED", "message": "quote_id is required"},
             )
+
+        # Idempotency (best-effort): if provided and already processed, replay the cached response.
+        if order_request.idempotency_key:
+            try:
+                from mvp.idempotency import PostgresIdempotencyStore
+
+                idem = PostgresIdempotencyStore()
+                existing = await idem.get(scope="order_create", key=order_request.idempotency_key)
+                if existing and isinstance(existing.value, dict):
+                    if (
+                        existing.value.get("status") == "success"
+                        and existing.value.get("order_id")
+                        and (existing.value.get("merchant_id") in (None, order_request.merchant_id))
+                    ):
+                        return existing.value
+            except Exception:
+                pass
+
+        # OfferObject + PreFlight (best-effort, additive): compute canonical offer(s) from quote snapshot and
+        # attach to order metadata. Enforcement is gated by `MVP_PREFLIGHT_ENFORCE=true`.
+        offers = None
+        preflight = None
+        try:
+            if order_request.quote_id:
+                from mvp.governance import PolicyInput, governance
+                from mvp.offer import build_offers_from_quote, preflight_offers
+                from services.quote_service import QuoteService
+                from services.shopify_policy_service import get_latest_policy_hashes
+
+                qs = await QuoteService().load_active_quote_or_raise(quote_id=order_request.quote_id)
+                if qs.merchant_id != order_request.merchant_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "QUOTE_MERCHANT_MISMATCH",
+                            "message": "quote_id does not belong to merchant_id",
+                        },
+                    )
+
+                snap = qs.snapshot_json or {}
+                snap_pricing = snap.get("pricing") or {}
+
+                policies = await get_latest_policy_hashes(order_request.merchant_id)
+                policy_hashes_available = bool(policies)
+
+                try:
+                    amount_total = float(snap_pricing.get("total") or 0.0)
+                except Exception:
+                    amount_total = None
+
+                addr = getattr(order_request, "shipping_address", None)
+                geo = None
+                if addr is not None:
+                    geo = {
+                        "country": getattr(addr, "country", None),
+                        "postal_code": getattr(addr, "postal_code", None),
+                        "city": getattr(addr, "city", None),
+                        "state": getattr(addr, "state", None),
+                    }
+
+                decision = governance.evaluate(
+                    PolicyInput(
+                        merchant_id=str(order_request.merchant_id),
+                        actor_type="agent",
+                        actor_ref=str(getattr(context, "agent_id", "")) or None,
+                        action="submit_payment",
+                        amount=amount_total,
+                        currency=str(snap.get("currency") or order_request.currency or "USD"),
+                        geo=geo,
+                        consent_scopes=[],
+                        approval_id=None,
+                    )
+                )
+                hil_required = decision.decision == "require_hil"
+
+                offers = build_offers_from_quote(
+                    merchant_id=str(order_request.merchant_id),
+                    quote_id=qs.quote_id,
+                    expires_at=qs.expires_at,
+                    engine=str(snap.get("engine") or qs.engine or "unknown"),
+                    engine_ref=str(snap.get("engine_ref") or qs.engine_ref or ""),
+                    currency=str(snap.get("currency") or order_request.currency or "USD"),
+                    pricing=snap_pricing,
+                    line_items=snap.get("line_items") or [],
+                    delivery_options=snap.get("delivery_options"),
+                    shipping_address=(
+                        order_request.shipping_address.model_dump()
+                        if hasattr(order_request.shipping_address, "model_dump")
+                        else order_request.shipping_address.dict()
+                    ),
+                )
+
+                preflight = preflight_offers(
+                    offers=offers,
+                    policy_hashes_available=policy_hashes_available,
+                    hil_required=hil_required,
+                    hil_reason=",".join(decision.reason_codes) if hil_required else None,
+                )
+
+                # Attach to metadata for downstream audit/evidence.
+                if not order_request.metadata:
+                    order_request.metadata = {}
+                mvp_meta = order_request.metadata.get("mvp") if isinstance(order_request.metadata, dict) else None
+                if not isinstance(mvp_meta, dict):
+                    mvp_meta = {}
+                mvp_meta.update(
+                    {
+                        "schema_version": "0.1",
+                        "quote_id": qs.quote_id,
+                        "offers": [o.model_dump(mode="json") for o in offers],
+                        "preflight": [p.model_dump(mode="json") for p in preflight],
+                        "policy_hashes_available": policy_hashes_available,
+                        "policy_hashes": [
+                            {
+                                "policy_type": p.get("policy_type"),
+                                "hash_sha256": p.get("hash_sha256"),
+                                "fetched_at": str(p.get("fetched_at") or ""),
+                            }
+                            for p in (policies or [])
+                        ],
+                        "risk_tier": decision.risk_tier,
+                    }
+                )
+                order_request.metadata["mvp"] = mvp_meta
+
+                enforce_preflight = os.getenv("MVP_PREFLIGHT_ENFORCE", "false").lower() == "true"
+                if enforce_preflight and any(r.status == "fail" for r in preflight):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "PREFLIGHT_FAILED",
+                            "message": "Offer preflight failed; checkout blocked.",
+                            "preflight": [p.model_dump(mode="json") for p in preflight],
+                        },
+                    )
+        except QuoteError as e:
+            # Keep behavior backward-compatible unless quote-first is explicitly required.
+            if ENABLE_QUOTE_FIRST_ORDER_CREATE:
+                raise HTTPException(status_code=400, detail={"error": e.code, "message": e.message})
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         
         # 添加 Agent 元数据
         if not order_request.metadata:
@@ -725,6 +904,37 @@ async def agent_create_order(
         # 调用标准订单创建
         from routes.order_routes import create_new_order
         order_response = await create_new_order(order_request, background_tasks)
+
+        # MVP ledger event (best-effort): canonical order creation timeline entry.
+        try:
+            from mvp.ledger_events import emit_ledger_event_best_effort
+
+            emit_ledger_event_best_effort(
+                merchant_id=str(order_request.merchant_id),
+                event_type="order_created",
+                order_id=str(order_response.order_id),
+                source={"type": "backend"},
+                amount={"value": float(order_response.total), "currency": str(order_response.currency)},
+                refs={
+                    "payment_intent_id": getattr(order_response, "payment_intent_id", None),
+                    "shopify_order_id": getattr(order_response, "shopify_order_id", None),
+                },
+                geo={
+                    "country": getattr(order_request.shipping_address, "country", None),
+                    "postal_code": getattr(order_request.shipping_address, "postal_code", None),
+                    "city": getattr(order_request.shipping_address, "city", None),
+                    "state": getattr(order_request.shipping_address, "state", None),
+                }
+                if getattr(order_request, "shipping_address", None) is not None
+                else None,
+                surface="backend",
+                adapter="agent_orders_create",
+                risk_tier=(order_request.metadata.get("mvp", {}).get("risk_tier") if isinstance(order_request.metadata, dict) else "unknown")
+                or "unknown",
+                idempotency_key=getattr(order_request, "idempotency_key", None) or str(order_response.order_id),
+            )
+        except Exception:
+            pass
         
         # 计算订单总额
         order_amount = float(order_response.total)
@@ -774,6 +984,42 @@ async def agent_create_order(
         
         # STEP 3: Record governance metrics (success)
         success = True
+
+        # MVP measurement scaffolding: record checkout success for order creation stage.
+        try:
+            from mvp.constants import EVENT_CHECKOUT_SUCCEEDED, SURFACE_BACKEND
+            from mvp.events import emit_best_effort
+
+            addr = getattr(order_request, "shipping_address", None)
+            geo = None
+            if addr is not None:
+                geo = {
+                    "country": getattr(addr, "country", None),
+                    "postal_code": getattr(addr, "postal_code", None),
+                    "city": getattr(addr, "city", None),
+                    "state": getattr(addr, "state", None),
+                }
+
+            emit_best_effort(
+                event_type=EVENT_CHECKOUT_SUCCEEDED,
+                payload={
+                    "stage": "order_create",
+                    "merchant_id": getattr(order_request, "merchant_id", None),
+                    "order_id": order_response.order_id,
+                    "quote_id": getattr(order_request, "quote_id", None),
+                    "currency": order_response.currency,
+                    "total": float(order_response.total),
+                    "psp": getattr(order_response, "psp", None),
+                },
+                merchant_id=getattr(order_request, "merchant_id", None),
+                geo=geo,
+                surface=SURFACE_BACKEND,
+                adapter="agent_orders_create",
+                risk_tier="unknown",
+                idempotency_key=order_response.order_id,
+            )
+        except Exception:
+            pass
         
         # 返回简化的响应给 Agent（统一支付协议）
         # 从标准 OrderResponse 中提取 PSP 信息和统一的 payment_action
@@ -807,6 +1053,7 @@ async def agent_create_order(
         response = {
             "status": "success",
             "order_id": order_response.order_id,
+            "merchant_id": order_request.merchant_id,
             "total": str(order_response.total),  # 保留兼容 (deprecated)
             "total_amount": float(order_response.total),  # 新增：标准字段
             "currency": order_response.currency,
@@ -822,6 +1069,15 @@ async def agent_create_order(
                 "created_at": order_response.created_at.isoformat()
             }
         }
+
+        # Attach computed offers + preflight to response when available (additive; safe for existing clients).
+        try:
+            if offers is not None:
+                response["offers"] = [o.model_dump(mode="json") for o in offers]
+            if preflight is not None:
+                response["preflight"] = [p.model_dump(mode="json") for p in preflight]
+        except Exception:
+            pass
 
         # If quote-first snapshot is present in order metadata, return it to client for UI rendering.
         try:
@@ -843,11 +1099,53 @@ async def agent_create_order(
         except Exception:
             # Best-effort: do not break order creation if quote metadata read fails.
             pass
+
+        # Store idempotency record (best-effort).
+        if order_request.idempotency_key:
+            try:
+                from mvp.idempotency import PostgresIdempotencyStore
+
+                idem = PostgresIdempotencyStore()
+                await idem.put(scope="order_create", key=order_request.idempotency_key, value=response)
+            except Exception:
+                pass
         
         return response
         
     except HTTPException as e:
         success = False
+        try:
+            from mvp.constants import EVENT_CHECKOUT_FAILED, SURFACE_BACKEND
+            from mvp.events import emit_best_effort
+
+            addr = getattr(order_request, "shipping_address", None)
+            geo = None
+            if addr is not None:
+                geo = {
+                    "country": getattr(addr, "country", None),
+                    "postal_code": getattr(addr, "postal_code", None),
+                    "city": getattr(addr, "city", None),
+                    "state": getattr(addr, "state", None),
+                }
+
+            emit_best_effort(
+                event_type=EVENT_CHECKOUT_FAILED,
+                payload={
+                    "stage": "order_create",
+                    "merchant_id": getattr(order_request, "merchant_id", None),
+                    "quote_id": getattr(order_request, "quote_id", None),
+                    "error_status": getattr(e, "status_code", None),
+                    "error": str(e.detail)[:500],
+                },
+                merchant_id=getattr(order_request, "merchant_id", None),
+                geo=geo,
+                surface=SURFACE_BACKEND,
+                adapter="agent_orders_create",
+                risk_tier="unknown",
+                idempotency_key=getattr(order_request, "quote_id", None) or getattr(order_request, "agent_session_id", None),
+            )
+        except Exception:
+            pass
         await log_agent_request(
             context=context,
             status_code=e.status_code,
@@ -858,6 +1156,38 @@ async def agent_create_order(
     except Exception as e:
         success = False
         logger.error(f"Agent order creation error: {e}")
+        try:
+            from mvp.constants import EVENT_CHECKOUT_FAILED, SURFACE_BACKEND
+            from mvp.events import emit_best_effort
+
+            addr = getattr(order_request, "shipping_address", None)
+            geo = None
+            if addr is not None:
+                geo = {
+                    "country": getattr(addr, "country", None),
+                    "postal_code": getattr(addr, "postal_code", None),
+                    "city": getattr(addr, "city", None),
+                    "state": getattr(addr, "state", None),
+                }
+
+            emit_best_effort(
+                event_type=EVENT_CHECKOUT_FAILED,
+                payload={
+                    "stage": "order_create",
+                    "merchant_id": getattr(order_request, "merchant_id", None),
+                    "quote_id": getattr(order_request, "quote_id", None),
+                    "error_status": 500,
+                    "error": str(e)[:500],
+                },
+                merchant_id=getattr(order_request, "merchant_id", None),
+                geo=geo,
+                surface=SURFACE_BACKEND,
+                adapter="agent_orders_create",
+                risk_tier="unknown",
+                idempotency_key=getattr(order_request, "quote_id", None) or getattr(order_request, "agent_session_id", None),
+            )
+        except Exception:
+            pass
         await log_agent_request(
             context=context,
             status_code=500,

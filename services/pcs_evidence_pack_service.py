@@ -8,6 +8,7 @@ from db.orders import get_order
 from services.merchant_store_service import get_primary_store
 from services.pcs_hash import sha256_json
 from services.shopify_policy_service import fetch_and_store_shop_policies, get_latest_policy_hashes
+from mvp.dispute_evidence import build_dispute_pack_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -180,3 +181,130 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
         logger.debug("PCS order metadata writeback failed order=%s: %s", order_id, e)
 
     return {"order_id": order_id, "merchant_id": merchant_id, "manifest_sha256": manifest_sha, "pack_version": pack_version}
+
+
+async def _collect_audit_trail_refs(*, merchant_id: str, order_id: Optional[str], limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Best-effort: collect recent audit-event refs for a merchant and optionally filter by order_id.
+
+    Source: `mvp_events` where `event_type = 'audit_event'`.
+    """
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT event_id, occurred_at, chain_hash, payload_json
+            FROM mvp_events
+            WHERE merchant_id = :merchant_id AND event_type = 'audit_event'
+            ORDER BY occurred_at DESC
+            LIMIT :limit
+            """,
+            {"merchant_id": merchant_id, "limit": limit},
+        )
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        payload = dict(r.get("payload_json") or {})
+        subj = payload.get("subject") or {}
+        if order_id and str(subj.get("order_id") or "") != str(order_id):
+            continue
+        out.append(
+            {
+                "event_id": r.get("event_id"),
+                "occurred_at": r.get("occurred_at").isoformat() if r.get("occurred_at") else None,
+                "chain_hash": r.get("chain_hash"),
+                "action": payload.get("action"),
+            }
+        )
+    return out
+
+
+async def create_dispute_evidence_pack(
+    *,
+    merchant_id: str,
+    dispute_ref: str,
+    order_id: Optional[str],
+    dispute_payload: Dict[str, Any],
+    status: str,
+    triggered_by: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Create a PCS v0.1 `dispute_pack` evidence pack (draft/frozen) when disputes arrive (best-effort).
+
+    Composition (best-effort):
+    - Order receipt summary
+    - Latest policy snapshot hashes
+    - Shipping/tracking refs if available
+    - Audit trail refs from `mvp_events` (intent/approval/execution/receipt)
+    """
+    if not dispute_ref:
+        return None
+
+    normalized_status = "frozen" if status == "frozen" else "draft"
+
+    existing = await database.fetch_one(
+        """
+        SELECT id, pack_version, status
+        FROM pcs_evidence_packs
+        WHERE merchant_id = :merchant_id AND dispute_ref = :dispute_ref AND pack_type = 'dispute_pack'
+        ORDER BY pack_version DESC
+        LIMIT 1
+        """,
+        {"merchant_id": merchant_id, "dispute_ref": dispute_ref},
+    )
+    if existing and existing.get("status") == "frozen" and normalized_status == "frozen":
+        return dict(existing)
+
+    order = await get_order(order_id) if order_id else None
+    latest_policy_rows = await get_latest_policy_hashes(merchant_id)
+
+    audit_refs = await _collect_audit_trail_refs(merchant_id=merchant_id, order_id=order_id)
+
+    manifest = build_dispute_pack_manifest(
+        merchant_id=merchant_id,
+        dispute_ref=dispute_ref,
+        order=order,
+        dispute_payload=dispute_payload,
+        status=normalized_status,
+        policy_rows=latest_policy_rows,
+        audit_refs=audit_refs,
+        triggered_by=triggered_by,
+    )
+    manifest_sha = manifest.get("manifest_sha256") or _compute_manifest_sha256(manifest)
+
+    pack_version = 1
+    if existing and existing.get("pack_version"):
+        pack_version = int(existing["pack_version"]) + 1
+        manifest["pack_version"] = pack_version
+
+    await database.execute(
+        """
+        INSERT INTO pcs_evidence_packs
+          (merchant_id, order_id, dispute_ref, pack_type, pack_version, status, generated_at, frozen_at,
+           manifest_json, manifest_sha256, signature, assets_json)
+        VALUES
+          (:merchant_id, :order_id, :dispute_ref, 'dispute_pack', :pack_version, :status, NOW(), :frozen_at,
+           CAST(:manifest_json AS jsonb), :manifest_sha256, NULL, '[]'::jsonb)
+        ON CONFLICT (merchant_id, pack_type, order_id, dispute_ref, pack_version) DO NOTHING
+        """,
+        {
+            "merchant_id": merchant_id,
+            "order_id": order_id,
+            "dispute_ref": dispute_ref,
+            "pack_version": pack_version,
+            "status": normalized_status,
+            "frozen_at": datetime.now(timezone.utc) if normalized_status == "frozen" else None,
+            "manifest_json": json.dumps(manifest, ensure_ascii=False),
+            "manifest_sha256": manifest_sha,
+        },
+    )
+
+    return {
+        "merchant_id": merchant_id,
+        "order_id": order_id,
+        "dispute_ref": dispute_ref,
+        "status": normalized_status,
+        "manifest_sha256": manifest_sha,
+        "pack_version": pack_version,
+    }

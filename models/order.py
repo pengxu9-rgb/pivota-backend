@@ -72,6 +72,7 @@ class CreateOrderRequest(BaseModel):
     agent_session_id: Optional[str] = None  # Agent 会话 ID（用于追踪）
     metadata: Optional[Dict[str, Any]] = None  # 额外元数据
     preferred_psp: Optional[str] = None  # 指定首选 PSP (stripe/adyen/checkout)
+    idempotency_key: Optional[str] = None  # Best-effort retry safety (agent/gateway)
 
 
 class PaymentAction(BaseModel):
