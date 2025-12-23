@@ -12,6 +12,7 @@ import os
 import hmac
 import hashlib
 import json
+import socket
 from datetime import datetime
 
 from db.orders import get_order, update_order_status, mark_order_paid, mark_order_shipped
@@ -220,23 +221,47 @@ async def handle_shopify_webhook(
             raise HTTPException(status_code=404, detail="Merchant not found")
 
         # Verify signature (strict in production; must use raw request body).
+        instance_id = socket.gethostname()
         is_production = (
             os.getenv("APP_ENV", "").lower() == "production"
             or os.getenv("ENVIRONMENT", "").lower() == "production"
             or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
         )
-        shopify_secret = (
-            merchant.get("shopify_webhook_secret")
-            or getattr(settings, "shopify_client_secret", None)
-            or ""
+        merchant_secret = merchant.get("shopify_webhook_secret")
+        app_secret = getattr(settings, "shopify_client_secret", None)
+        shopify_secret = merchant_secret or app_secret or ""
+        secret_source = "merchant" if merchant_secret else ("app_env" if app_secret else "none")
+        secret_len = len(shopify_secret) if shopify_secret else 0
+        secret_sha256_prefix = (
+            hashlib.sha256(shopify_secret.encode("utf-8")).hexdigest()[:10]
+            if shopify_secret
+            else None
         )
+
+        debug_meta = {
+            "merchant_id": merchant_id,
+            "instance": instance_id,
+            "topic": x_shopify_topic or "unknown",
+            "webhook_id": x_shopify_webhook_id,
+            "shop_domain": _canonicalize_shop_domain(x_shopify_shop_domain) if x_shopify_shop_domain else None,
+            "has_shop_domain_header": bool(x_shopify_shop_domain),
+            "has_hmac_header": bool(x_shopify_hmac_sha256),
+            "has_webhook_id_header": bool(x_shopify_webhook_id),
+            "content_length": request.headers.get("content-length"),
+            "user_agent": request.headers.get("user-agent"),
+            "secret_source": secret_source,
+            "secret_len": secret_len,
+            "secret_sha256_prefix": secret_sha256_prefix,
+        }
         if is_production:
             if not x_shopify_shop_domain:
+                logger.warning("Shopify webhook rejected: missing shop domain header %s", debug_meta)
                 raise HTTPException(status_code=401, detail="Missing Shopify shop domain")
             if not shopify_secret:
                 logger.error("SHOPIFY_CLIENT_SECRET is not configured; cannot verify Shopify webhooks in production")
                 raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
             if not x_shopify_hmac_sha256:
+                logger.warning("Shopify webhook rejected: missing HMAC header %s", debug_meta)
                 raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
 
         signature_verified = verify_shopify_hmac(
@@ -245,6 +270,11 @@ async def handle_shopify_webhook(
             header_hmac_base64=x_shopify_hmac_sha256,
         )
         if is_production and not signature_verified:
+            # This commonly indicates env drift across instances (different SHOPIFY_CLIENT_SECRET).
+            meta = dict(debug_meta)
+            if x_shopify_hmac_sha256:
+                meta["hmac_prefix"] = x_shopify_hmac_sha256[:10]
+            logger.warning("Shopify webhook rejected: invalid signature %s", meta)
             raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
 
         # Parse event
