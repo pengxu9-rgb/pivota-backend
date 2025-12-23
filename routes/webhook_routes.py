@@ -6,6 +6,7 @@ Webhook 处理路由
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Request, HTTPException, Header
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 import stripe
 import os
 import hmac
@@ -22,6 +23,21 @@ from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+
+
+def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or "").strip().lower()
+        return host or None
+    except Exception:
+        return raw.lower()
 
 
 # ============================================================================
@@ -241,12 +257,16 @@ async def handle_shopify_webhook(
             store_info = await get_primary_store(merchant_id)
             expected_domain = (store_info or {}).get("domain")
             if is_production and expected_domain and x_shopify_shop_domain:
-                if expected_domain.strip().lower() != x_shopify_shop_domain.strip().lower():
+                expected_canon = _canonicalize_shop_domain(expected_domain)
+                got_canon = _canonicalize_shop_domain(x_shopify_shop_domain)
+                if expected_canon and got_canon and expected_canon != got_canon:
                     logger.error(
-                        "Shopify webhook shop_domain mismatch merchant=%s expected=%s got=%s topic=%s",
+                        "Shopify webhook shop_domain mismatch merchant=%s expected=%s(expected=%s) got=%s(got=%s) topic=%s",
                         merchant_id,
                         expected_domain,
+                        expected_canon,
                         x_shopify_shop_domain,
+                        got_canon,
                         topic,
                     )
                     raise HTTPException(status_code=403, detail="Shop domain mismatch")
@@ -519,6 +539,10 @@ async def register_shopify_webhooks(
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Missing Shopify credentials")
+
+        shop_domain_canon = _canonicalize_shop_domain(shop_domain)
+        if not shop_domain_canon:
+            raise HTTPException(status_code=400, detail="Invalid Shopify store domain")
         
         # 要注册的 webhook topics
         topics = [
@@ -560,7 +584,7 @@ async def register_shopify_webhooks(
                     }
                 }
                 
-                url = f"https://{shop_domain}/admin/api/2024-07/webhooks.json"
+                url = f"https://{shop_domain_canon}/admin/api/2024-07/webhooks.json"
                 headers = {
                     "X-Shopify-Access-Token": access_token,
                     "Content-Type": "application/json"
