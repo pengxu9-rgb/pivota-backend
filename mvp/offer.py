@@ -172,6 +172,25 @@ def preflight_offer(
         reasons.append("missing_geo_country")
         required_actions.append({"type": "ASK_USER_FOR_GEO", "fields": ["country"]})
 
+    # Delivery options availability (best-effort safety):
+    # If we have a shipping geo but Storefront didn't return any delivery options,
+    # we should NOT imply "free shipping" or certainty about shipping fees.
+    # This is especially important for Storefront Cart engine where deliveryGroups
+    # can be empty when shipping profiles/rates are not configured for the address.
+    has_shipping_geo = bool(
+        getattr(offer.geo, "postal_code", None) or getattr(offer.geo, "city", None)
+    )
+    has_delivery_options = bool(getattr(offer, "delivery_options", None))
+    if has_shipping_geo and not has_delivery_options:
+        warnings.append("delivery_options_unavailable")
+        delivery_check = PreFlightCheck(status="warn", reason_codes=["delivery_options_unavailable"])
+        fallback_options.append(
+            {
+                "type": "CHECKOUT_FOR_FINAL_SHIPPING",
+                "message": "Delivery options unavailable for this address; final shipping fee is confirmed at checkout.",
+            }
+        )
+
     # Quote expiry gates "orderability certainty"
     if offer.quote_ref.expires_at <= ts:
         reasons.append("quote_expired")

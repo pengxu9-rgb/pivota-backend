@@ -44,6 +44,7 @@ Quote preview (`POST /agent/v1/quotes/preview`) needs a Shopify pricing engine t
   - Requires a Storefront access token (`X-Shopify-Storefront-Access-Token`).
   - Deployment shortcut: set `SHOPIFY_STOREFRONT_ACCESS_TOKEN` in the backend env.
   - Longer-term: store a per-merchant storefront token in `merchant_stores.api_key` JSON under `storefront_access_token`.
+  - Note: Storefront can return an empty `deliveryGroups` array when the shop has no shipping rates configured for the provided address; in that case backend preflight will warn with `delivery_options_unavailable` and you should treat shipping fee as “confirmed at checkout”.
 
 ---
 
