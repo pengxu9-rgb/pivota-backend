@@ -132,15 +132,16 @@ class ShopifyStorefrontPricingService:
             "total": cart.total,
         }
 
-        # If we successfully found delivery options with explicit costs, attempt to derive shipping_fee.
-        # This is best-effort and schema-dependent.
+        # Best-effort derive shipping_fee:
+        # - Prefer selected delivery option estimatedCost when available.
+        # - Else fallback to delta: total - subtotal - tax + discount_total (clamped >= 0).
         shipping_fee = self._derive_shipping_fee(cart)
         if shipping_fee is not None:
             pricing["shipping_fee"] = shipping_fee
-            # When Storefront returns subtotal/total excluding shipping (common), adjust total.
-            # When it already includes shipping, shipping_fee will be zero or the delta will be handled at checkout.
-            if pricing["total"] < pricing["subtotal"] + pricing["shipping_fee"]:
-                pricing["total"] = pricing["subtotal"] + pricing["shipping_fee"] + pricing["tax"] - pricing["discount_total"]
+        else:
+            delta = pricing["total"] - pricing["subtotal"] - pricing["tax"] + pricing["discount_total"]
+            if delta > 0:
+                pricing["shipping_fee"] = _d(delta)
 
         debug = {
             "debug_id": debug_id,
@@ -424,6 +425,10 @@ query($id: ID!) {
         selected_delivery_option: Optional[Dict[str, Any]],
         debug_id: str,
     ) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
+        # NOTE: Storefront schema varies by shop/api-version. Some expect:
+        # - addresses: [CartSelectableAddressInput!]! with field "deliveryAddress"
+        # - others expect field "address"
+        # Try both shapes before giving up.
         add_address = """
 mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
   cartDeliveryAddressesAdd(cartId: $cartId, addresses: $addresses) {
@@ -432,26 +437,49 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
   }
 }
 """
-        addresses = [
-            {
-                "deliveryAddress": {
-                    "countryCode": country,
-                    "zip": postal,
-                    **({"city": city} if city else {}),
-                    **({"provinceCode": province} if province else {}),
-                }
-            }
+
+        base_addr = {
+            "countryCode": country,
+            "zip": postal,
+            **({"city": city} if city else {}),
+            **({"provinceCode": province} if province else {}),
+        }
+
+        add_shapes = [
+            [{"deliveryAddress": base_addr}],
+            [{"address": base_addr}],
         ]
-        data = await self._storefront_graphql(
-            shop_domain=shop_domain,
-            storefront_token=storefront_token,
-            query=add_address,
-            variables={"cartId": cart_id, "addresses": addresses},
-            debug_id=debug_id,
-        )
-        root = (data.get("cartDeliveryAddressesAdd") or {}) if isinstance(data, dict) else {}
-        if (root.get("userErrors") or []):
-            return None, None
+
+        added = False
+        last_error_details: Dict[str, Any] = {}
+        for addresses in add_shapes:
+            try:
+                data = await self._storefront_graphql(
+                    shop_domain=shop_domain,
+                    storefront_token=storefront_token,
+                    query=add_address,
+                    variables={"cartId": cart_id, "addresses": addresses},
+                    debug_id=debug_id,
+                )
+                root = (data.get("cartDeliveryAddressesAdd") or {}) if isinstance(data, dict) else {}
+                user_errors = root.get("userErrors") or []
+                if user_errors:
+                    # Keep trying other shapes.
+                    last_error_details = {"user_errors": user_errors}
+                    continue
+                added = True
+                break
+            except ShopifyPricingError as e:
+                last_error_details = getattr(e, "details", {}) or {}
+                continue
+
+        if not added:
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                "Failed to attach delivery address for delivery options",
+                debug_id,
+                details=last_error_details,
+            )
 
         # Query delivery options (schema varies; keep it tolerant).
         delivery_query = """
@@ -485,10 +513,11 @@ query($id: ID!) {
         options: List[Dict[str, Any]] = []
         for edge in groups:
             node = (edge or {}).get("node") or {}
+            group_id = node.get("id")
             for opt in node.get("deliveryOptions") or []:
                 if not isinstance(opt, dict):
                     continue
-                options.append(opt)
+                options.append({**opt, "delivery_group_id": group_id})
 
         if not options:
             return None, None
@@ -501,9 +530,10 @@ query($id: ID!) {
         chosen = None
         if selected_delivery_option and isinstance(selected_delivery_option, dict):
             want_handle = selected_delivery_option.get("handle") or selected_delivery_option.get("id")
+            want_group = selected_delivery_option.get("delivery_group_id") or selected_delivery_option.get("deliveryGroupId")
             if want_handle:
                 for o in options:
-                    if o.get("handle") == want_handle:
+                    if o.get("handle") == want_handle and (not want_group or o.get("delivery_group_id") == want_group):
                         chosen = o
                         break
         if chosen is None:
@@ -518,14 +548,21 @@ mutation($cartId: ID!, $selectedDeliveryOptions: [CartSelectedDeliveryOptionInpu
   }
 }
 """
-        # We don't have deliveryGroupId in this query; some schemas require it.
-        # Try a minimal input with handle only; if it fails, we still return options.
+        group_id = chosen.get("delivery_group_id")
         try:
             await self._storefront_graphql(
                 shop_domain=shop_domain,
                 storefront_token=storefront_token,
                 query=update_sel,
-                variables={"cartId": cart_id, "selectedDeliveryOptions": [{"deliveryOptionHandle": chosen.get("handle")}]},
+                variables={
+                    "cartId": cart_id,
+                    "selectedDeliveryOptions": [
+                        {
+                            "deliveryGroupId": group_id,
+                            "deliveryOptionHandle": chosen.get("handle"),
+                        }
+                    ],
+                },
                 debug_id=debug_id,
             )
         except Exception:
