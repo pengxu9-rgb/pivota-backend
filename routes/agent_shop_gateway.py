@@ -320,6 +320,7 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
 
     base: Dict[str, Any] = {
         "id": p.product_id or p.id,
+        "product_id": p.product_id or p.id,
         "merchant_id": p.merchant_id,
         "title": p.title,
         "description": p.description or "",
@@ -2296,6 +2297,7 @@ async def _handle_find_similar_products(
         "metadata": { "creator_id": "creator_456", "source": "creator-agent-ui" }
       }'
     """
+    bt = background_tasks or BackgroundTasks()
     limit = min(payload.limit or 6, 30)
     background_tasks = background_tasks or BackgroundTasks()
 
@@ -2311,7 +2313,7 @@ async def _handle_find_similar_products(
                 merchant_id=payload.merchant_id,
                 limit=500,
                 agent_id="shopping_ai_similar",
-                background_tasks=background_tasks,
+                background_tasks=bt,
             )
             for p in products:
                 if p.product_id == payload.product_id or p.id == payload.product_id:

@@ -142,6 +142,27 @@ async def process_refund(
         except Exception:
             pass
 
+        # PCS v0.2-b (best-effort): internal refund fact for reducer replay (no PII).
+        try:
+            from services.pcs_fact_ingest import append_internal_fact_best_effort
+
+            await append_internal_fact_best_effort(
+                merchant_id=str(order.get("merchant_id")),
+                order_id=str(order_id),
+                fact_type="internal.refund_requested",
+                payload={
+                    "order_id": str(order_id),
+                    "merchant_id": str(order.get("merchant_id")),
+                    "amount": float(refund_amount),
+                    "currency": str(order.get("currency") or "USD"),
+                    "reason": refund_request.reason,
+                    "idempotency_key": refund_request.idempotency_key,
+                },
+                idempotency_key=refund_request.idempotency_key or f"{order_id}:{str(refund_amount)}",
+            )
+        except Exception:
+            pass
+
         # Get PSP adapter
         psp_type = merchant.get("psp_type", "stripe")
         psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
@@ -183,6 +204,27 @@ async def process_refund(
                 "refunded_by": current_user.get("user_id", "admin")
             }
         )
+
+        # PCS v0.2-b (best-effort): internal refund processed fact for reducer replay (no PII).
+        try:
+            from services.pcs_fact_ingest import append_internal_fact_best_effort
+
+            await append_internal_fact_best_effort(
+                merchant_id=str(order.get("merchant_id")),
+                order_id=str(order_id),
+                fact_type="internal.refund_processed",
+                payload={
+                    "order_id": str(order_id),
+                    "merchant_id": str(order.get("merchant_id")),
+                    "status": str(new_status),
+                    "amount": float(refund_amount),
+                    "currency": str(order.get("currency") or "USD"),
+                    "refund_id": str(refund_id),
+                },
+                idempotency_key=refund_request.idempotency_key or str(refund_id),
+            )
+        except Exception:
+            pass
         
         # Log refund event
         await log_order_event(

@@ -11,7 +11,9 @@ import os
 import secrets
 
 from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, insert_quote, mark_quote_consumed
+from services.pcs_hash import sha256_json
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingService
+from services.shopify_storefront_pricing_service import ShopifyStorefrontPricingService
 from utils.logger import logger
 
 
@@ -28,6 +30,14 @@ def normalize_discount_codes(codes: Optional[List[str]]) -> List[str]:
         out.append(v)
     # stable + de-dup
     return sorted(list(dict.fromkeys(out)))
+
+
+def normalize_items_for_fingerprint(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return _normalize_items_for_fingerprint(items)
+
+
+def normalize_shipping_for_fingerprint(addr: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    return _normalize_shipping_for_fingerprint(addr)
 
 
 def _normalize_shipping_for_fingerprint(addr: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -92,22 +102,33 @@ class QuoteSnapshot:
     engine: str
     engine_ref: str
     request_fingerprint: str
+    request_json: Dict[str, Any]
     snapshot_json: Dict[str, Any]
+    quote_hash_sha256: Optional[str]
     debug_id: Optional[str]
 
 
 class QuoteError(Exception):
-    def __init__(self, code: str, message: str, *, debug_id: Optional[str] = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        debug_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.debug_id = debug_id
+        self.details = details or {}
 
 
 class QuoteService:
     def __init__(self):
         self.ttl_seconds = int(os.getenv("QUOTE_TTL_SECONDS", "600"))
-        self.pricing = ShopifyPricingService()
+        self.pricing_storefront = ShopifyStorefrontPricingService()
+        self.pricing_admin_checkout = ShopifyPricingService()
 
     async def preview_quote(
         self,
@@ -132,20 +153,45 @@ class QuoteService:
         expires_at = compute_expires_at(self.ttl_seconds)
         quote_id = f"q_{secrets.token_hex(12)}"
 
+        # Engine selection:
+        # Prefer Storefront Cart engine when configured (Admin Checkout API requires write_checkouts
+        # which is unavailable for many modern apps). Fallback to Admin Checkout for compatibility.
+        normalized_items = _normalize_items_for_fingerprint(items)
+        normalized_shipping = _normalize_shipping_for_fingerprint(shipping_address)
+
+        result = None
+        last_err: Optional[ShopifyPricingError] = None
+
         try:
-            result = await self.pricing.preview_checkout_quote(
+            result = await self.pricing_storefront.preview_cart_quote(
                 merchant_id=merchant_id,
-                items=_normalize_items_for_fingerprint(items),
+                items=normalized_items,
                 discount_codes=codes,
                 customer_email=customer_email,
-                shipping_address=_normalize_shipping_for_fingerprint(shipping_address),
+                shipping_address=normalized_shipping,
                 selected_delivery_option=selected_delivery_option,
             )
         except ShopifyPricingError as e:
-            raise QuoteError(e.code, e.message, debug_id=e.debug_id)
+            last_err = e
+
+        if result is None:
+            try:
+                result = await self.pricing_admin_checkout.preview_checkout_quote(
+                    merchant_id=merchant_id,
+                    items=normalized_items,
+                    discount_codes=codes,
+                    customer_email=customer_email,
+                    shipping_address=normalized_shipping,
+                    selected_delivery_option=selected_delivery_option,
+                )
+            except ShopifyPricingError as e:
+                last_err = e
+
+        if result is None and last_err is not None:
+            raise QuoteError(last_err.code, last_err.message, debug_id=last_err.debug_id)
 
         snapshot_json: Dict[str, Any] = {
-            "engine": "shopify_rest_checkout",
+            "engine": result.engine,
             "engine_ref": result.engine_ref,
             "currency": result.currency,
             "pricing": {
@@ -174,16 +220,24 @@ class QuoteService:
         }
 
         now = datetime.now(timezone.utc)
+        quote_hash_sha256 = sha256_json(
+            {
+                "request": request_json,
+                "snapshot": snapshot_json,
+                "request_fingerprint": fingerprint,
+            }
+        )
         await insert_quote(
             {
                 "quote_id": quote_id,
                 "merchant_id": merchant_id,
                 "agent_id": agent_id,
-                "engine": "shopify_rest_checkout",
+                "engine": result.engine,
                 "engine_ref": str(result.engine_ref),
                 "request_fingerprint": fingerprint,
                 "request_json": request_json,
                 "snapshot_json": snapshot_json,
+                "quote_hash_sha256": quote_hash_sha256,
                 "status": "active",
                 "expires_at": expires_at,
                 "consumed_at": None,
@@ -197,7 +251,7 @@ class QuoteService:
         return {
             "quote_id": quote_id,
             "expires_at": expires_at,
-            "engine": "shopify_rest_checkout",
+            "engine": result.engine,
             "engine_ref": str(result.engine_ref),
             "currency": result.currency,
             "pricing": result.pricing,
@@ -223,7 +277,12 @@ class QuoteService:
         status = row.get("status")
 
         if status == "consumed":
-            raise QuoteError("QUOTE_CONSUMED", "Quote already consumed", debug_id=row.get("debug_id"))
+            raise QuoteError(
+                "QUOTE_CONSUMED",
+                "Quote already consumed",
+                debug_id=row.get("debug_id"),
+                details={"order_id": row.get("consumed_order_id")},
+            )
         if status == "expired":
             raise QuoteError("QUOTE_EXPIRED", "Quote expired", debug_id=row.get("debug_id"))
         if expires_at and isinstance(expires_at, datetime):
@@ -239,13 +298,15 @@ class QuoteService:
             engine=row.get("engine") or "shopify_rest_checkout",
             engine_ref=row.get("engine_ref") or "",
             request_fingerprint=row.get("request_fingerprint") or "",
+            request_json=row.get("request_json") or {},
             snapshot_json=row.get("snapshot_json") or {},
+            quote_hash_sha256=row.get("quote_hash_sha256"),
             debug_id=row.get("debug_id"),
         )
 
-    async def consume_quote_best_effort(self, quote_id: str) -> None:
+    async def consume_quote_best_effort(self, quote_id: str, *, order_id: Optional[str] = None) -> None:
         try:
-            await mark_quote_consumed(quote_id)
+            await mark_quote_consumed(quote_id, consumed_order_id=order_id)
         except Exception as e:
             logger.warning({"quote_id": quote_id, "error": str(e)}, "Failed to consume quote (best-effort)")
 

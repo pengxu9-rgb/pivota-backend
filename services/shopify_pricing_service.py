@@ -14,6 +14,7 @@ from utils.logger import logger
 
 @dataclass(frozen=True)
 class ShopifyPricingResult:
+    engine: str
     engine_ref: str
     currency: str
     pricing: Dict[str, Decimal]
@@ -174,6 +175,7 @@ class ShopifyPricingService:
         }
 
         return ShopifyPricingResult(
+            engine="shopify_rest_checkout",
             engine_ref=str(token),
             currency=currency,
             pricing=pricing,

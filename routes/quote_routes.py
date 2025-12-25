@@ -42,7 +42,7 @@ async def preview_quote(
     response = {
         "quote_id": result["quote_id"],
         "expires_at": result["expires_at"],
-        "engine": "shopify_rest_checkout",
+        "engine": result.get("engine") or "shopify_rest_checkout",
         "engine_ref": result["engine_ref"],
         "currency": result["currency"],
         "pricing": {

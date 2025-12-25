@@ -33,6 +33,41 @@ def _compute_manifest_sha256(manifest: Dict[str, Any]) -> str:
     return sha256_json(to_hash)
 
 
+def _extract_pricing_quote_evidence(order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort: extract a quote-first pricing lock summary from order.metadata.
+
+    Security/PII:
+    - The stored `pricing_quote` snapshot should not contain PII; it contains pricing, item refs and discount codes.
+    - We still treat this as best-effort and return None when shape is unexpected.
+    """
+    meta = order.get("metadata") or {}
+    if not isinstance(meta, dict):
+        return None
+
+    pricing_quote = meta.get("pricing_quote")
+    if not isinstance(pricing_quote, dict):
+        return None
+
+    quote_id = pricing_quote.get("quote_id")
+    if not quote_id:
+        return None
+
+    quote_hash_sha256 = pricing_quote.get("quote_hash_sha256") or sha256_json(pricing_quote)
+
+    return {
+        "quote_id": quote_id,
+        "expires_at": pricing_quote.get("expires_at"),
+        "engine": pricing_quote.get("engine"),
+        "engine_ref": pricing_quote.get("engine_ref"),
+        "request_fingerprint": pricing_quote.get("request_fingerprint"),
+        "quote_hash_sha256": quote_hash_sha256,
+        "pricing": pricing_quote.get("pricing"),
+        "promotion_lines": pricing_quote.get("promotion_lines") or [],
+        "line_items": pricing_quote.get("line_items") or [],
+    }
+
+
 async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: str) -> Optional[Dict[str, Any]]:
     """
     Create and freeze an EvidencePack v0.1 'order_snapshot' for an order (best-effort).
@@ -86,6 +121,8 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
     pivota_mandate_id = meta.get("pivota_mandate_id") or "unavailable"
     authorization_audit_ref = meta.get("authorization_audit_ref") or f"audit://pivota/orders/{order_id}"
 
+    pricing_quote_evidence = _extract_pricing_quote_evidence(order)
+
     manifest: Dict[str, Any] = {
         "schema_version": "0.1",
         "effective_from": "2025-01-01T00:00:00Z",
@@ -103,6 +140,7 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
             "currency": order.get("currency"),
             "order_total": str(order.get("total")),
         },
+        "pricing_quote": pricing_quote_evidence,
         "mandate_evidence": {
             "pivota_mandate_id": pivota_mandate_id,
             "pivota_agent_id": pivota_agent_id,
@@ -154,6 +192,27 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
         },
     )
 
+    # PCS v0.2-b (best-effort): internal evidence pack fact for reducer replay (no manifest/PII).
+    try:
+        from services.pcs_fact_ingest import append_internal_fact_best_effort
+
+        await append_internal_fact_best_effort(
+            merchant_id=str(merchant_id),
+            order_id=str(order_id),
+            fact_type="internal.evidence_pack_frozen",
+            payload={
+                "merchant_id": str(merchant_id),
+                "order_id": str(order_id),
+                "pack_type": "order_snapshot",
+                "pack_version": int(pack_version),
+                "manifest_sha256": str(manifest_sha),
+                "triggered_by": str(triggered_by),
+            },
+            idempotency_key=f"order_snapshot:{manifest_sha}",
+        )
+    except Exception:
+        pass
+
     # Best-effort writeback into orders.metadata for downstream (quote-first/evidence/UI).
     try:
         patch = {
@@ -164,6 +223,8 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
                 "authorization_audit_ref": authorization_audit_ref,
                 "order_snapshot_manifest_sha256": manifest_sha,
                 "triggered_by": triggered_by,
+                "quote_id": (pricing_quote_evidence or {}).get("quote_id"),
+                "quote_hash_sha256": (pricing_quote_evidence or {}).get("quote_hash_sha256"),
             }
         }
         await database.execute(
@@ -299,6 +360,29 @@ async def create_dispute_evidence_pack(
             "manifest_sha256": manifest_sha,
         },
     )
+
+    # PCS v0.2-b (best-effort): internal evidence pack fact for reducer replay (no manifest/PII).
+    if normalized_status == "frozen":
+        try:
+            from services.pcs_fact_ingest import append_internal_fact_best_effort
+
+            await append_internal_fact_best_effort(
+                merchant_id=str(merchant_id),
+                order_id=str(order_id) if order_id else None,
+                fact_type="internal.evidence_pack_frozen",
+                payload={
+                    "merchant_id": str(merchant_id),
+                    "order_id": str(order_id) if order_id else None,
+                    "dispute_ref": str(dispute_ref),
+                    "pack_type": "dispute_pack",
+                    "pack_version": int(pack_version),
+                    "manifest_sha256": str(manifest_sha),
+                    "triggered_by": str(triggered_by),
+                },
+                idempotency_key=f"dispute_pack:{manifest_sha}",
+            )
+        except Exception:
+            pass
 
     return {
         "merchant_id": merchant_id,

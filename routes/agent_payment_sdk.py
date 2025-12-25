@@ -436,6 +436,29 @@ async def create_payment(
             payment_status="processing",
             psp_used=psp_used,
         )
+
+        # PCS v0.2-b (best-effort): internal payment fact for reducer replay (no PII).
+        try:
+            from services.pcs_fact_ingest import append_internal_fact_best_effort
+
+            await append_internal_fact_best_effort(
+                merchant_id=str(merchant_id) if merchant_id else "",
+                order_id=str(request.order_id),
+                fact_type="internal.payment_updated",
+                payload={
+                    "order_id": str(request.order_id),
+                    "merchant_id": str(merchant_id) if merchant_id else None,
+                    "status": status,
+                    "payment_intent_id": payment_intent.id,
+                    "amount": float(amount),
+                    "currency": str(currency),
+                    "psp_used": str(psp_used),
+                    "idempotency_key": request.idempotency_key,
+                },
+                idempotency_key=request.idempotency_key or f"{request.order_id}:{payment_intent.id}:{status}",
+            )
+        except Exception:
+            pass
         
         # 9. Log request
         background_tasks.add_task(

@@ -1,0 +1,294 @@
+from __future__ import annotations
+
+import os
+import sys
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, Optional
+
+import httpx
+import pytest
+
+
+# Ensure we import the pivota-backend modules (external_repos/pivota-backend), not the workspace root.
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+
+# Many modules import `db.database` at import-time and require DATABASE_URL to be set.
+# Use a placeholder Postgres URL for unit/integration tests that monkeypatch DB calls.
+os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+
+
+class _TestAgentContext:
+    agent_id = "agent_test"
+    agent_name = "Test Agent"
+    allowed_merchants = None
+
+    def can_access_merchant(self, merchant_id: str) -> bool:
+        return True
+
+
+async def _override_get_agent_context() -> _TestAgentContext:
+    return _TestAgentContext()
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_replay_returns_cached_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        # Disable best-effort telemetry to avoid DB/file side effects in unit tests.
+        import mvp.events as mvp_events
+
+        monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+        import mvp.ledger_events as ledger_events
+
+        monkeypatch.setattr(ledger_events, "emit_best_effort", lambda **_: None)
+
+        # Governance should not block tests.
+        import services.agent_governance as governance_module
+
+        async def noop_validate_request(agent_id: str) -> None:
+            return None
+
+        async def noop_record_response(agent_id: str, latency_ms: int, success: bool) -> None:
+            return None
+
+        monkeypatch.setattr(governance_module.agent_governance, "validate_request", noop_validate_request)
+        monkeypatch.setattr(governance_module.agent_governance, "record_response", noop_record_response)
+
+        # Avoid DB usage logging.
+        import routes.agent_auth as agent_auth_module
+
+        async def noop_log_agent_request(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(agent_auth_module, "log_agent_request", noop_log_agent_request)
+        import routes.agent_api as agent_api_module
+
+        monkeypatch.setattr(agent_api_module, "log_agent_request", noop_log_agent_request)
+
+        # Use an in-memory idempotency store behind the Postgres interface.
+        import mvp.idempotency as idempotency_module
+        from mvp.idempotency import InMemoryIdempotencyStore
+
+        shared_store = InMemoryIdempotencyStore()
+
+        class FakePostgresIdempotencyStore:
+            async def get(self, *, scope: str, key: str):
+                return await shared_store.get(scope=scope, key=key)
+
+            async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
+                return await shared_store.put(scope=scope, key=key, value=value)
+
+        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+
+        # Ensure the underlying order creation is only executed once; the second call must replay.
+        import routes.order_routes as order_routes_module
+        from models.order import OrderResponse, PaymentAction
+
+        calls = {"count": 0}
+
+        async def fake_create_new_order(order_request: Any, background_tasks: Any):
+            calls["count"] += 1
+            order_id = f"ord_{calls['count']}"
+            now = datetime.now(timezone.utc)
+            return OrderResponse(
+                order_id=order_id,
+                merchant_id=order_request.merchant_id,
+                customer_email=order_request.customer_email,
+                items=order_request.items,
+                shipping_address=order_request.shipping_address,
+                subtotal=Decimal("10.00"),
+                shipping_fee=Decimal("0.00"),
+                tax=Decimal("0.00"),
+                total=Decimal("10.00"),
+                currency=order_request.currency or "USD",
+                status="pending",
+                payment_status="unpaid",
+                fulfillment_status=None,
+                payment_intent_id="pi_test",
+                client_secret="cs_test",
+                psp="stripe",
+                payment_action=PaymentAction(type="stripe_client_secret", client_secret="cs_test"),
+                shopify_order_id=None,
+                tracking_number=None,
+                created_at=now,
+                updated_at=now,
+                paid_at=None,
+                shipped_at=None,
+                agent_session_id=order_request.agent_session_id,
+                metadata=order_request.metadata,
+            )
+
+        monkeypatch.setattr(order_routes_module, "create_new_order", fake_create_new_order)
+
+        payload = {
+            "merchant_id": "m_test",
+            "customer_email": "test@example.com",
+            "items": [
+                {
+                    "product_id": "p_1",
+                    "product_title": "Test Product",
+                    "variant_id": "v_1",
+                    "quantity": 1,
+                    "unit_price": "10.00",
+                    "subtotal": "10.00",
+                }
+            ],
+            "shipping_address": {
+                "name": "Test",
+                "address_line1": "1 Test St",
+                "city": "SF",
+                "state": "CA",
+                "postal_code": "94107",
+                "country": "US",
+            },
+            "currency": "USD",
+            "idempotency_key": "idem_order_create_1",
+            "metadata": {},
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.post("/agent/v1/orders/create", json=payload)
+            second = await client.post("/agent/v1/orders/create", json=payload)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        body1 = first.json()
+        body2 = second.json()
+        assert body1["order_id"] == body2["order_id"]
+        assert calls["count"] == 1
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_payments_replay_does_not_double_execute(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        # Disable best-effort telemetry to avoid DB/file side effects in unit tests.
+        import mvp.events as mvp_events
+
+        monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+        import mvp.ledger_events as ledger_events
+
+        monkeypatch.setattr(ledger_events, "emit_best_effort", lambda **_: None)
+
+        # Avoid DB usage logging.
+        import routes.agent_auth as agent_auth_module
+
+        async def noop_log_agent_request(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(agent_auth_module, "log_agent_request", noop_log_agent_request)
+        import routes.agent_payment_sdk as payment_module
+
+        monkeypatch.setattr(payment_module, "log_agent_request", noop_log_agent_request)
+
+        # Stub order lookup.
+        async def fake_get_order(order_id: str) -> Optional[Dict[str, Any]]:
+            return {
+                "order_id": order_id,
+                "merchant_id": "m_test",
+                "payment_status": "unpaid",
+                "total": 10.0,
+                "currency": "USD",
+                "shipping_address": {
+                    "country": "US",
+                    "postal_code": "94107",
+                    "city": "SF",
+                    "state": "CA",
+                },
+            }
+
+        async def fake_update_payment_info(**_: Any) -> None:
+            return None
+
+        monkeypatch.setattr(payment_module, "get_order", fake_get_order)
+        monkeypatch.setattr(payment_module, "update_payment_info", fake_update_payment_info)
+
+        # Stub merchant onboarding lookup.
+        async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+            return {"merchant_id": merchant_id, "psp_connected": True}
+
+        monkeypatch.setattr(payment_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+
+        # Stub PSP routing selection.
+        async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
+            return "stripe", {"route_id": "route_test"}
+
+        monkeypatch.setattr(payment_module.PaymentRoutingService, "select_psp", fake_select_psp)
+
+        # In-memory payment table for idempotency checks.
+        payments: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+        from db.database import database as database_obj
+
+        async def fake_fetch_one(query: Any, values: Optional[Dict[str, Any]] = None):
+            if isinstance(query, str) and "FROM payments" in query:
+                values = values or {}
+                key = (str(values.get("key")), str(values.get("order_id")))
+                return payments.get(key)
+            return None
+
+        async def fake_execute(query: Any, values: Optional[Dict[str, Any]] = None):
+            if isinstance(query, str) and "INSERT INTO payments" in query:
+                values = values or {}
+                idem_key = str(values.get("idem_key") or "")
+                order_id = str(values.get("order_id") or "")
+                payments[(idem_key, order_id)] = {
+                    "payment_id": values.get("payment_id"),
+                    "payment_intent_id": values.get("intent_id"),
+                    "status": values.get("status"),
+                }
+                return None
+            return None
+
+        monkeypatch.setattr(database_obj, "fetch_one", fake_fetch_one)
+        monkeypatch.setattr(database_obj, "execute", fake_execute)
+
+        calls = {"count": 0}
+
+        async def fake_create_payment_with_failover(*_: Any, **__: Any):
+            calls["count"] += 1
+            payment_intent = SimpleNamespace(
+                id="pi_test_1",
+                status="succeeded",
+                client_secret="cs_test_1",
+            )
+            return True, payment_intent, None, "stripe"
+
+        monkeypatch.setattr(payment_module, "create_payment_with_failover", fake_create_payment_with_failover)
+
+        body = {
+            "order_id": "ord_test",
+            "payment_method": {"type": "card", "token": "tok_test"},
+            "idempotency_key": "idem_pay_1",
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.post("/agent/v1/payments", json=body)
+            second = await client.post("/agent/v1/payments", json=body)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        payload1 = first.json()
+        payload2 = second.json()
+        assert payload1["payment_id"] == payload2["payment_id"]
+        assert payload1["payment_intent_id"] == payload2["payment_intent_id"]
+        assert payload1["status"] == payload2["status"]
+        assert calls["count"] == 1
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)

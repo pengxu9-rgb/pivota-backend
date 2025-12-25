@@ -1,0 +1,582 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional
+
+import hashlib
+import httpx
+
+from services.merchant_store_service import get_primary_store
+from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingResult
+from utils.logger import logger
+
+
+def _d(v: Any) -> Decimal:
+    try:
+        return Decimal(str(v or "0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        return Decimal("0.00")
+
+
+def _gid(kind: str, numeric_id: str) -> str:
+    return f"gid://shopify/{kind}/{numeric_id}"
+
+
+def _extract_storefront_token(store: Dict[str, Any]) -> Optional[str]:
+    creds = store.get("api_credentials") if isinstance(store.get("api_credentials"), dict) else {}
+    candidates = [
+        creds.get("storefront_access_token"),
+        creds.get("storefront_token"),
+        creds.get("storefrontAccessToken"),
+        creds.get("storefrontAccessTokenPublic"),
+    ]
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            return c.strip()
+
+    # Fallback: allow a single-token deployment for early rollout.
+    # NOTE: This is NOT safe for multi-merchant long-term; prefer storing per-merchant.
+    env = (
+        (store.get("storefront_access_token") if isinstance(store.get("storefront_access_token"), str) else None)
+        or ""
+    )
+    if env.strip():
+        return env.strip()
+    import os
+
+    env2 = os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "") or ""
+    return env2.strip() or None
+
+
+@dataclass(frozen=True)
+class StorefrontCartResult:
+    cart_id: str
+    checkout_url: Optional[str]
+    currency: str
+    subtotal: Decimal
+    total: Decimal
+    tax: Decimal
+    delivery_options: Optional[List[Dict[str, Any]]]
+    selected_delivery_option: Optional[Dict[str, Any]]
+
+
+class ShopifyStorefrontPricingService:
+    """
+    Pricing oracle backed by Shopify Storefront Cart API.
+
+    Goal: provide a quote-first "locked pricing" snapshot without relying on deprecated
+    Admin REST Checkout API (which requires write_checkouts).
+    """
+
+    def __init__(self, api_version: str = "2024-07", timeout_seconds: float = 20.0):
+        self.api_version = api_version
+        self.timeout_seconds = timeout_seconds
+
+    async def preview_cart_quote(
+        self,
+        *,
+        merchant_id: str,
+        items: List[Dict[str, Any]],
+        discount_codes: List[str],
+        customer_email: Optional[str],
+        shipping_address: Optional[Dict[str, Any]],
+        selected_delivery_option: Optional[Dict[str, Any]],
+    ) -> ShopifyPricingResult:
+        debug_id = hashlib.sha256(
+            f"storefront:{merchant_id}:{datetime.now(timezone.utc).isoformat()}".encode("utf-8")
+        ).hexdigest()[:16]
+
+        store = await get_primary_store(merchant_id)
+        if not store or store.get("platform") != "shopify":
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                f"Merchant {merchant_id} has no Shopify primary store",
+                debug_id,
+            )
+
+        shop_domain = store.get("domain") or ""
+        storefront_token = _extract_storefront_token(store) or ""
+        if not shop_domain or not storefront_token:
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                "Missing Shopify Storefront token (X-Shopify-Storefront-Access-Token)",
+                debug_id,
+            )
+
+        cart = await self._create_cart(
+            shop_domain=shop_domain,
+            storefront_token=storefront_token,
+            items=items,
+            discount_codes=discount_codes,
+            shipping_address=shipping_address,
+            selected_delivery_option=selected_delivery_option,
+            debug_id=debug_id,
+        )
+
+        # Build line items: best-effort unit price from variant nodes.
+        line_items = await self._build_line_items(
+            shop_domain=shop_domain,
+            storefront_token=storefront_token,
+            items=items,
+            currency=cart.currency,
+            debug_id=debug_id,
+        )
+
+        pricing = {
+            "subtotal": cart.subtotal,
+            "discount_total": max(cart.subtotal - cart.total, Decimal("0.00")),
+            "shipping_fee": Decimal("0.00"),
+            "tax": cart.tax,
+            "total": cart.total,
+        }
+
+        # If we successfully found delivery options with explicit costs, attempt to derive shipping_fee.
+        # This is best-effort and schema-dependent.
+        shipping_fee = self._derive_shipping_fee(cart)
+        if shipping_fee is not None:
+            pricing["shipping_fee"] = shipping_fee
+            # When Storefront returns subtotal/total excluding shipping (common), adjust total.
+            # When it already includes shipping, shipping_fee will be zero or the delta will be handled at checkout.
+            if pricing["total"] < pricing["subtotal"] + pricing["shipping_fee"]:
+                pricing["total"] = pricing["subtotal"] + pricing["shipping_fee"] + pricing["tax"] - pricing["discount_total"]
+
+        debug = {
+            "debug_id": debug_id,
+            "engine": "shopify_storefront_cart",
+            "shop_domain": shop_domain,
+            "cart_id": cart.cart_id,
+            "checkout_url": cart.checkout_url,
+            "selected_delivery_option": cart.selected_delivery_option,
+            "storefront_delivery_options_count": len(cart.delivery_options or []),
+        }
+
+        return ShopifyPricingResult(
+            engine="shopify_storefront_cart",
+            engine_ref=str(cart.cart_id),
+            currency=cart.currency,
+            pricing=pricing,
+            promotion_lines=[],
+            line_items=line_items,
+            delivery_options=cart.delivery_options,
+            debug=debug,
+        )
+
+    async def _storefront_graphql(
+        self,
+        *,
+        shop_domain: str,
+        storefront_token: str,
+        query: str,
+        variables: Optional[Dict[str, Any]],
+        debug_id: str,
+    ) -> Dict[str, Any]:
+        url = f"https://{shop_domain}/api/{self.api_version}/graphql.json"
+        headers = {
+            "X-Shopify-Storefront-Access-Token": storefront_token,
+            "Content-Type": "application/json",
+        }
+        payload: Dict[str, Any] = {"query": query}
+        if variables is not None:
+            payload["variables"] = variables
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+        except Exception as e:
+            logger.warning({"debug_id": debug_id, "error": str(e)}, "Shopify Storefront request failed")
+            raise ShopifyPricingError("SHOPIFY_PRICING_UNAVAILABLE", "Storefront request failed", debug_id)
+
+        if resp.status_code >= 400:
+            logger.warning(
+                {"debug_id": debug_id, "status_code": resp.status_code, "body": (resp.text or "")[:800]},
+                "Shopify Storefront HTTP error",
+            )
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                f"Storefront pricing error (HTTP {resp.status_code})",
+                debug_id,
+            )
+
+        data = resp.json() or {}
+        if data.get("errors"):
+            logger.warning({"debug_id": debug_id, "errors": data.get("errors")}, "Shopify Storefront GraphQL errors")
+            raise ShopifyPricingError("SHOPIFY_PRICING_UNAVAILABLE", "Storefront GraphQL error", debug_id)
+        return data.get("data") or {}
+
+    async def _create_cart(
+        self,
+        *,
+        shop_domain: str,
+        storefront_token: str,
+        items: List[Dict[str, Any]],
+        discount_codes: List[str],
+        shipping_address: Optional[Dict[str, Any]],
+        selected_delivery_option: Optional[Dict[str, Any]],
+        debug_id: str,
+    ) -> StorefrontCartResult:
+        lines = []
+        for it in items or []:
+            variant_id = str(it.get("variant_id") or "").strip()
+            qty = int(it.get("quantity") or 0)
+            if not variant_id or qty <= 0:
+                continue
+            lines.append({"merchandiseId": _gid("ProductVariant", variant_id), "quantity": qty})
+
+        country = None
+        postal = None
+        city = None
+        province = None
+        if shipping_address and isinstance(shipping_address, dict):
+            country = (shipping_address.get("country") or "").strip().upper() or None
+            postal = (shipping_address.get("postal_code") or shipping_address.get("zip") or "").strip() or None
+            city = (shipping_address.get("city") or "").strip() or None
+            province = (shipping_address.get("state") or shipping_address.get("province") or "").strip() or None
+
+        cart_create = """
+mutation($input: CartInput!) {
+  cartCreate(input: $input) {
+    cart {
+      id
+      checkoutUrl
+      cost {
+        subtotalAmount { amount currencyCode }
+        totalTaxAmount { amount currencyCode }
+        totalAmount { amount currencyCode }
+      }
+    }
+    userErrors { field message code }
+  }
+}
+"""
+        variables: Dict[str, Any] = {"input": {"lines": lines}}
+        if discount_codes:
+            variables["input"]["discountCodes"] = discount_codes
+        if country:
+            variables["input"]["buyerIdentity"] = {"countryCode": country}
+
+        data = await self._storefront_graphql(
+            shop_domain=shop_domain,
+            storefront_token=storefront_token,
+            query=cart_create,
+            variables=variables,
+            debug_id=debug_id,
+        )
+        root = (data.get("cartCreate") or {}) if isinstance(data, dict) else {}
+        user_errors = root.get("userErrors") or []
+        if user_errors:
+            msg = user_errors[0].get("message") or "cartCreate failed"
+            raise ShopifyPricingError("SHOPIFY_PRICING_UNAVAILABLE", msg, debug_id)
+        cart = root.get("cart") or {}
+
+        cart_id = cart.get("id") or ""
+        checkout_url = cart.get("checkoutUrl") or None
+        cost = cart.get("cost") or {}
+        subtotal = _d((cost.get("subtotalAmount") or {}).get("amount"))
+        total = _d((cost.get("totalAmount") or {}).get("amount"))
+        tax_raw = (cost.get("totalTaxAmount") or {}).get("amount")
+        tax = _d(tax_raw) if tax_raw is not None else Decimal("0.00")
+        currency = (cost.get("totalAmount") or {}).get("currencyCode") or (cost.get("subtotalAmount") or {}).get(
+            "currencyCode"
+        ) or "USD"
+
+        delivery_options = None
+        selected = None
+
+        # Best-effort: attach a delivery address and fetch delivery options.
+        if cart_id and country and postal:
+            delivery_options, selected = await self._attach_address_and_select_delivery_best_effort(
+                shop_domain=shop_domain,
+                storefront_token=storefront_token,
+                cart_id=cart_id,
+                country=country,
+                postal=postal,
+                city=city,
+                province=province,
+                selected_delivery_option=selected_delivery_option,
+                debug_id=debug_id,
+            )
+
+            # Refresh totals after delivery selection.
+            refreshed = await self._get_cart_cost(
+                shop_domain=shop_domain, storefront_token=storefront_token, cart_id=cart_id, debug_id=debug_id
+            )
+            if refreshed:
+                subtotal = refreshed.subtotal
+                total = refreshed.total
+                tax = refreshed.tax
+                currency = refreshed.currency
+
+        return StorefrontCartResult(
+            cart_id=cart_id,
+            checkout_url=checkout_url,
+            currency=currency,
+            subtotal=subtotal,
+            total=total,
+            tax=tax,
+            delivery_options=delivery_options,
+            selected_delivery_option=selected,
+        )
+
+    async def _get_cart_cost(
+        self,
+        *,
+        shop_domain: str,
+        storefront_token: str,
+        cart_id: str,
+        debug_id: str,
+    ) -> Optional[StorefrontCartResult]:
+        query = """
+query($id: ID!) {
+  cart(id: $id) {
+    id
+    checkoutUrl
+    cost {
+      subtotalAmount { amount currencyCode }
+      totalTaxAmount { amount currencyCode }
+      totalAmount { amount currencyCode }
+    }
+  }
+}
+"""
+        data = await self._storefront_graphql(
+            shop_domain=shop_domain,
+            storefront_token=storefront_token,
+            query=query,
+            variables={"id": cart_id},
+            debug_id=debug_id,
+        )
+        cart = (data.get("cart") or {}) if isinstance(data, dict) else {}
+        if not cart:
+            return None
+        cost = cart.get("cost") or {}
+        subtotal = _d((cost.get("subtotalAmount") or {}).get("amount"))
+        total = _d((cost.get("totalAmount") or {}).get("amount"))
+        tax_raw = (cost.get("totalTaxAmount") or {}).get("amount")
+        tax = _d(tax_raw) if tax_raw is not None else Decimal("0.00")
+        currency = (cost.get("totalAmount") or {}).get("currencyCode") or (cost.get("subtotalAmount") or {}).get(
+            "currencyCode"
+        ) or "USD"
+        return StorefrontCartResult(
+            cart_id=cart.get("id") or cart_id,
+            checkout_url=cart.get("checkoutUrl") or None,
+            currency=currency,
+            subtotal=subtotal,
+            total=total,
+            tax=tax,
+            delivery_options=None,
+            selected_delivery_option=None,
+        )
+
+    async def _attach_address_and_select_delivery_best_effort(
+        self,
+        *,
+        shop_domain: str,
+        storefront_token: str,
+        cart_id: str,
+        country: str,
+        postal: str,
+        city: Optional[str],
+        province: Optional[str],
+        selected_delivery_option: Optional[Dict[str, Any]],
+        debug_id: str,
+    ) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
+        add_address = """
+mutation($cartId: ID!, $addresses: [CartDeliveryAddressInput!]!) {
+  cartDeliveryAddressesAdd(cartId: $cartId, addresses: $addresses) {
+    cart { id }
+    userErrors { field message code }
+  }
+}
+"""
+        addresses = [
+            {
+                "deliveryAddress": {
+                    "countryCode": country,
+                    "zip": postal,
+                    **({"city": city} if city else {}),
+                    **({"provinceCode": province} if province else {}),
+                }
+            }
+        ]
+        data = await self._storefront_graphql(
+            shop_domain=shop_domain,
+            storefront_token=storefront_token,
+            query=add_address,
+            variables={"cartId": cart_id, "addresses": addresses},
+            debug_id=debug_id,
+        )
+        root = (data.get("cartDeliveryAddressesAdd") or {}) if isinstance(data, dict) else {}
+        if (root.get("userErrors") or []):
+            return None, None
+
+        # Query delivery options (schema varies; keep it tolerant).
+        delivery_query = """
+query($id: ID!) {
+  cart(id: $id) {
+    deliveryGroups(first: 10) {
+      edges {
+        node {
+          id
+          deliveryOptions {
+            handle
+            title
+            description
+            estimatedCost { amount currencyCode }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+        data2 = await self._storefront_graphql(
+            shop_domain=shop_domain,
+            storefront_token=storefront_token,
+            query=delivery_query,
+            variables={"id": cart_id},
+            debug_id=debug_id,
+        )
+        cart = (data2.get("cart") or {}) if isinstance(data2, dict) else {}
+        groups = (((cart.get("deliveryGroups") or {}).get("edges")) or []) if isinstance(cart, dict) else []
+        options: List[Dict[str, Any]] = []
+        for edge in groups:
+            node = (edge or {}).get("node") or {}
+            for opt in node.get("deliveryOptions") or []:
+                if not isinstance(opt, dict):
+                    continue
+                options.append(opt)
+
+        if not options:
+            return None, None
+
+        def _opt_cost_amount(o: Dict[str, Any]) -> Decimal:
+            est = o.get("estimatedCost") or {}
+            return _d(est.get("amount"))
+
+        # Select: honor provided selection if possible, else pick cheapest.
+        chosen = None
+        if selected_delivery_option and isinstance(selected_delivery_option, dict):
+            want_handle = selected_delivery_option.get("handle") or selected_delivery_option.get("id")
+            if want_handle:
+                for o in options:
+                    if o.get("handle") == want_handle:
+                        chosen = o
+                        break
+        if chosen is None:
+            chosen = sorted(options, key=_opt_cost_amount)[0]
+
+        # Apply selection.
+        update_sel = """
+mutation($cartId: ID!, $selectedDeliveryOptions: [CartSelectedDeliveryOptionInput!]!) {
+  cartSelectedDeliveryOptionsUpdate(cartId: $cartId, selectedDeliveryOptions: $selectedDeliveryOptions) {
+    cart { id }
+    userErrors { field message code }
+  }
+}
+"""
+        # We don't have deliveryGroupId in this query; some schemas require it.
+        # Try a minimal input with handle only; if it fails, we still return options.
+        try:
+            await self._storefront_graphql(
+                shop_domain=shop_domain,
+                storefront_token=storefront_token,
+                query=update_sel,
+                variables={"cartId": cart_id, "selectedDeliveryOptions": [{"deliveryOptionHandle": chosen.get("handle")}]},
+                debug_id=debug_id,
+            )
+        except Exception:
+            pass
+
+        return options, chosen
+
+    async def _build_line_items(
+        self,
+        *,
+        shop_domain: str,
+        storefront_token: str,
+        items: List[Dict[str, Any]],
+        currency: str,
+        debug_id: str,
+    ) -> List[Dict[str, Any]]:
+        # Fetch variant prices in one round-trip using nodes().
+        variant_ids: List[str] = []
+        for it in items or []:
+            vid = str(it.get("variant_id") or "").strip()
+            if vid:
+                variant_ids.append(vid)
+        unique = list(dict.fromkeys(variant_ids))
+        if not unique:
+            return []
+
+        gids = [_gid("ProductVariant", vid) for vid in unique]
+        query = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on ProductVariant {
+      id
+      price { amount currencyCode }
+      compareAtPrice { amount currencyCode }
+    }
+  }
+}
+"""
+        data = await self._storefront_graphql(
+            shop_domain=shop_domain,
+            storefront_token=storefront_token,
+            query=query,
+            variables={"ids": gids},
+            debug_id=debug_id,
+        )
+        nodes = data.get("nodes") or []
+        price_by_gid: Dict[str, Dict[str, Any]] = {}
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            gid = n.get("id")
+            if gid:
+                price_by_gid[str(gid)] = n
+
+        out: List[Dict[str, Any]] = []
+        for it in items or []:
+            vid = str(it.get("variant_id") or "").strip()
+            qty = int(it.get("quantity") or 0)
+            if not vid or qty <= 0:
+                continue
+            gid = _gid("ProductVariant", vid)
+            node = price_by_gid.get(gid) or {}
+            price = (node.get("price") or {}) if isinstance(node, dict) else {}
+            compare = (node.get("compareAtPrice") or {}) if isinstance(node, dict) else {}
+            unit = _d(price.get("amount"))
+            compare_unit = _d(compare.get("amount")) if compare.get("amount") is not None else Decimal("0.00")
+            compare_savings = max(compare_unit - unit, Decimal("0.00")) if compare_unit else Decimal("0.00")
+            out.append(
+                {
+                    "product_id": it.get("product_id"),
+                    "variant_id": vid,
+                    "quantity": qty,
+                    "unit_price_original": unit,
+                    "unit_price_effective": unit,
+                    "line_discount_total": Decimal("0.00"),
+                    "compare_at_savings": compare_savings,
+                }
+            )
+        return out
+
+    def _derive_shipping_fee(self, cart: StorefrontCartResult) -> Optional[Decimal]:
+        opts = cart.delivery_options or []
+        if not opts:
+            return None
+        chosen = cart.selected_delivery_option or opts[0]
+        est = chosen.get("estimatedCost") if isinstance(chosen, dict) else None
+        if not isinstance(est, dict):
+            return None
+        amt = est.get("amount")
+        if amt is None:
+            return None
+        fee = _d(amt)
+        if fee < 0:
+            return Decimal("0.00")
+        return fee
+

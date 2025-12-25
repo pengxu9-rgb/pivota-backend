@@ -41,6 +41,30 @@ def parse_api_key(api_key: str) -> str:
     return api_key
 
 
+def parse_api_credentials(api_key: str) -> Dict[str, Any]:
+    """
+    Best-effort parse of merchant_stores.api_key when it contains JSON credentials.
+
+    Today we store Shopify tokens as JSON strings, e.g:
+      {"access_token":"shpat_xxx"}
+
+    We may also store additional tokens (e.g. Storefront) in the same JSON blob:
+      {"access_token":"shpat_xxx","storefront_access_token":"xxx"}
+
+    Returns {} when not JSON.
+    """
+    if not api_key:
+        return {}
+    raw = str(api_key).strip()
+    if not raw.startswith("{"):
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
     """
     Get all active stores for a merchant, checking both systems
@@ -82,8 +106,9 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
         # 解析 api_key 格式（支持 JSON 和纯字符串）
         for store in new_stores:
             store_dict = dict(store)
-            # 解析并替换 api_key
             original_key = store_dict.get("api_key", "")
+            store_dict["api_key_raw"] = original_key
+            store_dict["api_credentials"] = parse_api_credentials(original_key)
             store_dict["api_key"] = parse_api_key(original_key)
             stores.append(store_dict)
         
@@ -105,6 +130,8 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                     "platform": merchant.get("mcp_platform"),
                     "name": merchant.get("business_name", "Legacy Store"),
                     "domain": merchant.get("mcp_shop_domain", ""),
+                    "api_key_raw": raw_token,
+                    "api_credentials": parse_api_credentials(raw_token),
                     "api_key": parsed_token,
                     "status": "active" if merchant.get("mcp_connected", False) else "disconnected",
                     "connected_at": merchant.get("mcp_connected_at"),
@@ -191,4 +218,3 @@ async def has_any_store_connected(merchant_id: str) -> bool:
     """
     stores = await get_merchant_active_stores(merchant_id)
     return len(stores) > 0
-

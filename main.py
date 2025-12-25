@@ -87,6 +87,7 @@ from routes.migrate_employees_password import router as migrate_employees_passwo
 from routes.debug_product_sync import router as debug_product_sync_router
 from routes.merchant_store_connections import router as merchant_store_connections_router
 from routes.ops_shopify_integration_routes import router as ops_shopify_integration_router
+from routes.ops_pcs_reducer_routes import router as ops_pcs_reducer_router
 from routes.merchant_onboarding_shopify_verify_routes import router as merchant_onboarding_shopify_verify_router
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.admin_simple_fix import router as admin_simple_fix_router
@@ -509,6 +510,7 @@ app.include_router(admin_fix_psp_id_router)  # Admin fix PSP ID
 app.include_router(admin_debug_psp_metrics_router)  # Admin debug PSP metrics
 app.include_router(merchant_store_connections_router)  # Merchant store connections (Shopify, Wix)
 app.include_router(ops_shopify_integration_router)  # Internal ops: Shopify integration verify/report
+app.include_router(ops_pcs_reducer_router)  # Internal ops: PCS reducer replay
 app.include_router(merchant_onboarding_shopify_verify_router)  # Merchant onboarding facade: Shopify verify/report
 app.include_router(admin_cleanup_router)  # Admin cleanup utilities
 app.include_router(admin_simple_fix_router)  # Admin simple fix

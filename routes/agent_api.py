@@ -737,12 +737,58 @@ async def agent_create_order(
         if not context.can_access_merchant(order_request.merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
-        # Quote-first staged rollout: only enforce when FF enabled
-        if ENABLE_QUOTE_FIRST_ORDER_CREATE and not order_request.quote_id:
+        # Quote-first enforcement (PCS v0.2-a):
+        # - Keep existing global flag behavior (FF_ENABLE_QUOTE_FIRST_ORDER_CREATE).
+        # - Add tiered enforcement for L1C/L2+ (FF_ENABLE_QUOTE_FIRST_TIERED_ENFORCEMENT).
+        from services.quote_first_enforcement import should_require_quote_for_order_create
+
+        require_quote, require_ctx = await should_require_quote_for_order_create(merchant_id=order_request.merchant_id)
+        if require_quote and not order_request.quote_id:
+            # Quote-first enforcement: explicit telemetry signal for rollout / debugging.
+            try:
+                from mvp.constants import EVENT_QUOTE_REQUIRED_BLOCKED, SURFACE_BACKEND
+                from mvp.events import emit_best_effort
+
+                addr = getattr(order_request, "shipping_address", None)
+                geo = None
+                if addr is not None:
+                    geo = {
+                        "country": getattr(addr, "country", None),
+                        "postal_code": getattr(addr, "postal_code", None),
+                        "city": getattr(addr, "city", None),
+                        "state": getattr(addr, "state", None),
+                    }
+
+                emit_best_effort(
+                    event_type=EVENT_QUOTE_REQUIRED_BLOCKED,
+                    payload={
+                        "stage": "order_create",
+                        "merchant_id": getattr(order_request, "merchant_id", None),
+                        "agent_id": getattr(context, "agent_id", None),
+                        "context": require_ctx,
+                    },
+                    merchant_id=getattr(order_request, "merchant_id", None),
+                    geo=geo,
+                    surface=SURFACE_BACKEND,
+                    adapter="agent_orders_create",
+                    risk_tier="unknown",
+                    idempotency_key=getattr(order_request, "idempotency_key", None)
+                    or getattr(order_request, "agent_session_id", None),
+                )
+            except Exception:
+                pass
             raise HTTPException(
                 status_code=400,
-                detail={"error": "QUOTE_REQUIRED", "message": "quote_id is required"},
+                detail={
+                    "error": "QUOTE_REQUIRED",
+                    "message": "quote_id is required",
+                    "context": require_ctx,
+                },
             )
+
+        # Quote-first idempotency: default idempotency_key to merchant_id:quote_id when quote_id is present.
+        if order_request.quote_id and not order_request.idempotency_key:
+            order_request.idempotency_key = f"{order_request.merchant_id}:{order_request.quote_id}"
 
         # Idempotency (best-effort): if provided and already processed, replay the cached response.
         if order_request.idempotency_key:
@@ -880,8 +926,15 @@ async def agent_create_order(
                     )
         except QuoteError as e:
             # Keep behavior backward-compatible unless quote-first is explicitly required.
-            if ENABLE_QUOTE_FIRST_ORDER_CREATE:
-                raise HTTPException(status_code=400, detail={"error": e.code, "message": e.message})
+            if require_quote or ENABLE_QUOTE_FIRST_ORDER_CREATE:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": e.code,
+                        "message": e.message,
+                        **({"details": e.details} if getattr(e, "details", None) else {}),
+                    },
+                )
         except HTTPException:
             raise
         except Exception:
@@ -904,6 +957,78 @@ async def agent_create_order(
         # 调用标准订单创建
         from routes.order_routes import create_new_order
         order_response = await create_new_order(order_request, background_tasks)
+
+        # PCS v0.2-b (best-effort): emit internal fact for reducer replay (no PII).
+        try:
+            from services.pcs_fact_ingest import append_internal_fact_best_effort
+
+            quote_meta = None
+            try:
+                if isinstance(order_request.metadata, dict):
+                    pricing_quote = (order_request.metadata or {}).get("pricing_quote") or {}
+                    if isinstance(pricing_quote, dict):
+                        quote_meta = {
+                            "quote_id": pricing_quote.get("quote_id"),
+                            "quote_hash_sha256": pricing_quote.get("quote_hash_sha256"),
+                        }
+            except Exception:
+                quote_meta = None
+
+            await append_internal_fact_best_effort(
+                merchant_id=str(order_request.merchant_id),
+                order_id=str(order_response.order_id),
+                fact_type="internal.order_created",
+                payload={
+                    "order_id": str(order_response.order_id),
+                    "merchant_id": str(order_request.merchant_id),
+                    "quote_id": getattr(order_request, "quote_id", None)
+                    or (quote_meta or {}).get("quote_id"),
+                    "quote_hash_sha256": (quote_meta or {}).get("quote_hash_sha256"),
+                    "currency": str(order_response.currency or order_request.currency or "USD"),
+                    "total": float(order_response.total),
+                    "psp": getattr(order_response, "psp", None),
+                    "idempotency_key": getattr(order_request, "idempotency_key", None),
+                },
+                idempotency_key=getattr(order_request, "idempotency_key", None) or str(order_response.order_id),
+            )
+        except Exception:
+            pass
+
+        # Quote-first telemetry: quote successfully consumed by an order create.
+        try:
+            if getattr(order_request, "quote_id", None):
+                from mvp.constants import EVENT_QUOTE_CONSUMED, SURFACE_BACKEND
+                from mvp.events import emit_best_effort
+
+                addr = getattr(order_request, "shipping_address", None)
+                geo = None
+                if addr is not None:
+                    geo = {
+                        "country": getattr(addr, "country", None),
+                        "postal_code": getattr(addr, "postal_code", None),
+                        "city": getattr(addr, "city", None),
+                        "state": getattr(addr, "state", None),
+                    }
+
+                emit_best_effort(
+                    event_type=EVENT_QUOTE_CONSUMED,
+                    payload={
+                        "stage": "order_create",
+                        "merchant_id": getattr(order_request, "merchant_id", None),
+                        "order_id": getattr(order_response, "order_id", None),
+                        "quote_id": getattr(order_request, "quote_id", None),
+                        "agent_id": getattr(context, "agent_id", None),
+                    },
+                    merchant_id=getattr(order_request, "merchant_id", None),
+                    geo=geo,
+                    surface=SURFACE_BACKEND,
+                    adapter="agent_orders_create",
+                    risk_tier="unknown",
+                    idempotency_key=getattr(order_request, "idempotency_key", None)
+                    or getattr(order_request, "quote_id", None),
+                )
+        except Exception:
+            pass
 
         # MVP ledger event (best-effort): canonical order creation timeline entry.
         try:
@@ -1114,6 +1239,44 @@ async def agent_create_order(
         
     except HTTPException as e:
         success = False
+        # Quote-first telemetry: capture quote drift diagnostics distribution (no PII).
+        try:
+            detail = getattr(e, "detail", None)
+            if isinstance(detail, dict) and detail.get("error") == "QUOTE_MISMATCH":
+                from mvp.constants import EVENT_QUOTE_DRIFT_DETECTED, SURFACE_BACKEND
+                from mvp.events import emit_best_effort
+
+                addr = getattr(order_request, "shipping_address", None)
+                geo = None
+                if addr is not None:
+                    geo = {
+                        "country": getattr(addr, "country", None),
+                        "postal_code": getattr(addr, "postal_code", None),
+                        "city": getattr(addr, "city", None),
+                        "state": getattr(addr, "state", None),
+                    }
+
+                emit_best_effort(
+                    event_type=EVENT_QUOTE_DRIFT_DETECTED,
+                    payload={
+                        "stage": "order_create",
+                        "merchant_id": getattr(order_request, "merchant_id", None),
+                        "quote_id": getattr(order_request, "quote_id", None),
+                        "agent_id": getattr(context, "agent_id", None),
+                        "debug_id": detail.get("debug_id"),
+                        "drift": detail.get("details") if isinstance(detail.get("details"), dict) else None,
+                    },
+                    merchant_id=getattr(order_request, "merchant_id", None),
+                    geo=geo,
+                    surface=SURFACE_BACKEND,
+                    adapter="agent_orders_create",
+                    risk_tier="unknown",
+                    idempotency_key=getattr(order_request, "idempotency_key", None)
+                    or getattr(order_request, "quote_id", None)
+                    or getattr(order_request, "agent_session_id", None),
+                )
+        except Exception:
+            pass
         try:
             from mvp.constants import EVENT_CHECKOUT_FAILED, SURFACE_BACKEND
             from mvp.events import emit_best_effort

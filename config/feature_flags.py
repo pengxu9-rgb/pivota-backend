@@ -26,6 +26,13 @@ FEATURE_FLAGS = {
     # When enabled, /agent/v1/orders/create requires quote_id and uses quote snapshot as source of truth.
     # Default false for staged rollout.
     "enable_quote_first_order_create": os.getenv("FF_ENABLE_QUOTE_FIRST_ORDER_CREATE", "false").lower() == "true",
+
+    # Tiered quote-first enforcement (PCS v0.2-a):
+    # - Keeps existing behavior backward-compatible by default.
+    # - When enabled, we require quote_id only for merchants meeting a minimum PCS tier (e.g. L1C/L2)
+    #   or on an allowlist (FF_QUOTE_FIRST_REQUIRED_MERCHANT_IDS).
+    "enable_quote_first_tiered_enforcement": os.getenv("FF_ENABLE_QUOTE_FIRST_TIERED_ENFORCEMENT", "false").lower()
+    == "true",
 }
 
 
@@ -66,3 +73,4 @@ ENABLE_PLATFORM_WEBHOOK_REFUND = FEATURE_FLAGS["enable_platform_webhook_refund"]
 ENABLE_PLATFORM_SYNC_OUTBOUND = FEATURE_FLAGS["enable_platform_sync_outbound"]
 ENABLE_DISPUTE_MANAGEMENT = FEATURE_FLAGS["enable_dispute_management"]
 ENABLE_QUOTE_FIRST_ORDER_CREATE = FEATURE_FLAGS["enable_quote_first_order_create"]
+ENABLE_QUOTE_FIRST_TIERED_ENFORCEMENT = FEATURE_FLAGS["enable_quote_first_tiered_enforcement"]

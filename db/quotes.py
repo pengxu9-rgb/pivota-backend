@@ -20,9 +20,11 @@ quotes = Table(
     Column("request_fingerprint", String(128), index=True, nullable=False),
     Column("request_json", JSONB, nullable=False),
     Column("snapshot_json", JSONB, nullable=False),
+    Column("quote_hash_sha256", String(64), nullable=True),
     Column("status", String(32), index=True, nullable=False),  # active | consumed | expired
     Column("expires_at", DateTime(timezone=True), index=True, nullable=False),
     Column("consumed_at", DateTime(timezone=True), nullable=True),
+    Column("consumed_order_id", String(64), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("debug_id", String(64), nullable=True),
@@ -47,9 +49,11 @@ async def ensure_quotes_table() -> None:
               request_fingerprint VARCHAR(128) NOT NULL,
               request_json JSONB NOT NULL,
               snapshot_json JSONB NOT NULL,
+              quote_hash_sha256 CHAR(64),
               status VARCHAR(32) NOT NULL,
               expires_at TIMESTAMPTZ NOT NULL,
               consumed_at TIMESTAMPTZ,
+              consumed_order_id VARCHAR(64),
               created_at TIMESTAMPTZ NOT NULL,
               updated_at TIMESTAMPTZ NOT NULL,
               debug_id VARCHAR(64),
@@ -57,6 +61,8 @@ async def ensure_quotes_table() -> None:
             );
             """,
         )
+        await database.execute("ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_hash_sha256 CHAR(64);")
+        await database.execute("ALTER TABLE quotes ADD COLUMN IF NOT EXISTS consumed_order_id VARCHAR(64);")
         await database.execute(
             "CREATE INDEX IF NOT EXISTS idx_quotes_merchant_id ON quotes(merchant_id);"
         )
@@ -68,6 +74,9 @@ async def ensure_quotes_table() -> None:
         )
         await database.execute(
             "CREATE INDEX IF NOT EXISTS idx_quotes_request_fingerprint ON quotes(request_fingerprint);"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quotes_consumed_order_id ON quotes(consumed_order_id);"
         )
     except Exception:
         # Best-effort; if this fails, inserts will surface the error with context.
@@ -86,17 +95,35 @@ async def get_quote(quote_id: str) -> Optional[Dict[str, Any]]:
     return dict(rec) if rec else None
 
 
-async def mark_quote_consumed(quote_id: str) -> bool:
+async def mark_quote_consumed(quote_id: str, *, consumed_order_id: Optional[str] = None) -> bool:
     await ensure_quotes_table()
     now = datetime.now(timezone.utc)
     q = (
         quotes.update()
         .where(quotes.c.quote_id == quote_id)
         .where(quotes.c.status == "active")
-        .values(status="consumed", consumed_at=now, updated_at=now)
+        .values(
+            status="consumed",
+            consumed_at=now,
+            consumed_order_id=consumed_order_id,
+            updated_at=now,
+        )
     )
     rows = await database.execute(q)
-    return bool(rows is not None)
+    if rows is not None:
+        return True
+
+    # Backfill linkage if an older caller consumed the quote without an order_id.
+    if consumed_order_id:
+        q2 = (
+            quotes.update()
+            .where(quotes.c.quote_id == quote_id)
+            .where(quotes.c.status == "consumed")
+            .where(quotes.c.consumed_order_id.is_(None))
+            .values(consumed_order_id=consumed_order_id, updated_at=now)
+        )
+        await database.execute(q2)
+    return False
 
 
 async def expire_quote_if_needed(quote_id: str) -> None:

@@ -67,7 +67,7 @@ class QuoteLineItem(BaseModel):
 class QuotePreviewResponse(BaseModel):
     quote_id: str
     expires_at: datetime
-    engine: Literal["shopify_rest_checkout"]
+    engine: Literal["shopify_rest_checkout", "shopify_storefront_cart"]
     engine_ref: str
     currency: str
     pricing: QuotePricing

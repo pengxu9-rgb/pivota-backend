@@ -5,11 +5,38 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock
 from main import app
+from utils.auth import create_access_token
+from routes.agent_auth import AgentContext, get_agent_context as get_agent_context_dep
+from fastapi import Request
 
 
 @pytest.fixture
 def client():
     return TestClient(app)
+
+def _auth_header() -> dict:
+    token = create_access_token(
+        {
+            "sub": "user_test",
+            "email": "test@example.com",
+            "role": "admin",
+        }
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+@pytest.fixture
+def agent_context_override():
+    async def _override(request: Request):
+        return AgentContext(
+            {"agent_id": "agent_test", "agent_name": "Test Agent", "allowed_merchants": None},
+            request,
+        )
+
+    app.dependency_overrides[get_agent_context_dep] = _override
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_agent_context_dep, None)
 
 
 class TestProductDetailAPI:
@@ -27,7 +54,7 @@ class TestProductDetailAPI:
         
         response = client.get(
             "/products/test-merchant/test-product",
-            headers={"Authorization": "Bearer test-token"}
+            headers=_auth_header()
         )
         
         assert response.status_code == 404
@@ -50,7 +77,7 @@ class TestProductDetailAPI:
         
         response = client.get(
             "/products/test-merchant/test-product", 
-            headers={"Authorization": "Bearer test-token"}
+            headers=_auth_header()
         )
         
         assert response.status_code == 400
@@ -73,7 +100,7 @@ class TestProductDetailAPI:
         
         response = client.get(
             "/products/test-merchant/test-product",
-            headers={"Authorization": "Bearer test-token"}
+            headers=_auth_header()
         )
         
         assert response.status_code == 400
@@ -100,7 +127,7 @@ class TestProductDetailAPI:
         
         response = client.get(
             "/products/test-merchant/test-product",
-            headers={"Authorization": "Bearer test-token"}
+            headers=_auth_header()
         )
         
         assert response.status_code == 404
@@ -111,8 +138,8 @@ class TestAgentProductDetailAPI:
     """Test agent API product detail endpoint"""
     
     @patch('routes.agent_products.get_merchant_onboarding')
-    @patch('routes.agent_products.get_primary_store')
-    async def test_agent_api_no_store(self, mock_get_store, mock_get_merchant, client):
+    @patch('services.merchant_store_service.get_primary_store')
+    async def test_agent_api_no_store(self, mock_get_store, mock_get_merchant, client, agent_context_override):
         """Test agent API properly handles missing store"""
         # Mock merchant exists
         mock_get_merchant.return_value = {"id": "test-merchant"}
@@ -126,12 +153,12 @@ class TestAgentProductDetailAPI:
         )
         
         assert response.status_code == 404
-        assert "No connected stores found for merchant" in response.json()["detail"]
+        assert "No connected stores found" in response.json()["detail"]
         assert response.headers.get("X-Error-Code") == "STORE_NOT_FOUND"
     
     @patch('routes.agent_products.get_merchant_onboarding')
-    @patch('routes.agent_products.get_primary_store')
-    async def test_agent_api_missing_shop_domain(self, mock_get_store, mock_get_merchant, client):
+    @patch('services.merchant_store_service.get_primary_store')
+    async def test_agent_api_missing_shop_domain(self, mock_get_store, mock_get_merchant, client, agent_context_override):
         """Test agent API handles missing shop domain"""
         # Mock merchant exists
         mock_get_merchant.return_value = {"id": "test-merchant"}

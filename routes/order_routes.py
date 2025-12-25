@@ -38,6 +38,8 @@ from services.quote_service import (
     QuoteService,
     compute_request_fingerprint,
     normalize_discount_codes,
+    normalize_items_for_fingerprint,
+    normalize_shipping_for_fingerprint,
     parse_decimal_money,
 )
 
@@ -257,6 +259,57 @@ async def check_inventory_availability(
         return True, {"message": f"Inventory check error: {str(e)}, allowing order"}
 
 
+def _extract_delivery_option_identifier(selected_delivery_option: Any) -> Optional[str]:
+    """
+    Best-effort extraction of a stable delivery option identifier for drift diagnostics.
+
+    Do not include full delivery option payload in responses/events (may contain extra data),
+    only a stable identifier-like string.
+    """
+    if not selected_delivery_option:
+        return None
+
+    if isinstance(selected_delivery_option, str):
+        value = selected_delivery_option.strip()
+        return value or None
+
+    if not isinstance(selected_delivery_option, dict):
+        return None
+
+    for key in (
+        "id",
+        "identifier",
+        "handle",
+        "code",
+        "shipping_rate_id",
+        "rate_id",
+        "title",
+        "name",
+    ):
+        raw = selected_delivery_option.get(key)
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if value:
+            return value
+    return None
+
+
+def _build_quote_drift_normalized_request(
+    *,
+    items: List[Dict[str, Any]],
+    discount_codes: List[str],
+    shipping_address: Optional[Dict[str, Any]],
+    selected_delivery_option: Any,
+) -> Dict[str, Any]:
+    return {
+        "items": normalize_items_for_fingerprint(items),
+        "discount_codes": normalize_discount_codes(discount_codes),
+        "shipping_geo": normalize_shipping_for_fingerprint(shipping_address),
+        "selected_delivery_option": _extract_delivery_option_identifier(selected_delivery_option),
+    }
+
+
 # ============================================================================
 # 订单创建（Agent 调用）
 # ============================================================================
@@ -311,6 +364,20 @@ async def create_new_order(
                     detail="Merchant has not connected PSP. Cannot process payments."
                 )
 
+        # Quote-first enforcement (PCS v0.2-a): dual guard to prevent bypass.
+        from services.quote_first_enforcement import should_require_quote_for_order_create
+
+        require_quote, require_ctx = await should_require_quote_for_order_create(merchant_id=order_request.merchant_id)
+        if require_quote and not order_request.quote_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "QUOTE_REQUIRED",
+                    "message": "quote_id is required",
+                    "context": require_ctx,
+                },
+            )
+
         # 2. 检查库存（如果商户连接了 Shopify）
         has_inventory, inventory_info = await check_inventory_availability(
             order_request.merchant_id,
@@ -335,40 +402,96 @@ async def create_new_order(
                     quote_id=order_request.quote_id
                 )
 
-                if quote.merchant_id != order_request.merchant_id:
-                    raise QuoteError(
-                        "QUOTE_MISMATCH",
-                        "quote merchant_id mismatch",
-                        debug_id=quote.debug_id,
-                    )
-
-                fingerprint = compute_request_fingerprint(
-                    merchant_id=order_request.merchant_id,
-                    items=[
-                        {
-                            "product_id": it.product_id,
-                            "variant_id": it.variant_id or "",
-                            "quantity": it.quantity,
-                        }
-                        for it in (order_request.items or [])
-                    ],
-                    discount_codes=normalize_discount_codes(order_request.discount_codes),
-                    shipping_address={
+                order_items_for_fingerprint = [
+                    {
+                        "product_id": it.product_id,
+                        "variant_id": it.variant_id or "",
+                        "quantity": it.quantity,
+                    }
+                    for it in (order_request.items or [])
+                ]
+                order_discount_codes = normalize_discount_codes(order_request.discount_codes)
+                order_shipping_geo = (
+                    {
                         "country": order_request.shipping_address.country,
                         "postal_code": order_request.shipping_address.postal_code,
                         "city": order_request.shipping_address.city,
                         "state": order_request.shipping_address.state,
                     }
                     if order_request.shipping_address
-                    else None,
+                    else None
+                )
+
+                order_request_fingerprint = compute_request_fingerprint(
+                    merchant_id=order_request.merchant_id,
+                    items=order_items_for_fingerprint,
+                    discount_codes=order_discount_codes,
+                    shipping_address=order_shipping_geo,
                     selected_delivery_option=order_request.selected_delivery_option,
                 )
 
-                if fingerprint != quote.request_fingerprint:
+                order_request_normalized = _build_quote_drift_normalized_request(
+                    items=order_items_for_fingerprint,
+                    discount_codes=order_discount_codes,
+                    shipping_address=order_shipping_geo,
+                    selected_delivery_option=order_request.selected_delivery_option,
+                )
+
+                quote_request_json = quote.request_json if isinstance(quote.request_json, dict) else {}
+                quote_request_normalized = _build_quote_drift_normalized_request(
+                    items=quote_request_json.get("items") or [],
+                    discount_codes=quote_request_json.get("discount_codes") or [],
+                    shipping_address=quote_request_json.get("shipping_address"),
+                    selected_delivery_option=quote_request_json.get("selected_delivery_option"),
+                )
+
+                drift_fields: List[str] = []
+                if quote.merchant_id != order_request.merchant_id:
+                    drift_fields.append("merchant_id")
+                if quote_request_normalized.get("items") != order_request_normalized.get("items"):
+                    drift_fields.append("items")
+                if quote_request_normalized.get("discount_codes") != order_request_normalized.get(
+                    "discount_codes"
+                ):
+                    drift_fields.append("discount_codes")
+                if quote_request_normalized.get("shipping_geo") != order_request_normalized.get("shipping_geo"):
+                    drift_fields.append("shipping_geo")
+                if quote_request_normalized.get("selected_delivery_option") != order_request_normalized.get(
+                    "selected_delivery_option"
+                ):
+                    drift_fields.append("selected_delivery_option")
+
+                drift_details = {
+                    "quote_id": quote.quote_id,
+                    "quote_expires_at": quote.expires_at.isoformat() if quote.expires_at else None,
+                    "quote_hash_sha256": quote.quote_hash_sha256,
+                    "quote_request_fingerprint": quote.request_fingerprint,
+                    "order_request_fingerprint": order_request_fingerprint,
+                    "drift_fields": (
+                        drift_fields
+                        if drift_fields
+                        else ["selected_delivery_option"]
+                        if order_request_fingerprint != quote.request_fingerprint
+                        else []
+                    ),
+                    "quote_request_normalized": quote_request_normalized,
+                    "order_request_normalized": order_request_normalized,
+                }
+
+                if quote.merchant_id != order_request.merchant_id:
+                    raise QuoteError(
+                        "QUOTE_MISMATCH",
+                        "quote merchant_id mismatch",
+                        debug_id=quote.debug_id,
+                        details=drift_details,
+                    )
+
+                if order_request_fingerprint != quote.request_fingerprint:
                     raise QuoteError(
                         "QUOTE_MISMATCH",
                         "order request does not match quote snapshot",
                         debug_id=quote.debug_id,
+                        details=drift_details,
                     )
 
                 snap = quote.snapshot_json or {}
@@ -386,6 +509,7 @@ async def create_new_order(
                     "engine": quote.engine,
                     "engine_ref": quote.engine_ref,
                     "request_fingerprint": quote.request_fingerprint,
+                    "quote_hash_sha256": quote.quote_hash_sha256,
                     "pricing": pricing,
                     "promotion_lines": snap.get("promotion_lines") or [],
                     "line_items": snap.get("line_items") or [],
@@ -393,7 +517,12 @@ async def create_new_order(
             except QuoteError as e:
                 raise HTTPException(
                     status_code=409,
-                    detail={"error": e.code, "message": e.message, "debug_id": e.debug_id},
+                    detail={
+                        "error": e.code,
+                        "message": e.message,
+                        "debug_id": e.debug_id,
+                        **({"details": e.details} if getattr(e, "details", None) else {}),
+                    },
                 )
 
         else:
@@ -559,7 +688,7 @@ async def create_new_order(
         if order_request.quote_id:
             try:
                 quote_service = QuoteService()
-                await quote_service.consume_quote_best_effort(order_request.quote_id)
+                await quote_service.consume_quote_best_effort(order_request.quote_id, order_id=str(order_id))
             except Exception:
                 pass
 
