@@ -320,27 +320,35 @@ mutation($input: CartInput!) {
 
         # Best-effort: attach a delivery address and fetch delivery options.
         if cart_id and country and postal:
-            delivery_options, selected = await self._attach_address_and_select_delivery_best_effort(
-                shop_domain=shop_domain,
-                storefront_token=storefront_token,
-                cart_id=cart_id,
-                country=country,
-                postal=postal,
-                city=city,
-                province=province,
-                selected_delivery_option=selected_delivery_option,
-                debug_id=debug_id,
-            )
+            try:
+                delivery_options, selected = await self._attach_address_and_select_delivery_best_effort(
+                    shop_domain=shop_domain,
+                    storefront_token=storefront_token,
+                    cart_id=cart_id,
+                    country=country,
+                    postal=postal,
+                    city=city,
+                    province=province,
+                    selected_delivery_option=selected_delivery_option,
+                    debug_id=debug_id,
+                )
 
-            # Refresh totals after delivery selection.
-            refreshed = await self._get_cart_cost(
-                shop_domain=shop_domain, storefront_token=storefront_token, cart_id=cart_id, debug_id=debug_id
-            )
-            if refreshed:
-                subtotal = refreshed.subtotal
-                total = refreshed.total
-                tax = refreshed.tax
-                currency = refreshed.currency
+                # Refresh totals after delivery selection.
+                refreshed = await self._get_cart_cost(
+                    shop_domain=shop_domain, storefront_token=storefront_token, cart_id=cart_id, debug_id=debug_id
+                )
+                if refreshed:
+                    subtotal = refreshed.subtotal
+                    total = refreshed.total
+                    tax = refreshed.tax
+                    currency = refreshed.currency
+            except ShopifyPricingError as e:
+                # Delivery address/options are best-effort; keep the quote usable even if
+                # the Storefront schema differs across shops/versions.
+                logger.info(
+                    {"debug_id": debug_id, "code": e.code, "message": e.message, "details": getattr(e, "details", {})},
+                    "Storefront delivery options unavailable; continuing without delivery selection",
+                )
 
         return StorefrontCartResult(
             cart_id=cart_id,
@@ -417,7 +425,7 @@ query($id: ID!) {
         debug_id: str,
     ) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
         add_address = """
-mutation($cartId: ID!, $addresses: [CartDeliveryAddressInput!]!) {
+mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
   cartDeliveryAddressesAdd(cartId: $cartId, addresses: $addresses) {
     cart { id }
     userErrors { field message code }
