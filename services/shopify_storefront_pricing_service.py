@@ -201,8 +201,26 @@ class ShopifyStorefrontPricingService:
 
         data = resp.json() or {}
         if data.get("errors"):
-            logger.warning({"debug_id": debug_id, "errors": data.get("errors")}, "Shopify Storefront GraphQL errors")
-            raise ShopifyPricingError("SHOPIFY_PRICING_UNAVAILABLE", "Storefront GraphQL error", debug_id)
+            raw_errors = data.get("errors") or []
+            safe_errors: List[Dict[str, Any]] = []
+            for err in raw_errors:
+                if not isinstance(err, dict):
+                    continue
+                ext = err.get("extensions") or {}
+                safe_errors.append(
+                    {
+                        "message": err.get("message"),
+                        "code": (ext.get("code") if isinstance(ext, dict) else None),
+                        "path": err.get("path"),
+                    }
+                )
+            logger.warning({"debug_id": debug_id, "errors": safe_errors[:5]}, "Shopify Storefront GraphQL errors")
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                "Storefront GraphQL error",
+                debug_id,
+                details={"errors": safe_errors[:5]},
+            )
         return data.get("data") or {}
 
     async def _create_cart(
@@ -266,8 +284,24 @@ mutation($input: CartInput!) {
         root = (data.get("cartCreate") or {}) if isinstance(data, dict) else {}
         user_errors = root.get("userErrors") or []
         if user_errors:
-            msg = user_errors[0].get("message") or "cartCreate failed"
-            raise ShopifyPricingError("SHOPIFY_PRICING_UNAVAILABLE", msg, debug_id)
+            safe_user_errors: List[Dict[str, Any]] = []
+            for err in user_errors:
+                if not isinstance(err, dict):
+                    continue
+                safe_user_errors.append(
+                    {
+                        "field": err.get("field"),
+                        "message": err.get("message"),
+                        "code": err.get("code"),
+                    }
+                )
+            msg = (safe_user_errors[0].get("message") if safe_user_errors else None) or "cartCreate failed"
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                msg,
+                debug_id,
+                details={"user_errors": safe_user_errors[:5]},
+            )
         cart = root.get("cart") or {}
 
         cart_id = cart.get("id") or ""
@@ -579,4 +613,3 @@ query($ids: [ID!]!) {
         if fee < 0:
             return Decimal("0.00")
         return fee
-

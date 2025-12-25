@@ -25,11 +25,12 @@ class ShopifyPricingResult:
 
 
 class ShopifyPricingError(Exception):
-    def __init__(self, code: str, message: str, debug_id: str):
+    def __init__(self, code: str, message: str, debug_id: str, details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.code = code
         self.debug_id = debug_id
         self.message = message
+        self.details = details or {}
 
 
 class _VariantCompareAtCache:

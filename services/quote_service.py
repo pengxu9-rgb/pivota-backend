@@ -181,6 +181,7 @@ class QuoteService:
                     "code": e.code,
                     "message": e.message,
                     "debug_id": e.debug_id,
+                    "details": getattr(e, "details", {}) or {},
                 }
             )
 
@@ -202,6 +203,7 @@ class QuoteService:
                         "code": e.code,
                         "message": e.message,
                         "debug_id": e.debug_id,
+                        "details": getattr(e, "details", {}) or {},
                     }
                 )
 
