@@ -3,7 +3,7 @@
 Pivota 核心业务对象
 """
 
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, computed_field, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from decimal import Decimal
@@ -12,18 +12,28 @@ from decimal import Decimal
 class OrderItem(BaseModel):
     """订单项（单个产品）"""
     product_id: str
-    product_title: str
+    # Quote-first callers may omit these; pricing is locked by quote_id and stored separately.
+    product_title: Optional[str] = None
     variant_id: Optional[str] = None
     variant_title: Optional[str] = None
     sku: Optional[str] = None  # SKU (用于库存追踪)
     quantity: int
-    unit_price: Decimal
-    subtotal: Decimal  # quantity * unit_price
+    unit_price: Optional[Decimal] = None
+    subtotal: Optional[Decimal] = None  # quantity * unit_price
     
     class Config:
         json_encoders = {
             Decimal: lambda v: str(v)
         }
+
+    @model_validator(mode="after")
+    def _best_effort_subtotal(self) -> "OrderItem":
+        if self.subtotal is None and self.unit_price is not None:
+            try:
+                self.subtotal = self.unit_price * Decimal(self.quantity)
+            except Exception:
+                pass
+        return self
 
 
 class ShippingAddress(BaseModel):
@@ -73,6 +83,23 @@ class CreateOrderRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None  # 额外元数据
     preferred_psp: Optional[str] = None  # 指定首选 PSP (stripe/adyen/checkout)
     idempotency_key: Optional[str] = None  # Best-effort retry safety (agent/gateway)
+
+    @model_validator(mode="after")
+    def _enforce_legacy_item_fields_when_not_quote_first(self) -> "CreateOrderRequest":
+        # Legacy (non-quote) order create requires item title + unit_price for pricing calculation.
+        # Quote-first order create can omit these fields because pricing is computed from quote snapshot.
+        if not self.quote_id:
+            for item in self.items or []:
+                if not item.product_title:
+                    raise ValueError("items[].product_title is required when quote_id is not provided")
+                if item.unit_price is None:
+                    raise ValueError("items[].unit_price is required when quote_id is not provided")
+                if item.subtotal is None:
+                    try:
+                        item.subtotal = item.unit_price * Decimal(item.quantity)
+                    except Exception:
+                        raise ValueError("items[].subtotal is required when quote_id is not provided")
+        return self
 
 
 class PaymentAction(BaseModel):
