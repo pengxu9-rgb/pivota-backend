@@ -35,7 +35,7 @@ async def preview_quote(
     except QuoteError as e:
         raise HTTPException(
             status_code=503 if e.code == "SHOPIFY_PRICING_UNAVAILABLE" else 400,
-            detail={"error": e.code, "message": e.message, "debug_id": e.debug_id},
+            detail={"error": e.code, "message": e.message, "debug_id": e.debug_id, "details": getattr(e, "details", {})},
         )
 
     pricing = result["pricing"]

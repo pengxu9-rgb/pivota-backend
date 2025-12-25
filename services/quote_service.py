@@ -160,7 +160,9 @@ class QuoteService:
         normalized_shipping = _normalize_shipping_for_fingerprint(shipping_address)
 
         result = None
-        last_err: Optional[ShopifyPricingError] = None
+        attempts: List[Dict[str, Any]] = []
+        storefront_err: Optional[ShopifyPricingError] = None
+        admin_err: Optional[ShopifyPricingError] = None
 
         try:
             result = await self.pricing_storefront.preview_cart_quote(
@@ -172,7 +174,15 @@ class QuoteService:
                 selected_delivery_option=selected_delivery_option,
             )
         except ShopifyPricingError as e:
-            last_err = e
+            storefront_err = e
+            attempts.append(
+                {
+                    "engine": "shopify_storefront_cart",
+                    "code": e.code,
+                    "message": e.message,
+                    "debug_id": e.debug_id,
+                }
+            )
 
         if result is None:
             try:
@@ -185,10 +195,26 @@ class QuoteService:
                     selected_delivery_option=selected_delivery_option,
                 )
             except ShopifyPricingError as e:
-                last_err = e
+                admin_err = e
+                attempts.append(
+                    {
+                        "engine": "shopify_rest_checkout",
+                        "code": e.code,
+                        "message": e.message,
+                        "debug_id": e.debug_id,
+                    }
+                )
 
-        if result is None and last_err is not None:
-            raise QuoteError(last_err.code, last_err.message, debug_id=last_err.debug_id)
+        if result is None:
+            preferred = storefront_err or admin_err
+            if preferred is None:
+                raise QuoteError("SHOPIFY_PRICING_UNAVAILABLE", "Pricing engine unavailable")
+            raise QuoteError(
+                preferred.code,
+                preferred.message,
+                debug_id=preferred.debug_id,
+                details={"attempts": attempts},
+            )
 
         snapshot_json: Dict[str, Any] = {
             "engine": result.engine,

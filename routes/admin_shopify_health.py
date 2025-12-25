@@ -8,6 +8,7 @@ from db.database import database
 import json
 import httpx
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/shopify", tags=["admin-shopify-health"])
@@ -16,6 +17,9 @@ class ShopifyHealthResponse(BaseModel):
     merchant_id: str
     domain: Optional[str]
     token_present: bool
+    storefront_token_present: bool = False
+    storefront_reachable: Optional[bool] = None
+    storefront_http_status: Optional[int] = None
     reachable: bool
     http_status: Optional[int]
     error: Optional[str]
@@ -43,6 +47,9 @@ async def shopify_health(merchant_id: str):
                 merchant_id=merchant_id,
                 domain=None,
                 token_present=False,
+                storefront_token_present=bool(os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "")),
+                storefront_reachable=None,
+                storefront_http_status=None,
                 reachable=False,
                 http_status=404,
                 error="No Shopify store connected",
@@ -52,23 +59,53 @@ async def shopify_health(merchant_id: str):
         api_key_raw = store["api_key"] or ""
 
         token = None
+        storefront_token = None
         if api_key_raw:
             try:
                 data = json.loads(api_key_raw)
                 token = data.get("access_token") or data.get("token") or data.get("shopify_access_token")
+                storefront_token = (
+                    data.get("storefront_access_token")
+                    or data.get("storefront_token")
+                    or data.get("storefrontAccessToken")
+                )
             except Exception:
                 token = api_key_raw
+
+        if not storefront_token:
+            storefront_token = os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "") or None
 
         if not domain:
             return ShopifyHealthResponse(
                 merchant_id=merchant_id,
                 domain=None,
                 token_present=bool(token),
+                storefront_token_present=bool(storefront_token),
+                storefront_reachable=None,
+                storefront_http_status=None,
                 reachable=False,
                 http_status=400,
                 error="Shopify domain missing",
                 hint="Ensure domain is like 'yourstore.myshopify.com'",
             )
+
+        # Best-effort Storefront API ping (does not reveal token).
+        storefront_reachable = None
+        storefront_http_status = None
+        if storefront_token:
+            try:
+                sf_url = f"https://{domain}/api/2024-07/graphql.json"
+                sf_headers = {
+                    "X-Shopify-Storefront-Access-Token": storefront_token,
+                    "Content-Type": "application/json",
+                }
+                sf_payload = {"query": "query { shop { name } }"}
+                async with httpx.AsyncClient(timeout=8) as client:
+                    sf_resp = await client.post(sf_url, headers=sf_headers, json=sf_payload)
+                storefront_http_status = sf_resp.status_code
+                storefront_reachable = sf_resp.status_code == 200
+            except Exception:
+                storefront_reachable = False
 
         headers = {}
         if token:
@@ -85,6 +122,9 @@ async def shopify_health(merchant_id: str):
                         merchant_id=merchant_id,
                         domain=domain,
                         token_present=bool(token),
+                        storefront_token_present=bool(storefront_token),
+                        storefront_reachable=storefront_reachable,
+                        storefront_http_status=storefront_http_status,
                         reachable=True,
                         http_status=resp.status_code,
                         error=None,
@@ -95,6 +135,9 @@ async def shopify_health(merchant_id: str):
                         merchant_id=merchant_id,
                         domain=domain,
                         token_present=bool(token),
+                        storefront_token_present=bool(storefront_token),
+                        storefront_reachable=storefront_reachable,
+                        storefront_http_status=storefront_http_status,
                         reachable=False,
                         http_status=resp.status_code,
                         error=resp.text[:300],
@@ -107,6 +150,9 @@ async def shopify_health(merchant_id: str):
                 merchant_id=merchant_id,
                 domain=domain,
                 token_present=bool(token),
+                storefront_token_present=bool(storefront_token),
+                storefront_reachable=storefront_reachable,
+                storefront_http_status=storefront_http_status,
                 reachable=False,
                 http_status=http_status,
                 error=str(e),
@@ -115,7 +161,6 @@ async def shopify_health(merchant_id: str):
     except Exception as e:
         logger.error(f"Shopify health failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 
