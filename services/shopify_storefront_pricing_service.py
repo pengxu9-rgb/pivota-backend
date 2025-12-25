@@ -247,11 +247,23 @@ class ShopifyStorefrontPricingService:
         postal = None
         city = None
         province = None
+        address1 = None
+        address2 = None
         if shipping_address and isinstance(shipping_address, dict):
             country = (shipping_address.get("country") or "").strip().upper() or None
             postal = (shipping_address.get("postal_code") or shipping_address.get("zip") or "").strip() or None
             city = (shipping_address.get("city") or "").strip() or None
             province = (shipping_address.get("state") or shipping_address.get("province") or "").strip() or None
+            address1 = (
+                (shipping_address.get("address_line1") or shipping_address.get("address1") or shipping_address.get("line1") or "")
+                .strip()
+                or None
+            )
+            address2 = (
+                (shipping_address.get("address_line2") or shipping_address.get("address2") or shipping_address.get("line2") or "")
+                .strip()
+                or None
+            )
 
         cart_create = """
 mutation($input: CartInput!) {
@@ -330,6 +342,8 @@ mutation($input: CartInput!) {
                     postal=postal,
                     city=city,
                     province=province,
+                    address1=address1,
+                    address2=address2,
                     selected_delivery_option=selected_delivery_option,
                     debug_id=debug_id,
                 )
@@ -422,6 +436,8 @@ query($id: ID!) {
         postal: str,
         city: Optional[str],
         province: Optional[str],
+        address1: Optional[str],
+        address2: Optional[str],
         selected_delivery_option: Optional[Dict[str, Any]],
         debug_id: str,
     ) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
@@ -443,6 +459,8 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
             "zip": postal,
             **({"city": city} if city else {}),
             **({"provinceCode": province} if province else {}),
+            **({"address1": address1} if address1 else {}),
+            **({"address2": address2} if address2 else {}),
         }
 
         add_shapes = [
@@ -473,13 +491,8 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
                 last_error_details = getattr(e, "details", {}) or {}
                 continue
 
-        if not added:
-            raise ShopifyPricingError(
-                "SHOPIFY_PRICING_UNAVAILABLE",
-                "Failed to attach delivery address for delivery options",
-                debug_id,
-                details=last_error_details,
-            )
+        # Even if we fail to attach the address, still try to query deliveryGroups.
+        # Some shops return delivery options based on buyerIdentity/country only.
 
         # Query delivery options (schema varies; keep it tolerant).
         delivery_query = """
@@ -520,6 +533,13 @@ query($id: ID!) {
                 options.append({**opt, "delivery_group_id": group_id})
 
         if not options:
+            if not added and last_error_details:
+                raise ShopifyPricingError(
+                    "SHOPIFY_PRICING_UNAVAILABLE",
+                    "No delivery options; address attach failed",
+                    debug_id,
+                    details=last_error_details,
+                )
             return None, None
 
         def _opt_cost_amount(o: Dict[str, Any]) -> Decimal:
