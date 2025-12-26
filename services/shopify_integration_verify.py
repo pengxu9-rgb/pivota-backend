@@ -177,19 +177,35 @@ async def probe_shopify_payments_capability(
 async def probe_returns_capability(
     *, shop_domain: str, access_token: str, api_version: str = DEFAULT_API_VERSION
 ) -> bool:
-    probe_query = """
-    query ProbeReturns {
-      returns(first: 1) { nodes { id } }
-    }
-    """
     try:
-        await shopify_admin_graphql(
+        # Some shops expose Returns under `Order.returns` but not under `QueryRoot.returns`.
+        introspect_query = """
+        query TypeFields($name: String!) {
+          __type(name: $name) { fields { name } }
+        }
+        """
+        q = await shopify_admin_graphql(
             shop_domain=shop_domain,
             access_token=access_token,
-            query=probe_query,
+            query=introspect_query,
+            variables={"name": "QueryRoot"},
             api_version=api_version,
         )
-        return True
+        q_fields = (((q or {}).get("__type") or {}).get("fields")) or []
+        q_names = {str(f.get("name")) for f in q_fields if isinstance(f, dict) and f.get("name")}
+        if "returns" in q_names:
+            return True
+
+        o = await shopify_admin_graphql(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            query=introspect_query,
+            variables={"name": "Order"},
+            api_version=api_version,
+        )
+        o_fields = (((o or {}).get("__type") or {}).get("fields")) or []
+        o_names = {str(f.get("name")) for f in o_fields if isinstance(f, dict) and f.get("name")}
+        return "returns" in o_names
     except Exception:
         return False
 

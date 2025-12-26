@@ -12,6 +12,15 @@ from utils.logger import logger
 
 FALLBACK_ADMIN_API_VERSIONS = ["2025-01", "2024-10", "2024-07"]
 
+_INTROSPECT_TYPE_FIELDS_QUERY = """
+query TypeFields($name: String!) {
+  __type(name: $name) {
+    name
+    fields { name }
+  }
+}
+"""
+
 
 def _returns_list_query(*, first: int) -> str:
     safe_first = max(1, min(int(first), 100))
@@ -28,6 +37,29 @@ def _returns_list_query(*, first: int) -> str:
           order {{
             id
             legacyResourceId
+          }}
+        }}
+      }}
+    }}
+    """
+
+
+def _orders_with_returns_query(*, orders_first: int, returns_first: int) -> str:
+    safe_orders_first = max(1, min(int(orders_first), 50))
+    safe_returns_first = max(1, min(int(returns_first), 50))
+    return f"""
+    query ListOrdersWithReturns {{
+      orders(first: {safe_orders_first}, sortKey: UPDATED_AT, reverse: true) {{
+        nodes {{
+          id
+          legacyResourceId
+          returns(first: {safe_returns_first}) {{
+            nodes {{
+              id
+              status
+              createdAt
+              updatedAt
+            }}
           }}
         }}
       }}
@@ -70,6 +102,38 @@ async def fetch_shopify_returns(
     return nodes if isinstance(nodes, list) else []
 
 
+async def _introspect_type_fields(
+    *,
+    shop_domain: str,
+    access_token: str,
+    api_version: str,
+    type_name: str,
+) -> List[str]:
+    data = await shopify_admin_graphql(
+        shop_domain=shop_domain,
+        access_token=access_token,
+        query=_INTROSPECT_TYPE_FIELDS_QUERY,
+        variables={"name": type_name},
+        api_version=api_version,
+    )
+    fields = (((data or {}).get("__type") or {}).get("fields")) or []
+    names: List[str] = []
+    if isinstance(fields, list):
+        for f in fields:
+            if isinstance(f, dict) and f.get("name"):
+                names.append(str(f["name"]))
+    return names
+
+
+def _filter_returnish_fields(fields: List[str]) -> List[str]:
+    out: List[str] = []
+    for f in fields or []:
+        s = str(f or "")
+        if "return" in s.lower():
+            out.append(s)
+    return sorted(set(out))
+
+
 def _is_returns_undefined_field(err: ShopifyGraphQLError) -> bool:
     try:
         for e in (err.errors or [])[:10]:
@@ -83,6 +147,38 @@ def _is_returns_undefined_field(err: ShopifyGraphQLError) -> bool:
     except Exception:
         return False
     return False
+
+
+async def _fetch_shopify_returns_via_orders_best_effort(
+    *,
+    shop_domain: str,
+    access_token: str,
+    api_version: str,
+    orders_first: int,
+    returns_first: int,
+) -> List[Dict[str, Any]]:
+    data = await shopify_admin_graphql(
+        shop_domain=shop_domain,
+        access_token=access_token,
+        query=_orders_with_returns_query(orders_first=orders_first, returns_first=returns_first),
+        api_version=api_version,
+    )
+    orders = (((data or {}).get("orders") or {}).get("nodes")) or []
+    if not isinstance(orders, list):
+        return []
+    flattened: List[Dict[str, Any]] = []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        shopify_order_id = o.get("legacyResourceId") or o.get("id")
+        returns = (((o.get("returns") or {}).get("nodes")) or []) if isinstance(o.get("returns"), dict) else []
+        if not isinstance(returns, list):
+            continue
+        for r in returns:
+            if not isinstance(r, dict):
+                continue
+            flattened.append({**r, "order_id": shopify_order_id})
+    return flattened
 
 
 async def sync_shopify_returns_best_effort(
@@ -99,6 +195,7 @@ async def sync_shopify_returns_best_effort(
     Useful when webhooks aren't available/enabled yet.
     """
     graphql_attempts: List[Dict[str, Any]] = []
+    graphql_orders_fallback_attempts: List[Dict[str, Any]] = []
     versions_to_try: List[str] = []
     try:
         versions_to_try = [str(api_version).strip()] if api_version else []
@@ -144,6 +241,88 @@ async def sync_shopify_returns_best_effort(
     except ShopifyGraphQLError as e:
         is_returns_undefined = _is_returns_undefined_field(e)
 
+        schema_diag = None
+        if is_returns_undefined:
+            # Gather safe schema hints to help decide the correct query path.
+            try:
+                diag_version = versions_to_try[0] if versions_to_try else api_version
+                queryroot_fields = await _introspect_type_fields(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    api_version=diag_version,
+                    type_name="QueryRoot",
+                )
+                order_fields = await _introspect_type_fields(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    api_version=diag_version,
+                    type_name="Order",
+                )
+                shop_fields = await _introspect_type_fields(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    api_version=diag_version,
+                    type_name="Shop",
+                )
+                schema_diag = {
+                    "api_version": diag_version,
+                    "queryroot_returnish_fields": _filter_returnish_fields(queryroot_fields),
+                    "order_returnish_fields": _filter_returnish_fields(order_fields),
+                    "shop_returnish_fields": _filter_returnish_fields(shop_fields),
+                }
+            except Exception:
+                schema_diag = None
+
+        # If QueryRoot.returns is not available, it may still be available under Order.returns.
+        if is_returns_undefined:
+            for v in versions_to_try:
+                try:
+                    order_fields = await _introspect_type_fields(
+                        shop_domain=shop_domain,
+                        access_token=access_token,
+                        api_version=v,
+                        type_name="Order",
+                    )
+                    if "returns" not in set(order_fields):
+                        graphql_orders_fallback_attempts.append(
+                            {
+                                "api_version": v,
+                                "ok": False,
+                                "error": "Order.returns not available in schema",
+                            }
+                        )
+                        continue
+
+                    nodes = await _fetch_shopify_returns_via_orders_best_effort(
+                        shop_domain=shop_domain,
+                        access_token=access_token,
+                        api_version=v,
+                        orders_first=max(5, min(int(limit), 20)),
+                        returns_first=max(5, min(int(limit), 20)),
+                    )
+                    graphql_orders_fallback_attempts.append(
+                        {"api_version": v, "ok": True, "fetched": len(nodes), "strategy": "Order.returns"}
+                    )
+                    break
+                except ShopifyGraphQLError as e2:
+                    graphql_orders_fallback_attempts.append(
+                        {
+                            "api_version": v,
+                            "ok": False,
+                            "error": str(e2),
+                            "request_id": getattr(e2, "request_id", None),
+                            "errors": (e2.errors or [])[:2],
+                        }
+                    )
+                except Exception as e2:
+                    graphql_orders_fallback_attempts.append(
+                        {"api_version": v, "ok": False, "error": str(e2)}
+                    )
+
+            if nodes:
+                # Continue to upsert below using the same upsert path.
+                pass
+
         # Best-effort fallback: attempt REST returns endpoint (availability varies by shop/app).
         rest_error = None
         try:
@@ -176,7 +355,9 @@ async def sync_shopify_returns_best_effort(
                 "errors": (e.errors or [])[:3],
                 "request_id": getattr(e, "request_id", None),
                 "graphql_attempts": graphql_attempts or None,
+                "graphql_orders_fallback_attempts": graphql_orders_fallback_attempts or None,
                 "attempted_api_versions": versions_to_try,
+                "schema_diag": schema_diag,
                 "rest_error": rest_error,
                 "fetched": 0,
                 "upserted": 0,
