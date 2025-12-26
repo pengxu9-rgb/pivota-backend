@@ -10,6 +10,7 @@ Auth:
 """
 
 import os
+import secrets
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -89,7 +90,12 @@ async def list_disputes(
         msg = str(e)
         if "dispute_records" in msg and "does not exist" in msg:
             return {"items": [], "total": 0, "not_ready": True}
-        raise
+        debug_id = secrets.token_hex(8)
+        logger.exception("list_disputes failed debug_id=%s err=%s", debug_id, msg)
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "INTERNAL_ERROR", "message": "Failed to list disputes", "debug_id": debug_id},
+        )
 
 
 @router.get("/returns", response_model=Dict[str, Any])
@@ -143,7 +149,12 @@ async def list_returns(
         msg = str(e)
         if "return_records" in msg and "does not exist" in msg:
             return {"items": [], "total": 0, "not_ready": True}
-        raise
+        debug_id = secrets.token_hex(8)
+        logger.exception("list_returns failed debug_id=%s err=%s", debug_id, msg)
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "INTERNAL_ERROR", "message": "Failed to list returns", "debug_id": debug_id},
+        )
 
 
 @router.post("/returns/sync", response_model=Dict[str, Any])
