@@ -13,8 +13,10 @@ import os
 import secrets
 from typing import Any, Dict, Optional
 
+import stripe
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
+from config.settings import settings
 from db.database import database
 from services.merchant_store_service import get_primary_store
 from utils.logger import logger
@@ -77,6 +79,7 @@ async def require_admin_key(
 @router.get("/disputes", response_model=Dict[str, Any])
 async def list_disputes(
     merchantId: Optional[str] = Query(None),
+    orderId: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -89,6 +92,9 @@ async def list_disputes(
     if merchantId:
         where.append("merchant_id = :merchant_id")
         params["merchant_id"] = merchantId
+    if orderId:
+        where.append("order_id = :order_id")
+        params["order_id"] = orderId
     if status:
         where.append("status = :status")
         params["status"] = status
@@ -146,6 +152,139 @@ async def list_disputes(
                 **details,
             },
         )
+
+
+def _ensure_stripe_key() -> None:
+    if stripe.api_key:
+        return
+    if settings.stripe_secret_key:
+        stripe.api_key = settings.stripe_secret_key
+
+
+def _stripe_obj_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    for method in ("to_dict_recursive", "to_dict"):
+        fn = getattr(obj, method, None)
+        if callable(fn):
+            try:
+                out = fn()
+                return out if isinstance(out, dict) else {}
+            except Exception:
+                pass
+    try:
+        return dict(obj)
+    except Exception:
+        return {}
+
+
+def _stripe_disputes_for_charge_best_effort(*, charge_id: str, limit: int) -> list[dict]:
+    if not charge_id:
+        return []
+    try:
+        resp = stripe.Dispute.list(charge=charge_id, limit=limit)
+        data = resp.get("data") if isinstance(resp, dict) else getattr(resp, "data", None)
+        return [_stripe_obj_to_dict(d) for d in (data or []) if d]
+    except Exception:
+        # Fallback: list latest disputes and filter client-side (may miss older disputes).
+        try:
+            resp = stripe.Dispute.list(limit=limit)
+            data = resp.get("data") if isinstance(resp, dict) else getattr(resp, "data", None)
+            out = []
+            for d in data or []:
+                dd = _stripe_obj_to_dict(d)
+                if str(dd.get("charge") or "") == charge_id:
+                    out.append(dd)
+            return out
+        except Exception:
+            return []
+
+
+@router.post("/disputes/sync", response_model=Dict[str, Any])
+async def sync_disputes(
+    order_id: str = Query(..., alias="orderId"),
+    limit: int = Query(20, ge=1, le=50),
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """
+    Admin-key helper: best-effort backfill Stripe disputes for a specific order.
+
+    Motivation: Stripe dispute events may not carry enough metadata in webhook payloads;
+    this allows ops to backfill disputes by order_id deterministically.
+    """
+    _ensure_stripe_key()
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe is not configured")
+
+    try:
+        row = await database.fetch_one(
+            "SELECT order_id, merchant_id, payment_intent_id FROM orders WHERE order_id = :order_id LIMIT 1",
+            {"order_id": order_id},
+        )
+    except Exception as e:
+        debug_id = secrets.token_hex(8)
+        logger.exception("sync_disputes order lookup failed debug_id=%s err=%s", debug_id, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "ORDER_LOOKUP_FAILED", "message": "Failed to lookup order", "debug_id": debug_id},
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail={"code": "ORDER_NOT_FOUND", "message": "Order not found"})
+
+    merchant_id = str(row["merchant_id"])
+    payment_intent_id = str(row["payment_intent_id"] or "") or None
+
+    charges = []
+    try:
+        if payment_intent_id:
+            charge_list = stripe.Charge.list(payment_intent=payment_intent_id, limit=10)
+            charges = charge_list.get("data") if isinstance(charge_list, dict) else getattr(charge_list, "data", None) or []
+    except Exception:
+        charges = []
+
+    disputes: list[dict] = []
+    for ch in charges:
+        charge_id = (_stripe_obj_to_dict(ch).get("id") or getattr(ch, "id", None) or "") if ch else ""
+        disputes.extend(_stripe_disputes_for_charge_best_effort(charge_id=charge_id, limit=limit))
+
+    upserted = 0
+    dispute_ids: list[str] = []
+    try:
+        from services.dispute_records_service import upsert_stripe_dispute_record_best_effort
+
+        for d in disputes:
+            did = str(d.get("id") or "").strip()
+            if did:
+                dispute_ids.append(did)
+            await upsert_stripe_dispute_record_best_effort(
+                d,
+                event_type="sync",
+                order_id_hint=order_id,
+                merchant_id_hint=merchant_id,
+                db=database,
+            )
+            upserted += 1
+    except Exception as e:
+        debug_id = secrets.token_hex(8)
+        logger.exception("sync_disputes failed debug_id=%s err=%s", debug_id, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "SYNC_FAILED", "message": "Failed to sync disputes", "debug_id": debug_id},
+        )
+
+    return {
+        "ok": True,
+        "order_id": order_id,
+        "merchant_id": merchant_id,
+        "payment_intent_id": payment_intent_id,
+        "charges_count": len(charges),
+        "disputes_found": len(disputes),
+        "upserted": upserted,
+        "dispute_ids": dispute_ids,
+    }
 
 
 @router.get("/returns", response_model=Dict[str, Any])

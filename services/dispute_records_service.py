@@ -4,6 +4,9 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
+import stripe
+
+from config.settings import settings
 from services.pcs_hash import sha256_json
 from utils.logger import logger
 
@@ -18,6 +21,105 @@ def _utc_from_unix_ts(value: Any) -> Optional[datetime]:
         return datetime.fromtimestamp(ts, tz=timezone.utc)
     except Exception:
         return None
+
+
+def _row_get(row: Any, key: str) -> Any:
+    if row is None:
+        return None
+    try:
+        return row[key]
+    except Exception:
+        pass
+    try:
+        return dict(row).get(key)
+    except Exception:
+        return None
+
+
+def _extract_str_meta(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in value.items():
+        if k is None:
+            continue
+        ks = str(k).strip()
+        if not ks:
+            continue
+        if v is None:
+            continue
+        out[ks] = str(v)
+    return out
+
+
+def _ensure_stripe_api_key() -> bool:
+    """
+    Ensure stripe.api_key is configured for best-effort lookups.
+    Returns True when configured.
+    """
+    try:
+        if stripe.api_key:
+            return True
+    except Exception:
+        pass
+    if settings.stripe_secret_key:
+        try:
+            stripe.api_key = settings.stripe_secret_key
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _as_dict(obj: Any) -> Dict[str, Any]:
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "to_dict"):
+        try:
+            return obj.to_dict()
+        except Exception:
+            return {}
+    try:
+        return dict(obj)
+    except Exception:
+        return {}
+
+
+def _extract_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        v = value.strip()
+        return v or None
+    if isinstance(value, dict):
+        v = str(value.get("id") or "").strip()
+        return v or None
+    v = str(getattr(value, "id", "") or "").strip()
+    return v or None
+
+
+def _stripe_charge_lookup_best_effort(charge_id: str) -> Dict[str, Any]:
+    if not charge_id:
+        return {}
+    if not _ensure_stripe_api_key():
+        return {}
+    try:
+        ch = stripe.Charge.retrieve(charge_id)
+        return _as_dict(ch)
+    except Exception:
+        return {}
+
+
+def _stripe_payment_intent_lookup_best_effort(payment_intent_id: str) -> Dict[str, Any]:
+    if not payment_intent_id:
+        return {}
+    if not _ensure_stripe_api_key():
+        return {}
+    try:
+        pi = stripe.PaymentIntent.retrieve(payment_intent_id)
+        return _as_dict(pi)
+    except Exception:
+        return {}
 
 
 def _normalize_dispute_status(*, source: str, raw: Optional[str]) -> str:
@@ -83,7 +185,7 @@ async def _resolve_order_and_merchant_from_stripe_payload(
             {"order_id": order_id},
         )
         if row:
-            return str(row.get("order_id") or order_id), str(row.get("merchant_id") or "") or None
+            return str(_row_get(row, "order_id") or order_id), str(_row_get(row, "merchant_id") or "") or None
 
     if payment_intent_id:
         row = await db.fetch_one(
@@ -91,7 +193,7 @@ async def _resolve_order_and_merchant_from_stripe_payload(
             {"pi": payment_intent_id},
         )
         if row:
-            return str(row.get("order_id") or ""), str(row.get("merchant_id") or "")
+            return str(_row_get(row, "order_id") or ""), str(_row_get(row, "merchant_id") or "")
 
     # Final fallback: try metadata on payload
     meta = payload.get("metadata") or {}
@@ -105,6 +207,8 @@ async def upsert_stripe_dispute_record_best_effort(
     dispute: Dict[str, Any],
     *,
     event_type: Optional[str],
+    order_id_hint: Optional[str] = None,
+    merchant_id_hint: Optional[str] = None,
     db=None,
 ) -> None:
     """
@@ -130,9 +234,23 @@ async def upsert_stripe_dispute_record_best_effort(
     payment_intent_id = str(dispute.get("payment_intent") or "").strip() or None
     charge_id = str(dispute.get("charge") or "").strip() or None
 
-    meta = dispute.get("metadata") or {}
-    order_id_hint = str(meta.get("order_id") or "").strip() if isinstance(meta, dict) else None
-    merchant_id_hint = str(meta.get("merchant_id") or "").strip() if isinstance(meta, dict) else None
+    meta = _extract_str_meta(dispute.get("metadata") or {})
+    order_id_hint = order_id_hint or (str(meta.get("order_id") or "").strip() or None)
+    merchant_id_hint = merchant_id_hint or (str(meta.get("merchant_id") or "").strip() or None)
+
+    # Stripe disputes do not always include payment_intent/metadata; best-effort enrich from charge -> payment_intent.
+    if (not payment_intent_id) and charge_id:
+        charge_obj = _stripe_charge_lookup_best_effort(charge_id)
+        payment_intent_id = payment_intent_id or _extract_id(charge_obj.get("payment_intent"))
+        charge_meta = _extract_str_meta(charge_obj.get("metadata") or {})
+        order_id_hint = order_id_hint or (charge_meta.get("order_id") or None)
+        merchant_id_hint = merchant_id_hint or (charge_meta.get("merchant_id") or None)
+
+    if payment_intent_id and (not order_id_hint or not merchant_id_hint):
+        pi_obj = _stripe_payment_intent_lookup_best_effort(payment_intent_id)
+        pi_meta = _extract_str_meta(pi_obj.get("metadata") or {})
+        order_id_hint = order_id_hint or (pi_meta.get("order_id") or None)
+        merchant_id_hint = merchant_id_hint or (pi_meta.get("merchant_id") or None)
 
     try:
         order_id, merchant_id = await _resolve_order_and_merchant_from_stripe_payload(
@@ -148,10 +266,12 @@ async def upsert_stripe_dispute_record_best_effort(
     if not merchant_id:
         logger.warning(
             "Stripe dispute received but merchant_id could not be resolved; skipping persist "
-            "(dispute_id=%s payment_intent_id=%s event_type=%s)",
+            "(dispute_id=%s payment_intent_id=%s charge_id=%s event_type=%s order_hint=%s)",
             source_dispute_id,
             payment_intent_id,
+            charge_id,
             event_type,
+            order_id_hint,
         )
         return
 
@@ -279,7 +399,7 @@ async def upsert_shopify_dispute_record_best_effort(
                 {"merchant_id": merchant_id, "sid": platform_order_id},
             )
             if row:
-                order_id = str(row.get("order_id") or "") or None
+                order_id = str(_row_get(row, "order_id") or "") or None
         except Exception:
             order_id = None
 
