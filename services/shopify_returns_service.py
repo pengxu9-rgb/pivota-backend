@@ -10,22 +10,26 @@ from services.return_records_service import upsert_shopify_return_record_best_ef
 from utils.logger import logger
 
 
-RETURNS_LIST_QUERY = """
-query ListReturns($first: Int!) {
-  returns(first: $first) {
-    nodes {
-      id
-      status
-      createdAt
-      updatedAt
-      order {
-        id
-        legacyResourceId
-      }
-    }
-  }
-}
-"""
+def _returns_list_query(*, first: int) -> str:
+    safe_first = max(1, min(int(first), 100))
+    # Note: use a literal `first` value (no variables) so that when Shopify doesn't expose
+    # the Returns API, the error surface is a single `undefinedField` (without `variableNotUsed` noise).
+    return f"""
+    query ListReturns {{
+      returns(first: {safe_first}) {{
+        nodes {{
+          id
+          status
+          createdAt
+          updatedAt
+          order {{
+            id
+            legacyResourceId
+          }}
+        }}
+      }}
+    }}
+    """
 
 
 async def _shopify_admin_rest_get(
@@ -56,8 +60,7 @@ async def fetch_shopify_returns(
     data = await shopify_admin_graphql(
         shop_domain=shop_domain,
         access_token=access_token,
-        query=RETURNS_LIST_QUERY,
-        variables={"first": max(1, min(int(first), 100))},
+        query=_returns_list_query(first=first),
         api_version=api_version,
     )
     nodes = (((data or {}).get("returns") or {}).get("nodes")) or []
@@ -85,6 +88,23 @@ async def sync_shopify_returns_best_effort(
             first=limit,
         )
     except ShopifyGraphQLError as e:
+        # Shopify can entirely omit the Returns API from the Admin GraphQL schema (e.g. store/plan/feature gating).
+        # When that happens, the query fails with `undefinedField` for QueryRoot. We should treat it as a
+        # "not supported" condition (actionable), not a generic 500.
+        is_returns_undefined = False
+        try:
+            for err in (e.errors or [])[:5]:
+                if not isinstance(err, dict):
+                    continue
+                ext = err.get("extensions") or {}
+                if not isinstance(ext, dict):
+                    continue
+                if str(ext.get("code") or "") == "undefinedField" and str(ext.get("fieldName") or "") == "returns":
+                    is_returns_undefined = True
+                    break
+        except Exception:
+            is_returns_undefined = False
+
         # Best-effort fallback: attempt REST returns endpoint (availability varies by shop/app).
         rest_error = None
         try:
@@ -112,12 +132,19 @@ async def sync_shopify_returns_best_effort(
         if not nodes:
             return {
                 "ok": False,
+                "code": "RETURNS_API_UNAVAILABLE" if is_returns_undefined else "SHOPIFY_GRAPHQL_ERROR",
                 "error": str(e),
                 "errors": (e.errors or [])[:3],
                 "request_id": getattr(e, "request_id", None),
                 "rest_error": rest_error,
                 "fetched": 0,
                 "upserted": 0,
+                "hint": (
+                    "Shopify Returns API is not available for this shop/api_version. "
+                    "If you expect returns, verify Shopify plan/features and try a newer Admin API version (e.g. 2024-10+)."
+                    if is_returns_undefined
+                    else None
+                ),
             }
     except Exception as e:
         logger.warning(
