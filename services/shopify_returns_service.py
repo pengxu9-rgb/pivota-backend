@@ -44,6 +44,28 @@ def _returns_list_query(*, first: int) -> str:
     """
 
 
+def _shop_returns_list_query(*, first: int) -> str:
+    safe_first = max(1, min(int(first), 100))
+    return f"""
+    query ListReturnsViaShop {{
+      shop {{
+        returns(first: {safe_first}) {{
+          nodes {{
+            id
+            status
+            createdAt
+            updatedAt
+            order {{
+              id
+              legacyResourceId
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+
+
 def _orders_with_returns_query(*, orders_first: int, returns_first: int) -> str:
     safe_orders_first = max(1, min(int(orders_first), 50))
     safe_returns_first = max(1, min(int(returns_first), 50))
@@ -99,6 +121,23 @@ async def fetch_shopify_returns(
         api_version=api_version,
     )
     nodes = (((data or {}).get("returns") or {}).get("nodes")) or []
+    return nodes if isinstance(nodes, list) else []
+
+
+async def fetch_shopify_returns_via_shop(
+    *,
+    shop_domain: str,
+    access_token: str,
+    api_version: str,
+    first: int = 20,
+) -> List[Dict[str, Any]]:
+    data = await shopify_admin_graphql(
+        shop_domain=shop_domain,
+        access_token=access_token,
+        query=_shop_returns_list_query(first=first),
+        api_version=api_version,
+    )
+    nodes = (((((data or {}).get("shop") or {}).get("returns") or {}).get("nodes")) or [])
     return nodes if isinstance(nodes, list) else []
 
 
@@ -219,7 +258,7 @@ async def sync_shopify_returns_best_effort(
                     first=limit,
                 )
                 api_version_used = v
-                graphql_attempts.append({"api_version": v, "ok": True, "fetched": len(nodes)})
+                graphql_attempts.append({"api_version": v, "ok": True, "fetched": len(nodes), "strategy": "QueryRoot.returns"})
                 break
             except ShopifyGraphQLError as e:
                 last_graphql_error = e
@@ -230,10 +269,43 @@ async def sync_shopify_returns_best_effort(
                         "error": str(e),
                         "request_id": getattr(e, "request_id", None),
                         "errors": (e.errors or [])[:2],
+                        "strategy": "QueryRoot.returns",
                     }
                 )
-                # If this isn't the "returns field missing" case, don't keep retrying versions.
-                if not _is_returns_undefined_field(e):
+                if _is_returns_undefined_field(e):
+                    try:
+                        nodes = await fetch_shopify_returns_via_shop(
+                            shop_domain=shop_domain,
+                            access_token=access_token,
+                            api_version=v,
+                            first=limit,
+                        )
+                        api_version_used = v
+                        graphql_attempts.append(
+                            {
+                                "api_version": v,
+                                "ok": True,
+                                "fetched": len(nodes),
+                                "strategy": "Shop.returns",
+                            }
+                        )
+                        break
+                    except ShopifyGraphQLError as e2:
+                        last_graphql_error = e2
+                        graphql_attempts.append(
+                            {
+                                "api_version": v,
+                                "ok": False,
+                                "error": str(e2),
+                                "request_id": getattr(e2, "request_id", None),
+                                "errors": (e2.errors or [])[:2],
+                                "strategy": "Shop.returns",
+                            }
+                        )
+                        if not _is_returns_undefined_field(e2):
+                            raise
+                else:
+                    # If this isn't a "returns field missing" case, don't keep retrying versions.
                     raise
 
         if api_version_used is None and last_graphql_error is not None:

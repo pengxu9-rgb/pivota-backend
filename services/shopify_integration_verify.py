@@ -178,7 +178,8 @@ async def probe_returns_capability(
     *, shop_domain: str, access_token: str, api_version: str = DEFAULT_API_VERSION
 ) -> bool:
     try:
-        # Some shops expose Returns under `Order.returns` but not under `QueryRoot.returns`.
+        # Shopify Returns availability is schema-gated; some shops expose returns under `Shop.returns`
+        # or `Order.returns` even when `QueryRoot.returns` is not present.
         introspect_query = """
         query TypeFields($name: String!) {
           __type(name: $name) { fields { name } }
@@ -194,6 +195,18 @@ async def probe_returns_capability(
         q_fields = (((q or {}).get("__type") or {}).get("fields")) or []
         q_names = {str(f.get("name")) for f in q_fields if isinstance(f, dict) and f.get("name")}
         if "returns" in q_names:
+            return True
+
+        s = await shopify_admin_graphql(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            query=introspect_query,
+            variables={"name": "Shop"},
+            api_version=api_version,
+        )
+        s_fields = (((s or {}).get("__type") or {}).get("fields")) or []
+        s_names = {str(f.get("name")) for f in s_fields if isinstance(f, dict) and f.get("name")}
+        if "returns" in s_names:
             return True
 
         o = await shopify_admin_graphql(
