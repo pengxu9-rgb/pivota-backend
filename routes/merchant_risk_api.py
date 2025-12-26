@@ -21,6 +21,50 @@ from utils.logger import logger
 
 router = APIRouter(prefix="/agent/internal", tags=["risk"])
 
+def _count_from_row(row: Any) -> int:
+    if row is None:
+        return 0
+    try:
+        return int(row["n"])
+    except Exception:
+        pass
+    try:
+        return int(dict(row).get("n") or 0)
+    except Exception:
+        return 0
+
+
+def _db_error_details(err: Exception) -> Dict[str, Any]:
+    msg = str(err or "")
+    sqlstate = None
+    for obj in (err, getattr(err, "orig", None), getattr(err, "__cause__", None)):
+        if not obj:
+            continue
+        s = getattr(obj, "sqlstate", None)
+        if isinstance(s, str) and s:
+            sqlstate = s
+            break
+    return {
+        "error_type": err.__class__.__name__,
+        "sqlstate": sqlstate,
+        "db_error": msg[:800],
+    }
+
+
+def _looks_like_missing_relation(err: Exception, relation: str) -> bool:
+    details = _db_error_details(err)
+    msg = (details.get("db_error") or "").lower()
+    rel = relation.lower()
+    if details.get("sqlstate") in {"42P01", "42703"}:
+        return True
+    if "undefinedtable" in err.__class__.__name__.lower():
+        return True
+    if "relation" in msg and rel in msg and "does not exist" in msg:
+        return True
+    if "no such table" in msg and rel in msg:
+        return True
+    return False
+
 
 async def require_admin_key(
     x_admin_key: str = Header(..., alias="X-ADMIN-KEY"),
@@ -86,16 +130,21 @@ async def list_disputes(
             """,
             params,
         )
-        return {"items": [dict(r) for r in (rows or [])], "total": int((total_row or {}).get("n") or 0)}
+        return {"items": [dict(r) for r in (rows or [])], "total": _count_from_row(total_row)}
     except Exception as e:
-        msg = str(e)
-        if "dispute_records" in msg and "does not exist" in msg:
-            return {"items": [], "total": 0, "not_ready": True}
+        if _looks_like_missing_relation(e, "dispute_records"):
+            return {"items": [], "total": 0, "not_ready": True, "reason": "missing_migration_or_schema"}
         debug_id = secrets.token_hex(8)
-        logger.exception("list_disputes failed debug_id=%s err=%s", debug_id, msg)
+        logger.exception("list_disputes failed debug_id=%s err=%s", debug_id, str(e))
+        details = _db_error_details(e)
         raise HTTPException(
             status_code=500,
-            detail={"code": "INTERNAL_ERROR", "message": "Failed to list disputes", "debug_id": debug_id},
+            detail={
+                "code": "INTERNAL_ERROR",
+                "message": "Failed to list disputes",
+                "debug_id": debug_id,
+                **details,
+            },
         )
 
 
@@ -145,16 +194,21 @@ async def list_returns(
             """,
             params,
         )
-        return {"items": [dict(r) for r in (rows or [])], "total": int((total_row or {}).get("n") or 0)}
+        return {"items": [dict(r) for r in (rows or [])], "total": _count_from_row(total_row)}
     except Exception as e:
-        msg = str(e)
-        if "return_records" in msg and "does not exist" in msg:
-            return {"items": [], "total": 0, "not_ready": True}
+        if _looks_like_missing_relation(e, "return_records"):
+            return {"items": [], "total": 0, "not_ready": True, "reason": "missing_migration_or_schema"}
         debug_id = secrets.token_hex(8)
-        logger.exception("list_returns failed debug_id=%s err=%s", debug_id, msg)
+        logger.exception("list_returns failed debug_id=%s err=%s", debug_id, str(e))
+        details = _db_error_details(e)
         raise HTTPException(
             status_code=500,
-            detail={"code": "INTERNAL_ERROR", "message": "Failed to list returns", "debug_id": debug_id},
+            detail={
+                "code": "INTERNAL_ERROR",
+                "message": "Failed to list returns",
+                "debug_id": debug_id,
+                **details,
+            },
         )
 
 
