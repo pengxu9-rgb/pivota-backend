@@ -198,3 +198,55 @@ WHERE scope = 'order_create'
 ### Payment replay / double execution concerns
 - Use `/agent/v1/payments` with `idempotency_key` for safe retries.
 - If duplicates are suspected, query `payments` by `(order_id, idempotency_key)` and validate that only one row exists.
+
+
+## 6) Post‑Sale Risk: Disputes (Chargebacks) + Returns (v0.2)
+
+This repo currently supports **signals + ops visibility** (not a full CS/returns workflow yet).
+
+### 6.1 Stripe chargebacks (disputes)
+
+- **Webhook ingestion**: `POST /webhooks/stripe`
+  - Handles `charge.dispute.*` (best‑effort) and upserts `dispute_records`.
+  - Does **not** auto‑mutate order state (treat as risk/ops signal).
+- **Stripe webhook topics to enable** (recommended):
+  - `charge.dispute.created`
+  - `charge.dispute.updated`
+  - `charge.dispute.closed`
+  - (optional) `charge.dispute.funds_withdrawn`, `charge.dispute.funds_reinstated`
+
+### 6.2 Shopify disputes + returns
+
+- **Disputes**:
+  - Webhooks: `disputes/create`, `disputes/update` are already handled in `routes/webhook_routes.py`.
+  - Best‑effort:
+    - append order event + telemetry
+    - create PCS `dispute_pack` evidence pack
+    - upsert `dispute_records` for ops list visibility
+- **Returns**:
+  - Webhooks: `returns/create`, `returns/update` are attempted during onboarding/resubscribe.
+  - Reality: Shopify topic availability varies by shop/app; you may see 404 “topic not found”.
+  - Fallback: use the **admin sync** endpoint to pull latest returns via Admin GraphQL and upsert `return_records`.
+
+### 6.3 Ops endpoints (admin-key protected)
+
+Backend (pivota-backend):
+- `GET /agent/internal/disputes`
+- `GET /agent/internal/returns`
+- `POST /agent/internal/returns/sync?merchantId=...&limit=20&apiVersion=2024-07`
+
+Gateway (PIVOTA-Agent):
+- `GET /api/merchant/disputes`
+- `GET /api/merchant/returns`
+- `POST /api/merchant/returns/sync` (JSON: `{ "merchantId": "...", "limit": 20 }`)
+
+Creator UI (pivota-creator-ui):
+- `GET /ops/disputes` (reads `/api/ops/disputes`)
+- `GET /ops/returns` (reads `/api/ops/returns` + `/api/ops/returns/sync`)
+
+### 6.4 Database tables
+
+- `dispute_records` (Stripe + Shopify disputes)
+- `return_records` (Shopify returns)
+
+Migration: `db/migrations/035_disputes_and_returns.sql`

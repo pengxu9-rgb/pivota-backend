@@ -350,6 +350,8 @@ async def verify_shopify_integration(
         "tender_transactions/create",
         "disputes/create",
         "disputes/update",
+        "returns/create",
+        "returns/update",
         "customers/data_request",
         "customers/redact",
         "shop/redact",

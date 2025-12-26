@@ -57,6 +57,7 @@ async def handle_stripe_webhook(
     - payment_intent.succeeded: 支付成功
     - payment_intent.payment_failed: 支付失败
     - charge.refunded: 退款成功
+    - charge.dispute.*: 争议/拒付（chargeback）信号（best-effort 记录，不自动变更订单状态）
     """
     try:
         payload = await request.body()
@@ -180,6 +181,27 @@ async def handle_stripe_webhook(
                     }
                 )
                 logger.info(f"Order {order_id} refunded: {refund_amount}")
+
+        elif event_type and str(event_type).startswith("charge.dispute."):
+            # Stripe dispute/chargeback signals.
+            # Do not mutate order state here; treat as risk/ops signal and persist best-effort.
+            try:
+                from services.dispute_records_service import upsert_stripe_dispute_record_best_effort
+                dispute_payload = {}
+                if isinstance(data, dict):
+                    dispute_payload = data
+                elif hasattr(data, "to_dict"):
+                    try:
+                        dispute_payload = data.to_dict()
+                    except Exception:
+                        dispute_payload = {}
+
+                await upsert_stripe_dispute_record_best_effort(
+                    dispute_payload,
+                    event_type=str(event_type),
+                )
+            except Exception:
+                pass
         
         return {"status": "success", "event": event_type}
         
@@ -207,11 +229,12 @@ async def handle_shopify_webhook(
     """
     处理 Shopify 事件
     
-    支持的事件：
-    - orders/create, orders/updated, orders/paid, orders/cancelled
-    - fulfillments/create, fulfillments/update, orders/fulfilled (legacy)
-    - refunds/create (preferred) / orders/refunded (legacy)
-    """
+	    支持的事件：
+	    - orders/create, orders/updated, orders/paid, orders/cancelled
+	    - fulfillments/create, fulfillments/update, orders/fulfilled (legacy)
+	    - refunds/create (preferred) / orders/refunded (legacy)
+	    - returns/* (Shopify Returns; topic availability varies by shop/app)
+	    """
     try:
         payload = await request.body()
         
@@ -510,7 +533,7 @@ async def handle_shopify_webhook(
                 },
             )
 
-        elif topic in ("disputes/create", "disputes/update"):
+	        elif topic in ("disputes/create", "disputes/update"):
             # Dispute signals are critical for tiering/risk; store event and best-effort link to order_id.
             platform_order_id = str(data.get("order_id") or "")
             from db.database import database
@@ -585,9 +608,9 @@ async def handle_shopify_webhook(
             except Exception:
                 pass
 
-            # MVP ledger event (best-effort): dispute timeline entry.
-            try:
-                from mvp.ledger_events import emit_ledger_event_best_effort
+	            # MVP ledger event (best-effort): dispute timeline entry.
+	            try:
+	                from mvp.ledger_events import emit_ledger_event_best_effort
 
                 raw_status = (data.get("status") or "").lower()
                 is_resolved = raw_status in {"won", "lost", "resolved", "closed"}
@@ -609,9 +632,56 @@ async def handle_shopify_webhook(
                     risk_tier="unknown",
                     idempotency_key=str(data.get("id") or "") or None,
                     signature_verified=True,
-                )
-            except Exception:
-                pass
+	                )
+	            except Exception:
+	                pass
+
+	            # Upsert normalized dispute record for ops visibility (best-effort).
+	            try:
+	                from services.dispute_records_service import upsert_shopify_dispute_record_best_effort
+
+	                await upsert_shopify_dispute_record_best_effort(
+	                    merchant_id=str(merchant_id),
+	                    payload=dict(data or {}),
+	                    topic=str(topic),
+	                )
+	            except Exception:
+	                pass
+
+	        elif topic and topic.startswith("returns/"):
+	            # Returns/RMA signals (if enabled). Best-effort: record and upsert minimal return record.
+	            platform_order_id = str(data.get("order_id") or data.get("shopify_order_id") or "")
+	            from db.database import database
+
+	            pivota = None
+	            if platform_order_id:
+	                pivota = await database.fetch_one(
+	                    "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
+	                    {"shopify_order_id": platform_order_id},
+	                )
+	            pivota_order_id = (
+	                pivota["order_id"]
+	                if pivota
+	                else (f"shopify_{platform_order_id}" if platform_order_id else "shopify_return_unknown")
+	            )
+
+	            await log_order_event(
+	                event_type="return_webhook",
+	                order_id=pivota_order_id,
+	                merchant_id=merchant_id,
+	                metadata={"topic": topic, "shopify_order_id": platform_order_id or None},
+	            )
+
+	            try:
+	                from services.return_records_service import upsert_shopify_return_record_best_effort
+
+	                await upsert_shopify_return_record_best_effort(
+	                    merchant_id=str(merchant_id),
+	                    payload=dict(data or {}),
+	                    topic=str(topic),
+	                )
+	            except Exception:
+	                pass
 
         elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
             await log_order_event(
@@ -673,7 +743,7 @@ async def register_shopify_webhooks(
             raise HTTPException(status_code=400, detail="Invalid Shopify store domain")
         
         # 要注册的 webhook topics
-        topics = [
+	        topics = [
             # Orders
             "orders/create",
             "orders/updated",
@@ -688,14 +758,17 @@ async def register_shopify_webhooks(
             "refunds/create",
             # Money movement (refund funds settled / payment settled signals)
             "tender_transactions/create",
-            # Disputes (Shopify Payments)
-            "disputes/create",
-            "disputes/update",
-            # GDPR compliance (required when accessing customer/order data)
-            "customers/data_request",
-            "customers/redact",
-            "shop/redact",
-        ]
+	            # Disputes (Shopify Payments)
+	            "disputes/create",
+	            "disputes/update",
+	            # Returns (if enabled by shop/app)
+	            "returns/create",
+	            "returns/update",
+	            # GDPR compliance (required when accessing customer/order data)
+	            "customers/data_request",
+	            "customers/redact",
+	            "shop/redact",
+	        ]
         
         registered = []
         already_exists = []

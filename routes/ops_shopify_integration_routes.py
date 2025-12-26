@@ -26,6 +26,11 @@ class OpsResubscribeRequest(BaseModel):
     topics: Optional[List[str]] = None
 
 
+class OpsSyncReturnsRequest(BaseModel):
+    api_version: Optional[str] = None
+    limit: int = Field(20, ge=1, le=100)
+
+
 def _decode_scopes_json(value: Any) -> Any:
     """
     Backward-compatible: older versions stored scopes_json as a JSON string.
@@ -111,6 +116,8 @@ async def ops_resubscribe_shopify_webhooks(
         "tender_transactions/create",
         "disputes/create",
         "disputes/update",
+        "returns/create",
+        "returns/update",
         "customers/data_request",
         "customers/redact",
         "shop/redact",
@@ -133,3 +140,39 @@ async def ops_resubscribe_shopify_webhooks(
         raise HTTPException(status_code=500, detail="Failed to resubscribe webhooks")
 
     return {"status": "success", "webhooks": report, "requested_by": current_user.get("sub")}
+
+
+@router.post("/merchants/{merchant_id}/integrations/shopify/returns/sync")
+async def ops_sync_shopify_returns(
+    merchant_id: str,
+    request: OpsSyncReturnsRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    """
+    Ops helper: fetch latest Shopify returns via Admin GraphQL and upsert to return_records.
+    This is a pragmatic bridge when Returns webhooks are unavailable or not yet enabled.
+    """
+    store_info = await get_primary_store(merchant_id)
+    if not store_info or (store_info.get("platform") or "").lower() != "shopify":
+        raise HTTPException(status_code=400, detail="Primary store is not Shopify")
+
+    shop_domain = store_info.get("domain") or ""
+    access_token = store_info.get("api_key") or ""
+    if not shop_domain or not access_token:
+        raise HTTPException(status_code=400, detail="Missing Shopify credentials")
+
+    try:
+        from services.shopify_returns_service import sync_shopify_returns_best_effort
+
+        result = await sync_shopify_returns_best_effort(
+            merchant_id=merchant_id,
+            shop_domain=shop_domain,
+            access_token=access_token,
+            api_version=request.api_version or "2024-07",
+            limit=request.limit,
+        )
+    except Exception as e:
+        logger.warning("Ops returns sync failed merchant=%s: %s", merchant_id, e)
+        raise HTTPException(status_code=500, detail="Failed to sync returns")
+
+    return {"status": "success", "result": result, "requested_by": current_user.get("sub")}
