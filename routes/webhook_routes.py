@@ -533,7 +533,7 @@ async def handle_shopify_webhook(
                 },
             )
 
-	        elif topic in ("disputes/create", "disputes/update"):
+        elif topic in ("disputes/create", "disputes/update"):
             # Dispute signals are critical for tiering/risk; store event and best-effort link to order_id.
             platform_order_id = str(data.get("order_id") or "")
             from db.database import database
@@ -608,9 +608,9 @@ async def handle_shopify_webhook(
             except Exception:
                 pass
 
-	            # MVP ledger event (best-effort): dispute timeline entry.
-	            try:
-	                from mvp.ledger_events import emit_ledger_event_best_effort
+            # MVP ledger event (best-effort): dispute timeline entry.
+            try:
+                from mvp.ledger_events import emit_ledger_event_best_effort
 
                 raw_status = (data.get("status") or "").lower()
                 is_resolved = raw_status in {"won", "lost", "resolved", "closed"}
@@ -632,56 +632,56 @@ async def handle_shopify_webhook(
                     risk_tier="unknown",
                     idempotency_key=str(data.get("id") or "") or None,
                     signature_verified=True,
-	                )
-	            except Exception:
-	                pass
+                )
+            except Exception:
+                pass
 
-	            # Upsert normalized dispute record for ops visibility (best-effort).
-	            try:
-	                from services.dispute_records_service import upsert_shopify_dispute_record_best_effort
+            # Upsert normalized dispute record for ops visibility (best-effort).
+            try:
+                from services.dispute_records_service import upsert_shopify_dispute_record_best_effort
 
-	                await upsert_shopify_dispute_record_best_effort(
-	                    merchant_id=str(merchant_id),
-	                    payload=dict(data or {}),
-	                    topic=str(topic),
-	                )
-	            except Exception:
-	                pass
+                await upsert_shopify_dispute_record_best_effort(
+                    merchant_id=str(merchant_id),
+                    payload=dict(data or {}),
+                    topic=str(topic),
+                )
+            except Exception:
+                pass
 
-	        elif topic and topic.startswith("returns/"):
-	            # Returns/RMA signals (if enabled). Best-effort: record and upsert minimal return record.
-	            platform_order_id = str(data.get("order_id") or data.get("shopify_order_id") or "")
-	            from db.database import database
+        elif topic and topic.startswith("returns/"):
+            # Returns/RMA signals (if enabled). Best-effort: record and upsert minimal return record.
+            platform_order_id = str(data.get("order_id") or data.get("shopify_order_id") or "")
+            from db.database import database
 
-	            pivota = None
-	            if platform_order_id:
-	                pivota = await database.fetch_one(
-	                    "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
-	                    {"shopify_order_id": platform_order_id},
-	                )
-	            pivota_order_id = (
-	                pivota["order_id"]
-	                if pivota
-	                else (f"shopify_{platform_order_id}" if platform_order_id else "shopify_return_unknown")
-	            )
+            pivota = None
+            if platform_order_id:
+                pivota = await database.fetch_one(
+                    "SELECT order_id FROM orders WHERE shopify_order_id = :shopify_order_id",
+                    {"shopify_order_id": platform_order_id},
+                )
+            pivota_order_id = (
+                pivota["order_id"]
+                if pivota
+                else (f"shopify_{platform_order_id}" if platform_order_id else "shopify_return_unknown")
+            )
 
-	            await log_order_event(
-	                event_type="return_webhook",
-	                order_id=pivota_order_id,
-	                merchant_id=merchant_id,
-	                metadata={"topic": topic, "shopify_order_id": platform_order_id or None},
-	            )
+            await log_order_event(
+                event_type="return_webhook",
+                order_id=pivota_order_id,
+                merchant_id=merchant_id,
+                metadata={"topic": topic, "shopify_order_id": platform_order_id or None},
+            )
 
-	            try:
-	                from services.return_records_service import upsert_shopify_return_record_best_effort
+            try:
+                from services.return_records_service import upsert_shopify_return_record_best_effort
 
-	                await upsert_shopify_return_record_best_effort(
-	                    merchant_id=str(merchant_id),
-	                    payload=dict(data or {}),
-	                    topic=str(topic),
-	                )
-	            except Exception:
-	                pass
+                await upsert_shopify_return_record_best_effort(
+                    merchant_id=str(merchant_id),
+                    payload=dict(data or {}),
+                    topic=str(topic),
+                )
+            except Exception:
+                pass
 
         elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
             await log_order_event(
@@ -743,7 +743,7 @@ async def register_shopify_webhooks(
             raise HTTPException(status_code=400, detail="Invalid Shopify store domain")
         
         # 要注册的 webhook topics
-	        topics = [
+        topics = [
             # Orders
             "orders/create",
             "orders/updated",
@@ -758,17 +758,17 @@ async def register_shopify_webhooks(
             "refunds/create",
             # Money movement (refund funds settled / payment settled signals)
             "tender_transactions/create",
-	            # Disputes (Shopify Payments)
-	            "disputes/create",
-	            "disputes/update",
-	            # Returns (if enabled by shop/app)
-	            "returns/create",
-	            "returns/update",
-	            # GDPR compliance (required when accessing customer/order data)
-	            "customers/data_request",
-	            "customers/redact",
-	            "shop/redact",
-	        ]
+            # Disputes (Shopify Payments)
+            "disputes/create",
+            "disputes/update",
+            # Returns (if enabled by shop/app)
+            "returns/create",
+            "returns/update",
+            # GDPR compliance (required when accessing customer/order data)
+            "customers/data_request",
+            "customers/redact",
+            "shop/redact",
+        ]
         
         registered = []
         already_exists = []
