@@ -413,27 +413,28 @@ async def sync_shopify_returns_best_effort(
 
         # Best-effort fallback: attempt REST returns endpoint (availability varies by shop/app).
         rest_error = None
-        try:
-            rest_data = await _shopify_admin_rest_get(
-                shop_domain=shop_domain,
-                access_token=access_token,
-                api_version=api_version,
-                path=f"returns.json?limit={max(1, min(int(limit), 250))}",
-            )
-            # Shopify REST shapes vary by version; try common keys.
-            rest_nodes = (
-                rest_data.get("returns")
-                or rest_data.get("return_requests")
-                or rest_data.get("returnRequests")
-                or []
-            )
-            if isinstance(rest_nodes, list):
-                nodes = rest_nodes
-            else:
+        if not nodes:
+            try:
+                rest_data = await _shopify_admin_rest_get(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    api_version=api_version,
+                    path=f"returns.json?limit={max(1, min(int(limit), 250))}",
+                )
+                # Shopify REST shapes vary by version; try common keys.
+                rest_nodes = (
+                    rest_data.get("returns")
+                    or rest_data.get("return_requests")
+                    or rest_data.get("returnRequests")
+                    or []
+                )
+                if isinstance(rest_nodes, list):
+                    nodes = rest_nodes
+                else:
+                    nodes = []
+            except Exception as e2:
+                rest_error = str(e2)
                 nodes = []
-        except Exception as e2:
-            rest_error = str(e2)
-            nodes = []
 
         if not nodes:
             return {
