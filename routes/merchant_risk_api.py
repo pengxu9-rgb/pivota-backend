@@ -51,10 +51,11 @@ async def list_disputes(
         params["source"] = source
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    count_params = {k: v for k, v in params.items() if k not in {"limit", "offset"}}
 
     try:
         total_row = await database.fetch_one(
-            f"SELECT COUNT(*) AS n FROM dispute_records {where_sql}", params
+            f"SELECT COUNT(*) AS n FROM dispute_records {where_sql}", count_params
         )
         rows = await database.fetch_all(
             f"""
@@ -110,10 +111,11 @@ async def list_returns(
         params["status"] = status
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    count_params = {k: v for k, v in params.items() if k not in {"limit", "offset"}}
 
     try:
         total_row = await database.fetch_one(
-            f"SELECT COUNT(*) AS n FROM return_records {where_sql}", params
+            f"SELECT COUNT(*) AS n FROM return_records {where_sql}", count_params
         )
         rows = await database.fetch_all(
             f"""
