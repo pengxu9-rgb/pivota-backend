@@ -79,8 +79,6 @@ def _orders_with_returns_query(*, orders_first: int, returns_first: int) -> str:
             nodes {{
               id
               status
-              createdAt
-              updatedAt
             }}
           }}
         }}
