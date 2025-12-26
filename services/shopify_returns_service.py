@@ -454,12 +454,13 @@ async def sync_shopify_returns_best_effort(
             order = (r.get("order") or {}) if isinstance(r, dict) else {}
             payload: Dict[str, Any]
             if isinstance(r, dict) and ("createdAt" in r or "updatedAt" in r):
+                order_id = r.get("order_id") or order.get("legacyResourceId") or order.get("id")
                 payload = {
                     "id": r.get("id"),
                     "status": r.get("status"),
                     "created_at": r.get("createdAt"),
                     "updated_at": r.get("updatedAt"),
-                    "order_id": order.get("legacyResourceId") or order.get("id"),
+                    "order_id": order_id,
                 }
             else:
                 # REST-ish fallback shape
