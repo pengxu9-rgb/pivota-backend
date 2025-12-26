@@ -7,6 +7,19 @@ from services.pcs_hash import sha256_json
 from utils.logger import logger
 
 
+def _row_get(row: Any, key: str) -> Any:
+    if row is None:
+        return None
+    try:
+        return row[key]
+    except Exception:
+        pass
+    try:
+        return dict(row).get(key)
+    except Exception:
+        return None
+
+
 def _normalize_return_status(raw: Optional[str]) -> str:
     s = (raw or "").strip().lower()
     if not s:
@@ -68,7 +81,7 @@ async def upsert_shopify_return_record_best_effort(
                 {"merchant_id": merchant_id, "sid": platform_order_id},
             )
             if row:
-                order_id = str(row.get("order_id") or "") or None
+                order_id = str(_row_get(row, "order_id") or "") or None
         except Exception:
             order_id = None
 

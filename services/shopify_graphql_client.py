@@ -15,7 +15,22 @@ class ShopifyGraphQLError(RuntimeError):
 
     def __str__(self) -> str:
         rid = f" request_id={self.request_id}" if self.request_id else ""
-        return f"{self.message}{rid}"
+        first_msg = ""
+        first_code = ""
+        try:
+            if self.errors and isinstance(self.errors, list):
+                e0 = self.errors[0] or {}
+                if isinstance(e0, dict):
+                    first_msg = str(e0.get("message") or "").strip()
+                    ext = e0.get("extensions") or {}
+                    if isinstance(ext, dict):
+                        first_code = str(ext.get("code") or "").strip()
+        except Exception:
+            pass
+        suffix = ""
+        if first_code or first_msg:
+            suffix = f" first_error={first_code}:{first_msg}".rstrip(":")
+        return f"{self.message}{rid}{suffix}"
 
 
 async def shopify_admin_graphql(
