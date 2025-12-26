@@ -393,6 +393,24 @@ async def sync_shopify_returns_best_effort(
                 # Continue to upsert below using the same upsert path.
                 pass
 
+            # If the fallback query is available but returns no nodes, this is not an API-unavailable
+            # failure; it likely means the shop has no returns created yet.
+            if not nodes and any(a.get("ok") is True for a in graphql_orders_fallback_attempts):
+                return {
+                    "ok": True,
+                    "fetched": 0,
+                    "upserted": 0,
+                    "code": "NO_RETURNS_FOUND",
+                    "graphql_attempts": graphql_attempts or None,
+                    "graphql_orders_fallback_attempts": graphql_orders_fallback_attempts or None,
+                    "attempted_api_versions": versions_to_try,
+                    "schema_diag": schema_diag,
+                    "hint": (
+                        "Returns API is reachable via Order.returns, but no returns were found. "
+                        "Create a return in Shopify Admin (or enable Shopify Returns workflow) and retry sync."
+                    ),
+                }
+
         # Best-effort fallback: attempt REST returns endpoint (availability varies by shop/app).
         rest_error = None
         try:
