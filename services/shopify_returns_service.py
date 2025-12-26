@@ -10,6 +10,9 @@ from services.return_records_service import upsert_shopify_return_record_best_ef
 from utils.logger import logger
 
 
+FALLBACK_ADMIN_API_VERSIONS = ["2025-01", "2024-10", "2024-07"]
+
+
 def _returns_list_query(*, first: int) -> str:
     safe_first = max(1, min(int(first), 100))
     # Note: use a literal `first` value (no variables) so that when Shopify doesn't expose
@@ -67,6 +70,21 @@ async def fetch_shopify_returns(
     return nodes if isinstance(nodes, list) else []
 
 
+def _is_returns_undefined_field(err: ShopifyGraphQLError) -> bool:
+    try:
+        for e in (err.errors or [])[:10]:
+            if not isinstance(e, dict):
+                continue
+            ext = e.get("extensions") or {}
+            if not isinstance(ext, dict):
+                continue
+            if str(ext.get("code") or "") == "undefinedField" and str(ext.get("fieldName") or "") == "returns":
+                return True
+    except Exception:
+        return False
+    return False
+
+
 async def sync_shopify_returns_best_effort(
     *,
     merchant_id: str,
@@ -80,30 +98,51 @@ async def sync_shopify_returns_best_effort(
     Best-effort pull of latest returns via Admin GraphQL and upsert into return_records.
     Useful when webhooks aren't available/enabled yet.
     """
+    graphql_attempts: List[Dict[str, Any]] = []
+    versions_to_try: List[str] = []
     try:
-        nodes = await fetch_shopify_returns(
-            shop_domain=shop_domain,
-            access_token=access_token,
-            api_version=api_version,
-            first=limit,
-        )
+        versions_to_try = [str(api_version).strip()] if api_version else []
+    except Exception:
+        versions_to_try = []
+    for v in FALLBACK_ADMIN_API_VERSIONS:
+        if v not in versions_to_try:
+            versions_to_try.append(v)
+
+    try:
+        nodes: List[Dict[str, Any]] = []
+        api_version_used: Optional[str] = None
+        last_graphql_error: Optional[ShopifyGraphQLError] = None
+
+        for v in versions_to_try:
+            try:
+                nodes = await fetch_shopify_returns(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    api_version=v,
+                    first=limit,
+                )
+                api_version_used = v
+                graphql_attempts.append({"api_version": v, "ok": True, "fetched": len(nodes)})
+                break
+            except ShopifyGraphQLError as e:
+                last_graphql_error = e
+                graphql_attempts.append(
+                    {
+                        "api_version": v,
+                        "ok": False,
+                        "error": str(e),
+                        "request_id": getattr(e, "request_id", None),
+                        "errors": (e.errors or [])[:2],
+                    }
+                )
+                # If this isn't the "returns field missing" case, don't keep retrying versions.
+                if not _is_returns_undefined_field(e):
+                    raise
+
+        if api_version_used is None and last_graphql_error is not None:
+            raise last_graphql_error
     except ShopifyGraphQLError as e:
-        # Shopify can entirely omit the Returns API from the Admin GraphQL schema (e.g. store/plan/feature gating).
-        # When that happens, the query fails with `undefinedField` for QueryRoot. We should treat it as a
-        # "not supported" condition (actionable), not a generic 500.
-        is_returns_undefined = False
-        try:
-            for err in (e.errors or [])[:5]:
-                if not isinstance(err, dict):
-                    continue
-                ext = err.get("extensions") or {}
-                if not isinstance(ext, dict):
-                    continue
-                if str(ext.get("code") or "") == "undefinedField" and str(ext.get("fieldName") or "") == "returns":
-                    is_returns_undefined = True
-                    break
-        except Exception:
-            is_returns_undefined = False
+        is_returns_undefined = _is_returns_undefined_field(e)
 
         # Best-effort fallback: attempt REST returns endpoint (availability varies by shop/app).
         rest_error = None
@@ -136,6 +175,8 @@ async def sync_shopify_returns_best_effort(
                 "error": str(e),
                 "errors": (e.errors or [])[:3],
                 "request_id": getattr(e, "request_id", None),
+                "graphql_attempts": graphql_attempts or None,
+                "attempted_api_versions": versions_to_try,
                 "rest_error": rest_error,
                 "fetched": 0,
                 "upserted": 0,
@@ -180,4 +221,10 @@ async def sync_shopify_returns_best_effort(
         except Exception:
             continue
 
-    return {"ok": True, "fetched": len(nodes), "upserted": upserted}
+    return {
+        "ok": True,
+        "fetched": len(nodes),
+        "upserted": upserted,
+        "graphql_attempts": graphql_attempts or None,
+        "attempted_api_versions": versions_to_try,
+    }
