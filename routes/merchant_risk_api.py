@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
 from db.database import database
 from services.merchant_store_service import get_primary_store
+from utils.logger import logger
 
 router = APIRouter(prefix="/agent/internal", tags=["risk"])
 
