@@ -216,6 +216,7 @@ from routes.accounts_orders_api import router as accounts_orders_router
 from routes.merchant_promotions_api import router as merchant_promotions_router
 from routes.merchant_risk_api import router as merchant_risk_router
 from routes.shopify_promotions_sync_api import router as shopify_promotions_sync_router
+from routes.shopify_products_sync_api import router as shopify_products_sync_router
 
 # Service routers (only include what exists)
 try:
@@ -560,6 +561,7 @@ app.include_router(merchant_products_router)  # Merchant product optimization AP
 app.include_router(merchant_promotions_router)  # Merchant/agent promotions API (DB-backed)
 app.include_router(merchant_risk_router)  # Internal risk APIs (disputes/returns)
 app.include_router(shopify_promotions_sync_router)  # Sync Shopify promotions into DB-backed promotions
+app.include_router(shopify_products_sync_router)  # Sync Shopify products into products_cache
 app.include_router(product_enrichment_router)  # Internal product enrichment trigger
 if DEBUG_MODE:
     app.include_router(create_test_agent_router)  # Create test agent account
