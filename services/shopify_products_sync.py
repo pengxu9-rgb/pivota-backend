@@ -139,6 +139,9 @@ async def sync_shopify_products_for_merchant(
             # Ensure JSON-serializable payload for products_cache JSONB.
             # StandardProduct contains datetimes; `.json()` converts them to ISO strings.
             prod = json.loads(sp.json())
+            # Defensive: some nested/raw fields may still contain datetimes;
+            # normalize anything JSON can't encode into strings.
+            prod = json.loads(json.dumps(prod, default=str))
             platform_product_id = str(
                 prod.get("product_id") or prod.get("id") or ""
             ).strip()
