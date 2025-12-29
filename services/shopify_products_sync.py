@@ -136,7 +136,9 @@ async def sync_shopify_products_for_merchant(
 
         for sp in products:
             # StandardProduct provides product_id; fall back to id if needed.
-            prod = sp.dict()
+            # Ensure JSON-serializable payload for products_cache JSONB.
+            # StandardProduct contains datetimes; `.json()` converts them to ISO strings.
+            prod = json.loads(sp.json())
             platform_product_id = str(
                 prod.get("product_id") or prod.get("id") or ""
             ).strip()
