@@ -51,12 +51,14 @@ async def _get_shopify_store_credentials(merchant_id: str) -> Dict[str, str]:
     if not row:
         raise ShopifyProductsSyncConfigError("No Shopify store connected for this merchant")
 
-    status = (row.get("status") or "").lower()
-    if status != "active":
-        raise ShopifyProductsSyncConfigError(f"Shopify store is {row.get('status')}; reconnect required")
+    data = dict(row)
 
-    shop_domain = row.get("domain")
-    api_key_raw = row.get("api_key")
+    status = (data.get("status") or "").lower()
+    if status != "active":
+        raise ShopifyProductsSyncConfigError(f"Shopify store is {data.get('status')}; reconnect required")
+
+    shop_domain = data.get("domain")
+    api_key_raw = data.get("api_key")
 
     access_token: Optional[str] = None
     if isinstance(api_key_raw, str) and api_key_raw.strip().startswith("{"):
@@ -169,4 +171,3 @@ async def sync_shopify_products_for_merchant(
         "syncedAt": datetime.utcnow().isoformat(),
         "lastError": last_error,
     }
-
