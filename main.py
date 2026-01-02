@@ -136,6 +136,7 @@ from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_route
 from routes.admin_fix_order_psp import router as admin_fix_order_psp_router
 from routes.admin_debug_psp import router as admin_debug_psp_router
 from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
+from routes.employee_agent_mgmt import router as employee_agent_mgmt_router
 from routes.employee_agents_management import router as employee_agents_management_router
 from routes.employee_agents_simple import router as employee_agents_simple_router
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
@@ -424,6 +425,8 @@ app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
 app.include_router(admin_fix_order_psp_router)
 app.include_router(admin_debug_psp_router)  # Admin debug PSP data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
+# Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
+app.include_router(employee_agent_mgmt_router)
 # TEMPORARILY DISABLED - causing "Failed to fetch agents: get" error
 # app.include_router(employee_agents_management_router)  # Employee agents management
 app.include_router(admin_fix_agents_router)  # Admin fix agents data
