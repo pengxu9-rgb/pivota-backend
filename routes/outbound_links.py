@@ -11,6 +11,7 @@ from sqlalchemy import and_, asc, desc, select, update
 
 from db.database import database
 from db.outbound_links import outbound_link_rules
+from utils.auth import get_current_employee
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     make_rule_id,
@@ -26,6 +27,7 @@ from services.outbound_links_service import (
 
 api_router = APIRouter(prefix="/api/links", tags=["outbound-links"])
 admin_router = APIRouter(prefix="/agent/internal/links", tags=["outbound-links-admin"])
+employee_router = APIRouter(prefix="/employee/links", tags=["outbound-links-employee"])
 public_router = APIRouter(tags=["outbound-links"])
 
 
@@ -224,6 +226,40 @@ async def list_rules(
     return {"rules": [_to_out(r).model_dump() for r in rows], "count": len(rows), "offset": offset, "limit": limit}
 
 
+@employee_router.get("/rules", response_model=Dict[str, Any])
+async def employee_list_rules(
+    market: Optional[str] = Query(None),
+    tool: Optional[str] = Query(None),
+    status_: Optional[str] = Query(None, alias="status"),
+    scope: Optional[str] = Query(None),
+    scopeId: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    # Same implementation as admin list_rules but with employee auth.
+    _ = current_user
+    clauses = []
+    if market:
+        clauses.append(outbound_link_rules.c.market == normalize_market(market))
+    if tool:
+        clauses.append(outbound_link_rules.c.tool == normalize_tool(tool))
+    if status_:
+        clauses.append(outbound_link_rules.c.status == str(status_).strip().lower())
+    if scope:
+        clauses.append(outbound_link_rules.c.scope == normalize_scope(scope))
+    if scopeId:
+        s = normalize_scope(scope or "sku") if scope else None
+        clauses.append(outbound_link_rules.c.scope_id == (normalize_scope_id(s, scopeId) if s else scopeId))
+
+    stmt = select(outbound_link_rules)
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+    stmt = stmt.order_by(desc(outbound_link_rules.c.updated_at), desc(outbound_link_rules.c.created_at)).limit(limit).offset(offset)
+    rows = await database.fetch_all(stmt)
+    return {"rules": [_to_out(r).model_dump() for r in rows], "count": len(rows), "offset": offset, "limit": limit}
+
+
 @admin_router.post("/rules", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def create_rule(
     body: LinkRuleIn,
@@ -263,6 +299,17 @@ async def create_rule(
     return {"rule": _to_out(stored).model_dump()}
 
 
+@employee_router.post("/rules", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def employee_create_rule(
+    body: LinkRuleIn,
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    # Mirror admin create behavior; stamp createdBy by default.
+    created_by = body.createdBy or str(current_user.get("email") or current_user.get("sub") or "")
+    body2 = body.copy(update={"createdBy": created_by})
+    return await create_rule(body=body2, _=None)  # type: ignore[arg-type]
+
+
 class PublishRequest(BaseModel):
     ruleIds: List[str] = Field(default_factory=list)
     approvedBy: Optional[str] = None
@@ -285,6 +332,16 @@ async def publish_rules(
 
     rows = await database.fetch_all(select(outbound_link_rules).where(outbound_link_rules.c.id.in_(body.ruleIds)).order_by(asc(outbound_link_rules.c.id)))
     return {"published": [_to_out(r).model_dump() for r in rows]}
+
+
+@employee_router.post("/publish", response_model=Dict[str, Any])
+async def employee_publish_rules(
+    body: PublishRequest,
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    approved_by = body.approvedBy or str(current_user.get("email") or current_user.get("sub") or "")
+    body2 = body.copy(update={"approvedBy": approved_by})
+    return await publish_rules(body=body2, _=None)  # type: ignore[arg-type]
 
 
 class CsvImportResponse(BaseModel):
@@ -380,9 +437,19 @@ async def import_csv(
 
     return CsvImportResponse(created=created, errors=errors, ruleIds=rule_ids)
 
+@employee_router.post("/import-csv", response_model=CsvImportResponse)
+async def employee_import_csv(
+    req: Request,
+    current_user: dict = Depends(get_current_employee),
+    tool: str = Query("*"),
+    market: str = Query("US"),
+) -> CsvImportResponse:
+    return await import_csv(req=req, _=None, tool=tool, market=market, createdBy=str(current_user.get("email") or ""))  # type: ignore[arg-type]
+
 
 # Composite router exported for main.py include_router()
 router = APIRouter()
 router.include_router(api_router)
 router.include_router(admin_router)
+router.include_router(employee_router)
 router.include_router(public_router)
