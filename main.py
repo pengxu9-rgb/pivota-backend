@@ -219,6 +219,7 @@ from routes.merchant_risk_api import router as merchant_risk_router
 from routes.shopify_promotions_sync_api import router as shopify_promotions_sync_router
 from routes.shopify_products_sync_api import router as shopify_products_sync_router
 from routes.outbound_links import router as outbound_links_router
+from routes.external_offers import router as external_offers_router
 
 # Service routers (only include what exists)
 try:
@@ -523,6 +524,7 @@ app.include_router(admin_simple_fix_router)  # Admin simple fix
 app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
 app.include_router(outbound_links_router)  # Outbound links (resolve + redirect + ops config)
+app.include_router(external_offers_router)  # External offers (fetch/cache OG/JSON-LD for external-only products)
 app.include_router(simple_test_orders_router)  # Simple test orders generation
 app.include_router(migrate_employees_password_router)  # Migrate employees table
 app.include_router(debug_product_sync_router)  # Debug product sync
