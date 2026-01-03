@@ -52,6 +52,7 @@ async def resolve_external_offer_endpoint(body: ResolveExternalOfferRequest) -> 
             "market": snap.market,
             "canonicalUrl": out["canonicalUrl"],
             "domain": out["domain"],
+            **({ "brand": out["brand"] } if out.get("brand") else {}),
             **({ "title": out["title"] } if out.get("title") else {}),
             **({ "imageUrl": out["imageUrl"] } if out.get("imageUrl") else {}),
             **({ "price": out["price"] } if out.get("price") else {}),
