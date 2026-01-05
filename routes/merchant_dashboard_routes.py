@@ -303,9 +303,14 @@ async def get_merchant_psps(
             capabilities = []
             if row["capabilities"]:
                 capabilities = row["capabilities"].split(',')
-            
+
             psp_id = row["psp_id"]
             provider = row["provider"]
+            api_key = row["api_key"]
+            configured = bool(api_key and str(api_key).strip() and api_key != "pending_setup")
+            effective_status = row["status"]
+            if not configured and (effective_status or "").lower() == "active":
+                effective_status = "pending"
             # Prefer metrics keyed by provider (psp_used), fall back to legacy psp_id
             stats = psp_stats.get(provider) or psp_stats.get(psp_id) or {
                 "total_orders": 0,
@@ -319,14 +324,14 @@ async def get_merchant_psps(
                 "provider": row["provider"],
                 "name": row["name"],
                 "account_id": row["account_id"],
-                "status": row["status"],
+                "status": effective_status,
                 "connected_at": row["connected_at"],
                 "capabilities": capabilities,
-                "api_key_last4": row["api_key"][-4:] if row["api_key"] and len(row["api_key"]) >= 4 else "****",
+                "api_key_last4": api_key[-4:] if api_key and len(api_key) >= 4 else "****",
                 "success_rate": stats["success_rate"],
                 "volume_today": round(stats["total_volume"], 2),  # Now showing actual volume for this PSP
                 "transaction_count": stats["total_orders"],
-                "is_active": row["status"] == "active"
+                "is_active": (effective_status or "").lower() == "active"
             })
             print(f"DEBUG: PSP {psp_id} - Volume: ${stats['total_volume']:.2f}, Transactions: {stats['total_orders']}")
     except Exception as e:

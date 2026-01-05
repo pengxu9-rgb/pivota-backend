@@ -31,10 +31,13 @@ class ConnectWixRequest(BaseModel):
 class ConnectPSPRequest(BaseModel):
     merchant_id: str
     psp_type: str  # stripe, adyen, paypal, square
-    api_key: str
+    api_key: Optional[str] = None
     test_mode: bool = True
     account_id: Optional[str] = None
     secret_key: Optional[str] = None  # For PayPal Client Secret
+    # Custom PSP onboarding: allow saving provider selection without credentials.
+    setup_later: bool = False
+    custom_psp: bool = False
 
 class SyncProductsRequest(BaseModel):
     merchant_id: str
@@ -314,6 +317,9 @@ async def setup_merchant_psp(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
+        api_key = (request.api_key or "").strip()
+        setup_later = bool(request.setup_later) or not api_key
+
         # Check if merchant exists
         merchant_check = await database.fetch_one(
             "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :merchant_id",
@@ -333,9 +339,10 @@ async def setup_merchant_psp(
         if existing:
             # Update existing PSP
             update_query = """UPDATE merchant_psps 
-                   SET api_key = :api_key, status = 'active', connected_at = :connected_at"""
+                   SET api_key = :api_key, status = :status, connected_at = :connected_at"""
             params = {
-                "api_key": request.api_key,
+                "api_key": api_key if not setup_later else "pending_setup",
+                "status": "pending" if setup_later else "active",
                 "connected_at": datetime.now(),
                 "psp_id": existing["psp_id"]
             }
@@ -411,10 +418,12 @@ async def setup_merchant_psp(
                 "merchant_id": request.merchant_id,
                 "provider": request.psp_type,
                 "name": f"{request.psp_type.capitalize()} Account",
-                "api_key": request.api_key,
+                # When onboarding chooses "Other" and wants to configure later, we
+                # store a placeholder and mark as pending so it doesn't show as connected.
+                "api_key": api_key if not setup_later else "pending_setup",
                 "account_id": account_id,
                 "capabilities": ",".join(capabilities),
-                "status": "active",
+                "status": "pending" if setup_later else "active",
                 "connected_at": datetime.now(),
             }
             
@@ -433,7 +442,11 @@ async def setup_merchant_psp(
         
         return {
             "status": "success",
-            "message": f"{request.psp_type.capitalize()} connected successfully",
+            "message": (
+                f"{request.psp_type.capitalize()} saved for later setup"
+                if setup_later
+                else f"{request.psp_type.capitalize()} connected successfully"
+            ),
             "psp_id": psp_id
         }
     
