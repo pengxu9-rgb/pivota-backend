@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, asc, desc, select, update
 
 from db.database import database
-from db.outbound_links import outbound_link_rules
+from db.outbound_links import outbound_link_rules, outbound_click_events
 from utils.auth import get_current_employee
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
@@ -503,6 +503,72 @@ async def employee_import_csv(
         mode=mode,
         createdBy=str(current_user.get("email") or ""),
     )  # type: ignore[arg-type]
+
+
+class ClickEventOut(BaseModel):
+    id: int
+    createdAt: Optional[datetime] = None
+    market: str
+    tool: str
+    ruleId: Optional[str] = None
+    jobId: Optional[str] = None
+    sessionId: Optional[str] = None
+    skuId: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    area: Optional[str] = None
+    kind: Optional[str] = None
+    destDomain: Optional[str] = None
+    destinationUrl: Optional[str] = None
+
+
+def _to_click_out(row: Any) -> ClickEventOut:
+    d = dict(row)
+    return ClickEventOut(
+        id=int(d["id"]),
+        createdAt=d.get("created_at"),
+        market=str(d.get("market") or ""),
+        tool=str(d.get("tool") or ""),
+        ruleId=d.get("rule_id"),
+        jobId=d.get("job_id"),
+        sessionId=d.get("session_id"),
+        skuId=d.get("sku_id"),
+        brand=d.get("brand"),
+        category=d.get("category"),
+        area=d.get("area"),
+        kind=d.get("kind"),
+        destDomain=d.get("dest_domain"),
+        destinationUrl=d.get("destination_url"),
+    )
+
+
+@employee_router.get("/clicks", response_model=Dict[str, Any])
+async def employee_list_clicks(
+    market: Optional[str] = Query(None),
+    tool: Optional[str] = Query(None),
+    ruleId: Optional[str] = Query(None),
+    destDomain: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    _ = current_user
+    clauses = []
+    if market:
+        clauses.append(outbound_click_events.c.market == normalize_market(market))
+    if tool:
+        clauses.append(outbound_click_events.c.tool == normalize_tool(tool))
+    if ruleId:
+        clauses.append(outbound_click_events.c.rule_id == str(ruleId).strip())
+    if destDomain:
+        clauses.append(outbound_click_events.c.dest_domain == str(destDomain).strip().lower())
+
+    stmt = select(outbound_click_events)
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+    stmt = stmt.order_by(desc(outbound_click_events.c.created_at)).limit(limit).offset(offset)
+    rows = await database.fetch_all(stmt)
+    return {"clicks": [_to_click_out(r).model_dump() for r in rows], "count": len(rows), "offset": offset, "limit": limit}
 
 
 # Composite router exported for main.py include_router()
