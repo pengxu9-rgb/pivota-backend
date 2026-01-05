@@ -547,6 +547,7 @@ async def employee_list_clicks(
     market: Optional[str] = Query(None),
     tool: Optional[str] = Query(None),
     ruleId: Optional[str] = Query(None),
+    jobId: Optional[str] = Query(None),
     destDomain: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -560,6 +561,8 @@ async def employee_list_clicks(
         clauses.append(outbound_click_events.c.tool == normalize_tool(tool))
     if ruleId:
         clauses.append(outbound_click_events.c.rule_id == str(ruleId).strip())
+    if jobId:
+        clauses.append(outbound_click_events.c.job_id == str(jobId).strip())
     if destDomain:
         clauses.append(outbound_click_events.c.dest_domain == str(destDomain).strip().lower())
 
