@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, asc, desc, select, update
 
 from db.database import database
-from db.outbound_links import outbound_link_rules, outbound_click_events
+from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
 from utils.auth import get_current_employee
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
@@ -572,6 +572,143 @@ async def employee_list_clicks(
     stmt = stmt.order_by(desc(outbound_click_events.c.created_at)).limit(limit).offset(offset)
     rows = await database.fetch_all(stmt)
     return {"clicks": [_to_click_out(r).model_dump() for r in rows], "count": len(rows), "offset": offset, "limit": limit}
+
+
+class AllowedDomainIn(BaseModel):
+    market: str = "US"
+    domain: str = Field(..., min_length=3)
+    status: str = Field(default="active")  # active|disabled
+    notes: Optional[str] = None
+
+
+class AllowedDomainOut(BaseModel):
+    id: int
+    market: str
+    domain: str
+    status: str
+    notes: Optional[str] = None
+    createdBy: Optional[str] = None
+    createdAt: Optional[datetime] = None
+    updatedAt: Optional[datetime] = None
+
+
+def _to_allowed_domain_out(row: Any) -> AllowedDomainOut:
+    d = dict(row)
+    return AllowedDomainOut(
+        id=int(d["id"]),
+        market=str(d.get("market") or ""),
+        domain=str(d.get("domain") or ""),
+        status=str(d.get("status") or "active"),
+        notes=d.get("notes"),
+        createdBy=d.get("created_by"),
+        createdAt=d.get("created_at"),
+        updatedAt=d.get("updated_at"),
+    )
+
+
+@employee_router.get("/allowed-domains", response_model=Dict[str, Any])
+async def employee_list_allowed_domains(
+    market: str = Query("US"),
+    status_: Optional[str] = Query(None, alias="status"),
+    q: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    _ = current_user
+    market_norm = normalize_market(market)
+    clauses = [outbound_link_allowed_domains.c.market == market_norm]
+    if status_:
+        clauses.append(outbound_link_allowed_domains.c.status == str(status_).strip().lower())
+    if q:
+        needle = f"%{str(q).strip().lower()}%"
+        clauses.append(outbound_link_allowed_domains.c.domain.ilike(needle))
+
+    stmt = (
+        select(outbound_link_allowed_domains)
+        .where(and_(*clauses))
+        .order_by(asc(outbound_link_allowed_domains.c.domain))
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = await database.fetch_all(stmt)
+    return {"domains": [_to_allowed_domain_out(r).model_dump() for r in rows], "count": len(rows), "offset": offset, "limit": limit}
+
+
+@employee_router.post("/allowed-domains", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def employee_upsert_allowed_domain(
+    body: AllowedDomainIn,
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    market_norm = normalize_market(body.market)
+    domain_norm = str(body.domain or "").strip().lower().lstrip(".")
+    if not domain_norm or "." not in domain_norm:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_DOMAIN"})
+    status_norm = str(body.status or "active").strip().lower()
+    if status_norm not in {"active", "disabled"}:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_STATUS"})
+
+    now = datetime.utcnow()
+    created_by = str(current_user.get("email") or current_user.get("sub") or "")
+
+    existing = await database.fetch_one(
+        select(outbound_link_allowed_domains).where(
+            and_(
+                outbound_link_allowed_domains.c.market == market_norm,
+                outbound_link_allowed_domains.c.domain == domain_norm,
+            )
+        )
+    )
+    if existing:
+        await database.execute(
+            update(outbound_link_allowed_domains)
+            .where(outbound_link_allowed_domains.c.id == dict(existing)["id"])
+            .values(status=status_norm, notes=body.notes, updated_at=now),
+        )
+        row = await database.fetch_one(select(outbound_link_allowed_domains).where(outbound_link_allowed_domains.c.id == dict(existing)["id"]))
+        return {"domain": _to_allowed_domain_out(row).model_dump()}
+
+    await database.execute(
+        outbound_link_allowed_domains.insert(),
+        {
+            "market": market_norm,
+            "domain": domain_norm,
+            "status": status_norm,
+            "notes": body.notes,
+            "created_by": created_by,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    row = await database.fetch_one(
+        select(outbound_link_allowed_domains)
+        .where(and_(outbound_link_allowed_domains.c.market == market_norm, outbound_link_allowed_domains.c.domain == domain_norm))
+        .limit(1)
+    )
+    return {"domain": _to_allowed_domain_out(row).model_dump()}
+
+
+@employee_router.patch("/allowed-domains/{domain_id}", response_model=Dict[str, Any])
+async def employee_update_allowed_domain(
+    domain_id: int,
+    body: AllowedDomainIn,
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    _ = current_user
+    status_norm = str(body.status or "").strip().lower()
+    if status_norm and status_norm not in {"active", "disabled"}:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_STATUS"})
+    update_values: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if status_norm:
+        update_values["status"] = status_norm
+    if body.notes is not None:
+        update_values["notes"] = body.notes
+    stmt = update(outbound_link_allowed_domains).where(outbound_link_allowed_domains.c.id == int(domain_id)).values(**update_values)
+    await database.execute(stmt)
+    row = await database.fetch_one(select(outbound_link_allowed_domains).where(outbound_link_allowed_domains.c.id == int(domain_id)))
+    if not row:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND"})
+    return {"domain": _to_allowed_domain_out(row).model_dump()}
 
 
 # Composite router exported for main.py include_router()

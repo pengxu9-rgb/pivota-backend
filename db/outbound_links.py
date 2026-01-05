@@ -87,3 +87,23 @@ Index(
     outbound_click_events.c.created_at,
 )
 
+
+# Optional domain allowlist for outbound destinations (per market).
+#
+# Design:
+# - If allowlist is empty for a market, allow all domains (backward compatible).
+# - If allowlist has any active rows for a market, only allow matching domains (including subdomains).
+outbound_link_allowed_domains = Table(
+    "outbound_link_allowed_domains",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("market", String(8), nullable=False),
+    Column("domain", String(256), nullable=False),
+    Column("status", String(16), nullable=False, server_default="active"),  # active|disabled
+    Column("notes", Text, nullable=True),
+    Column("created_by", String(128), nullable=True),
+    Column("created_at", DateTime, server_default=func.now()),
+    Column("updated_at", DateTime, server_default=func.now()),
+)
+
+Index("idx_outbound_link_allowed_domains_market_domain", outbound_link_allowed_domains.c.market, outbound_link_allowed_domains.c.domain, unique=True)

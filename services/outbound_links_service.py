@@ -13,7 +13,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from sqlalchemy import and_, desc, or_, select
 
 from db.database import database
-from db.outbound_links import outbound_link_rules, outbound_click_events
+from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
 
 
 DEFAULT_UTM_TEMPLATE = "utm_source=pivota&utm_medium={{tool}}&utm_campaign={{market}}"
@@ -185,6 +185,42 @@ async def _select_best_rule(
     return dict(row) if row else None
 
 
+def _domain_matches(dest_domain: str, allowed_domain: str) -> bool:
+    d = str(dest_domain or "").strip().lower().lstrip(".")
+    a = str(allowed_domain or "").strip().lower().lstrip(".")
+    if not d or not a:
+        return False
+    return d == a or d.endswith(f".{a}")
+
+
+async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
+    """
+    Backward compatible:
+    - If allowlist is empty for this market, allow everything.
+    - If allowlist has at least 1 active entry, enforce it.
+    """
+    dest_domain = url_domain(destination_url).strip().lower()
+    if not dest_domain:
+        return False
+
+    rows = await database.fetch_all(
+        select(outbound_link_allowed_domains.c.domain)
+        .where(
+            and_(
+                outbound_link_allowed_domains.c.market == market,
+                outbound_link_allowed_domains.c.status == "active",
+            )
+        )
+        .order_by(outbound_link_allowed_domains.c.domain.asc())
+    )
+    allowed = [str(dict(r).get("domain") or "").strip().lower() for r in rows]
+    allowed = [d for d in allowed if d]
+    if not allowed:
+        return True
+
+    return any(_domain_matches(dest_domain, a) for a in allowed)
+
+
 async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) -> ResolvedLink:
     market = normalize_market(input.get("market"))
     tool = normalize_tool(input.get("tool"))
@@ -240,6 +276,9 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
         "market": market,
     }
     dest_with_utm = apply_utm(dest, utm_template, tokens)
+
+    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+        raise ValueError("DOMAIN_NOT_ALLOWED")
 
     token_payload = {
         "market": market,
