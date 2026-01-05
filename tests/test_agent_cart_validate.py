@@ -55,3 +55,46 @@ def test_agent_cart_validate_uses_cached_products_and_returns_variant_id(client)
     assert payload["items"][0]["product_id"] == product_id
     assert payload["items"][0]["variant_id"] == variant_id
 
+
+def test_agent_cart_validate_accepts_variant_id_as_product_id(client):
+    merchant_id = "merch_test_2"
+    product_id = "prod_2"
+    variant_id = "var_2"
+
+    product_data = {
+        "id": product_id,
+        "product_id": product_id,
+        "platform": "shopify",
+        "merchant_id": merchant_id,
+        "title": "Test Product 2",
+        "price": 20.0,
+        "currency": "USD",
+        "in_stock": True,
+        "variants": [
+            {"id": variant_id, "variant_id": variant_id, "title": "Default", "price": 19.0, "inventory_quantity": 10},
+        ],
+    }
+
+    with patch("routes.agent_api.get_merchant_active_stores", new=AsyncMock(return_value=[{"platform": "shopify"}])), patch(
+        "routes.agent_api.get_cached_products",
+        new=AsyncMock(return_value=[{"product_data": product_data}]),
+    ), patch(
+        "routes.agent_api.verify_merchant_active",
+        new=AsyncMock(return_value={"id": merchant_id, "status": "active"}),
+    ), patch(
+        "routes.agent_api.log_agent_request",
+        new=AsyncMock(return_value=None),
+    ):
+        # Intentionally send variant_id as product_id to match look-replicator sku IDs.
+        res = client.post(
+            f"/agent/v1/cart/validate?merchant_id={merchant_id}&shipping_country=US",
+            headers={"X-API-Key": "test-api-key"},
+            json=[{"product_id": variant_id, "quantity": 1}],
+        )
+
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["status"] == "success"
+    assert isinstance(payload.get("items"), list) and payload["items"]
+    assert payload["items"][0]["product_id"] == product_id
+    assert payload["items"][0]["variant_id"] == variant_id

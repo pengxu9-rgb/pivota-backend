@@ -114,6 +114,42 @@ def extract_sku(product: Dict[str, Any]) -> Optional[str]:
     sku = product.get("sku")
     return str(sku) if sku else None
 
+def index_variants(products: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a lookup from variant_id -> { product, variant } using cached StandardProduct payloads.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for product in products:
+        variants = product.get("variants")
+        if not isinstance(variants, list):
+            continue
+        for v in variants:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("variant_id") or v.get("id")
+            if not vid:
+                continue
+            out[str(vid)] = {"product": product, "variant": v}
+    return out
+
+def extract_variant_price(variant: Dict[str, Any]) -> Optional[Decimal]:
+    try:
+        p = variant.get("price")
+        if p is None:
+            return None
+        return Decimal(str(p))
+    except Exception:
+        return None
+
+def variant_in_stock(variant: Dict[str, Any]) -> Optional[bool]:
+    try:
+        qty = variant.get("inventory_quantity")
+        if qty is None:
+            return None
+        return int(qty) > 0
+    except Exception:
+        return None
+
 
 # ============================================================================
 # PCS / Shopify Webhook Debug (metadata-only)
@@ -628,6 +664,7 @@ async def agent_validate_cart(
         # 获取产品信息
         product_map = {}
         products = await load_cached_product_data_for_merchant(merchant_id)
+        variant_map = index_variants(products)
         for product in products:
             pid = product.get("product_id") or product.get("id")
             if pid is None:
@@ -640,50 +677,69 @@ async def agent_validate_cart(
         subtotal = Decimal("0")
         
         for item in items:
-            product_id = str(item.get("product_id"))
+            input_id = str(item.get("product_id"))
             try:
                 quantity = int(item.get("quantity", 1) or 1)
             except Exception:
                 quantity = 1
-            
-            if product_id not in product_map:
+
+            product = product_map.get(input_id)
+            variant = None
+            if product is None:
+                hit = variant_map.get(input_id)
+                if hit:
+                    product = hit.get("product")
+                    variant = hit.get("variant")
+
+            if product is None:
                 validation_errors.append({
-                    "product_id": product_id,
+                    "product_id": input_id,
                     "error": "Product not found"
                 })
                 continue
-            
-            product = product_map[product_id]
+
+            canonical_product_id = str(product.get("product_id") or product.get("id") or input_id)
             
             # 检查库存
-            if not product.get("in_stock", True):
+            v_stock = variant_in_stock(variant) if isinstance(variant, dict) else None
+            in_stock = bool(product.get("in_stock", True)) if v_stock is None else bool(v_stock)
+            if not in_stock:
                 validation_errors.append({
-                    "product_id": product_id,
+                    "product_id": input_id,
                     "error": "Out of stock"
                 })
                 continue
             
             # 计算价格
-            try:
-                unit_price = Decimal(str(product.get("price", 0) or 0))
-            except Exception:
-                unit_price = Decimal("0")
+            unit_price = None
+            if isinstance(variant, dict):
+                unit_price = extract_variant_price(variant)
+            if unit_price is None:
+                try:
+                    unit_price = Decimal(str(product.get("price", 0) or 0))
+                except Exception:
+                    unit_price = Decimal("0")
             item_subtotal = unit_price * quantity
             subtotal += item_subtotal
 
-            variant_id = extract_variant_id(product)
+            variant_id = None
+            if isinstance(variant, dict):
+                variant_id = variant.get("variant_id") or variant.get("id")
+            if not variant_id:
+                variant_id = extract_variant_id(product)
             if not variant_id:
                 validation_errors.append({
-                    "product_id": product_id,
+                    "product_id": input_id,
                     "error": "Missing variant_id"
                 })
                 continue
             
             validated_items.append({
-                "product_id": product_id,
+                # Always return canonical IDs suitable for quote/order endpoints.
+                "product_id": canonical_product_id,
                 "product_title": product.get("title"),
-                "variant_id": variant_id,
-                "sku": extract_sku(product),
+                "variant_id": str(variant_id),
+                "sku": extract_sku(product) if not isinstance(variant, dict) else (variant.get("sku") or extract_sku(product)),
                 "quantity": quantity,
                 "unit_price": str(unit_price),
                 "subtotal": str(item_subtotal),
