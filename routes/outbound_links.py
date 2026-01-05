@@ -590,6 +590,7 @@ async def employee_clicks_report(
     startAt: Optional[str] = Query(None),
     endAt: Optional[str] = Query(None),
     groupBy: str = Query("destDomain"),
+    minClicks: int = Query(1, ge=1, le=1000000),
     limit: int = Query(200, ge=1, le=500),
     current_user: dict = Depends(get_current_employee),
 ) -> Dict[str, Any]:
@@ -598,8 +599,12 @@ async def employee_clicks_report(
 
     groupBy:
       - destDomain (default)
+      - destinationUrl
       - ruleId
       - jobId
+      - brand
+      - category
+      - area
       - day (UTC)
     """
     _ = current_user
@@ -625,16 +630,24 @@ async def employee_clicks_report(
     end_dt = parse_dt(endAt)
 
     group = str(groupBy or "destDomain").strip()
-    if group not in {"destDomain", "ruleId", "jobId", "day"}:
+    if group not in {"destDomain", "destinationUrl", "ruleId", "jobId", "brand", "category", "area", "day"}:
         raise HTTPException(status_code=400, detail={"code": "INVALID_GROUP_BY"})
 
     key_expr = None
     if group == "destDomain":
         key_expr = outbound_click_events.c.dest_domain
+    elif group == "destinationUrl":
+        key_expr = outbound_click_events.c.destination_url
     elif group == "ruleId":
         key_expr = outbound_click_events.c.rule_id
     elif group == "jobId":
         key_expr = outbound_click_events.c.job_id
+    elif group == "brand":
+        key_expr = outbound_click_events.c.brand
+    elif group == "category":
+        key_expr = outbound_click_events.c.category
+    elif group == "area":
+        key_expr = outbound_click_events.c.area
     else:
         key_expr = func.date_trunc("day", outbound_click_events.c.created_at)
 
@@ -661,7 +674,7 @@ async def employee_clicks_report(
     )
     if clauses:
         stmt = stmt.where(and_(*clauses))
-    stmt = stmt.group_by(key_expr).order_by(desc(func.count(outbound_click_events.c.id))).limit(limit)
+    stmt = stmt.group_by(key_expr).having(func.count(outbound_click_events.c.id) >= int(minClicks)).order_by(desc(func.count(outbound_click_events.c.id))).limit(limit)
 
     rows = await database.fetch_all(stmt)
     out: List[Dict[str, Any]] = []
@@ -687,6 +700,7 @@ async def employee_clicks_report(
         "groupBy": group,
         "startAt": startAt,
         "endAt": endAt,
+        "minClicks": minClicks,
         "rows": out,
         "count": len(out),
         "limit": limit,
