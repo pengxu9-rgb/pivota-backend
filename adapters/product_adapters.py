@@ -8,11 +8,61 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import httpx
 import logging
+import time
 from urllib.parse import urlparse, parse_qs
 
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 
 logger = logging.getLogger(__name__)
+
+_SHOP_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
+_SHOP_CURRENCY_TTL_SECONDS = 6 * 60 * 60
+
+
+def _get_cached_shop_currency(shop_domain: str) -> Optional[str]:
+    key = (shop_domain or "").strip().lower()
+    if not key:
+        return None
+    hit = _SHOP_CURRENCY_CACHE.get(key)
+    if not hit:
+        return None
+    expires_at, currency = hit
+    if expires_at < time.time():
+        _SHOP_CURRENCY_CACHE.pop(key, None)
+        return None
+    return currency
+
+
+def _set_cached_shop_currency(shop_domain: str, currency: str) -> None:
+    key = (shop_domain or "").strip().lower()
+    cur = (currency or "").strip().upper()
+    if not key or not cur:
+        return
+    _SHOP_CURRENCY_CACHE[key] = (time.time() + _SHOP_CURRENCY_TTL_SECONDS, cur)
+
+
+async def _fetch_shop_currency(
+    *,
+    client: httpx.AsyncClient,
+    shop_domain: str,
+    headers: Dict[str, str],
+    api_version: str = "2024-07",
+) -> Optional[str]:
+    """
+    Fetch the shop's base currency from Shopify.
+
+    Shopify product/variant prices returned by Admin REST are in the shop currency, but the
+    products endpoint does not include a currency field. We must fetch it from /shop.json.
+    """
+    url = f"https://{shop_domain}/admin/api/{api_version}/shop.json"
+    resp = await client.get(url, headers=headers)
+    if resp.status_code != 200:
+        return None
+    data = resp.json() or {}
+    shop = data.get("shop") if isinstance(data, dict) else None
+    currency = (shop.get("currency") if isinstance(shop, dict) else None) or ""
+    cur = str(currency).strip().upper()
+    return cur or None
 
 
 class ShopifyProductAdapter:
@@ -46,6 +96,17 @@ class ShopifyProductAdapter:
         try:
             logger.info(f"🌐 ShopifyAdapter Fetch start merchant_id={merchant_id} shop_domain={shop_domain} limit={limit}")
             async with httpx.AsyncClient(timeout=30.0) as client:
+                shop_currency = _get_cached_shop_currency(shop_domain)
+                if not shop_currency:
+                    try:
+                        shop_currency = await _fetch_shop_currency(
+                            client=client, shop_domain=shop_domain, headers=headers
+                        )
+                        if shop_currency:
+                            _set_cached_shop_currency(shop_domain, shop_currency)
+                    except Exception:
+                        shop_currency = None
+
                 response = await client.get(url, headers=headers, params=params)
             
             if response.status_code != 200:
@@ -62,7 +123,7 @@ class ShopifyProductAdapter:
             
             # 转换为标准格式
             standard_products = [
-                ShopifyProductAdapter.convert_to_standard(sp, merchant_id)
+                ShopifyProductAdapter.convert_to_standard(sp, merchant_id, currency=(shop_currency or "USD"))
                 for sp in shopify_products
             ]
             
@@ -101,7 +162,7 @@ class ShopifyProductAdapter:
             return [], None, error_msg
     
     @staticmethod
-    def convert_to_standard(shopify_product: Dict[str, Any], merchant_id: str) -> StandardProduct:
+    def convert_to_standard(shopify_product: Dict[str, Any], merchant_id: str, currency: str = "USD") -> StandardProduct:
         """
         核心转换逻辑：Shopify Product → StandardProduct
         """
@@ -261,7 +322,7 @@ class ShopifyProductAdapter:
             tags=tags,
             price=default_price,
             compare_at_price=None,  # 在变体中
-            currency="USD",  # 可从 shop.json 获取
+            currency=str(currency or "USD").upper(),
             inventory_quantity=default_inventory,
             sku=default_sku,
             barcode=default_barcode,
