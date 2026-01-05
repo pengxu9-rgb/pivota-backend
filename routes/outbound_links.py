@@ -346,6 +346,7 @@ async def employee_publish_rules(
 
 class CsvImportResponse(BaseModel):
     created: int
+    updated: int = 0
     errors: List[str] = Field(default_factory=list)
     ruleIds: List[str] = Field(default_factory=list)
 
@@ -356,6 +357,7 @@ async def import_csv(
     _: None = Depends(require_links_admin),
     tool: str = Query("*"),
     market: str = Query("US"),
+    mode: str = Query("create"),
     createdBy: Optional[str] = Query(None),
 ) -> CsvImportResponse:
     """
@@ -377,8 +379,10 @@ async def import_csv(
 
     reader = csv.DictReader(io.StringIO(text))
     created = 0
+    updated = 0
     errors: List[str] = []
     rule_ids: List[str] = []
+    mode_norm = str(mode or "create").strip().lower()
 
     for idx, row in enumerate(reader, start=2):
         try:
@@ -408,34 +412,80 @@ async def import_csv(
             start_dt = datetime.fromisoformat(start_at) if start_at else None
             end_dt = datetime.fromisoformat(end_at) if end_at else None
 
-            rid = make_rule_id()
-            await database.execute(
-                outbound_link_rules.insert(),
-                {
-                    "id": rid,
-                    "market": market_norm,
-                    "tool": tool_norm,
-                    "scope": scope,
-                    "scope_id": scope_id,
-                    "destination_url": dest,
-                    "purchase_enabled_override": poe,
-                    "priority": priority,
-                    "partner_type": partner_type,
-                    "disclosure_text": disclosure_text,
-                    "utm_template": utm_template,
-                    "notes": notes,
-                    "start_at": start_dt,
-                    "end_at": end_dt,
-                    "status": "draft",
-                    "created_by": createdBy,
-                },
-            )
-            created += 1
-            rule_ids.append(rid)
+            now = datetime.utcnow()
+
+            # Upsert mode: update an existing draft rule for the same key (market+tool+scope+scope_id).
+            # Never mutate published rules; if only published exists, create a new draft.
+            existing_id: Optional[str] = None
+            if mode_norm == "upsert":
+                existing = await database.fetch_one(
+                    select(outbound_link_rules.c.id)
+                    .where(
+                        and_(
+                            outbound_link_rules.c.market == market_norm,
+                            outbound_link_rules.c.tool == tool_norm,
+                            outbound_link_rules.c.scope == scope,
+                            outbound_link_rules.c.scope_id == scope_id,
+                            outbound_link_rules.c.status == "draft",
+                        )
+                    )
+                    .order_by(desc(outbound_link_rules.c.updated_at), desc(outbound_link_rules.c.created_at))
+                    .limit(1)
+                )
+                if existing:
+                    existing_id = dict(existing).get("id")
+
+            if existing_id:
+                stmt = (
+                    update(outbound_link_rules)
+                    .where(outbound_link_rules.c.id == existing_id)
+                    .values(
+                        destination_url=dest,
+                        purchase_enabled_override=poe,
+                        priority=priority,
+                        partner_type=partner_type,
+                        disclosure_text=disclosure_text,
+                        utm_template=utm_template,
+                        notes=notes,
+                        start_at=start_dt,
+                        end_at=end_dt,
+                        updated_at=now,
+                    )
+                )
+                await database.execute(stmt)
+                updated += 1
+                rule_ids.append(existing_id)
+            else:
+                rid = make_rule_id()
+                await database.execute(
+                    outbound_link_rules.insert(),
+                    {
+                        "id": rid,
+                        "market": market_norm,
+                        "tool": tool_norm,
+                        "scope": scope,
+                        "scope_id": scope_id,
+                        "destination_url": dest,
+                        "purchase_enabled_override": poe,
+                        "priority": priority,
+                        "partner_type": partner_type,
+                        "disclosure_text": disclosure_text,
+                        "utm_template": utm_template,
+                        "notes": notes,
+                        "start_at": start_dt,
+                        "end_at": end_dt,
+                        "status": "draft",
+                        "created_by": createdBy,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                created += 1
+                rule_ids.append(rid)
         except Exception as exc:
             errors.append(f"Row {idx}: {str(exc)}")
 
-    return CsvImportResponse(created=created, errors=errors, ruleIds=rule_ids)
+    return CsvImportResponse(created=created, updated=updated, errors=errors, ruleIds=rule_ids)
 
 @employee_router.post("/import-csv", response_model=CsvImportResponse)
 async def employee_import_csv(
@@ -443,8 +493,16 @@ async def employee_import_csv(
     current_user: dict = Depends(get_current_employee),
     tool: str = Query("*"),
     market: str = Query("US"),
+    mode: str = Query("create"),
 ) -> CsvImportResponse:
-    return await import_csv(req=req, _=None, tool=tool, market=market, createdBy=str(current_user.get("email") or ""))  # type: ignore[arg-type]
+    return await import_csv(
+        req=req,
+        _=None,
+        tool=tool,
+        market=market,
+        mode=mode,
+        createdBy=str(current_user.get("email") or ""),
+    )  # type: ignore[arg-type]
 
 
 # Composite router exported for main.py include_router()
