@@ -2938,10 +2938,66 @@ async def _handle_get_product_detail(
     if not match:
         # Strong contract: this should not happen if product comes from find_products,
         # so treat it as PRODUCT_NOT_FOUND.
-        raise HTTPException(
-            status_code=404,
-            detail="PRODUCT_NOT_FOUND",
-        )
+        # Final fallback for Shopify: the product may exist in the merchant's
+        # Shopify store but not be present in our cache/hybrid slice yet.
+        try:
+            from services.merchant_store_service import get_merchant_active_stores
+            from adapters.product_adapters import ShopifyProductAdapter
+            from db.products import upsert_product_cache
+
+            stores = await get_merchant_active_stores(merchant_id)
+            shopify_store = next(
+                (
+                    s
+                    for s in stores
+                    if (s.get("platform") or "").lower() == "shopify"
+                    and (s.get("domain") or "").strip()
+                    and (s.get("api_key") or "").strip()
+                ),
+                None,
+            )
+
+            if shopify_store:
+                shop_domain = str(shopify_store["domain"]).strip()
+                access_token = str(shopify_store["api_key"]).strip()
+                fetched, fetch_error = await ShopifyProductAdapter.fetch_product_by_id(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    merchant_id=merchant_id,
+                    product_id=product_id,
+                )
+                if fetched:
+                    match = fetched
+                    query_source = "shopify_admin_by_id"
+                    # Best-effort: cache the fetched product so future calls are fast.
+                    try:
+                        background_tasks.add_task(
+                            upsert_product_cache,
+                            merchant_id,
+                            "shopify",
+                            str(product_id),
+                            fetched.dict(),
+                            6 * 60 * 60,
+                        )
+                    except Exception:
+                        pass
+                elif fetch_error and fetch_error != "NOT_FOUND":
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "SHOPIFY_PRODUCT_FETCH_FAILED",
+                            "message": fetch_error,
+                        },
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            # If anything goes wrong in the fallback, keep the contract
+            # and return PRODUCT_NOT_FOUND rather than leaking internals.
+            pass
+
+        if not match:
+            raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
 
     base = _standard_to_shop_product(match)
 

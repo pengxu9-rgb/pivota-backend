@@ -67,6 +67,68 @@ async def _fetch_shop_currency(
 
 class ShopifyProductAdapter:
     """Shopify 产品适配器：Shopify API → StandardProduct"""
+
+    @staticmethod
+    async def fetch_product_by_id(
+        *,
+        shop_domain: str,
+        access_token: str,
+        merchant_id: str,
+        product_id: str,
+        api_version: str = "2024-07",
+    ) -> Tuple[Optional[StandardProduct], Optional[str]]:
+        """
+        Fetch a single product from Shopify Admin REST by numeric product id.
+
+        Returns:
+            (product, error_message)
+        """
+        shop_domain = (shop_domain or "").strip()
+        access_token = (access_token or "").strip()
+        pid = (product_id or "").strip()
+        if not shop_domain or not access_token or not pid:
+            return None, "Missing shop_domain/access_token/product_id"
+
+        url = f"https://{shop_domain}/admin/api/{api_version}/products/{pid}.json"
+        headers = {"X-Shopify-Access-Token": access_token}
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                shop_currency = _get_cached_shop_currency(shop_domain)
+                if not shop_currency:
+                    try:
+                        shop_currency = await _fetch_shop_currency(
+                            client=client,
+                            shop_domain=shop_domain,
+                            headers=headers,
+                            api_version=api_version,
+                        )
+                        if shop_currency:
+                            _set_cached_shop_currency(shop_domain, shop_currency)
+                    except Exception:
+                        shop_currency = None
+
+                resp = await client.get(url, headers=headers)
+
+            if resp.status_code == 404:
+                return None, "NOT_FOUND"
+            if resp.status_code != 200:
+                return (
+                    None,
+                    f"Shopify API error: {resp.status_code} - {resp.text[:200]}",
+                )
+
+            data = resp.json() or {}
+            product = data.get("product") if isinstance(data, dict) else None
+            if not isinstance(product, dict):
+                return None, "Invalid Shopify response: missing product"
+
+            standard = ShopifyProductAdapter.convert_to_standard(
+                product, merchant_id, currency=(shop_currency or "USD")
+            )
+            return standard, None
+        except Exception as e:
+            return None, f"Failed to fetch Shopify product: {str(e)}"
     
     @staticmethod
     async def fetch_products(
