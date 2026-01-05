@@ -12,6 +12,7 @@ from adapters.psp_adapter import PSPAdapter, get_psp_adapter, PaymentIntent
 from db.merchant_onboarding import get_merchant_onboarding
 from db.database import database
 from utils.logger import logger
+import hashlib
 
 
 @dataclass
@@ -162,19 +163,103 @@ class MultiPSPOrchestrator:
         if not self.psp_configs:
             return False, None, "No PSP configured for merchant", "none"
         
+        order_id_for_log = str(metadata.get("order_id") or "").strip() or None
+        route_id_for_log = str(metadata.get("route_id") or "").strip() or None
+        agent_id_for_log = str(metadata.get("agent_id") or "").strip() or None
+
+        async def _log_attempt_start(*, attempt_number: int, psp_name: str) -> Optional[str]:
+            if not order_id_for_log:
+                return None
+            try:
+                attempt_id = (
+                    "att_"
+                    + hashlib.md5(
+                        f"{order_id_for_log}:{psp_name}:{attempt_number}:{datetime.utcnow().isoformat()}".encode()
+                    ).hexdigest()[:12]
+                )
+                await database.execute(
+                    """
+                    INSERT INTO payment_attempts (
+                        attempt_id, order_id, route_id, agent_id,
+                        psp_name, attempt_number, status,
+                        amount, currency, created_at
+                    ) VALUES (
+                        :attempt_id, :order_id, :route_id, :agent_id,
+                        :psp_name, :attempt_number, :status,
+                        :amount, :currency, NOW()
+                    )
+                    """,
+                    {
+                        "attempt_id": attempt_id,
+                        "order_id": order_id_for_log,
+                        "route_id": route_id_for_log,
+                        "agent_id": agent_id_for_log,
+                        "psp_name": psp_name,
+                        "attempt_number": attempt_number,
+                        "status": "pending",
+                        "amount": float(amount),
+                        "currency": currency,
+                    },
+                )
+                return attempt_id
+            except Exception as e:
+                logger.warning(
+                    {"order_id": order_id_for_log, "psp": psp_name, "error": str(e)},
+                    "Failed to log payment attempt start (best-effort)",
+                )
+                return None
+
+        async def _log_attempt_finish(
+            *,
+            attempt_id: Optional[str],
+            status: str,
+            response_time_ms: Optional[int] = None,
+            error_message: Optional[str] = None,
+        ) -> None:
+            if not attempt_id:
+                return
+            try:
+                await database.execute(
+                    """
+                    UPDATE payment_attempts
+                    SET status = :status,
+                        response_time_ms = :response_time_ms,
+                        error_code = :error_code,
+                        error_message = :error_message,
+                        completed_at = NOW()
+                    WHERE attempt_id = :attempt_id
+                    """,
+                    {
+                        "attempt_id": attempt_id,
+                        "status": status,
+                        "response_time_ms": response_time_ms,
+                        "error_code": "PSP_ERROR" if status == "failed" else None,
+                        "error_message": error_message,
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    {"attempt_id": attempt_id, "error": str(e)},
+                    "Failed to log payment attempt finish (best-effort)",
+                )
+
         # Try each PSP in priority order
+        attempt_number = 0
         for config in self.psp_configs:
+            attempt_number += 1
             try:
                 logger.info(f"Attempting payment with {config.psp_type} (priority {config.priority})")
-                
+
                 # Get PSP adapter
                 psp_adapter = get_psp_adapter(
                     config.psp_type,
                     config.api_key,
                     merchant_account=config.merchant_account
                 )
-                
+
                 # Attempt payment
+                attempt_id = await _log_attempt_start(attempt_number=attempt_number, psp_name=config.psp_type)
+                start_ts = datetime.utcnow()
                 success, payment_intent, error = await psp_adapter.create_payment_intent(
                     amount=amount,
                     currency=currency,
@@ -184,10 +269,16 @@ class MultiPSPOrchestrator:
                         "psp_type": config.psp_type
                     }
                 )
-                
+                response_time_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+
                 if success:
                     logger.info(f"Payment intent created successfully with {config.psp_type}")
-                    
+                    await _log_attempt_finish(
+                        attempt_id=attempt_id,
+                        status="success",
+                        response_time_ms=response_time_ms,
+                    )
+
                     # Log success for analytics
                     await self._log_psp_attempt(
                         psp_type=config.psp_type,
@@ -200,7 +291,13 @@ class MultiPSPOrchestrator:
                     return True, payment_intent, None, config.psp_type
                 else:
                     logger.warning(f"{config.psp_type} failed: {error}")
-                    
+                    await _log_attempt_finish(
+                        attempt_id=attempt_id,
+                        status="failed",
+                        response_time_ms=response_time_ms,
+                        error_message=error,
+                    )
+
                     # Log failure
                     await self._log_psp_attempt(
                         psp_type=config.psp_type,
@@ -213,7 +310,7 @@ class MultiPSPOrchestrator:
                     
                     # Continue to next PSP
                     continue
-                    
+
             except Exception as e:
                 logger.error(f"Exception with {config.psp_type}: {e}")
                 continue

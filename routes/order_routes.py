@@ -789,44 +789,9 @@ async def create_new_order(
                 )
                 preferred_psps = None
 
-            # For observability, record a single payment_attempt row (attempt_number=1).
-            # We set initial PSP name to the first preferred PSP, or the selected type.
-            initial_psp_name = (
-                (preferred_psps[0] if preferred_psps else None)
-                or psp_type
-                or "stripe"
-            )
-            try:
-                payment_attempt_id = f"att_{hashlib.md5(f'{order_id}1{datetime.utcnow().isoformat()}'.encode()).hexdigest()[:12]}"
-                await database.execute(
-                    """
-                    INSERT INTO payment_attempts (
-                        attempt_id, order_id, route_id, agent_id,
-                        psp_name, attempt_number, status,
-                        amount, currency, created_at
-                    ) VALUES (
-                        :attempt_id, :order_id, :route_id, :agent_id,
-                        :psp_name, :attempt_number, :status,
-                        :amount, :currency, NOW()
-                    )
-                    """,
-                    {
-                        "attempt_id": payment_attempt_id,
-                        "order_id": order_id,
-                        "route_id": route_id_for_attempt,
-                        "agent_id": agent_id,
-                        "psp_name": initial_psp_name,
-                        "attempt_number": 1,
-                        "status": "pending",
-                        "amount": float(total),
-                        "currency": order_request.currency,
-                    },
-                )
-            except Exception as log_err:
-                logger.warning(
-                    f"⚠️ Failed to log payment_attempt for order {order_id}: {log_err}"
-                )
-                payment_attempt_id = None
+            # Attempt-level logging is handled inside MultiPSPOrchestrator (best-effort),
+            # so we don't create a single aggregated payment_attempt row here.
+            payment_attempt_id = None
 
             # 使用 MultiPSPOrchestrator，按路由配置的优先级（preferred_psps）
             # 自动在 adyen → stripe → checkout 之间切换。
@@ -909,31 +874,7 @@ async def create_new_order(
                         f"⚠️ Failed to build payment_action for order {order_id}: {pa_err}"
                     )
 
-                # Update payment_attempt as success (best-effort)
-                if payment_attempt_id:
-                    try:
-                        await database.execute(
-                            """
-                            UPDATE payment_attempts
-                            SET status = :status,
-                                response_time_ms = :response_time_ms,
-                                error_code = NULL,
-                                error_message = NULL,
-                                psp_name = :psp_name,
-                                completed_at = NOW()
-                            WHERE attempt_id = :attempt_id
-                            """,
-                            {
-                                "status": "success",
-                                "response_time_ms": response_ms,
-                                "psp_name": final_psp,
-                                "attempt_id": payment_attempt_id,
-                            },
-                        )
-                    except Exception as log_err:
-                        logger.warning(
-                            f"⚠️ Failed to update payment_attempt {payment_attempt_id} as success: {log_err}"
-                        )
+                # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
 
                 # Log redirect URL when available（Checkout / PayPal / Stripe Checkout）
                 redirect_url = getattr(payment_intent, "redirect_url", None)
@@ -953,7 +894,7 @@ async def create_new_order(
                     payment_intent_id=payment_intent_id,
                     client_secret=client_secret or "",
                     payment_status="awaiting_payment",
-                    psp_used=psp_type,
+                    psp_used=final_psp,
                 )
                 await log_order_event(
                     event_type="order_created",
@@ -969,31 +910,7 @@ async def create_new_order(
                 )
             else:
                 logger.error(f"Payment intent creation failed via MultiPSP: {error}")
-                # Update payment_attempt as failed (best-effort)
-                if payment_attempt_id:
-                    try:
-                        await database.execute(
-                            """
-                            UPDATE payment_attempts
-                            SET status = :status,
-                                response_time_ms = :response_time_ms,
-                                error_message = :error_message,
-                                psp_name = :psp_name,
-                                completed_at = NOW()
-                            WHERE attempt_id = :attempt_id
-                            """,
-                            {
-                                "status": "failed",
-                                "response_time_ms": response_ms,
-                                "error_message": str(error) if error else None,
-                                "psp_name": final_psp,
-                                "attempt_id": payment_attempt_id,
-                            },
-                        )
-                    except Exception as log_err:
-                        logger.warning(
-                            f"⚠️ Failed to update payment_attempt {payment_attempt_id} as failed: {log_err}"
-                        )
+                # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
                 await log_order_event(
                     event_type="payment_intent_failed",
                     order_id=order_id,
@@ -1002,27 +919,6 @@ async def create_new_order(
                 )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
-            # Mark attempt as failed if we managed to create one
-            if payment_attempt_id:
-                try:
-                    await database.execute(
-                        """
-                        UPDATE payment_attempts
-                        SET status = :status,
-                            error_message = :error_message,
-                            completed_at = NOW()
-                        WHERE attempt_id = :attempt_id
-                        """,
-                        {
-                            "status": "failed",
-                            "error_message": str(e),
-                            "attempt_id": payment_attempt_id,
-                        },
-                    )
-                except Exception as log_err:
-                    logger.warning(
-                        f"⚠️ Failed to update payment_attempt {payment_attempt_id} in exception handler: {log_err}"
-                    )
             await log_order_event(
                 event_type="payment_intent_error",
                 order_id=order_id,
