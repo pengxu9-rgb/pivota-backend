@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import hashlib
 import httpx
+import re
 
 from services.merchant_store_service import get_primary_store
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingResult
@@ -115,12 +116,19 @@ class ShopifyStorefrontPricingService:
             debug_id=debug_id,
         )
 
+        country_for_prices = None
+        if shipping_address and isinstance(shipping_address, dict):
+            raw_country = (shipping_address.get("country") or "").strip().upper()
+            if re.fullmatch(r"[A-Z]{2}", raw_country or ""):
+                country_for_prices = raw_country
+
         # Build line items: best-effort unit price from variant nodes.
         line_items = await self._build_line_items(
             shop_domain=shop_domain,
             storefront_token=storefront_token,
             items=items,
             currency=cart.currency,
+            country=country_for_prices,
             debug_id=debug_id,
         )
 
@@ -597,6 +605,7 @@ mutation($cartId: ID!, $selectedDeliveryOptions: [CartSelectedDeliveryOptionInpu
         storefront_token: str,
         items: List[Dict[str, Any]],
         currency: str,
+        country: Optional[str],
         debug_id: str,
     ) -> List[Dict[str, Any]]:
         # Fetch variant prices in one round-trip using nodes().
@@ -610,7 +619,24 @@ mutation($cartId: ID!, $selectedDeliveryOptions: [CartSelectedDeliveryOptionInpu
             return []
 
         gids = [_gid("ProductVariant", vid) for vid in unique]
-        query = """
+        if country:
+            # IMPORTANT: cart pricing can be in the buyer's presentment currency (based on buyerIdentity country).
+            # Without `@inContext(country: ...)`, variant prices returned by nodes() default to shop currency,
+            # which leads to mismatched currency codes in checkout (e.g. cart totals USD but unit prices EUR).
+            query = """
+query($ids: [ID!]!, $country: CountryCode!) @inContext(country: $country) {
+  nodes(ids: $ids) {
+    ... on ProductVariant {
+      id
+      price { amount currencyCode }
+      compareAtPrice { amount currencyCode }
+    }
+  }
+}
+"""
+            variables = {"ids": gids, "country": country}
+        else:
+            query = """
 query($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on ProductVariant {
@@ -621,11 +647,13 @@ query($ids: [ID!]!) {
   }
 }
 """
+            variables = {"ids": gids}
+
         data = await self._storefront_graphql(
             shop_domain=shop_domain,
             storefront_token=storefront_token,
             query=query,
-            variables={"ids": gids},
+            variables=variables,
             debug_id=debug_id,
         )
         nodes = data.get("nodes") or []
