@@ -7,6 +7,7 @@ import random
 import httpx
 import string
 import json
+import asyncio
 from utils.auth import get_current_user
 from db.database import database
 from models.order_response import format_order_for_response
@@ -465,10 +466,10 @@ async def get_merchant_analytics(
     current_user: dict = Depends(get_current_user)
 ):
     """Get merchant analytics from real data"""
-    if current_user["role"] not in ["merchant", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
     try:
+        if current_user["role"] not in ["merchant", "admin"]:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
         # Get analytics from real orders
         analytics_query = """
             SELECT 
@@ -574,7 +575,13 @@ async def get_merchant_analytics(
             "data": data
         }
         
-    except Exception as e:
+    except asyncio.CancelledError:
+        raise
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except HTTPException:
+        raise
+    except BaseException as e:
         logger.error(f"Error fetching analytics for {merchant_id}: {e}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
