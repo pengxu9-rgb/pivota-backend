@@ -136,6 +136,7 @@ def _build_shopify_cache_payload(
     *,
     merchant_id: str,
     raw_shopify_product: Dict[str, Any],
+    currency: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any], StandardProduct]:
     """
     Build a StandardProduct-shaped cache payload for Shopify products.
@@ -144,7 +145,11 @@ def _build_shopify_cache_payload(
     can be parsed as StandardProduct. We still keep `raw` and other additive keys for
     debugging and recommendation_meta derivation.
     """
-    standard_product = ShopifyProductAdapter.convert_to_standard(raw_shopify_product, merchant_id)
+    standard_product = ShopifyProductAdapter.convert_to_standard(
+        raw_shopify_product,
+        merchant_id,
+        currency=(currency or "USD"),
+    )
     product_data: Dict[str, Any] = json.loads(standard_product.json())
 
     platform_product_id = str(raw_shopify_product.get("id") or standard_product.id or "")
@@ -631,6 +636,16 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             if not shop_domain or not access_token:
                 raise ShopifyConfigError("Shopify configuration missing (SHOPIFY_STORE_URL/SHOPIFY_ACCESS_TOKEN)")
 
+            shop_currency: Optional[str] = None
+            try:
+                shop_currency = await ShopifyProductAdapter.fetch_shop_currency(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    api_version=SHOPIFY_API_VERSION,
+                )
+            except Exception:
+                shop_currency = None
+
             # Pagination-aware import: fetch up to SHOPIFY_MAX_PAGES_PER_RUN pages.
             page_size = int(os.getenv("SHOPIFY_IMPORT_LIMIT", str(SHOPIFY_IMPORT_LIMIT)))
             if page_size < 1 or page_size > 250:
@@ -763,6 +778,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                         platform_product_id, product_data, standard_product = _build_shopify_cache_payload(
                             merchant_id=merchant_id,
                             raw_shopify_product=p,
+                            currency=shop_currency,
                         )
 
                         if sync_only_orderable and not bool(getattr(standard_product, "orderable", False)):
