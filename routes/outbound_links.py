@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, asc, desc, select, update
+from sqlalchemy import and_, asc, desc, func, select, update
 
 from db.database import database
 from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
@@ -572,6 +572,125 @@ async def employee_list_clicks(
     stmt = stmt.order_by(desc(outbound_click_events.c.created_at)).limit(limit).offset(offset)
     rows = await database.fetch_all(stmt)
     return {"clicks": [_to_click_out(r).model_dump() for r in rows], "count": len(rows), "offset": offset, "limit": limit}
+
+
+class ClickReportRow(BaseModel):
+    key: str
+    clicks: int
+    jobs: int
+    sessions: int
+    firstAt: Optional[str] = None
+    lastAt: Optional[str] = None
+
+
+@employee_router.get("/clicks/report", response_model=Dict[str, Any])
+async def employee_clicks_report(
+    market: Optional[str] = Query(None),
+    tool: Optional[str] = Query(None),
+    startAt: Optional[str] = Query(None),
+    endAt: Optional[str] = Query(None),
+    groupBy: str = Query("destDomain"),
+    limit: int = Query(200, ge=1, le=500),
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """
+    Aggregate outbound click events for ops reporting.
+
+    groupBy:
+      - destDomain (default)
+      - ruleId
+      - jobId
+      - day (UTC)
+    """
+    _ = current_user
+
+    def parse_dt(v: Optional[str]) -> Optional[datetime]:
+        if not v:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        # Accept YYYY-MM-DD by treating it as UTC midnight.
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            try:
+                return datetime.fromisoformat(f"{s}T00:00:00")
+            except Exception:
+                return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    start_dt = parse_dt(startAt)
+    end_dt = parse_dt(endAt)
+
+    group = str(groupBy or "destDomain").strip()
+    if group not in {"destDomain", "ruleId", "jobId", "day"}:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_GROUP_BY"})
+
+    key_expr = None
+    if group == "destDomain":
+        key_expr = outbound_click_events.c.dest_domain
+    elif group == "ruleId":
+        key_expr = outbound_click_events.c.rule_id
+    elif group == "jobId":
+        key_expr = outbound_click_events.c.job_id
+    else:
+        key_expr = func.date_trunc("day", outbound_click_events.c.created_at)
+
+    clauses = []
+    if market:
+        clauses.append(outbound_click_events.c.market == normalize_market(market))
+    if tool:
+        clauses.append(outbound_click_events.c.tool == normalize_tool(tool))
+    if start_dt:
+        clauses.append(outbound_click_events.c.created_at >= start_dt)
+    if end_dt:
+        clauses.append(outbound_click_events.c.created_at < end_dt)
+
+    stmt = (
+        select(
+            key_expr.label("key"),
+            func.count(outbound_click_events.c.id).label("clicks"),
+            func.count(func.distinct(outbound_click_events.c.job_id)).label("jobs"),
+            func.count(func.distinct(outbound_click_events.c.session_id)).label("sessions"),
+            func.min(outbound_click_events.c.created_at).label("first_at"),
+            func.max(outbound_click_events.c.created_at).label("last_at"),
+        )
+        .select_from(outbound_click_events)
+    )
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+    stmt = stmt.group_by(key_expr).order_by(desc(func.count(outbound_click_events.c.id))).limit(limit)
+
+    rows = await database.fetch_all(stmt)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        k = d.get("key")
+        if isinstance(k, datetime):
+            key = k.date().isoformat()
+        else:
+            key = str(k) if k is not None and str(k).strip() else "—"
+        out.append(
+            ClickReportRow(
+                key=key,
+                clicks=int(d.get("clicks") or 0),
+                jobs=int(d.get("jobs") or 0),
+                sessions=int(d.get("sessions") or 0),
+                firstAt=(d.get("first_at").isoformat() if isinstance(d.get("first_at"), datetime) else None),
+                lastAt=(d.get("last_at").isoformat() if isinstance(d.get("last_at"), datetime) else None),
+            ).model_dump()
+        )
+
+    return {
+        "groupBy": group,
+        "startAt": startAt,
+        "endAt": endAt,
+        "rows": out,
+        "count": len(out),
+        "limit": limit,
+    }
 
 
 class AllowedDomainIn(BaseModel):
