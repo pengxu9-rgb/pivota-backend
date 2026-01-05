@@ -522,10 +522,15 @@ async def get_merchant_analytics(
         revenue_growth = 0
         
         if growth and analytics:
-            if growth["orders_prev_30"] > 0:
-                order_growth = ((analytics["orders_last_30_days"] - growth["orders_prev_30"]) / growth["orders_prev_30"]) * 100
-            if growth["revenue_prev_30"] > 0:
-                revenue_growth = ((analytics["revenue_last_30_days"] - float(growth["revenue_prev_30"])) / float(growth["revenue_prev_30"])) * 100
+            orders_prev_30 = growth["orders_prev_30"] or 0
+            revenue_prev_30 = float(growth["revenue_prev_30"] or 0)
+            orders_last_30 = analytics["orders_last_30_days"] or 0
+            revenue_last_30 = float(analytics["revenue_last_30_days"] or 0)
+
+            if orders_prev_30 > 0:
+                order_growth = ((orders_last_30 - orders_prev_30) / orders_prev_30) * 100
+            if revenue_prev_30 > 0:
+                revenue_growth = ((revenue_last_30 - revenue_prev_30) / revenue_prev_30) * 100
         
         # Calculate Analytics rates
         total_orders = analytics["total_orders"] if analytics else 0
