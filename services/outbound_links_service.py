@@ -244,6 +244,7 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
 
     matched: Optional[Dict[str, Any]] = None
     matched_scope: Optional[str] = None
+    matched_scope_id: Optional[str] = None
     for scope, sid in scopes:
         if scope != "default" and not sid:
             continue
@@ -255,6 +256,7 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
         if rule:
             matched = rule
             matched_scope = scope
+            matched_scope_id = sid_norm
             break
 
     if not matched:
@@ -274,6 +276,9 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
     tokens = {
         "tool": tool,
         "market": market,
+        **({ "scope": matched_scope } if matched_scope else {}),
+        **({ "scope_id": matched_scope_id } if matched_scope_id else {}),
+        **({ "rule_id": str(matched.get("id")) } if matched.get("id") else {}),
     }
     dest_with_utm = apply_utm(dest, utm_template, tokens)
 
