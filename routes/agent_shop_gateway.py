@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 from collections import Counter
 from datetime import datetime
@@ -42,6 +43,70 @@ AGENT_API_BASE = os.getenv("AGENT_API_BASE", "https://web-production-fedb.up.rai
 AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API_KEY") or os.getenv("AGENT_API_KEY")
 
 logger = logging.getLogger(__name__)
+
+_MERCHANT_SHOPIFY_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
+_MERCHANT_SHOPIFY_CURRENCY_TTL_SECONDS = 6 * 60 * 60
+
+
+def _get_cached_merchant_shopify_currency(merchant_id: str) -> Optional[str]:
+    mid = (merchant_id or "").strip()
+    if not mid:
+        return None
+    hit = _MERCHANT_SHOPIFY_CURRENCY_CACHE.get(mid)
+    if not hit:
+        return None
+    expires_at, currency = hit
+    if expires_at < time.time():
+        _MERCHANT_SHOPIFY_CURRENCY_CACHE.pop(mid, None)
+        return None
+    return currency
+
+
+def _set_cached_merchant_shopify_currency(merchant_id: str, currency: str) -> None:
+    mid = (merchant_id or "").strip()
+    cur = (currency or "").strip().upper()
+    if not mid or not cur:
+        return
+    _MERCHANT_SHOPIFY_CURRENCY_CACHE[mid] = (
+        time.time() + _MERCHANT_SHOPIFY_CURRENCY_TTL_SECONDS,
+        cur,
+    )
+
+
+async def _resolve_shopify_currency_for_merchant(merchant_id: str) -> Optional[str]:
+    cached = _get_cached_merchant_shopify_currency(merchant_id)
+    if cached:
+        return cached
+
+    try:
+        from services.merchant_store_service import get_merchant_active_stores
+        from adapters.product_adapters import ShopifyProductAdapter
+
+        stores = await get_merchant_active_stores(merchant_id)
+        shopify_store = next(
+            (
+                s
+                for s in stores
+                if (s.get("platform") or "").lower() == "shopify"
+                and (s.get("domain") or "").strip()
+                and (s.get("api_key") or "").strip()
+            ),
+            None,
+        )
+        if not shopify_store:
+            return None
+
+        shop_domain = str(shopify_store["domain"]).strip()
+        access_token = str(shopify_store["api_key"]).strip()
+        cur = await ShopifyProductAdapter.fetch_shop_currency(
+            shop_domain=shop_domain,
+            access_token=access_token,
+        )
+        if cur:
+            _set_cached_merchant_shopify_currency(merchant_id, cur)
+        return cur
+    except Exception:
+        return None
 
 router = APIRouter(prefix="/agent/shop/v1", tags=["Shopping Gateway"])
 DEV_MODE = os.getenv("APP_ENV", "dev") != "production"
@@ -450,36 +515,46 @@ def _is_dict_visible_for_creator_featured(data: Dict[str, Any]) -> bool:
     return _is_status_active(status)
 
 
-async def _load_product_by_id(product_id: str) -> Optional[StandardProduct]:
+async def _load_product_by_id(
+    product_id: str,
+    *,
+    merchant_id: Optional[str] = None,
+) -> Optional[StandardProduct]:
     """
     Load a single product from cache by product_id/platform_product_id.
+
+    Important: product_id can collide across merchants/platforms, so we always
+    prefer filtering by merchant_id when available and ordering by cached_at.
     """
     from db.database import database
 
-    queries = [
-        """
-        SELECT product_data
-        FROM products_cache
-        WHERE product_data->>'product_id' = :pid
-        LIMIT 1
-        """,
-        """
-        SELECT product_data
-        FROM products_cache
-        WHERE platform_product_id = :pid
-        LIMIT 1
-        """,
-    ]
-    for q in queries:
-        try:
-            row = await database.fetch_one(q, {"pid": product_id})
-            if row and "product_data" in row:
-                try:
-                    return StandardProduct.parse_obj(row["product_data"])
-                except Exception:
-                    continue
-        except Exception:
-            continue
+    pid = (product_id or "").strip()
+    mid = (merchant_id or "").strip() or None
+    if not pid:
+        return None
+
+    query = """
+    SELECT product_data
+    FROM products_cache
+    WHERE (:mid IS NULL OR merchant_id = :mid)
+      AND (expires_at IS NULL OR expires_at > NOW())
+      AND (
+        product_data->>'product_id' = :pid
+        OR platform_product_id = :pid
+        OR product_data->>'id' = :pid
+      )
+    ORDER BY cached_at DESC
+    LIMIT 1
+    """
+    try:
+        row = await database.fetch_one(query, {"pid": pid, "mid": mid})
+        if row and "product_data" in row:
+            try:
+                return StandardProduct.parse_obj(row["product_data"])
+            except Exception:
+                return None
+    except Exception:
+        return None
     return None
 
 
@@ -552,6 +627,13 @@ async def _handle_find_products(
             status_code=502,
             detail=f"Failed to fetch products for merchant {merchant_id}: {error}",
         )
+
+    # Shopify currency correction (避免缓存里币种默认 USD 导致前端单位错误).
+    shop_currency = await _resolve_shopify_currency_for_merchant(merchant_id)
+    if shop_currency:
+        for p in products:
+            if (p.platform or "").lower() == "shopify":
+                p.currency = shop_currency
 
     # Visibility: only surface sellable products to the agent front-end.
     visible: List[StandardProduct] = []
@@ -1581,6 +1663,12 @@ async def _handle_find_products_multi(
                 try:
                     prod = StandardProduct(**product_data)
                     prod.merchant_id = prod.merchant_id or merchant_id
+                    if (prod.platform or "").lower() == "shopify":
+                        shop_currency = await _resolve_shopify_currency_for_merchant(
+                            prod.merchant_id
+                        )
+                        if shop_currency:
+                            prod.currency = shop_currency
                     if not _creator_featured_visible_product(prod):
                         continue
                     item = _standard_to_shop_product(prod)
@@ -1600,6 +1688,13 @@ async def _handle_find_products_multi(
                     title = product_data.get("title") or product_data.get("name") or ""
                     price = product_data.get("price") or product_data.get("compare_at_price") or 0
                     currency = product_data.get("currency") or "USD"
+                    if isinstance(merchant_id, str) and merchant_id:
+                        try:
+                            shop_currency = await _resolve_shopify_currency_for_merchant(merchant_id)
+                            if shop_currency:
+                                currency = shop_currency
+                        except Exception:
+                            pass
                     image_url = (
                         product_data.get("image_url")
                         or (product_data.get("images") or [{}])[0].get("src")
@@ -1662,9 +1757,12 @@ async def _handle_find_products_multi(
                         background_tasks=background_tasks,
                         force_cache_only=True,
                     )
+                    shop_currency = await _resolve_shopify_currency_for_merchant(mid)
                     for p in products:
                         if not _creator_featured_visible_product(p):
                             continue
+                        if shop_currency and (p.platform or "").lower() == "shopify":
+                            p.currency = shop_currency
                         item = _standard_to_shop_product(p)
                         item["merchant_name"] = name
                         mapped.append(item)
@@ -1702,7 +1800,10 @@ async def _handle_find_products_multi(
                 agent_id="shopping_ai_multi",
                 background_tasks=background_tasks,
             )
+            shop_currency = await _resolve_shopify_currency_for_merchant(mid)
             for p in products:
+                if shop_currency and (p.platform or "").lower() == "shopify":
+                    p.currency = shop_currency
                 merchant_products.append((p, name))
         except Exception:
             # Ignore individual merchant failures to keep cross-merchant search robust
@@ -2302,7 +2403,7 @@ async def _handle_find_similar_products(
     background_tasks = background_tasks or BackgroundTasks()
 
     # Try loading base product from cache first
-    base_product = await _load_product_by_id(payload.product_id)
+    base_product = await _load_product_by_id(payload.product_id, merchant_id=payload.merchant_id)
 
     # If not found in cache but we know the merchant, fall back to the
     # hybrid path so products that only exist in the realtime slice can
@@ -2900,7 +3001,7 @@ async def _handle_get_product_detail(
     # Fast path: try loading directly from products cache by product_id.
     # 对于已经通过产品列表曝光过的商品，这条路径通常是命中缓存的，
     # 能避免为单个商品再去拉整页 catalog，显著降低详情页延迟。
-    match: Optional[StandardProduct] = await _load_product_by_id(product_id)
+    match: Optional[StandardProduct] = await _load_product_by_id(product_id, merchant_id=merchant_id)
     query_source: str = "product_cache_direct" if match else "unknown"
 
     products: List[StandardProduct] = []
@@ -2931,7 +3032,7 @@ async def _handle_get_product_detail(
         if not match:
             # Second chance: if hybrid layer couldn't find it, try cache again in case
             # the product was recently synced but not yet surfaced in the hybrid slice.
-            match = await _load_product_by_id(product_id)
+            match = await _load_product_by_id(product_id, merchant_id=merchant_id)
             if match:
                 query_source = "product_cache_fallback"
 
@@ -2998,6 +3099,12 @@ async def _handle_get_product_detail(
 
         if not match:
             raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
+
+    # Shopify currency correction (avoid stale USD labels from cache rows).
+    if (match.platform or "").lower() == "shopify":
+        shop_currency = await _resolve_shopify_currency_for_merchant(merchant_id)
+        if shop_currency:
+            match.currency = shop_currency
 
     base = _standard_to_shop_product(match)
 

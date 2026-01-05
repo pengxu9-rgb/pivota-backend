@@ -69,6 +69,41 @@ class ShopifyProductAdapter:
     """Shopify 产品适配器：Shopify API → StandardProduct"""
 
     @staticmethod
+    async def fetch_shop_currency(
+        *,
+        shop_domain: str,
+        access_token: str,
+        api_version: str = "2024-07",
+    ) -> Optional[str]:
+        """
+        Fetch and cache Shopify shop currency (EUR/USD/etc.) for a shop domain.
+        Returns None when the currency cannot be fetched.
+        """
+        shop_domain = (shop_domain or "").strip()
+        access_token = (access_token or "").strip()
+        if not shop_domain or not access_token:
+            return None
+
+        cached = _get_cached_shop_currency(shop_domain)
+        if cached:
+            return cached
+
+        headers = {"X-Shopify-Access-Token": access_token}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                cur = await _fetch_shop_currency(
+                    client=client,
+                    shop_domain=shop_domain,
+                    headers=headers,
+                    api_version=api_version,
+                )
+            if cur:
+                _set_cached_shop_currency(shop_domain, cur)
+            return cur
+        except Exception:
+            return None
+
+    @staticmethod
     async def fetch_product_by_id(
         *,
         shop_domain: str,
