@@ -37,6 +37,7 @@ from services.agent_ranking_service import (
 )
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
+from db.products import get_cached_products
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
@@ -59,6 +60,59 @@ async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
         )
     
     return merchant
+
+async def load_cached_product_data_for_merchant(merchant_id: str) -> List[Dict[str, Any]]:
+    """
+    Load cached StandardProduct dicts for a merchant across all active stores.
+
+    Agent endpoints should be read-only and avoid realtime pulls; use cache rows from `products_cache`.
+    """
+    stores = await get_merchant_active_stores(merchant_id)
+    if not stores:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for store in stores:
+        platform = (store or {}).get("platform")
+        if not platform:
+            continue
+        try:
+            cached_rows = await get_cached_products(merchant_id, platform, include_expired=False)
+            rows.extend(cached_rows or [])
+        except Exception as e:
+            logger.error(f"Failed to load cached products for merchant={merchant_id} platform={platform}: {e}")
+            continue
+
+    products: List[Dict[str, Any]] = []
+    for row in rows:
+        data = (row or {}).get("product_data")
+        if isinstance(data, dict):
+            products.append(data)
+    return products
+
+def extract_variant_id(product: Dict[str, Any]) -> Optional[str]:
+    variants = product.get("variants")
+    if isinstance(variants, list) and variants:
+        first = variants[0]
+        if isinstance(first, dict):
+            vid = first.get("variant_id") or first.get("id")
+            if vid:
+                return str(vid)
+    meta = product.get("platform_metadata")
+    if isinstance(meta, dict):
+        vid = meta.get("variant_id") or meta.get("variantId")
+        if vid:
+            return str(vid)
+    return None
+
+def extract_sku(product: Dict[str, Any]) -> Optional[str]:
+    variants = product.get("variants")
+    if isinstance(variants, list) and variants and isinstance(variants[0], dict):
+        sku = variants[0].get("sku")
+        if sku:
+            return str(sku)
+    sku = product.get("sku")
+    return str(sku) if sku else None
 
 
 # ============================================================================
@@ -512,22 +566,20 @@ async def agent_get_product(
             }
         
         # 从缓存获取产品
-        cached_products = await get_cached_products(merchant_id)
-        
-        if cached_products and cached_products.get("products"):
-            for product in cached_products["products"]:
-                if str(product.get("id")) == str(product_id):
-                    # 记录请求
-                    background_tasks.add_task(
-                        log_agent_request,
-                        context=context,
-                        status_code=200,
-                        merchant_id=merchant_id
-                    )
-                    return {
-                        "status": "success",
-                        "product": product
-                    }
+        products = await load_cached_product_data_for_merchant(merchant_id)
+        for product in products:
+            pid = product.get("product_id") or product.get("id")
+            if str(pid) == str(product_id):
+                background_tasks.add_task(
+                    log_agent_request,
+                    context=context,
+                    status_code=200,
+                    merchant_id=merchant_id
+                )
+                return {
+                    "status": "success",
+                    "product": product
+                }
         
         raise HTTPException(status_code=404, detail="Product not found")
         
@@ -574,12 +626,13 @@ async def agent_validate_cart(
         merchant = await verify_merchant_active(merchant_id)
         
         # 获取产品信息
-        cached_products = await get_cached_products(merchant_id)
         product_map = {}
-        
-        if cached_products and cached_products.get("products"):
-            for product in cached_products["products"]:
-                product_map[str(product.get("id"))] = product
+        products = await load_cached_product_data_for_merchant(merchant_id)
+        for product in products:
+            pid = product.get("product_id") or product.get("id")
+            if pid is None:
+                continue
+            product_map[str(pid)] = product
         
         # 验证每个商品
         validated_items = []
@@ -588,7 +641,10 @@ async def agent_validate_cart(
         
         for item in items:
             product_id = str(item.get("product_id"))
-            quantity = item.get("quantity", 1)
+            try:
+                quantity = int(item.get("quantity", 1) or 1)
+            except Exception:
+                quantity = 1
             
             if product_id not in product_map:
                 validation_errors.append({
@@ -608,15 +664,26 @@ async def agent_validate_cart(
                 continue
             
             # 计算价格
-            unit_price = Decimal(str(product.get("price", 0)))
+            try:
+                unit_price = Decimal(str(product.get("price", 0) or 0))
+            except Exception:
+                unit_price = Decimal("0")
             item_subtotal = unit_price * quantity
             subtotal += item_subtotal
+
+            variant_id = extract_variant_id(product)
+            if not variant_id:
+                validation_errors.append({
+                    "product_id": product_id,
+                    "error": "Missing variant_id"
+                })
+                continue
             
             validated_items.append({
                 "product_id": product_id,
                 "product_title": product.get("title"),
-                "variant_id": product.get("variant_id"),
-                "sku": product.get("sku"),
+                "variant_id": variant_id,
+                "sku": extract_sku(product),
                 "quantity": quantity,
                 "unit_price": str(unit_price),
                 "subtotal": str(item_subtotal),
