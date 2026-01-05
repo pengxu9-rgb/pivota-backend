@@ -286,6 +286,7 @@ class QuoteService:
             "promotion_lines": result.promotion_lines,
             "line_items": result.line_items,
             "delivery_options": result.delivery_options,
+            "checkout_url": (result.debug or {}).get("checkout_url"),
         }
 
     async def load_active_quote_or_raise(self, *, quote_id: str) -> QuoteSnapshot:

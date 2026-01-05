@@ -44,6 +44,7 @@ async def preview_quote(
         "expires_at": result["expires_at"],
         "engine": result.get("engine") or "shopify_rest_checkout",
         "engine_ref": result["engine_ref"],
+        "checkout_url": result.get("checkout_url"),
         "currency": result["currency"],
         "pricing": {
             "subtotal": parse_decimal_money(pricing.get("subtotal")),

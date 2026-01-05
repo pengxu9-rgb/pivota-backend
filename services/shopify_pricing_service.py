@@ -171,6 +171,7 @@ class ShopifyPricingService:
                 str(checkout_payload).encode("utf-8")
             ).hexdigest()[:16],
             "shopify_status_code": resp.status_code,
+            "checkout_url": checkout.get("web_url"),
             "rounding": rounding_meta,
             "selected_delivery_option": selected_delivery_option,
         }
