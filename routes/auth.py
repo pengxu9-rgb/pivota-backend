@@ -264,10 +264,27 @@ async def login(data: LoginRequest):
         # [Phase 6.2] For agents, get their agent_id from agents table
         agent_id = None
         if user['role'] == 'agent':
-            agent_record = await database.fetch_one(
-                "SELECT agent_id FROM agents WHERE email = :email LIMIT 1",
-                {"email": user['email']}
-            )
+            try:
+                agent_record = await database.fetch_one(
+                    "SELECT agent_id FROM agents WHERE email = :email LIMIT 1",
+                    {"email": user['email']}
+                )
+            except Exception as e:
+                # Backward compatibility: older deployments had an `agents` table
+                # without an `email` column. Add it non-destructively and retry.
+                if 'column "email" does not exist' in str(e):
+                    try:
+                        await database.execute(
+                            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS email VARCHAR(255)"
+                        )
+                        agent_record = await database.fetch_one(
+                            "SELECT agent_id FROM agents WHERE email = :email LIMIT 1",
+                            {"email": user['email']},
+                        )
+                    except Exception:
+                        agent_record = None
+                else:
+                    raise
             if agent_record:
                 agent_id = agent_record['agent_id']
         

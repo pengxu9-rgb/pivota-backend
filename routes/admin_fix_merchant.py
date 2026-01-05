@@ -1,6 +1,7 @@
 """Admin endpoint to fix merchant_id mismatch"""
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 from db.database import database
 from routes.auth_routes import require_admin
 import logging
@@ -16,6 +17,11 @@ class MergeMerchantsRequest(BaseModel):
     keep_merchant_id: str
     remove_merchant_id: str
     user_email: str
+
+class FixUserRoleRequest(BaseModel):
+    email: str
+    role: str
+    merchant_id: Optional[str] = None
 
 @router.post("/merchant-id")
 async def fix_merchant_id(
@@ -133,3 +139,84 @@ async def merge_merchants(
     except Exception as e:
         logger.error(f"Failed to merge merchants: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to merge: {str(e)}")
+
+
+@router.post("/user-role")
+async def fix_user_role(
+    request: FixUserRoleRequest,
+    current_user: dict = Depends(require_admin),
+):
+    """
+    Fix a user's role (and merchant_id when role=merchant).
+
+    Useful when a merchant was accidentally created with role=agent and cannot
+    login due to agent lookup/schema mismatch.
+    """
+    valid_roles = {"super_admin", "admin", "employee", "outsourced", "merchant", "agent"}
+    if request.role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"Invalid role: {request.role}")
+
+    try:
+        merchant_id = request.merchant_id
+        if request.role == "merchant" and not merchant_id:
+            merchant = await database.fetch_one(
+                """
+                SELECT merchant_id
+                FROM merchant_onboarding
+                WHERE contact_email = :email
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                {"email": request.email},
+            )
+            if merchant:
+                merchant_id = merchant["merchant_id"]
+
+        # Update users row
+        try:
+            if merchant_id and request.role == "merchant":
+                user = await database.fetch_one(
+                    """
+                    UPDATE users
+                    SET role = :role, merchant_id = :merchant_id
+                    WHERE email = :email
+                    RETURNING id, email, role, merchant_id
+                    """,
+                    {"email": request.email, "role": request.role, "merchant_id": merchant_id},
+                )
+            else:
+                user = await database.fetch_one(
+                    """
+                    UPDATE users
+                    SET role = :role
+                    WHERE email = :email
+                    RETURNING id, email, role, merchant_id
+                    """,
+                    {"email": request.email, "role": request.role},
+                )
+        except Exception as e:
+            # Some legacy schemas may not have users.merchant_id yet
+            logger.warning(f"Failed to update users.merchant_id (column may not exist): {e}")
+            user = await database.fetch_one(
+                """
+                UPDATE users
+                SET role = :role
+                WHERE email = :email
+                RETURNING id, email, role
+                """,
+                {"email": request.email, "role": request.role},
+            )
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        return {
+            "status": "success",
+            "user": dict(user),
+            "resolved_merchant_id": merchant_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fix user role: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fix user role: {str(e)}")
