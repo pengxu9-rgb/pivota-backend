@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+import logging
 import random
 import httpx
 import string
@@ -11,6 +12,7 @@ from db.database import database
 from models.order_response import format_order_for_response
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Demo data for merchant dashboard
 DEMO_MERCHANT_DATA = {
