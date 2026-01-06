@@ -130,12 +130,17 @@ async def endpoints_summary() -> Dict[str, Any]:
             {"method": "GET", "path": "/health", "desc": "Health check"},
             {"method": "GET", "path": "/merchants", "desc": "List merchants"},
             {"method": "GET", "path": "/products/search", "desc": "Search products"},
+            {
+                "method": "POST",
+                "path": "/recommendations/roles/normalize",
+                "desc": "Normalize roleHints → roleIds (recommendations)",
+            },
+            {"method": "POST", "path": "/recommendations/feed", "desc": "Get recommendations feed (role → urls/offers)"},
             {"method": "POST", "path": "/orders/create", "desc": "Create order"},
             {"method": "GET", "path": "/orders/{order_id}", "desc": "Get order"},
             {"method": "POST", "path": "/payments", "desc": "Create payment"},
         ],
     }
-
 
 
 

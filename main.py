@@ -195,6 +195,7 @@ from routes.shopify_manual import router as shopify_manual_router
 from routes.fulfillment_api import router as fulfillment_api_router
 from routes.refund_api import router as refund_api_router
 from routes.agent_docs import router as agent_docs_router
+from routes.agent_recommendations import router as agent_recommendations_router
 from routes.fix_orders_table import router as fix_orders_table_router
 from routes.agent_metrics import router as agent_metrics_router
 from routes.agent_keys import router as agent_keys_router
@@ -564,6 +565,7 @@ app.include_router(order_router)  # Order processing
 app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-facing)
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
+app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_management_router)  # Agent management
