@@ -31,6 +31,7 @@ from routes.ops_routes import router as ops_router
 from routes.psp_routes import router as psp_router
 from routes.payment_routes import router as payment_router
 from routes.agent_checkout_intents import router as agent_checkout_intents_router
+from routes.employee_settlement_rules import employee_router as employee_settlement_router
 
 # Dashboard routers
 from routes.dashboard_routes import router as dashboard_router
@@ -436,6 +437,7 @@ app.include_router(admin_debug_psp_router)  # Admin debug PSP data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
 # Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
 app.include_router(employee_agent_mgmt_router)
+app.include_router(employee_settlement_router)
 # TEMPORARILY DISABLED - causing "Failed to fetch agents: get" error
 # app.include_router(employee_agents_management_router)  # Employee agents management
 app.include_router(admin_fix_agents_router)  # Admin fix agents data
