@@ -1712,6 +1712,7 @@ async def agent_confirm_payment(
 async def agent_get_order(
     order_id: str,
     background_tasks: BackgroundTasks,
+    buyer_ref: Optional[str] = None,
     context: AgentContext = Depends(get_agent_context),
 ):
     """获取订单状态"""
@@ -1720,10 +1721,16 @@ async def agent_get_order(
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        
-        # 验证商户访问权限
-        if not context.can_access_merchant(order["merchant_id"]):
-            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # Agent-scoped access: allow by (agent_id + buyer_ref) without requiring merchant permissions.
+        if buyer_ref:
+            stored = (order.get("metadata") or {}).get("buyer_ref")
+            if order.get("agent_id") != context.agent_id or str(stored or "") != str(buyer_ref):
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
+        else:
+            # Legacy access: validate merchant access.
+            if not context.can_access_merchant(order["merchant_id"]):
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
         
         # 记录请求
         background_tasks.add_task(
@@ -1777,6 +1784,7 @@ async def agent_get_order(
 async def agent_list_orders(
     background_tasks: BackgroundTasks,
     merchant_id: Optional[str] = None,
+    buyer_ref: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
@@ -1806,6 +1814,11 @@ async def agent_list_orders(
         if status:
             query += " AND status = :status"
             params["status"] = status
+
+        # Agent-scoped filtering by buyer_ref (stored in metadata JSON).
+        if buyer_ref:
+            query += " AND (metadata ->> 'buyer_ref') = :buyer_ref"
+            params["buyer_ref"] = buyer_ref
         
         query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
         params["limit"] = limit
@@ -1859,6 +1872,7 @@ async def agent_list_orders(
 async def agent_refund_order(
     order_id: str,
     background_tasks: BackgroundTasks,
+    buyer_ref: Optional[str] = None,
     context: AgentContext = Depends(get_agent_context)
 ):
     """Proxy refund to admin refund API, but enforce agent ownership."""
@@ -1866,8 +1880,13 @@ async def agent_refund_order(
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        if order.get("agent_id") != context.agent_id:
-            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        if buyer_ref:
+            stored = (order.get("metadata") or {}).get("buyer_ref")
+            if order.get("agent_id") != context.agent_id or str(stored or "") != str(buyer_ref):
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
+        else:
+            if order.get("agent_id") != context.agent_id:
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
 
         # Build refund request (full refund)
         class _Req(BaseModel):
@@ -1889,6 +1908,7 @@ async def agent_refund_order(
 @router.post("/orders/{order_id}/cancel")
 async def agent_cancel_order(
     order_id: str,
+    buyer_ref: Optional[str] = None,
     context: AgentContext = Depends(get_agent_context)
 ):
     """Cancel an order owned by the agent (defensive - no optional columns)."""
@@ -1896,8 +1916,13 @@ async def agent_cancel_order(
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        if order.get("agent_id") != context.agent_id:
-            raise HTTPException(status_code=403, detail="Not authorized for this order")
+        if buyer_ref:
+            stored = (order.get("metadata") or {}).get("buyer_ref")
+            if order.get("agent_id") != context.agent_id or str(stored or "") != str(buyer_ref):
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
+        else:
+            if order.get("agent_id") != context.agent_id:
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
 
         # Block cancel if clearly paid/succeeded
         paid_status = str(order.get("payment_status") or "").lower()
