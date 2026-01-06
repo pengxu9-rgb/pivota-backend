@@ -148,7 +148,18 @@ class ShopifyPricingService:
         payload = resp.json() or {}
         checkout = payload.get("checkout") or {}
         token = checkout.get("token") or ""
-        currency = checkout.get("currency") or "USD"
+        # Checkout API currency can be missing or inconsistent across shops/versions.
+        # When absent, derive it from the `*_price_set` money objects so we don't label
+        # shop currency amounts (e.g. EUR) as USD.
+        currency = (
+            checkout.get("currency")
+            or checkout.get("presentment_currency")
+            or (checkout.get("total_price_set") or {}).get("presentment_money", {}).get("currency_code")
+            or (checkout.get("subtotal_price_set") or {}).get("presentment_money", {}).get("currency_code")
+            or (checkout.get("total_price_set") or {}).get("shop_money", {}).get("currency_code")
+            or (checkout.get("subtotal_price_set") or {}).get("shop_money", {}).get("currency_code")
+            or "USD"
+        )
 
         pricing = self._extract_pricing(checkout)
         promotion_lines, rounding_meta = self._extract_promotion_lines(

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import hashlib
 import httpx
+import os
 import re
 
 from services.merchant_store_service import get_primary_store
@@ -75,6 +76,19 @@ class ShopifyStorefrontPricingService:
         self.api_version = api_version
         self.timeout_seconds = timeout_seconds
 
+    def _use_buyer_country_for_pricing(self) -> bool:
+        # When enabled, we set buyerIdentity.countryCode and @inContext(country: ...)
+        # so Shopify returns the buyer's presentment currency for that country.
+        # Disable this to always price in shop currency (useful when a merchant does
+        # not want multi-currency pricing).
+        raw = (
+            os.getenv("SHOPIFY_STOREFRONT_USE_BUYER_COUNTRY_FOR_PRICING")
+            or os.getenv("SHOPIFY_STOREFRONT_USE_BUYER_COUNTRY_FOR_CURRENCY")
+            or "true"
+        )
+        v = str(raw).strip().lower()
+        return v not in {"0", "false", "no", "off"}
+
     async def preview_cart_quote(
         self,
         *,
@@ -106,6 +120,7 @@ class ShopifyStorefrontPricingService:
                 debug_id,
             )
 
+        use_buyer_country_for_pricing = self._use_buyer_country_for_pricing()
         cart = await self._create_cart(
             shop_domain=shop_domain,
             storefront_token=storefront_token,
@@ -113,11 +128,12 @@ class ShopifyStorefrontPricingService:
             discount_codes=discount_codes,
             shipping_address=shipping_address,
             selected_delivery_option=selected_delivery_option,
+            use_buyer_country_for_pricing=use_buyer_country_for_pricing,
             debug_id=debug_id,
         )
 
         country_for_prices = None
-        if shipping_address and isinstance(shipping_address, dict):
+        if use_buyer_country_for_pricing and shipping_address and isinstance(shipping_address, dict):
             raw_country = (shipping_address.get("country") or "").strip().upper()
             if re.fullmatch(r"[A-Z]{2}", raw_country or ""):
                 country_for_prices = raw_country
@@ -241,6 +257,7 @@ class ShopifyStorefrontPricingService:
         discount_codes: List[str],
         shipping_address: Optional[Dict[str, Any]],
         selected_delivery_option: Optional[Dict[str, Any]],
+        use_buyer_country_for_pricing: bool,
         debug_id: str,
     ) -> StorefrontCartResult:
         lines = []
@@ -292,7 +309,7 @@ mutation($input: CartInput!) {
         variables: Dict[str, Any] = {"input": {"lines": lines}}
         if discount_codes:
             variables["input"]["discountCodes"] = discount_codes
-        if country:
+        if use_buyer_country_for_pricing and country:
             variables["input"]["buyerIdentity"] = {"countryCode": country}
 
         data = await self._storefront_graphql(

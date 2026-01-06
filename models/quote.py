@@ -75,3 +75,6 @@ class QuotePreviewResponse(BaseModel):
     promotion_lines: List[PromotionLine]
     line_items: List[QuoteLineItem]
     delivery_options: Optional[List[Dict[str, Any]]] = None
+    # Debug helpers (safe): allow clients to understand why an engine was chosen.
+    debug_id: Optional[str] = None
+    attempts: Optional[List[Dict[str, Any]]] = None

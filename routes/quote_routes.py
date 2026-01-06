@@ -56,6 +56,8 @@ async def preview_quote(
         "promotion_lines": result.get("promotion_lines") or [],
         "line_items": result.get("line_items") or [],
         "delivery_options": result.get("delivery_options"),
+        "debug_id": result.get("debug_id"),
+        "attempts": (result.get("attempts") or None),
     }
 
     # MVP measurement scaffolding (best-effort): offer/quote generated.

@@ -496,6 +496,15 @@ async def create_new_order(
 
                 snap = quote.snapshot_json or {}
                 pricing = (snap.get("pricing") or {}) if isinstance(snap, dict) else {}
+                quote_currency = None
+                try:
+                    quote_currency = str(snap.get("currency") or "").strip().upper() if isinstance(snap, dict) else None
+                except Exception:
+                    quote_currency = None
+                if quote_currency:
+                    # Quote-first: currency is locked by the quote snapshot, not by the request payload.
+                    # This prevents mismatches where amounts are from EUR but currency is defaulted to USD.
+                    order_request.currency = quote_currency
 
                 subtotal = parse_decimal_money(pricing.get("subtotal"))
                 discount_total = parse_decimal_money(pricing.get("discount_total"))
