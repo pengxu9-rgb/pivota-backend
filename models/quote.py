@@ -70,7 +70,16 @@ class QuotePreviewResponse(BaseModel):
     engine: Literal["shopify_rest_checkout", "shopify_storefront_cart"]
     engine_ref: str
     checkout_url: Optional[str] = None
+    # Backward compatible currency field (historically used across clients).
+    # Prefer the explicit fields below for new clients.
     currency: str
+    # Phase 0: explicit currency terminology (non-MoR path).
+    # - presentment_currency: platform-authoritative display currency for the quote
+    # - charge_currency: currency the buyer will be charged in (currently same as presentment in non-MoR)
+    # - settlement_currency: currency the merchant settles in (may be unknown at quote time)
+    presentment_currency: str
+    charge_currency: str
+    settlement_currency: Optional[str] = None
     pricing: QuotePricing
     promotion_lines: List[PromotionLine]
     line_items: List[QuoteLineItem]

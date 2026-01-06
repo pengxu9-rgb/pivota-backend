@@ -39,6 +39,7 @@ async def preview_quote(
         )
 
     pricing = result["pricing"]
+    presentment_currency = result["currency"]
     response = {
         "quote_id": result["quote_id"],
         "expires_at": result["expires_at"],
@@ -46,6 +47,13 @@ async def preview_quote(
         "engine_ref": result["engine_ref"],
         "checkout_url": result.get("checkout_url"),
         "currency": result["currency"],
+        "presentment_currency": presentment_currency,
+        # Non-MoR: charge currency is currently the same as the platform quote currency.
+        # When we introduce FX/PSP conversion, this will diverge.
+        "charge_currency": presentment_currency,
+        # Settlement currency is determined by merchant/PSP contract and can be configured
+        # via employee settlement rules; it may not be known at quote time.
+        "settlement_currency": None,
         "pricing": {
             "subtotal": parse_decimal_money(pricing.get("subtotal")),
             "discount_total": parse_decimal_money(pricing.get("discount_total")),

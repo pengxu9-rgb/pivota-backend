@@ -517,6 +517,7 @@ async def create_new_order(
                     "expires_at": quote.expires_at.isoformat() if quote.expires_at else None,
                     "engine": quote.engine,
                     "engine_ref": quote.engine_ref,
+                    "currency": quote_currency,
                     "request_fingerprint": quote.request_fingerprint,
                     "quote_hash_sha256": quote.quote_hash_sha256,
                     "pricing": pricing,

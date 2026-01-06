@@ -1537,6 +1537,13 @@ async def agent_create_order(
             "total": str(order_response.total),  # 保留兼容 (deprecated)
             "total_amount": float(order_response.total),  # 新增：标准字段
             "currency": order_response.currency,
+            # Phase 0: explicit currency terminology (non-MoR path).
+            # Presentment currency is the platform-authoritative quote currency (when quote-first),
+            # charge currency is the currency used for PSP charge (currently same as order_response.currency),
+            # settlement currency may be configured via employee settlement rules (not returned here yet).
+            "presentment_currency": order_response.currency,
+            "charge_currency": order_response.currency,
+            "settlement_currency": None,
             "payment": {
                 "psp": psp_type,
                 "client_secret": order_response.client_secret,
@@ -1576,6 +1583,11 @@ async def agent_create_order(
                     "engine": pricing_quote.get("engine"),
                     "engine_ref": pricing_quote.get("engine_ref"),
                 }
+                # Override presentment/charge currency when quote snapshot is available.
+                q_currency = pricing_quote.get("currency")
+                if q_currency:
+                    response["presentment_currency"] = q_currency
+                    response["charge_currency"] = q_currency
         except Exception:
             # Best-effort: do not break order creation if quote metadata read fails.
             pass
