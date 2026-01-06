@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from db.database import database
 from utils.auth import get_current_employee
+from services.settlement_rules_service import ensure_settlement_rules_table, select_best_settlement_rule
 
 
 employee_router = APIRouter(prefix="/employee/settlement", tags=["employee-settlement"])
@@ -43,38 +44,7 @@ def _money(v: Any) -> Decimal:
 
 
 async def _ensure_tables() -> None:
-    # Phase 2 (MVP): settlement rules and manual FX rates can be configured by employees.
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settlement_rules (
-          id TEXT PRIMARY KEY,
-          status TEXT NOT NULL DEFAULT 'active', -- active|disabled
-          merchant_id TEXT NULL,
-          platform TEXT NULL,
-          market TEXT NULL,
-          psp TEXT NULL,
-          charge_currency TEXT NULL,
-          settlement_currency TEXT NOT NULL,
-          psp_fee_bps INTEGER NOT NULL DEFAULT 0,
-          psp_fee_fixed NUMERIC(18,6) NOT NULL DEFAULT 0,
-          platform_fee_bps INTEGER NOT NULL DEFAULT 0,
-          platform_fee_fixed NUMERIC(18,6) NOT NULL DEFAULT 0,
-          fx_rate NUMERIC(18,10) NULL,
-          fx_rate_as_of TIMESTAMPTZ NULL,
-          fx_spread_bps INTEGER NOT NULL DEFAULT 0,
-          notes TEXT NULL,
-          created_by TEXT NULL,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_settlement_rules_lookup
-          ON settlement_rules(merchant_id, platform, market, psp, charge_currency, status, updated_at)
-        """
-    )
+    await ensure_settlement_rules_table()
 
 
 class SettlementRule(BaseModel):
@@ -176,34 +146,13 @@ def _match_score(rule: Dict[str, Any], ctx: Dict[str, Optional[str]]) -> int:
 
 
 async def _select_best_rule(*, merchant_id: str, platform: Optional[str], market: Optional[str], psp: Optional[str], charge_currency: Optional[str]) -> Optional[Dict[str, Any]]:
-    await _ensure_tables()
-    rows = await database.fetch_all(
-        """
-        SELECT *
-        FROM settlement_rules
-        WHERE status = 'active'
-          AND (merchant_id IS NULL OR merchant_id = :merchant_id)
-        ORDER BY updated_at DESC
-        LIMIT 200
-        """,
-        {"merchant_id": merchant_id},
+    return await select_best_settlement_rule(
+        merchant_id=merchant_id,
+        platform=platform,
+        market=market,
+        psp=psp,
+        charge_currency=charge_currency,
     )
-    ctx = {
-        "merchant_id": merchant_id,
-        "platform": platform,
-        "market": market,
-        "psp": psp,
-        "charge_currency": charge_currency,
-    }
-    best = None
-    best_score = -1
-    for r in rows or []:
-        d = dict(r)
-        score = _match_score(d, ctx)
-        if score > best_score:
-            best = d
-            best_score = score
-    return best
 
 
 def _row_to_rule(row: Dict[str, Any]) -> SettlementRule:

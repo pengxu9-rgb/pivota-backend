@@ -1584,10 +1584,17 @@ async def agent_create_order(
                     "engine_ref": pricing_quote.get("engine_ref"),
                 }
                 # Override presentment/charge currency when quote snapshot is available.
-                q_currency = pricing_quote.get("currency")
+                q_currency = (
+                    pricing_quote.get("charge_currency")
+                    or pricing_quote.get("presentment_currency")
+                    or pricing_quote.get("currency")
+                )
                 if q_currency:
                     response["presentment_currency"] = q_currency
                     response["charge_currency"] = q_currency
+                q_settlement = pricing_quote.get("settlement_currency")
+                if q_settlement:
+                    response["settlement_currency"] = q_settlement
         except Exception:
             # Best-effort: do not break order creation if quote metadata read fails.
             pass

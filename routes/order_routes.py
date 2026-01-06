@@ -506,6 +506,12 @@ async def create_new_order(
                     # This prevents mismatches where amounts are from EUR but currency is defaulted to USD.
                     order_request.currency = quote_currency
 
+                settlement_currency = None
+                try:
+                    settlement_currency = str(snap.get("settlement_currency") or "").strip().upper() if isinstance(snap, dict) else None
+                except Exception:
+                    settlement_currency = None
+
                 subtotal = parse_decimal_money(pricing.get("subtotal"))
                 discount_total = parse_decimal_money(pricing.get("discount_total"))
                 shipping_fee = parse_decimal_money(pricing.get("shipping_fee"))
@@ -518,6 +524,7 @@ async def create_new_order(
                     "engine": quote.engine,
                     "engine_ref": quote.engine_ref,
                     "currency": quote_currency,
+                    "settlement_currency": settlement_currency,
                     "request_fingerprint": quote.request_fingerprint,
                     "quote_hash_sha256": quote.quote_hash_sha256,
                     "pricing": pricing,
