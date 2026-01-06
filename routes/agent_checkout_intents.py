@@ -82,6 +82,15 @@ async def create_checkout_intent(
     merchant_ids = sorted({str(it.merchant_id).strip() for it in req.items if str(it.merchant_id or "").strip()})
     if not merchant_ids:
         raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "items[] must include merchant_id"})
+    if len(merchant_ids) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MULTI_MERCHANT_NOT_SUPPORTED",
+                "message": "Create one checkout intent per merchant_id (split the cart by merchant).",
+                "merchant_ids": merchant_ids,
+            },
+        )
 
     for mid in merchant_ids:
         if not context.can_access_merchant(mid):
