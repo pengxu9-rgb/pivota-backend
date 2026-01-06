@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from routes.agent_auth import AgentContext, get_agent_context
+from db.database import database
+import uuid
 
 
 router = APIRouter(prefix="/agent/v1/checkout", tags=["agent-checkout"])
@@ -69,6 +71,8 @@ class CreateCheckoutIntentRequest(BaseModel):
     market: Optional[str] = None
     locale: Optional[str] = None
     source: Optional[str] = None
+    customer_email: Optional[str] = None
+    shipping_address: Optional[Dict[str, Any]] = None
 
 
 @router.post("/intents")
@@ -102,6 +106,36 @@ async def create_checkout_intent(
     locale = (req.locale or "").strip().lower() or None
     source = (req.source or "").strip().lower() or None
 
+    intent_id: Optional[str] = None
+    expires_at_sec = int(time.time()) + 60 * 60
+    prefill: Optional[Dict[str, Any]] = None
+    if req.customer_email or req.shipping_address:
+        prefill = {
+            "customer_email": (req.customer_email or "").strip() or None,
+            "shipping_address": req.shipping_address,
+        }
+
+    # Best-effort: store prefill server-side (avoid leaking into URLs/tokens).
+    # If the table isn't migrated yet, we still return a usable checkout_url without prefill.
+    if prefill:
+        try:
+            intent_id = f"ci_{uuid.uuid4().hex}"
+            await database.execute(
+                """
+                INSERT INTO checkout_intents (intent_id, agent_id, buyer_ref, expires_at, prefill, created_at, updated_at)
+                VALUES (:intent_id, :agent_id, :buyer_ref, to_timestamp(:expires_at), :prefill::jsonb, NOW(), NOW())
+                """,
+                {
+                    "intent_id": intent_id,
+                    "agent_id": context.agent_id,
+                    "buyer_ref": buyer_ref,
+                    "expires_at": expires_at_sec,
+                    "prefill": json.dumps(prefill, ensure_ascii=False),
+                },
+            )
+        except Exception:
+            intent_id = None
+
     token = mint_checkout_token(
         {
             "agent_id": context.agent_id,
@@ -111,6 +145,7 @@ async def create_checkout_intent(
             "locale": locale,
             "merchant_ids": merchant_ids,
             "scopes": ["checkout"],
+            **({"intent_id": intent_id} if intent_id else {}),
             # Bind items to the token (merchant-scoped enforcement is applied at auth;
             # item-level enforcement can be added later if needed).
             "items": [it.model_dump() for it in req.items],
@@ -143,5 +178,50 @@ async def create_checkout_intent(
     return {
         "checkout_token": token,
         "checkout_url": checkout_url,
-        "expires_at": int(time.time()) + 60 * 60,
+        "expires_at": expires_at_sec,
     }
+
+
+@router.get("/prefill")
+async def get_checkout_prefill(
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Return checkout prefill data for the current checkout token (if available).
+
+    Auth:
+    - X-Checkout-Token (preferred)
+    """
+    payload = getattr(context, "checkout_token_payload", None)
+    if not isinstance(payload, dict):
+        return {"prefill": None}
+
+    intent_id = str(payload.get("intent_id") or "").strip()
+    if not intent_id:
+        return {"prefill": None}
+
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT prefill, expires_at
+            FROM checkout_intents
+            WHERE intent_id = :intent_id AND agent_id = :agent_id
+            LIMIT 1
+            """,
+            {"intent_id": intent_id, "agent_id": context.agent_id},
+        )
+    except Exception:
+        return {"prefill": None}
+
+    if not row:
+        return {"prefill": None}
+
+    try:
+        expires_at = row.get("expires_at")
+        if expires_at and hasattr(expires_at, "timestamp") and expires_at.timestamp() < time.time():
+            return {"prefill": None}
+    except Exception:
+        pass
+
+    prefill = row.get("prefill")
+    return {"prefill": prefill if isinstance(prefill, dict) else None}

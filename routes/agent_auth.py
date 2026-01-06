@@ -292,6 +292,7 @@ async def _get_agent_context_from_checkout_token(request: Request, token: str) -
             "/agent/v1/orders/",
             "/agent/v1/payments",
             "/agent/v1/buyers/merge",
+            "/agent/v1/checkout/prefill",
         )
         if not any(path.startswith(p) for p in allowed_prefixes):
             raise HTTPException(status_code=403, detail="Checkout token not authorized for this endpoint")
