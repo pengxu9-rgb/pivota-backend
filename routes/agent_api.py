@@ -1287,6 +1287,17 @@ async def agent_create_order(
         # 添加 Agent 元数据
         if not order_request.metadata:
             order_request.metadata = {}
+
+        # Checkout token: if present, hydrate identity/context fields into order metadata.
+        # This prevents footguns where callers forget to pass buyer_ref/job_id while still
+        # keeping server-side identity anchored to the minted token.
+        if isinstance(order_request.metadata, dict):
+            token_payload = getattr(context, "checkout_token_payload", None)
+            if isinstance(token_payload, dict):
+                for key in ("buyer_ref", "job_id", "market", "locale"):
+                    v = token_payload.get(key)
+                    if v and not order_request.metadata.get(key):
+                        order_request.metadata[key] = v
         
         order_request.metadata.update({
             "agent_id": context.agent_id,
