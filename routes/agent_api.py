@@ -49,6 +49,56 @@ router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
 # Helper Functions
 # ============================================================================
 
+def _normalize_buyer_ref(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    v = str(value).strip()
+    return v or None
+
+
+async def resolve_buyer_ref_sources(agent_id: str, canonical_buyer_ref: str) -> List[str]:
+    """
+    Return buyer_refs that should be visible when requesting orders for `canonical_buyer_ref`.
+    Direction is one-way: sources -> target.
+
+    Example: guest:xxx merged into user:yyy
+    - resolve_buyer_ref_sources(agent_id, "user:yyy") => ["user:yyy", "guest:xxx", ...]
+    - resolve_buyer_ref_sources(agent_id, "guest:xxx") => ["guest:xxx"] (no inverse expansion)
+    """
+    canonical = _normalize_buyer_ref(canonical_buyer_ref)
+    if not canonical:
+        return []
+
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT source_ref
+            FROM buyer_ref_aliases
+            WHERE agent_id = :agent_id AND target_ref = :target_ref
+            """,
+            {"agent_id": agent_id, "target_ref": canonical},
+        )
+        sources = [str(r["source_ref"]) for r in (rows or []) if r and r.get("source_ref")]
+        # stable de-dup
+        out: List[str] = [canonical]
+        for s in sources:
+            if s and s not in out:
+                out.append(s)
+        return out
+    except Exception:
+        # Best-effort: if table isn't available yet, fall back to canonical only.
+        return [canonical]
+
+
+def build_in_params(prefix: str, values: List[str]) -> (str, Dict[str, Any]):
+    placeholders: List[str] = []
+    params: Dict[str, Any] = {}
+    for idx, v in enumerate(values):
+        key = f"{prefix}_{idx}"
+        placeholders.append(f":{key}")
+        params[key] = v
+    return ", ".join(placeholders), params
+
 async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
     """Verify merchant exists and is not deleted"""
     merchant = await get_merchant_onboarding(merchant_id)
@@ -142,6 +192,82 @@ def extract_variant_price(variant: Dict[str, Any]) -> Optional[Decimal]:
         return Decimal(str(p))
     except Exception:
         return None
+
+
+class BuyerRefMergeRequest(BaseModel):
+    source_buyer_ref: str
+    target_buyer_ref: str
+
+
+@router.post("/buyers/merge")
+async def agent_merge_buyer_refs(
+    req: BuyerRefMergeRequest,
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Merge (alias) a source buyer_ref into a canonical target buyer_ref (agent-scoped).
+
+    Intended usage:
+    - user logs in: merge guest:{uuid} -> user:{public_id}
+    - later order lookups with buyer_ref=user:{public_id} include both
+    """
+    source_ref = _normalize_buyer_ref(getattr(req, "source_buyer_ref", None))
+    target_ref = _normalize_buyer_ref(getattr(req, "target_buyer_ref", None))
+    if not source_ref or not target_ref:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "INVALID_REQUEST",
+                "message": "source_buyer_ref and target_buyer_ref are required",
+            },
+        )
+    if source_ref == target_ref:
+        return {
+            "status": "success",
+            "source_buyer_ref": source_ref,
+            "target_buyer_ref": target_ref,
+        }
+
+    # If the provided target is itself a source, collapse to its canonical target (best-effort).
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT target_ref
+            FROM buyer_ref_aliases
+            WHERE agent_id = :agent_id AND source_ref = :source_ref
+            """,
+            {"agent_id": context.agent_id, "source_ref": target_ref},
+        )
+        if row and row.get("target_ref"):
+            target_ref = str(row["target_ref"])
+    except Exception:
+        pass
+
+    try:
+        await database.execute(
+            """
+            INSERT INTO buyer_ref_aliases (agent_id, source_ref, target_ref, created_at, updated_at)
+            VALUES (:agent_id, :source_ref, :target_ref, NOW(), NOW())
+            ON CONFLICT (agent_id, source_ref)
+            DO UPDATE SET target_ref = EXCLUDED.target_ref, updated_at = NOW()
+            """,
+            {
+                "agent_id": context.agent_id,
+                "source_ref": source_ref,
+                "target_ref": target_ref,
+            },
+        )
+    except Exception as e:
+        logger.error(f"buyer_ref merge failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "UPSTREAM_ERROR",
+                "message": "Failed to store buyer_ref merge",
+            },
+        )
+
+    return {"status": "success", "source_buyer_ref": source_ref, "target_buyer_ref": target_ref}
 
 def variant_in_stock(variant: Dict[str, Any]) -> Optional[bool]:
     try:
@@ -1725,7 +1851,8 @@ async def agent_get_order(
         # Agent-scoped access: allow by (agent_id + buyer_ref) without requiring merchant permissions.
         if buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
-            if order.get("agent_id") != context.agent_id or str(stored or "") != str(buyer_ref):
+            allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
+            if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
         else:
             # Legacy access: validate merchant access.
@@ -1815,10 +1942,13 @@ async def agent_list_orders(
             query += " AND status = :status"
             params["status"] = status
 
-        # Agent-scoped filtering by buyer_ref (stored in metadata JSON).
+        # Agent-scoped filtering by buyer_ref (stored in metadata JSON), including merged guest refs.
         if buyer_ref:
-            query += " AND (metadata ->> 'buyer_ref') = :buyer_ref"
-            params["buyer_ref"] = buyer_ref
+            allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
+            placeholders, extra = build_in_params("buyer_ref", allowed_refs)
+            if placeholders:
+                query += f" AND (metadata ->> 'buyer_ref') IN ({placeholders})"
+                params.update(extra)
         
         query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
         params["limit"] = limit
@@ -1882,7 +2012,8 @@ async def agent_refund_order(
             raise HTTPException(status_code=404, detail="Order not found")
         if buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
-            if order.get("agent_id") != context.agent_id or str(stored or "") != str(buyer_ref):
+            allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
+            if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
         else:
             if order.get("agent_id") != context.agent_id:
@@ -1918,7 +2049,8 @@ async def agent_cancel_order(
             raise HTTPException(status_code=404, detail="Order not found")
         if buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
-            if order.get("agent_id") != context.agent_id or str(stored or "") != str(buyer_ref):
+            allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
+            if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
         else:
             if order.get("agent_id") != context.agent_id:
