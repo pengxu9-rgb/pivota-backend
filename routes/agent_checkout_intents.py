@@ -19,6 +19,37 @@ import uuid
 
 router = APIRouter(prefix="/agent/v1/checkout", tags=["agent-checkout"])
 
+async def _ensure_checkout_intents_table() -> None:
+    """
+    Best-effort self-healing for environments where migrations cannot be run manually.
+    Safe to call multiple times (IF NOT EXISTS).
+    """
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checkout_intents (
+          intent_id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          buyer_ref TEXT,
+          expires_at TIMESTAMPTZ NOT NULL,
+          prefill JSONB,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    await database.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_checkout_intents_agent_buyer
+          ON checkout_intents(agent_id, buyer_ref)
+        """
+    )
+    await database.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_at
+          ON checkout_intents(expires_at)
+        """
+    )
+
 
 def _base64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
@@ -134,7 +165,25 @@ async def create_checkout_intent(
                 },
             )
         except Exception:
-            intent_id = None
+            # Attempt a one-time self-heal (create table + retry insert).
+            try:
+                await _ensure_checkout_intents_table()
+                intent_id = f"ci_{uuid.uuid4().hex}"
+                await database.execute(
+                    """
+                    INSERT INTO checkout_intents (intent_id, agent_id, buyer_ref, expires_at, prefill, created_at, updated_at)
+                    VALUES (:intent_id, :agent_id, :buyer_ref, to_timestamp(:expires_at), :prefill::jsonb, NOW(), NOW())
+                    """,
+                    {
+                        "intent_id": intent_id,
+                        "agent_id": context.agent_id,
+                        "buyer_ref": buyer_ref,
+                        "expires_at": expires_at_sec,
+                        "prefill": json.dumps(prefill, ensure_ascii=False),
+                    },
+                )
+            except Exception:
+                intent_id = None
 
     token = mint_checkout_token(
         {
