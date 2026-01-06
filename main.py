@@ -30,6 +30,7 @@ from routes.offer_routes import router as offer_router
 from routes.ops_routes import router as ops_router
 from routes.psp_routes import router as psp_router
 from routes.payment_routes import router as payment_router
+from routes.agent_checkout_intents import router as agent_checkout_intents_router
 
 # Dashboard routers
 from routes.dashboard_routes import router as dashboard_router
@@ -377,7 +378,13 @@ app.add_middleware(
     allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-Id"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-API-Key",
+        "X-Checkout-Token",
+        "X-Request-Id",
+    ],
     expose_headers=["X-Request-Id", "X-Total-Count"],
 )
 
@@ -397,6 +404,7 @@ app.add_middleware(StructuredLoggingMiddleware)
 
 # Include available routers
 app.include_router(agent_router)
+app.include_router(agent_checkout_intents_router)
 app.include_router(quote_router)
 app.include_router(offer_router)
 app.include_router(ops_router)

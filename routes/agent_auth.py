@@ -12,6 +12,7 @@ from datetime import datetime
 
 from db.agents import (
     get_agent_by_key,
+    get_agent,
     check_rate_limit,
     check_daily_quota,
     log_agent_usage,
@@ -19,10 +20,15 @@ from db.agents import (
 )
 from utils.logger import logger
 import os
+import base64
+import hashlib
+import hmac
+import json
 
 
 # API Key Header
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+checkout_token_header = APIKeyHeader(name="X-Checkout-Token", auto_error=False)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -53,7 +59,8 @@ class AgentContext:
 async def get_agent_context(
     request: Request,
     api_key: Optional[str] = Security(api_key_header),
-    bearer: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme)
+    bearer: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+    checkout_token: Optional[str] = Security(checkout_token_header),
 ) -> AgentContext:
     """
     验证 Agent API Key 并返回上下文
@@ -61,6 +68,39 @@ async def get_agent_context(
     这是主要的认证函数，所有 Agent API 都应该使用这个依赖
     """
     
+    # 0. Checkout token auth (preferred for embedded checkout / shared UI)
+    if checkout_token:
+        context = await _get_agent_context_from_checkout_token(request, checkout_token)
+
+        # Apply the same rate/quota guards at the agent_id level.
+        rate_ok, current, limit = await check_rate_limit(context.agent_id)
+        if not rate_ok:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded: {current}/{limit} requests per minute",
+                headers={
+                    "X-RateLimit-Limit": str(limit),
+                    "X-RateLimit-Remaining": str(max(0, limit - current)),
+                    "X-RateLimit-Reset": str(int(time.time()) + 60),
+                },
+            )
+
+        quota_ok, used, quota = await check_daily_quota(context.agent_id)
+        if not quota_ok:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily quota exceeded: {used}/{quota} requests",
+                headers={
+                    "X-Quota-Limit": str(quota),
+                    "X-Quota-Remaining": str(max(0, quota - used)),
+                    "X-Quota-Reset": "00:00 UTC",
+                },
+            )
+
+        await update_agent_stats(context.agent_id, increment_requests=1)
+        logger.info(f"Agent {context.agent_name} authenticated via checkout token for {request.url.path}")
+        return context
+
     # 1. 从 X-API-Key 或 Authorization: Bearer 中提取 API Key
     if not api_key and bearer and bearer.scheme.lower() == "bearer":
         api_key = bearer.credentials
@@ -147,6 +187,115 @@ async def get_agent_context(
     
     logger.info(f"Agent {agent['agent_name']} authenticated for {request.url.path}")
     
+    return context
+
+
+def _base64url_decode(data: str) -> bytes:
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+
+def _base64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def _constant_time_equals(a: str, b: str) -> bool:
+    try:
+        return hmac.compare_digest(str(a or ""), str(b or ""))
+    except Exception:
+        return False
+
+
+def _checkout_token_secret() -> str:
+    return (os.getenv("CHECKOUT_TOKEN_SECRET") or os.getenv("AGENT_CHECKOUT_TOKEN_SECRET") or "").strip()
+
+
+async def _get_agent_context_from_checkout_token(request: Request, token: str) -> AgentContext:
+    raw = (token or "").strip()
+    if not raw:
+        raise HTTPException(status_code=401, detail="Missing checkout token")
+
+    secret = _checkout_token_secret()
+    if not secret:
+        raise HTTPException(status_code=500, detail="Checkout token secret is not configured")
+
+    # Accept either:
+    # - "<payload_b64url>.<sig_b64url>"
+    # - "v1.<payload_b64url>.<sig_b64url>"
+    parts = raw.split(".")
+    if len(parts) == 2:
+        payload_b64, sig = parts
+    elif len(parts) == 3 and parts[0] == "v1":
+        payload_b64, sig = parts[1], parts[2]
+    else:
+        raise HTTPException(status_code=401, detail="Invalid checkout token format")
+
+    expected = _base64url_encode(hmac.new(secret.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest())
+    if not _constant_time_equals(sig, expected):
+        raise HTTPException(status_code=401, detail="Invalid checkout token signature")
+
+    try:
+        payload_raw = _base64url_decode(payload_b64).decode("utf-8")
+        payload = json.loads(payload_raw)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid checkout token payload")
+
+    now = int(time.time())
+    exp = int(payload.get("exp") or 0)
+    if exp and now > exp:
+        raise HTTPException(status_code=401, detail="Checkout token expired")
+
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=401, detail="Checkout token missing agent_id")
+
+    agent = await get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid checkout token agent")
+
+    # Normalize fields expected by AgentContext
+    if "agent_name" not in agent and "name" in agent:
+        agent["agent_name"] = agent["name"]
+    if "allowed_merchants" not in agent:
+        agent["allowed_merchants"] = None
+
+    # Active check: support both is_active and status fields
+    is_active = agent.get("is_active")
+    if is_active is None:
+        status = agent.get("status")
+        is_active = (str(status).lower() == "active") if status else True
+    if not is_active:
+        raise HTTPException(status_code=403, detail="Agent is deactivated")
+
+    context = AgentContext(agent, request)
+
+    # Restrict merchant access to the token's merchant_ids (when provided).
+    token_merchants = payload.get("merchant_ids")
+    if isinstance(token_merchants, list):
+        token_merchants_norm = [str(m).strip() for m in token_merchants if str(m or "").strip()]
+        if token_merchants_norm:
+            if context.allowed_merchants is None:
+                context.allowed_merchants = token_merchants_norm
+            else:
+                allowed = set(str(m).strip() for m in (context.allowed_merchants or []) if str(m or "").strip())
+                context.allowed_merchants = [m for m in token_merchants_norm if m in allowed]
+
+    # Attach raw token payload for downstream callers (best-effort; do not rely on it for PII).
+    setattr(context, "checkout_token_payload", payload)
+
+    # Optional scope enforcement: when scopes include "checkout", allow only checkout-safe agent endpoints.
+    scopes = payload.get("scopes")
+    if isinstance(scopes, list) and "checkout" in scopes and "agent_api" not in scopes and "full" not in scopes:
+        path = str(getattr(request, "url", None).path if getattr(request, "url", None) else request.url.path)
+        allowed_prefixes = (
+            "/agent/v1/quotes/",
+            "/agent/v1/orders/",
+            "/agent/v1/payments",
+            "/agent/v1/buyers/merge",
+        )
+        if not any(path.startswith(p) for p in allowed_prefixes):
+            raise HTTPException(status_code=403, detail="Checkout token not authorized for this endpoint")
+
     return context
 
 
