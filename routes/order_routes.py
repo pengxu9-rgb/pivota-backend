@@ -512,6 +512,13 @@ async def create_new_order(
                 except Exception:
                     settlement_currency = None
 
+                checkout_url = None
+                try:
+                    if isinstance(snap, dict):
+                        checkout_url = snap.get("checkout_url") or (snap.get("metadata") or {}).get("checkout_url")
+                except Exception:
+                    checkout_url = None
+
                 subtotal = parse_decimal_money(pricing.get("subtotal"))
                 discount_total = parse_decimal_money(pricing.get("discount_total"))
                 shipping_fee = parse_decimal_money(pricing.get("shipping_fee"))
@@ -525,6 +532,7 @@ async def create_new_order(
                     "engine_ref": quote.engine_ref,
                     "currency": quote_currency,
                     "settlement_currency": settlement_currency,
+                    "checkout_url": checkout_url,
                     "request_fingerprint": quote.request_fingerprint,
                     "quote_hash_sha256": quote.quote_hash_sha256,
                     "pricing": pricing,
@@ -927,6 +935,32 @@ async def create_new_order(
                 )
             else:
                 logger.error(f"Payment intent creation failed via MultiPSP: {error}")
+                # Long-term fallback: if we have a platform checkout URL from the quote snapshot,
+                # return a redirect_url action so the client can continue on the store platform.
+                fallback_checkout_url = None
+                try:
+                    if isinstance(pricing_quote_meta, dict):
+                        fallback_checkout_url = pricing_quote_meta.get("checkout_url")
+                except Exception:
+                    fallback_checkout_url = None
+
+                if fallback_checkout_url and not payment_action:
+                    psp_type = "checkout"
+                    client_secret = str(fallback_checkout_url)
+                    payment_action = {
+                        "type": "redirect_url",
+                        "url": str(fallback_checkout_url),
+                        "raw": {
+                            "reason": "psp_unavailable",
+                            "error": error,
+                        },
+                    }
+                    await log_order_event(
+                        event_type="payment_fallback_platform_checkout",
+                        order_id=order_id,
+                        merchant_id=order_request.merchant_id,
+                        metadata={"checkout_url": str(fallback_checkout_url)},
+                    )
                 # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
                 await log_order_event(
                     event_type="payment_intent_failed",
@@ -936,6 +970,30 @@ async def create_new_order(
                 )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
+            fallback_checkout_url = None
+            try:
+                if isinstance(pricing_quote_meta, dict):
+                    fallback_checkout_url = pricing_quote_meta.get("checkout_url")
+            except Exception:
+                fallback_checkout_url = None
+
+            if fallback_checkout_url and not payment_action:
+                psp_type = "checkout"
+                client_secret = str(fallback_checkout_url)
+                payment_action = {
+                    "type": "redirect_url",
+                    "url": str(fallback_checkout_url),
+                    "raw": {
+                        "reason": "psp_error",
+                        "error": str(e),
+                    },
+                }
+                await log_order_event(
+                    event_type="payment_fallback_platform_checkout",
+                    order_id=order_id,
+                    merchant_id=order_request.merchant_id,
+                    metadata={"checkout_url": str(fallback_checkout_url)},
+                )
             await log_order_event(
                 event_type="payment_intent_error",
                 order_id=order_id,

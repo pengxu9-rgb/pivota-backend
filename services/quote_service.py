@@ -14,7 +14,6 @@ from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, ins
 from services.pcs_hash import sha256_json
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingService
 from services.shopify_storefront_pricing_service import ShopifyStorefrontPricingService
-from services.settlement_rules_service import select_best_settlement_rule
 from utils.logger import logger
 
 
@@ -222,27 +221,6 @@ class QuoteService:
         presentment_currency = result.currency
         charge_currency = result.currency
         settlement_currency: Optional[str] = None
-        settlement_rule_id: Optional[str] = None
-
-        # Phase 0: best-effort infer settlement currency from employee-configured rules.
-        # Quote time may not know PSP yet; rule matching treats missing dimensions as wildcards.
-        try:
-            market = None
-            if isinstance(shipping_address, dict):
-                market = str(shipping_address.get("country") or "").strip().upper() or None
-            rule = await select_best_settlement_rule(
-                merchant_id=merchant_id,
-                platform="shopify",
-                market=market,
-                psp=None,
-                charge_currency=charge_currency,
-            )
-            if isinstance(rule, dict):
-                settlement_currency = str(rule.get("settlement_currency") or "").strip().upper() or None
-                settlement_rule_id = str(rule.get("id") or "").strip() or None
-        except Exception:
-            settlement_currency = None
-            settlement_rule_id = None
 
         snapshot_json: Dict[str, Any] = {
             "engine": result.engine,
@@ -251,6 +229,7 @@ class QuoteService:
             "presentment_currency": presentment_currency,
             "charge_currency": charge_currency,
             "settlement_currency": settlement_currency,
+            "checkout_url": (result.debug or {}).get("checkout_url"),
             "pricing": {
                 "subtotal": str(result.pricing["subtotal"]),
                 "discount_total": str(result.pricing["discount_total"]),
@@ -264,7 +243,6 @@ class QuoteService:
             "metadata": {
                 **(result.debug or {}),
                 "discount_codes": codes,
-                **({"settlement_rule_id": settlement_rule_id} if settlement_rule_id else {}),
             },
         }
 
