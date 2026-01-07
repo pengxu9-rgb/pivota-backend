@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, asc, desc, func, select, update
+from sqlalchemy import and_, asc, desc, func, or_, select, update
 
 from db.database import database
 from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
@@ -22,6 +22,7 @@ from services.outbound_links_service import (
     parse_and_verify_redirect_token,
     resolve_outbound_link,
     log_outbound_click,
+    log_outbound_event,
 )
 
 
@@ -130,6 +131,49 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
         pass
 
     return RedirectResponse(url=dest, status_code=302)
+
+
+class ImpressionRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    context: Dict[str, Any] = Field(default_factory=dict)
+
+
+@api_router.post("/impression", response_model=Dict[str, Any])
+async def impression_endpoint(req: Request, body: ImpressionRequest) -> Dict[str, Any]:
+    """
+    Record a best-effort *impression* event for a signed redirect token.
+
+    Callers should pass the same `token` embedded in the redirect URL (GET /r?token=...).
+    This avoids leaking raw destination URLs to clients while still allowing analytics.
+    """
+    payload = parse_and_verify_redirect_token(body.token)
+    dest = str(payload.get("dest") or "")
+    if not dest.startswith("http://") and not dest.startswith("https://"):
+        raise HTTPException(status_code=400, detail="INVALID_DEST")
+
+    # Merge extra context (best-effort) without overwriting token-provided identifiers.
+    ctx = payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {}
+    ctx2 = dict(ctx or {})
+    extra = body.context if isinstance(body.context, dict) else {}
+    for k, v in (extra or {}).items():
+        if k in ctx2 and ctx2.get(k) not in (None, "", [], {}):
+            continue
+        ctx2[k] = v
+    payload["ctx"] = ctx2
+
+    try:
+        await log_outbound_event(
+            token_payload=payload,
+            request_meta={
+                "user_agent": req.headers.get("user-agent"),
+                "ip": getattr(getattr(req, "client", None), "host", None),
+            },
+            event_type="impression",
+        )
+    except Exception:
+        pass
+
+    return {"ok": True}
 
 
 class LinkRuleIn(BaseModel):
@@ -566,6 +610,10 @@ async def employee_list_clicks(
     if destDomain:
         clauses.append(outbound_click_events.c.dest_domain == str(destDomain).strip().lower())
 
+    # Backward compatible: treat missing eventType as "click", and exclude impressions.
+    event_type_expr = outbound_click_events.c.context["eventType"].astext
+    clauses.append(or_(event_type_expr.is_(None), event_type_expr != "impression"))
+
     stmt = select(outbound_click_events)
     if clauses:
         stmt = stmt.where(and_(*clauses))
@@ -661,6 +709,10 @@ async def employee_clicks_report(
     if end_dt:
         clauses.append(outbound_click_events.c.created_at < end_dt)
 
+    # Backward compatible: treat missing eventType as "click", and exclude impressions.
+    event_type_expr = outbound_click_events.c.context["eventType"].astext
+    clauses.append(or_(event_type_expr.is_(None), event_type_expr != "impression"))
+
     stmt = (
         select(
             key_expr.label("key"),
@@ -701,6 +753,181 @@ async def employee_clicks_report(
         "startAt": startAt,
         "endAt": endAt,
         "minClicks": minClicks,
+        "rows": out,
+        "count": len(out),
+        "limit": limit,
+    }
+
+
+@employee_router.get("/impressions", response_model=Dict[str, Any])
+async def employee_list_impressions(
+    market: Optional[str] = Query(None),
+    tool: Optional[str] = Query(None),
+    ruleId: Optional[str] = Query(None),
+    jobId: Optional[str] = Query(None),
+    destDomain: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    _ = current_user
+    clauses = []
+    if market:
+        clauses.append(outbound_click_events.c.market == normalize_market(market))
+    if tool:
+        clauses.append(outbound_click_events.c.tool == normalize_tool(tool))
+    if ruleId:
+        clauses.append(outbound_click_events.c.rule_id == str(ruleId).strip())
+    if jobId:
+        clauses.append(outbound_click_events.c.job_id == str(jobId).strip())
+    if destDomain:
+        clauses.append(outbound_click_events.c.dest_domain == str(destDomain).strip().lower())
+
+    event_type_expr = outbound_click_events.c.context["eventType"].astext
+    clauses.append(event_type_expr == "impression")
+
+    stmt = select(outbound_click_events)
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+    stmt = stmt.order_by(desc(outbound_click_events.c.created_at)).limit(limit).offset(offset)
+    rows = await database.fetch_all(stmt)
+    return {"impressions": [_to_click_out(r).model_dump() for r in rows], "count": len(rows), "offset": offset, "limit": limit}
+
+
+class ImpressionReportRow(BaseModel):
+    key: str
+    impressions: int
+    jobs: int
+    sessions: int
+    firstAt: Optional[str] = None
+    lastAt: Optional[str] = None
+
+
+@employee_router.get("/impressions/report", response_model=Dict[str, Any])
+async def employee_impressions_report(
+    market: Optional[str] = Query(None),
+    tool: Optional[str] = Query(None),
+    startAt: Optional[str] = Query(None),
+    endAt: Optional[str] = Query(None),
+    groupBy: str = Query("destDomain"),
+    minImpressions: int = Query(1, ge=1, le=1000000),
+    limit: int = Query(200, ge=1, le=500),
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """
+    Aggregate outbound *impression* events for ops reporting.
+
+    groupBy:
+      - destDomain (default)
+      - destinationUrl
+      - ruleId
+      - jobId
+      - brand
+      - category
+      - area
+      - day (UTC)
+    """
+    _ = current_user
+
+    def parse_dt(v: Optional[str]) -> Optional[datetime]:
+        if not v:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            try:
+                return datetime.fromisoformat(f"{s}T00:00:00")
+            except Exception:
+                return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    start_dt = parse_dt(startAt)
+    end_dt = parse_dt(endAt)
+
+    group = str(groupBy or "destDomain").strip()
+    if group not in {"destDomain", "destinationUrl", "ruleId", "jobId", "brand", "category", "area", "day"}:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_GROUP_BY"})
+
+    key_expr = None
+    if group == "destDomain":
+        key_expr = outbound_click_events.c.dest_domain
+    elif group == "destinationUrl":
+        key_expr = outbound_click_events.c.destination_url
+    elif group == "ruleId":
+        key_expr = outbound_click_events.c.rule_id
+    elif group == "jobId":
+        key_expr = outbound_click_events.c.job_id
+    elif group == "brand":
+        key_expr = outbound_click_events.c.brand
+    elif group == "category":
+        key_expr = outbound_click_events.c.category
+    elif group == "area":
+        key_expr = outbound_click_events.c.area
+    else:
+        key_expr = func.date_trunc("day", outbound_click_events.c.created_at)
+
+    clauses = []
+    if market:
+        clauses.append(outbound_click_events.c.market == normalize_market(market))
+    if tool:
+        clauses.append(outbound_click_events.c.tool == normalize_tool(tool))
+    if start_dt:
+        clauses.append(outbound_click_events.c.created_at >= start_dt)
+    if end_dt:
+        clauses.append(outbound_click_events.c.created_at < end_dt)
+
+    event_type_expr = outbound_click_events.c.context["eventType"].astext
+    clauses.append(event_type_expr == "impression")
+
+    stmt = (
+        select(
+            key_expr.label("key"),
+            func.count(outbound_click_events.c.id).label("impressions"),
+            func.count(func.distinct(outbound_click_events.c.job_id)).label("jobs"),
+            func.count(func.distinct(outbound_click_events.c.session_id)).label("sessions"),
+            func.min(outbound_click_events.c.created_at).label("first_at"),
+            func.max(outbound_click_events.c.created_at).label("last_at"),
+        )
+        .select_from(outbound_click_events)
+    )
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+    stmt = (
+        stmt.group_by(key_expr)
+        .having(func.count(outbound_click_events.c.id) >= int(minImpressions))
+        .order_by(desc(func.count(outbound_click_events.c.id)))
+        .limit(limit)
+    )
+
+    rows = await database.fetch_all(stmt)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        k = d.get("key")
+        if isinstance(k, datetime):
+            key = k.date().isoformat()
+        else:
+            key = str(k) if k is not None and str(k).strip() else "—"
+        out.append(
+            ImpressionReportRow(
+                key=key,
+                impressions=int(d.get("impressions") or 0),
+                jobs=int(d.get("jobs") or 0),
+                sessions=int(d.get("sessions") or 0),
+                firstAt=(d.get("first_at").isoformat() if isinstance(d.get("first_at"), datetime) else None),
+                lastAt=(d.get("last_at").isoformat() if isinstance(d.get("last_at"), datetime) else None),
+            ).model_dump()
+        )
+
+    return {
+        "groupBy": group,
+        "startAt": startAt,
+        "endAt": endAt,
+        "minImpressions": minImpressions,
         "rows": out,
         "count": len(out),
         "limit": limit,

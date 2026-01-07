@@ -317,28 +317,42 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
     )
 
 
-async def log_outbound_click(*, token_payload: Dict[str, Any], request_meta: Dict[str, Any]) -> None:
+async def log_outbound_event(*, token_payload: Dict[str, Any], request_meta: Dict[str, Any], event_type: str) -> None:
+    """
+    Best-effort outbound telemetry.
+
+    We store `eventType` under the JSONB `context` field to avoid schema changes and keep
+    existing `area`/`kind` semantics (UI surface classification).
+    """
     ctx = token_payload.get("ctx") if isinstance(token_payload.get("ctx"), dict) else {}
+    ctx2 = dict(ctx or {})
+    if event_type and not ctx2.get("eventType"):
+        ctx2["eventType"] = str(event_type)
+
     dest = str(token_payload.get("dest") or "")
     row = {
         "market": str(token_payload.get("market") or ""),
         "tool": str(token_payload.get("tool") or ""),
         "rule_id": str(token_payload.get("ruleId") or "") or None,
-        "job_id": str(ctx.get("jobId") or "") or None,
-        "session_id": str(ctx.get("sessionId") or "") or None,
-        "sku_id": str(ctx.get("skuId") or "") or None,
-        "brand": str(ctx.get("brand") or "") or None,
-        "category": str(ctx.get("category") or "") or None,
-        "area": str(ctx.get("area") or "") or None,
-        "kind": str(ctx.get("kind") or "") or None,
+        "job_id": str(ctx2.get("jobId") or "") or None,
+        "session_id": str(ctx2.get("sessionId") or "") or None,
+        "sku_id": str(ctx2.get("skuId") or "") or None,
+        "brand": str(ctx2.get("brand") or "") or None,
+        "category": str(ctx2.get("category") or "") or None,
+        "area": str(ctx2.get("area") or "") or None,
+        "kind": str(ctx2.get("kind") or "") or None,
         "dest_domain": url_domain(dest) or None,
         "destination_url": dest or None,
-        "context": ctx or None,
+        "context": ctx2 or None,
         "user_agent": request_meta.get("user_agent"),
         "ip": request_meta.get("ip"),
     }
     try:
         await database.execute(outbound_click_events.insert(), row)
     except Exception:
-        # Best-effort: never break redirect.
+        # Best-effort: never break redirect or callers.
         return
+
+
+async def log_outbound_click(*, token_payload: Dict[str, Any], request_meta: Dict[str, Any]) -> None:
+    await log_outbound_event(token_payload=token_payload, request_meta=request_meta, event_type="click")
