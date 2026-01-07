@@ -1,13 +1,13 @@
 import csv
 import io
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, asc, desc, func, or_, select, update
+from sqlalchemy import and_, asc, case, desc, func, or_, select, update
 
 from db.database import database
 from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
@@ -15,10 +15,12 @@ from utils.auth import get_current_employee
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     make_rule_id,
+    make_report_token,
     normalize_market,
     normalize_scope,
     normalize_scope_id,
     normalize_tool,
+    parse_and_verify_report_token,
     parse_and_verify_redirect_token,
     resolve_outbound_link,
     log_outbound_click,
@@ -174,6 +176,56 @@ async def impression_endpoint(req: Request, body: ImpressionRequest) -> Dict[str
         pass
 
     return {"ok": True}
+
+
+class ShareTrafficReportIn(BaseModel):
+    market: str = "US"
+    tool: str = "*"
+    destDomain: str = Field(..., min_length=3)
+    startAt: Optional[str] = None
+    endAt: Optional[str] = None
+    granularity: str = "day"  # total|day
+    ttlSeconds: int = 30 * 24 * 3600
+
+
+@employee_router.post("/reports/share-traffic", response_model=Dict[str, Any])
+async def employee_share_traffic_report(
+    req: Request,
+    body: ShareTrafficReportIn,
+    current_user: dict = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """
+    Create a signed, public traffic report URL (no employee auth needed to view).
+    Intended to be shared with merchants as early "proof of traffic".
+    """
+    _ = current_user
+    market = normalize_market(body.market)
+    tool = normalize_tool(body.tool)
+    dest_domain = str(body.destDomain or "").strip().lower().lstrip(".")
+    if "." not in dest_domain:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_DOMAIN"})
+
+    granularity = str(body.granularity or "day").strip()
+    if granularity not in {"total", "day"}:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_GRANULARITY"})
+
+    ttl = int(body.ttlSeconds or 0)
+    if ttl < 60 or ttl > 180 * 24 * 3600:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_TTL"})
+
+    token = make_report_token(
+        {
+            "market": market,
+            "tool": tool,
+            "destDomain": dest_domain,
+            "startAt": body.startAt,
+            "endAt": body.endAt,
+            "granularity": granularity,
+        },
+        ttl_seconds=ttl,
+    )
+    base = str(req.base_url).rstrip("/")
+    return {"ok": True, "reportUrl": f"{base}/api/links/report?token={token}"}
 
 
 class LinkRuleIn(BaseModel):
@@ -932,6 +984,135 @@ async def employee_impressions_report(
         "count": len(out),
         "limit": limit,
     }
+
+
+@api_router.get("/report", response_model=Dict[str, Any])
+async def public_traffic_report(
+    token: str = Query(..., min_length=10),
+) -> Dict[str, Any]:
+    """
+    Public traffic report endpoint protected by a signed token.
+
+    The token is minted via `POST /employee/links/reports/share-traffic` and encodes a fixed
+    scope (market/tool/domain + optional time range). This endpoint returns only aggregated
+    metrics (no IP/user-agent).
+    """
+    payload = parse_and_verify_report_token(token)
+    market = normalize_market(payload.get("market"))
+    tool = normalize_tool(payload.get("tool"))
+    dest_domain = str(payload.get("destDomain") or "").strip().lower().lstrip(".")
+    if "." not in dest_domain:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_DOMAIN"})
+
+    granularity = str(payload.get("granularity") or "day").strip()
+    if granularity not in {"total", "day"}:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_GRANULARITY"})
+
+    def parse_dt(v: Optional[str]) -> Optional[datetime]:
+        if not v:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            try:
+                return datetime.fromisoformat(f"{s}T00:00:00")
+            except Exception:
+                return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    start_dt = parse_dt(payload.get("startAt"))
+    end_dt = parse_dt(payload.get("endAt"))
+
+    # Default to last 30d if no explicit window.
+    if not start_dt and not end_dt:
+        end_dt = datetime.utcnow()
+        start_dt = end_dt - timedelta(days=30)
+
+    if start_dt and end_dt:
+        if end_dt < start_dt:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_TIME_RANGE"})
+        if (end_dt - start_dt).total_seconds() > 180 * 24 * 3600:
+            raise HTTPException(status_code=400, detail={"code": "TIME_RANGE_TOO_LARGE"})
+
+    clauses = [
+        outbound_click_events.c.market == market,
+        outbound_click_events.c.tool == tool,
+        outbound_click_events.c.dest_domain == dest_domain,
+    ]
+    if start_dt:
+        clauses.append(outbound_click_events.c.created_at >= start_dt)
+    if end_dt:
+        clauses.append(outbound_click_events.c.created_at < end_dt)
+
+    event_type_expr = outbound_click_events.c.context["eventType"].astext
+    is_impression = case((event_type_expr == "impression", 1), else_=0)
+    is_click = case((or_(event_type_expr.is_(None), event_type_expr != "impression"), 1), else_=0)
+
+    totals_stmt = (
+        select(
+            func.sum(is_impression).label("impressions"),
+            func.sum(is_click).label("clicks"),
+            func.count(func.distinct(outbound_click_events.c.session_id)).label("sessions"),
+            func.count(func.distinct(outbound_click_events.c.job_id)).label("jobs"),
+            func.min(outbound_click_events.c.created_at).label("first_at"),
+            func.max(outbound_click_events.c.created_at).label("last_at"),
+        )
+        .select_from(outbound_click_events)
+        .where(and_(*clauses))
+    )
+    totals = dict(await database.fetch_one(totals_stmt) or {})
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "scope": {
+            "market": market,
+            "tool": tool,
+            "destDomain": dest_domain,
+            "startAt": payload.get("startAt"),
+            "endAt": payload.get("endAt"),
+        },
+        "totals": {
+            "impressions": int(totals.get("impressions") or 0),
+            "clicks": int(totals.get("clicks") or 0),
+            "sessions": int(totals.get("sessions") or 0),
+            "jobs": int(totals.get("jobs") or 0),
+            "firstAt": (totals.get("first_at").isoformat() if isinstance(totals.get("first_at"), datetime) else None),
+            "lastAt": (totals.get("last_at").isoformat() if isinstance(totals.get("last_at"), datetime) else None),
+        },
+    }
+
+    if granularity == "day":
+        day_expr = func.date_trunc("day", outbound_click_events.c.created_at)
+        by_day_stmt = (
+            select(
+                day_expr.label("day"),
+                func.sum(is_impression).label("impressions"),
+                func.sum(is_click).label("clicks"),
+                func.count(func.distinct(outbound_click_events.c.session_id)).label("sessions"),
+                func.count(func.distinct(outbound_click_events.c.job_id)).label("jobs"),
+            )
+            .select_from(outbound_click_events)
+            .where(and_(*clauses))
+            .group_by(day_expr)
+            .order_by(day_expr.asc())
+            .limit(366)
+        )
+        rows = await database.fetch_all(by_day_stmt)
+        out["byDay"] = [
+            {
+                "day": (dict(r).get("day").date().isoformat() if isinstance(dict(r).get("day"), datetime) else None),
+                "impressions": int(dict(r).get("impressions") or 0),
+                "clicks": int(dict(r).get("clicks") or 0),
+                "sessions": int(dict(r).get("sessions") or 0),
+                "jobs": int(dict(r).get("jobs") or 0),
+            }
+            for r in rows
+        ]
+    return out
 
 
 class AllowedDomainIn(BaseModel):

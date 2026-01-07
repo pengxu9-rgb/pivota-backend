@@ -44,6 +44,10 @@ def _signing_secret() -> str:
         or "dev-insecure-secret"
     )
 
+def _reports_signing_secret() -> str:
+    # Prefer a dedicated secret so outbound report-share links can be rotated independently.
+    return os.getenv("OUTBOUND_REPORTS_SIGNING_SECRET") or _signing_secret()
+
 
 def make_rule_id() -> str:
     return f"lr_{uuid.uuid4().hex[:24]}"
@@ -114,6 +118,7 @@ def make_redirect_token(payload: Dict[str, Any], ttl_seconds: int = 7 * 24 * 360
     now = _now_ts()
     body = {
         "v": 0,
+        "t": "redirect",
         **payload,
         "iat": now,
         "exp": now + int(ttl_seconds),
@@ -133,6 +138,39 @@ def parse_and_verify_redirect_token(token: str) -> Dict[str, Any]:
         raise ValueError("INVALID_SIGNATURE")
     payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
     if not isinstance(payload, dict):
+        raise ValueError("INVALID_TOKEN")
+    if payload.get("t") not in (None, "redirect"):
+        raise ValueError("INVALID_TOKEN")
+    exp = int(payload.get("exp") or 0)
+    if exp and _now_ts() > exp:
+        raise ValueError("TOKEN_EXPIRED")
+    return payload
+
+
+def make_report_token(payload: Dict[str, Any], ttl_seconds: int = 30 * 24 * 3600) -> str:
+    now = _now_ts()
+    body = {
+        "v": 0,
+        "t": "report",
+        **payload,
+        "iat": now,
+        "exp": now + int(ttl_seconds),
+    }
+    payload_b64 = _b64url_encode(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    sig = hmac.new(_reports_signing_secret().encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{payload_b64}.{sig_b64}"
+
+
+def parse_and_verify_report_token(token: str) -> Dict[str, Any]:
+    if not token or "." not in token:
+        raise ValueError("INVALID_TOKEN")
+    payload_b64, sig_b64 = token.split(".", 1)
+    expected = hmac.new(_reports_signing_secret().encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
+    if not hmac.compare_digest(_b64url_encode(expected), sig_b64):
+        raise ValueError("INVALID_SIGNATURE")
+    payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    if not isinstance(payload, dict) or payload.get("t") != "report":
         raise ValueError("INVALID_TOKEN")
     exp = int(payload.get("exp") or 0)
     if exp and _now_ts() > exp:
