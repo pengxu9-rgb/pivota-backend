@@ -4,7 +4,7 @@ Agent 专用 API 路由
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
@@ -23,6 +23,7 @@ from routes.order_routes import cancel_order as admin_cancel_order
 from routes.fulfillment_api import track_order_fulfillment
 from routes.order_routes import create_new_order
 from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
+from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
@@ -54,6 +55,25 @@ def _normalize_buyer_ref(value: Optional[str]) -> Optional[str]:
         return None
     v = str(value).strip()
     return v or None
+
+
+def _order_agent_user_ref(order: Dict[str, Any]) -> Optional[str]:
+    meta = (order or {}).get("metadata")
+    if isinstance(meta, dict):
+        raw = meta.get("agent_user_ref") or meta.get("agentUserRef")
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        return s or None
+    return None
+
+
+def _enforce_agent_user_order_access(*, order: Dict[str, Any], context: AgentContext, agent_user: AgentUserContext) -> None:
+    if str(order.get("agent_id") or "") != str(context.agent_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this order")
+    stored = _order_agent_user_ref(order)
+    if not stored or stored != agent_user.agent_user_ref:
+        raise HTTPException(status_code=403, detail="Not authorized for this order")
 
 
 async def resolve_buyer_ref_sources(agent_id: str, canonical_buyer_ref: str) -> List[str]:
@@ -283,6 +303,8 @@ def variant_in_stock(variant: Dict[str, Any]) -> Optional[bool]:
 async def agent_create_acp_checkout_session(
     payload: Dict[str, Any],
     context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
+    x_buyer_ref: Optional[str] = Header(None, alias="X-Buyer-Ref"),
 ):
     """
     Create an ACP-hosted checkout session for a merchant.
@@ -334,11 +356,19 @@ async def agent_create_acp_checkout_session(
 
     request_id = str(uuid.uuid4())
     return_url = payload.get("return_url") or payload.get("returnUrl") or None
+    buyer_ref = _normalize_buyer_ref(x_buyer_ref or payload.get("buyer_ref") or payload.get("buyerRef"))
     body = {
         "items": acp_items,
         "buyer": None,
         "fulfillment_address": None,
-        "metadata": {"request_id": request_id, "source": "look_replicator", **({"return_url": return_url} if return_url else {})},
+        "metadata": {
+            "request_id": request_id,
+            "source": "look_replicator",
+            "agent_id": getattr(context, "agent_id", None),
+            **({"agent_user_ref": agent_user.agent_user_ref} if agent_user else {}),
+            **({"buyer_ref": buyer_ref} if buyer_ref else {}),
+            **({"return_url": return_url} if return_url else {}),
+        },
     }
 
     try:
@@ -1028,6 +1058,8 @@ async def agent_create_order(
     order_request: CreateOrderRequest,
     background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
+    x_buyer_ref: Optional[str] = Header(None, alias="X-Buyer-Ref"),
 ):
     """
     创建订单（代理标准订单创建流程）
@@ -1298,6 +1330,13 @@ async def agent_create_order(
                     v = token_payload.get(key)
                     if v and not order_request.metadata.get(key):
                         order_request.metadata[key] = v
+
+            # Agent tools end-user attribution (verified via JWKS).
+            if agent_user and not order_request.metadata.get("agent_user_ref"):
+                order_request.metadata["agent_user_ref"] = agent_user.agent_user_ref
+            buyer_ref = _normalize_buyer_ref(x_buyer_ref)
+            if buyer_ref and not order_request.metadata.get("buyer_ref"):
+                order_request.metadata["buyer_ref"] = buyer_ref
         
         order_request.metadata.update({
             "agent_id": context.agent_id,
@@ -1870,6 +1909,7 @@ async def agent_get_order(
     background_tasks: BackgroundTasks,
     buyer_ref: Optional[str] = None,
     context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     """获取订单状态"""
     try:
@@ -1878,8 +1918,11 @@ async def agent_get_order(
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
+        # Agent-user scoped access: prefer verified end-user identity when provided.
+        if agent_user:
+            _enforce_agent_user_order_access(order=order, context=context, agent_user=agent_user)
         # Agent-scoped access: allow by (agent_id + buyer_ref) without requiring merchant permissions.
-        if buyer_ref:
+        elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
             if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
@@ -1946,6 +1989,7 @@ async def agent_list_orders(
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     """
     列出 Agent 创建的订单
@@ -1971,6 +2015,11 @@ async def agent_list_orders(
         if status:
             query += " AND status = :status"
             params["status"] = status
+
+        # Agent-user scoped filtering (verified via JWKS).
+        if agent_user:
+            query += " AND (metadata ->> 'agent_user_ref') = :agent_user_ref"
+            params["agent_user_ref"] = agent_user.agent_user_ref
 
         # Agent-scoped filtering by buyer_ref (stored in metadata JSON), including merged guest refs.
         if buyer_ref:
@@ -2023,6 +2072,106 @@ async def agent_list_orders(
         )
         raise HTTPException(status_code=500, detail="Failed to list orders")
 
+@router.get("/orders/events")
+async def agent_list_order_events(
+    background_tasks: BackgroundTasks,
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    wait_ms: int = Query(default=0, ge=0, le=25_000),
+    merchant_id: Optional[str] = None,
+    buyer_ref: Optional[str] = None,
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
+):
+    """
+    Incremental order event feed for Agent tools UIs.
+
+    Filters:
+    - Prefer verified agent-user scoping when X-Agent-User-JWT is present.
+    - Fall back to buyer_ref for legacy anonymous sessions.
+    - Otherwise returns all events for the agent (agent-scoped).
+    """
+    import asyncio
+
+    try:
+        # If specified, enforce merchant access (agent-level control).
+        if merchant_id and not context.can_access_merchant(merchant_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+        params: Dict[str, Any] = {
+            "agent_id": context.agent_id,
+            "after_id": int(after_id or 0),
+            "limit": int(limit),
+        }
+
+        query = """
+            SELECT
+                e.id,
+                e.event_type,
+                e.merchant_id,
+                e.order_id,
+                e.status,
+                e.total_amount,
+                e.currency,
+                e.payment_method,
+                e.error_message,
+                e.created_at
+            FROM order_events e
+            JOIN orders o ON o.order_id = e.order_id
+            WHERE o.agent_id = :agent_id
+              AND o.is_deleted = FALSE
+              AND e.id > :after_id
+        """
+
+        if merchant_id:
+            query += " AND e.merchant_id = :merchant_id"
+            params["merchant_id"] = merchant_id
+
+        if agent_user:
+            query += " AND (o.metadata ->> 'agent_user_ref') = :agent_user_ref"
+            params["agent_user_ref"] = agent_user.agent_user_ref
+        elif buyer_ref:
+            allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
+            placeholders, extra = build_in_params("buyer_ref", allowed_refs)
+            if placeholders:
+                query += f" AND (o.metadata ->> 'buyer_ref') IN ({placeholders})"
+                params.update(extra)
+
+        query += " ORDER BY e.id ASC LIMIT :limit"
+
+        deadline = None
+        if wait_ms and wait_ms > 0:
+            deadline = asyncio.get_event_loop().time() + (wait_ms / 1000.0)
+
+        rows = []
+        while True:
+            rows = await database.fetch_all(query, params)
+            if rows:
+                break
+            if deadline is None:
+                break
+            if asyncio.get_event_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.25)
+
+        events = [dict(r) for r in (rows or [])]
+        last_id = int(events[-1]["id"]) if events else int(after_id or 0)
+
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=200,
+            merchant_id=merchant_id,
+        )
+
+        return {"status": "success", "events": events, "last_id": last_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent list order events error: {e}")
+        await log_agent_request(context=context, status_code=500, error_message=str(e))
+        raise HTTPException(status_code=500, detail="Failed to list order events")
+
 
 # ----------------------------------------------------------------------------
 # Order actions for Agents (refund, cancel, track)
@@ -2033,14 +2182,17 @@ async def agent_refund_order(
     order_id: str,
     background_tasks: BackgroundTasks,
     buyer_ref: Optional[str] = None,
-    context: AgentContext = Depends(get_agent_context)
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     """Proxy refund to admin refund API, but enforce agent ownership."""
     try:
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        if buyer_ref:
+        if agent_user:
+            _enforce_agent_user_order_access(order=order, context=context, agent_user=agent_user)
+        elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
             if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
@@ -2070,14 +2222,17 @@ async def agent_refund_order(
 async def agent_cancel_order(
     order_id: str,
     buyer_ref: Optional[str] = None,
-    context: AgentContext = Depends(get_agent_context)
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     """Cancel an order owned by the agent (defensive - no optional columns)."""
     try:
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        if buyer_ref:
+        if agent_user:
+            _enforce_agent_user_order_access(order=order, context=context, agent_user=agent_user)
+        elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
             if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
