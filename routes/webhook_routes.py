@@ -14,6 +14,7 @@ import hashlib
 import json
 import socket
 from datetime import datetime
+from decimal import Decimal
 
 from db.orders import get_order, update_order_status, mark_order_paid, mark_order_shipped
 from db.merchant_onboarding import get_merchant_onboarding
@@ -24,6 +25,42 @@ from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+
+
+def _stripe_minor_unit_factor(currency: Optional[str]) -> Decimal:
+    """
+    Stripe reports amounts in the smallest currency unit.
+    Default exponent=2 (factor=100), with common exceptions handled.
+    """
+    c = (currency or "").strip().lower()
+    if not c:
+        return Decimal("100")
+
+    zero_decimal = {
+        "bif",
+        "clp",
+        "djf",
+        "gnf",
+        "jpy",
+        "kmf",
+        "krw",
+        "mga",
+        "pyg",
+        "rwf",
+        "ugx",
+        "vnd",
+        "vuv",
+        "xaf",
+        "xof",
+        "xpf",
+    }
+    three_decimal = {"bhd", "jod", "kwd", "omr", "tnd"}
+
+    if c in zero_decimal:
+        return Decimal("1")
+    if c in three_decimal:
+        return Decimal("1000")
+    return Decimal("100")
 
 
 def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
@@ -163,6 +200,7 @@ async def handle_stripe_webhook(
             charge_id = data.get("id")
             payment_intent_id = data.get("payment_intent")
             refund_amount = data.get("amount_refunded")
+            currency = (data.get("currency") or "").strip().lower() or None
             
             query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
             from db.database import database
@@ -170,7 +208,51 @@ async def handle_stripe_webhook(
             
             if result:
                 order_id = result["order_id"]
-                await update_order_status(order_id, "refunded")
+                # Stripe's charge.amount_refunded is cumulative (not delta). Use it to converge
+                # order state without double-counting if we also processed the refund internally.
+                try:
+                    order_total = Decimal(str(result.get("total") or "0"))
+                except Exception:
+                    order_total = Decimal("0")
+                try:
+                    existing_total_refunded = Decimal(str(result.get("total_refunded") or "0"))
+                except Exception:
+                    existing_total_refunded = Decimal("0")
+                try:
+                    refunded_minor = Decimal(str(refund_amount)) if refund_amount is not None else Decimal("0")
+                except Exception:
+                    refunded_minor = Decimal("0")
+
+                factor = _stripe_minor_unit_factor(currency or str(result.get("currency") or ""))
+                try:
+                    refunded_total = refunded_minor / factor
+                except Exception:
+                    refunded_total = Decimal("0")
+
+                next_total_refunded = max(existing_total_refunded, refunded_total)
+                if order_total > Decimal("0") and next_total_refunded < order_total:
+                    next_status = "partially_refunded"
+                else:
+                    next_status = "refunded"
+
+                existing_meta = result.get("metadata") or {}
+                if not isinstance(existing_meta, dict):
+                    existing_meta = {}
+                await update_order_status(
+                    order_id,
+                    next_status,
+                    payment_status=next_status,
+                    total_refunded=next_total_refunded,
+                    metadata={
+                        **existing_meta,
+                        "stripe_charge_refunded": {
+                            "charge_id": charge_id,
+                            "amount_refunded_minor": refund_amount,
+                            "currency": currency or str(result.get("currency") or ""),
+                            "received_at": datetime.now().isoformat(),
+                        },
+                    },
+                )
                 await log_order_event(
                     event_type="refund_processed_webhook",
                     order_id=order_id,
