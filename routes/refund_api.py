@@ -53,8 +53,14 @@ async def process_refund(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     
-    # Check if order is paid
-    if order["payment_status"] != "paid":
+    # Check if order is in a refundable financial state
+    # Note: partial refunds transition payment_status to "partially_refunded".
+    if str(order.get("payment_status") or "").lower() not in (
+        "paid",
+        "completed",
+        "partially_refunded",
+        "refunded",
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"Cannot refund unpaid order. Current status: {order['payment_status']}"
