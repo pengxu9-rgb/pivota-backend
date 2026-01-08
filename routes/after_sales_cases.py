@@ -605,9 +605,18 @@ async def process_case_refund(
         pass
 
     # Update case status best-effort
-    audit = _append_audit(audit, "refund_processed", {"result_status": refund_result.get("status") if isinstance(refund_result, dict) else None})
+    audit = _append_audit(
+        audit,
+        "refund_processed",
+        {"result_status": refund_result.get("status") if isinstance(refund_result, dict) else None},
+    )
     next_status = "refund_processed"
     try:
+        if isinstance(refund_result, dict) and str(refund_result.get("new_order_status") or "") in (
+            "partially_refunded",
+            "refunded",
+        ):
+            next_status = str(refund_result.get("new_order_status"))
         if isinstance(refund_result, dict) and refund_result.get("refund_type") == "partial":
             next_status = "partially_refunded"
         if isinstance(refund_result, dict) and refund_result.get("status") == "already_refunded":
@@ -636,15 +645,16 @@ async def process_case_refund(
     order_summary = None
     try:
         if isinstance(order, dict) and order.get("order_id"):
-            order_summary = {
-                "order_id": str(order.get("order_id")),
-                "status": str(order.get("status") or ""),
-                "payment_status": str(order.get("payment_status") or ""),
-                "fulfillment_status": str(order.get("fulfillment_status") or ""),
-                "total": str(order.get("total") or ""),
-                "currency": str(order.get("currency") or ""),
-                "updated_at": str(order.get("updated_at") or ""),
-            }
+	            order_summary = {
+	                "order_id": str(order.get("order_id")),
+	                "status": str(order.get("status") or ""),
+	                "payment_status": str(order.get("payment_status") or ""),
+	                "fulfillment_status": str(order.get("fulfillment_status") or ""),
+	                "total": str(order.get("total") or ""),
+	                "total_refunded": str(order.get("total_refunded") or ""),
+	                "currency": str(order.get("currency") or ""),
+	                "updated_at": str(order.get("updated_at") or ""),
+	            }
     except Exception:
         order_summary = None
     return {

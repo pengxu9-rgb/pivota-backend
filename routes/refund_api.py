@@ -60,12 +60,16 @@ async def process_refund(
             detail=f"Cannot refund unpaid order. Current status: {order['payment_status']}"
         )
     
-    # Check if already refunded
-    if order.get("status") == "refunded":
+    order_total = Decimal(str(order.get("total") or "0"))
+    total_refunded = Decimal(str(order.get("total_refunded") or "0"))
+    remaining = order_total - total_refunded
+
+    # Check if already fully refunded (cumulative)
+    if remaining <= Decimal("0"):
         return {
             "status": "already_refunded",
             "message": "Order was already refunded",
-            "order_id": order_id
+            "order_id": order_id,
         }
     
     # Get merchant
@@ -73,14 +77,16 @@ async def process_refund(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    # Calculate refund amount
-    refund_amount = Decimal(str(refund_request.amount)) if refund_request.amount else Decimal(str(order["total"]))
+    # Calculate refund amount: None means "refund remaining", not necessarily full order total.
+    refund_amount = Decimal(str(refund_request.amount)) if refund_request.amount is not None else remaining
+    if refund_amount <= Decimal("0"):
+        raise HTTPException(status_code=400, detail="Refund amount must be > 0")
     
-    # Validate refund amount
-    if refund_amount > Decimal(str(order["total"])):
+    # Validate refund amount against remaining refundable amount
+    if refund_amount > remaining:
         raise HTTPException(
             status_code=400,
-            detail=f"Refund amount ${refund_amount} exceeds order total ${order['total']}"
+            detail=f"Refund amount ${refund_amount} exceeds remaining refundable amount ${remaining}"
         )
     
     try:
@@ -197,9 +203,20 @@ async def process_refund(
         psp_adapter = get_psp_adapter(psp_type, psp_key)
         
         # Process refund through PSP
+        # For Stripe: passing amount=None refunds the full PaymentIntent amount, which is only safe
+        # when no prior refunds exist. Otherwise always pass an explicit amount.
+        psp_refund_amount = None
+        try:
+            if total_refunded <= Decimal("0") and refund_amount >= order_total:
+                psp_refund_amount = None
+            else:
+                psp_refund_amount = refund_amount
+        except Exception:
+            psp_refund_amount = refund_amount
+
         success, refund_id, error = await psp_adapter.refund_payment(
             payment_intent_id=order["payment_intent_id"],
-            amount=refund_amount if refund_amount < Decimal(str(order["total"])) else None,
+            amount=psp_refund_amount,
             reason=refund_request.reason,
             idempotency_key=refund_request.idempotency_key,
         )
@@ -207,22 +224,53 @@ async def process_refund(
         if not success:
             raise HTTPException(status_code=400, detail=f"Refund failed: {error}")
         
-        # Update order status
-        is_partial = refund_amount < Decimal(str(order["total"]))
-        new_status = "partially_refunded" if is_partial else "refunded"
+        # Update order status + totals (cumulative)
+        next_total_refunded = total_refunded + refund_amount
+        new_status = "refunded" if next_total_refunded >= order_total else "partially_refunded"
         
-        await update_order_status(
-            order_id=order_id,
-            status=new_status,
-            metadata={
-                **(order.get("metadata") or {}),
-                "refund_id": refund_id,
-                "refund_amount": str(refund_amount),
-                "refund_reason": refund_request.reason,
-                "refunded_by": current_user.get("user_id", "admin"),
-                "refunded_at": datetime.now().isoformat(),
-            }
-        )
+        try:
+            await update_order_status(
+                order_id=order_id,
+                status=new_status,
+                payment_status=new_status,
+                total_refunded=next_total_refunded,
+                metadata={
+                    **(order.get("metadata") or {}),
+                    "refund_id": refund_id,
+                    "refund_amount": str(refund_amount),
+                    "refund_reason": refund_request.reason,
+                    "refunded_by": current_user.get("user_id", "admin"),
+                    "refunded_at": datetime.now().isoformat(),
+                    "total_refunded": str(next_total_refunded),
+                },
+            )
+        except Exception:
+            # Best-effort schema self-heal for legacy DBs missing total_refunded
+            try:
+                from sqlalchemy import text
+                from db.database import database as _db
+
+                await _db.execute(
+                    text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
+                )
+                await update_order_status(
+                    order_id=order_id,
+                    status=new_status,
+                    payment_status=new_status,
+                    total_refunded=next_total_refunded,
+                    metadata={
+                        **(order.get("metadata") or {}),
+                        "refund_id": refund_id,
+                        "refund_amount": str(refund_amount),
+                        "refund_reason": refund_request.reason,
+                        "refunded_by": current_user.get("user_id", "admin"),
+                        "refunded_at": datetime.now().isoformat(),
+                        "total_refunded": str(next_total_refunded),
+                    },
+                )
+            except Exception:
+                # Do not fail the refund response if persistence fails.
+                pass
 
         # PCS v0.2-b (best-effort): internal refund processed fact for reducer replay (no PII).
         try:
@@ -322,6 +370,7 @@ async def process_refund(
         
         background_tasks.add_task(update_shopify_order_task)
 
+        is_partial = next_total_refunded < order_total
         response = {
             "status": "success",
             "message": f"{'Partial refund' if is_partial else 'Full refund'} processed successfully",
@@ -330,7 +379,9 @@ async def process_refund(
             "refund_amount": str(refund_amount),
             "original_amount": str(order["total"]),
             "is_partial": is_partial,
-            "new_order_status": new_status
+            "new_order_status": new_status,
+            "total_refunded": str(next_total_refunded),
+            "remaining_refundable": str(max(order_total - next_total_refunded, Decimal('0'))),
         }
 
         # Best-effort idempotency record
@@ -370,6 +421,7 @@ async def get_refund_status(
         "is_refunded": is_refunded,
         "refund_status": order.get("status"),
         "original_amount": str(order["total"]),
+        "total_refunded": str(order.get("total_refunded") or 0),
         "currency": order["currency"]
     }
     
