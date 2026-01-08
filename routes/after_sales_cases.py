@@ -325,8 +325,22 @@ async def create_after_sales_case(
             await _ensure_after_sales_cases_table()
             await _do_insert()
     except Exception as e:
-        logger.error(f"after_sales create_case error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to create after-sales case")
+        debug_id = f"as_create_{uuid.uuid4().hex[:10]}"
+        logger.error(
+            f"after_sales create_case error debug_id={debug_id}: {e}",
+            exc_info=True,
+        )
+        # Return a sanitized error so callers can debug without server logs.
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "AFTER_SALES_CREATE_FAILED",
+                "message": "Failed to create after-sales case",
+                "debug_id": debug_id,
+                "cause": type(e).__name__,
+                "detail": str(e)[:240],
+            },
+        )
 
     loaded = await _get_case_by_id(case_id)
     return {
