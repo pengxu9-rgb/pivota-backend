@@ -68,11 +68,27 @@ def _order_agent_user_ref(order: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _agent_user_matches_order_ref(*, stored_ref: str, agent_user: AgentUserContext) -> bool:
+    """
+    Backward-compatible matching:
+    - preferred: match stored `agent_user_ref` exactly
+    - legacy: older systems may have stored the JWT `sub` directly (without issuer prefix)
+    """
+    if not stored_ref:
+        return False
+    if stored_ref == agent_user.agent_user_ref:
+        return True
+    # Only allow subject match when the stored ref does not appear issuer-prefixed.
+    if ":" not in stored_ref and agent_user.subject and stored_ref == agent_user.subject:
+        return True
+    return False
+
+
 def _enforce_agent_user_order_access(*, order: Dict[str, Any], context: AgentContext, agent_user: AgentUserContext) -> None:
     if str(order.get("agent_id") or "") != str(context.agent_id):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
     stored = _order_agent_user_ref(order)
-    if not stored or stored != agent_user.agent_user_ref:
+    if not stored or not _agent_user_matches_order_ref(stored_ref=stored, agent_user=agent_user):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
 
 
@@ -1925,7 +1941,7 @@ async def agent_get_order(
         # If the order is attributed to a verified agent-user, require that identity.
         stored_agent_user_ref = _order_agent_user_ref(order)
         if stored_agent_user_ref:
-            if not agent_user or agent_user.agent_user_ref != stored_agent_user_ref:
+            if not agent_user or not _agent_user_matches_order_ref(stored_ref=stored_agent_user_ref, agent_user=agent_user):
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
         # Legacy compatibility: allow access by buyer_ref even when X-Agent-User-JWT is present,
         # as long as the order itself is not agent-user-attributed.
@@ -2033,16 +2049,24 @@ async def agent_list_orders(
                 buyer_filter_params.update(extra)
 
         # Compatibility: when both are present, union agent_user_ref + buyer_ref legacy orders.
-        if agent_user and buyer_filter_sql:
-            query += f" AND ((metadata ->> 'agent_user_ref') = :agent_user_ref OR {buyer_filter_sql})"
+        agent_user_filter_sql = None
+        if agent_user:
+            agent_user_filter_sql = "(metadata ->> 'agent_user_ref') = :agent_user_ref"
             params["agent_user_ref"] = agent_user.agent_user_ref
+            if agent_user.subject and ":" not in (agent_user.subject or ""):
+                agent_user_filter_sql = f"({agent_user_filter_sql} OR (metadata ->> 'agent_user_ref') = :agent_user_subject)"
+                params["agent_user_subject"] = agent_user.subject
+
+        if agent_user_filter_sql and buyer_filter_sql:
+            query += f" AND ({agent_user_filter_sql} OR {buyer_filter_sql})"
             params.update(buyer_filter_params)
-        elif agent_user:
-            query += " AND (metadata ->> 'agent_user_ref') = :agent_user_ref"
-            params["agent_user_ref"] = agent_user.agent_user_ref
+        elif agent_user_filter_sql:
+            query += f" AND {agent_user_filter_sql}"
         elif buyer_filter_sql:
             query += f" AND {buyer_filter_sql}"
             params.update(buyer_filter_params)
+        else:
+            pass
         
         query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
         params["limit"] = limit
@@ -2152,16 +2176,24 @@ async def agent_list_order_events(
                 buyer_filter_params.update(extra)
 
         # Compatibility: when both are present, union agent_user_ref + buyer_ref legacy events.
-        if agent_user and buyer_filter_sql:
-            query += f" AND ((o.metadata ->> 'agent_user_ref') = :agent_user_ref OR {buyer_filter_sql})"
+        agent_user_filter_sql = None
+        if agent_user:
+            agent_user_filter_sql = "(o.metadata ->> 'agent_user_ref') = :agent_user_ref"
             params["agent_user_ref"] = agent_user.agent_user_ref
+            if agent_user.subject and ":" not in (agent_user.subject or ""):
+                agent_user_filter_sql = f"({agent_user_filter_sql} OR (o.metadata ->> 'agent_user_ref') = :agent_user_subject)"
+                params["agent_user_subject"] = agent_user.subject
+
+        if agent_user_filter_sql and buyer_filter_sql:
+            query += f" AND ({agent_user_filter_sql} OR {buyer_filter_sql})"
             params.update(buyer_filter_params)
-        elif agent_user:
-            query += " AND (o.metadata ->> 'agent_user_ref') = :agent_user_ref"
-            params["agent_user_ref"] = agent_user.agent_user_ref
+        elif agent_user_filter_sql:
+            query += f" AND {agent_user_filter_sql}"
         elif buyer_filter_sql:
             query += f" AND {buyer_filter_sql}"
             params.update(buyer_filter_params)
+        else:
+            pass
 
         query += " ORDER BY e.id ASC LIMIT :limit"
 
@@ -2223,7 +2255,7 @@ async def agent_refund_order(
 
         stored_agent_user_ref = _order_agent_user_ref(order)
         if stored_agent_user_ref:
-            if not agent_user or agent_user.agent_user_ref != stored_agent_user_ref:
+            if not agent_user or not _agent_user_matches_order_ref(stored_ref=stored_agent_user_ref, agent_user=agent_user):
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
         elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
@@ -2267,7 +2299,7 @@ async def agent_cancel_order(
 
         stored_agent_user_ref = _order_agent_user_ref(order)
         if stored_agent_user_ref:
-            if not agent_user or agent_user.agent_user_ref != stored_agent_user_ref:
+            if not agent_user or not _agent_user_matches_order_ref(stored_ref=stored_agent_user_ref, agent_user=agent_user):
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
         elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
