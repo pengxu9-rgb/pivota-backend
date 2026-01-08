@@ -1918,14 +1918,21 @@ async def agent_get_order(
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        # Agent-user scoped access: prefer verified end-user identity when provided.
-        if agent_user:
-            _enforce_agent_user_order_access(order=order, context=context, agent_user=agent_user)
-        # Agent-scoped access: allow by (agent_id + buyer_ref) without requiring merchant permissions.
+        # Always enforce agent ownership for Agent API calls.
+        if str(order.get("agent_id") or "") != str(context.agent_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # If the order is attributed to a verified agent-user, require that identity.
+        stored_agent_user_ref = _order_agent_user_ref(order)
+        if stored_agent_user_ref:
+            if not agent_user or agent_user.agent_user_ref != stored_agent_user_ref:
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
+        # Legacy compatibility: allow access by buyer_ref even when X-Agent-User-JWT is present,
+        # as long as the order itself is not agent-user-attributed.
         elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
-            if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
+            if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
         else:
             # Legacy access: validate merchant access.
@@ -2016,18 +2023,26 @@ async def agent_list_orders(
             query += " AND status = :status"
             params["status"] = status
 
-        # Agent-user scoped filtering (verified via JWKS).
-        if agent_user:
-            query += " AND (metadata ->> 'agent_user_ref') = :agent_user_ref"
-            params["agent_user_ref"] = agent_user.agent_user_ref
-
-        # Agent-scoped filtering by buyer_ref (stored in metadata JSON), including merged guest refs.
+        buyer_filter_sql = None
+        buyer_filter_params: Dict[str, Any] = {}
         if buyer_ref:
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
             placeholders, extra = build_in_params("buyer_ref", allowed_refs)
             if placeholders:
-                query += f" AND (metadata ->> 'buyer_ref') IN ({placeholders})"
-                params.update(extra)
+                buyer_filter_sql = f"(metadata ->> 'buyer_ref') IN ({placeholders})"
+                buyer_filter_params.update(extra)
+
+        # Compatibility: when both are present, union agent_user_ref + buyer_ref legacy orders.
+        if agent_user and buyer_filter_sql:
+            query += f" AND ((metadata ->> 'agent_user_ref') = :agent_user_ref OR {buyer_filter_sql})"
+            params["agent_user_ref"] = agent_user.agent_user_ref
+            params.update(buyer_filter_params)
+        elif agent_user:
+            query += " AND (metadata ->> 'agent_user_ref') = :agent_user_ref"
+            params["agent_user_ref"] = agent_user.agent_user_ref
+        elif buyer_filter_sql:
+            query += f" AND {buyer_filter_sql}"
+            params.update(buyer_filter_params)
         
         query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
         params["limit"] = limit
@@ -2127,15 +2142,26 @@ async def agent_list_order_events(
             query += " AND e.merchant_id = :merchant_id"
             params["merchant_id"] = merchant_id
 
-        if agent_user:
-            query += " AND (o.metadata ->> 'agent_user_ref') = :agent_user_ref"
-            params["agent_user_ref"] = agent_user.agent_user_ref
-        elif buyer_ref:
+        buyer_filter_sql = None
+        buyer_filter_params: Dict[str, Any] = {}
+        if buyer_ref:
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
             placeholders, extra = build_in_params("buyer_ref", allowed_refs)
             if placeholders:
-                query += f" AND (o.metadata ->> 'buyer_ref') IN ({placeholders})"
-                params.update(extra)
+                buyer_filter_sql = f"(o.metadata ->> 'buyer_ref') IN ({placeholders})"
+                buyer_filter_params.update(extra)
+
+        # Compatibility: when both are present, union agent_user_ref + buyer_ref legacy events.
+        if agent_user and buyer_filter_sql:
+            query += f" AND ((o.metadata ->> 'agent_user_ref') = :agent_user_ref OR {buyer_filter_sql})"
+            params["agent_user_ref"] = agent_user.agent_user_ref
+            params.update(buyer_filter_params)
+        elif agent_user:
+            query += " AND (o.metadata ->> 'agent_user_ref') = :agent_user_ref"
+            params["agent_user_ref"] = agent_user.agent_user_ref
+        elif buyer_filter_sql:
+            query += f" AND {buyer_filter_sql}"
+            params.update(buyer_filter_params)
 
         query += " ORDER BY e.id ASC LIMIT :limit"
 
@@ -2190,15 +2216,19 @@ async def agent_refund_order(
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        if agent_user:
-            _enforce_agent_user_order_access(order=order, context=context, agent_user=agent_user)
+
+        # Always enforce agent ownership for Agent API calls.
+        if str(order.get("agent_id") or "") != str(context.agent_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        stored_agent_user_ref = _order_agent_user_ref(order)
+        if stored_agent_user_ref:
+            if not agent_user or agent_user.agent_user_ref != stored_agent_user_ref:
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
         elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
-            if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
-                raise HTTPException(status_code=403, detail="Not authorized for this order")
-        else:
-            if order.get("agent_id") != context.agent_id:
+            if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
 
         # Build refund request (full refund)
@@ -2230,15 +2260,19 @@ async def agent_cancel_order(
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        if agent_user:
-            _enforce_agent_user_order_access(order=order, context=context, agent_user=agent_user)
+
+        # Always enforce agent ownership for Agent API calls.
+        if str(order.get("agent_id") or "") != str(context.agent_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        stored_agent_user_ref = _order_agent_user_ref(order)
+        if stored_agent_user_ref:
+            if not agent_user or agent_user.agent_user_ref != stored_agent_user_ref:
+                raise HTTPException(status_code=403, detail="Not authorized for this order")
         elif buyer_ref:
             stored = (order.get("metadata") or {}).get("buyer_ref")
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
-            if order.get("agent_id") != context.agent_id or str(stored or "") not in allowed_refs:
-                raise HTTPException(status_code=403, detail="Not authorized for this order")
-        else:
-            if order.get("agent_id") != context.agent_id:
+            if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
 
         # Block cancel if clearly paid/succeeded
