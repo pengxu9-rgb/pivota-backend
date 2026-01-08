@@ -598,12 +598,21 @@ async def process_case_refund(
         current_user={"role": "admin"},
     )
 
+    # Reload order after refund attempt (PII-safe summary only)
+    try:
+        order = await get_order(str(order.get("order_id")))
+    except Exception:
+        pass
+
     # Update case status best-effort
     audit = _append_audit(audit, "refund_processed", {"result_status": refund_result.get("status") if isinstance(refund_result, dict) else None})
     next_status = "refund_processed"
     try:
         if isinstance(refund_result, dict) and refund_result.get("refund_type") == "partial":
             next_status = "partially_refunded"
+        if isinstance(refund_result, dict) and refund_result.get("status") == "already_refunded":
+            # Make the case converge to the order's current terminal status.
+            next_status = str((order or {}).get("status") or "refunded")
         if isinstance(refund_result, dict) and refund_result.get("status") in ("partially_refunded", "refunded"):
             next_status = str(refund_result.get("status"))
     except Exception:
@@ -624,8 +633,23 @@ async def process_case_refund(
         pass
 
     reloaded = await _get_case_by_id(case_id)
+    order_summary = None
+    try:
+        if isinstance(order, dict) and order.get("order_id"):
+            order_summary = {
+                "order_id": str(order.get("order_id")),
+                "status": str(order.get("status") or ""),
+                "payment_status": str(order.get("payment_status") or ""),
+                "fulfillment_status": str(order.get("fulfillment_status") or ""),
+                "total": str(order.get("total") or ""),
+                "currency": str(order.get("currency") or ""),
+                "updated_at": str(order.get("updated_at") or ""),
+            }
+    except Exception:
+        order_summary = None
     return {
         "status": "success",
         "case": _serialize_case(reloaded),
         "refund": refund_result,
+        "order": order_summary,
     }
