@@ -188,6 +188,7 @@ from routes.merchant_agent_bank import router as merchant_agent_bank_router  # M
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
+from routes.after_sales_cases import router as after_sales_cases_router
 from routes.agent_events import router as agent_events_router
 from routes.agent_management import router as agent_management_router
 from routes.shopify_setup import router as shopify_setup_router
@@ -565,6 +566,7 @@ app.include_router(order_router)  # Order processing
 app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-facing)
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
+app.include_router(after_sales_cases_router)  # After-sales Case API (refund/return_refund)
 app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
