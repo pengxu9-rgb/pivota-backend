@@ -2384,7 +2384,13 @@ async def agent_track_order(
             raise HTTPException(status_code=404, detail="Order not found")
         if order.get("agent_id") != context.agent_id:
             raise HTTPException(status_code=403, detail="Not authorized for this order")
-        tracking = await track_order_fulfillment(order_id, context)
+        # `track_order_fulfillment` is also an HTTP handler that expects FastAPI-injected
+        # `BackgroundTasks` + `context`. When called from here, pass arguments explicitly.
+        tracking = await track_order_fulfillment(
+            order_id=order_id,
+            background_tasks=BackgroundTasks(),
+            context=context,
+        )
         return tracking
     except HTTPException:
         raise
