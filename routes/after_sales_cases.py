@@ -80,6 +80,60 @@ class CreateAfterSalesCaseRequest(BaseModel):
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
+async def _ensure_after_sales_cases_table() -> None:
+    """
+    Best-effort defensive DDL. Production should normally rely on SQL migrations,
+    but the migration runner is best-effort and may skip new files.
+    """
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS after_sales_cases (
+              id BIGSERIAL PRIMARY KEY,
+              case_id TEXT NOT NULL UNIQUE,
+              order_id TEXT NOT NULL,
+              merchant_id TEXT NOT NULL,
+              agent_id TEXT NOT NULL,
+              agent_user_ref TEXT,
+              buyer_ref TEXT,
+              case_type TEXT NOT NULL,
+              resolution TEXT NOT NULL,
+              reason_code TEXT,
+              reason_text TEXT,
+              requested_refund_amount NUMERIC(12, 2),
+              currency_order TEXT,
+              currency_charge TEXT,
+              line_items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              amount_breakdown_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+              status TEXT NOT NULL DEFAULT 'requested',
+              label_url TEXT,
+              audit_log JSONB NOT NULL DEFAULT '[]'::jsonb,
+              idempotency_key TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_after_sales_cases_order ON after_sales_cases (order_id, created_at DESC)"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_after_sales_cases_agent ON after_sales_cases (agent_id, created_at DESC)"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_after_sales_cases_status ON after_sales_cases (status, updated_at DESC)"
+        )
+        await database.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_after_sales_cases_agent_idempotency
+              ON after_sales_cases (agent_id, idempotency_key)
+              WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''
+            """
+        )
+    except Exception:
+        # Best-effort only; routes will surface meaningful errors if DB is broken.
+        return
+
 
 async def _enforce_order_access(
     *,
@@ -209,51 +263,59 @@ async def create_after_sales_case(
     )
 
     try:
-        await database.execute(
-            """
-            INSERT INTO after_sales_cases (
-              case_id, order_id, merchant_id, agent_id,
-              agent_user_ref, buyer_ref,
-              case_type, resolution,
-              reason_code, reason_text,
-              requested_refund_amount, currency_order, currency_charge,
-              line_items_json, amount_breakdown_json,
-              status, label_url, audit_log, idempotency_key,
-              created_at, updated_at
+        async def _do_insert() -> None:
+            await database.execute(
+                """
+                INSERT INTO after_sales_cases (
+                  case_id, order_id, merchant_id, agent_id,
+                  agent_user_ref, buyer_ref,
+                  case_type, resolution,
+                  reason_code, reason_text,
+                  requested_refund_amount, currency_order, currency_charge,
+                  line_items_json, amount_breakdown_json,
+                  status, label_url, audit_log, idempotency_key,
+                  created_at, updated_at
+                )
+                VALUES (
+                  :case_id, :order_id, :merchant_id, :agent_id,
+                  :agent_user_ref, :buyer_ref,
+                  :case_type, :resolution,
+                  :reason_code, :reason_text,
+                  :requested_refund_amount, :currency_order, :currency_charge,
+                  :line_items_json::jsonb, :amount_breakdown_json::jsonb,
+                  :status, :label_url, :audit_log::jsonb, :idempotency_key,
+                  NOW(), NOW()
+                )
+                """,
+                {
+                    "case_id": case_id,
+                    "order_id": order_id,
+                    "merchant_id": merchant_id,
+                    "agent_id": context.agent_id,
+                    "agent_user_ref": agent_user.agent_user_ref if agent_user else None,
+                    "buyer_ref": canonical_buyer_ref,
+                    "case_type": req.case_type,
+                    "resolution": req.resolution,
+                    "reason_code": (req.reason_code or None),
+                    "reason_text": (req.reason_text or None),
+                    "requested_refund_amount": float(requested_amount) if requested_amount is not None else None,
+                    "currency_order": currency_order,
+                    "currency_charge": currency_charge,
+                    "line_items_json": json.dumps([li.model_dump() for li in (req.line_items or [])], ensure_ascii=False),
+                    "amount_breakdown_json": json.dumps(req.amount_breakdown.model_dump() if req.amount_breakdown else {}, ensure_ascii=False),
+                    "status": "requested",
+                    "label_url": None,
+                    "audit_log": json.dumps(audit, ensure_ascii=False),
+                    "idempotency_key": idem,
+                },
             )
-            VALUES (
-              :case_id, :order_id, :merchant_id, :agent_id,
-              :agent_user_ref, :buyer_ref,
-              :case_type, :resolution,
-              :reason_code, :reason_text,
-              :requested_refund_amount, :currency_order, :currency_charge,
-              :line_items_json, :amount_breakdown_json,
-              :status, :label_url, :audit_log, :idempotency_key,
-              NOW(), NOW()
-            )
-            """,
-            {
-                "case_id": case_id,
-                "order_id": order_id,
-                "merchant_id": merchant_id,
-                "agent_id": context.agent_id,
-                "agent_user_ref": agent_user.agent_user_ref if agent_user else None,
-                "buyer_ref": canonical_buyer_ref,
-                "case_type": req.case_type,
-                "resolution": req.resolution,
-                "reason_code": (req.reason_code or None),
-                "reason_text": (req.reason_text or None),
-                "requested_refund_amount": float(requested_amount) if requested_amount is not None else None,
-                "currency_order": currency_order,
-                "currency_charge": currency_charge,
-                "line_items_json": json.dumps([li.model_dump() for li in (req.line_items or [])]),
-                "amount_breakdown_json": json.dumps(req.amount_breakdown.model_dump() if req.amount_breakdown else {}),
-                "status": "requested",
-                "label_url": None,
-                "audit_log": json.dumps(audit),
-                "idempotency_key": idem,
-            },
-        )
+
+        try:
+            await _do_insert()
+        except Exception:
+            # One-time self-heal: create table/indexes, then retry insert.
+            await _ensure_after_sales_cases_table()
+            await _do_insert()
     except Exception as e:
         logger.error(f"after_sales create_case error: {e}")
         raise HTTPException(status_code=500, detail="Failed to create after-sales case")
@@ -428,7 +490,7 @@ async def issue_return_label_placeholder(
             UPDATE after_sales_cases
             SET label_url = :label_url,
                 status = 'label_issued',
-                audit_log = :audit_log,
+                audit_log = :audit_log::jsonb,
                 updated_at = NOW()
             WHERE case_id = :case_id
             """,
@@ -489,7 +551,7 @@ async def process_case_refund(
             """
             UPDATE after_sales_cases
             SET status = 'refund_pending',
-                audit_log = :audit_log,
+                audit_log = :audit_log::jsonb,
                 updated_at = NOW()
             WHERE case_id = :case_id
             """,
@@ -530,7 +592,7 @@ async def process_case_refund(
             """
             UPDATE after_sales_cases
             SET status = :status,
-                audit_log = :audit_log,
+                audit_log = :audit_log::jsonb,
                 updated_at = NOW()
             WHERE case_id = :case_id
             """,
@@ -545,4 +607,3 @@ async def process_case_refund(
         "case": _serialize_case(reloaded),
         "refund": refund_result,
     }
-
