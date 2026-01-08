@@ -227,6 +227,7 @@ async def process_refund(
         # Update order status + totals (cumulative)
         next_total_refunded = total_refunded + refund_amount
         new_status = "refunded" if next_total_refunded >= order_total else "partially_refunded"
+        is_partial = new_status == "partially_refunded"
         
         try:
             await update_order_status(
@@ -370,7 +371,6 @@ async def process_refund(
         
         background_tasks.add_task(update_shopify_order_task)
 
-        is_partial = next_total_refunded < order_total
         response = {
             "status": "success",
             "message": f"{'Partial refund' if is_partial else 'Full refund'} processed successfully",
