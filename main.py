@@ -1153,6 +1153,29 @@ async def health_check():
     """Dedicated health check endpoint"""
     return {"status": "ok", "timestamp": time.time()}
 
+@app.get("/__build")
+async def build_info():
+    """
+    Deployment introspection (no secrets).
+    Useful to confirm which git SHA / deployment is running in prod.
+    """
+    return {
+        "service": "pivota-backend",
+        "timestamp": time.time(),
+        "git": {
+            "commit_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA")
+            or os.getenv("GIT_COMMIT_SHA")
+            or os.getenv("VERCEL_GIT_COMMIT_SHA")
+            or None,
+            "branch": os.getenv("RAILWAY_GIT_BRANCH") or os.getenv("GIT_BRANCH") or None,
+        },
+        "railway": {
+            "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
+            "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID") or None,
+            "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
+        },
+    }
+
 # Catch-all OPTIONS to satisfy permissive CORS preflight checks (even when Access-Control-Request-Method is missing).
 @app.options("/{full_path:path}")
 async def options_passthrough(full_path: str, request: Request):
