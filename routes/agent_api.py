@@ -2048,13 +2048,15 @@ async def agent_list_orders(
                 buyer_filter_sql = f"(metadata ->> 'buyer_ref') IN ({placeholders})"
                 buyer_filter_params.update(extra)
 
+        agent_user_ref_expr = "COALESCE(metadata ->> 'agent_user_ref', metadata ->> 'agentUserRef')"
+
         # Compatibility: when both are present, union agent_user_ref + buyer_ref legacy orders.
         agent_user_filter_sql = None
         if agent_user:
-            agent_user_filter_sql = "(metadata ->> 'agent_user_ref') = :agent_user_ref"
+            agent_user_filter_sql = f"({agent_user_ref_expr}) = :agent_user_ref"
             params["agent_user_ref"] = agent_user.agent_user_ref
             if agent_user.subject and ":" not in (agent_user.subject or ""):
-                agent_user_filter_sql = f"({agent_user_filter_sql} OR (metadata ->> 'agent_user_ref') = :agent_user_subject)"
+                agent_user_filter_sql = f"({agent_user_filter_sql} OR ({agent_user_ref_expr}) = :agent_user_subject)"
                 params["agent_user_subject"] = agent_user.subject
 
         if agent_user_filter_sql and buyer_filter_sql:
@@ -2066,7 +2068,7 @@ async def agent_list_orders(
                 f"{agent_user_filter_sql}"
                 " OR ("
                 f"{buyer_filter_sql}"
-                " AND (metadata ->> 'agent_user_ref') IS NULL"
+                f" AND ({agent_user_ref_expr}) IS NULL"
                 ")"
                 ")"
             )
@@ -2076,7 +2078,7 @@ async def agent_list_orders(
         elif buyer_filter_sql:
             # buyer_ref is a legacy/compat identifier; do not expose agent-user-attributed orders
             # unless a verified X-Agent-User-JWT is present (handled above).
-            query += f" AND ({buyer_filter_sql} AND (metadata ->> 'agent_user_ref') IS NULL)"
+            query += f" AND ({buyer_filter_sql} AND ({agent_user_ref_expr}) IS NULL)"
             params.update(buyer_filter_params)
         else:
             pass
@@ -2188,13 +2190,15 @@ async def agent_list_order_events(
                 buyer_filter_sql = f"(o.metadata ->> 'buyer_ref') IN ({placeholders})"
                 buyer_filter_params.update(extra)
 
+        agent_user_ref_expr = "COALESCE(o.metadata ->> 'agent_user_ref', o.metadata ->> 'agentUserRef')"
+
         # Compatibility: when both are present, union agent_user_ref + buyer_ref legacy events.
         agent_user_filter_sql = None
         if agent_user:
-            agent_user_filter_sql = "(o.metadata ->> 'agent_user_ref') = :agent_user_ref"
+            agent_user_filter_sql = f"({agent_user_ref_expr}) = :agent_user_ref"
             params["agent_user_ref"] = agent_user.agent_user_ref
             if agent_user.subject and ":" not in (agent_user.subject or ""):
-                agent_user_filter_sql = f"({agent_user_filter_sql} OR (o.metadata ->> 'agent_user_ref') = :agent_user_subject)"
+                agent_user_filter_sql = f"({agent_user_filter_sql} OR ({agent_user_ref_expr}) = :agent_user_subject)"
                 params["agent_user_subject"] = agent_user.subject
 
         if agent_user_filter_sql and buyer_filter_sql:
@@ -2203,7 +2207,7 @@ async def agent_list_order_events(
                 f"{agent_user_filter_sql}"
                 " OR ("
                 f"{buyer_filter_sql}"
-                " AND (o.metadata ->> 'agent_user_ref') IS NULL"
+                f" AND ({agent_user_ref_expr}) IS NULL"
                 ")"
                 ")"
             )
@@ -2211,7 +2215,7 @@ async def agent_list_order_events(
         elif agent_user_filter_sql:
             query += f" AND {agent_user_filter_sql}"
         elif buyer_filter_sql:
-            query += f" AND ({buyer_filter_sql} AND (o.metadata ->> 'agent_user_ref') IS NULL)"
+            query += f" AND ({buyer_filter_sql} AND ({agent_user_ref_expr}) IS NULL)"
             params.update(buyer_filter_params)
         else:
             pass
