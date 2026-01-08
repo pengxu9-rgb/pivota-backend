@@ -163,10 +163,28 @@ async def process_refund(
         except Exception:
             pass
 
-        # Get PSP adapter
-        psp_type = merchant.get("psp_type", "stripe")
-        psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-        
+        # Get PSP adapter (refund must match the PSP that actually processed this order)
+        order_psp_type = str(order.get("psp_used") or "").strip().lower() or None
+        if not order_psp_type:
+            psp_id = str(order.get("psp_id") or "").strip().lower()
+            if psp_id.startswith("psp_stripe"):
+                order_psp_type = "stripe"
+            elif psp_id.startswith("psp_adyen"):
+                order_psp_type = "adyen"
+
+        if not order_psp_type:
+            payment_intent_id = str(order.get("payment_intent_id") or "")
+            if payment_intent_id.startswith("pi_"):
+                order_psp_type = "stripe"
+
+        merchant_psp_type = str(merchant.get("psp_type") or "").strip().lower() or None
+        psp_type = order_psp_type or merchant_psp_type or "stripe"
+
+        # Only use merchant-stored PSP keys if they correspond to the same PSP type.
+        psp_key = None
+        if merchant_psp_type and merchant_psp_type == psp_type:
+            psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
+
         if not psp_key:
             if psp_type == "stripe":
                 psp_key = settings.stripe_secret_key
