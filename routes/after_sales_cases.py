@@ -177,6 +177,19 @@ async def _get_case_by_id(case_id: str) -> Optional[Dict[str, Any]]:
         raise HTTPException(status_code=500, detail="Failed to load after-sales case")
 
 
+def _is_idempotency_unique_violation(e: Exception) -> bool:
+    try:
+        msg = str(e)
+    except Exception:
+        msg = ""
+    return (
+        "ux_after_sales_cases_agent_idempotency" in msg
+        or "after_sales_cases_agent_idempotency" in msg
+        or "unique constraint" in msg.lower() and "idempotency" in msg.lower()
+    )
+
+
+
 def _append_audit(audit: List[Dict[str, Any]], event: str, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     audit = list(audit or [])
     audit.append(
@@ -224,10 +237,15 @@ async def create_after_sales_case(
                 "SELECT case_id FROM after_sales_cases WHERE agent_id = :agent_id AND idempotency_key = :k",
                 {"agent_id": context.agent_id, "k": idem},
             )
-            if existing and existing.get("case_id"):
-                case_id = str(existing["case_id"])
-                loaded = await _get_case_by_id(case_id)
-                return {"status": "success", "case": _serialize_case(loaded)}
+            existing_case_id = dict(existing).get("case_id") if existing else None
+            if existing_case_id:
+                loaded = await _get_case_by_id(str(existing_case_id))
+                serialized = _serialize_case(loaded)
+                return {
+                    "status": "success",
+                    "case": serialized,
+                    "next_action": _next_action_for_case(serialized),
+                }
         except Exception:
             pass
 
@@ -270,34 +288,52 @@ async def create_after_sales_case(
         },
     )
 
+    async def _load_existing_case_by_idempotency() -> Optional[Dict[str, Any]]:
+        if not idem:
+            return None
+        row = await database.fetch_one(
+            "SELECT case_id FROM after_sales_cases WHERE agent_id = :agent_id AND idempotency_key = :k",
+            {"agent_id": context.agent_id, "k": idem},
+        )
+        existing_case_id = dict(row).get("case_id") if row else None
+        if not existing_case_id:
+            return None
+        loaded = await _get_case_by_id(str(existing_case_id))
+        serialized = _serialize_case(loaded)
+        return {
+            "status": "success",
+            "case": serialized,
+            "next_action": _next_action_for_case(serialized),
+        }
+
     try:
         async def _do_insert() -> None:
-	            await database.execute(
-	                """
-	                INSERT INTO after_sales_cases (
-	                  case_id, order_id, merchant_id, agent_id,
-	                  agent_user_ref, buyer_ref,
-	                  case_type, resolution,
-	                  reason_code, reason_text,
-	                  requested_refund_amount, currency_order, currency_charge,
-	                  line_items_json, amount_breakdown_json,
-	                  status, label_url, audit_log, idempotency_key,
-	                  created_at, updated_at
-	                )
-	                VALUES (
-	                  :case_id, :order_id, :merchant_id, :agent_id,
-	                  :agent_user_ref, :buyer_ref,
-	                  :case_type, :resolution,
-	                  :reason_code, :reason_text,
-	                  :requested_refund_amount, :currency_order, :currency_charge,
-	                  CAST(:line_items_json AS JSONB), CAST(:amount_breakdown_json AS JSONB),
-	                  :status, :label_url, CAST(:audit_log AS JSONB), :idempotency_key,
-	                  NOW(), NOW()
-	                )
-	                """,
-	                {
-	                    "case_id": case_id,
-	                    "order_id": order_id,
+            await database.execute(
+                """
+                INSERT INTO after_sales_cases (
+                  case_id, order_id, merchant_id, agent_id,
+                  agent_user_ref, buyer_ref,
+                  case_type, resolution,
+                  reason_code, reason_text,
+                  requested_refund_amount, currency_order, currency_charge,
+                  line_items_json, amount_breakdown_json,
+                  status, label_url, audit_log, idempotency_key,
+                  created_at, updated_at
+                )
+                VALUES (
+                  :case_id, :order_id, :merchant_id, :agent_id,
+                  :agent_user_ref, :buyer_ref,
+                  :case_type, :resolution,
+                  :reason_code, :reason_text,
+                  :requested_refund_amount, :currency_order, :currency_charge,
+                  CAST(:line_items_json AS JSONB), CAST(:amount_breakdown_json AS JSONB),
+                  :status, :label_url, CAST(:audit_log AS JSONB), :idempotency_key,
+                  NOW(), NOW()
+                )
+                """,
+                {
+                    "case_id": case_id,
+                    "order_id": order_id,
                     "merchant_id": merchant_id,
                     "agent_id": context.agent_id,
                     "agent_user_ref": agent_user.agent_user_ref if agent_user else None,
@@ -308,22 +344,34 @@ async def create_after_sales_case(
                     "reason_text": (req.reason_text or None),
                     "requested_refund_amount": float(requested_amount) if requested_amount is not None else None,
                     "currency_order": currency_order,
-	                    "currency_charge": currency_charge,
-	                    "line_items_json": json.dumps([li.model_dump() for li in (req.line_items or [])], ensure_ascii=False),
-	                    "amount_breakdown_json": json.dumps(req.amount_breakdown.model_dump() if req.amount_breakdown else {}, ensure_ascii=False),
-	                    "status": "requested",
-	                    "label_url": None,
-	                    "audit_log": json.dumps(audit, ensure_ascii=False),
-	                    "idempotency_key": idem,
-	                },
-	            )
+                    "currency_charge": currency_charge,
+                    "line_items_json": json.dumps([li.model_dump() for li in (req.line_items or [])], ensure_ascii=False),
+                    "amount_breakdown_json": json.dumps(req.amount_breakdown.model_dump() if req.amount_breakdown else {}, ensure_ascii=False),
+                    "status": "requested",
+                    "label_url": None,
+                    "audit_log": json.dumps(audit, ensure_ascii=False),
+                    "idempotency_key": idem,
+                },
+            )
 
         try:
             await _do_insert()
-        except Exception:
+        except Exception as e:
+            # Idempotency safety: if another request already created this case, return it.
+            if idem and _is_idempotency_unique_violation(e):
+                existing_resp = await _load_existing_case_by_idempotency()
+                if existing_resp:
+                    return existing_resp
             # One-time self-heal: create table/indexes, then retry insert.
             await _ensure_after_sales_cases_table()
-            await _do_insert()
+            try:
+                await _do_insert()
+            except Exception as e2:
+                if idem and _is_idempotency_unique_violation(e2):
+                    existing_resp = await _load_existing_case_by_idempotency()
+                    if existing_resp:
+                        return existing_resp
+                raise
     except Exception as e:
         debug_id = f"as_create_{uuid.uuid4().hex[:10]}"
         logger.error(
