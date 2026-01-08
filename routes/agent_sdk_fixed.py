@@ -488,7 +488,7 @@ async def search_products(
 # ORDERS
 # ============================================================================
 
-@router.get("/orders")
+@router.get("/sdk/orders", deprecated=True)
 async def list_orders(
     merchant_id: Optional[str] = None,
     status: Optional[str] = None,
@@ -496,7 +496,11 @@ async def list_orders(
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context)
 ):
-    """List orders"""
+    """
+    List orders (SDK legacy).
+
+    Deprecated: use `/agent/v1/orders` from `routes/agent_api.py` instead.
+    """
     try:
         # Build WHERE clauses
         # Always scope to current agent
@@ -530,7 +534,23 @@ async def list_orders(
         
         return {
             "status": "success",
-            "orders": [dict(o) for o in orders],
+            # Avoid returning sensitive fields (e.g. client_secret, raw metadata, full addresses)
+            # from this legacy listing endpoint. Use /agent/v1/orders/{order_id} for details.
+            "orders": [
+                {
+                    "order_id": o.get("order_id"),
+                    "merchant_id": o.get("merchant_id"),
+                    "merchant_name": o.get("merchant_name"),
+                    "status": o.get("status"),
+                    "payment_status": o.get("payment_status"),
+                    "fulfillment_status": o.get("fulfillment_status"),
+                    "total": str(o.get("total")) if o.get("total") is not None else None,
+                    "currency": o.get("currency"),
+                    "created_at": o.get("created_at"),
+                    "updated_at": o.get("updated_at"),
+                }
+                for o in orders
+            ],
             "pagination": {
                 "limit": limit,
                 "offset": offset,
