@@ -200,7 +200,8 @@ async def process_refund(
         success, refund_id, error = await psp_adapter.refund_payment(
             payment_intent_id=order["payment_intent_id"],
             amount=refund_amount if refund_amount < Decimal(str(order["total"])) else None,
-            reason=refund_request.reason
+            reason=refund_request.reason,
+            idempotency_key=refund_request.idempotency_key,
         )
         
         if not success:
@@ -213,13 +214,13 @@ async def process_refund(
         await update_order_status(
             order_id=order_id,
             status=new_status,
-            refunded_at=datetime.now(),
             metadata={
                 **(order.get("metadata") or {}),
                 "refund_id": refund_id,
                 "refund_amount": str(refund_amount),
                 "refund_reason": refund_request.reason,
-                "refunded_by": current_user.get("user_id", "admin")
+                "refunded_by": current_user.get("user_id", "admin"),
+                "refunded_at": datetime.now().isoformat(),
             }
         )
 
@@ -378,7 +379,7 @@ async def get_refund_status(
             "refund_id": metadata.get("refund_id"),
             "refund_amount": metadata.get("refund_amount"),
             "refund_reason": metadata.get("refund_reason"),
-            "refunded_at": order.get("refunded_at").isoformat() if order.get("refunded_at") else None,
+            "refunded_at": metadata.get("refunded_at") or (order.get("refunded_at").isoformat() if order.get("refunded_at") else None),
             "refunded_by": metadata.get("refunded_by")
         })
     

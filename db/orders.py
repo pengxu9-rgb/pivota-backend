@@ -229,6 +229,12 @@ async def update_order_status(
     """更新订单状态（防御性：只能前进，不能回退）"""
     update_data = {"status": status, "updated_at": datetime.now()}
     update_data.update(additional_fields)
+
+    # Defensive: ignore fields not present in the SQLAlchemy table definition.
+    # Some environments have divergent schemas; passing unknown keys raises:
+    # "Unconsumed column names: <...>"
+    valid_cols = set(orders.c.keys())
+    update_data = {k: v for (k, v) in update_data.items() if k in valid_cols}
     
     query = orders.update().where(
         orders.c.order_id == order_id

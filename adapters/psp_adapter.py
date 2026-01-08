@@ -71,7 +71,8 @@ class PSPAdapter(ABC):
         self,
         payment_intent_id: str,
         amount: Optional[Decimal] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """退款"""
         pass
@@ -200,7 +201,8 @@ class StripeAdapter(PSPAdapter):
         self,
         payment_intent_id: str,
         amount: Optional[Decimal] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Stripe 退款"""
         try:
@@ -216,8 +218,11 @@ class StripeAdapter(PSPAdapter):
                     refund_data["reason"] = reason_norm
                 else:
                     refund_data["metadata"] = {"reason": reason_norm}
-            
-            refund = stripe.Refund.create(**refund_data)
+
+            if idempotency_key:
+                refund = stripe.Refund.create(**refund_data, idempotency_key=str(idempotency_key))
+            else:
+                refund = stripe.Refund.create(**refund_data)
             return True, refund.id, None
         except Exception as e:
             # Fall back to generic exception to avoid dependency on stripe.error namespace
@@ -374,7 +379,8 @@ class AdyenAdapter(PSPAdapter):
         self,
         payment_intent_id: str,
         amount: Optional[Decimal] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Adyen 退款"""
         try:
