@@ -272,32 +272,32 @@ async def create_after_sales_case(
 
     try:
         async def _do_insert() -> None:
-            await database.execute(
-                """
-                INSERT INTO after_sales_cases (
-                  case_id, order_id, merchant_id, agent_id,
-                  agent_user_ref, buyer_ref,
-                  case_type, resolution,
-                  reason_code, reason_text,
-                  requested_refund_amount, currency_order, currency_charge,
-                  line_items_json, amount_breakdown_json,
-                  status, label_url, audit_log, idempotency_key,
-                  created_at, updated_at
-                )
-                VALUES (
-                  :case_id, :order_id, :merchant_id, :agent_id,
-                  :agent_user_ref, :buyer_ref,
-                  :case_type, :resolution,
-                  :reason_code, :reason_text,
-                  :requested_refund_amount, :currency_order, :currency_charge,
-                  :line_items_json::jsonb, :amount_breakdown_json::jsonb,
-                  :status, :label_url, :audit_log::jsonb, :idempotency_key,
-                  NOW(), NOW()
-                )
-                """,
-                {
-                    "case_id": case_id,
-                    "order_id": order_id,
+	            await database.execute(
+	                """
+	                INSERT INTO after_sales_cases (
+	                  case_id, order_id, merchant_id, agent_id,
+	                  agent_user_ref, buyer_ref,
+	                  case_type, resolution,
+	                  reason_code, reason_text,
+	                  requested_refund_amount, currency_order, currency_charge,
+	                  line_items_json, amount_breakdown_json,
+	                  status, label_url, audit_log, idempotency_key,
+	                  created_at, updated_at
+	                )
+	                VALUES (
+	                  :case_id, :order_id, :merchant_id, :agent_id,
+	                  :agent_user_ref, :buyer_ref,
+	                  :case_type, :resolution,
+	                  :reason_code, :reason_text,
+	                  :requested_refund_amount, :currency_order, :currency_charge,
+	                  CAST(:line_items_json AS JSONB), CAST(:amount_breakdown_json AS JSONB),
+	                  :status, :label_url, CAST(:audit_log AS JSONB), :idempotency_key,
+	                  NOW(), NOW()
+	                )
+	                """,
+	                {
+	                    "case_id": case_id,
+	                    "order_id": order_id,
                     "merchant_id": merchant_id,
                     "agent_id": context.agent_id,
                     "agent_user_ref": agent_user.agent_user_ref if agent_user else None,
@@ -308,15 +308,15 @@ async def create_after_sales_case(
                     "reason_text": (req.reason_text or None),
                     "requested_refund_amount": float(requested_amount) if requested_amount is not None else None,
                     "currency_order": currency_order,
-                    "currency_charge": currency_charge,
-                    "line_items_json": json.dumps([li.model_dump() for li in (req.line_items or [])], ensure_ascii=False),
-                    "amount_breakdown_json": json.dumps(req.amount_breakdown.model_dump() if req.amount_breakdown else {}, ensure_ascii=False),
-                    "status": "requested",
-                    "label_url": None,
-                    "audit_log": json.dumps(audit, ensure_ascii=False),
-                    "idempotency_key": idem,
-                },
-            )
+	                    "currency_charge": currency_charge,
+	                    "line_items_json": json.dumps([li.model_dump() for li in (req.line_items or [])], ensure_ascii=False),
+	                    "amount_breakdown_json": json.dumps(req.amount_breakdown.model_dump() if req.amount_breakdown else {}, ensure_ascii=False),
+	                    "status": "requested",
+	                    "label_url": None,
+	                    "audit_log": json.dumps(audit, ensure_ascii=False),
+	                    "idempotency_key": idem,
+	                },
+	            )
 
         try:
             await _do_insert()
@@ -512,11 +512,11 @@ async def issue_return_label_placeholder(
             UPDATE after_sales_cases
             SET label_url = :label_url,
                 status = 'label_issued',
-                audit_log = :audit_log::jsonb,
+                audit_log = CAST(:audit_log AS JSONB),
                 updated_at = NOW()
             WHERE case_id = :case_id
             """,
-            {"case_id": case_id, "label_url": label_url, "audit_log": json.dumps(audit)},
+            {"case_id": case_id, "label_url": label_url, "audit_log": json.dumps(audit, ensure_ascii=False)},
         )
     except Exception as e:
         logger.error(f"after_sales issue_label error: {e}")
@@ -573,11 +573,11 @@ async def process_case_refund(
             """
             UPDATE after_sales_cases
             SET status = 'refund_pending',
-                audit_log = :audit_log::jsonb,
+                audit_log = CAST(:audit_log AS JSONB),
                 updated_at = NOW()
             WHERE case_id = :case_id
             """,
-            {"case_id": case_id, "audit_log": json.dumps(audit)},
+            {"case_id": case_id, "audit_log": json.dumps(audit, ensure_ascii=False)},
         )
     except Exception:
         pass
@@ -614,11 +614,11 @@ async def process_case_refund(
             """
             UPDATE after_sales_cases
             SET status = :status,
-                audit_log = :audit_log::jsonb,
+                audit_log = CAST(:audit_log AS JSONB),
                 updated_at = NOW()
             WHERE case_id = :case_id
             """,
-            {"case_id": case_id, "status": next_status, "audit_log": json.dumps(audit)},
+            {"case_id": case_id, "status": next_status, "audit_log": json.dumps(audit, ensure_ascii=False)},
         )
     except Exception:
         pass
