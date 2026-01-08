@@ -40,6 +40,7 @@ orders = Table(
     Column("shipping_fee", Numeric(10, 2), default=0),
     Column("tax", Numeric(10, 2), default=0),
     Column("total", Numeric(10, 2), nullable=False),
+    Column("total_refunded", Numeric(10, 2), default=0),
     Column("currency", String(3), default="USD"),
     
     # 状态机
@@ -129,6 +130,11 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS total NUMERIC(10,2);
                 """))
+            if "column \"total_refunded\" of relation \"orders\" does not exist" in err or "total_refunded" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders
+                    ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;
+                """))
             if "column \"shipping_fee\" of relation \"orders\" does not exist" in err or "shipping_fee" in err:
                 await database.execute(text("""
                     ALTER TABLE orders 
@@ -185,7 +191,23 @@ async def get_order(order_id: str) -> Optional[Dict[str, Any]]:
         (orders.c.order_id == order_id) & 
         orders.c.is_deleted.is_(False)
     )
-    result = await database.fetch_one(query)
+    try:
+        result = await database.fetch_one(query)
+    except Exception as e:
+        # Defensive: some prod DBs may lag behind the SQLAlchemy table definition.
+        err = str(e)
+        if "total_refunded" in err:
+            try:
+                from sqlalchemy import text
+
+                await database.execute(
+                    text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
+                )
+                result = await database.fetch_one(query)
+            except Exception:
+                raise
+        else:
+            raise
     return dict(result) if result else None
 
 
