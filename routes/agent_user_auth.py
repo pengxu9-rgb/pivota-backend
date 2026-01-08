@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 from pydantic import BaseModel
 
 from services.agent_user_jwt import AgentUserJwtError, AgentUserIdentity, verify_agent_user_jwt
@@ -45,11 +45,9 @@ def get_agent_user_identity(
 
 
 def get_agent_user_context(
-    ident: Optional[AgentUserIdentity] = None,
     x_agent_user_jwt: Optional[str] = Header(None, alias="X-Agent-User-JWT"),
+    ident: Optional[AgentUserIdentity] = Depends(get_agent_user_identity),
 ) -> Optional[AgentUserContext]:
-    if ident is None:
-        ident = get_agent_user_identity(x_agent_user_jwt=x_agent_user_jwt)
     if ident is None:
         return None
     return AgentUserContext(agent_user_ref=ident.agent_user_ref, issuer=ident.issuer, subject=ident.subject)
