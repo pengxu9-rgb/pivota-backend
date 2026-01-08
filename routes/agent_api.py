@@ -2058,7 +2058,18 @@ async def agent_list_orders(
                 params["agent_user_subject"] = agent_user.subject
 
         if agent_user_filter_sql and buyer_filter_sql:
-            query += f" AND ({agent_user_filter_sql} OR {buyer_filter_sql})"
+            # Keep list/detail consistent: when an order has agent_user_ref, it must match the
+            # verified agent-user identity; buyer_ref fallback should only include legacy orders
+            # that have no agent_user_ref attributed.
+            query += (
+                " AND ("
+                f"{agent_user_filter_sql}"
+                " OR ("
+                f"{buyer_filter_sql}"
+                " AND (metadata ->> 'agent_user_ref') IS NULL"
+                ")"
+                ")"
+            )
             params.update(buyer_filter_params)
         elif agent_user_filter_sql:
             query += f" AND {agent_user_filter_sql}"
@@ -2185,7 +2196,15 @@ async def agent_list_order_events(
                 params["agent_user_subject"] = agent_user.subject
 
         if agent_user_filter_sql and buyer_filter_sql:
-            query += f" AND ({agent_user_filter_sql} OR {buyer_filter_sql})"
+            query += (
+                " AND ("
+                f"{agent_user_filter_sql}"
+                " OR ("
+                f"{buyer_filter_sql}"
+                " AND (o.metadata ->> 'agent_user_ref') IS NULL"
+                ")"
+                ")"
+            )
             params.update(buyer_filter_params)
         elif agent_user_filter_sql:
             query += f" AND {agent_user_filter_sql}"
