@@ -2074,7 +2074,9 @@ async def agent_list_orders(
         elif agent_user_filter_sql:
             query += f" AND {agent_user_filter_sql}"
         elif buyer_filter_sql:
-            query += f" AND {buyer_filter_sql}"
+            # buyer_ref is a legacy/compat identifier; do not expose agent-user-attributed orders
+            # unless a verified X-Agent-User-JWT is present (handled above).
+            query += f" AND ({buyer_filter_sql} AND (metadata ->> 'agent_user_ref') IS NULL)"
             params.update(buyer_filter_params)
         else:
             pass
@@ -2209,7 +2211,7 @@ async def agent_list_order_events(
         elif agent_user_filter_sql:
             query += f" AND {agent_user_filter_sql}"
         elif buyer_filter_sql:
-            query += f" AND {buyer_filter_sql}"
+            query += f" AND ({buyer_filter_sql} AND (o.metadata ->> 'agent_user_ref') IS NULL)"
             params.update(buyer_filter_params)
         else:
             pass
