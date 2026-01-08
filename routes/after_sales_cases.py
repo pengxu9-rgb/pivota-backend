@@ -12,7 +12,7 @@ Design goals:
 - Minimal PII storage (no addresses/emails in after_sales_cases table)
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header, Query
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header, Query, Body
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Literal
 from decimal import Decimal
@@ -191,7 +191,7 @@ def _append_audit(audit: List[Dict[str, Any]], event: str, payload: Optional[Dic
 
 @router.post("/cases")
 async def create_after_sales_case(
-    req: CreateAfterSalesCaseRequest,
+    payload: Dict[str, Any] = Body(...),
     buyer_ref: Optional[str] = Query(default=None),
     x_buyer_ref: Optional[str] = Header(None, alias="X-Buyer-Ref"),
     context: AgentContext = Depends(get_agent_context),
@@ -202,6 +202,14 @@ async def create_after_sales_case(
     - refund_without_return (full or partial)
     - refund_with_return (RMA/label flow; label_url is a placeholder for now)
     """
+    # Backward compatibility: earlier OpenAPI mistakenly embedded the request as {"req": {...}}
+    # due to a dependency signature. Accept both shapes.
+    raw = payload.get("req") if isinstance(payload, dict) and "req" in payload else payload
+    try:
+        req = CreateAfterSalesCaseRequest.model_validate(raw)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid request body")
+
     order_id = str(req.order_id or "").strip()
     if not order_id:
         raise HTTPException(status_code=400, detail="order_id is required")
