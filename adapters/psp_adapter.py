@@ -208,7 +208,14 @@ class StripeAdapter(PSPAdapter):
             if amount:
                 refund_data["amount"] = int(amount * 100)
             if reason:
-                refund_data["reason"] = reason
+                # Stripe only accepts a small enum for `reason`.
+                # Keep caller-provided human text as metadata instead of failing the refund.
+                allowed_reasons = {"duplicate", "fraudulent", "requested_by_customer"}
+                reason_norm = str(reason).strip()
+                if reason_norm in allowed_reasons:
+                    refund_data["reason"] = reason_norm
+                else:
+                    refund_data["metadata"] = {"reason": reason_norm}
             
             refund = stripe.Refund.create(**refund_data)
             return True, refund.id, None
