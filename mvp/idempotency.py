@@ -79,11 +79,26 @@ class PostgresIdempotencyStore:
         )
         if not row:
             return None
+        raw = row["value_json"] if row["value_json"] is not None else None
+        value: Dict[str, Any] = {}
+        try:
+            if raw is None:
+                value = {}
+            elif isinstance(raw, dict):
+                value = raw
+            elif isinstance(raw, str):
+                parsed = json.loads(raw)
+                value = parsed if isinstance(parsed, dict) else {}
+            else:
+                # Some drivers may return JSONB as a Mapping-like object; fall back to dict().
+                value = dict(raw)
+        except Exception:
+            value = {}
         return IdempotencyRecord(
             scope=row["scope"],
             key=row["idem_key"],
             created_at=row["created_at"],
-            value=dict(row["value_json"]) if row["value_json"] is not None else {},
+            value=value,
         )
 
     async def put(self, *, scope: str, key: str, value: Dict[str, Any]) -> IdempotencyRecord:
@@ -103,4 +118,3 @@ class PostgresIdempotencyStore:
         if rec:
             return rec
         return IdempotencyRecord(scope=scope, key=key, created_at=datetime.now(timezone.utc), value=value)
-
