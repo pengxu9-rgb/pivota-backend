@@ -22,8 +22,36 @@ from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import subprocess
 import os
+from pathlib import Path
+
+
+def _guard_single_order_routes_py() -> None:
+    """
+    Governance guardrail: avoid duplicate `order_routes.py` files.
+
+    Multiple copies across the repo create "shadowing" risk and lead to fixing
+    the wrong implementation. This runs once at process startup and fails fast
+    on deploy if a second copy is added.
+    """
+    repo_root = Path(__file__).resolve().parent
+    ignored_dirs = {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache"}
+    matches: list[str] = []
+
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in ignored_dirs]
+        if "order_routes.py" in filenames:
+            matches.append(Path(dirpath, "order_routes.py").relative_to(repo_root).as_posix())
+
+    matches.sort()
+    expected = ["routes/order_routes.py"]
+    if matches != expected:
+        raise RuntimeError(
+            "Repo governance violation: expected a single `order_routes.py` at "
+            "`routes/order_routes.py`, found:\n- " + "\n- ".join(matches)
+        )
 
 # Core routers (only include what exists)
+_guard_single_order_routes_py()
 from routes.agent_routes import router as agent_router
 from routes.quote_routes import router as quote_router
 from routes.offer_routes import router as offer_router
