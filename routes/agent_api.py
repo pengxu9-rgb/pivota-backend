@@ -1977,6 +1977,7 @@ async def agent_get_order(
                 "payment_status": order["payment_status"],
                 "fulfillment_status": order.get("fulfillment_status"),
                 "total": str(order["total"]),
+                "total_refunded": str(order.get("total_refunded") or 0),
                 "currency": order["currency"],
                 "shopify_order_id": order.get("shopify_order_id"),
                 "tracking_number": order.get("tracking_number"),
