@@ -1310,7 +1310,12 @@ async def create_shopify_order(order_id: str) -> bool:
             logger.error(f"[Shopify] Order {order_id} not found")
             return False
         
-        logger.info(f"[Shopify] Order data: merchant_id={order.get('merchant_id')}, customer_email={order.get('customer_email')}, items_count={len(order.get('items', []))}")
+        logger.info(
+            "[Shopify] Order data: merchant_id=%s items_count=%s has_email=%s",
+            order.get("merchant_id"),
+            len(order.get("items", []) or []),
+            bool(str(order.get("customer_email") or "").strip()),
+        )
         
         merchant = await get_merchant_onboarding(order["merchant_id"])
         if not merchant:
@@ -1330,7 +1335,11 @@ async def create_shopify_order(order_id: str) -> bool:
         shop_domain = store_info.get("domain")
         access_token = store_info.get("api_key")
         
-        logger.info(f"[Shopify] Store credentials: domain={shop_domain}, has_token={bool(access_token)}, token_length={len(access_token) if access_token else 0}")
+        logger.info(
+            "[Shopify] Store credentials: domain=%s has_token=%s",
+            shop_domain,
+            bool(access_token),
+        )
         
         if not shop_domain or not access_token:
             logger.error(f"[Shopify] Missing credentials for merchant {order['merchant_id']}: domain={bool(shop_domain)}, token={bool(access_token)}")
@@ -1372,11 +1381,21 @@ async def create_shopify_order(order_id: str) -> bool:
                 logger.info(f"Using custom line item for {item.get('product_title')}")
         
         # 转换地址格式：Pivota → Shopify
-        shipping_addr = order["shipping_address"]
-        name_parts = shipping_addr.get("name", "Customer").split(" ", 1)
+        customer_email = str(order.get("customer_email") or "").strip()
+        shipping_addr = order.get("shipping_address") or {}
+        raw_name = str(shipping_addr.get("name") or "").strip()
+        fallback_name = str(order.get("customer_name") or "").strip()
+        email_name = ""
+        if customer_email and "@" in customer_email:
+            email_name = customer_email.split("@", 1)[0].strip()
+        full_name = raw_name or fallback_name or email_name or "Customer"
+        parts = full_name.split()
+        first_name = parts[0] if parts else "Customer"
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
         shopify_shipping = {
-            "first_name": name_parts[0] if len(name_parts) > 0 else "Customer",
-            "last_name": name_parts[1] if len(name_parts) > 1 else "",
+            "first_name": first_name,
+            "last_name": last_name,
+            "name": full_name,
             "address1": shipping_addr.get("address_line1", ""),
             "address2": shipping_addr.get("address_line2"),
             "city": shipping_addr.get("city", ""),
@@ -1386,16 +1405,29 @@ async def create_shopify_order(order_id: str) -> bool:
             "phone": shipping_addr.get("phone")
         }
         
-        logger.info(f"[Shopify] Converted address: {shopify_shipping}")
+        logger.info(
+            "[Shopify] Converted address: has_name=%s country=%s",
+            bool(full_name and full_name != "Customer"),
+            shopify_shipping.get("country"),
+        )
         
         shopify_order_data = {
             "order": {
-                "email": order["customer_email"],
+                # Email is required for receipts; keep optional in payload in case a legacy order row is missing it.
+                **({"email": customer_email} if customer_email else {}),
+                # Ensure staff notification subjects that use `{{ customer.name }}` don't render empty.
+                "customer": {
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    **({"email": customer_email} if customer_email else {}),
+                },
                 "financial_status": "paid",
-                "send_receipt": True,
-                "send_fulfillment_receipt": True,
+                "send_receipt": bool(customer_email),
+                "send_fulfillment_receipt": bool(customer_email),
                 "line_items": line_items,
                 "shipping_address": shopify_shipping,
+                # Many templates reference billing_address.* for the buyer identity.
+                "billing_address": shopify_shipping,
                 "note": f"Pivota Order ID: {order_id}",
                 "tags": "pivota,agent-order"
             }
@@ -1410,8 +1442,12 @@ async def create_shopify_order(order_id: str) -> bool:
             "Content-Type": "application/json"
         }
         
-        logger.info(f"[Shopify] Calling API: {url}")
-        logger.info(f"[Shopify] Order data payload: line_items_count={len(shopify_order_data['order']['line_items'])}, email={shopify_order_data['order'].get('email')}")
+        logger.info(
+            "[Shopify] Calling API: %s (line_items_count=%s has_email=%s)",
+            url,
+            len(shopify_order_data["order"].get("line_items") or []),
+            bool(customer_email),
+        )
         
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=shopify_order_data, headers=headers, timeout=10.0)
