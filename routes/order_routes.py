@@ -1389,14 +1389,23 @@ async def create_shopify_order(order_id: str) -> bool:
         if customer_email and "@" in customer_email:
             email_name = customer_email.split("@", 1)[0].strip()
         full_name = raw_name or fallback_name or email_name or "Customer"
+        # Shopify staff notification subjects are often customized to render the buyer identity using
+        # `customer.*` and/or `billing_address.*`. If a last name is blank, Liquid templates may apply
+        # a fallback like `{{ last_name | default: first_name }}` which can render duplicated names
+        # (e.g. "peng peng"). We avoid this by using an invisible last name placeholder for single-token names.
+        INVISIBLE_LAST_NAME = "\u200b"  # zero-width space
         parts = full_name.split()
-        first_name = parts[0] if parts else "Customer"
-        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        if not parts:
+            first_name, last_name = "Customer", INVISIBLE_LAST_NAME
+        elif len(parts) == 1:
+            first_name, last_name = parts[0], INVISIBLE_LAST_NAME
+        else:
+            first_name, last_name = parts[0], " ".join(parts[1:])
         shopify_shipping = {
             "first_name": first_name,
-            # Omit last_name when empty; Shopify can otherwise backfill it and render duplicated names
-            # in staff notification templates (e.g. "peng peng").
-            **({"last_name": last_name} if last_name else {}),
+            "last_name": last_name,
+            # Some notification templates use `billing_address.name`/`shipping_address.name` directly.
+            "name": full_name,
             "address1": shipping_addr.get("address_line1", ""),
             "address2": shipping_addr.get("address_line2"),
             "city": shipping_addr.get("city", ""),
@@ -1419,7 +1428,7 @@ async def create_shopify_order(order_id: str) -> bool:
                 # Ensure staff notification subjects that use `{{ customer.name }}` don't render empty.
                 "customer": {
                     "first_name": first_name,
-                    **({"last_name": last_name} if last_name else {}),
+                    "last_name": last_name,
                     **({"email": customer_email} if customer_email else {}),
                 },
                 "financial_status": "paid",
