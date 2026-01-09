@@ -1394,8 +1394,9 @@ async def create_shopify_order(order_id: str) -> bool:
         last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
         shopify_shipping = {
             "first_name": first_name,
-            "last_name": last_name,
-            "name": full_name,
+            # Omit last_name when empty; Shopify can otherwise backfill it and render duplicated names
+            # in staff notification templates (e.g. "peng peng").
+            **({"last_name": last_name} if last_name else {}),
             "address1": shipping_addr.get("address_line1", ""),
             "address2": shipping_addr.get("address_line2"),
             "city": shipping_addr.get("city", ""),
@@ -1418,7 +1419,7 @@ async def create_shopify_order(order_id: str) -> bool:
                 # Ensure staff notification subjects that use `{{ customer.name }}` don't render empty.
                 "customer": {
                     "first_name": first_name,
-                    "last_name": last_name,
+                    **({"last_name": last_name} if last_name else {}),
                     **({"email": customer_email} if customer_email else {}),
                 },
                 "financial_status": "paid",
