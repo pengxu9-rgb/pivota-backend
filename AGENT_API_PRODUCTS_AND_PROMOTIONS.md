@@ -11,6 +11,7 @@ Auth:
 Notes:
 - The canonical machine-readable API spec is `GET https://web-production-fedb.up.railway.app/openapi.json`.
 - Promotions/discounts are best-effort previews; the final amount is confirmed at checkout.
+- Shopify marketing rules (e.g. buy-X-get-Y / order discounts) are synced into Pivota’s promotions table best-effort; first-time previews may take longer while the sync warms.
 
 ---
 
@@ -66,6 +67,8 @@ Use this to surface Shopify discounts/promotions in your own UI:
 
 > Many promotions only apply with full cart context (multiple items, quantities, shipping address, discount codes).
 > If you preview a single item, you may see no discount even though checkout applies one later.
+>
+> If you recently changed discounts in Shopify Admin, allow some time for promotion sync to reflect in preview.
 
 ```http
 POST /agent/v1/quotes/preview
@@ -89,4 +92,3 @@ Key response fields:
 - `pricing.discount_total`
 - `promotion_lines[]` (labels + allocations)
 - `line_items[]` (unit price original/effective, line discounts, compare-at savings)
-

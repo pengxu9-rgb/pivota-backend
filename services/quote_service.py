@@ -9,13 +9,37 @@ import hashlib
 import json
 import os
 import secrets
+import time
 
 from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, insert_quote, mark_quote_consumed
 from services.promotions_service import PromotionStatus, list_promotions
 from services.pcs_hash import sha256_json
+from services.shopify_promotions_sync import sync_shopify_promotions_for_merchant
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingService
 from services.shopify_storefront_pricing_service import ShopifyStorefrontPricingService
 from utils.logger import logger
+
+
+# ---------------------------------------------------------------------------
+# Promotions sync throttling (best-effort, in-memory)
+# ---------------------------------------------------------------------------
+
+_PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS = int(os.getenv("PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS", "1800"))  # 30m default
+_PROMOTIONS_SYNC_LAST_ATTEMPT_AT: Dict[str, float] = {}
+
+
+def _should_attempt_shopify_promotions_sync(merchant_id: str) -> bool:
+    now = time.time()
+    last = _PROMOTIONS_SYNC_LAST_ATTEMPT_AT.get(merchant_id)
+    if last is not None and (now - last) < _PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS:
+        return False
+    _PROMOTIONS_SYNC_LAST_ATTEMPT_AT[merchant_id] = now
+    # Best-effort cap: prevent unbounded growth.
+    if len(_PROMOTIONS_SYNC_LAST_ATTEMPT_AT) > 200:
+        # Remove oldest ~50 entries.
+        for k, _ in sorted(_PROMOTIONS_SYNC_LAST_ATTEMPT_AT.items(), key=lambda kv: kv[1])[:50]:
+            _PROMOTIONS_SYNC_LAST_ATTEMPT_AT.pop(k, None)
+    return True
 
 
 def normalize_discount_codes(codes: Optional[List[str]]) -> List[str]:
@@ -225,6 +249,7 @@ class QuoteService:
             pricing=result.pricing,
             line_items=result.line_items,
             promotion_lines=result.promotion_lines,
+            creator_id=agent_id,
         )
 
         presentment_currency = result.currency
@@ -319,6 +344,7 @@ class QuoteService:
         pricing: Dict[str, Decimal],
         line_items: List[Dict[str, Any]],
         promotion_lines: List[Dict[str, Any]],
+        creator_id: Optional[str] = None,
         channel: str = "creator_agents",
     ) -> None:
         """
@@ -326,15 +352,54 @@ class QuoteService:
 
         This is intentionally best-effort and fail-open: if promotions DB is down, we still return a quote.
         """
-        try:
-            promotions, _ = await list_promotions(
-                merchant_id=merchant_id,
-                status=PromotionStatus.ACTIVE,
-                channel=channel,
-            )
-        except Exception as e:
-            logger.warning({"merchant_id": merchant_id, "error": str(e)}, "Failed to load promotions (best-effort)")
-            return None
+        async def _load_promotions(*, channel_filter: Optional[str]) -> List[Any]:
+            try:
+                promos, _ = await list_promotions(
+                    merchant_id=merchant_id,
+                    status=PromotionStatus.ACTIVE,
+                    channel=channel_filter,
+                    creator_id=creator_id,
+                )
+                return promos or []
+            except Exception as e:
+                logger.warning(
+                    "Failed to load promotions (best-effort)",
+                    extra={"merchant_id": merchant_id, "channel": channel_filter, "error": str(e)},
+                )
+                return []
+
+        # Prefer channel-scoped promos, but fall back to "any channel" to avoid silently
+        # dropping promos due to channel naming mismatches across stacks.
+        promotions = await _load_promotions(channel_filter=channel)
+        if not promotions:
+            promotions = await _load_promotions(channel_filter=None)
+
+        # Best-effort: if promotions are still missing, attempt an on-demand Shopify promotions sync,
+        # throttled per merchant. This helps creators see Shopify marketing discounts without requiring
+        # a separate admin sync call.
+        auto_sync = os.getenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "1")
+        if (
+            not promotions
+            and auto_sync not in ("0", "false", "False")
+            and _should_attempt_shopify_promotions_sync(merchant_id)
+        ):
+            try:
+                summary = await sync_shopify_promotions_for_merchant(merchant_id=merchant_id, channel=channel)
+                logger.info(
+                    "Synced Shopify promotions (best-effort)",
+                    extra={
+                        "merchant_id": merchant_id,
+                        "rules_fetched": summary.get("rulesFetched"),
+                        "created": summary.get("created"),
+                        "updated": summary.get("updated"),
+                    },
+                )
+            except Exception as e:
+                logger.info(
+                    "Shopify promotions sync skipped/failed",
+                    extra={"merchant_id": merchant_id, "error": str(e)},
+                )
+            promotions = await _load_promotions(channel_filter=channel)
 
         if not promotions:
             return None
@@ -425,8 +490,12 @@ class QuoteService:
                 )
             except Exception as promo_err:
                 logger.warning(
-                    {"merchant_id": merchant_id, "promotion_id": getattr(promo, "id", None), "error": str(promo_err)},
                     "Failed to apply promotion (best-effort)",
+                    extra={
+                        "merchant_id": merchant_id,
+                        "promotion_id": getattr(promo, "id", None),
+                        "error": str(promo_err),
+                    },
                 )
                 continue
 
@@ -480,7 +549,10 @@ class QuoteService:
         try:
             await mark_quote_consumed(quote_id, consumed_order_id=order_id)
         except Exception as e:
-            logger.warning({"quote_id": quote_id, "error": str(e)}, "Failed to consume quote (best-effort)")
+            logger.warning(
+                "Failed to consume quote (best-effort)",
+                extra={"quote_id": quote_id, "error": str(e)},
+            )
 
     def _serialize_promotion_lines(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out = []
