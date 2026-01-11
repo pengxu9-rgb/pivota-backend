@@ -426,10 +426,14 @@ class QuoteService:
                     continue
 
                 eligible_product_ids: Optional[List[str]] = None
+                eligible_variant_ids: Optional[List[str]] = None
                 if not scope.get("global"):
                     eligible_product_ids = scope.get("productIds") or scope.get("product_ids") or []
+                    eligible_variant_ids = scope.get("variantIds") or scope.get("variant_ids") or []
                     if not isinstance(eligible_product_ids, list):
                         eligible_product_ids = []
+                    if not isinstance(eligible_variant_ids, list):
+                        eligible_variant_ids = []
 
                 # Expand eligible unit prices using pricing line_items (already resolved by engine).
                 unit_prices: List[Decimal] = []
@@ -437,8 +441,15 @@ class QuoteService:
                     if not isinstance(li, dict):
                         continue
                     product_id = str(li.get("product_id") or "").strip()
-                    if eligible_product_ids is not None and product_id not in eligible_product_ids:
-                        continue
+                    variant_id = str(li.get("variant_id") or "").strip()
+                    if eligible_product_ids is not None or eligible_variant_ids is not None:
+                        eligible = False
+                        if eligible_product_ids is not None and product_id and product_id in eligible_product_ids:
+                            eligible = True
+                        if eligible_variant_ids is not None and variant_id and variant_id in eligible_variant_ids:
+                            eligible = True
+                        if not eligible:
+                            continue
                     qty = int(li.get("quantity") or 0)
                     if qty <= 0:
                         continue
