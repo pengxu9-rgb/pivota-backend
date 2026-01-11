@@ -22,6 +22,7 @@ import httpx
 import logging
 import time
 import json
+import os
 from datetime import datetime
 
 from routes.agent_api import get_agent_context, AgentContext, log_agent_request
@@ -33,9 +34,43 @@ from db.products import get_product_cache_row
 from models.standard_product import StandardProduct
 from db.product_quality import product_quality_snapshot
 from config.settings import settings
+from utils.redis_client import get_redis_client
 
 router = APIRouter(prefix="/agent/v1/products", tags=["Agent Products"])
 logger = logging.getLogger(__name__)
+
+PRODUCT_DETAILS_CACHE_TTL_SECONDS = int(os.getenv("PRODUCT_DETAILS_CACHE_TTL_SECONDS", "3600"))
+
+
+def _product_details_cache_key(*, merchant_id: str, platform: str, platform_product_id: str) -> str:
+    return f"agent_products:details:{platform}:{merchant_id}:{platform_product_id}"
+
+
+def _variant_to_product_cache_key(*, merchant_id: str, platform: str, variant_id: str) -> str:
+    return f"agent_products:variant_to_product:{platform}:{merchant_id}:{variant_id}"
+
+
+async def _redis_get_json(key: str) -> Optional[Dict[str, Any]]:
+    client = get_redis_client()
+    if client is None:
+        return None
+    try:
+        raw = await client.get(key)
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+async def _redis_set_json(key: str, value: Dict[str, Any], ttl_seconds: int) -> None:
+    client = get_redis_client()
+    if client is None:
+        return None
+    try:
+        await client.set(key, json.dumps(value, separators=(",", ":"), ensure_ascii=False), ex=max(1, int(ttl_seconds)))
+    except Exception:
+        return None
 
 
 def _get_quality_thresholds() -> Dict[str, float]:
@@ -706,6 +741,18 @@ async def get_product_details(
 
         platform = store.get("platform")
 
+        cached = await _redis_get_json(
+            _product_details_cache_key(merchant_id=merchant_id, platform=str(platform or "unknown"), platform_product_id=str(product_id))
+        )
+        if cached and isinstance(cached, dict) and cached.get("status") == "success":
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id,
+            )
+            return cached
+
         # For non-Shopify platforms (e.g. Wix), serve details from cached StandardProduct
         if platform != "shopify":
             cache_row = await get_product_cache_row(
@@ -785,7 +832,7 @@ async def get_product_details(
                 merchant_id=merchant_id,
             )
 
-            return {
+            resp = {
                 "status": "success",
                 "product": {
                     "id": product_id_out,
@@ -795,10 +842,17 @@ async def get_product_details(
                     "vendor": prod.get("vendor"),
                     "product_type": product_type,
                     "variants": variants,
+                    "options": prod.get("options") or [],
                     "images": images,
                     "tags": tags,
                 },
             }
+            await _redis_set_json(
+                _product_details_cache_key(merchant_id=merchant_id, platform=str(platform or "unknown"), platform_product_id=str(product_id)),
+                resp,
+                PRODUCT_DETAILS_CACHE_TTL_SECONDS,
+            )
+            return resp
 
         # Shopify path: fetch fresh details from Shopify Admin API
         shop_domain = store.get("domain") or store.get("shop_domain")
@@ -847,8 +901,36 @@ async def get_product_details(
         product = response.json()["product"]
 
         # Transform for agent
+        options_out: List[Dict[str, Any]] = []
+        for opt in product.get("options") or []:
+            if not isinstance(opt, dict):
+                continue
+            options_out.append(
+                {
+                    "name": opt.get("name"),
+                    "position": opt.get("position"),
+                    "values": opt.get("values") or [],
+                }
+            )
+
         variants = []
         for variant in product.get("variants", []):
+            option_map: Dict[str, str] = {}
+            for opt in options_out:
+                name = str(opt.get("name") or "").strip()
+                if not name:
+                    continue
+                pos = int(opt.get("position") or 0)
+                if pos == 1:
+                    val = variant.get("option1")
+                elif pos == 2:
+                    val = variant.get("option2")
+                elif pos == 3:
+                    val = variant.get("option3")
+                else:
+                    val = None
+                if val:
+                    option_map[name] = str(val)
             variants.append(
                 {
                     "variant_id": str(variant["id"]),
@@ -859,6 +941,7 @@ async def get_product_details(
                     "available": variant.get("inventory_quantity", 0) > 0,
                     "weight": variant.get("weight"),
                     "weight_unit": variant.get("weight_unit"),
+                    "options": option_map,
                 }
             )
 
@@ -891,7 +974,7 @@ async def get_product_details(
         except Exception as e:
             logger.debug(f"Failed to log product click event: {e}", exc_info=True)
 
-        return {
+        resp = {
             "status": "success",
             "product": {
                 "id": str(product["id"]),
@@ -901,12 +984,19 @@ async def get_product_details(
                 "vendor": product.get("vendor"),
                 "product_type": product.get("product_type"),
                 "variants": variants,
+                "options": options_out,
                 "images": [img.get("src") for img in product.get("images", [])],
                 "tags": product.get("tags", "").split(",")
                 if product.get("tags")
                 else [],
             },
         }
+        await _redis_set_json(
+            _product_details_cache_key(merchant_id=merchant_id, platform="shopify", platform_product_id=str(product_id)),
+            resp,
+            PRODUCT_DETAILS_CACHE_TTL_SECONDS,
+        )
+        return resp
             
     except HTTPException:
         raise
@@ -922,127 +1012,108 @@ async def get_product_details_by_variant(
     background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
 ):
-    """
-    Resolve a Shopify variant_id to its parent product, then return product details.
+    """Resolve a platform variant_id to its parent product and return product details."""
+    if not context.can_access_merchant(merchant_id):
+        raise HTTPException(status_code=403, detail="Not authorized")
 
-    UIs often only know the checkout SKU/variant id (skuId) but still need:
-    - full product description
-    - additional images
-    - variant list for selection
-    """
-    try:
-        # Verify access
-        if not context.can_access_merchant(merchant_id):
-            raise HTTPException(status_code=403, detail="Not authorized")
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
 
-        merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found")
+    store = await get_primary_store(merchant_id)
+    if not store:
+        raise HTTPException(
+            status_code=404,
+            detail="No connected stores found for merchant",
+            headers={"X-Error-Code": "STORE_NOT_FOUND"},
+        )
 
-        store = await get_primary_store(merchant_id)
-        if not store:
-            raise HTTPException(
-                status_code=404,
-                detail="No connected stores found for merchant",
-                headers={"X-Error-Code": "STORE_NOT_FOUND"},
-            )
+    platform = store.get("platform")
+    if platform != "shopify":
+        # Best-effort: treat variant_id as product_id for non-Shopify cached products.
+        resp = await get_product_details(
+            merchant_id=merchant_id,
+            product_id=variant_id,
+            background_tasks=background_tasks,
+            context=context,
+        )
+        if isinstance(resp, dict) and resp.get("status") == "success":
+            resp["selected_variant_id"] = str(variant_id)
+        return resp
 
-        platform = store.get("platform")
-        if platform != "shopify":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Product details only supported for Shopify (merchant uses {platform})",
-            )
+    shop_domain = store.get("domain") or store.get("shop_domain")
+    api_key_raw = store.get("api_key") or store.get("access_token")
+    access_token = api_key_raw
+    if api_key_raw and isinstance(api_key_raw, str) and api_key_raw.strip().startswith("{"):
+        try:
+            token_data = json.loads(api_key_raw)
+            access_token = token_data.get("access_token") or token_data.get("token") or api_key_raw
+        except Exception:
+            access_token = api_key_raw
 
-        shop_domain = store.get("domain") or store.get("shop_domain")
-        if not shop_domain:
-            raise HTTPException(
-                status_code=400,
-                detail="Store configuration incomplete - missing domain",
-                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
-            )
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Store configuration incomplete - missing domain",
+            headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+        )
 
-        api_key_raw = store.get("api_key") or store.get("access_token")
-        access_token = api_key_raw
-        if api_key_raw and api_key_raw.strip().startswith("{"):
+    if not access_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Store configuration incomplete - missing credentials",
+            headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+        )
+
+    variant_key = _variant_to_product_cache_key(merchant_id=merchant_id, platform="shopify", variant_id=str(variant_id))
+    cached_pid = None
+    client = get_redis_client()
+    if client is not None:
+        try:
+            cached_pid = await client.get(variant_key)
+        except Exception:
+            cached_pid = None
+
+    product_id = str(cached_pid or "").strip() or None
+    if not product_id:
+        url = f"https://{shop_domain}/admin/api/2024-01/variants/{variant_id}.json"
+        headers = {
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient() as http:
+            response = await http.get(url, headers=headers, timeout=10.0)
+        if response.status_code != 200:
+            raise HTTPException(status_code=404, detail="Variant not found")
+        variant = response.json().get("variant") or {}
+        product_id = str(variant.get("product_id") or "").strip()
+        if not product_id:
+            raise HTTPException(status_code=404, detail="Variant not found")
+        if client is not None:
             try:
-                token_data = json.loads(api_key_raw)
-                access_token = token_data.get("access_token") or token_data.get("token") or api_key_raw
+                await client.set(variant_key, product_id, ex=max(1, int(PRODUCT_DETAILS_CACHE_TTL_SECONDS)))
             except Exception:
                 pass
 
-        if not access_token:
-            raise HTTPException(
-                status_code=400,
-                detail="Store configuration incomplete - missing credentials",
-                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
-            )
+    resp = await get_product_details(
+        merchant_id=merchant_id,
+        product_id=product_id,
+        background_tasks=background_tasks,
+        context=context,
+    )
 
-        headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+    if isinstance(resp, dict) and resp.get("status") == "success":
+        selected_variant_id = str(variant_id)
+        resp["selected_variant_id"] = selected_variant_id
+        try:
+            variants = resp.get("product", {}).get("variants") or []
+            for v in variants:
+                if isinstance(v, dict) and str(v.get("variant_id")) == selected_variant_id:
+                    v["selected"] = True
+        except Exception:
+            pass
 
-        # 1) Resolve variant -> product_id
-        variant_url = f"https://{shop_domain}/admin/api/2024-01/variants/{variant_id}.json"
-        async with httpx.AsyncClient() as client:
-            variant_resp = await client.get(variant_url, headers=headers, timeout=10.0)
-
-        if variant_resp.status_code != 200:
-            raise HTTPException(status_code=404, detail="Variant not found")
-
-        variant = (variant_resp.json() or {}).get("variant") or {}
-        product_id = str(variant.get("product_id") or "").strip()
-        if not product_id:
-            raise HTTPException(status_code=404, detail="Product not found")
-
-        # 2) Fetch product details
-        product_url = f"https://{shop_domain}/admin/api/2024-01/products/{product_id}.json"
-        async with httpx.AsyncClient() as client:
-            product_resp = await client.get(product_url, headers=headers, timeout=10.0)
-
-        if product_resp.status_code != 200:
-            raise HTTPException(status_code=404, detail="Product not found")
-
-        product = (product_resp.json() or {}).get("product") or {}
-
-        variants = []
-        for v in product.get("variants", []) or []:
-            inv_qty = v.get("inventory_quantity", 0)
-            variants.append(
-                {
-                    "variant_id": str(v.get("id")),
-                    "title": v.get("title", "Default"),
-                    "price": float(v.get("price", 0)),
-                    "sku": v.get("sku"),
-                    "inventory_quantity": inv_qty,
-                    "available": bool(inv_qty and int(inv_qty) > 0),
-                    "weight": v.get("weight"),
-                    "weight_unit": v.get("weight_unit"),
-                    "selected": str(v.get("id")) == str(variant_id),
-                }
-            )
-
-        options = []
-        for opt in product.get("options", []) or []:
-            if not isinstance(opt, dict):
-                continue
-            values = opt.get("values")
-            if not isinstance(values, list):
-                values = []
-            options.append(
-                {
-                    "name": opt.get("name"),
-                    "position": opt.get("position"),
-                    "values": values,
-                }
-            )
-
-        background_tasks.add_task(
-            log_agent_request,
-            context=context,
-            status_code=200,
-            merchant_id=merchant_id,
-        )
-
-        # Log click (best-effort)
+        # Best-effort: log a click for variant-details surface (no PII).
         try:
             await log_product_events(
                 [
@@ -1065,32 +1136,7 @@ async def get_product_details_by_variant(
         except Exception as e:
             logger.debug(f"Failed to log product click event: {e}", exc_info=True)
 
-        return {
-            "status": "success",
-            "selected_variant_id": str(variant_id),
-            "product": {
-                "id": str(product.get("id") or product_id),
-                "merchant_id": merchant_id,
-                "title": product.get("title", ""),
-                "description": product.get("body_html", ""),
-                "vendor": product.get("vendor"),
-                "product_type": product.get("product_type"),
-                "variants": variants,
-                "options": options,
-                "images": [
-                    img.get("src")
-                    for img in (product.get("images", []) or [])
-                    if isinstance(img, dict) and img.get("src")
-                ],
-                "tags": product.get("tags", "").split(",") if product.get("tags") else [],
-            },
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get product details by variant: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get product: {str(e)}")
+    return resp
 
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import hashlib
@@ -11,6 +11,7 @@ import os
 import secrets
 
 from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, insert_quote, mark_quote_consumed
+from services.promotions_service import PromotionStatus, list_promotions
 from services.pcs_hash import sha256_json
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingService
 from services.shopify_storefront_pricing_service import ShopifyStorefrontPricingService
@@ -218,6 +219,14 @@ class QuoteService:
                 details={"attempts": attempts},
             )
 
+        await self._apply_infra_promotions_best_effort(
+            merchant_id=merchant_id,
+            items=normalized_items,
+            pricing=result.pricing,
+            line_items=result.line_items,
+            promotion_lines=result.promotion_lines,
+        )
+
         presentment_currency = result.currency
         charge_currency = result.currency
         settlement_currency: Optional[str] = None
@@ -301,6 +310,127 @@ class QuoteService:
             "debug_id": (result.debug or {}).get("debug_id"),
             "attempts": attempts or [],
         }
+
+    async def _apply_infra_promotions_best_effort(
+        self,
+        *,
+        merchant_id: str,
+        items: List[Dict[str, Any]],
+        pricing: Dict[str, Decimal],
+        line_items: List[Dict[str, Any]],
+        promotion_lines: List[Dict[str, Any]],
+        channel: str = "creator_agents",
+    ) -> None:
+        """
+        Apply Pivota infra promotions on top of the Shopify pricing result (quote-first).
+
+        This is intentionally best-effort and fail-open: if promotions DB is down, we still return a quote.
+        """
+        try:
+            promotions, _ = await list_promotions(
+                merchant_id=merchant_id,
+                status=PromotionStatus.ACTIVE,
+                channel=channel,
+            )
+        except Exception as e:
+            logger.warning({"merchant_id": merchant_id, "error": str(e)}, "Failed to load promotions (best-effort)")
+            return None
+
+        if not promotions:
+            return None
+
+        def d(v: Any) -> Decimal:
+            try:
+                return Decimal(str(v or "0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            except Exception:
+                return Decimal("0.00")
+
+        for promo in promotions:
+            try:
+                if getattr(promo, "type", None) != "MULTI_BUY_DISCOUNT":
+                    continue
+
+                scope = getattr(promo, "scope", None) or {}
+                cfg = getattr(promo, "config", None) or {}
+
+                threshold = int(cfg.get("thresholdQuantity") or cfg.get("threshold_quantity") or 0)
+                discount_percent_raw = cfg.get("discountPercent") or cfg.get("discount_percent") or 0
+                discount_percent = Decimal(str(discount_percent_raw))
+
+                if threshold <= 0 or discount_percent <= 0:
+                    continue
+
+                eligible_product_ids: Optional[List[str]] = None
+                if not scope.get("global"):
+                    eligible_product_ids = scope.get("productIds") or scope.get("product_ids") or []
+                    if not isinstance(eligible_product_ids, list):
+                        eligible_product_ids = []
+
+                # Expand eligible unit prices using pricing line_items (already resolved by engine).
+                unit_prices: List[Decimal] = []
+                for li in line_items or []:
+                    if not isinstance(li, dict):
+                        continue
+                    product_id = str(li.get("product_id") or "").strip()
+                    if eligible_product_ids is not None and product_id not in eligible_product_ids:
+                        continue
+                    qty = int(li.get("quantity") or 0)
+                    if qty <= 0:
+                        continue
+                    unit = d(li.get("unit_price_effective") or li.get("unit_price_original"))
+                    if unit <= 0:
+                        continue
+                    for _ in range(qty):
+                        unit_prices.append(unit)
+
+                total_qty = len(unit_prices)
+                if total_qty < threshold:
+                    continue
+
+                # Discount the highest-priced eligible units first.
+                unit_prices.sort(reverse=True)
+                discountable_qty = (total_qty // threshold) * threshold
+                discount_base = sum(unit_prices[:discountable_qty], Decimal("0.00"))
+                if discount_base <= 0:
+                    continue
+
+                promo_discount = (discount_base * discount_percent / Decimal("100")).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                if promo_discount <= 0:
+                    continue
+
+                # Apply as an order-level manual adjustment.
+                pricing["discount_total"] = d(pricing.get("discount_total")) + promo_discount
+                pricing["total"] = max(d(pricing.get("total")) - promo_discount, Decimal("0.00"))
+
+                promotion_lines.append(
+                    {
+                        "id": f"infra:{promo.id}",
+                        "source_ref": promo.id,
+                        "discount_class": "order",
+                        "method": "manual_adjustment",
+                        "label": getattr(promo, "humanReadableRule", None) or getattr(promo, "name", None) or "Deal",
+                        "code": None,
+                        "amount": (Decimal("0.00") - promo_discount),
+                        "allocations": [],
+                        "metadata": {
+                            "promotion_id": promo.id,
+                            "source": "pivota_infra",
+                            "kind": "MULTI_BUY_DISCOUNT",
+                            "threshold_quantity": threshold,
+                            "discount_percent": float(discount_percent),
+                        },
+                    }
+                )
+            except Exception as promo_err:
+                logger.warning(
+                    {"merchant_id": merchant_id, "promotion_id": getattr(promo, "id", None), "error": str(promo_err)},
+                    "Failed to apply promotion (best-effort)",
+                )
+                continue
+
+        return None
 
     async def load_active_quote_or_raise(self, *, quote_id: str) -> QuoteSnapshot:
         row = await get_quote(quote_id)
