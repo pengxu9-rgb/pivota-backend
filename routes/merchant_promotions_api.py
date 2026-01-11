@@ -17,6 +17,7 @@ from services.promotions_service import (
     get_promotion,
     list_promotions,
     soft_delete_promotion,
+    update_promotion,
 )
 
 router = APIRouter(
