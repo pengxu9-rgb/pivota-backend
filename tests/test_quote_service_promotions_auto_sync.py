@@ -96,6 +96,8 @@ async def test_quote_service_auto_sync_shopify_promotions_when_missing(monkeypat
     monkeypatch.setattr("services.quote_service.sync_shopify_promotions_for_merchant", fake_sync_shopify_promotions_for_merchant)
     monkeypatch.setattr("services.quote_service._should_attempt_shopify_promotions_sync", lambda _mid: True)
     monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "1")
+    # Allow the quote path a tiny sync budget in tests so we can assert the promo applies.
+    monkeypatch.setenv("PROMOTIONS_SYNC_QUOTE_WAIT_SECONDS", "1")
 
     pricing = {
         "subtotal": Decimal("100.00"),
@@ -122,4 +124,3 @@ async def test_quote_service_auto_sync_shopify_promotions_when_missing(monkeypat
     assert calls["sync"] == 1
     assert pricing["discount_total"] == Decimal("3.00")
     assert len(promotion_lines) == 1
-
