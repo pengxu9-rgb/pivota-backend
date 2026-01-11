@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncio
 import hashlib
 import json
 import os
@@ -26,6 +27,19 @@ from utils.logger import logger
 
 _PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS = int(os.getenv("PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS", "1800"))  # 30m default
 _PROMOTIONS_SYNC_LAST_ATTEMPT_AT: Dict[str, float] = {}
+_PROMOTIONS_SYNC_MAX_CONCURRENCY = int(os.getenv("PROMOTIONS_SYNC_MAX_CONCURRENCY", "2"))
+_PROMOTIONS_SYNC_SEMAPHORE = asyncio.Semaphore(max(1, _PROMOTIONS_SYNC_MAX_CONCURRENCY))
+
+
+async def _sync_shopify_promotions_background(*, merchant_id: str, channel: str) -> None:
+    try:
+        async with _PROMOTIONS_SYNC_SEMAPHORE:
+            await sync_shopify_promotions_for_merchant(merchant_id=merchant_id, channel=channel)
+    except Exception as e:  # pragma: no cover - best-effort
+        logger.info(
+            "Shopify promotions background sync failed",
+            extra={"merchant_id": merchant_id, "error": str(e)},
+        )
 
 
 def _should_attempt_shopify_promotions_sync(merchant_id: str) -> bool:
@@ -383,23 +397,52 @@ class QuoteService:
             and auto_sync not in ("0", "false", "False")
             and _should_attempt_shopify_promotions_sync(merchant_id)
         ):
-            try:
-                summary = await sync_shopify_promotions_for_merchant(merchant_id=merchant_id, channel=channel)
-                logger.info(
-                    "Synced Shopify promotions (best-effort)",
-                    extra={
-                        "merchant_id": merchant_id,
-                        "rules_fetched": summary.get("rulesFetched"),
-                        "created": summary.get("created"),
-                        "updated": summary.get("updated"),
-                    },
-                )
-            except Exception as e:
-                logger.info(
-                    "Shopify promotions sync skipped/failed",
-                    extra={"merchant_id": merchant_id, "error": str(e)},
-                )
-            promotions = await _load_promotions(channel_filter=channel)
+            # IMPORTANT: do not block the quote preview path. Shopify sync can take a long time
+            # (pagination, rate limits), and blocking can cause gateway 502 timeouts, impacting
+            # the main checkout/quote flow. By default we schedule the sync in the background.
+            #
+            # Optional: allow a small time budget (env) for fast stores so promos can apply immediately.
+            # Read dynamically so ops can tune without code changes, and tests can patch env.
+            wait_seconds = max(0.0, float(os.getenv("PROMOTIONS_SYNC_QUOTE_WAIT_SECONDS", "0")))
+            if wait_seconds > 0:
+                try:
+                    summary = await asyncio.wait_for(
+                        sync_shopify_promotions_for_merchant(merchant_id=merchant_id, channel=channel),
+                        timeout=wait_seconds,
+                    )
+                    logger.info(
+                        "Synced Shopify promotions within quote budget (best-effort)",
+                        extra={
+                            "merchant_id": merchant_id,
+                            "wait_seconds": wait_seconds,
+                            "rules_fetched": summary.get("rulesFetched"),
+                            # Avoid LogRecord attribute collisions (e.g. "created").
+                            "promotions_created": summary.get("created"),
+                            "promotions_updated": summary.get("updated"),
+                        },
+                    )
+                    promotions = await _load_promotions(channel_filter=channel)
+                except Exception as e:
+                    logger.info(
+                        "Shopify promotions sync skipped/failed (quote budget)",
+                        extra={"merchant_id": merchant_id, "wait_seconds": wait_seconds, "error": str(e)},
+                    )
+                    return None
+            else:
+                try:
+                    asyncio.create_task(
+                        _sync_shopify_promotions_background(merchant_id=merchant_id, channel=channel)
+                    )
+                    logger.info(
+                        "Scheduled Shopify promotions background sync (best-effort)",
+                        extra={"merchant_id": merchant_id},
+                    )
+                except RuntimeError as e:  # pragma: no cover - defensive
+                    logger.info(
+                        "Failed to schedule Shopify promotions background sync",
+                        extra={"merchant_id": merchant_id, "error": str(e)},
+                    )
+                return None
 
         if not promotions:
             return None

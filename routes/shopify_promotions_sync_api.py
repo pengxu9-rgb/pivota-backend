@@ -109,10 +109,14 @@ async def sync_shopify_promotions_endpoint(
     status_code=status.HTTP_200_OK,
 )
 async def sync_shopify_promotions_get(
+    background_tasks: BackgroundTasks,
     merchant_id: str = Path(..., description="Internal merchant ID"),
     _: None = Depends(require_shopify_promotions_admin),
 ) -> Dict[str, Any]:
     """
     GET alias for sync endpoint to make it easy to trigger from a browser.
     """
-    return await sync_shopify_promotions_endpoint(merchant_id=merchant_id)  # type: ignore[arg-type]
+    return await sync_shopify_promotions_endpoint(
+        background_tasks=background_tasks,
+        merchant_id=merchant_id,
+    )
