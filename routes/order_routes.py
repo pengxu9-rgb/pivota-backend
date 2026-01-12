@@ -1393,19 +1393,29 @@ async def create_shopify_order(order_id: str) -> bool:
         # `customer.*` and/or `billing_address.*`. If a last name is blank, Liquid templates may apply
         # a fallback like `{{ last_name | default: first_name }}` which can render duplicated names
         # (e.g. "peng peng"). We avoid this by using an invisible last name placeholder for single-token names.
-        INVISIBLE_LAST_NAME = "\u200b"  # zero-width space
+        # NOTE: \u200b (ZWSP) may still be treated as "blank" by some template filters; use
+        # a non-whitespace invisible character to prevent Liquid `default`/`blank` fallbacks.
+        INVISIBLE_LAST_NAME = "\u2060"  # word joiner
         parts = full_name.split()
-        if not parts:
+        normalized_parts = [p for p in parts if p.strip()]
+        # If the name is duplicated (e.g. "peng peng"), treat it as a single-token input.
+        all_same = bool(normalized_parts) and len({p.lower() for p in normalized_parts}) == 1
+        include_name_field = False
+        if not normalized_parts:
             first_name, last_name = "Customer", INVISIBLE_LAST_NAME
-        elif len(parts) == 1:
-            first_name, last_name = parts[0], INVISIBLE_LAST_NAME
+        elif len(normalized_parts) == 1 or all_same:
+            first_name, last_name = normalized_parts[0], INVISIBLE_LAST_NAME
+            full_name = normalized_parts[0]
         else:
-            first_name, last_name = parts[0], " ".join(parts[1:])
+            first_name, last_name = normalized_parts[0], " ".join(normalized_parts[1:])
+            include_name_field = True
         shopify_shipping = {
             "first_name": first_name,
             "last_name": last_name,
-            # Some notification templates use `billing_address.name`/`shipping_address.name` directly.
-            "name": full_name,
+            # Some templates use `billing_address.name`/`shipping_address.name` directly.
+            # Avoid sending `name` for single-token inputs, as Shopify may re-parse it and
+            # backfill last_name=first_name, resulting in duplicated names.
+            **({"name": full_name} if include_name_field else {}),
             "address1": shipping_addr.get("address_line1", ""),
             "address2": shipping_addr.get("address_line2"),
             "city": shipping_addr.get("city", ""),
