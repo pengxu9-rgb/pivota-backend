@@ -11,6 +11,7 @@ from databases import Database
 
 from db.orders import get_order, update_order
 from db.database import database as db
+from db.merchant_onboarding import get_merchant_onboarding
 from adapters.psp_adapter import get_psp_adapter
 from utils.logger import logger
 from config.settings import settings
@@ -91,7 +92,13 @@ class RefundService:
                 )
                 
                 # 5. Process PSP refund (outside transaction to avoid long locks)
-                psp_result = await self._process_psp_refund(order, refund_id, amount, reason)
+                psp_result = await self._process_psp_refund(
+                    order,
+                    refund_id,
+                    amount,
+                    reason,
+                    idempotency_key=idempotency_key,
+                )
                 
                 # 6. Update refund record with result
                 if psp_result["success"]:
@@ -222,41 +229,72 @@ class RefundService:
         order: Dict[str, Any], 
         refund_id: str,
         amount: float,
-        reason: str
+        reason: str,
+        *,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Process refund with payment service provider"""
         try:
-            # Get PSP adapter
-            psp_type = order.get("psp_used", "stripe")
-            merchant_id = order["merchant_id"]
-            
-            # Get PSP credentials
-            # TODO: Get from merchant settings
-            if psp_type == "stripe":
-                psp_key = settings.stripe_secret_key
-            else:
-                psp_key = None
-            
+            # Resolve PSP type for this order (prefer the PSP that actually processed it).
+            order_psp_type = str(order.get("psp_used") or "").strip().lower() or None
+            if not order_psp_type:
+                psp_id = str(order.get("psp_id") or "").strip().lower()
+                if psp_id.startswith("psp_stripe"):
+                    order_psp_type = "stripe"
+                elif psp_id.startswith("psp_adyen"):
+                    order_psp_type = "adyen"
+                elif psp_id.startswith("psp_checkout"):
+                    order_psp_type = "checkout"
+                elif psp_id.startswith("psp_paypal"):
+                    order_psp_type = "paypal"
+
+            if not order_psp_type:
+                payment_intent_id_guess = str(order.get("payment_intent_id") or "")
+                if payment_intent_id_guess.startswith("pi_"):
+                    order_psp_type = "stripe"
+
+            psp_type = order_psp_type or "stripe"
+            merchant_id = str(order.get("merchant_id") or "")
+
+            # Try merchant-scoped credentials first, then fall back to env defaults.
+            psp_key: Optional[str] = None
+            adapter_kwargs: Dict[str, Any] = {}
+            try:
+                merchant = await get_merchant_onboarding(merchant_id) if merchant_id else None
+                merchant_psp_type = str((merchant or {}).get("psp_type") or "").strip().lower() or None
+                if merchant_psp_type and merchant_psp_type == psp_type:
+                    psp_key = (merchant or {}).get("psp_sandbox_key") or (merchant or {}).get("psp_key")
+            except Exception:
+                merchant = None
+
+            if not psp_key:
+                if psp_type == "stripe":
+                    psp_key = settings.stripe_secret_key
+                elif psp_type == "adyen":
+                    psp_key = getattr(settings, "adyen_api_key", None)
+                    adapter_kwargs["merchant_account"] = getattr(settings, "adyen_merchant_account", "PivotaTestMerchant")
+                elif psp_type == "checkout":
+                    psp_key = getattr(settings, "checkout_secret_key", None) or getattr(settings, "checkout_api_key", None)
+                    adapter_kwargs["public_key"] = getattr(settings, "checkout_public_key", None)
+                elif psp_type == "paypal":
+                    psp_key = getattr(settings, "paypal_client_id", None) or getattr(settings, "paypal_api_key", None)
+                    adapter_kwargs["client_secret"] = getattr(settings, "paypal_client_secret", None)
+                    adapter_kwargs["is_sandbox"] = bool(getattr(settings, "paypal_sandbox", True))
+
             if not psp_key:
                 raise ValueError(f"No PSP key configured for {psp_type}")
-            
-            # Get adapter and process refund
-            adapter = get_psp_adapter(psp_type, psp_key)
-            
-            # For Stripe, we need the payment_intent_id
-            payment_intent_id = order.get("payment_intent_id")
+
+            adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
+
+            payment_intent_id = str(order.get("payment_intent_id") or "").strip()
             if not payment_intent_id:
                 raise ValueError("No payment_intent_id found for order")
-            
-            # Process refund
+
             success, psp_refund_id, error = await adapter.refund_payment(
                 payment_intent_id=payment_intent_id,
                 amount=Decimal(str(amount)),
-                metadata={
-                    "order_id": order["order_id"],
-                    "refund_id": refund_id,
-                    "reason": reason
-                }
+                reason=reason,
+                idempotency_key=idempotency_key,
             )
             
             if success:
@@ -496,4 +534,3 @@ class RefundService:
 
 # Create singleton instance
 refund_service = RefundService()
-
