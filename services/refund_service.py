@@ -348,6 +348,10 @@ class RefundService:
                 WHEN COALESCE(total_refunded, 0) + :amount >= total THEN 'refunded'
                 ELSE 'partially_refunded'
             END,
+            status = CASE
+                WHEN COALESCE(total_refunded, 0) + :amount >= total THEN 'refunded'
+                ELSE 'partially_refunded'
+            END,
             updated_at = NOW()
         WHERE order_id = :order_id
         """
