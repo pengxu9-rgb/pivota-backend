@@ -1106,6 +1106,7 @@ async def get_order_detail(
                 total, currency, status, payment_status, payment_method,
                 customer_name, customer_email, shipping_address,
                 items, subtotal, shipping_fee, tax,
+                COALESCE(total_refunded, 0) as total_refunded,
                 created_at, updated_at
             FROM orders
             WHERE order_id = :order_id AND merchant_id = :merchant_id
@@ -1125,6 +1126,7 @@ async def get_order_detail(
                 "subtotal": float(order["subtotal"]) if order["subtotal"] else 0,
                 "shipping_fee": float(order["shipping_fee"]) if order["shipping_fee"] else 0,
                 "tax": float(order["tax"]) if order["tax"] else 0,
+                "total_refunded": float(order["total_refunded"]) if order["total_refunded"] else 0,
                 "currency": order["currency"],
                 "status": order["status"],
                 "payment_status": order["payment_status"],
@@ -1371,16 +1373,24 @@ async def get_order_refunds(
     if not order_exists:
         raise HTTPException(status_code=404, detail="Order not found")
     
-    # Get refund history with enhanced details
-    refunds = await refund_service.get_refund_history(order_id)
+    await _ensure_refund_tables_best_effort()
+
+    # Get refund history with enhanced details (best-effort)
+    try:
+        refunds = await refund_service.get_refund_history(order_id)
+    except Exception:
+        refunds = []
     
     # Get order details for context
     order_query = """
-    SELECT total_amount, total_refunded, payment_status, currency
+    SELECT total as total_amount, COALESCE(total_refunded, 0) as total_refunded, payment_status, currency
     FROM orders 
     WHERE order_id = :order_id
     """
-    order_data = await database.fetch_one(order_query, {"order_id": order_id})
+    try:
+        order_data = await database.fetch_one(order_query, {"order_id": order_id})
+    except Exception:
+        order_data = {"total_amount": 0, "total_refunded": 0, "payment_status": "unknown", "currency": "USD"}
     
     # Calculate refund summary
     total_refunded = sum(r.get("amount", 0) for r in refunds if r.get("status") == "completed")
