@@ -86,6 +86,80 @@ def _coerce_json_list(value: Any) -> List[Dict[str, Any]]:
     return []
 
 
+async def _ensure_refund_tables_best_effort() -> None:
+    """
+    Best-effort defensive DDL for refund tables/columns.
+    Production should normally rely on SQL migrations, but the migration runner can be best-effort.
+    """
+    try:
+        await database.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
+    except Exception:
+        pass
+
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refund_records (
+                refund_id VARCHAR(50) PRIMARY KEY,
+                order_id VARCHAR(50) NOT NULL,
+                merchant_id VARCHAR(50) NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                currency VARCHAR(3) DEFAULT 'USD',
+                reason VARCHAR(100),
+                source VARCHAR(50),
+                status VARCHAR(50) DEFAULT 'pending',
+                platform_type VARCHAR(50),
+                platform_refund_id VARCHAR(255),
+                platform_sync_status VARCHAR(50),
+                psp_type VARCHAR(50),
+                psp_refund_id VARCHAR(255),
+                raw_payload JSONB,
+                created_by VARCHAR(255),
+                error_message TEXT,
+                idempotency_key VARCHAR(255) UNIQUE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                processed_at TIMESTAMP,
+                CONSTRAINT fk_refund_order FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE RESTRICT
+            );
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refund_retry_queue (
+                id SERIAL PRIMARY KEY,
+                refund_id VARCHAR(50) NOT NULL,
+                retry_count INT DEFAULT 0,
+                max_retries INT DEFAULT 3,
+                next_retry_at TIMESTAMP,
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC);")
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC);")
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_idempotency ON refund_records (idempotency_key);")
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_platform_refund ON refund_records (platform_type, platform_refund_id);")
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_retry_queue_next ON refund_retry_queue (next_retry_at) WHERE retry_count < max_retries;"
+        )
+    except Exception:
+        pass
+
+
+def _error_debug_id(prefix: str) -> str:
+    return f"{prefix}_{hashlib.sha256(f'{time.time()}_{random.random()}'.encode()).hexdigest()[:10]}"
+
+
 async def _append_after_sales_audit_event(case_id: str, event: str, payload: Dict[str, Any]) -> None:
     try:
         row = await database.fetch_one(
@@ -1175,6 +1249,8 @@ async def merchant_refund_order(
         raise HTTPException(status_code=404, detail="Order not found")
     
     try:
+        await _ensure_refund_tables_best_effort()
+
         # Process refund through service
         result = await refund_service.create_refund(
             order_id=order_id,
@@ -1199,7 +1275,7 @@ async def merchant_refund_order(
         
         # Handle different statuses
         if result["status"] == "duplicate":
-            return HTTPException(
+            raise HTTPException(
                 status_code=409,
                 detail={
                     "message": "Refund already processed",
@@ -1227,10 +1303,50 @@ async def merchant_refund_order(
         # Validation errors
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Refund processing error: {e}")
+        # One retry after best-effort DDL self-heal (handles missing migrations / tables).
+        try:
+            await _ensure_refund_tables_best_effort()
+            result = await refund_service.create_refund(
+                order_id=order_id,
+                amount=refund_request.amount,
+                reason=refund_request.reason,
+                source=refund_request.source,
+                created_by=current_user.get("email", current_user.get("user_id")),
+            )
+            if isinstance(result, dict) and result.get("status") == "failed":
+                return {
+                    "status": "processing",
+                    "message": "Refund is being processed. You'll be notified when complete.",
+                    "refund_id": result.get("refund_id"),
+                    "amount": refund_request.amount,
+                }
+            if isinstance(result, dict) and result.get("status") == "duplicate":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "Refund already processed", "refund_id": result.get("refund_id")},
+                )
+            if isinstance(result, dict) and result.get("status") == "success":
+                return {
+                    "status": "success",
+                    "message": "Refund processed successfully",
+                    "refund_id": result.get("refund_id"),
+                    "psp_refund_id": result.get("psp_refund_id"),
+                    "amount": refund_request.amount,
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+        debug_id = _error_debug_id("merchant_refund")
+        logger.error(f"Refund processing error debug_id={debug_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail="Failed to process refund. Please try again later."
+            detail={
+                "error": "MERCHANT_REFUND_FAILED",
+                "message": "Failed to process refund. Please try again later.",
+                "debug_id": debug_id,
+            },
         )
 
 @router.get("/merchant/orders/{order_id}/refunds")
@@ -1452,6 +1568,7 @@ async def merchant_approve_after_sales_case_and_refund(
         pass
 
     try:
+        await _ensure_refund_tables_best_effort()
         refund_result = await refund_service.create_refund(
             order_id=order_id,
             amount=amount,
@@ -1477,21 +1594,48 @@ async def merchant_approve_after_sales_case_and_refund(
             pass
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        audit.append({"at": _now_iso(), "event": "refund_failed", "payload": {"error": type(e).__name__}})
+        # One retry after best-effort DDL self-heal.
         try:
-            await database.execute(
-                """
-                UPDATE after_sales_cases
-                SET status = 'refund_pending',
-                    audit_log = CAST(:audit_log AS JSONB),
-                    updated_at = NOW()
-                WHERE case_id = :case_id
-                """,
-                {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+            await _ensure_refund_tables_best_effort()
+            refund_result = await refund_service.create_refund(
+                order_id=order_id,
+                amount=amount,
+                reason=reason,
+                source="pivota_merchant_after_sales",
+                created_by=created_by,
+                idempotency_key=f"after_sales_case:{cid}",
             )
         except Exception:
+            refund_result = None
+
+        if refund_result is not None:
+            # Continue the flow and persist status below.
             pass
-        raise HTTPException(status_code=500, detail="Failed to process refund")
+        else:
+            debug_id = _error_debug_id("merchant_after_sales_refund")
+            audit.append({"at": _now_iso(), "event": "refund_failed", "payload": {"debug_id": debug_id}})
+            try:
+                await database.execute(
+                    """
+                    UPDATE after_sales_cases
+                    SET status = 'refund_pending',
+                        audit_log = CAST(:audit_log AS JSONB),
+                        updated_at = NOW()
+                    WHERE case_id = :case_id
+                    """,
+                    {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+                )
+            except Exception:
+                pass
+            logger.error(f"merchant after-sales refund failed debug_id={debug_id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "MERCHANT_AFTER_SALES_REFUND_FAILED",
+                    "message": "Failed to process refund. Please try again later.",
+                    "debug_id": debug_id,
+                },
+            )
 
     # Reload order to infer final status (best effort).
     try:
