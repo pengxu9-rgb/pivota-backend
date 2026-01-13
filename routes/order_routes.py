@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
+from urllib.parse import urlencode
 import time
 import hashlib
 import httpx
@@ -49,6 +50,96 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 # ============================================================================
 # 促销折扣应用（多件折扣）
 # ============================================================================
+
+def _normalize_shopify_domain(domain: str) -> str:
+    d = (domain or "").strip()
+    if not d:
+        return d
+    d = d.replace("https://", "").replace("http://", "").strip().rstrip("/")
+    if d.endswith(".myshopify.com"):
+        return d
+    return f"{d}.myshopify.com"
+
+
+def _build_shopify_cart_permalink_best_effort(
+    *,
+    shop_domain: str,
+    items: List[OrderItem],
+    discount_codes: Optional[List[str]] = None,
+) -> Optional[str]:
+    """
+    Build a Shopify cart permalink checkout fallback:
+      https://{shop}/cart/{variant_id}:{qty},{variant_id}:{qty}?discount=CODE1,CODE2
+
+    Note: this does not guarantee pricing match with our quote; final total is computed by Shopify checkout.
+    """
+    domain = _normalize_shopify_domain(shop_domain)
+    if not domain:
+        return None
+
+    parts: List[str] = []
+    for item in items or []:
+        variant_id = getattr(item, "variant_id", None) or None
+        try:
+            qty = int(getattr(item, "quantity", 0) or 0)
+        except Exception:
+            qty = 0
+        if not variant_id or qty <= 0:
+            continue
+        try:
+            variant_numeric = str(int(str(variant_id)))
+        except Exception:
+            continue
+        parts.append(f"{variant_numeric}:{qty}")
+
+    if not parts:
+        return None
+
+    base = f"https://{domain}/cart/" + ",".join(parts)
+
+    codes = []
+    for c in (discount_codes or []):
+        if isinstance(c, str) and c.strip():
+            codes.append(c.strip())
+    if codes:
+        # Shopify supports `discount=CODE` and typically accepts comma-delimited codes.
+        q = urlencode({"discount": ",".join(codes[:5])})
+        return f"{base}?{q}"
+    return base
+
+
+async def _get_platform_checkout_fallback_url_best_effort(
+    *,
+    merchant_id: str,
+    items: List[OrderItem],
+    discount_codes: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Platform-hosted checkout fallback when we cannot create an external PSP payment intent.
+    Returns {url, platform, method} or None.
+    """
+    try:
+        store = await get_primary_store(merchant_id)
+    except Exception:
+        store = None
+
+    platform = (store or {}).get("platform")
+    domain = (store or {}).get("domain")
+    if not platform or not domain:
+        return None
+
+    if str(platform).lower() == "shopify":
+        url = _build_shopify_cart_permalink_best_effort(
+            shop_domain=str(domain),
+            items=items,
+            discount_codes=discount_codes,
+        )
+        if url:
+            return {"url": url, "platform": "shopify", "method": "cart_permalink"}
+
+    # TODO: add platform-hosted checkout fallbacks for wix/woocommerce when needed.
+    return None
+
 
 async def compute_order_discount_from_promotions(
     merchant_id: str,
@@ -944,22 +1035,31 @@ async def create_new_order(
                 except Exception:
                     fallback_checkout_url = None
 
-                if fallback_checkout_url and not payment_action:
+                platform_checkout = None
+                if not fallback_checkout_url:
+                    platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
+                        merchant_id=order_request.merchant_id,
+                        items=order_request.items,
+                        discount_codes=order_request.discount_codes,
+                    )
+
+                if (fallback_checkout_url or platform_checkout) and not payment_action:
                     psp_type = "checkout"
-                    client_secret = str(fallback_checkout_url)
+                    client_secret = str(fallback_checkout_url or (platform_checkout or {}).get("url"))
                     payment_action = {
                         "type": "redirect_url",
-                        "url": str(fallback_checkout_url),
+                        "url": str(fallback_checkout_url or (platform_checkout or {}).get("url")),
                         "raw": {
                             "reason": "psp_unavailable",
                             "error": error,
+                            **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
                         },
                     }
                     await log_order_event(
                         event_type="payment_fallback_platform_checkout",
                         order_id=order_id,
                         merchant_id=order_request.merchant_id,
-                        metadata={"checkout_url": str(fallback_checkout_url)},
+                        metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                     )
                 # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
                 await log_order_event(
@@ -977,22 +1077,31 @@ async def create_new_order(
             except Exception:
                 fallback_checkout_url = None
 
-            if fallback_checkout_url and not payment_action:
+            platform_checkout = None
+            if not fallback_checkout_url:
+                platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
+                    merchant_id=order_request.merchant_id,
+                    items=order_request.items,
+                    discount_codes=order_request.discount_codes,
+                )
+
+            if (fallback_checkout_url or platform_checkout) and not payment_action:
                 psp_type = "checkout"
-                client_secret = str(fallback_checkout_url)
+                client_secret = str(fallback_checkout_url or (platform_checkout or {}).get("url"))
                 payment_action = {
                     "type": "redirect_url",
-                    "url": str(fallback_checkout_url),
+                    "url": str(fallback_checkout_url or (platform_checkout or {}).get("url")),
                     "raw": {
                         "reason": "psp_error",
                         "error": str(e),
+                        **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
                     },
                 }
                 await log_order_event(
                     event_type="payment_fallback_platform_checkout",
                     order_id=order_id,
                     merchant_id=order_request.merchant_id,
-                    metadata={"checkout_url": str(fallback_checkout_url)},
+                    metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                 )
             await log_order_event(
                 event_type="payment_intent_error",
