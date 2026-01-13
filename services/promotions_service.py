@@ -280,8 +280,11 @@ async def create_promotion(data: PromotionCreate) -> PromotionOut:
         "name": payload["name"],
         "type": payload["type"],
         "description": payload.get("description") or "",
-        "start_at": payload["startAt"],
-        "end_at": payload["endAt"],
+        # Defensive: always normalize datetimes at the DB boundary.
+        # This avoids asyncpg failures when offset-aware datetimes slip through
+        # (e.g. ISO strings with "Z" / "+00:00").
+        "start_at": _normalize_dt(payload["startAt"]),
+        "end_at": _normalize_dt(payload["endAt"]),
         "channels": payload["channels"],
         "scope": payload.get("scope") or {},
         "config": cfg,
@@ -317,9 +320,9 @@ async def update_promotion(promo_id: str, data: PromotionUpdate) -> Optional[Pro
     if data.description is not None:
         update_fields["description"] = data.description
     if data.startAt is not None:
-        update_fields["start_at"] = data.startAt
+        update_fields["start_at"] = _normalize_dt(data.startAt)
     if data.endAt is not None:
-        update_fields["end_at"] = data.endAt
+        update_fields["end_at"] = _normalize_dt(data.endAt)
     if data.channels is not None:
         update_fields["channels"] = data.channels
     if data.scope is not None:

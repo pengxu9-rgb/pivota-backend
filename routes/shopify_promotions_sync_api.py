@@ -9,7 +9,7 @@ source of truth for promotions.
 import os
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Path, Query, status
 
 from services.shopify_promotions_sync import (
     ShopifyPromotionsConfigError,
@@ -23,6 +23,19 @@ router = APIRouter(
     prefix="/agent/internal/shopify/promotions",
     tags=["shopify_promotions"],
 )
+
+
+async def _sync_shopify_promotions_job(merchant_id: str) -> None:
+    try:
+        await sync_shopify_promotions_for_merchant(merchant_id=merchant_id)
+    except Exception:  # pragma: no cover - background defensive logging
+        # Don't surface to clients; just ensure it is logged for investigation.
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Shopify promotions sync job failed",
+            extra={"merchant_id": merchant_id},
+        )
 
 
 async def require_shopify_promotions_admin(
@@ -42,7 +55,12 @@ async def require_shopify_promotions_admin(
     status_code=status.HTTP_200_OK,
 )
 async def sync_shopify_promotions_endpoint(
+    background_tasks: BackgroundTasks,
     merchant_id: str = Path(..., description="Internal merchant ID"),
+    wait: bool = Query(
+        False,
+        description="If true, wait for sync completion (may time out on large stores).",
+    ),
     _: None = Depends(require_shopify_promotions_admin),
 ) -> Dict[str, Any]:
     """
@@ -52,8 +70,12 @@ async def sync_shopify_promotions_endpoint(
     tools or one-off scripts (not from public frontends).
     """
     try:
+        if not wait:
+            background_tasks.add_task(_sync_shopify_promotions_job, merchant_id)
+            return {"ok": True, "scheduled": True}
+
         summary = await sync_shopify_promotions_for_merchant(merchant_id=merchant_id)
-        return {"ok": True, "summary": summary}
+        return {"ok": True, "scheduled": False, "summary": summary}
     except ShopifyPromotionsConfigError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -87,10 +109,14 @@ async def sync_shopify_promotions_endpoint(
     status_code=status.HTTP_200_OK,
 )
 async def sync_shopify_promotions_get(
+    background_tasks: BackgroundTasks,
     merchant_id: str = Path(..., description="Internal merchant ID"),
     _: None = Depends(require_shopify_promotions_admin),
 ) -> Dict[str, Any]:
     """
     GET alias for sync endpoint to make it easy to trigger from a browser.
     """
-    return await sync_shopify_promotions_endpoint(merchant_id=merchant_id)  # type: ignore[arg-type]
+    return await sync_shopify_promotions_endpoint(
+        background_tasks=background_tasks,
+        merchant_id=merchant_id,
+    )
