@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
 from db.database import database
-from db.orders import mark_order_shipped
+from db.orders import get_order, mark_order_shipped
 from db.products import log_order_event
 from services.refund_service import refund_service
 from pydantic import BaseModel
@@ -19,6 +19,7 @@ import json
 import hashlib
 
 from services.payment_routing_service import PaymentRoutingService
+from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
 
 router = APIRouter()
 
@@ -58,6 +59,30 @@ class MerchantRoutingUpdate(BaseModel):
     routing_strategy: str = "priority"
     max_retries: int = 2
     timeout_ms: int = 30000
+
+
+class ApproveAfterSalesCaseRequest(BaseModel):
+    """Optional override fields for merchant approval."""
+    approved_refund_amount: Optional[float] = None
+    note: Optional[str] = None
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _coerce_json_list(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
 
 @router.get("/merchant/dashboard/stats")
 async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
@@ -1151,6 +1176,217 @@ async def add_product(
             **product_data
         }
     }
+
+
+@router.get("/merchant/orders/{order_id}/after-sales/cases")
+async def merchant_list_after_sales_cases_for_order(
+    order_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """List after-sales cases for an order (merchant-owned)."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+    oid = str(order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="order_id is required")
+
+    # Ensure order belongs to merchant
+    order_exists = await database.fetch_one(
+        "SELECT 1 FROM orders WHERE order_id = :order_id AND merchant_id = :merchant_id",
+        {"order_id": oid, "merchant_id": merchant_id},
+    )
+    if not order_exists:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    await _ensure_after_sales_cases_table()
+    rows = await database.fetch_all(
+        """
+        SELECT * FROM after_sales_cases
+        WHERE order_id = :order_id AND merchant_id = :merchant_id
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        {"order_id": oid, "merchant_id": merchant_id},
+    )
+    cases = [_serialize_case(dict(r)) for r in (rows or [])]
+    return {"status": "success", "total": len(cases), "cases": cases}
+
+
+@router.post("/merchant/after-sales/cases/{case_id}/approve")
+async def merchant_approve_after_sales_case_and_refund(
+    case_id: str,
+    payload: ApproveAfterSalesCaseRequest = Body(default={}),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Merchant approval step for buyer-initiated refund requests.
+
+    Behavior:
+    - Marks the case as `approved` (audit log) and executes the refund through RefundService.
+    - Uses a stable idempotency key (`after_sales_case:{case_id}`) to prevent double refunds.
+    """
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+    cid = str(case_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="case_id is required")
+
+    await _ensure_after_sales_cases_table()
+    loaded = await database.fetch_one(
+        "SELECT * FROM after_sales_cases WHERE case_id = :case_id",
+        {"case_id": cid},
+    )
+    if not loaded:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    loaded = dict(loaded)
+    if str(loaded.get("merchant_id") or "") != str(merchant_id):
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    current_status = str(loaded.get("status") or "")
+    if current_status in ("refunded", "partially_refunded", "refund_processed"):
+        return {"status": "success", "case": _serialize_case(loaded), "refund": {"status": "already_processed"}}
+
+    order_id = str(loaded.get("order_id") or "")
+    if not order_id:
+        raise HTTPException(status_code=500, detail="Case missing order_id")
+
+    # Ensure order belongs to merchant and compute refundable.
+    order = await get_order(order_id)
+    if not order or str(order.get("merchant_id") or "") != str(merchant_id):
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    requested_amount = loaded.get("requested_refund_amount")
+    approved_override = payload.approved_refund_amount
+    amount = None
+    if approved_override is not None:
+        amount = float(approved_override)
+    elif requested_amount is not None:
+        amount = float(requested_amount)
+    else:
+        try:
+            total = float(order.get("total") or order.get("total_amount") or 0)
+            refunded = float(order.get("total_refunded") or 0)
+            amount = max(0.0, total - refunded)
+        except Exception:
+            amount = None
+
+    if amount is None or amount <= 0:
+        raise HTTPException(status_code=400, detail="Refund amount is not refundable")
+
+    reason = str(loaded.get("reason_text") or loaded.get("reason_code") or "Refund requested").strip() or "Refund requested"
+    created_by = current_user.get("email") or current_user.get("sub") or "merchant"
+
+    audit = _coerce_json_list(loaded.get("audit_log"))
+    audit.append(
+        {
+            "at": _now_iso(),
+            "event": "merchant_approved",
+            "payload": {"amount": amount, "note": payload.note or ""},
+        }
+    )
+
+    # Best-effort status update before executing refund.
+    try:
+        await database.execute(
+            """
+            UPDATE after_sales_cases
+            SET status = 'approved',
+                audit_log = CAST(:audit_log AS JSONB),
+                updated_at = NOW()
+            WHERE case_id = :case_id
+            """,
+            {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+        )
+    except Exception:
+        pass
+
+    try:
+        refund_result = await refund_service.create_refund(
+            order_id=order_id,
+            amount=amount,
+            reason=reason,
+            source="pivota_merchant_after_sales",
+            created_by=created_by,
+            idempotency_key=f"after_sales_case:{cid}",
+        )
+    except ValueError as e:
+        audit.append({"at": _now_iso(), "event": "refund_validation_failed", "payload": {"error": str(e)[:240]}})
+        try:
+            await database.execute(
+                """
+                UPDATE after_sales_cases
+                SET status = 'approved',
+                    audit_log = CAST(:audit_log AS JSONB),
+                    updated_at = NOW()
+                WHERE case_id = :case_id
+                """,
+                {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        audit.append({"at": _now_iso(), "event": "refund_failed", "payload": {"error": type(e).__name__}})
+        try:
+            await database.execute(
+                """
+                UPDATE after_sales_cases
+                SET status = 'refund_pending',
+                    audit_log = CAST(:audit_log AS JSONB),
+                    updated_at = NOW()
+                WHERE case_id = :case_id
+                """,
+                {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Failed to process refund")
+
+    # Reload order to infer final status (best effort).
+    try:
+        order = await get_order(order_id)
+    except Exception:
+        order = None
+    inferred_status = "refund_processed"
+    try:
+        payment_status = str((order or {}).get("payment_status") or "")
+        if payment_status in ("partially_refunded", "refunded"):
+            inferred_status = payment_status
+    except Exception:
+        pass
+
+    audit.append(
+        {
+            "at": _now_iso(),
+            "event": "refund_result",
+            "payload": {
+                "status": str(refund_result.get("status") if isinstance(refund_result, dict) else ""),
+                "refund_id": refund_result.get("refund_id") if isinstance(refund_result, dict) else None,
+            },
+        }
+    )
+
+    try:
+        await database.execute(
+            """
+            UPDATE after_sales_cases
+            SET status = :status,
+                audit_log = CAST(:audit_log AS JSONB),
+                updated_at = NOW()
+            WHERE case_id = :case_id
+            """,
+            {"case_id": cid, "status": inferred_status, "audit_log": json.dumps(audit, ensure_ascii=False)},
+        )
+    except Exception:
+        pass
+
+    reloaded = await database.fetch_one("SELECT * FROM after_sales_cases WHERE case_id = :case_id", {"case_id": cid})
+    return {"status": "success", "case": _serialize_case(dict(reloaded) if reloaded else loaded), "refund": refund_result}
 
 @router.post("/merchant/security/change-password")
 async def change_password(
