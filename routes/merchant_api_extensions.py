@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
 from db.database import database
-from db.orders import mark_order_shipped
+from db.orders import get_order, mark_order_shipped
 from db.products import log_order_event
 from services.refund_service import refund_service
 from pydantic import BaseModel
@@ -19,6 +19,8 @@ import json
 import hashlib
 
 from services.payment_routing_service import PaymentRoutingService
+from services.merchant_store_service import get_primary_store
+from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
 
 router = APIRouter()
 
@@ -58,6 +60,248 @@ class MerchantRoutingUpdate(BaseModel):
     routing_strategy: str = "priority"
     max_retries: int = 2
     timeout_ms: int = 30000
+
+
+class ApproveAfterSalesCaseRequest(BaseModel):
+    """Optional override fields for merchant approval."""
+    approved_refund_amount: Optional[float] = None
+    note: Optional[str] = None
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _coerce_json_list(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+async def _ensure_refund_tables_best_effort() -> None:
+    """
+    Best-effort defensive DDL for refund tables/columns.
+    Production should normally rely on SQL migrations, but the migration runner can be best-effort.
+    """
+    try:
+        await database.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
+    except Exception:
+        pass
+
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refund_records (
+                refund_id VARCHAR(50) PRIMARY KEY,
+                order_id VARCHAR(50) NOT NULL,
+                merchant_id VARCHAR(50) NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                currency VARCHAR(3) DEFAULT 'USD',
+                reason VARCHAR(100),
+                source VARCHAR(50),
+                status VARCHAR(50) DEFAULT 'pending',
+                platform_type VARCHAR(50),
+                platform_refund_id VARCHAR(255),
+                platform_sync_status VARCHAR(50),
+                psp_type VARCHAR(50),
+                psp_refund_id VARCHAR(255),
+                raw_payload JSONB,
+                created_by VARCHAR(255),
+                error_message TEXT,
+                idempotency_key VARCHAR(255) UNIQUE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                processed_at TIMESTAMP,
+                CONSTRAINT fk_refund_order FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE RESTRICT
+            );
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refund_retry_queue (
+                id SERIAL PRIMARY KEY,
+                refund_id VARCHAR(50) NOT NULL,
+                retry_count INT DEFAULT 0,
+                max_retries INT DEFAULT 3,
+                next_retry_at TIMESTAMP,
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC);")
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC);")
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_idempotency ON refund_records (idempotency_key);")
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_platform_refund ON refund_records (platform_type, platform_refund_id);")
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_retry_queue_next ON refund_retry_queue (next_retry_at) WHERE retry_count < max_retries;"
+        )
+    except Exception:
+        pass
+
+
+def _error_debug_id(prefix: str) -> str:
+    return f"{prefix}_{hashlib.sha256(f'{time.time()}_{random.random()}'.encode()).hexdigest()[:10]}"
+
+
+async def _append_after_sales_audit_event(case_id: str, event: str, payload: Dict[str, Any]) -> None:
+    try:
+        row = await database.fetch_one(
+            "SELECT audit_log FROM after_sales_cases WHERE case_id = :case_id",
+            {"case_id": case_id},
+        )
+        if not row:
+            return
+        audit = _coerce_json_list(dict(row).get("audit_log"))
+        audit.append({"at": _now_iso(), "event": event, "payload": payload})
+        await database.execute(
+            """
+            UPDATE after_sales_cases
+            SET audit_log = CAST(:audit_log AS JSONB),
+                updated_at = NOW()
+            WHERE case_id = :case_id
+            """,
+            {"case_id": case_id, "audit_log": json.dumps(audit, ensure_ascii=False)},
+        )
+    except Exception:
+        return
+
+
+async def _create_shopify_manual_refund_best_effort(
+    *,
+    merchant_id: str,
+    pivota_order_id: str,
+    shopify_order_id: str,
+    case_id: str,
+    refund_amount: float,
+    reason: str,
+) -> None:
+    """
+    Best-effort platform sync for Shopify:
+    - Create a "manual" refund record in Shopify for accounting.
+    - Optionally restock inventory when the order is fully refunded.
+    """
+    try:
+        store = await get_primary_store(merchant_id)
+        if not store or str(store.get("platform") or "").lower() != "shopify":
+            return
+        shop_domain = str(store.get("domain") or "").strip()
+        access_token = str(store.get("api_key") or "").strip()
+        if not shop_domain or not access_token:
+            return
+
+        # Idempotency per after-sales case: skip if already recorded.
+        try:
+            row = await database.fetch_one(
+                "SELECT audit_log FROM after_sales_cases WHERE case_id = :case_id",
+                {"case_id": case_id},
+            )
+            audit = _coerce_json_list(dict(row).get("audit_log")) if row else []
+            if any((a.get("event") == "shopify_manual_refund_created") for a in audit):
+                return
+        except Exception:
+            pass
+
+        order = await get_order(pivota_order_id)
+        if not order or str(order.get("merchant_id") or "") != str(merchant_id):
+            return
+
+        # Restock only when the order is fully refunded (best-effort).
+        restock = str(order.get("payment_status") or "").lower() == "refunded"
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            refund_line_items: list[dict[str, Any]] = []
+            if restock:
+                # Fetch Shopify line items so we can restock all quantities.
+                order_url = (
+                    f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}.json"
+                    "?fields=line_items"
+                )
+                resp = await client.get(
+                    order_url,
+                    headers={
+                        "X-Shopify-Access-Token": access_token,
+                        "Content-Type": "application/json",
+                    },
+                )
+                if resp.status_code == 200:
+                    shopify_order = resp.json().get("order") or {}
+                    for li in (shopify_order.get("line_items") or []):
+                        try:
+                            line_item_id = li.get("id")
+                            qty = int(li.get("quantity") or 0)
+                            if line_item_id and qty > 0:
+                                refund_line_items.append(
+                                    {
+                                        "line_item_id": line_item_id,
+                                        "quantity": qty,
+                                        "restock_type": "return",
+                                    }
+                                )
+                        except Exception:
+                            continue
+
+            # Create refund record (gateway=manual so it does not hit PSP again).
+            refunds_url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/refunds.json"
+            body: Dict[str, Any] = {
+                "refund": {
+                    "note": f"Pivota after-sales case {case_id}: {reason}".strip()[:240],
+                    "notify": False,
+                    "transactions": [
+                        {
+                            "kind": "refund",
+                            "gateway": "manual",
+                            "amount": f"{refund_amount:.2f}",
+                        }
+                    ],
+                }
+            }
+            if refund_line_items:
+                body["refund"]["refund_line_items"] = refund_line_items
+
+            resp = await client.post(
+                refunds_url,
+                json=body,
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+            )
+            if resp.status_code not in (200, 201):
+                await _append_after_sales_audit_event(
+                    case_id,
+                    "shopify_manual_refund_failed",
+                    {"status_code": resp.status_code},
+                )
+                return
+            shopify_refund = resp.json().get("refund") or {}
+            await _append_after_sales_audit_event(
+                case_id,
+                "shopify_manual_refund_created",
+                {"shopify_refund_id": shopify_refund.get("id"), "restock": bool(refund_line_items)},
+            )
+    except Exception:
+        # Never fail the merchant approval flow because Shopify sync is best-effort.
+        try:
+            await _append_after_sales_audit_event(case_id, "shopify_manual_refund_failed", {"status_code": None})
+        except Exception:
+            pass
 
 @router.get("/merchant/dashboard/stats")
 async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
@@ -1005,6 +1249,8 @@ async def merchant_refund_order(
         raise HTTPException(status_code=404, detail="Order not found")
     
     try:
+        await _ensure_refund_tables_best_effort()
+
         # Process refund through service
         result = await refund_service.create_refund(
             order_id=order_id,
@@ -1029,7 +1275,7 @@ async def merchant_refund_order(
         
         # Handle different statuses
         if result["status"] == "duplicate":
-            return HTTPException(
+            raise HTTPException(
                 status_code=409,
                 detail={
                     "message": "Refund already processed",
@@ -1057,10 +1303,50 @@ async def merchant_refund_order(
         # Validation errors
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Refund processing error: {e}")
+        # One retry after best-effort DDL self-heal (handles missing migrations / tables).
+        try:
+            await _ensure_refund_tables_best_effort()
+            result = await refund_service.create_refund(
+                order_id=order_id,
+                amount=refund_request.amount,
+                reason=refund_request.reason,
+                source=refund_request.source,
+                created_by=current_user.get("email", current_user.get("user_id")),
+            )
+            if isinstance(result, dict) and result.get("status") == "failed":
+                return {
+                    "status": "processing",
+                    "message": "Refund is being processed. You'll be notified when complete.",
+                    "refund_id": result.get("refund_id"),
+                    "amount": refund_request.amount,
+                }
+            if isinstance(result, dict) and result.get("status") == "duplicate":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "Refund already processed", "refund_id": result.get("refund_id")},
+                )
+            if isinstance(result, dict) and result.get("status") == "success":
+                return {
+                    "status": "success",
+                    "message": "Refund processed successfully",
+                    "refund_id": result.get("refund_id"),
+                    "psp_refund_id": result.get("psp_refund_id"),
+                    "amount": refund_request.amount,
+                }
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+        debug_id = _error_debug_id("merchant_refund")
+        logger.error(f"Refund processing error debug_id={debug_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail="Failed to process refund. Please try again later."
+            detail={
+                "error": "MERCHANT_REFUND_FAILED",
+                "message": "Failed to process refund. Please try again later.",
+                "debug_id": debug_id,
+            },
         )
 
 @router.get("/merchant/orders/{order_id}/refunds")
@@ -1151,6 +1437,262 @@ async def add_product(
             **product_data
         }
     }
+
+
+@router.get("/merchant/orders/{order_id}/after-sales/cases")
+async def merchant_list_after_sales_cases_for_order(
+    order_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """List after-sales cases for an order (merchant-owned)."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+    oid = str(order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="order_id is required")
+
+    # Ensure order belongs to merchant
+    order_exists = await database.fetch_one(
+        "SELECT 1 FROM orders WHERE order_id = :order_id AND merchant_id = :merchant_id",
+        {"order_id": oid, "merchant_id": merchant_id},
+    )
+    if not order_exists:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    await _ensure_after_sales_cases_table()
+    rows = await database.fetch_all(
+        """
+        SELECT * FROM after_sales_cases
+        WHERE order_id = :order_id AND merchant_id = :merchant_id
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        {"order_id": oid, "merchant_id": merchant_id},
+    )
+    cases = [_serialize_case(dict(r)) for r in (rows or [])]
+    return {"status": "success", "total": len(cases), "cases": cases}
+
+
+@router.post("/merchant/after-sales/cases/{case_id}/approve")
+async def merchant_approve_after_sales_case_and_refund(
+    case_id: str,
+    background_tasks: BackgroundTasks,
+    payload: ApproveAfterSalesCaseRequest = Body(default={}),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Merchant approval step for buyer-initiated refund requests.
+
+    Behavior:
+    - Marks the case as `approved` (audit log) and executes the refund through RefundService.
+    - Uses a stable idempotency key (`after_sales_case:{case_id}`) to prevent double refunds.
+    """
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+    cid = str(case_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="case_id is required")
+
+    await _ensure_after_sales_cases_table()
+    loaded = await database.fetch_one(
+        "SELECT * FROM after_sales_cases WHERE case_id = :case_id",
+        {"case_id": cid},
+    )
+    if not loaded:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    loaded = dict(loaded)
+    if str(loaded.get("merchant_id") or "") != str(merchant_id):
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    current_status = str(loaded.get("status") or "")
+    if current_status in ("refunded", "partially_refunded", "refund_processed"):
+        return {"status": "success", "case": _serialize_case(loaded), "refund": {"status": "already_processed"}}
+
+    order_id = str(loaded.get("order_id") or "")
+    if not order_id:
+        raise HTTPException(status_code=500, detail="Case missing order_id")
+
+    # Ensure order belongs to merchant and compute refundable.
+    order = await get_order(order_id)
+    if not order or str(order.get("merchant_id") or "") != str(merchant_id):
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    requested_amount = loaded.get("requested_refund_amount")
+    approved_override = payload.approved_refund_amount
+    amount = None
+    if approved_override is not None:
+        amount = float(approved_override)
+    elif requested_amount is not None:
+        amount = float(requested_amount)
+    else:
+        try:
+            total = float(order.get("total") or order.get("total_amount") or 0)
+            refunded = float(order.get("total_refunded") or 0)
+            amount = max(0.0, total - refunded)
+        except Exception:
+            amount = None
+
+    if amount is None or amount <= 0:
+        raise HTTPException(status_code=400, detail="Refund amount is not refundable")
+
+    reason = str(loaded.get("reason_text") or loaded.get("reason_code") or "Refund requested").strip() or "Refund requested"
+    created_by = current_user.get("email") or current_user.get("sub") or "merchant"
+
+    audit = _coerce_json_list(loaded.get("audit_log"))
+    audit.append(
+        {
+            "at": _now_iso(),
+            "event": "merchant_approved",
+            "payload": {"amount": amount, "note": payload.note or ""},
+        }
+    )
+
+    # Best-effort status update before executing refund.
+    try:
+        await database.execute(
+            """
+            UPDATE after_sales_cases
+            SET status = 'approved',
+                audit_log = CAST(:audit_log AS JSONB),
+                updated_at = NOW()
+            WHERE case_id = :case_id
+            """,
+            {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+        )
+    except Exception:
+        pass
+
+    try:
+        await _ensure_refund_tables_best_effort()
+        refund_result = await refund_service.create_refund(
+            order_id=order_id,
+            amount=amount,
+            reason=reason,
+            source="pivota_merchant_after_sales",
+            created_by=created_by,
+            idempotency_key=f"after_sales_case:{cid}",
+        )
+    except ValueError as e:
+        audit.append({"at": _now_iso(), "event": "refund_validation_failed", "payload": {"error": str(e)[:240]}})
+        try:
+            await database.execute(
+                """
+                UPDATE after_sales_cases
+                SET status = 'approved',
+                    audit_log = CAST(:audit_log AS JSONB),
+                    updated_at = NOW()
+                WHERE case_id = :case_id
+                """,
+                {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # One retry after best-effort DDL self-heal.
+        try:
+            await _ensure_refund_tables_best_effort()
+            refund_result = await refund_service.create_refund(
+                order_id=order_id,
+                amount=amount,
+                reason=reason,
+                source="pivota_merchant_after_sales",
+                created_by=created_by,
+                idempotency_key=f"after_sales_case:{cid}",
+            )
+        except Exception:
+            refund_result = None
+
+        if refund_result is not None:
+            # Continue the flow and persist status below.
+            pass
+        else:
+            debug_id = _error_debug_id("merchant_after_sales_refund")
+            audit.append({"at": _now_iso(), "event": "refund_failed", "payload": {"debug_id": debug_id}})
+            try:
+                await database.execute(
+                    """
+                    UPDATE after_sales_cases
+                    SET status = 'refund_pending',
+                        audit_log = CAST(:audit_log AS JSONB),
+                        updated_at = NOW()
+                    WHERE case_id = :case_id
+                    """,
+                    {"case_id": cid, "audit_log": json.dumps(audit, ensure_ascii=False)},
+                )
+            except Exception:
+                pass
+            logger.error(f"merchant after-sales refund failed debug_id={debug_id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "MERCHANT_AFTER_SALES_REFUND_FAILED",
+                    "message": "Failed to process refund. Please try again later.",
+                    "debug_id": debug_id,
+                },
+            )
+
+    # Reload order to infer final status (best effort).
+    try:
+        order = await get_order(order_id)
+    except Exception:
+        order = None
+    inferred_status = "refund_processed"
+    try:
+        payment_status = str((order or {}).get("payment_status") or "")
+        if payment_status in ("partially_refunded", "refunded"):
+            inferred_status = payment_status
+    except Exception:
+        pass
+
+    audit.append(
+        {
+            "at": _now_iso(),
+            "event": "refund_result",
+            "payload": {
+                "status": str(refund_result.get("status") if isinstance(refund_result, dict) else ""),
+                "refund_id": refund_result.get("refund_id") if isinstance(refund_result, dict) else None,
+            },
+        }
+    )
+
+    try:
+        await database.execute(
+            """
+            UPDATE after_sales_cases
+            SET status = :status,
+                audit_log = CAST(:audit_log AS JSONB),
+                updated_at = NOW()
+            WHERE case_id = :case_id
+            """,
+            {"case_id": cid, "status": inferred_status, "audit_log": json.dumps(audit, ensure_ascii=False)},
+        )
+    except Exception:
+        pass
+
+    reloaded = await database.fetch_one("SELECT * FROM after_sales_cases WHERE case_id = :case_id", {"case_id": cid})
+    # Best-effort: reflect refund in Shopify as a "manual" refund record (accounting/inventory sync).
+    try:
+        shopify_order_id = str((order or {}).get("shopify_order_id") or "").strip()
+        if shopify_order_id:
+            background_tasks.add_task(
+                _create_shopify_manual_refund_best_effort,
+                merchant_id=str(merchant_id),
+                pivota_order_id=str(order_id),
+                shopify_order_id=shopify_order_id,
+                case_id=str(cid),
+                refund_amount=float(amount),
+                reason=str(reason),
+            )
+    except Exception:
+        pass
+
+    return {"status": "success", "case": _serialize_case(dict(reloaded) if reloaded else loaded), "refund": refund_result}
 
 @router.post("/merchant/security/change-password")
 async def change_password(
