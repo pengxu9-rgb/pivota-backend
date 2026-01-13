@@ -19,6 +19,7 @@ import json
 import hashlib
 
 from services.payment_routing_service import PaymentRoutingService
+from services.merchant_store_service import get_primary_store
 from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
 
 router = APIRouter()
@@ -83,6 +84,150 @@ def _coerce_json_list(value: Any) -> List[Dict[str, Any]]:
         except Exception:
             return []
     return []
+
+
+async def _append_after_sales_audit_event(case_id: str, event: str, payload: Dict[str, Any]) -> None:
+    try:
+        row = await database.fetch_one(
+            "SELECT audit_log FROM after_sales_cases WHERE case_id = :case_id",
+            {"case_id": case_id},
+        )
+        if not row:
+            return
+        audit = _coerce_json_list(dict(row).get("audit_log"))
+        audit.append({"at": _now_iso(), "event": event, "payload": payload})
+        await database.execute(
+            """
+            UPDATE after_sales_cases
+            SET audit_log = CAST(:audit_log AS JSONB),
+                updated_at = NOW()
+            WHERE case_id = :case_id
+            """,
+            {"case_id": case_id, "audit_log": json.dumps(audit, ensure_ascii=False)},
+        )
+    except Exception:
+        return
+
+
+async def _create_shopify_manual_refund_best_effort(
+    *,
+    merchant_id: str,
+    pivota_order_id: str,
+    shopify_order_id: str,
+    case_id: str,
+    refund_amount: float,
+    reason: str,
+) -> None:
+    """
+    Best-effort platform sync for Shopify:
+    - Create a "manual" refund record in Shopify for accounting.
+    - Optionally restock inventory when the order is fully refunded.
+    """
+    try:
+        store = await get_primary_store(merchant_id)
+        if not store or str(store.get("platform") or "").lower() != "shopify":
+            return
+        shop_domain = str(store.get("domain") or "").strip()
+        access_token = str(store.get("api_key") or "").strip()
+        if not shop_domain or not access_token:
+            return
+
+        # Idempotency per after-sales case: skip if already recorded.
+        try:
+            row = await database.fetch_one(
+                "SELECT audit_log FROM after_sales_cases WHERE case_id = :case_id",
+                {"case_id": case_id},
+            )
+            audit = _coerce_json_list(dict(row).get("audit_log")) if row else []
+            if any((a.get("event") == "shopify_manual_refund_created") for a in audit):
+                return
+        except Exception:
+            pass
+
+        order = await get_order(pivota_order_id)
+        if not order or str(order.get("merchant_id") or "") != str(merchant_id):
+            return
+
+        # Restock only when the order is fully refunded (best-effort).
+        restock = str(order.get("payment_status") or "").lower() == "refunded"
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            refund_line_items: list[dict[str, Any]] = []
+            if restock:
+                # Fetch Shopify line items so we can restock all quantities.
+                order_url = (
+                    f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}.json"
+                    "?fields=line_items"
+                )
+                resp = await client.get(
+                    order_url,
+                    headers={
+                        "X-Shopify-Access-Token": access_token,
+                        "Content-Type": "application/json",
+                    },
+                )
+                if resp.status_code == 200:
+                    shopify_order = resp.json().get("order") or {}
+                    for li in (shopify_order.get("line_items") or []):
+                        try:
+                            line_item_id = li.get("id")
+                            qty = int(li.get("quantity") or 0)
+                            if line_item_id and qty > 0:
+                                refund_line_items.append(
+                                    {
+                                        "line_item_id": line_item_id,
+                                        "quantity": qty,
+                                        "restock_type": "return",
+                                    }
+                                )
+                        except Exception:
+                            continue
+
+            # Create refund record (gateway=manual so it does not hit PSP again).
+            refunds_url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/refunds.json"
+            body: Dict[str, Any] = {
+                "refund": {
+                    "note": f"Pivota after-sales case {case_id}: {reason}".strip()[:240],
+                    "notify": False,
+                    "transactions": [
+                        {
+                            "kind": "refund",
+                            "gateway": "manual",
+                            "amount": f"{refund_amount:.2f}",
+                        }
+                    ],
+                }
+            }
+            if refund_line_items:
+                body["refund"]["refund_line_items"] = refund_line_items
+
+            resp = await client.post(
+                refunds_url,
+                json=body,
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+            )
+            if resp.status_code not in (200, 201):
+                await _append_after_sales_audit_event(
+                    case_id,
+                    "shopify_manual_refund_failed",
+                    {"status_code": resp.status_code},
+                )
+                return
+            shopify_refund = resp.json().get("refund") or {}
+            await _append_after_sales_audit_event(
+                case_id,
+                "shopify_manual_refund_created",
+                {"shopify_refund_id": shopify_refund.get("id"), "restock": bool(refund_line_items)},
+            )
+    except Exception:
+        # Never fail the merchant approval flow because Shopify sync is best-effort.
+        try:
+            await _append_after_sales_audit_event(case_id, "shopify_manual_refund_failed", {"status_code": None})
+        except Exception:
+            pass
 
 @router.get("/merchant/dashboard/stats")
 async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
@@ -1217,6 +1362,7 @@ async def merchant_list_after_sales_cases_for_order(
 @router.post("/merchant/after-sales/cases/{case_id}/approve")
 async def merchant_approve_after_sales_case_and_refund(
     case_id: str,
+    background_tasks: BackgroundTasks,
     payload: ApproveAfterSalesCaseRequest = Body(default={}),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1386,6 +1532,22 @@ async def merchant_approve_after_sales_case_and_refund(
         pass
 
     reloaded = await database.fetch_one("SELECT * FROM after_sales_cases WHERE case_id = :case_id", {"case_id": cid})
+    # Best-effort: reflect refund in Shopify as a "manual" refund record (accounting/inventory sync).
+    try:
+        shopify_order_id = str((order or {}).get("shopify_order_id") or "").strip()
+        if shopify_order_id:
+            background_tasks.add_task(
+                _create_shopify_manual_refund_best_effort,
+                merchant_id=str(merchant_id),
+                pivota_order_id=str(order_id),
+                shopify_order_id=shopify_order_id,
+                case_id=str(cid),
+                refund_amount=float(amount),
+                reason=str(reason),
+            )
+    except Exception:
+        pass
+
     return {"status": "success", "case": _serialize_case(dict(reloaded) if reloaded else loaded), "refund": refund_result}
 
 @router.post("/merchant/security/change-password")
