@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from db.database import database
 from db.orders import mark_order_shipped
 from db.products import log_order_event
@@ -19,6 +20,7 @@ import json
 import hashlib
 
 from services.payment_routing_service import PaymentRoutingService
+from services.merchant_store_service import get_primary_store
 
 router = APIRouter()
 
@@ -30,6 +32,270 @@ class RefundRequest(BaseModel):
     source: str = "pivota_merchant"
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+
+async def _ensure_refund_tables_best_effort() -> None:
+    """
+    Ensure refund tables/columns exist.
+    Best-effort: do not raise on failures (keeps merchant UI stable during partial deploys).
+    """
+    try:
+        await database.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded DECIMAL(10,2) DEFAULT 0")
+    except Exception:
+        return
+
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refund_records (
+                refund_id VARCHAR(50) PRIMARY KEY,
+                order_id VARCHAR(50) NOT NULL,
+                merchant_id VARCHAR(50) NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                currency VARCHAR(3) DEFAULT 'USD',
+                reason VARCHAR(100),
+                source VARCHAR(50),
+                status VARCHAR(50) DEFAULT 'pending',
+                platform_type VARCHAR(50),
+                platform_refund_id VARCHAR(255),
+                platform_sync_status VARCHAR(50),
+                psp_type VARCHAR(50),
+                psp_refund_id VARCHAR(255),
+                raw_payload JSONB,
+                created_by VARCHAR(255),
+                error_message TEXT,
+                idempotency_key VARCHAR(255) UNIQUE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                processed_at TIMESTAMP
+            )
+            """
+        )
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC)")
+        await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC)")
+    except Exception:
+        return
+
+
+def _normalize_shopify_domain(domain: str) -> str:
+    d = (domain or "").strip()
+    if not d:
+        return d
+    d = d.replace("https://", "").replace("http://", "").strip().rstrip("/")
+    if d.endswith(".myshopify.com"):
+        return d
+    return f"{d}.myshopify.com"
+
+
+async def _get_shopify_credentials_for_merchant(merchant_id: str) -> Optional[dict]:
+    try:
+        store = await get_primary_store(merchant_id)
+    except Exception:
+        store = None
+    if not store or str(store.get("platform", "")).lower() != "shopify":
+        return None
+    shop_domain = _normalize_shopify_domain(store.get("domain") or "")
+    access_token = store.get("api_key") or ""
+    if not shop_domain or not access_token:
+        return None
+    return {"shop_domain": shop_domain, "access_token": access_token}
+
+
+async def _shopify_get_order(shop_domain: str, access_token: str, shopify_order_id: str) -> Optional[dict]:
+    url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}.json"
+    headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None
+        try:
+            return resp.json().get("order")
+        except Exception:
+            return None
+
+
+async def _shopify_get_transactions(shop_domain: str, access_token: str, shopify_order_id: str) -> list[dict]:
+    url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/transactions.json"
+    headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return []
+        try:
+            return resp.json().get("transactions") or []
+        except Exception:
+            return []
+
+
+async def _shopify_create_transaction(
+    shop_domain: str,
+    access_token: str,
+    shopify_order_id: str,
+    *,
+    kind: str,
+    amount: str,
+    gateway: str = "manual",
+    status: str = "success",
+    parent_id: Optional[int] = None,
+) -> Optional[dict]:
+    url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/transactions.json"
+    headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+    tx: dict[str, Any] = {"kind": kind, "status": status, "amount": amount, "gateway": gateway}
+    if parent_id is not None:
+        tx["parent_id"] = parent_id
+    payload = {"transaction": tx}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code not in (200, 201):
+            return None
+        try:
+            return resp.json().get("transaction")
+        except Exception:
+            return None
+
+
+async def _shopify_ensure_manual_sale_transaction_best_effort(
+    shop_domain: str,
+    access_token: str,
+    shopify_order_id: str,
+) -> Optional[int]:
+    try:
+        order = await _shopify_get_order(shop_domain, access_token, shopify_order_id)
+        if not order:
+            return None
+
+        txs = await _shopify_get_transactions(shop_domain, access_token, shopify_order_id)
+        for tx in txs:
+            try:
+                if str(tx.get("status")) == "success" and str(tx.get("kind")) in ("sale", "capture"):
+                    return int(tx["id"])
+            except Exception:
+                continue
+
+        total_price = str(order.get("total_price") or "0")
+        created = await _shopify_create_transaction(
+            shop_domain,
+            access_token,
+            shopify_order_id,
+            kind="sale",
+            amount=total_price,
+            gateway="manual",
+            status="success",
+        )
+        if created and created.get("id") is not None:
+            return int(created["id"])
+    except Exception:
+        return None
+    return None
+
+
+async def _shopify_create_manual_refund_best_effort(
+    *,
+    merchant_id: str,
+    shopify_order_id: str,
+    refund_id: str,
+    amount: float,
+) -> None:
+    creds = await _get_shopify_credentials_for_merchant(merchant_id)
+    if not creds:
+        return
+    shop_domain = creds["shop_domain"]
+    access_token = creds["access_token"]
+
+    try:
+        await _ensure_refund_tables_best_effort()
+        parent_tx_id = await _shopify_ensure_manual_sale_transaction_best_effort(shop_domain, access_token, shopify_order_id)
+        refund_amount = str(Decimal(str(amount)).quantize(Decimal("0.01")))
+
+        url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/refunds.json"
+        headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+        refund_tx: dict[str, Any] = {
+            "kind": "refund",
+            "gateway": "manual",
+            "status": "success",
+            "amount": refund_amount,
+        }
+        if parent_tx_id is not None:
+            refund_tx["parent_id"] = parent_tx_id
+        payload = {
+            "refund": {
+                "notify": False,
+                "note": f"Pivota refund {refund_id}",
+                "refund_line_items": [],
+                "transactions": [refund_tx],
+            }
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code in (200, 201):
+                data = resp.json() if resp.content else {}
+                shopify_refund_id = None
+                try:
+                    shopify_refund_id = data.get("refund", {}).get("id")
+                except Exception:
+                    shopify_refund_id = None
+
+                await database.execute(
+                    """
+                    UPDATE refund_records
+                    SET
+                        platform_type = 'shopify',
+                        platform_refund_id = COALESCE(:platform_refund_id, platform_refund_id),
+                        platform_sync_status = 'synced'
+                    WHERE refund_id = :refund_id
+                    """,
+                    {
+                        "refund_id": refund_id,
+                        "platform_refund_id": str(shopify_refund_id) if shopify_refund_id is not None else None,
+                    },
+                )
+                return
+
+        # Fallback: create a manual "refund" transaction (shows up in Payments/transactions).
+        created_tx = await _shopify_create_transaction(
+            shop_domain,
+            access_token,
+            shopify_order_id,
+            kind="refund",
+            amount=refund_amount,
+            gateway="manual",
+            status="success",
+            parent_id=parent_tx_id,
+        )
+
+        if created_tx and created_tx.get("id") is not None:
+            await database.execute(
+                """
+                UPDATE refund_records
+                SET
+                    platform_type = 'shopify',
+                    platform_refund_id = COALESCE(:platform_refund_id, platform_refund_id),
+                    platform_sync_status = 'synced'
+                WHERE refund_id = :refund_id
+                """,
+                {"refund_id": refund_id, "platform_refund_id": str(created_tx["id"])},
+            )
+        else:
+            await database.execute(
+                """
+                UPDATE refund_records
+                SET platform_type = 'shopify', platform_sync_status = 'failed'
+                WHERE refund_id = :refund_id
+                """,
+                {"refund_id": refund_id},
+            )
+    except Exception:
+        try:
+            await database.execute(
+                """
+                UPDATE refund_records
+                SET platform_type = 'shopify', platform_sync_status = 'failed'
+                WHERE refund_id = :refund_id
+                """,
+                {"refund_id": refund_id},
+            )
+        except Exception:
+            pass
 
 async def get_merchant_id_from_user(current_user: dict) -> str:
     """Get merchant ID from current user token"""
@@ -846,6 +1112,7 @@ async def connect_store(
 @router.get("/merchant/orders/{order_id}")
 async def get_order_detail(
     order_id: str,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """Get order details"""
@@ -855,6 +1122,8 @@ async def get_order_detail(
     merchant_id = await get_merchant_id_from_user(current_user)
     
     try:
+        await _ensure_refund_tables_best_effort()
+
         # Query directly from database
         query = """
             SELECT 
@@ -862,7 +1131,9 @@ async def get_order_detail(
                 total, currency, status, payment_status, payment_method,
                 customer_name, customer_email, shipping_address,
                 items, subtotal, shipping_fee, tax,
-                created_at, updated_at
+                created_at, updated_at,
+                COALESCE(total_refunded, 0) as total_refunded,
+                shopify_order_id
             FROM orders
             WHERE order_id = :order_id AND merchant_id = :merchant_id
         """
@@ -871,6 +1142,36 @@ async def get_order_detail(
         
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
+
+        # Prefer refund_records sum for historical correctness; fall back to orders.total_refunded.
+        total_refunded = float(order.get("total_refunded") or 0)
+        try:
+            refunded_sum = await database.fetch_one(
+                """
+                SELECT COALESCE(SUM(amount), 0) AS total_refunded
+                FROM refund_records
+                WHERE order_id = :order_id AND status = 'completed'
+                """,
+                {"order_id": order_id},
+            )
+            if refunded_sum and refunded_sum.get("total_refunded") is not None:
+                total_refunded = max(total_refunded, float(refunded_sum["total_refunded"]))
+        except Exception:
+            pass
+
+        # Best-effort: if Shopify shows "Paid 0", create a manual sale transaction once the order is viewed.
+        try:
+            if order.get("shopify_order_id"):
+                creds = await _get_shopify_credentials_for_merchant(merchant_id)
+                if creds:
+                    background_tasks.add_task(
+                        _shopify_ensure_manual_sale_transaction_best_effort,
+                        creds["shop_domain"],
+                        creds["access_token"],
+                        str(order["shopify_order_id"]),
+                    )
+        except Exception:
+            pass
         
         return {
             "status": "success",
@@ -885,6 +1186,8 @@ async def get_order_detail(
                 "status": order["status"],
                 "payment_status": order["payment_status"],
                 "payment_method": order["payment_method"],
+                "total_refunded": total_refunded,
+                "refundable_amount": max(0.0, float(order["total"] or 0) - total_refunded),
                 "customer": {
                     "name": order["customer_name"],
                     "email": order["customer_email"]
@@ -963,6 +1266,7 @@ async def merchant_mark_shipped(
 async def merchant_refund_order(
     order_id: str,
     refund_request: RefundRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -1005,6 +1309,8 @@ async def merchant_refund_order(
         raise HTTPException(status_code=404, detail="Order not found")
     
     try:
+        await _ensure_refund_tables_best_effort()
+
         # Process refund through service
         result = await refund_service.create_refund(
             order_id=order_id,
@@ -1029,13 +1335,7 @@ async def merchant_refund_order(
         
         # Handle different statuses
         if result["status"] == "duplicate":
-            return HTTPException(
-                status_code=409,
-                detail={
-                    "message": "Refund already processed",
-                    "refund_id": result["refund_id"]
-                }
-            )
+            raise HTTPException(status_code=409, detail=f"Refund already processed (refund_id={result.get('refund_id')})")
         elif result["status"] == "failed":
             # Still return success as it's queued for retry
             return {
@@ -1045,6 +1345,23 @@ async def merchant_refund_order(
                 "amount": refund_request.amount
             }
         else:
+            # Best-effort: sync to Shopify so merchants see a "manual refund" record in Shopify.
+            try:
+                order_row = await database.fetch_one(
+                    "SELECT shopify_order_id FROM orders WHERE order_id = :order_id",
+                    {"order_id": order_id},
+                )
+                if order_row and order_row.get("shopify_order_id") and result.get("refund_id"):
+                    background_tasks.add_task(
+                        _shopify_create_manual_refund_best_effort,
+                        merchant_id=merchant_id,
+                        shopify_order_id=str(order_row["shopify_order_id"]),
+                        refund_id=str(result.get("refund_id")),
+                        amount=float(refund_request.amount),
+                    )
+            except Exception:
+                pass
+
             return {
                 "status": "success",
                 "message": "Refund processed successfully",
@@ -1066,6 +1383,7 @@ async def merchant_refund_order(
 @router.get("/merchant/orders/{order_id}/refunds")
 async def get_order_refunds(
     order_id: str,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """Get refund history for an order"""
@@ -1087,39 +1405,89 @@ async def get_order_refunds(
     
     if not order_exists:
         raise HTTPException(status_code=404, detail="Order not found")
-    
-    # Get refund history with enhanced details
-    refunds = await refund_service.get_refund_history(order_id)
-    
+
+    await _ensure_refund_tables_best_effort()
+
+    # Get refund history with enhanced details (best-effort)
+    try:
+        refunds = await refund_service.get_refund_history(order_id)
+    except Exception:
+        refunds = []
+
+    # Best-effort backfill: sync completed refunds that haven't been synced to Shopify yet.
+    try:
+        order_row = await database.fetch_one(
+            "SELECT shopify_order_id FROM orders WHERE order_id = :order_id",
+            {"order_id": order_id},
+        )
+        shopify_order_id = str(order_row["shopify_order_id"]) if order_row and order_row.get("shopify_order_id") else None
+        if shopify_order_id:
+            for r in refunds[:5]:
+                if r.get("status") != "completed":
+                    continue
+                if r.get("platform_type") == "shopify" and r.get("platform_sync_status") == "synced":
+                    continue
+                if r.get("platform_refund_id"):
+                    continue
+                if not r.get("refund_id"):
+                    continue
+                background_tasks.add_task(
+                    _shopify_create_manual_refund_best_effort,
+                    merchant_id=merchant_id,
+                    shopify_order_id=shopify_order_id,
+                    refund_id=str(r.get("refund_id")),
+                    amount=float(r.get("amount") or 0),
+                )
+    except Exception:
+        pass
+
     # Get order details for context
     order_query = """
-    SELECT total_amount, total_refunded, payment_status, currency
+    SELECT total as total_amount, COALESCE(total_refunded, 0) as total_refunded, payment_status, currency
     FROM orders 
     WHERE order_id = :order_id
     """
-    order_data = await database.fetch_one(order_query, {"order_id": order_id})
-    
+    try:
+        order_data = await database.fetch_one(order_query, {"order_id": order_id})
+        order_data = dict(order_data) if order_data else None
+    except Exception:
+        order_data = None
+    if not order_data:
+        order_data = {"total_amount": 0, "total_refunded": 0, "payment_status": "unknown", "currency": "USD"}
+
     # Calculate refund summary
-    total_refunded = sum(r.get("amount", 0) for r in refunds if r.get("status") == "completed")
-    pending_refunds = sum(r.get("amount", 0) for r in refunds if r.get("status") == "pending")
-    
+    completed_sum = sum(float(r.get("amount") or 0) for r in refunds if r.get("status") == "completed")
+    pending_sum = sum(float(r.get("amount") or 0) for r in refunds if r.get("status") == "pending")
+
+    # Use the larger of (orders.total_refunded) and (refund_records sum) for correctness.
+    try:
+        order_total_refunded = float(order_data["total_refunded"]) if order_data and order_data.get("total_refunded") is not None else 0.0
+    except Exception:
+        order_total_refunded = 0.0
+    effective_total_refunded = max(order_total_refunded, float(completed_sum or 0))
+
+    try:
+        total_amount = float(order_data["total_amount"]) if order_data and order_data.get("total_amount") is not None else 0.0
+    except Exception:
+        total_amount = 0.0
+
     return {
         "status": "success",
         "order_summary": {
             "order_id": order_id,
-            "total_amount": float(order_data["total_amount"]) if order_data["total_amount"] else 0,
-            "total_refunded": float(order_data["total_refunded"]) if order_data["total_refunded"] else 0,
-            "payment_status": order_data["payment_status"],
-            "currency": order_data["currency"] or "USD",
-            "refundable_amount": float(order_data["total_amount"] - order_data["total_refunded"]) if order_data["total_amount"] and order_data["total_refunded"] else float(order_data["total_amount"]) if order_data["total_amount"] else 0
+            "total_amount": total_amount,
+            "total_refunded": effective_total_refunded,
+            "payment_status": order_data.get("payment_status", "unknown"),
+            "currency": order_data.get("currency") or "USD",
+            "refundable_amount": max(0.0, total_amount - effective_total_refunded),
         },
         "refund_summary": {
             "total_refunds": len(refunds),
-            "completed_amount": total_refunded,
-            "pending_amount": pending_refunds,
-            "failed_count": len([r for r in refunds if r.get("status") == "failed"])
+            "completed_amount": completed_sum,
+            "pending_amount": pending_sum,
+            "failed_count": len([r for r in refunds if r.get("status") == "failed"]),
         },
-        "refunds": refunds
+        "refunds": refunds,
     }
 
 @router.post("/merchant/orders/export")

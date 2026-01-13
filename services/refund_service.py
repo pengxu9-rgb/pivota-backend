@@ -369,9 +369,13 @@ class RefundService:
             created_at,
             processed_at,
             error_message,
+            platform_type,
+            platform_refund_id,
+            platform_sync_status,
+            raw_payload,
+            psp_type,
             psp_refund_id,
             idempotency_key,
-            metadata,
             CASE 
                 WHEN status = 'completed' THEN 'success'
                 WHEN status = 'failed' THEN 'error'
@@ -496,4 +500,3 @@ class RefundService:
 
 # Create singleton instance
 refund_service = RefundService()
-
