@@ -1099,6 +1099,8 @@ async def get_order_detail(
     merchant_id = await get_merchant_id_from_user(current_user)
     
     try:
+        await _ensure_refund_tables_best_effort()
+
         # Query directly from database
         query = """
             SELECT 
@@ -1116,6 +1118,21 @@ async def get_order_detail(
         
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
+
+        # Backfill total_refunded from refund_records to keep UI accurate even when
+        # historical refunds happened before orders.total_refunded existed.
+        try:
+            refunded_row = await database.fetch_one(
+                """
+                SELECT COALESCE(SUM(amount), 0) AS total_refunded
+                FROM refund_records
+                WHERE order_id = :order_id AND status = 'completed'
+                """,
+                {"order_id": order_id},
+            )
+            computed_total_refunded = float(refunded_row["total_refunded"]) if refunded_row else 0.0
+        except Exception:
+            computed_total_refunded = 0.0
         
         return {
             "status": "success",
@@ -1126,7 +1143,7 @@ async def get_order_detail(
                 "subtotal": float(order["subtotal"]) if order["subtotal"] else 0,
                 "shipping_fee": float(order["shipping_fee"]) if order["shipping_fee"] else 0,
                 "tax": float(order["tax"]) if order["tax"] else 0,
-                "total_refunded": float(order["total_refunded"]) if order["total_refunded"] else 0,
+                "total_refunded": float(max(float(order["total_refunded"] or 0), computed_total_refunded)),
                 "currency": order["currency"],
                 "status": order["status"],
                 "payment_status": order["payment_status"],
@@ -1395,16 +1412,23 @@ async def get_order_refunds(
     # Calculate refund summary
     total_refunded = sum(r.get("amount", 0) for r in refunds if r.get("status") == "completed")
     pending_refunds = sum(r.get("amount", 0) for r in refunds if r.get("status") == "pending")
+
+    # Use the larger of (orders.total_refunded) and (refund_records sum) for correctness.
+    try:
+        order_total_refunded = float(order_data["total_refunded"]) if order_data and order_data.get("total_refunded") is not None else 0.0
+    except Exception:
+        order_total_refunded = 0.0
+    effective_total_refunded = max(order_total_refunded, float(total_refunded or 0))
     
     return {
         "status": "success",
         "order_summary": {
             "order_id": order_id,
             "total_amount": float(order_data["total_amount"]) if order_data["total_amount"] else 0,
-            "total_refunded": float(order_data["total_refunded"]) if order_data["total_refunded"] else 0,
+            "total_refunded": effective_total_refunded,
             "payment_status": order_data["payment_status"],
             "currency": order_data["currency"] or "USD",
-            "refundable_amount": float(order_data["total_amount"] - order_data["total_refunded"]) if order_data["total_amount"] and order_data["total_refunded"] else float(order_data["total_amount"]) if order_data["total_amount"] else 0
+            "refundable_amount": float(float(order_data["total_amount"] or 0) - effective_total_refunded) if order_data else 0
         },
         "refund_summary": {
             "total_refunds": len(refunds),
