@@ -2,17 +2,58 @@
 Structured Logging Middleware
 Records all API requests in JSON format for analysis
 """
+import hashlib
 import time
 import json
 import uuid
 from datetime import datetime
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import Message
-from typing import Callable
+from typing import Any, Dict, Optional
 import logging
 
 logger = logging.getLogger("structured_logs")
+
+
+_SENSITIVE_QUERY_KEYS = {
+    "sig",
+    "signature",
+    "token",
+    "access_token",
+    "authorization",
+    "auth",
+    "api_key",
+    "key",
+    "secret",
+    "password",
+}
+
+
+def _sha256_16(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _redact_query_params(params: Dict[str, str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in (params or {}).items():
+        kl = (k or "").lower()
+        if kl in _SENSITIVE_QUERY_KEYS or "token" in kl or "sig" in kl:
+            out[k] = "[REDACTED]"
+        else:
+            out[k] = v
+    return out
+
+
+def _client_ip_hash(request: Request) -> Optional[str]:
+    # Prefer X-Forwarded-For (first IP), fall back to request.client.host.
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    ip = None
+    if xff:
+        ip = xff.split(",")[0].strip()
+    if not ip and request.client:
+        ip = request.client.host
+    return _sha256_16(ip) if ip else None
+
 
 class StructuredLoggingMiddleware(BaseHTTPMiddleware):
     """
@@ -28,8 +69,9 @@ class StructuredLoggingMiddleware(BaseHTTPMiddleware):
     """
     
     async def dispatch(self, request: Request, call_next):
-        # Generate unique request ID
-        request_id = str(uuid.uuid4())
+        # Prefer upstream request id if present; otherwise generate.
+        upstream = (request.headers.get("x-request-id") or "").strip()
+        request_id = upstream if (0 < len(upstream) <= 128) else str(uuid.uuid4())
         request.state.request_id = request_id
         
         # Capture start time
@@ -42,15 +84,22 @@ class StructuredLoggingMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             status_code = response.status_code
-            error = None
+            error: Optional[Dict[str, Any]] = None
         except Exception as e:
             status_code = 500
-            error = str(e)
+            # Avoid leaking secrets via exception strings.
+            error = {"type": type(e).__name__}
             # Re-raise to let FastAPI handle it
             raise
         finally:
             # Calculate duration
             duration_ms = int((time.time() - start_time) * 1000)
+
+            context = {
+                "operation": getattr(request.state, "operation", None),
+                "merchant_id": getattr(request.state, "merchant_id", None),
+                "group_id": getattr(request.state, "group_id", None),
+            }
             
             # Build structured log
             log_entry = {
@@ -58,13 +107,14 @@ class StructuredLoggingMiddleware(BaseHTTPMiddleware):
                 "request_id": request_id,
                 "method": request.method,
                 "path": request.url.path,
-                "query_params": dict(request.query_params) if request.query_params else None,
+                "query_params": _redact_query_params(dict(request.query_params)) if request.query_params else None,
                 "status_code": status_code,
                 "duration_ms": duration_ms,
                 "user_agent": request.headers.get("user-agent"),
-                "ip_address": request.client.host if request.client else None,
+                "ip_hash": _client_ip_hash(request),
                 "user_info": user_info,
-                "error": error
+                "context": context if any(v is not None for v in context.values()) else None,
+                "error": error,
             }
             
             # Log based on status
@@ -76,26 +126,27 @@ class StructuredLoggingMiddleware(BaseHTTPMiddleware):
                 logger.info(json.dumps(log_entry))
         
         # Add request ID to response headers
+        response.headers["X-Request-Id"] = request_id
         response.headers["X-Request-ID"] = request_id
         
         return response
     
     def _extract_user_info(self, request: Request) -> dict:
         """Extract user information from request"""
-        user_info = {}
+        user_info: Dict[str, Any] = {}
         
         # Check for API key (Agent API)
         api_key = request.headers.get("x-api-key")
         if api_key:
             user_info["type"] = "agent"
-            user_info["api_key_prefix"] = api_key[:15] + "..." if len(api_key) > 15 else api_key
+            user_info["api_key_hash"] = _sha256_16(api_key)
         
         # Check for Bearer token (Employee/Merchant)
         auth_header = request.headers.get("authorization")
         if auth_header and auth_header.startswith("Bearer "):
-            user_info["type"] = "authenticated"
             token = auth_header[7:]
-            user_info["token_prefix"] = token[:15] + "..." if len(token) > 15 else token
+            user_info["auth"] = "bearer"
+            user_info["token_hash"] = _sha256_16(token)
         
         return user_info if user_info else None
 
@@ -190,8 +241,6 @@ def setup_structured_logging():
     os.makedirs("logs", exist_ok=True)
     
     logging.config.dictConfig(LOGGING_CONFIG)
-
-
 
 
 

@@ -1,10 +1,11 @@
 fastapi==0.104.1
 uvicorn[standard]
-httpx
+httpx<0.28
 python-dotenv
 stripe
-SQLAlchemy
-Databases
+SQLAlchemy==1.4.52
+greenlet
+databases==0.7.0
 pydantic
 pydantic-settings
 alembic      # optional for migrations later
@@ -21,3 +22,4 @@ python-multipart  # for form data handling
 cryptography  # for JWT and security
 requests  # for HTTP requests (backup to httpx)
 bcrypt
+prometheus-client

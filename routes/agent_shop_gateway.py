@@ -20,14 +20,18 @@ import os
 import re
 import time
 import unicodedata
+import mimetypes
 from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
+from db.database import database
+from models.reviews_refs import SkuRef as ReviewsSkuRef
 from services.product_query_service import get_products_hybrid
 from services.similarity_service import (
     SimilarityService,
@@ -46,6 +50,64 @@ logger = logging.getLogger(__name__)
 
 _MERCHANT_SHOPIFY_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
 _MERCHANT_SHOPIFY_CURRENCY_TTL_SECONDS = 6 * 60 * 60
+
+_REVIEW_MEDIA_IP_LIMIT_STORE: Dict[str, tuple[int, int]] = {}
+
+
+def _reviews_enabled() -> bool:
+    return os.getenv("REVIEWS_ENABLED", "true").lower() == "true"
+
+
+def _reviews_featured_enabled() -> bool:
+    return os.getenv("REVIEWS_FEATURED_ENABLED", "true").lower() == "true"
+
+
+def _reviews_default_view_override() -> Optional[str]:
+    v = (os.getenv("REVIEWS_DEFAULT_VIEW") or "").strip().lower()
+    if v in {"merchant", "group"}:
+        return v
+    return None
+
+
+def _reviews_media_rpm() -> int:
+    raw = (os.getenv("REVIEWS_MEDIA_RPM") or "").strip()
+    try:
+        v = int(raw) if raw else 120
+    except Exception:
+        v = 120
+    return max(1, min(v, 10_000))
+
+
+def _reviews_media_import_dir() -> str:
+    base = os.getenv("REVIEWS_IMPORT_DIR", os.path.join(os.getcwd(), "tmp", "reviews-imports"))
+    return os.path.realpath(base)
+
+
+def _review_media_client_ip(request: Request) -> str:
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip() or "unknown"
+    return (request.client.host if request.client else None) or "unknown"
+
+
+def _check_review_media_rate_limit(ip: str) -> bool:
+    rpm = _reviews_media_rpm()
+    window = int(time.time() // 60)
+    prev = _REVIEW_MEDIA_IP_LIMIT_STORE.get(ip)
+    if prev and prev[0] == window:
+        if prev[1] >= rpm:
+            return False
+        _REVIEW_MEDIA_IP_LIMIT_STORE[ip] = (window, prev[1] + 1)
+        return True
+    _REVIEW_MEDIA_IP_LIMIT_STORE[ip] = (window, 1)
+    return True
+
+
+def _set_media_cache_headers(resp: Response, etag: Optional[str]) -> None:
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    if etag:
+        resp.headers["ETag"] = f"\"{etag}\""
 
 
 def _get_cached_merchant_shopify_currency(merchant_id: str) -> Optional[str]:
@@ -195,6 +257,41 @@ class ProductRef(BaseModel):
 
 class GetProductDetailPayload(BaseModel):
     product: ProductRef
+
+
+class ListSkuReviewsFilters(BaseModel):
+    featured_only: bool = False
+    has_media: bool = False
+    limit: int = 20
+    cursor: Optional[str] = None
+
+
+class ListSkuReviewsPayload(BaseModel):
+    sku: ReviewsSkuRef
+    filters: Optional[ListSkuReviewsFilters] = None
+
+
+class ListGroupReviewsFilters(BaseModel):
+    merchant_ids: Optional[List[str]] = None
+    featured_only: bool = False
+    has_media: bool = False
+    limit: int = 20
+    cursor: Optional[str] = None
+
+
+class ListGroupReviewsPayload(BaseModel):
+    group_id: int
+    filters: Optional[ListGroupReviewsFilters] = None
+
+
+class ListGroupMerchantsPayload(BaseModel):
+    group_id: int
+
+
+class ListSellerFeedbackPayload(BaseModel):
+    merchant_id: str
+    limit: int = 20
+    cursor: Optional[str] = None
 
 
 class OrderItem(BaseModel):
@@ -3138,12 +3235,39 @@ async def _handle_get_product_detail(
         else None
     )
 
+    review_summary = None
+    seller_feedback_summary = None
+    try:
+        if not _reviews_enabled():
+            raise RuntimeError("reviews_disabled")
+        from services.reviews_service import get_review_summary_for_sku, get_seller_feedback_summary
+        from observability.reviews_metrics import record_pdp_default_view
+
+        review_summary = await get_review_summary_for_sku(
+            merchant_id=merchant_id,
+            platform=str(match.platform),
+            platform_product_id=str(match.product_id or match.id),
+            variant_id=None,
+        )
+        seller_feedback_summary = await get_seller_feedback_summary(merchant_id)
+
+        dv = _reviews_default_view_override()
+        if dv and review_summary:
+            review_summary["default_view"] = dv
+        record_pdp_default_view(str(review_summary.get("default_view") or "merchant"))
+    except Exception:
+        # PDP should stay available even when reviews are degraded.
+        review_summary = None
+        seller_feedback_summary = None
+
     return {
         "product": {
             **base,
             "attributes": attributes or None,
             "options": options or None,
             "product_options": legacy_product_options,
+            "review_summary": review_summary,
+            "seller_feedback_summary": seller_feedback_summary,
         },
         "metadata": {
             "query_source": query_source,
@@ -3257,6 +3381,10 @@ async def invoke_shop_operation(
     Supported operations:
     - find_products
     - get_product_detail
+    - list_sku_reviews
+    - list_group_reviews
+    - list_group_merchants
+    - list_seller_feedback
     - create_order       (demo-only)
     - submit_payment     (demo-only)
     - find_similar_products
@@ -3282,7 +3410,199 @@ async def invoke_shop_operation(
 
     if operation == "get_product_detail":
         payload = GetProductDetailPayload(**request.payload)
-        return await _handle_get_product_detail(payload.product, background_tasks)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.product.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            return await _handle_get_product_detail(payload.product, background_tasks)
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_sku_reviews":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListSkuReviewsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.sku.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import build_sku_key, list_sku_reviews
+
+            f = payload.filters or ListSkuReviewsFilters()
+            if bool(f.featured_only) and not _reviews_featured_enabled():
+                return {"items": [], "next_cursor": None, "limit": int(f.limit or 20)}
+            sku_key = build_sku_key(
+                merchant_id=payload.sku.merchant_id,
+                platform=payload.sku.platform,
+                platform_product_id=payload.sku.platform_product_id,
+                variant_id=payload.sku.variant_id,
+            )
+            return await list_sku_reviews(
+                sku_key=sku_key,
+                featured_only=bool(f.featured_only),
+                has_media=bool(f.has_media),
+                limit=int(f.limit or 20),
+                cursor=f.cursor,
+            )
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_group_reviews":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListGroupReviewsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.group_id = int(payload.group_id)
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import list_group_reviews
+
+            f = payload.filters or ListGroupReviewsFilters()
+            if bool(f.featured_only) and not _reviews_featured_enabled():
+                return {"items": [], "next_cursor": None, "limit": int(f.limit or 20)}
+            return await list_group_reviews(
+                group_id=int(payload.group_id),
+                merchant_ids=f.merchant_ids,
+                featured_only=bool(f.featured_only),
+                has_media=bool(f.has_media),
+                limit=int(f.limit or 20),
+                cursor=f.cursor,
+            )
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_group_merchants":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListGroupMerchantsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.group_id = int(payload.group_id)
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import get_group_counts_by_merchant
+
+            counts = await get_group_counts_by_merchant(int(payload.group_id))
+            return {"group_id": int(payload.group_id), "counts_by_merchant": counts}
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_seller_feedback":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListSellerFeedbackPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import list_seller_feedback
+
+            return await list_seller_feedback(
+                merchant_id=payload.merchant_id,
+                limit=int(payload.limit or 20),
+                cursor=payload.cursor,
+            )
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
 
     if operation == "create_order":
         payload = CreateOrderPayload(**request.payload)
@@ -3379,3 +3699,111 @@ async def invoke_shop_operation(
         status_code=400,
         detail=f"Unsupported operation: {operation}",
     )
+
+
+@router.get("/review-media/{public_id}")
+async def get_review_media(public_id: str, request: Request) -> Response:
+    """
+    Serves imported review media by unguessable public_id.
+    Requires exp+sig query params (HMAC) and applies IP rate limiting.
+    """
+    started = time.time()
+    status_code = 200
+    bytes_served = 0
+    sig_fail_reason: Optional[str] = None
+    rate_limited = False
+    try:
+        if not _reviews_enabled():
+            status_code = 404
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        request.state.operation = "review_media"
+
+        ip = _review_media_client_ip(request)
+        if not _check_review_media_rate_limit(ip):
+            rate_limited = True
+            status_code = 429
+            raise HTTPException(status_code=429, detail="RATE_LIMITED")
+
+        exp_raw = (request.query_params.get("exp") or "").strip()
+        sig = (request.query_params.get("sig") or "").strip()
+        if not exp_raw or not sig:
+            status_code = 403
+            sig_fail_reason = "missing"
+            raise HTTPException(status_code=403, detail="SIGNATURE_REQUIRED")
+
+        try:
+            exp = int(exp_raw)
+        except Exception:
+            status_code = 403
+            sig_fail_reason = "bad_exp"
+            raise HTTPException(status_code=403, detail="BAD_SIGNATURE")
+
+        from services.reviews_service import verify_review_media_signature_with_reason, _allow_legacy_review_media_id
+
+        ok, reason = verify_review_media_signature_with_reason(public_id=public_id, exp=exp, sig=sig)
+        if not ok:
+            status_code = 403
+            sig_fail_reason = reason
+            raise HTTPException(status_code=403, detail="BAD_SIGNATURE")
+
+        media_row = await database.fetch_one(
+            """
+            SELECT m.id, m.public_id, m.type, m.file_path, m.file_hash
+            FROM media_assets m
+            JOIN product_reviews r ON r.id = m.review_id
+            WHERE m.status = 'active'
+              AND r.status = 'active'
+              AND (
+                m.public_id = :pid
+                OR (:allow_legacy = true AND m.public_id IS NULL AND m.id = :legacy_id)
+              )
+            LIMIT 1
+            """,
+            {
+                "pid": str(public_id),
+                "allow_legacy": bool(_allow_legacy_review_media_id()),
+                "legacy_id": int(public_id) if public_id.isdigit() else -1,
+            },
+        )
+        if not media_row:
+            status_code = 404
+            raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
+
+        file_path = os.path.realpath(str(media_row["file_path"] or ""))
+        if not file_path or not os.path.exists(file_path):
+            status_code = 404
+            raise HTTPException(status_code=404, detail="MEDIA_FILE_MISSING")
+
+        # Safety: only serve from REVIEWS_IMPORT_DIR.
+        base = _reviews_media_import_dir()
+        if not file_path.startswith(base + os.sep) and file_path != base:
+            status_code = 404
+            raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
+
+        etag = str(media_row["file_hash"] or "").strip() or None
+        if etag and (request.headers.get("if-none-match") or "").strip() == f"\"{etag}\"":
+            resp = Response(status_code=304)
+            _set_media_cache_headers(resp, etag)
+            return resp
+
+        media_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        bytes_served = int(os.path.getsize(file_path)) if os.path.exists(file_path) else 0
+        resp = FileResponse(file_path, media_type=media_type)
+        _set_media_cache_headers(resp, etag)
+        return resp
+    except HTTPException as e:
+        status_code = int(e.status_code)
+        raise
+    finally:
+        try:
+            from observability.reviews_metrics import record_media_request
+
+            record_media_request(
+                status_code=status_code,
+                duration_seconds=max(0.0, time.time() - started),
+                bytes_served=bytes_served,
+                sig_fail_reason=sig_fail_reason,
+                rate_limited=rate_limited,
+            )
+        except Exception:
+            pass
