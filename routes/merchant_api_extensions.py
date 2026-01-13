@@ -1260,27 +1260,27 @@ async def merchant_refund_order(
             created_by=current_user.get("email", current_user.get("user_id"))
         )
         
-        # Log refund event
-        await log_order_event(
-            event_type="merchant_refund",
-            order_id=order_id,
-            merchant_id=merchant_id,
-            metadata={
-                "refund_id": result.get("refund_id"),
-                "amount": refund_request.amount,
-                "reason": refund_request.reason,
-                "status": result["status"]
-            }
-        )
+        # Best-effort logging (must not fail the refund response).
+        try:
+            await log_order_event(
+                event_type="merchant_refund",
+                order_id=order_id,
+                merchant_id=merchant_id,
+                metadata={
+                    "refund_id": result.get("refund_id"),
+                    "amount": refund_request.amount,
+                    "reason": refund_request.reason,
+                    "status": result["status"],
+                },
+            )
+        except Exception:
+            pass
         
         # Handle different statuses
         if result["status"] == "duplicate":
             raise HTTPException(
                 status_code=409,
-                detail={
-                    "message": "Refund already processed",
-                    "refund_id": result["refund_id"]
-                }
+                detail=f"Refund already processed (refund_id: {result.get('refund_id')})",
             )
         elif result["status"] == "failed":
             # Still return success as it's queued for retry
@@ -1323,7 +1323,7 @@ async def merchant_refund_order(
             if isinstance(result, dict) and result.get("status") == "duplicate":
                 raise HTTPException(
                     status_code=409,
-                    detail={"message": "Refund already processed", "refund_id": result.get("refund_id")},
+                    detail=f"Refund already processed (refund_id: {result.get('refund_id')})",
                 )
             if isinstance(result, dict) and result.get("status") == "success":
                 return {
@@ -1342,11 +1342,8 @@ async def merchant_refund_order(
         logger.error(f"Refund processing error debug_id={debug_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={
-                "error": "MERCHANT_REFUND_FAILED",
-                "message": "Failed to process refund. Please try again later.",
-                "debug_id": debug_id,
-            },
+            # Keep `detail` a string for backward-compatible clients that render it directly.
+            detail=f"Failed to process refund. Please try again later. (debug_id: {debug_id})",
         )
 
 @router.get("/merchant/orders/{order_id}/refunds")
@@ -1630,11 +1627,7 @@ async def merchant_approve_after_sales_case_and_refund(
             logger.error(f"merchant after-sales refund failed debug_id={debug_id}: {e}", exc_info=True)
             raise HTTPException(
                 status_code=500,
-                detail={
-                    "error": "MERCHANT_AFTER_SALES_REFUND_FAILED",
-                    "message": "Failed to process refund. Please try again later.",
-                    "debug_id": debug_id,
-                },
+                detail=f"Failed to process refund. Please try again later. (debug_id: {debug_id})",
             )
 
     # Reload order to infer final status (best effort).
