@@ -11,9 +11,10 @@ import os
 import re
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
@@ -194,6 +195,42 @@ def _wilson_lower_bound(pos: int, n: int, z: float = 1.96) -> float:
     return (centre - margin) / denom
 
 
+def _json_sanitize(value: Any) -> Any:
+    """
+    Make a value JSON-serializable for audit logs.
+
+    Important: audit must be best-effort; it should never break the main flow.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime, date)):
+        # Use ISO for stable readability and cross-language parsing.
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, bytes):
+        # Avoid raw bytes in JSON (also avoids logging potentially sensitive binary data verbatim).
+        return base64.b64encode(value).decode("utf-8")
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            out[str(k)] = _json_sanitize(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_json_sanitize(v) for v in value]
+    # Fallback for SQLAlchemy Rows / Records / unknown objects.
+    try:
+        if hasattr(value, "_mapping"):
+            return _json_sanitize(dict(value._mapping))  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return str(value)
+
+
 async def _audit(
     *,
     actor: Dict[str, Any],
@@ -204,19 +241,26 @@ async def _audit(
     before: Optional[Dict[str, Any]],
     after: Optional[Dict[str, Any]],
 ) -> None:
-    await database.execute(
-        employee_audit_logs.insert().values(
-            actor_employee_id=actor.get("employee_id") or actor.get("user_id") or actor.get("sub"),
-            actor_email=actor.get("email"),
-            action=action,
-            target_type=target_type,
-            target_id=str(target_id),
-            reason=reason,
-            before_json=before,
-            after_json=after,
-            created_at=_now(),
+    try:
+        await database.execute(
+            employee_audit_logs.insert().values(
+                actor_employee_id=actor.get("employee_id") or actor.get("user_id") or actor.get("sub"),
+                actor_email=actor.get("email"),
+                action=action,
+                target_type=target_type,
+                target_id=str(target_id),
+                reason=reason,
+                before_json=_json_sanitize(before) if before is not None else None,
+                after_json=_json_sanitize(after) if after is not None else None,
+                created_at=_now(),
+            )
         )
-    )
+    except Exception as e:
+        # Audit logging must be best-effort; do not break the request path.
+        try:
+            logger.warning("reviews.audit.failed action=%s target=%s:%s err=%s", action, target_type, target_id, e)
+        except Exception:
+            pass
 
 
 async def get_active_group_membership_for_sku_key(sku_key: str) -> Optional[Dict[str, Any]]:
@@ -1947,7 +1991,17 @@ async def commit_import_batch(
             continue
 
         payload_raw = _row_get(r, "payload_json")
-        payload = payload_raw if isinstance(payload_raw, dict) else {}
+        payload: Dict[str, Any] = {}
+        if isinstance(payload_raw, dict):
+            payload = payload_raw
+        elif isinstance(payload_raw, str):
+            # Some drivers/dialects can surface JSON/JSONB as text; accept both.
+            try:
+                parsed = json.loads(payload_raw)
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
         platform = _as_text(payload.get("platform"))
         platform_product_id = _as_text(payload.get("platform_product_id") or payload.get("product_id"))
         variant_id = _as_text(payload.get("variant_id")) or None
