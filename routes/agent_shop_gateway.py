@@ -262,6 +262,7 @@ class GetProductDetailPayload(BaseModel):
 class ListSkuReviewsFilters(BaseModel):
     featured_only: bool = False
     has_media: bool = False
+    rating: Optional[int] = None  # 1..5
     limit: int = 20
     cursor: Optional[str] = None
 
@@ -3448,11 +3449,25 @@ async def invoke_shop_operation(
         status_code = 200
         error_detail = None
         try:
-            from services.reviews_service import build_sku_key, list_sku_reviews
+            from services.reviews_service import build_product_key, build_sku_key, list_product_reviews, list_sku_reviews
 
             f = payload.filters or ListSkuReviewsFilters()
             if bool(f.featured_only) and not _reviews_featured_enabled():
                 return {"items": [], "next_cursor": None, "limit": int(f.limit or 20)}
+            # If variant_id is omitted, treat as product-level listing across all variants.
+            if payload.sku.variant_id is None or str(payload.sku.variant_id).strip() == "":
+                product_key = build_product_key(
+                    merchant_id=payload.sku.merchant_id,
+                    platform=payload.sku.platform,
+                    platform_product_id=payload.sku.platform_product_id,
+                )
+                return await list_product_reviews(
+                    product_key=product_key,
+                    has_media=bool(f.has_media),
+                    rating=f.rating,
+                    limit=int(f.limit or 20),
+                    cursor=f.cursor,
+                )
             sku_key = build_sku_key(
                 merchant_id=payload.sku.merchant_id,
                 platform=payload.sku.platform,
@@ -3463,6 +3478,7 @@ async def invoke_shop_operation(
                 sku_key=sku_key,
                 featured_only=bool(f.featured_only),
                 has_media=bool(f.has_media),
+                rating=f.rating,
                 limit=int(f.limit or 20),
                 cursor=f.cursor,
             )

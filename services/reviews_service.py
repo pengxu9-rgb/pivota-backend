@@ -704,6 +704,7 @@ async def list_sku_reviews(
     sku_key: str,
     featured_only: bool = False,
     has_media: bool = False,
+    rating: Optional[int] = None,
     limit: int = 20,
     cursor: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -716,6 +717,10 @@ async def list_sku_reviews(
     if has_media:
         where.append("r.media_count > 0")
 
+    if rating is not None:
+        where.append("r.rating = :rating")
+        params["rating"] = int(rating)
+
     if featured_only:
         mem = await get_active_group_membership_for_sku_key(sku_key)
         gid_raw = _row_get(mem, "group_id") if mem else None
@@ -727,6 +732,101 @@ async def list_sku_reviews(
 
     if cursor_pair:
         # Avoid row-value tuple comparisons for SQLite compatibility.
+        where.append("(r.created_at < :cursor_ts OR (r.created_at = :cursor_ts AND r.id < :cursor_id))")
+        params["cursor_ts"] = cursor_pair[0]
+        params["cursor_id"] = cursor_pair[1]
+
+    where_sql = " AND ".join(where)
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT r.id, r.merchant_id, r.product_key, r.sku_key, r.platform, r.platform_product_id, r.variant_id,
+               r.verification, r.rating, r.title,
+               COALESCE(NULLIF(r.body_redacted, ''), r.body) AS body_effective,
+               r.media_count, r.created_at
+        FROM product_reviews r
+        WHERE {where_sql}
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT {limit}
+        """,
+        params,
+    )
+
+    items: List[Dict[str, Any]] = []
+    next_cursor: Optional[str] = None
+    for row in rows:
+        rid = int(row["id"])
+        media_rows = await database.fetch_all(
+            """
+            SELECT id, type, url, public_id
+            FROM media_assets
+            WHERE review_id = :rid AND status = 'active'
+            ORDER BY id ASC
+            LIMIT 6
+            """,
+            {"rid": rid},
+        )
+        media_out = []
+        for m in media_rows:
+            pid = _as_text(_row_get(m, "public_id"))
+            media_out.append(
+                {
+                    "id": int(m["id"]),
+                    "type": m["type"],
+                    "url": _signed_media_url(public_id=pid or None, media_id=int(m["id"])),
+                }
+            )
+        items.append(
+            {
+                "review_id": rid,
+                "merchant_id": str(row["merchant_id"]),
+                "product_key": row["product_key"],
+                "sku_key": row["sku_key"],
+                "platform": row["platform"],
+                "platform_product_id": row["platform_product_id"],
+                "variant_id": row["variant_id"],
+                "verification": row["verification"],
+                "rating": row["rating"],
+                "title": row["title"],
+                "body": row["body_effective"],
+                "snippet": _safe_snippet(row["body_effective"]),
+                "created_at": _as_iso_datetime(_row_get(row, "created_at")),
+                "media": media_out,
+                "is_featured": False,
+                "merge": None,
+            }
+        )
+        next_cursor = _encode_cursor(_row_get(row, "created_at"), rid) if _as_datetime(_row_get(row, "created_at")) else None
+
+    return {"items": items, "next_cursor": next_cursor, "limit": limit}
+
+
+async def list_product_reviews(
+    *,
+    product_key: str,
+    has_media: bool = False,
+    rating: Optional[int] = None,
+    limit: int = 20,
+    cursor: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Product-level listing across all variants under a product_key.
+    Used by PDP when variant_id is not specified.
+    """
+    limit = max(1, min(int(limit or 20), 50))
+    cursor_pair = _decode_cursor(cursor or "")
+
+    where = ["r.product_key = :pk", "r.status = 'active'"]
+    params: Dict[str, Any] = {"pk": product_key}
+
+    if has_media:
+        where.append("r.media_count > 0")
+
+    if rating is not None:
+        where.append("r.rating = :rating")
+        params["rating"] = int(rating)
+
+    if cursor_pair:
         where.append("(r.created_at < :cursor_ts OR (r.created_at = :cursor_ts AND r.id < :cursor_id))")
         params["cursor_ts"] = cursor_pair[0]
         params["cursor_id"] = cursor_pair[1]
