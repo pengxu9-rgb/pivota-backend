@@ -87,6 +87,15 @@ def buyer_submit_enabled() -> bool:
     return (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower() == "true"
 
 
+def buyer_submit_merchant_allowed(merchant_id: str) -> bool:
+    raw = (os.getenv("REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST") or "").strip()
+    if not raw:
+        return True
+    mid = (merchant_id or "").strip()
+    allow = {x.strip() for x in raw.split(",") if x.strip()}
+    return mid in allow
+
+
 def _new_media_public_id() -> str:
     # Keep consistent with import pipeline.
     return uuid4().hex
@@ -127,6 +136,8 @@ async def attach_buyer_review_media(
 
     verified = verify_submission_token(token)
     rid = int(review_id)
+    if not buyer_submit_merchant_allowed(verified.merchant_id):
+        raise HTTPException(status_code=403, detail="NOT_ALLOWED")
 
     owner = await database.fetch_one(buyer_review_ownership.select().where(buyer_review_ownership.c.review_id == rid))
     if not owner or str(owner["token_jti_hash"] or "") != verified.jti_hash:
@@ -217,6 +228,8 @@ def issue_submission_token(
     if not buyer_submit_enabled():
         raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
     _require_issuer_key(request)
+    if not buyer_submit_merchant_allowed(merchant_id):
+        raise HTTPException(status_code=403, detail="NOT_ALLOWED")
 
     ttl = max(60, min(int(ttl_seconds or 900), 3600))
     now = _now_ts()
@@ -453,6 +466,8 @@ async def create_buyer_review(
     verified = verify_submission_token(token)
 
     if verified.merchant_id != merchant_id:
+        raise HTTPException(status_code=403, detail="NOT_ALLOWED")
+    if not buyer_submit_merchant_allowed(merchant_id):
         raise HTTPException(status_code=403, detail="NOT_ALLOWED")
 
     p = (platform or "").strip().lower()

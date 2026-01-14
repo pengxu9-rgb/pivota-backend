@@ -3656,12 +3656,31 @@ async def invoke_shop_operation(
         try:
             read_allowed = bool(_reviews_enabled())
             write_allowed = False
+            write_reason = "BUYER_SUBMIT_DISABLED"
             try:
-                from services.buyer_reviews_service import buyer_submit_enabled
+                from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
 
-                write_allowed = bool(buyer_submit_enabled())
+                mid = ""
+                try:
+                    mid = (payload.subject.merchant_id if payload.subject else "") or ""
+                except Exception:
+                    mid = ""
+                buyer_enabled = bool(buyer_submit_enabled())
+                if not buyer_enabled:
+                    write_allowed = False
+                    write_reason = "BUYER_SUBMIT_DISABLED"
+                elif not mid:
+                    write_allowed = False
+                    write_reason = "MISSING_SUBJECT"
+                elif not bool(buyer_submit_merchant_allowed(mid)):
+                    write_allowed = False
+                    write_reason = "BUYER_SUBMIT_NOT_ALLOWED"
+                else:
+                    write_allowed = True
+                    write_reason = "OK"
             except Exception:
                 write_allowed = False
+                write_reason = "BUYER_SUBMIT_DISABLED"
 
             items: List[Dict[str, Any]] = []
 
@@ -3691,7 +3710,7 @@ async def invoke_shop_operation(
                 {
                     "entrypoint_id": "PDP_WRITE_REVIEW",
                     "allowed": write_allowed,
-                    "reason": "OK" if write_allowed else "BUYER_SUBMIT_DISABLED",
+                    "reason": write_reason,
                     "priority": 70,
                     "launch_modes": ["EMBED_CONFIG"],
                     "ui_spec": {"label": "Write a review"},
@@ -3782,17 +3801,27 @@ async def invoke_shop_operation(
             # intent == "write"
             write_allowed = False
             try:
-                from services.buyer_reviews_service import buyer_submit_enabled
+                from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
 
-                write_allowed = bool(buyer_submit_enabled())
+                buyer_enabled = bool(buyer_submit_enabled())
+                merchant_allowed = bool(buyer_submit_merchant_allowed(merchant_id))
+                write_allowed = buyer_enabled and merchant_allowed
             except Exception:
                 write_allowed = False
 
             if not write_allowed:
+                reason = "BUYER_SUBMIT_DISABLED"
+                try:
+                    from services.buyer_reviews_service import buyer_submit_enabled
+
+                    if bool(buyer_submit_enabled()):
+                        reason = "BUYER_SUBMIT_NOT_ALLOWED"
+                except Exception:
+                    reason = "BUYER_SUBMIT_DISABLED"
                 return {
                     "status": "success",
                     "allowed": False,
-                    "reason": "BUYER_SUBMIT_DISABLED",
+                    "reason": reason,
                     "launch_mode": None,
                     "target": None,
                     "tracking": tracking,
