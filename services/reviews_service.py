@@ -281,6 +281,24 @@ async def get_active_group_membership_for_sku_key(sku_key: str) -> Optional[Dict
     return dict(row) if row else None
 
 
+async def get_active_group_membership_for_product_key(product_key: str) -> Optional[Dict[str, Any]]:
+    # Best-effort: if any SKU under this product_key is grouped, treat the product as grouped.
+    row = await database.fetch_one(
+        """
+        SELECT m.*
+        FROM review_group_membership m
+        JOIN review_group g ON g.id = m.group_id
+        WHERE m.product_key = :pk
+          AND m.status = 'active'
+          AND g.status = 'active'
+        ORDER BY m.confidence DESC, m.updated_at DESC, m.id DESC
+        LIMIT 1
+        """,
+        {"pk": product_key},
+    )
+    return dict(row) if row else None
+
+
 async def get_group_counts_by_merchant(group_id: int) -> Dict[str, int]:
     q = """
     SELECT merchant_id, COUNT(*)::int AS cnt
@@ -423,19 +441,37 @@ async def get_review_summary_for_sku(
         variant_id=variant_id,
     )
 
-    membership = await get_active_group_membership_for_sku_key(sku_key)
+    # PDP calls this with variant_id=None. In that case, we want product-level aggregation
+    # across all variants (not only sku_key ending with the '∅' sentinel).
+    is_product_level = (_as_text(variant_id) == "") or (_as_text(variant_id) == VARIANT_ID_SENTINEL)
+    membership = (
+        await get_active_group_membership_for_product_key(product_key)
+        if is_product_level
+        else await get_active_group_membership_for_sku_key(sku_key)
+    )
     gid_raw = _row_get(membership, "group_id") if membership else None
     group_id = int(gid_raw) if gid_raw is not None else None
 
-    merchant_row = await database.fetch_one(
-        """
-        SELECT COUNT(*)::int AS total,
-               COALESCE(SUM(media_count), 0)::int AS media_count
-        FROM product_reviews
-        WHERE sku_key = :sku_key AND status = 'active'
-        """,
-        {"sku_key": sku_key},
-    )
+    if is_product_level:
+        merchant_row = await database.fetch_one(
+            """
+            SELECT COUNT(*)::int AS total,
+                   COALESCE(SUM(media_count), 0)::int AS media_count
+            FROM product_reviews
+            WHERE product_key = :pk AND status = 'active'
+            """,
+            {"pk": product_key},
+        )
+    else:
+        merchant_row = await database.fetch_one(
+            """
+            SELECT COUNT(*)::int AS total,
+                   COALESCE(SUM(media_count), 0)::int AS media_count
+            FROM product_reviews
+            WHERE sku_key = :sku_key AND status = 'active'
+            """,
+            {"sku_key": sku_key},
+        )
     merchant_review_count = int(merchant_row["total"] or 0) if merchant_row else 0
     merchant_media_count = int(merchant_row["media_count"] or 0) if merchant_row else 0
 
