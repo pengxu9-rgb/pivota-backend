@@ -8,7 +8,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import HTTPException, Request
 
@@ -36,6 +36,41 @@ def _sha256_hex(data: bytes) -> str:
 
 def _sha256_16(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _row_get(row: Any, key: str) -> Any:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get(key)
+    if isinstance(row, Mapping):
+        try:
+            return row.get(key)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            return row[key]
+        except Exception:
+            return None
+    try:
+        return getattr(row, key)
+    except Exception:
+        return None
+
+
+def _as_iso_datetime(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        try:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.isoformat()
+        except Exception:
+            return None
+    if isinstance(value, str):
+        return value
+    return None
 
 
 def _signing_secret() -> bytes:
@@ -359,7 +394,7 @@ async def create_buyer_review(
             return {
                 "status": "success",
                 "review_id": int(existing_review_id),
-                "moderation_state": str(row.get("status") or ""),
+                "moderation_state": str(_row_get(row, "status") or ""),
                 "idempotent_replay": True,
             }
 
@@ -430,8 +465,7 @@ async def get_buyer_review_status(*, token: str, review_id: int) -> Dict[str, An
     return {
         "status": "success",
         "review_id": rid,
-        "moderation_state": str(row.get("status") or ""),
-        "created_at": (row.get("created_at").isoformat() if row.get("created_at") else None),
-        "updated_at": (row.get("updated_at").isoformat() if row.get("updated_at") else None),
+        "moderation_state": str(_row_get(row, "status") or ""),
+        "created_at": _as_iso_datetime(_row_get(row, "created_at")),
+        "updated_at": _as_iso_datetime(_row_get(row, "updated_at")),
     }
-
