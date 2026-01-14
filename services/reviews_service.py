@@ -9,6 +9,7 @@ import logging
 import time
 import os
 import re
+import mimetypes
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone, date
