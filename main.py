@@ -1218,7 +1218,7 @@ async def build_info():
 @app.options("/{full_path:path}")
 async def options_passthrough(full_path: str, request: Request):
     origin = request.headers.get("Origin", "*")
-    allow_headers = "Content-Type, Authorization, X-API-Key, X-Request-Id"
+    allow_headers = "Content-Type, Authorization, X-API-Key, X-Request-Id, X-Buyer-Issuer-Key, Idempotency-Key"
     allow_methods = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
     return Response(
         status_code=200,

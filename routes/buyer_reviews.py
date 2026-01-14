@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, File, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
-from services.buyer_reviews_service import create_buyer_review, get_buyer_review_status, issue_submission_token
+from services.buyer_reviews_service import attach_buyer_review_media, create_buyer_review, get_buyer_review_status, issue_submission_token
 
 
 router = APIRouter(prefix="/buyer/reviews/v1", tags=["Buyer Reviews"])
@@ -88,3 +88,21 @@ async def buyer_get_review(
     token = _bearer_token(authorization)
     return await get_buyer_review_status(token=token, review_id=int(review_id))
 
+
+@router.post("/reviews/{review_id}/media")
+async def buyer_attach_review_media(
+    review_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    token = _bearer_token(authorization)
+    blob = await file.read()
+    return await attach_buyer_review_media(
+        request=request,
+        token=token,
+        review_id=int(review_id),
+        filename=(file.filename or ""),
+        content_type=(file.content_type or ""),
+        blob=blob,
+    )

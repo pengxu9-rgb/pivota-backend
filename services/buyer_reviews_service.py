@@ -4,17 +4,19 @@ import base64
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from uuid import uuid4
 
 from fastapi import HTTPException, Request
 
 from db.database import database
-from db.reviews_center import buyer_review_idempotency_keys, buyer_review_ownership, buyer_review_submission_jtis, product_reviews
-from services.reviews_service import VARIANT_ID_SENTINEL, build_product_key, build_sku_key
+from db.reviews_center import buyer_review_idempotency_keys, buyer_review_ownership, buyer_review_submission_jtis, media_assets, product_reviews
+from services.reviews_service import VARIANT_ID_SENTINEL, _reviews_media_s3_put, build_product_key, build_sku_key
 
 
 def _now_ts() -> int:
@@ -83,6 +85,107 @@ def _signing_secret() -> bytes:
 
 def buyer_submit_enabled() -> bool:
     return (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower() == "true"
+
+
+def _new_media_public_id() -> str:
+    # Keep consistent with import pipeline.
+    return uuid4().hex
+
+
+def _guess_media_type(filename: str, content_type: str) -> str:
+    ct = (content_type or "").strip().lower()
+    if ct.startswith("video/"):
+        return "video"
+    ext = (os.path.splitext(filename)[1] or "").lower()
+    if ext in {".mp4", ".mov", ".webm"}:
+        return "video"
+    return "image"
+
+
+def _is_allowed_content_type(content_type: str) -> bool:
+    ct = (content_type or "").strip().lower()
+    if not ct:
+        return False
+    if ct.startswith("image/"):
+        return ct in {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    if ct.startswith("video/"):
+        return ct in {"video/mp4", "video/webm", "video/quicktime"}
+    return False
+
+
+async def attach_buyer_review_media(
+    *,
+    request: Request,
+    token: str,
+    review_id: int,
+    filename: str,
+    content_type: str,
+    blob: bytes,
+) -> Dict[str, Any]:
+    if not buyer_submit_enabled():
+        raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
+
+    verified = verify_submission_token(token)
+    rid = int(review_id)
+
+    owner = await database.fetch_one(buyer_review_ownership.select().where(buyer_review_ownership.c.review_id == rid))
+    if not owner or str(owner["token_jti_hash"] or "") != verified.jti_hash:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    row = await database.fetch_one(product_reviews.select().where(product_reviews.c.id == rid))
+    if not row:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    status = str(_row_get(row, "status") or "")
+    if status not in {"under_review", "active"}:
+        raise HTTPException(status_code=400, detail="REVIEW_STATUS_INVALID")
+
+    name = (filename or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="MISSING_FILENAME")
+
+    ct = (content_type or "").strip() or (mimetypes.guess_type(name)[0] or "").strip() or "application/octet-stream"
+    if not _is_allowed_content_type(ct):
+        raise HTTPException(status_code=400, detail="UNSUPPORTED_MEDIA_TYPE")
+
+    max_bytes = int(os.getenv("REVIEWS_BUYER_MEDIA_MAX_BYTES") or "10485760")  # 10MB
+    if max_bytes > 0 and len(blob) > max_bytes:
+        raise HTTPException(status_code=413, detail="MEDIA_TOO_LARGE")
+
+    public_id = _new_media_public_id()
+    media_type = _guess_media_type(name, ct)
+    url = f"/agent/shop/v1/review-media/{public_id}"
+    file_hash = _sha256_hex(blob)
+
+    s3_uri = _reviews_media_s3_put(public_id, filename=name, blob=blob, content_type=ct)
+    if not s3_uri:
+        raise HTTPException(status_code=503, detail="MEDIA_STORAGE_UNAVAILABLE")
+
+    now_dt = datetime.now(timezone.utc)
+    media_id = await database.execute(
+        media_assets.insert().values(
+            review_id=rid,
+            type=media_type,
+            public_id=public_id,
+            url=url,
+            file_path=s3_uri,
+            file_hash=file_hash,
+            status="active",
+            created_at=now_dt,
+        )
+    )
+
+    await database.execute(
+        product_reviews.update()
+        .where(product_reviews.c.id == rid)
+        .values(media_count=(product_reviews.c.media_count + 1), updated_at=now_dt)
+    )
+
+    return {
+        "status": "success",
+        "review_id": rid,
+        "media": {"id": int(media_id), "public_id": public_id, "type": media_type},
+    }
 
 
 def _issuer_key() -> str:
