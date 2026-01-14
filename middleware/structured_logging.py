@@ -160,13 +160,19 @@ class RequestResponseLoggingMiddleware(BaseHTTPMiddleware):
         request_id = str(uuid.uuid4())
         
         # Log request
+        headers = dict(request.headers)
+        for hk in list(headers.keys()):
+            kl = (hk or "").lower()
+            if kl in {"authorization", "x-api-key", "x-buyer-issuer-key", "cookie", "set-cookie"}:
+                headers[hk] = "[REDACTED]"
+
         request_log = {
             "request_id": request_id,
             "timestamp": datetime.utcnow().isoformat(),
             "type": "request",
             "method": request.method,
             "path": request.url.path,
-            "headers": dict(request.headers),
+            "headers": headers,
         }
         
         # Optionally log body (only for non-file uploads)
@@ -241,7 +247,6 @@ def setup_structured_logging():
     os.makedirs("logs", exist_ok=True)
     
     logging.config.dictConfig(LOGGING_CONFIG)
-
 
 
 

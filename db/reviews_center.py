@@ -272,6 +272,54 @@ import_items = Table(
     Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )
 
+
+# ---------------------------------------------------------------------------
+# Buyer review submission (idempotency + replay prevention)
+# ---------------------------------------------------------------------------
+
+buyer_review_submission_jtis = Table(
+    "buyer_review_submission_jtis",
+    metadata,
+    Column("id", _ID_TYPE, primary_key=True, autoincrement=True),
+    Column("merchant_id", String(64), nullable=False),
+    Column("jti_hash", Text, nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+Index("ux_buyer_review_submission_jtis_jti_hash", buyer_review_submission_jtis.c.jti_hash, unique=True)
+Index("idx_buyer_review_submission_jtis_expires", buyer_review_submission_jtis.c.expires_at)
+
+
+buyer_review_idempotency_keys = Table(
+    "buyer_review_idempotency_keys",
+    metadata,
+    Column("id", _ID_TYPE, primary_key=True, autoincrement=True),
+    Column("merchant_id", String(64), nullable=False),
+    Column("idempotency_key_hash", Text, nullable=False),
+    Column("request_hash", Text, nullable=False),
+    Column("review_id", _ID_TYPE, ForeignKey("product_reviews.id", ondelete="SET NULL"), nullable=True),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+Index(
+    "ux_buyer_review_idempotency_keys_merchant_key",
+    buyer_review_idempotency_keys.c.merchant_id,
+    buyer_review_idempotency_keys.c.idempotency_key_hash,
+    unique=True,
+)
+
+
+buyer_review_ownership = Table(
+    "buyer_review_ownership",
+    metadata,
+    Column("review_id", _ID_TYPE, ForeignKey("product_reviews.id", ondelete="CASCADE"), primary_key=True),
+    Column("token_jti_hash", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+Index("idx_buyer_review_ownership_token", buyer_review_ownership.c.token_jti_hash)
+
 Index("idx_import_items_batch_status", import_items.c.batch_id, import_items.c.status)
 Index(
     "ux_import_items_merchant_source_external_review",

@@ -295,6 +295,30 @@ class ListSellerFeedbackPayload(BaseModel):
     cursor: Optional[str] = None
 
 
+class ReviewSubjectRef(BaseModel):
+    merchant_id: str
+    platform: str
+    platform_product_id: str
+    variant_id: Optional[str] = None
+
+
+class ListReviewEntrypointsPayload(BaseModel):
+    agent_id: Optional[str] = None
+    surface: Optional[str] = None
+    locale: Optional[str] = None
+    capabilities: Optional[Dict[str, Any]] = None
+    subject: Optional[ReviewSubjectRef] = None
+
+
+class ResolveReviewIntentPayload(BaseModel):
+    agent_id: Optional[str] = None
+    surface: Optional[str] = None
+    locale: Optional[str] = None
+    entrypoint_id: str
+    intent: str = Field(..., description="read | write")
+    subject: ReviewSubjectRef
+
+
 class OrderItem(BaseModel):
     merchant_id: str
     product_id: str
@@ -3386,6 +3410,8 @@ async def invoke_shop_operation(
     - list_group_reviews
     - list_group_merchants
     - list_seller_feedback
+    - list_review_entrypoints
+    - resolve_review_intent
     - create_order       (demo-only)
     - submit_payment     (demo-only)
     - find_similar_products
@@ -3599,6 +3625,205 @@ async def invoke_shop_operation(
                 limit=int(payload.limit or 20),
                 cursor=payload.cursor,
             )
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_review_entrypoints":
+        payload = ListReviewEntrypointsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.subject.merchant_id if payload.subject else None
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            read_allowed = bool(_reviews_enabled())
+            write_allowed = False
+            try:
+                from services.buyer_reviews_service import buyer_submit_enabled
+
+                write_allowed = bool(buyer_submit_enabled())
+            except Exception:
+                write_allowed = False
+
+            items: List[Dict[str, Any]] = []
+
+            # Read entrypoints (existing read path via invoke + review-media).
+            for eid, prio in (
+                ("PDP_SUMMARY", 100),
+                ("PDP_TAB", 90),
+                ("AGENT_CHAT_CARD", 80),
+                ("SEARCH_SNIPPET", 30),
+            ):
+                items.append(
+                    {
+                        "entrypoint_id": eid,
+                        "allowed": read_allowed,
+                        "reason": "OK" if read_allowed else "REVIEWS_DISABLED",
+                        "priority": prio,
+                        "launch_modes": ["EMBED_CONFIG"],
+                        "ui_spec": {"label": "Reviews"},
+                        "policy_tags": ["reviews.read"],
+                        "analytics_schema_version": 1,
+                        "tracking_required_fields": ["entrypoint_id", "surface", "agent_id", "intent"],
+                    }
+                )
+
+            # Write entrypoints (buyer submission flow, default gated by env flag).
+            items.append(
+                {
+                    "entrypoint_id": "PDP_WRITE_REVIEW",
+                    "allowed": write_allowed,
+                    "reason": "OK" if write_allowed else "BUYER_SUBMIT_DISABLED",
+                    "priority": 70,
+                    "launch_modes": ["EMBED_CONFIG"],
+                    "ui_spec": {"label": "Write a review"},
+                    "policy_tags": ["reviews.write"],
+                    "analytics_schema_version": 1,
+                    "tracking_required_fields": ["entrypoint_id", "surface", "agent_id", "intent"],
+                }
+            )
+
+            return {"status": "success", "items": items}
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "resolve_review_intent":
+        payload = ResolveReviewIntentPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.subject.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            intent = (payload.intent or "").strip().lower()
+            if intent not in {"read", "write"}:
+                raise HTTPException(status_code=400, detail="INVALID_INTENT")
+
+            subject = payload.subject
+            merchant_id = (subject.merchant_id or "").strip()
+            platform = (subject.platform or "").strip().lower()
+            platform_product_id = (subject.platform_product_id or "").strip()
+            variant_id = (subject.variant_id or "").strip()
+
+            tracking = {
+                "entrypoint_id": payload.entrypoint_id,
+                "intent": intent,
+                "surface": payload.surface,
+                "agent_id": payload.agent_id,
+            }
+
+            if intent == "read":
+                allowed = bool(_reviews_enabled())
+                if not allowed:
+                    return {
+                        "status": "success",
+                        "allowed": False,
+                        "reason": "REVIEWS_DISABLED",
+                        "launch_mode": None,
+                        "target": None,
+                        "tracking": tracking,
+                    }
+                embed_config = {
+                    "type": "reviews_read",
+                    "invoke": {
+                        "operation": "list_sku_reviews",
+                        "payload": {
+                            "sku": {
+                                "merchant_id": merchant_id,
+                                "platform": platform,
+                                "platform_product_id": platform_product_id,
+                                "variant_id": variant_id or None,
+                            },
+                            "filters": {"limit": 20},
+                        },
+                    },
+                }
+                return {
+                    "status": "success",
+                    "allowed": True,
+                    "reason": "OK",
+                    "launch_mode": "EMBED_CONFIG",
+                    "target": {"embed_config": embed_config},
+                    "tracking": tracking,
+                }
+
+            # intent == "write"
+            write_allowed = False
+            try:
+                from services.buyer_reviews_service import buyer_submit_enabled
+
+                write_allowed = bool(buyer_submit_enabled())
+            except Exception:
+                write_allowed = False
+
+            if not write_allowed:
+                return {
+                    "status": "success",
+                    "allowed": False,
+                    "reason": "BUYER_SUBMIT_DISABLED",
+                    "launch_mode": None,
+                    "target": None,
+                    "tracking": tracking,
+                }
+
+            embed_config = {
+                "type": "buyer_review_submission",
+                "requirements": {
+                    "auth": "Bearer submission_token",
+                    "idempotency_header": "Idempotency-Key",
+                    "submission_token_issue": "server_side_only",
+                },
+                "endpoints": {
+                    "create_review_path": "/buyer/reviews/v1/reviews",
+                    "get_review_path_template": "/buyer/reviews/v1/reviews/{review_id}",
+                },
+                "subject": {
+                    "merchant_id": merchant_id,
+                    "platform": platform,
+                    "platform_product_id": platform_product_id,
+                    "variant_id": variant_id or None,
+                },
+            }
+            return {
+                "status": "success",
+                "allowed": True,
+                "reason": "OK",
+                "launch_mode": "EMBED_CONFIG",
+                "target": {"embed_config": embed_config},
+                "tracking": tracking,
+            }
         except HTTPException as e:
             status_code = int(e.status_code)
             error_detail = str(e.detail)
