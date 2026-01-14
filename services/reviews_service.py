@@ -1939,6 +1939,58 @@ def _new_media_public_id() -> str:
     return uuid4().hex
 
 
+def _reviews_media_s3_bucket() -> str:
+    return (os.getenv("REVIEWS_MEDIA_S3_BUCKET") or "").strip()
+
+
+def _reviews_media_s3_prefix() -> str:
+    return (os.getenv("REVIEWS_MEDIA_S3_PREFIX") or "reviews-media").strip().strip("/")
+
+
+def _reviews_media_s3_endpoint_url() -> Optional[str]:
+    # Supports AWS S3 and S3-compatible providers (e.g. Cloudflare R2 / MinIO).
+    v = (os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip()
+    return v or None
+
+
+def _reviews_media_s3_region() -> Optional[str]:
+    v = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "").strip()
+    return v or None
+
+
+def _reviews_media_s3_put(public_id: str, *, filename: str, blob: bytes, content_type: str) -> Optional[str]:
+    """
+    Upload review media to S3 and return a `s3://bucket/key` URI.
+    Best-effort by default: if config is missing or upload fails, returns None.
+    """
+    bucket = _reviews_media_s3_bucket()
+    if not bucket:
+        return None
+
+    ext = (os.path.splitext(filename)[1] or "").lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    key = f"{_reviews_media_s3_prefix()}/{public_id}{ext}"
+
+    try:
+        import boto3
+    except Exception:
+        logger.warning("reviews.media.s3.boto3_missing")
+        return None
+
+    try:
+        client = boto3.client(
+            "s3",
+            region_name=_reviews_media_s3_region(),
+            endpoint_url=_reviews_media_s3_endpoint_url(),
+        )
+        client.put_object(Bucket=bucket, Key=key, Body=blob, ContentType=content_type)
+        return f"s3://{bucket}/{key}"
+    except Exception as e:
+        logger.warning("reviews.media.s3.put_failed %s", type(e).__name__)
+        return None
+
+
 async def commit_import_batch(
     *,
     actor: Dict[str, Any],
@@ -2136,7 +2188,8 @@ async def commit_import_batch(
             blob = media_blob.get(os.path.basename(fname))
             if not blob:
                 continue
-            out_path = os.path.join(batch_dir, os.path.basename(fname))
+            basename = os.path.basename(fname)
+            out_path = os.path.join(batch_dir, basename)
             try:
                 with open(out_path, "wb") as f:
                     f.write(blob)
@@ -2144,16 +2197,19 @@ async def commit_import_batch(
             except Exception:
                 continue
 
-            mtype = "video" if os.path.splitext(fname)[1].lower() in {".mp4", ".mov", ".webm"} else "image"
+            ext = os.path.splitext(basename)[1].lower()
+            mtype = "video" if ext in {".mp4", ".mov", ".webm"} else "image"
             public_id = _new_media_public_id()
             url = f"/agent/shop/v1/review-media/{public_id}"
+            content_type = mimetypes.guess_type(basename)[0] or "application/octet-stream"
+            s3_uri = _reviews_media_s3_put(public_id, filename=basename, blob=blob, content_type=content_type)
             media_id = await database.execute(
                 media_assets.insert().values(
                     review_id=int(new_review_id),
                     type=mtype,
                     public_id=public_id,
                     url=url,
-                    file_path=out_path,
+                    file_path=s3_uri or out_path,
                     file_hash=file_hash,
                     status="active",
                     created_at=_now(),

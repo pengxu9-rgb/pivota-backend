@@ -3769,7 +3769,62 @@ async def get_review_media(public_id: str, request: Request) -> Response:
             status_code = 404
             raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
 
-        file_path = os.path.realpath(str(media_row["file_path"] or ""))
+        etag = str(media_row["file_hash"] or "").strip() or None
+        if etag and (request.headers.get("if-none-match") or "").strip() == f"\"{etag}\"":
+            resp = Response(status_code=304)
+            _set_media_cache_headers(resp, etag)
+            return resp
+
+        file_path_raw = str(media_row["file_path"] or "").strip()
+
+        # S3-backed media: file_path is stored as `s3://bucket/key`.
+        if file_path_raw.startswith("s3://"):
+            try:
+                import asyncio
+                from starlette.concurrency import iterate_in_threadpool
+                from starlette.responses import StreamingResponse
+
+                import boto3
+            except Exception:
+                status_code = 500
+                raise HTTPException(status_code=500, detail="MEDIA_STORAGE_UNAVAILABLE")
+
+            # Parse `s3://bucket/key`
+            try:
+                rest = file_path_raw[len("s3://") :]
+                bucket, key = rest.split("/", 1)
+            except Exception:
+                status_code = 404
+                raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
+
+            endpoint_url = (os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip() or None
+            region = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "").strip() or None
+            client = boto3.client("s3", region_name=region, endpoint_url=endpoint_url)
+
+            try:
+                obj = await asyncio.to_thread(client.get_object, Bucket=bucket, Key=key)
+                body = obj["Body"]
+                content_type = (obj.get("ContentType") or "").strip() or "application/octet-stream"
+                content_length = obj.get("ContentLength")
+            except Exception:
+                status_code = 404
+                raise HTTPException(status_code=404, detail="MEDIA_FILE_MISSING")
+
+            # Streaming body is blocking; run iteration in a threadpool.
+            resp = StreamingResponse(
+                iterate_in_threadpool(body.iter_chunks(chunk_size=1024 * 1024)),
+                media_type=content_type,
+            )
+            if content_length is not None:
+                try:
+                    resp.headers["Content-Length"] = str(int(content_length))
+                except Exception:
+                    pass
+            _set_media_cache_headers(resp, etag)
+            return resp
+
+        # Default: local disk media under REVIEWS_IMPORT_DIR.
+        file_path = os.path.realpath(file_path_raw)
         if not file_path or not os.path.exists(file_path):
             status_code = 404
             raise HTTPException(status_code=404, detail="MEDIA_FILE_MISSING")
@@ -3779,12 +3834,6 @@ async def get_review_media(public_id: str, request: Request) -> Response:
         if not file_path.startswith(base + os.sep) and file_path != base:
             status_code = 404
             raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
-
-        etag = str(media_row["file_hash"] or "").strip() or None
-        if etag and (request.headers.get("if-none-match") or "").strip() == f"\"{etag}\"":
-            resp = Response(status_code=304)
-            _set_media_cache_headers(resp, etag)
-            return resp
 
         media_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
         bytes_served = int(os.path.getsize(file_path)) if os.path.exists(file_path) else 0

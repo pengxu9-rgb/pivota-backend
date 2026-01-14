@@ -23,3 +23,4 @@ cryptography  # for JWT and security
 requests  # for HTTP requests (backup to httpx)
 bcrypt
 prometheus-client
+boto3
