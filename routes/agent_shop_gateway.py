@@ -3835,8 +3835,10 @@ async def invoke_shop_operation(
                     "submission_token_issue": "server_side_only",
                 },
                 "endpoints": {
+                    "proof_exchange_path": "/buyer/reviews/v1/verification/exchange",
                     "create_review_path": "/buyer/reviews/v1/reviews",
                     "get_review_path_template": "/buyer/reviews/v1/reviews/{review_id}",
+                    "attach_media_path_template": "/buyer/reviews/v1/reviews/{review_id}/media",
                 },
                 "subject": {
                     "merchant_id": merchant_id,

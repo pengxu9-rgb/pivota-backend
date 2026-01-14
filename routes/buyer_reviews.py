@@ -5,7 +5,13 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, File, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
-from services.buyer_reviews_service import attach_buyer_review_media, create_buyer_review, get_buyer_review_status, issue_submission_token
+from services.buyer_reviews_service import (
+    attach_buyer_review_media,
+    create_buyer_review,
+    exchange_proof_for_submission_token,
+    get_buyer_review_status,
+    issue_submission_token,
+)
 
 
 router = APIRouter(prefix="/buyer/reviews/v1", tags=["Buyer Reviews"])
@@ -44,6 +50,24 @@ async def buyer_issue_token(
         merchant_id=body.merchant_id,
         subjects=[s.model_dump() for s in body.subjects],
         verification=body.verification,
+        ttl_seconds=int(body.ttl_seconds),
+    )
+
+
+class ExchangeProofRequest(BaseModel):
+    ttl_seconds: int = Field(900, ge=60, le=3600)
+
+
+@router.post("/verification/exchange")
+async def buyer_exchange_proof(
+    request: Request,
+    body: ExchangeProofRequest,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    proof_token = _bearer_token(authorization)
+    return await exchange_proof_for_submission_token(
+        request=request,
+        proof_token=proof_token,
         ttl_seconds=int(body.ttl_seconds),
     )
 
