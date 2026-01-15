@@ -134,27 +134,9 @@ fi
 
 echo "== [F] metrics delta (optional) =="
 if [[ -n "${METRICS_BEARER_TOKEN:-}" ]]; then
-  METRICS_AFTER="$(_snapshot_metrics || true)"
-  printf '%s\n' "$METRICS_AFTER"
-  echo
-  python3 - <<'PY' "$METRICS_BEFORE" "$METRICS_AFTER"
-import re,sys
-before=sys.argv[1].splitlines()
-after=sys.argv[2].splitlines()
-def parse(lines):
-  out={}
-  for ln in lines:
-    m=re.match(r"^([a-zA-Z0-9_]+)=([0-9]+(?:\.[0-9]+)?)$", ln.strip())
-    if not m:
-      continue
-    out[m.group(1)]=float(m.group(2))
-  return out
-b=parse(before); a=parse(after)
-keys=["reviews_buyer_exchange_total","reviews_buyer_create_total","reviews_buyer_media_upload_total"]
-for k in keys:
-  dv=a.get(k,0.0)-b.get(k,0.0)
-  print(f"delta_{k}={dv}")
-PY
+  chmod +x "$(dirname "${BASH_SOURCE[0]}")/check_reviews_buyer_metrics.py" 2>/dev/null || true
+  REVIEWS_BASE_URL="$REVIEWS_BASE_URL" METRICS_BEARER_TOKEN="$METRICS_BEARER_TOKEN" \
+    python3 "$(dirname "${BASH_SOURCE[0]}")/check_reviews_buyer_metrics.py" || true
 else
   echo "metrics_skip=1 (missing METRICS_BEARER_TOKEN)"
 fi
