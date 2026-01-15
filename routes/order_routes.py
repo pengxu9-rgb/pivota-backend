@@ -43,6 +43,10 @@ from services.quote_service import (
     normalize_shipping_for_fingerprint,
     parse_decimal_money,
 )
+from services.shopify_transactions_service import (
+    extract_shopify_access_token,
+    ensure_external_payment_transaction_best_effort,
+)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -280,7 +284,7 @@ async def check_inventory_availability(
             return True, {"message": f"Platform {merchant.get('mcp_platform')} inventory check not implemented"}
         
         shop_domain = store_info.get("domain")
-        access_token = store_info.get("api_key")
+        access_token = extract_shopify_access_token(store_info.get("api_key"))
         
         if not shop_domain or not access_token:
             return True, {"message": "Shop credentials missing, skipping inventory check"}
@@ -1605,6 +1609,28 @@ async def create_shopify_order(order_id: str) -> bool:
                     merchant_id=order["merchant_id"],
                     metadata={"shopify_order_id": shopify_order_id}
                 )
+
+                # Best-effort reconciliation: record external PSP payment as a Shopify transaction.
+                try:
+                    psp_used = order.get("psp_used") or merchant.get("psp_type") or None
+                    payment_ref = order.get("payment_intent_id") or None
+                    await ensure_external_payment_transaction_best_effort(
+                        shop_domain=shop_domain,
+                        access_token=access_token,
+                        shopify_order_id=shopify_order_id,
+                        psp_used=psp_used,
+                        external_payment_ref=payment_ref,
+                        amount=float(order.get("total") or 0),
+                        currency=str(order.get("currency") or "USD"),
+                        pivota_order_id=order_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Shopify] Payment transaction sync failed order_id=%s shopify_order_id=%s err=%s",
+                        order_id,
+                        shopify_order_id,
+                        str(e),
+                    )
                 
                 logger.info(f"[Shopify] ✅ Successfully created Shopify order {shopify_order_id} for Pivota order {order_id}")
                 return True

@@ -17,6 +17,10 @@ from utils.auth import require_admin
 from adapters.psp_adapter import get_psp_adapter
 from config.settings import settings
 from utils.logger import logger
+from services.shopify_transactions_service import (
+    extract_shopify_access_token,
+    ensure_external_refund_transaction_best_effort,
+)
 
 
 router = APIRouter(prefix="/orders", tags=["refunds"])
@@ -52,6 +56,12 @@ async def process_refund(
     order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    store_info: Optional[Dict[str, Any]] = None
+    try:
+        store_info = await get_primary_store(order.get("merchant_id"))
+    except Exception:
+        store_info = None
     
     # Check if order is in a refundable financial state
     # Note: partial refunds transition payment_status to "partially_refunded".
@@ -337,40 +347,56 @@ async def process_refund(
         async def update_shopify_order_task():
             """Update or cancel Shopify order after refund"""
             try:
-                if True and order.get("shopify_order_id"):
-                    shop_domain = store_info.get("domain")
-                    access_token = store_info.get("api_key")
-                    
-                    if shop_domain and access_token:
-                        import httpx
-                        
-                        # Cancel the Shopify order
-                        url = f"https://{shop_domain}/admin/api/2024-01/orders/{order['shopify_order_id']}/cancel.json"
-                        headers_shopify = {
-                            "X-Shopify-Access-Token": access_token,
-                            "Content-Type": "application/json"
-                        }
-                        
-                        cancel_data = {
-                            "amount": str(refund_amount),
-                            "currency": order["currency"],
-                            "reason": refund_request.reason or "customer_request",
-                            "email": True,  # Send cancellation email
-                            "refund": True
-                        }
-                        
-                        async with httpx.AsyncClient() as client:
-                            response = await client.post(
-                                url,
-                                json=cancel_data,
-                                headers=headers_shopify,
-                                timeout=10.0
+                if not (order.get("shopify_order_id") and store_info and store_info.get("platform") == "shopify"):
+                    return
+
+                shop_domain = store_info.get("domain")
+                access_token = extract_shopify_access_token(store_info.get("api_key"))
+                if not (shop_domain and access_token):
+                    return
+
+                await ensure_external_refund_transaction_best_effort(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    shopify_order_id=str(order["shopify_order_id"]),
+                    psp_used=order.get("psp_used") or psp_type,
+                    external_refund_ref=refund_id,
+                    amount=float(refund_amount),
+                    currency=str(order.get("currency") or "USD"),
+                    pivota_order_id=order_id,
+                )
+
+                # Full refund: optionally cancel the Shopify order for merchant ops visibility,
+                # but do NOT ask Shopify to process refunds (external PSP already handled it).
+                if not is_partial:
+                    import httpx
+
+                    url = f"https://{shop_domain}/admin/api/2024-01/orders/{order['shopify_order_id']}/cancel.json"
+                    headers_shopify = {
+                        "X-Shopify-Access-Token": access_token,
+                        "Content-Type": "application/json",
+                    }
+                    cancel_data = {
+                        "amount": str(refund_amount),
+                        "currency": str(order.get("currency") or "USD"),
+                        "reason": refund_request.reason or "customer_request",
+                        "email": True,
+                        "refund": False,
+                    }
+
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(
+                            url,
+                            json=cancel_data,
+                            headers=headers_shopify,
+                            timeout=10.0,
+                        )
+                        if response.status_code == 200:
+                            logger.info(f"Shopify order {order['shopify_order_id']} cancelled")
+                        else:
+                            logger.warning(
+                                f"Failed to cancel Shopify order: {response.status_code}"
                             )
-                            
-                            if response.status_code == 200:
-                                logger.info(f"Shopify order {order['shopify_order_id']} cancelled")
-                            else:
-                                logger.warning(f"Failed to cancel Shopify order: {response.status_code}")
                                 
             except Exception as e:
                 logger.error(f"Error updating Shopify order after refund: {e}")
