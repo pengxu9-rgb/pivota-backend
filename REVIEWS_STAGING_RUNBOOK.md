@@ -26,10 +26,12 @@ Security note:
 
 ### Reviews backend
 - `REVIEWS_BUYER_PROOF_SIGNING_SECRET`: validates proof tokens from the issuer
+- `REVIEWS_BUYER_SUBMIT_SIGNING_SECRET`: signs buyer `submission_token` (set in staging/prod; do not rely on defaults)
 - (optional, to accept `invitation_token` at `/buyer/reviews/v1/verification/exchange`): `REVIEWS_PROOF_ISSUER_BASE_URL`, `REVIEWS_PROOF_ISSUER_INTERNAL_KEY` (or reuse `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`)
 - `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST`: comma-separated merchant ids for canary (empty = allow all)
 - `REVIEWS_MEDIA_SIGNING_SECRET`: signs `/review-media` URLs
 - `JWT_SECRET_KEY`: employee JWT signing secret (used by smoke scripts)
+- (recommended): `REVIEWS_RISK_HASH_SECRET` (HMAC salt for risk signals like `ip_hash`; avoids reversible hashing)
 
 ### Proof issuer
 - `REVIEWS_BUYER_PROOF_SIGNING_SECRET`: must match the reviews backend secret

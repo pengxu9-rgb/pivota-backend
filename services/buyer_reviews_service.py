@@ -83,6 +83,23 @@ def _signing_secret() -> bytes:
         raw = "dev-insecure-buyer-submit-secret"
     return raw.encode("utf-8")
 
+def _risk_hash_secret() -> Optional[bytes]:
+    """
+    Secret used for non-reversible hashing of sensitive signals (e.g. IP).
+
+    If not set, we fall back to hashing without a secret to remain backward compatible,
+    but production should set it (or at least set REVIEWS_BUYER_SUBMIT_SIGNING_SECRET).
+    """
+    raw = (os.getenv("REVIEWS_RISK_HASH_SECRET") or "").strip()
+    if raw:
+        return raw.encode("utf-8")
+
+    raw = (os.getenv("REVIEWS_BUYER_SUBMIT_SIGNING_SECRET") or "").strip()
+    if raw:
+        return raw.encode("utf-8")
+
+    return None
+
 
 def _proof_signing_secret() -> bytes:
     raw = (os.getenv("REVIEWS_BUYER_PROOF_SIGNING_SECRET") or "").strip()
@@ -541,6 +558,9 @@ def _client_ip_hash(request: Request) -> Optional[str]:
     ip = (xff.split(",")[0].strip() if xff else "") or (request.client.host if request.client else "")
     if not ip:
         return None
+    secret = _risk_hash_secret()
+    if secret:
+        return hmac.new(secret, ip.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
     return _sha256_16(ip)
 
 
