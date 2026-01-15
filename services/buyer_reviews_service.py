@@ -93,6 +93,11 @@ def _proof_signing_secret() -> bytes:
 def buyer_submit_enabled() -> bool:
     return (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower() == "true"
 
+def buyer_submit_internal_issuer_enabled() -> bool:
+    # Internal-only token issuer for staging/dev smoke tests.
+    # Real buyer flows should use proof exchange instead.
+    return (os.getenv("REVIEWS_BUYER_SUBMIT_INTERNAL_ISSUER_ENABLED") or "").strip().lower() == "true"
+
 
 def buyer_submit_merchant_allowed(merchant_id: str) -> bool:
     raw = (os.getenv("REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST") or "").strip()
@@ -389,6 +394,9 @@ def issue_submission_token(
 ) -> Dict[str, Any]:
     if not buyer_submit_enabled():
         raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
+    if not buyer_submit_internal_issuer_enabled():
+        # Hide internal issuer by default (prod/canary should use proof exchange).
+        raise HTTPException(status_code=404, detail="BUYER_SUBMIT_ISSUER_DISABLED")
     _require_issuer_key(request)
     if not buyer_submit_merchant_allowed(merchant_id):
         raise HTTPException(status_code=403, detail="NOT_ALLOWED")
