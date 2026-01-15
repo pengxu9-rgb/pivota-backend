@@ -83,6 +83,17 @@ Deploy proof issuer as its own Railway service using the `pivota-backend` repo/b
 - **Start command**: `uvicorn proof_issuer_main:app --host 0.0.0.0 --port $PORT`
 - **Healthcheck path**: `/health`
 
+## Cleanup job (Railway cron/job)
+
+Create a periodic cleanup job for replay/idempotency tables:
+
+- **Schedule**: `0 */6 * * *` (every 6 hours) during canary; later change to daily.
+- **Command**: `python3 scripts/cleanup_buyer_submission_tables.py --apply`
+- **DB**: ensure `DATABASE_URL` is available in the job (link the same Postgres / copy the variable).
+
+Validate once:
+- Trigger the job manually ("Run now") and confirm logs show `ok=1` and `deleted_*` counts.
+
 ## Rollout guidance (canary → prod)
 
 1. Keep buyer write entrypoint gated by `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST`.

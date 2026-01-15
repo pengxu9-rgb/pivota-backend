@@ -111,6 +111,12 @@ Suggested schedule:
 Suggested job command (inside a Railway cron/job container):
 - `python3 scripts/cleanup_buyer_submission_tables.py --apply`
 
+Railway setup (UI):
+- In the same Railway project/environment as the reviews backend, create a new **Cron**/**Job** service.
+- Attach/link the same Postgres so `DATABASE_URL` is injected (or set `DATABASE_URL` manually).
+- Set the start command to the job command above.
+- Run once manually ("Run now") and confirm logs show `ok=1` and `deleted_*` counts.
+
 ## Stage 4 — Rollout to prod (P0)
 
 1. Deploy both services to prod with `REVIEWS_BUYER_SUBMIT_ENABLED=false` (dark launch).
