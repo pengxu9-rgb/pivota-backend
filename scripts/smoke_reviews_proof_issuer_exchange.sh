@@ -16,6 +16,10 @@ set -euo pipefail
 # - PLATFORM (default: shopify)
 # - VARIANT_ID
 # - PROOF_ISSUER_INTERNAL_KEY (otherwise prompts)
+#
+# Replay behavior:
+# - By default, tolerates transient 5xx/timeout on the 2nd exchange and retries.
+# - Set STRICT_REPLAY=true to fail if 409 is not observed.
 
 PROOF_ISSUER_BASE_URL="${PROOF_ISSUER_BASE_URL:-}"
 REVIEWS_BASE_URL="${REVIEWS_BASE_URL:-}"
@@ -23,6 +27,9 @@ MERCHANT_ID="${MERCHANT_ID:-}"
 PLATFORM="${PLATFORM:-shopify}"
 PLATFORM_PRODUCT_ID="${PLATFORM_PRODUCT_ID:-}"
 VARIANT_ID="${VARIANT_ID:-}"
+REPLAY_ATTEMPTS="${REPLAY_ATTEMPTS:-3}"
+REPLAY_DELAY_SECONDS="${REPLAY_DELAY_SECONDS:-0.5}"
+STRICT_REPLAY="${STRICT_REPLAY:-}"
 
 if [[ -z "$PROOF_ISSUER_BASE_URL" ]]; then
   echo "ERROR: missing PROOF_ISSUER_BASE_URL (e.g. https://<proof-issuer-host>)" >&2
@@ -97,23 +104,64 @@ fp=hashlib.sha256(tok.encode()).hexdigest()[:12] if tok else ""
 print(f"exchange_ok expires_at={exp} submission_token_fp={fp}")
 PY
 else
+  echo "ERROR: exchange #1 failed" >&2
   head -c 200 "$BODY1" || true
   echo
+  rm -f "$HDR1" "$BODY1" || true
+  exit 1
 fi
 
 echo "== exchange #2 (expect 409) =="
-HDR2="$(mktemp "${TMPDIR:-/tmp}/proof_exchange_hdr2.XXXXXX")"
-BODY2="$(mktemp "${TMPDIR:-/tmp}/proof_exchange_body2.XXXXXX")"
-curl -sS -D "$HDR2" -o "$BODY2" -H "Content-Type: application/json" -H "Authorization: Bearer $PROOF_TOKEN" \
-  -d '{"ttl_seconds":900}' "$EXCHANGE_URL" || true
-CODE2="$(awk 'NR==1{print $2}' "$HDR2" | tr -d '\r')"
-echo "http_status=$CODE2"
-if [[ "$CODE2" == "409" ]]; then
-  echo "replay_ok"
-else
-  head -c 200 "$BODY2" || true
-  echo
+last_code=""
+last_body=""
+attempt=1
+while [[ $attempt -le $REPLAY_ATTEMPTS ]]; do
+  HDR2="$(mktemp "${TMPDIR:-/tmp}/proof_exchange_hdr2.XXXXXX")"
+  BODY2="$(mktemp "${TMPDIR:-/tmp}/proof_exchange_body2.XXXXXX")"
+  curl -sS -D "$HDR2" -o "$BODY2" -H "Content-Type: application/json" -H "Authorization: Bearer $PROOF_TOKEN" \
+    -d '{"ttl_seconds":900}' "$EXCHANGE_URL" || true
+  CODE2="$(awk 'NR==1{print $2}' "$HDR2" | tr -d '\r')"
+  echo "attempt=$attempt http_status=$CODE2"
+
+  if [[ "$CODE2" == "409" ]]; then
+    echo "replay_ok"
+    rm -f "$HDR2" "$BODY2" || true
+    last_code="409"
+    break
+  fi
+
+  last_code="$CODE2"
+  last_body="$(head -c 200 "$BODY2" 2>/dev/null || true)"
+  rm -f "$HDR2" "$BODY2" || true
+
+  if [[ "$CODE2" =~ ^5[0-9][0-9]$ || -z "$CODE2" || "$CODE2" == "000" ]]; then
+    if [[ $attempt -lt $REPLAY_ATTEMPTS ]]; then
+      sleep "$REPLAY_DELAY_SECONDS" || true
+    fi
+    attempt=$((attempt+1))
+    continue
+  fi
+
+  break
+done
+
+if [[ "$last_code" != "409" ]]; then
+  if [[ "$last_code" =~ ^5[0-9][0-9]$ || -z "$last_code" || "$last_code" == "000" ]]; then
+    echo "replay_infra_flake=1 (no 409 observed; last_http_status=${last_code:-unknown})"
+    strict="$(printf '%s' "${STRICT_REPLAY:-}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$strict" == "true" ]]; then
+      echo "ERROR: STRICT_REPLAY=true and replay check did not return 409" >&2
+      printf '%s\n' "$last_body" >&2
+      rm -f "$HDR1" "$BODY1" || true
+      exit 1
+    fi
+  else
+    echo "ERROR: replay check unexpected status=$last_code" >&2
+    printf '%s\n' "$last_body" >&2
+    rm -f "$HDR1" "$BODY1" || true
+    exit 1
+  fi
 fi
 
-rm -f "$HDR1" "$BODY1" "$HDR2" "$BODY2" || true
+rm -f "$HDR1" "$BODY1" || true
 echo "OK"
