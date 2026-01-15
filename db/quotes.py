@@ -7,6 +7,7 @@ from sqlalchemy import Column, DateTime, String, Table, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.database import database, metadata
+from utils.logger import logger
 
 
 quotes = Table(
@@ -38,7 +39,8 @@ async def ensure_quotes_table() -> None:
     during startup, but this avoids hard failures if that import ordering changes.
     """
     try:
-        await database.execute(
+        # NOTE: Keep each statement separate; some drivers reject multi-statement executes.
+        statements = [
             """
             CREATE TABLE IF NOT EXISTS quotes (
               quote_id VARCHAR(64) PRIMARY KEY,
@@ -60,26 +62,19 @@ async def ensure_quotes_table() -> None:
               notes TEXT
             );
             """,
-        )
-        await database.execute("ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_hash_sha256 CHAR(64);")
-        await database.execute("ALTER TABLE quotes ADD COLUMN IF NOT EXISTS consumed_order_id VARCHAR(64);")
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_quotes_merchant_id ON quotes(merchant_id);"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_quotes_status ON quotes(status);"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_quotes_expires_at ON quotes(expires_at);"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_quotes_request_fingerprint ON quotes(request_fingerprint);"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_quotes_consumed_order_id ON quotes(consumed_order_id);"
-        )
-    except Exception:
+            "ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_hash_sha256 CHAR(64);",
+            "ALTER TABLE quotes ADD COLUMN IF NOT EXISTS consumed_order_id VARCHAR(64);",
+            "CREATE INDEX IF NOT EXISTS idx_quotes_merchant_id ON quotes(merchant_id);",
+            "CREATE INDEX IF NOT EXISTS idx_quotes_status ON quotes(status);",
+            "CREATE INDEX IF NOT EXISTS idx_quotes_expires_at ON quotes(expires_at);",
+            "CREATE INDEX IF NOT EXISTS idx_quotes_request_fingerprint ON quotes(request_fingerprint);",
+            "CREATE INDEX IF NOT EXISTS idx_quotes_consumed_order_id ON quotes(consumed_order_id);",
+        ]
+        for stmt in statements:
+            await database.execute(stmt)
+    except Exception as e:
         # Best-effort; if this fails, inserts will surface the error with context.
+        logger.warning("ensure_quotes_table failed (best-effort)", extra={"error": str(e)})
         return
 
 
