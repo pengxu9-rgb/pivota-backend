@@ -79,6 +79,20 @@ VARIANT_ID="<variant_id_or_empty>" \
 /bin/bash scripts/run_reviews_staging_checklist.sh
 ```
 
+## (Optional) Issue invitation from a paid order (internal)
+
+If your order service is in the same monolith and orders are in the `orders` table, you can mint an invitation token from a paid order:
+
+```bash
+cd pivota-backend
+REVIEWS_BASE_URL="https://<reviews-host>" \
+MERCHANT_ID="<merchant_id>" \
+ORDER_ID="<order_id>" \
+PLATFORM_PRODUCT_ID="<platform_product_id>" \
+VARIANT_ID="<variant_id_or_empty>" \
+./scripts/smoke_issue_review_invitation_from_order.sh
+```
+
 ## Proof issuer deployment (Railway)
 
 Deploy proof issuer as its own Railway service using the `pivota-backend` repo/branch:
