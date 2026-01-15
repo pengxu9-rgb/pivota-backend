@@ -78,6 +78,7 @@ class StorefrontCartResult:
     tax: Decimal
     delivery_options: Optional[List[Dict[str, Any]]]
     selected_delivery_option: Optional[Dict[str, Any]]
+    unit_price_by_variant_id: Dict[str, Decimal]
 
 
 class ShopifyStorefrontPricingService:
@@ -228,43 +229,26 @@ async def _rotate_storefront_token_best_effort(
             if re.fullmatch(r"[A-Z]{2}", raw_country or ""):
                 country_for_prices = raw_country
 
-        # Build line items: best-effort unit price from variant nodes.
-        try:
-            line_items = await self._build_line_items(
-                shop_domain=shop_domain,
-                storefront_token=storefront_token,
-                items=items,
-                currency=cart.currency,
-                country=country_for_prices,
-                debug_id=debug_id,
+        # Build line items from cart line costs (avoids extra ProductVariant nodes() query,
+        # which can be denied when `unauthenticated_read_product_listings` isn't enabled).
+        line_items: List[Dict[str, Any]] = []
+        for it in items or []:
+            vid = str(it.get("variant_id") or "").strip()
+            qty = int(it.get("quantity") or 0)
+            if not vid or qty <= 0:
+                continue
+            unit = cart.unit_price_by_variant_id.get(vid) or Decimal("0.00")
+            line_items.append(
+                {
+                    "product_id": it.get("product_id"),
+                    "variant_id": vid,
+                    "quantity": qty,
+                    "unit_price_original": unit,
+                    "unit_price_effective": unit,
+                    "line_discount_total": Decimal("0.00"),
+                    "compare_at_savings": Decimal("0.00"),
+                }
             )
-        except ShopifyPricingError as e:
-            # Self-heal common misconfig:
-            # when Storefront scopes were enabled AFTER token issuance, the existing token can still pass
-            # `shop { name }` but fails on ProductVariant fields with ACCESS_DENIED.
-            if _is_missing_product_listings_scope(e) and _rotate_allowed(
-                merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s
-            ):
-                new_token = await _rotate_storefront_token_best_effort(
-                    merchant_id=merchant_id,
-                    store_id=store.get("store_id") if isinstance(store.get("store_id"), str) else None,
-                    shop_domain=shop_domain,
-                    admin_access_token=store.get("api_key") or "",
-                )
-                if new_token:
-                    storefront_token = new_token
-                    line_items = await self._build_line_items(
-                        shop_domain=shop_domain,
-                        storefront_token=storefront_token,
-                        items=items,
-                        currency=cart.currency,
-                        country=country_for_prices,
-                        debug_id=debug_id,
-                    )
-                else:
-                    raise
-            else:
-                raise
 
         pricing = {
             "subtotal": cart.subtotal,
@@ -395,7 +379,15 @@ async def _rotate_storefront_token_best_effort(
             qty = int(it.get("quantity") or 0)
             if not variant_id or qty <= 0:
                 continue
-            lines.append({"merchandiseId": _gid("ProductVariant", variant_id), "quantity": qty})
+            # Attach variant_id as a cart line attribute so we can map line costs back
+            # without needing ProductVariant read scopes.
+            lines.append(
+                {
+                    "merchandiseId": _gid("ProductVariant", variant_id),
+                    "quantity": qty,
+                    "attributes": [{"key": "pivota_variant_id", "value": variant_id}],
+                }
+            )
 
         country = None
         postal = None
@@ -425,6 +417,18 @@ mutation($input: CartInput!) {
     cart {
       id
       checkoutUrl
+      lines(first: 100) {
+        edges {
+          node {
+            quantity
+            attributes { key value }
+            cost {
+              amountPerQuantity { amount currencyCode }
+              totalAmount { amount currencyCode }
+            }
+          }
+        }
+      }
       cost {
         subtotalAmount { amount currencyCode }
         totalTaxAmount { amount currencyCode }
@@ -473,6 +477,39 @@ mutation($input: CartInput!) {
 
         cart_id = cart.get("id") or ""
         checkout_url = cart.get("checkoutUrl") or None
+
+        unit_price_by_variant_id: Dict[str, Decimal] = {}
+        try:
+            lines_root = cart.get("lines") or {}
+            edges = lines_root.get("edges") or []
+            for e in edges or []:
+                node = (e.get("node") or {}) if isinstance(e, dict) else {}
+                if not isinstance(node, dict):
+                    continue
+                attrs = node.get("attributes") or []
+                variant_id = None
+                if isinstance(attrs, list):
+                    for a in attrs:
+                        if not isinstance(a, dict):
+                            continue
+                        if a.get("key") == "pivota_variant_id":
+                            variant_id = a.get("value")
+                            break
+                if not isinstance(variant_id, str) or not variant_id.strip():
+                    continue
+                cost = node.get("cost") or {}
+                apq = (cost.get("amountPerQuantity") or {}) if isinstance(cost, dict) else {}
+                amt = apq.get("amount") if isinstance(apq, dict) else None
+                if amt is None:
+                    # Fallback: total / qty
+                    total_amt = ((cost.get("totalAmount") or {}) if isinstance(cost, dict) else {}).get("amount")
+                    qty = int(node.get("quantity") or 0)
+                    if total_amt is not None and qty > 0:
+                        unit_price_by_variant_id[variant_id.strip()] = _d(Decimal(str(total_amt)) / Decimal(qty))
+                    continue
+                unit_price_by_variant_id[variant_id.strip()] = _d(amt)
+        except Exception:
+            unit_price_by_variant_id = {}
         cost = cart.get("cost") or {}
         subtotal = _d((cost.get("subtotalAmount") or {}).get("amount"))
         total = _d((cost.get("totalAmount") or {}).get("amount"))
@@ -528,6 +565,7 @@ mutation($input: CartInput!) {
             tax=tax,
             delivery_options=delivery_options,
             selected_delivery_option=selected,
+            unit_price_by_variant_id=unit_price_by_variant_id,
         )
 
     async def _get_cart_cost(
