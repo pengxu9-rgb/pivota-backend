@@ -7,9 +7,12 @@ from typing import Any, Dict, List, Optional
 
 import hashlib
 import httpx
+import json
 import os
 import re
+import time
 
+from db.database import database
 from services.merchant_store_service import get_primary_store
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingResult
 from utils.logger import logger
@@ -88,6 +91,80 @@ class ShopifyStorefrontPricingService:
     def __init__(self, api_version: str = "2024-07", timeout_seconds: float = 20.0):
         self.api_version = api_version
         self.timeout_seconds = timeout_seconds
+        self._rotate_cooldown_s = int(os.getenv("SHOPIFY_STOREFRONT_ROTATE_COOLDOWN_SECONDS", "3600") or "3600")
+
+
+_storefront_rotate_attempted_at: Dict[str, float] = {}
+
+
+def _is_missing_product_listings_scope(err: ShopifyPricingError) -> bool:
+    try:
+        details = getattr(err, "details", {}) or {}
+        errors = details.get("errors") or []
+        if not isinstance(errors, list) or not errors:
+            return False
+        first = errors[0] if isinstance(errors[0], dict) else {}
+        msg = (first.get("message") or "") if isinstance(first, dict) else ""
+        code = (first.get("code") or "") if isinstance(first, dict) else ""
+        return (
+            str(code).upper() == "ACCESS_DENIED"
+            and "unauthenticated_read_product_listings" in str(msg)
+            and "productvariant" in str(msg).lower()
+        )
+    except Exception:
+        return False
+
+
+def _rotate_allowed(*, merchant_id: str, cooldown_s: int) -> bool:
+    now = time.time()
+    last = _storefront_rotate_attempted_at.get(merchant_id, 0.0)
+    if (now - last) < float(max(cooldown_s, 0)):
+        return False
+    _storefront_rotate_attempted_at[merchant_id] = now
+    return True
+
+
+async def _rotate_storefront_token_best_effort(
+    *,
+    merchant_id: str,
+    store_id: Optional[str],
+    shop_domain: str,
+    admin_access_token: str,
+) -> Optional[str]:
+    """
+    Create a new Storefront token and persist it for the merchant store.
+    This is best-effort and will not raise.
+    """
+    try:
+        url = f"https://{shop_domain}/admin/api/2024-07/storefront_access_tokens.json"
+        headers = {"X-Shopify-Access-Token": admin_access_token, "Content-Type": "application/json"}
+        payload = {"storefront_access_token": {"title": "Pivota Pricing"}}
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code not in (200, 201):
+            return None
+
+        data = resp.json() or {}
+        storefront = data.get("storefront_access_token") if isinstance(data, dict) else None
+        new_token = storefront.get("access_token") if isinstance(storefront, dict) else None
+        new_token = new_token.strip() if isinstance(new_token, str) and new_token.strip() else None
+        if not new_token:
+            return None
+
+        # Persist: merge into api_key JSON for this store row.
+        if store_id:
+            token_json = json.dumps({"access_token": admin_access_token, "storefront_access_token": new_token})
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET api_key = :api_key, connected_at = CURRENT_TIMESTAMP
+                WHERE store_id = :store_id AND merchant_id = :merchant_id
+                """,
+                {"api_key": token_json, "store_id": store_id, "merchant_id": merchant_id},
+            )
+        return new_token
+    except Exception:
+        return None
 
     def _use_buyer_country_for_pricing(self) -> bool:
         # When enabled, we set buyerIdentity.countryCode and @inContext(country: ...)
@@ -152,14 +229,42 @@ class ShopifyStorefrontPricingService:
                 country_for_prices = raw_country
 
         # Build line items: best-effort unit price from variant nodes.
-        line_items = await self._build_line_items(
-            shop_domain=shop_domain,
-            storefront_token=storefront_token,
-            items=items,
-            currency=cart.currency,
-            country=country_for_prices,
-            debug_id=debug_id,
-        )
+        try:
+            line_items = await self._build_line_items(
+                shop_domain=shop_domain,
+                storefront_token=storefront_token,
+                items=items,
+                currency=cart.currency,
+                country=country_for_prices,
+                debug_id=debug_id,
+            )
+        except ShopifyPricingError as e:
+            # Self-heal common misconfig:
+            # when Storefront scopes were enabled AFTER token issuance, the existing token can still pass
+            # `shop { name }` but fails on ProductVariant fields with ACCESS_DENIED.
+            if _is_missing_product_listings_scope(e) and _rotate_allowed(
+                merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s
+            ):
+                new_token = await _rotate_storefront_token_best_effort(
+                    merchant_id=merchant_id,
+                    store_id=store.get("store_id") if isinstance(store.get("store_id"), str) else None,
+                    shop_domain=shop_domain,
+                    admin_access_token=store.get("api_key") or "",
+                )
+                if new_token:
+                    storefront_token = new_token
+                    line_items = await self._build_line_items(
+                        shop_domain=shop_domain,
+                        storefront_token=storefront_token,
+                        items=items,
+                        currency=cart.currency,
+                        country=country_for_prices,
+                        debug_id=debug_id,
+                    )
+                else:
+                    raise
+            else:
+                raise
 
         pricing = {
             "subtotal": cart.subtotal,
