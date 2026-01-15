@@ -100,7 +100,7 @@ If you don't see Cron/Job in Railway UI:
   - **Worker service loop** (works on any plan): create an “Empty Service” and set the start command to:
 
 ```bash
-bash -lc 'set -euo pipefail; while true; do python3 scripts/cleanup_buyer_submission_tables.py --apply; sleep 21600; done'
+/bin/bash scripts/run_cleanup_buyer_submission_loop.sh
 ```
 
 ## Rollout guidance (canary → prod)

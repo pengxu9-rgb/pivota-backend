@@ -119,7 +119,8 @@ Railway setup (UI):
 
 If Cron/Job UI is not available in your Railway plan:
 - Use a dedicated **worker service** with a sleep loop:
-  - start command: `bash -lc 'set -euo pipefail; while true; do python3 scripts/cleanup_buyer_submission_tables.py --apply; sleep 21600; done'`
+  - start command: `/bin/bash scripts/run_cleanup_buyer_submission_loop.sh`
+  - optional: set `SLEEP_SECONDS=21600` (6h) or `SLEEP_SECONDS=86400` (daily)
   - ensure `DATABASE_URL` is set for that service.
 
 ## Stage 4 — Rollout to prod (P0)
