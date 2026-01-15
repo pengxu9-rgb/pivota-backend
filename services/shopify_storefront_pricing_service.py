@@ -616,6 +616,7 @@ query($id: ID!) {
             tax=tax,
             delivery_options=None,
             selected_delivery_option=None,
+            unit_price_by_variant_id={},
         )
 
     async def _attach_address_and_select_delivery_best_effort(
