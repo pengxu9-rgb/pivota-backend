@@ -104,38 +104,31 @@ async def _mint_invitation_via_proof_issuer(
 
     return {"invitation_token": token, "expires_at": exp}
 
-
-class IssueInvitationFromOrderRequest(BaseModel):
-    merchant_id: str = Field(..., min_length=1)
-    order_id: str = Field(..., min_length=1)
-    ttl_seconds: int = Field(7 * 24 * 3600, ge=300, le=7 * 24 * 3600)
-    platform_product_id: Optional[str] = None
-    variant_id: Optional[str] = None
-
-
-@router.post("/invitation/issue-from-order")
-async def issue_invitation_from_order(
-    body: IssueInvitationFromOrderRequest,
-    response: Response,
-    x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
-) -> Dict[str, Any]:
-    _require_internal_key(x_internal_key)
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-
-    merchant_id = (body.merchant_id or "").strip()
-    order_id = (body.order_id or "").strip()
-    if not merchant_id or not order_id:
-        raise HTTPException(status_code=400, detail="INVALID_REQUEST")
-
-    order = await get_order(order_id)
-    if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
-        raise HTTPException(status_code=404, detail="NOT_FOUND")
-
+def _order_is_paid(order: Dict[str, Any]) -> bool:
     payment_status = str(order.get("payment_status") or "").strip().lower()
     status = str(order.get("status") or "").strip().lower()
-    is_paid = payment_status == "paid" or status in {"paid", "shipped", "delivered"}
-    if not is_paid:
+    return payment_status == "paid" or status in {"paid", "shipped", "delivered"}
+
+
+async def mint_invitations_from_paid_order(
+    *,
+    merchant_id: str,
+    order: Dict[str, Any],
+    ttl_seconds: int,
+    platform_product_id: Optional[str] = None,
+    variant_id: Optional[str] = None,
+    verification: str = "verified_buyer",
+) -> Dict[str, Any]:
+    """
+    Core logic: extract product/variant subjects from an order and mint invitation tokens.
+
+    This function assumes the caller has already authorized the request context (agent/employee/etc).
+    It enforces that the order is paid, but does not perform any auth checks itself.
+    """
+    if not order or str(order.get("merchant_id") or "").strip() != (merchant_id or "").strip():
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    if not _order_is_paid(order):
         raise HTTPException(status_code=403, detail="ORDER_NOT_PAID")
 
     store = await get_primary_store(merchant_id)
@@ -145,8 +138,8 @@ async def issue_invitation_from_order(
     if not isinstance(items, list) or not items:
         raise HTTPException(status_code=400, detail="ORDER_ITEMS_MISSING")
 
-    want_pp = str(body.platform_product_id or "").strip()
-    want_vid = str(body.variant_id or "").strip()
+    want_pp = str(platform_product_id or "").strip()
+    want_vid = str(variant_id or "").strip()
 
     subjects: List[Dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -175,21 +168,54 @@ async def issue_invitation_from_order(
     if not subjects:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
-    # IMPORTANT: submission_token is single-use in the Reviews backend, so we must mint
-    # one invitation token per subject (product/variant). This enables "one review per line item"
-    # without changing the replay/ownership tables.
     out_items: List[Dict[str, Any]] = []
     for s in subjects:
         minted = await _mint_invitation_via_proof_issuer(
             merchant_id=merchant_id,
             subjects=[s],
-            ttl_seconds=int(body.ttl_seconds),
-            verification="verified_buyer",
+            ttl_seconds=int(ttl_seconds),
+            verification=verification,
         )
         out_items.append({"subject": s, **minted})
 
-    # Convenience compatibility: if exactly one subject, surface the token at top-level too.
     if len(out_items) == 1:
         return {"status": "success", **out_items[0]}
 
     return {"status": "success", "items": out_items}
+
+
+class IssueInvitationFromOrderRequest(BaseModel):
+    merchant_id: str = Field(..., min_length=1)
+    order_id: str = Field(..., min_length=1)
+    ttl_seconds: int = Field(7 * 24 * 3600, ge=300, le=7 * 24 * 3600)
+    platform_product_id: Optional[str] = None
+    variant_id: Optional[str] = None
+
+
+@router.post("/invitation/issue-from-order")
+async def issue_invitation_from_order(
+    body: IssueInvitationFromOrderRequest,
+    response: Response,
+    x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_key(x_internal_key)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    merchant_id = (body.merchant_id or "").strip()
+    order_id = (body.order_id or "").strip()
+    if not merchant_id or not order_id:
+        raise HTTPException(status_code=400, detail="INVALID_REQUEST")
+
+    order = await get_order(order_id)
+    if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    return await mint_invitations_from_paid_order(
+        merchant_id=merchant_id,
+        order=order,
+        ttl_seconds=int(body.ttl_seconds),
+        platform_product_id=body.platform_product_id,
+        variant_id=body.variant_id,
+        verification="verified_buyer",
+    )

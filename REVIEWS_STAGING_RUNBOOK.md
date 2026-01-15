@@ -93,6 +93,17 @@ VARIANT_ID="<variant_id_or_empty>" \
 ./scripts/smoke_issue_review_invitation_from_order.sh
 ```
 
+## (Optional) Issue invitation from a paid order (Agent API; no internal key)
+
+If your checkout/order UI can call Agent API (authenticated via `X-Checkout-Token` or `X-API-Key`), you can mint invitation tokens without passing any internal issuer keys to the browser:
+
+```bash
+cd pivota-backend
+REVIEWS_BASE_URL="https://<reviews-host>" \
+ORDER_ID="<order_id>" \
+./scripts/smoke_agent_issue_review_invitation_from_order.sh
+```
+
 ## Proof issuer deployment (Railway)
 
 Deploy proof issuer as its own Railway service using the `pivota-backend` repo/branch:
