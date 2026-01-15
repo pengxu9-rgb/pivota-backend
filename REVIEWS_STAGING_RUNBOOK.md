@@ -77,3 +77,4 @@ Deploy proof issuer as its own Railway service using the `pivota-backend` repo/b
    - media upload/read success rate
 3. Expand allowlist gradually; rollback is immediate by removing merchants from allowlist.
 
+See `REVIEWS_CANARY_PROD_CHECKLIST.md` for the full canary→prod checklist and the gating matrix checks.
