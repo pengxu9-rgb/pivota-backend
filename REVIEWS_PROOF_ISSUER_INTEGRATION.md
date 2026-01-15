@@ -75,6 +75,19 @@ Notes:
   - `REVIEWS_PROOF_ISSUER_INTERNAL_KEY` (or reuse `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`)
 - Replay is enforced by reusing the same `jti` between invitation and proof tokens (2nd exchange returns 409).
 
+### Shortcut for Pivota orders (server-side)
+
+If your order service runs in the same `pivota-backend` monolith and has access to the Orders DB,
+you can mint an invitation from a *paid order* without touching buyer PII:
+- `POST /internal/reviews/v1/invitation/issue-from-order` (requires `X-Internal-Key`)
+- This endpoint:
+  - validates the order is paid
+  - extracts `subjects[]` from `orders.items[]` (`product_id` + optional `variant_id`)
+  - calls the proof issuer `/internal/reviews/v1/invitation/issue` internally
+
+Smoke:
+- `./scripts/smoke_issue_review_invitation_from_order.sh`
+
 ## Multi-platform rules
 
 The only platform-specific field that flows into Reviews is:
