@@ -24,6 +24,9 @@ Security note:
 - Confirm canary gating is configured on reviews backend:
   - `REVIEWS_BUYER_SUBMIT_ENABLED=true`
   - `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST=<comma-separated merchant ids>`
+- Recommended security hardening:
+  - `REVIEWS_BUYER_SUBMIT_SIGNING_SECRET` (signs `submission_token`; don’t rely on defaults)
+  - `REVIEWS_RISK_HASH_SECRET` (HMAC salt for risk signals like `ip_hash`)
 
 ## Stage 1 — Canary smoke (P0)
 
