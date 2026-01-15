@@ -109,6 +109,8 @@ class IssueInvitationFromOrderRequest(BaseModel):
     merchant_id: str = Field(..., min_length=1)
     order_id: str = Field(..., min_length=1)
     ttl_seconds: int = Field(7 * 24 * 3600, ge=300, le=7 * 24 * 3600)
+    platform_product_id: Optional[str] = None
+    variant_id: Optional[str] = None
 
 
 @router.post("/invitation/issue-from-order")
@@ -143,7 +145,11 @@ async def issue_invitation_from_order(
     if not isinstance(items, list) or not items:
         raise HTTPException(status_code=400, detail="ORDER_ITEMS_MISSING")
 
+    want_pp = str(body.platform_product_id or "").strip()
+    want_vid = str(body.variant_id or "").strip()
+
     subjects: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -151,23 +157,39 @@ async def issue_invitation_from_order(
         vid = str(it.get("variant_id") or "").strip()
         if not pp:
             continue
-        subject: Dict[str, Any] = {
-            "merchant_id": merchant_id,
-            "platform": platform,
-            "platform_product_id": pp,
-        }
+        if want_pp and pp != want_pp:
+            continue
+        if want_vid and vid != want_vid:
+            continue
+
+        key = (pp, vid)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        subject: Dict[str, Any] = {"merchant_id": merchant_id, "platform": platform, "platform_product_id": pp}
         if vid:
             subject["variant_id"] = vid
         subjects.append(subject)
+
     if not subjects:
-        raise HTTPException(status_code=400, detail="ORDER_ITEMS_MISSING")
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
 
-    minted = await _mint_invitation_via_proof_issuer(
-        merchant_id=merchant_id,
-        subjects=subjects,
-        ttl_seconds=int(body.ttl_seconds),
-        verification="verified_buyer",
-    )
+    # IMPORTANT: submission_token is single-use in the Reviews backend, so we must mint
+    # one invitation token per subject (product/variant). This enables "one review per line item"
+    # without changing the replay/ownership tables.
+    out_items: List[Dict[str, Any]] = []
+    for s in subjects:
+        minted = await _mint_invitation_via_proof_issuer(
+            merchant_id=merchant_id,
+            subjects=[s],
+            ttl_seconds=int(body.ttl_seconds),
+            verification="verified_buyer",
+        )
+        out_items.append({"subject": s, **minted})
 
-    return {"status": "success", **minted}
+    # Convenience compatibility: if exactly one subject, surface the token at top-level too.
+    if len(out_items) == 1:
+        return {"status": "success", **out_items[0]}
 
+    return {"status": "success", "items": out_items}

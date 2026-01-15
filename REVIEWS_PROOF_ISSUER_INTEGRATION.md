@@ -83,6 +83,7 @@ you can mint an invitation from a *paid order* without touching buyer PII:
 - This endpoint:
   - validates the order is paid
   - extracts `subjects[]` from `orders.items[]` (`product_id` + optional `variant_id`)
+  - mints **one invitation token per subject** (so the buyer can submit multiple reviews for a multi-item order)
   - calls the proof issuer `/internal/reviews/v1/invitation/issue` internally
 
 Smoke:

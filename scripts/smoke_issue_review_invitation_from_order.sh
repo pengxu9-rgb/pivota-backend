@@ -36,7 +36,7 @@ read -rs "JWT_SECRET_KEY?JWT_SECRET_KEY (reviews backend Railway env): " ; echo
 
 echo "== issue invitation_token from order =="
 ISSUE_RESP="$(curl -sS -H "Content-Type: application/json" -H "X-Internal-Key: $X_INTERNAL_KEY" \
-  -d "{\"merchant_id\":\"$MERCHANT_ID\",\"order_id\":\"$ORDER_ID\",\"ttl_seconds\":86400}" \
+  -d "{\"merchant_id\":\"$MERCHANT_ID\",\"order_id\":\"$ORDER_ID\",\"ttl_seconds\":86400,\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\"$( [[ -n "$VARIANT_ID" ]] && printf ',\"variant_id\":\"%s\"' "$VARIANT_ID" )}" \
   "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/issue-from-order")"
 
 INV_FP="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json,hashlib; o=json.load(sys.stdin); t=o.get("invitation_token",""); print(hashlib.sha256(t.encode()).hexdigest()[:12] if t else "")')"
@@ -44,7 +44,8 @@ INV_FP="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json,hashlib; o=jso
 echo "issue_ok invitation_fp=$INV_FP"
 
 echo "== exchange invitation -> submission_token =="
-EXCHANGE_RESP="$(curl -sS -H "Authorization: Bearer $(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"invitation_token\",\"\"))')" \
+INVITATION_TOKEN="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"invitation_token\",\"\"))')"
+EXCHANGE_RESP="$(curl -sS -H "Authorization: Bearer $INVITATION_TOKEN" \
   -H "Content-Type: application/json" -d '{"ttl_seconds":900}' \
   "$REVIEWS_BASE_URL/buyer/reviews/v1/verification/exchange")"
 
