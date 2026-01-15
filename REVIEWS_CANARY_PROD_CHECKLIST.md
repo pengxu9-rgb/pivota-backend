@@ -105,6 +105,12 @@ DATABASE_URL="<public postgres url>" ./scripts/cleanup_buyer_submission_tables.p
 DATABASE_URL="<public postgres url>" ./scripts/cleanup_buyer_submission_tables.py --apply
 ```
 
+Suggested schedule:
+- `0 */6 * * *` (every 6 hours) for the first week of canary, then `0 4 * * *` daily.
+
+Suggested job command (inside a Railway cron/job container):
+- `python3 scripts/cleanup_buyer_submission_tables.py --apply`
+
 ## Stage 4 — Rollout to prod (P0)
 
 1. Deploy both services to prod with `REVIEWS_BUYER_SUBMIT_ENABLED=false` (dark launch).
