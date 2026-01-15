@@ -571,6 +571,8 @@ async def employee_list_audit_logs(
 async def employee_list_reviews_for_moderation(
     merchant_id: Optional[str] = None,
     status: Optional[str] = None,
+    source_type: Optional[str] = None,
+    source_system: Optional[str] = None,
     limit: int = 50,
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
 ) -> Dict[str, Any]:
@@ -583,9 +585,17 @@ async def employee_list_reviews_for_moderation(
     if status:
         where.append("status = :st")
         params["st"] = str(status)
+    if source_type:
+        where.append("source_type = :stype")
+        params["stype"] = str(source_type)
+    if source_system:
+        where.append("source_system = :ssys")
+        params["ssys"] = str(source_system)
     rows = await database.fetch_all(
         f"""
-        SELECT id, merchant_id, platform, platform_product_id, variant_id, group_id, verification, rating, title,
+        SELECT id, merchant_id, platform, platform_product_id, variant_id, group_id,
+               source_type, source_system, external_review_id,
+               verification, rating, title,
                COALESCE(NULLIF(body_redacted, ''), body) AS body_effective,
                media_count, status, created_at, updated_at
         FROM product_reviews
