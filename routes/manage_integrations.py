@@ -3,6 +3,8 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Dict, Any
 from db.database import database
 from utils.auth import get_current_user
+import json
+import httpx
 
 router = APIRouter()
 
@@ -72,7 +74,11 @@ async def update_store(
     
     try:
         # Verify ownership
-        check_query = "SELECT store_id FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id"
+        check_query = """
+            SELECT store_id, platform, domain, api_key
+            FROM merchant_stores
+            WHERE store_id = :store_id AND merchant_id = :merchant_id
+        """
         store = await database.fetch_one(check_query, {"store_id": store_id, "merchant_id": merchant_id})
         
         if not store:
@@ -87,8 +93,78 @@ async def update_store(
             values["name"] = store_data["name"]
         
         if "api_key" in store_data:
+            # Merge credentials when api_key is provided as a JSON/dict patch, e.g.
+            # {"storefront_access_token":"..."} so we don't wipe the existing Admin token.
+            patch = store_data["api_key"]
+            current_raw = store.get("api_key") or ""
+
+            current: Dict[str, Any] = {}
+            if isinstance(current_raw, str) and current_raw.strip().startswith("{"):
+                try:
+                    parsed = json.loads(current_raw)
+                    if isinstance(parsed, dict):
+                        current = parsed
+                except Exception:
+                    current = {}
+            elif isinstance(current_raw, str) and current_raw.strip():
+                # Legacy single-token format
+                current = {"access_token": current_raw.strip()}
+
+            patch_dict: Dict[str, Any] = {}
+            if isinstance(patch, dict):
+                patch_dict = patch
+            elif isinstance(patch, str) and patch.strip().startswith("{"):
+                try:
+                    parsed = json.loads(patch)
+                    if isinstance(parsed, dict):
+                        patch_dict = parsed
+                except Exception:
+                    patch_dict = {}
+            elif isinstance(patch, str) and patch.strip():
+                # Treat as full admin token replacement
+                patch_dict = {"access_token": patch.strip()}
+
+            merged = dict(current)
+            for k, v in (patch_dict or {}).items():
+                if not isinstance(k, str) or not k:
+                    continue
+                if isinstance(v, str):
+                    if not v.strip():
+                        continue
+                    merged[k] = v.strip()
+                elif v is None:
+                    continue
+                else:
+                    merged[k] = v
+
+            # Optional verify: if storefront token present for Shopify, ping Storefront API.
+            if (
+                (store.get("platform") == "shopify")
+                and isinstance(store.get("domain"), str)
+                and isinstance(merged.get("storefront_access_token"), str)
+                and merged.get("storefront_access_token")
+            ):
+                domain = store.get("domain")
+                token = merged.get("storefront_access_token")
+                try:
+                    url = f"https://{domain}/api/2024-07/graphql.json"
+                    headers = {"X-Shopify-Storefront-Access-Token": token, "Content-Type": "application/json"}
+                    payload = {"query": "query { shop { name } }"}
+                    async with httpx.AsyncClient(timeout=8.0) as client:
+                        resp = await client.post(url, headers=headers, json=payload)
+                    if resp.status_code != 200:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid Shopify Storefront token. API returned: {resp.status_code}",
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    # Best-effort: don't block update if verification can't run
+                    pass
+
             update_fields.append("api_key = :api_key")
-            values["api_key"] = store_data["api_key"]
+            values["api_key"] = json.dumps(merged, ensure_ascii=False)
         
         if "status" in store_data:
             update_fields.append("status = :status")
@@ -283,7 +359,6 @@ async def cleanup_integrations(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup: {str(e)}")
-
 
 
 

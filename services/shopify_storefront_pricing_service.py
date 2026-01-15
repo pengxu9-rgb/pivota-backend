@@ -38,18 +38,31 @@ def _extract_storefront_token(store: Dict[str, Any]) -> Optional[str]:
         if isinstance(c, str) and c.strip():
             return c.strip()
 
-    # Fallback: allow a single-token deployment for early rollout.
-    # NOTE: This is NOT safe for multi-merchant long-term; prefer storing per-merchant.
-    env = (
-        (store.get("storefront_access_token") if isinstance(store.get("storefront_access_token"), str) else None)
-        or ""
-    )
-    if env.strip():
-        return env.strip()
-    import os
+    # Per-store fallback (if upstream populated a dedicated field).
+    direct = store.get("storefront_access_token") if isinstance(store.get("storefront_access_token"), str) else None
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
 
-    env2 = os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "") or ""
-    return env2.strip() or None
+    # Global fallback is dangerous in multi-merchant deployments; keep it explicitly opt-in.
+    allow_global = (os.getenv("SHOPIFY_STOREFRONT_ALLOW_GLOBAL_TOKEN", "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not allow_global:
+        return None
+
+    env_token = (os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "") or "").strip()
+    if not env_token:
+        return None
+
+    env_domain = (os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN_DOMAIN", "") or "").strip().lower()
+    store_domain = (store.get("domain") or "").strip().lower()
+    if env_domain and store_domain and env_domain != store_domain:
+        return None
+
+    return env_token
 
 
 @dataclass(frozen=True)
@@ -215,13 +228,24 @@ class ShopifyStorefrontPricingService:
 
         if resp.status_code >= 400:
             logger.warning(
-                {"debug_id": debug_id, "status_code": resp.status_code, "body": (resp.text or "")[:800]},
+                {
+                    "debug_id": debug_id,
+                    "status_code": resp.status_code,
+                    "x_request_id": resp.headers.get("x-request-id"),
+                },
                 "Shopify Storefront HTTP error",
             )
+            hint = None
+            if resp.status_code == 401:
+                hint = (
+                    "Storefront token invalid for this shop. Reconnect store and provide a valid "
+                    "Storefront access token (X-Shopify-Storefront-Access-Token)."
+                )
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
                 f"Storefront pricing error (HTTP {resp.status_code})",
                 debug_id,
+                details={"status_code": resp.status_code, "hint": hint} if hint else {"status_code": resp.status_code},
             )
 
         data = resp.json() or {}

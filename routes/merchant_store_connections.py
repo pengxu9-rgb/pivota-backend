@@ -23,6 +23,31 @@ class ConnectShopifyRequest(BaseModel):
     merchant_id: str
     shop_domain: str
     access_token: str
+    # Optional: Storefront token for quote/checkout pricing (Storefront Cart API).
+    # If omitted, backend will try to auto-create one using the Admin token.
+    storefront_access_token: Optional[str] = None
+    storefront_token: Optional[str] = None
+
+
+async def _create_storefront_access_token_best_effort(*, shop_domain: str, access_token: str) -> Optional[str]:
+    """
+    Best-effort create a Shopify Storefront API token using the Admin token.
+    Requires the custom app to have Storefront API enabled on Shopify side.
+    """
+    try:
+        url = f"https://{shop_domain}/admin/api/2024-07/storefront_access_tokens.json"
+        headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+        payload = {"storefront_access_token": {"title": "Pivota Pricing"}}
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code not in (200, 201):
+            return None
+        data = resp.json() or {}
+        storefront = data.get("storefront_access_token") if isinstance(data, dict) else None
+        token = storefront.get("access_token") if isinstance(storefront, dict) else None
+        return token.strip() if isinstance(token, str) and token.strip() else None
+    except Exception:
+        return None
 
 
 class ShopifySyncRequest(BaseModel):
@@ -121,18 +146,119 @@ async def merchant_connect_shopify(
         shop_info = shop_data["shop"]
         canonical_myshopify_domain = shop_info.get("myshopify_domain") or request.shop_domain
         logger.info(f"✅ Shopify credentials verified for {canonical_myshopify_domain}")
-        
-        # Check if store already exists
+
+        # Storefront token strategy:
+        # 1) accept from request (optional)
+        # 2) preserve prior stored token (so merchants can reconnect without re-entering)
+        # 3) best-effort auto-create using Admin token (to simplify merchant UX)
+        storefront_token_raw = (request.storefront_access_token or request.storefront_token or "").strip()
+        storefront_token_from_request = bool(storefront_token_raw)
+        storefront_token = storefront_token_raw or None
+        storefront_token_created = False
+        storefront_token_verified = None
+
         existing = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
+            """SELECT store_id, api_key FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'shopify' 
                AND (domain = :domain_input OR domain = :domain_canonical)""",
             {
                 "merchant_id": request.merchant_id,
                 "domain_input": request.shop_domain,
                 "domain_canonical": canonical_myshopify_domain,
-            }
+            },
         )
+
+        existing_creds: Dict[str, Any] = {}
+        if existing and (existing.get("api_key") or ""):
+            try:
+                parsed = json.loads(existing.get("api_key") or "")
+                if isinstance(parsed, dict):
+                    existing_creds = parsed
+            except Exception:
+                existing_creds = {}
+
+        if not storefront_token:
+            stored = (
+                (
+                    existing_creds.get("storefront_access_token")
+                    if isinstance(existing_creds.get("storefront_access_token"), str)
+                    else None
+                )
+                or (existing_creds.get("storefront_token") if isinstance(existing_creds.get("storefront_token"), str) else None)
+                or (
+                    existing_creds.get("storefrontAccessToken")
+                    if isinstance(existing_creds.get("storefrontAccessToken"), str)
+                    else None
+                )
+            )
+            storefront_token = stored.strip() if isinstance(stored, str) and stored.strip() else None
+
+        if not storefront_token:
+            auto = await _create_storefront_access_token_best_effort(
+                shop_domain=canonical_myshopify_domain,
+                access_token=request.access_token,
+            )
+            if auto:
+                storefront_token = auto
+                storefront_token_created = True
+
+        if storefront_token:
+            try:
+                sf_url = f"https://{canonical_myshopify_domain}/api/2024-07/graphql.json"
+                sf_payload = {"query": "query { shop { name } }"}
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    sf_resp = await client.post(
+                        sf_url,
+                        headers={
+                            "X-Shopify-Storefront-Access-Token": storefront_token,
+                            "Content-Type": "application/json",
+                        },
+                        json=sf_payload,
+                    )
+                if sf_resp.status_code != 200:
+                    if storefront_token_from_request:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid Shopify Storefront token. API returned: {sf_resp.status_code}",
+                        )
+
+                    storefront_token_verified = False
+                    storefront_token = None
+
+                    # If stored token is invalid, try to auto-create a fresh one (best-effort).
+                    if not storefront_token_created:
+                        auto2 = await _create_storefront_access_token_best_effort(
+                            shop_domain=canonical_myshopify_domain,
+                            access_token=request.access_token,
+                        )
+                        if auto2:
+                            try:
+                                async with httpx.AsyncClient(timeout=8.0) as client:
+                                    sf_resp2 = await client.post(
+                                        sf_url,
+                                        headers={
+                                            "X-Shopify-Storefront-Access-Token": auto2,
+                                            "Content-Type": "application/json",
+                                        },
+                                        json=sf_payload,
+                                    )
+                                if sf_resp2.status_code == 200:
+                                    storefront_token = auto2
+                                    storefront_token_created = True
+                                    storefront_token_verified = True
+                            except Exception:
+                                pass
+                else:
+                    storefront_token_verified = True
+            except HTTPException:
+                raise
+            except Exception:
+                storefront_token_verified = None
+
+        token_blob: Dict[str, Any] = {"access_token": request.access_token}
+        if storefront_token:
+            token_blob["storefront_access_token"] = storefront_token
+        token_json = json.dumps(token_blob, ensure_ascii=False)
         
         if existing:
             # Update existing store - store token as JSON for consistency
@@ -146,7 +272,7 @@ async def merchant_connect_shopify(
                    WHERE store_id = :store_id""",
                 {
                     "domain": canonical_myshopify_domain,
-                    "token": '{"access_token":"' + request.access_token + '"}',
+                    "token": token_json,
                     "store_id": existing["store_id"],
                 }
             )
@@ -163,7 +289,7 @@ async def merchant_connect_shopify(
                     "merchant_id": request.merchant_id,
                     "domain": canonical_myshopify_domain,
                     "name": shop_info.get("name", canonical_myshopify_domain),
-                    "token": '{"access_token":"' + request.access_token + '"}'
+                    "token": token_json,
                 }
             )
         
@@ -175,7 +301,13 @@ async def merchant_connect_shopify(
             "message": "Shopify store connected successfully",
             "store_id": store_id,
             "shop_name": shop_info.get("name"),
-            "shop_domain": canonical_myshopify_domain
+            "shop_domain": canonical_myshopify_domain,
+            "storefront_token_present": bool(storefront_token),
+            "storefront_token_verified": storefront_token_verified,
+            "storefront_token_created": storefront_token_created,
+            "warning": None
+            if storefront_token
+            else "Storefront token missing: enable Storefront API for the Shopify custom app so Pivota can auto-generate it, or have support add it later.",
         }
         
     except HTTPException:

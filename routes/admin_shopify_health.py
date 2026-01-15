@@ -47,7 +47,11 @@ async def shopify_health(merchant_id: str):
                 merchant_id=merchant_id,
                 domain=None,
                 token_present=False,
-                storefront_token_present=bool(os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "")),
+                storefront_token_present=bool(
+                    (os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "") or "").strip()
+                    and (os.getenv("SHOPIFY_STOREFRONT_ALLOW_GLOBAL_TOKEN", "") or "").strip().lower()
+                    in {"1", "true", "yes", "on"}
+                ),
                 storefront_reachable=None,
                 storefront_http_status=None,
                 reachable=False,
@@ -73,7 +77,18 @@ async def shopify_health(merchant_id: str):
                 token = api_key_raw
 
         if not storefront_token:
-            storefront_token = os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "") or None
+            allow_global = (os.getenv("SHOPIFY_STOREFRONT_ALLOW_GLOBAL_TOKEN", "") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if allow_global:
+                env_token = (os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN", "") or "").strip() or None
+                env_domain = (os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN_DOMAIN", "") or "").strip().lower()
+                if env_token and env_domain and (domain or "").strip().lower() != env_domain:
+                    env_token = None
+                storefront_token = env_token
 
         if not domain:
             return ShopifyHealthResponse(
@@ -161,6 +176,4 @@ async def shopify_health(merchant_id: str):
     except Exception as e:
         logger.error(f"Shopify health failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
 

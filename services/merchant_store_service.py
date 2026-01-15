@@ -32,7 +32,8 @@ def parse_api_key(api_key: str) -> str:
             # 尝试提取 access_token
             if isinstance(parsed, dict) and "access_token" in parsed:
                 token = parsed["access_token"]
-                logger.info(f"Parsed JSON format token: {token[:15]}...")
+                # Do not log secrets (tokens).
+                logger.info("Parsed JSON format token from merchant_stores.api_key")
                 return token
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse JSON token, using as-is: {e}")

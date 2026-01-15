@@ -130,19 +130,27 @@ class ShopifyPricingService:
             )
 
         if resp.status_code not in (200, 201):
+            # Do not log response bodies here: they may include customer email/address.
             logger.warning(
                 {
                     "debug_id": debug_id,
                     "merchant_id": merchant_id,
                     "status_code": resp.status_code,
-                    "body": (resp.text or "")[:800],
+                    "x_request_id": resp.headers.get("x-request-id"),
                 },
                 "Shopify checkout pricing error response",
             )
+            hint = None
+            if resp.status_code == 403:
+                hint = (
+                    "Admin REST Checkout API is deprecated and often blocked for custom apps "
+                    "(requires write_checkouts). Prefer Storefront Cart pricing with a Storefront token."
+                )
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
                 f"Shopify pricing error (HTTP {resp.status_code})",
                 debug_id,
+                details={"status_code": resp.status_code, "hint": hint} if hint else {"status_code": resp.status_code},
             )
 
         payload = resp.json() or {}
