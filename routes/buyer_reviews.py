@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from observability.reviews_metrics import record_buyer_create, record_buyer_exchange, record_buyer_media_upload
 from services.buyer_reviews_service import (
     attach_buyer_review_media,
     create_buyer_review,
@@ -64,12 +66,23 @@ async def buyer_exchange_proof(
     body: ExchangeProofRequest,
     authorization: Optional[str] = Header(None),
 ) -> Dict[str, Any]:
-    proof_token = _bearer_token(authorization)
-    return await exchange_proof_for_submission_token(
-        request=request,
-        proof_token=proof_token,
-        ttl_seconds=int(body.ttl_seconds),
-    )
+    start = time.perf_counter()
+    try:
+        proof_token = _bearer_token(authorization)
+        result = await exchange_proof_for_submission_token(
+            request=request,
+            proof_token=proof_token,
+            ttl_seconds=int(body.ttl_seconds),
+        )
+        record_buyer_exchange(result="success", reason="ok", duration_seconds=(time.perf_counter() - start))
+        return result
+    except HTTPException as e:
+        reason = str(e.detail or "error")
+        record_buyer_exchange(result="error", reason=reason[:64], duration_seconds=(time.perf_counter() - start))
+        raise
+    except Exception:
+        record_buyer_exchange(result="error", reason="exception", duration_seconds=(time.perf_counter() - start))
+        raise
 
 
 class CreateReviewRequest(BaseModel):
@@ -89,19 +102,30 @@ async def buyer_create_review(
     authorization: Optional[str] = Header(None),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ) -> Dict[str, Any]:
-    token = _bearer_token(authorization)
-    return await create_buyer_review(
-        request=request,
-        token=token,
-        idempotency_key=(idempotency_key or "").strip(),
-        merchant_id=body.merchant_id,
-        platform=body.platform,
-        platform_product_id=body.platform_product_id,
-        variant_id=body.variant_id,
-        rating=int(body.rating),
-        title=body.title,
-        body=body.body,
-    )
+    start = time.perf_counter()
+    try:
+        token = _bearer_token(authorization)
+        result = await create_buyer_review(
+            request=request,
+            token=token,
+            idempotency_key=(idempotency_key or "").strip(),
+            merchant_id=body.merchant_id,
+            platform=body.platform,
+            platform_product_id=body.platform_product_id,
+            variant_id=body.variant_id,
+            rating=int(body.rating),
+            title=body.title,
+            body=body.body,
+        )
+        record_buyer_create(result="success", reason="ok", duration_seconds=(time.perf_counter() - start))
+        return result
+    except HTTPException as e:
+        reason = str(e.detail or "error")
+        record_buyer_create(result="error", reason=reason[:64], duration_seconds=(time.perf_counter() - start))
+        raise
+    except Exception:
+        record_buyer_create(result="error", reason="exception", duration_seconds=(time.perf_counter() - start))
+        raise
 
 
 @router.get("/reviews/{review_id}")
@@ -120,13 +144,24 @@ async def buyer_attach_review_media(
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(None),
 ) -> Dict[str, Any]:
-    token = _bearer_token(authorization)
-    blob = await file.read()
-    return await attach_buyer_review_media(
-        request=request,
-        token=token,
-        review_id=int(review_id),
-        filename=(file.filename or ""),
-        content_type=(file.content_type or ""),
-        blob=blob,
-    )
+    start = time.perf_counter()
+    try:
+        token = _bearer_token(authorization)
+        blob = await file.read()
+        result = await attach_buyer_review_media(
+            request=request,
+            token=token,
+            review_id=int(review_id),
+            filename=(file.filename or ""),
+            content_type=(file.content_type or ""),
+            blob=blob,
+        )
+        record_buyer_media_upload(result="success", reason="ok", duration_seconds=(time.perf_counter() - start))
+        return result
+    except HTTPException as e:
+        reason = str(e.detail or "error")
+        record_buyer_media_upload(result="error", reason=reason[:64], duration_seconds=(time.perf_counter() - start))
+        raise
+    except Exception:
+        record_buyer_media_upload(result="error", reason="exception", duration_seconds=(time.perf_counter() - start))
+        raise

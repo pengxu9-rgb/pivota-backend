@@ -70,10 +70,24 @@ Confirm these exist on the reviews backend `/metrics` (auth required in your set
 - `reviews_invoke_requests_total` / `reviews_invoke_errors_total`
 - `reviews_media_sig_verify_failed_total` (missing/expired/bad_signature)
 - `reviews_media_rate_limited_total`
+- buyer submit:
+  - `reviews_buyer_exchange_total`
+  - `reviews_buyer_create_total`
+  - `reviews_buyer_media_upload_total`
 
 Add alerts (starter thresholds):
 - spike in `reviews_media_sig_verify_failed_total{reason="bad_signature"}` (possible abuse)
 - elevated 5xx on `/buyer/reviews/v1/*` and `/employee/reviews/v1/reviews/{id}/status`
+
+## Stage 3.1 — Storage hygiene (P1)
+
+Because canary deployments often change storage backends, it’s easy to accumulate stale rows.
+Run a periodic cleanup to remove expired replay JTIs and old idempotency keys:
+
+```bash
+DATABASE_URL="<public postgres url>" ./scripts/cleanup_buyer_submission_tables.py
+DATABASE_URL="<public postgres url>" ./scripts/cleanup_buyer_submission_tables.py --apply
+```
 
 ## Stage 4 — Rollout to prod (P0)
 
@@ -94,4 +108,3 @@ It should validate a platform/order proof and mint a `proof_token` that contains
 - `exp`, `jti`, `verification`
 
 No PII should be included in the proof token.
-

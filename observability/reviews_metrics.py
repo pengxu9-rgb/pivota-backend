@@ -95,6 +95,39 @@ try:
         buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0),
     )
 
+    reviews_buyer_exchange_total = Counter(
+        "reviews_buyer_exchange_total",
+        "Buyer proof exchange attempts (by result + reason).",
+        ["result", "reason"],
+    )
+    reviews_buyer_exchange_duration_seconds = Histogram(
+        "reviews_buyer_exchange_duration_seconds",
+        "Buyer proof exchange duration (seconds).",
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+    )
+
+    reviews_buyer_create_total = Counter(
+        "reviews_buyer_create_total",
+        "Buyer review create attempts (by result + reason).",
+        ["result", "reason"],
+    )
+    reviews_buyer_create_duration_seconds = Histogram(
+        "reviews_buyer_create_duration_seconds",
+        "Buyer review create duration (seconds).",
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+    )
+
+    reviews_buyer_media_upload_total = Counter(
+        "reviews_buyer_media_upload_total",
+        "Buyer review media upload attempts (by result + reason).",
+        ["result", "reason"],
+    )
+    reviews_buyer_media_upload_duration_seconds = Histogram(
+        "reviews_buyer_media_upload_duration_seconds",
+        "Buyer review media upload duration (seconds).",
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+    )
+
 except Exception:  # pragma: no cover
     # Prometheus client not installed or metrics disabled; provide no-ops.
     Counter = Histogram = None  # type: ignore
@@ -113,6 +146,12 @@ except Exception:  # pragma: no cover
     reviews_import_validate_duration_seconds = None
     reviews_import_commit_total = None
     reviews_import_commit_duration_seconds = None
+    reviews_buyer_exchange_total = None
+    reviews_buyer_exchange_duration_seconds = None
+    reviews_buyer_create_total = None
+    reviews_buyer_create_duration_seconds = None
+    reviews_buyer_media_upload_total = None
+    reviews_buyer_media_upload_duration_seconds = None
 
 
 def record_invoke_request(*, operation: str, status_code: int, duration_seconds: float, error_type: Optional[str] = None) -> None:
@@ -171,3 +210,24 @@ def record_import_commit(*, result: str, reason: str, duration_seconds: float, s
         reviews_import_commit_total.labels(result=str(result), reason=str(reason), succeeded=str(bool(succeeded)).lower()).inc()
     if reviews_import_commit_duration_seconds is not None:
         reviews_import_commit_duration_seconds.observe(max(0.0, float(duration_seconds)))
+
+
+def record_buyer_exchange(*, result: str, reason: str, duration_seconds: float) -> None:
+    if reviews_buyer_exchange_total is not None:
+        reviews_buyer_exchange_total.labels(result=str(result), reason=str(reason)).inc()
+    if reviews_buyer_exchange_duration_seconds is not None:
+        reviews_buyer_exchange_duration_seconds.observe(max(0.0, float(duration_seconds)))
+
+
+def record_buyer_create(*, result: str, reason: str, duration_seconds: float) -> None:
+    if reviews_buyer_create_total is not None:
+        reviews_buyer_create_total.labels(result=str(result), reason=str(reason)).inc()
+    if reviews_buyer_create_duration_seconds is not None:
+        reviews_buyer_create_duration_seconds.observe(max(0.0, float(duration_seconds)))
+
+
+def record_buyer_media_upload(*, result: str, reason: str, duration_seconds: float) -> None:
+    if reviews_buyer_media_upload_total is not None:
+        reviews_buyer_media_upload_total.labels(result=str(result), reason=str(reason)).inc()
+    if reviews_buyer_media_upload_duration_seconds is not None:
+        reviews_buyer_media_upload_duration_seconds.observe(max(0.0, float(duration_seconds)))
