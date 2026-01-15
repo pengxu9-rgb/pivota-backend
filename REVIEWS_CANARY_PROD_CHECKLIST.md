@@ -122,6 +122,11 @@ If Cron/Job UI is not available in your Railway plan:
   - start command: `/bin/bash scripts/run_cleanup_buyer_submission_loop.sh`
   - optional: set `SLEEP_SECONDS=21600` (6h) or `SLEEP_SECONDS=86400` (daily)
   - ensure `DATABASE_URL` is set for that service.
+  - the loop script binds `$PORT` and responds `200` on `GET /healthz` / `GET /` so Railway keeps it alive.
+
+To verify the loop is running without waiting hours:
+- temporarily set `SLEEP_SECONDS=30` and confirm multiple `cleanup_start_utc=...` lines appear
+- set it back to `21600` after confirming
 
 ## Stage 4 — Rollout to prod (P0)
 

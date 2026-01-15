@@ -103,6 +103,10 @@ If you don't see Cron/Job in Railway UI:
 /bin/bash scripts/run_cleanup_buyer_submission_loop.sh
 ```
 
+Notes for the loop service:
+- The script binds a minimal health server on `$PORT` (supports `GET /healthz`, `GET /health`, `GET /`) so Railway keeps the container running.
+- To confirm it’s actually looping, temporarily set `SLEEP_SECONDS=30`, wait for 2–3 `cleanup_start_utc=...` lines, then set it back to `21600` (6h).
+
 ## Rollout guidance (canary → prod)
 
 1. Keep buyer write entrypoint gated by `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST`.
