@@ -55,6 +55,26 @@ Response:
 Replay:
 - exchanging the same `proof_token` twice must return `409 REPLAY_DETECTED`.
 
+## Optional: post-purchase invitation tokens (recommended for browser flows)
+
+If you need a browser-safe link/token (e.g. order confirmation page) without leaking `X-Internal-Key`,
+use an `invitation_token`:
+
+1) An upstream server (connector/order service) calls the proof issuer (internal-only) to mint an invitation:
+   - `POST /internal/reviews/v1/invitation/issue` (`X-Internal-Key` required)
+   - returns `invitation_token`
+2) The browser/client submits that `invitation_token` to the reviews backend exchange endpoint:
+   - `POST /buyer/reviews/v1/verification/exchange`
+   - `Authorization: Bearer <invitation_token>`
+3) The reviews backend calls the proof issuer internally to exchange invitation → proof, then proceeds as usual.
+
+Notes:
+- Proof issuer must have `REVIEWS_BUYER_INVITATION_SIGNING_SECRET` set.
+- Reviews backend must be configured with:
+  - `REVIEWS_PROOF_ISSUER_BASE_URL`
+  - `REVIEWS_PROOF_ISSUER_INTERNAL_KEY` (or reuse `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`)
+- Replay is enforced by reusing the same `jti` between invitation and proof tokens (2nd exchange returns 409).
+
 ## Multi-platform rules
 
 The only platform-specific field that flows into Reviews is:
@@ -85,4 +105,3 @@ From `pivota-backend/`:
 - `./scripts/smoke_reviews_proof_issuer_exchange.sh`
 - `./scripts/smoke_buyer_review_via_proof_issuer.sh`
 - `./scripts/run_reviews_staging_checklist.sh`
-

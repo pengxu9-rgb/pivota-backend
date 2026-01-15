@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
 
+import httpx
 from fastapi import HTTPException, Request
 
 from db.database import database
@@ -88,6 +89,46 @@ def _proof_signing_secret() -> bytes:
     if not raw:
         raise HTTPException(status_code=503, detail="BUYER_SUBMIT_PROOF_DISABLED")
     return raw.encode("utf-8")
+
+
+def _proof_issuer_base_url() -> str:
+    return (os.getenv("REVIEWS_PROOF_ISSUER_BASE_URL") or "").strip()
+
+
+def _proof_issuer_internal_key() -> str:
+    return (os.getenv("REVIEWS_PROOF_ISSUER_INTERNAL_KEY") or os.getenv("REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY") or "").strip()
+
+
+async def _exchange_invitation_token_for_proof_token(invitation_token: str) -> str:
+    base = _proof_issuer_base_url().rstrip("/")
+    key = _proof_issuer_internal_key()
+    if not base or not key:
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+
+    url = f"{base}/internal/reviews/v1/invitation/exchange"
+    headers = {"X-Internal-Key": key, "Content-Type": "application/json"}
+    payload = {"invitation_token": (invitation_token or "").strip()}
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+    except Exception:
+        raise HTTPException(status_code=503, detail="PROOF_ISSUER_UNAVAILABLE")
+
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+        except Exception:
+            raise HTTPException(status_code=503, detail="PROOF_ISSUER_UNAVAILABLE")
+        proof_token = str(data.get("proof_token") or "").strip()
+        if not proof_token:
+            raise HTTPException(status_code=503, detail="PROOF_ISSUER_UNAVAILABLE")
+        return proof_token
+
+    if resp.status_code in {401, 403}:
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+
+    raise HTTPException(status_code=503, detail="PROOF_ISSUER_UNAVAILABLE")
 
 
 def buyer_submit_enabled() -> bool:
@@ -363,7 +404,17 @@ async def exchange_proof_for_submission_token(
     if not buyer_submit_enabled():
         raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
 
-    verified = verify_proof_token(proof_token)
+    try:
+        verified = verify_proof_token(proof_token)
+    except HTTPException as e:
+        # Backward compatible: accept invitation tokens iff proof issuer wiring is configured.
+        if e.status_code != 401:
+            raise
+        if not _proof_issuer_base_url() or not _proof_issuer_internal_key():
+            raise
+        exchanged = await _exchange_invitation_token_for_proof_token(proof_token)
+        proof_token = exchanged
+        verified = verify_proof_token(proof_token)
     if not buyer_submit_merchant_allowed(verified.merchant_id):
         raise HTTPException(status_code=403, detail="NOT_ALLOWED")
 

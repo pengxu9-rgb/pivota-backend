@@ -26,6 +26,7 @@ Security note:
 
 ### Reviews backend
 - `REVIEWS_BUYER_PROOF_SIGNING_SECRET`: validates proof tokens from the issuer
+- (optional, to accept `invitation_token` at `/buyer/reviews/v1/verification/exchange`): `REVIEWS_PROOF_ISSUER_BASE_URL`, `REVIEWS_PROOF_ISSUER_INTERNAL_KEY` (or reuse `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`)
 - `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST`: comma-separated merchant ids for canary (empty = allow all)
 - `REVIEWS_MEDIA_SIGNING_SECRET`: signs `/review-media` URLs
 - `JWT_SECRET_KEY`: employee JWT signing secret (used by smoke scripts)
@@ -33,6 +34,7 @@ Security note:
 ### Proof issuer
 - `REVIEWS_BUYER_PROOF_SIGNING_SECRET`: must match the reviews backend secret
 - `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`: internal auth for minting proofs
+- (optional): `REVIEWS_BUYER_INVITATION_SIGNING_SECRET` (required if issuing `invitation_token`)
 - `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST`: (optional) canary allowlist, recommended to match backend
 
 ## One-shot validation
@@ -61,6 +63,19 @@ The checklist covers:
 - entry layer `list_review_entrypoints` + `resolve_review_intent(write)`
 - issuer→exchange replay protection
 - buyer E2E: proof→exchange→create→upload→approve→visible→signed media 200/304 + signature negative tests
+
+Optional invitation flow:
+
+```bash
+RUN_INVITATION_FLOW=true \
+REVIEWS_BASE_URL="https://pivota-backend-production.up.railway.app" \
+PROOF_ISSUER_BASE_URL="https://proof-issuer-production.up.railway.app" \
+MERCHANT_ID="<merchant_id>" \
+PLATFORM="shopify" \
+PLATFORM_PRODUCT_ID="<product_id>" \
+VARIANT_ID="<variant_id_or_empty>" \
+/bin/bash scripts/run_reviews_staging_checklist.sh
+```
 
 ## Proof issuer deployment (Railway)
 

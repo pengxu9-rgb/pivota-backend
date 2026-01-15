@@ -17,7 +17,10 @@ Security note:
 - Confirm secrets are set:
   - Both: `REVIEWS_BUYER_PROOF_SIGNING_SECRET` (must match)
   - Proof issuer only: `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`
+  - Proof issuer only (optional, for invitation tokens): `REVIEWS_BUYER_INVITATION_SIGNING_SECRET`
   - Reviews backend: `REVIEWS_MEDIA_SIGNING_SECRET`, `JWT_SECRET_KEY`
+- If you want the reviews backend to accept `invitation_token` at `/buyer/reviews/v1/verification/exchange`:
+  - Reviews backend: `REVIEWS_PROOF_ISSUER_BASE_URL`, `REVIEWS_PROOF_ISSUER_INTERNAL_KEY` (or reuse `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`)
 - Confirm canary gating is configured on reviews backend:
   - `REVIEWS_BUYER_SUBMIT_ENABLED=true`
   - `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST=<comma-separated merchant ids>`
@@ -42,6 +45,19 @@ This verifies:
 - proof issuer → exchange replay protection (2nd exchange returns 409)
 - buyer write end-to-end: `under_review → employee approve → active visible via read path`
 - signed media: `200 + ETag`, `304`, missing sig → `403`, tamper exp → `403`
+
+Optional (invitation token path):
+
+```bash
+cd pivota-backend
+PROOF_ISSUER_BASE_URL="https://<proof-issuer-host>" \
+REVIEWS_BASE_URL="https://<reviews-host>" \
+MERCHANT_ID="<canary_merchant_id>" \
+PLATFORM="shopify" \
+PLATFORM_PRODUCT_ID="<product_id>" \
+VARIANT_ID="<variant_id_or_empty>" \
+./scripts/smoke_buyer_review_via_invitation.sh
+```
 
 ## Stage 2 — Canary gating checks (P0)
 

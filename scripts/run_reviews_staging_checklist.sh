@@ -69,4 +69,11 @@ PROOF_ISSUER_BASE_URL="$PROOF_ISSUER_BASE_URL" REVIEWS_BASE_URL="$REVIEWS_BASE_U
   /bin/bash "$(dirname "${BASH_SOURCE[0]}")/smoke_buyer_review_via_proof_issuer.sh"
 echo
 
+if [[ "${RUN_INVITATION_FLOW:-}" == "true" ]]; then
+  echo "== [E] buyer E2E via invitation token (optional) =="
+  PROOF_ISSUER_BASE_URL="$PROOF_ISSUER_BASE_URL" REVIEWS_BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" \
+    /bin/bash "$(dirname "${BASH_SOURCE[0]}")/smoke_buyer_review_via_invitation.sh"
+  echo
+fi
+
 echo "ALL OK"
