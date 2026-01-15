@@ -590,19 +590,35 @@ async def _claim_idempotency_key(
     if existing:
         if str(existing["request_hash"] or "") != request_hash:
             return None, True
-        rid = existing.get("review_id")
+        rid = _row_get(existing, "review_id")
         return (int(rid) if rid is not None else None), False
 
-    await database.execute(
-        buyer_review_idempotency_keys.insert().values(
-            merchant_id=merchant_id,
-            idempotency_key_hash=key_hash,
-            request_hash=request_hash,
-            review_id=None,
-            created_at=datetime.now(timezone.utc),
+    try:
+        await database.execute(
+            buyer_review_idempotency_keys.insert().values(
+                merchant_id=merchant_id,
+                idempotency_key_hash=key_hash,
+                request_hash=request_hash,
+                review_id=None,
+                created_at=datetime.now(timezone.utc),
+            )
         )
-    )
-    return None, False
+        return None, False
+    except Exception:
+        # Best-effort race handling: if another request inserted the idempotency row,
+        # re-read and treat it as a replay/conflict instead of throwing 500.
+        existing = await database.fetch_one(
+            buyer_review_idempotency_keys.select().where(
+                (buyer_review_idempotency_keys.c.merchant_id == merchant_id)
+                & (buyer_review_idempotency_keys.c.idempotency_key_hash == key_hash)
+            )
+        )
+        if existing:
+            if str(existing["request_hash"] or "") != request_hash:
+                return None, True
+            rid = _row_get(existing, "review_id")
+            return (int(rid) if rid is not None else None), False
+        raise
 
 
 async def _bind_idempotency_to_review(
