@@ -61,8 +61,17 @@ _snapshot_metrics() {
     echo "metrics_skip=1 (missing METRICS_BEARER_TOKEN)"
     return 0
   fi
-  curl -sS -H "Authorization: Bearer $METRICS_BEARER_TOKEN" "$REVIEWS_BASE_URL/metrics" \
-  | python3 - <<'PY'
+  local resp
+  resp="$(curl -sS -H "Authorization: Bearer $METRICS_BEARER_TOKEN" "$REVIEWS_BASE_URL/metrics" || true)"
+  if [[ -z "$resp" ]]; then
+    echo "metrics_skip=1 (empty response)"
+    return 0
+  fi
+  if ! printf '%s' "$resp" | grep -q '^# HELP '; then
+    echo "metrics_skip=1 (forbidden or unexpected response)"
+    return 0
+  fi
+  printf '%s' "$resp" | python3 - <<'PY'
 import re,sys
 text=sys.stdin.read().splitlines()
 families=["reviews_buyer_exchange_total","reviews_buyer_create_total","reviews_buyer_media_upload_total"]
