@@ -94,6 +94,15 @@ Create a periodic cleanup job for replay/idempotency tables:
 Validate once:
 - Trigger the job manually ("Run now") and confirm logs show `ok=1` and `deleted_*` counts.
 
+If you don't see Cron/Job in Railway UI:
+- Some Railway plans hide native Cron/Job UI. Use one of these fallbacks:
+  - **Railway Functions**: create a scheduled function with a cron expression (project-level “Functions”).
+  - **Worker service loop** (works on any plan): create an “Empty Service” and set the start command to:
+
+```bash
+bash -lc 'set -euo pipefail; while true; do python3 scripts/cleanup_buyer_submission_tables.py --apply; sleep 21600; done'
+```
+
 ## Rollout guidance (canary → prod)
 
 1. Keep buyer write entrypoint gated by `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST`.

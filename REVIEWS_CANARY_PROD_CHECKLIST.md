@@ -117,6 +117,11 @@ Railway setup (UI):
 - Set the start command to the job command above.
 - Run once manually ("Run now") and confirm logs show `ok=1` and `deleted_*` counts.
 
+If Cron/Job UI is not available in your Railway plan:
+- Use a dedicated **worker service** with a sleep loop:
+  - start command: `bash -lc 'set -euo pipefail; while true; do python3 scripts/cleanup_buyer_submission_tables.py --apply; sleep 21600; done'`
+  - ensure `DATABASE_URL` is set for that service.
+
 ## Stage 4 — Rollout to prod (P0)
 
 1. Deploy both services to prod with `REVIEWS_BUYER_SUBMIT_ENABLED=false` (dark launch).
