@@ -59,6 +59,22 @@ def _get_order_create_lock(key: str) -> asyncio.Lock:
     return lock
 
 
+def _is_asyncpg_operation_in_progress_error(err: BaseException) -> bool:
+    """
+    asyncpg raises `InterfaceError: cannot perform operation: another operation is in progress`
+    when a connection is poisoned/busy (often after cancellations/timeouts). Treat as transient.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = err
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur)
+        if "another operation is in progress" in msg:
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -1399,7 +1415,23 @@ async def agent_create_order(
 
         # 调用标准订单创建 (serialize per-merchant to avoid concurrent order creation hazards)
         async with _get_order_create_lock(order_request.merchant_id):
-            order_response = await create_new_order(order_request, background_tasks)
+            try:
+                order_response = await create_new_order(order_request, background_tasks)
+            except Exception as e:
+                # Emergency self-heal: if a pooled asyncpg connection is in a poisoned/busy state,
+                # reset the pool and retry once. Idempotency keys (when present) prevent duplicates.
+                if _is_asyncpg_operation_in_progress_error(e):
+                    try:
+                        logger.warning(
+                            "[agent_orders_create] asyncpg connection busy; resetting DB pool and retrying once"
+                        )
+                        await database.disconnect()
+                        await database.connect()
+                    except Exception:
+                        pass
+                    order_response = await create_new_order(order_request, background_tasks)
+                else:
+                    raise
 
         # PCS v0.2-b (best-effort): emit internal fact for reducer replay (no PII).
         try:
