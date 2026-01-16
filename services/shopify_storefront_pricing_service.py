@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+import base64
 import hashlib
 import httpx
 import json
@@ -28,6 +29,11 @@ def _d(v: Any) -> Decimal:
 
 def _gid(kind: str, numeric_id: str) -> str:
     return f"gid://shopify/{kind}/{numeric_id}"
+
+
+def _storefront_id(kind: str, numeric_id: str) -> str:
+    # Storefront GraphQL IDs are opaque (base64) strings, not raw gid://... URIs.
+    return base64.b64encode(_gid(kind, numeric_id).encode("utf-8")).decode("utf-8")
 
 
 def _extract_storefront_token(store: Dict[str, Any]) -> Optional[str]:
@@ -424,7 +430,7 @@ class ShopifyStorefrontPricingService:
             # without needing ProductVariant read scopes.
             lines.append(
                 {
-                    "merchandiseId": _gid("ProductVariant", variant_id),
+                    "merchandiseId": _storefront_id("ProductVariant", variant_id),
                     "quantity": qty,
                     "attributes": [{"key": "pivota_variant_id", "value": variant_id}],
                 }
@@ -844,7 +850,7 @@ mutation($cartId: ID!, $selectedDeliveryOptions: [CartSelectedDeliveryOptionInpu
         if not unique:
             return []
 
-        gids = [_gid("ProductVariant", vid) for vid in unique]
+        ids = [_storefront_id("ProductVariant", vid) for vid in unique]
         if country:
             # IMPORTANT: cart pricing can be in the buyer's presentment currency (based on buyerIdentity country).
             # Without `@inContext(country: ...)`, variant prices returned by nodes() default to shop currency,
@@ -860,7 +866,7 @@ query($ids: [ID!]!, $country: CountryCode!) @inContext(country: $country) {
   }
 }
 """
-            variables = {"ids": gids, "country": country}
+            variables = {"ids": ids, "country": country}
         else:
             query = """
 query($ids: [ID!]!) {
@@ -873,7 +879,7 @@ query($ids: [ID!]!) {
   }
 }
 """
-            variables = {"ids": gids}
+            variables = {"ids": ids}
 
         data = await self._storefront_graphql(
             shop_domain=shop_domain,
@@ -883,13 +889,13 @@ query($ids: [ID!]!) {
             debug_id=debug_id,
         )
         nodes = data.get("nodes") or []
-        price_by_gid: Dict[str, Dict[str, Any]] = {}
+        price_by_id: Dict[str, Dict[str, Any]] = {}
         for n in nodes:
             if not isinstance(n, dict):
                 continue
-            gid = n.get("id")
-            if gid:
-                price_by_gid[str(gid)] = n
+            node_id = n.get("id")
+            if node_id:
+                price_by_id[str(node_id)] = n
 
         out: List[Dict[str, Any]] = []
         for it in items or []:
@@ -897,8 +903,8 @@ query($ids: [ID!]!) {
             qty = int(it.get("quantity") or 0)
             if not vid or qty <= 0:
                 continue
-            gid = _gid("ProductVariant", vid)
-            node = price_by_gid.get(gid) or {}
+            node_id = _storefront_id("ProductVariant", vid)
+            node = price_by_id.get(node_id) or {}
             price = (node.get("price") or {}) if isinstance(node, dict) else {}
             compare = (node.get("compareAtPrice") or {}) if isinstance(node, dict) else {}
             unit = _d(price.get("amount"))
