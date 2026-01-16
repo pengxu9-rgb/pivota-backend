@@ -21,6 +21,7 @@ from __future__ import annotations
 import hmac
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response
@@ -58,6 +59,28 @@ def _proof_issuer_internal_key() -> str:
         (os.getenv("REVIEWS_PROOF_ISSUER_INTERNAL_KEY") or "").strip()
         or (os.getenv("REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY") or "").strip()
     )
+
+def _invitation_link_base_url() -> str:
+    """
+    Optional base URL for buyer review submission UI.
+
+    If set, responses from invitation issuance endpoints include `invitation_url` as:
+      {base}#invitation_token=<token>
+
+    Using the URL fragment reduces accidental leakage via Referer headers.
+    """
+    return (os.getenv("REVIEWS_BUYER_INVITATION_LINK_BASE_URL") or "").strip()
+
+
+def _invitation_url_for_token(invitation_token: str) -> Optional[str]:
+    base = _invitation_link_base_url().strip()
+    if not base:
+        return None
+    b = base.rstrip("#")
+    t = (invitation_token or "").strip()
+    if not t:
+        return None
+    return f"{b}#invitation_token={quote(t, safe='')}"
 
 
 async def _mint_invitation_via_proof_issuer(
@@ -102,7 +125,11 @@ async def _mint_invitation_via_proof_issuer(
     if not token or not exp:
         raise HTTPException(status_code=503, detail="PROOF_ISSUER_UNAVAILABLE")
 
-    return {"invitation_token": token, "expires_at": exp}
+    out: Dict[str, Any] = {"invitation_token": token, "expires_at": exp}
+    url = _invitation_url_for_token(token)
+    if url:
+        out["invitation_url"] = url
+    return out
 
 def _order_is_paid(order: Dict[str, Any]) -> bool:
     payment_status = str(order.get("payment_status") or "").strip().lower()
