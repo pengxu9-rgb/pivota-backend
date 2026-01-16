@@ -620,6 +620,38 @@ async def create_new_order(
                 tax = parse_decimal_money(pricing.get("tax"))
                 total = parse_decimal_money(pricing.get("total"))
 
+                if total <= 0:
+                    fallback_subtotal = Decimal("0")
+                    try:
+                        raw_line_items = (snap.get("line_items") or []) if isinstance(snap, dict) else []
+                        if isinstance(raw_line_items, list) and raw_line_items:
+                            for li in raw_line_items:
+                                if not isinstance(li, dict):
+                                    continue
+                                try:
+                                    qty = int(li.get("quantity") or 0)
+                                except Exception:
+                                    qty = 0
+                                if qty <= 0:
+                                    continue
+                                unit = (
+                                    li.get("unit_price_effective")
+                                    or li.get("unit_price_original")
+                                    or li.get("price")
+                                    or 0
+                                )
+                                fallback_subtotal += parse_decimal_money(unit) * Decimal(qty)
+                    except Exception:
+                        fallback_subtotal = Decimal("0")
+
+                    if fallback_subtotal > 0 and subtotal <= 0:
+                        logger.warning(
+                            "[QuoteFirst] Quote snapshot pricing subtotal/total is zero; falling back to quote line_items",
+                            extra={"merchant_id": order_request.merchant_id, "quote_id": quote.quote_id},
+                        )
+                        subtotal = fallback_subtotal
+                        total = max(Decimal("0"), subtotal - discount_total) + shipping_fee + tax
+
                 pricing_quote_meta = {
                     "quote_id": quote.quote_id,
                     "expires_at": quote.expires_at.isoformat() if quote.expires_at else None,
