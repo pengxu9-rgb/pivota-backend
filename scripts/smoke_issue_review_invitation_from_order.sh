@@ -55,13 +55,40 @@ body={"merchant_id":mid,"order_id":oid,"ttl_seconds":86400,"platform_product_id"
 if vid:
   body["variant_id"]=vid
 print(json.dumps(body,separators=(",",":")))' )"
-ISSUE_RESP="$(curl --http1.1 --max-time 20 -sS -H "Content-Type: application/json" -H "X-Internal-Key: $X_INTERNAL_KEY" \
+_tmp_issue_body="$(mktemp "${TMPDIR:-/tmp}/reviews_inv_issue_body.XXXXXX")"
+_tmp_issue_hdr="$(mktemp "${TMPDIR:-/tmp}/reviews_inv_issue_hdr.XXXXXX")"
+ISSUE_HTTP="$(curl --http1.1 --max-time 20 -sS -D "$_tmp_issue_hdr" -o "$_tmp_issue_body" -w "%{http_code}" \
+  -H "Content-Type: application/json" -H "X-Internal-Key: $X_INTERNAL_KEY" \
   -d "$ISSUE_BODY" \
-  "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/issue-from-order")"
+  "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/issue-from-order" || true)"
+ISSUE_RESP="$(cat "$_tmp_issue_body" 2>/dev/null || true)"
 
 INV_FP="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json,hashlib; o=json.load(sys.stdin); t=o.get("invitation_token",""); print(hashlib.sha256(t.encode()).hexdigest()[:12] if t else "")' 2>/dev/null || true)"
-[[ -z "$INV_FP" ]] && { echo "ERROR: failed to issue invitation_token" >&2; exit 1; }
+if [[ "$ISSUE_HTTP" != "200" || -z "$INV_FP" ]]; then
+  echo "ERROR: failed to issue invitation_token (http_status=${ISSUE_HTTP:-})" >&2
+  echo "--- headers (first 20) ---" >&2
+  head -n 20 "$_tmp_issue_hdr" >&2 || true
+  if [[ -n "$ISSUE_RESP" ]]; then
+    if printf '%s' "$ISSUE_RESP" | head -c 1 | grep -q '{'; then
+      echo "--- body keys/detail ---" >&2
+      printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json
+o=json.load(sys.stdin)
+print("keys=", sorted(list(o.keys()))[:20])
+print("detail=", o.get("detail"))
+err=o.get("error") or {}
+if isinstance(err, dict):
+  print("error.code=", err.get("code"))
+  print("error.message=", err.get("message"))' >&2 || true
+    else
+      echo "--- body (first 256B) ---" >&2
+      printf '%s' "$ISSUE_RESP" | head -c 256 >&2 || true
+    fi
+  fi
+  rm -f "$_tmp_issue_body" "$_tmp_issue_hdr" || true
+  exit 1
+fi
 echo "issue_ok invitation_fp=$INV_FP"
+rm -f "$_tmp_issue_body" "$_tmp_issue_hdr" || true
 
 echo "== exchange invitation -> submission_token =="
 INVITATION_TOKEN="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("invitation_token",""))' 2>/dev/null || true)"
