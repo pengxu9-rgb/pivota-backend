@@ -42,6 +42,7 @@ from catalog.recommendation_meta import derive_recommendation_meta
 from db.products import upsert_product_cache, touch_products_cache_ttl
 from db.platform_import_reports import get_platform_report
 from db.platform_orders import insert_platform_order
+from db.database import database
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus, validate_orderable
 from adapters.product_adapters import ShopifyProductAdapter
 
@@ -194,6 +195,53 @@ def _parse_shopify_next_page_info(link_header: Optional[str]) -> Optional[str]:
         if page_info_values:
             return page_info_values[0]
     return None
+
+
+async def _best_effort_update_store_product_count(
+    *,
+    merchant_id: str,
+    platform: str,
+    product_count: int,
+) -> None:
+    """
+    Keep merchant_stores.product_count in sync with background imports so the merchant
+    portal doesn't show 0 products while products_cache is being populated.
+    """
+    try:
+        mid = str(merchant_id or "").strip()
+        plat = str(platform or "").strip().lower()
+        if not mid or not plat:
+            return
+
+        row = await database.fetch_one(
+            """
+            SELECT store_id
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND status IN ('active', 'connected')
+            ORDER BY connected_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {"merchant_id": mid, "platform": plat},
+        )
+        if not row:
+            return
+        store_id = row.get("store_id")
+        if not store_id:
+            return
+
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET product_count = :count, last_sync = CURRENT_TIMESTAMP
+            WHERE store_id = :store_id
+            """,
+            {"count": int(product_count or 0), "store_id": store_id},
+        )
+    except Exception:
+        # Never block import completion on a dashboard-only update.
+        return
 
 
 async def _fetch_shopify_products_page(
@@ -863,6 +911,11 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                     counts=counts,
                     attempt=attempt,
                 )
+                await _best_effort_update_store_product_count(
+                    merchant_id=merchant_id,
+                    platform="shopify",
+                    product_count=succeeded,
+                )
 
                 logger.info(
                     "Shopify page imported",
@@ -945,6 +998,11 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                     counts=counts,
                     attempt=attempt,
                     next_run_at=next_run_at,
+                )
+                await _best_effort_update_store_product_count(
+                    merchant_id=merchant_id,
+                    platform="shopify",
+                    product_count=succeeded,
                 )
 
                 return {
@@ -1216,6 +1274,12 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         await mark_import_task_succeeded(task_id, counts=counts)
+        if connector == "shopify":
+            await _best_effort_update_store_product_count(
+                merchant_id=merchant_id,
+                platform="shopify",
+                product_count=int(counts.get("succeeded") or 0),
+            )
 
         return {
             "processed": True,

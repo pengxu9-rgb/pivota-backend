@@ -183,6 +183,7 @@ async def get_merchant_stores(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     stores = []
+    cache_counts_by_platform: Dict[str, int] = {}
     
     # Try to read from database
     try:
@@ -204,11 +205,35 @@ async def get_merchant_stores(
         """
         
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
+
+        # Derive product counts from products_cache so the UI isn't blocked on
+        # merchant_stores.product_count being updated by background import workers.
+        try:
+            cache_rows = await database.fetch_all(
+                """
+                SELECT platform, COUNT(*) AS active_cached
+                FROM products_cache
+                WHERE merchant_id = :merchant_id
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                GROUP BY platform
+                """,
+                {"merchant_id": merchant_id},
+            )
+            for r in cache_rows or []:
+                plat = (r.get("platform") or "").strip().lower()
+                if plat:
+                    cache_counts_by_platform[plat] = int(r.get("active_cached") or 0)
+        except Exception:
+            cache_counts_by_platform = {}
+
         print(f"DEBUG get_merchant_stores: Found {len(rows)} stores")
         for row in rows:
             is_active = row["status"] == "active"
             has_api_key = row["api_key_present"]
             is_connected = is_active and has_api_key
+            platform = (row["platform"] or "").strip().lower()
+            cached_count = cache_counts_by_platform.get(platform, 0)
+            display_count = cached_count if cached_count > 0 else (row["product_count"] or 0)
             
             stores.append({
                 "id": row["store_id"],
@@ -222,7 +247,8 @@ async def get_merchant_stores(
                 "shop_domain": row["domain"],  # Alias for compatibility
                 "connected_at": row["connected_at"],
                 "last_sync": row["last_sync"],
-                "product_count": row["product_count"] or 0
+                "product_count": display_count,
+                "product_count_source": "products_cache" if cached_count > 0 else "merchant_stores"
             })
     except Exception as e:
         print(f"Database error: {e}")
