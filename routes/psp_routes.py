@@ -6,6 +6,7 @@ from db.orders import get_order, mark_order_paid
 from db.products import log_order_event
 from config.settings import settings
 from utils.logger import logger
+import asyncio
 import hmac
 import hashlib
 import json
@@ -127,6 +128,14 @@ async def adyen_webhook(
                             logger.info(
                                 f"Order {order_id} marked as paid via Adyen webhook"
                             )
+                            try:
+                                from routes.order_routes import create_shopify_order
+
+                                asyncio.create_task(create_shopify_order(order_id))
+                            except Exception as shopify_err:
+                                logger.warning(
+                                    f"[AdyenWebhook] create_shopify_order best-effort failed for {order_id}: {shopify_err}"
+                                )
                         elif not order:
                             logger.error(
                                 f"[AdyenWebhook] no order found for {order_id}; cannot mark paid"
