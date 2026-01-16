@@ -61,9 +61,25 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
                 # If we can't parse it, return the original response body.
                 return JSONResponse(status_code=response.status_code, content={"detail": body.decode("utf-8", errors="replace")})
 
+            def _filtered_headers(raw_headers) -> dict:
+                out = {}
+                try:
+                    for k, v in dict(raw_headers).items():
+                        lk = str(k).lower()
+                        if lk in {"content-length", "content-encoding", "transfer-encoding"}:
+                            continue
+                        out[k] = v
+                except Exception:
+                    return {}
+                return out
+
             # Already normalized
             if isinstance(payload, dict) and payload.get("status") == "error" and "error" in payload:
-                return JSONResponse(status_code=response.status_code, content=payload, headers=dict(response.headers))
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content=payload,
+                    headers=_filtered_headers(response.headers),
+                )
 
             # FastAPI default error shapes
             if isinstance(payload, dict) and "detail" in payload:
@@ -102,9 +118,13 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         request_id = getattr(request.state, "request_id", None)
         out_headers = {}
         try:
-            out_headers.update(dict(headers))
+            for k, v in dict(headers).items():
+                lk = str(k).lower()
+                if lk in {"content-length", "content-encoding", "transfer-encoding"}:
+                    continue
+                out_headers[k] = v
         except Exception:
-            pass
+            out_headers = {}
         # NOTE: Do not set X-Request-Id here; StructuredLoggingMiddleware already
         # injects X-Request-ID. Setting both variants can produce duplicate
         # `x-request-id` headers after HTTP/2 normalization.
