@@ -15,6 +15,7 @@ import time
 from db.database import database
 from services.merchant_store_service import get_primary_store
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingResult
+from services.shopify_transactions_service import extract_shopify_access_token
 from utils.logger import logger
 
 
@@ -81,6 +82,86 @@ class StorefrontCartResult:
     unit_price_by_variant_id: Dict[str, Decimal]
 
 
+_STOREFRONT_ROTATE_ATTEMPTED_AT: Dict[str, float] = {}
+
+
+def _rotate_allowed(*, merchant_id: str, cooldown_s: int) -> bool:
+    now = time.time()
+    last = _STOREFRONT_ROTATE_ATTEMPTED_AT.get(merchant_id, 0.0)
+    if (now - last) < float(max(cooldown_s, 0)):
+        return False
+    _STOREFRONT_ROTATE_ATTEMPTED_AT[merchant_id] = now
+    return True
+
+
+def _is_invalid_merchandise_id(err: ShopifyPricingError) -> bool:
+    try:
+        details = getattr(err, "details", {}) or {}
+        user_errors = details.get("user_errors") or []
+        if not isinstance(user_errors, list):
+            return False
+        for ue in user_errors:
+            if not isinstance(ue, dict):
+                continue
+            msg = str(ue.get("message") or "")
+            field = ue.get("field") or []
+            code = str(ue.get("code") or "").upper()
+            if code == "INVALID" and "merchandise" in msg.lower() and "does not exist" in msg.lower():
+                return True
+            if isinstance(field, list) and any(str(p).lower() == "merchandiseid" for p in field):
+                if "does not exist" in msg.lower():
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+async def _rotate_storefront_token_best_effort(
+    *,
+    merchant_id: str,
+    store_id: Optional[str],
+    shop_domain: str,
+    admin_access_token: str,
+    existing_credentials: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    Best-effort: create a new Storefront token and persist it for the store row.
+    This helps when Storefront scopes were enabled AFTER the original token was issued.
+    """
+    try:
+        url = f"https://{shop_domain}/admin/api/2024-07/storefront_access_tokens.json"
+        headers = {"X-Shopify-Access-Token": admin_access_token, "Content-Type": "application/json"}
+        payload = {"storefront_access_token": {"title": "Pivota Pricing"}}
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code not in (200, 201):
+            return None
+
+        data = resp.json() or {}
+        storefront = data.get("storefront_access_token") if isinstance(data, dict) else None
+        new_token = storefront.get("access_token") if isinstance(storefront, dict) else None
+        new_token = new_token.strip() if isinstance(new_token, str) and new_token.strip() else None
+        if not new_token:
+            return None
+
+        # Persist: merge into api_key JSON for this store row (when it's a real merchant_stores row).
+        if store_id and not str(store_id).startswith("legacy_"):
+            merged = dict(existing_credentials or {})
+            merged.setdefault("access_token", admin_access_token)
+            merged["storefront_access_token"] = new_token
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET api_key = :api_key, connected_at = CURRENT_TIMESTAMP
+                WHERE store_id = :store_id AND merchant_id = :merchant_id
+                """,
+                {"api_key": json.dumps(merged), "store_id": store_id, "merchant_id": merchant_id},
+            )
+        return new_token
+    except Exception:
+        return None
+
+
 class ShopifyStorefrontPricingService:
     """
     Pricing oracle backed by Shopify Storefront Cart API.
@@ -139,16 +220,49 @@ class ShopifyStorefrontPricingService:
             )
 
         use_buyer_country_for_pricing = self._use_buyer_country_for_pricing()
-        cart = await self._create_cart(
-            shop_domain=shop_domain,
-            storefront_token=storefront_token,
-            items=items,
-            discount_codes=discount_codes,
-            shipping_address=shipping_address,
-            selected_delivery_option=selected_delivery_option,
-            use_buyer_country_for_pricing=use_buyer_country_for_pricing,
-            debug_id=debug_id,
-        )
+        try:
+            cart = await self._create_cart(
+                shop_domain=shop_domain,
+                storefront_token=storefront_token,
+                items=items,
+                discount_codes=discount_codes,
+                shipping_address=shipping_address,
+                selected_delivery_option=selected_delivery_option,
+                use_buyer_country_for_pricing=use_buyer_country_for_pricing,
+                debug_id=debug_id,
+            )
+        except ShopifyPricingError as e:
+            # Self-heal common misconfig: Storefront scopes enabled after token issuance.
+            if _is_invalid_merchandise_id(e) and _rotate_allowed(
+                merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s
+            ):
+                admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
+                if admin_access_token and shop_domain:
+                    new_token = await _rotate_storefront_token_best_effort(
+                        merchant_id=merchant_id,
+                        store_id=store.get("store_id") if isinstance(store.get("store_id"), str) else None,
+                        shop_domain=shop_domain,
+                        admin_access_token=admin_access_token,
+                        existing_credentials=store.get("api_credentials") if isinstance(store.get("api_credentials"), dict) else None,
+                    )
+                    if new_token:
+                        storefront_token = new_token
+                        cart = await self._create_cart(
+                            shop_domain=shop_domain,
+                            storefront_token=storefront_token,
+                            items=items,
+                            discount_codes=discount_codes,
+                            shipping_address=shipping_address,
+                            selected_delivery_option=selected_delivery_option,
+                            use_buyer_country_for_pricing=use_buyer_country_for_pricing,
+                            debug_id=debug_id,
+                        )
+                    else:
+                        raise
+                else:
+                    raise
+            else:
+                raise
 
         country_for_prices = None
         if use_buyer_country_for_pricing and shipping_address and isinstance(shipping_address, dict):
