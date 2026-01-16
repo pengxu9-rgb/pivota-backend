@@ -1543,6 +1543,35 @@ async def create_shopify_order(order_id: str) -> bool:
             bool(full_name and full_name != "Customer"),
             shopify_shipping.get("country"),
         )
+
+        # Merchant PSP payments (e.g. Stripe) complete outside Shopify. Shopify's customer order
+        # confirmation email can show "Paid 0" unless a successful transaction exists at the time
+        # the email is generated. We embed a best-effort external transaction during order creation
+        # to keep the email accurate. We still run a post-create reconciliation (transactions API)
+        # afterwards for idempotency / late-binding payment refs.
+        psp_used_for_txn = str(order.get("psp_used") or merchant.get("psp_type") or "").strip().lower() or None
+        external_payment_ref = str(order.get("payment_intent_id") or "").strip() or None
+        currency_code = str(order.get("currency") or "").strip().upper() or "USD"
+        try:
+            order_total = Decimal(str(order.get("total") or "0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except Exception:
+            order_total = Decimal("0.00")
+
+        transactions_payload: List[Dict[str, Any]] = []
+        if order_total > 0:
+            txn: Dict[str, Any] = {
+                "kind": "sale",
+                "status": "success",
+                "amount": str(order_total),
+                "source_name": "external",
+                # Shopify expects a gateway string; fall back to "manual" if unknown.
+                "gateway": psp_used_for_txn or "manual",
+            }
+            if currency_code and len(currency_code) == 3:
+                txn["currency"] = currency_code
+            if external_payment_ref:
+                txn["authorization"] = external_payment_ref
+            transactions_payload = [txn]
         
         shopify_order_data = {
             "order": {
@@ -1554,6 +1583,7 @@ async def create_shopify_order(order_id: str) -> bool:
                     "last_name": last_name,
                     **({"email": customer_email} if customer_email else {}),
                 },
+                **({"transactions": transactions_payload} if transactions_payload else {}),
                 "financial_status": "paid",
                 "send_receipt": bool(customer_email),
                 "send_fulfillment_receipt": bool(customer_email),
@@ -1584,6 +1614,16 @@ async def create_shopify_order(order_id: str) -> bool:
         
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=shopify_order_data, headers=headers, timeout=10.0)
+            # Some Shopify configurations may reject embedded transactions on order create.
+            # Fall back to creating the order without transactions to preserve fulfillment,
+            # then the post-create reconciliation will attempt to add a transaction.
+            if response.status_code in (400, 401, 403, 422) and transactions_payload:
+                try:
+                    retry_payload = {"order": dict(shopify_order_data["order"])}
+                    retry_payload["order"].pop("transactions", None)
+                    response = await client.post(url, json=retry_payload, headers=headers, timeout=10.0)
+                except Exception:
+                    pass
             
             logger.info(f"[Shopify] API response: {response.status_code}")
             
