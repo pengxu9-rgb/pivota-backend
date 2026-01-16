@@ -739,7 +739,8 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                         merchant_id=merchant_id,
                         platform="shopify",
                         ttl_seconds=shopify_cache_ttl_seconds,
-                        include_expired=True,
+                        # Do not revive expired rows: we explicitly expire Shopify cache on store reconnect.
+                        include_expired=False,
                     )
                     counts["touched_existing_cache_rows"] = touched
                 except Exception as exc:
