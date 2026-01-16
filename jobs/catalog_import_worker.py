@@ -758,6 +758,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             page_info: Optional[str] = str(page_info_value) if page_info_value else None
 
             started_at = datetime.utcnow()
+            full_sync_started_at = started_at
             total = int(counts.get("total", 0) or 0)
             succeeded = int(counts.get("succeeded", 0) or 0)
             failed = int(counts.get("failed", 0) or 0)
@@ -977,6 +978,26 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                     "has_next_page": page_info is not None,
                 },
             )
+
+            # If we finished a full catalog run (no cursor remaining), expire any older
+            # cache rows that were not touched by this sync. This prevents inflated counts
+            # after store reconnects or interrupted historical imports.
+            if page_info is None and stop_reason is None:
+                try:
+                    expired = await database.execute(
+                        """
+                        UPDATE products_cache
+                        SET expires_at = NOW()
+                        WHERE merchant_id = :merchant_id
+                          AND platform = 'shopify'
+                          AND cached_at < :started_at
+                          AND (expires_at IS NULL OR expires_at > NOW())
+                        """,
+                        {"merchant_id": merchant_id, "started_at": full_sync_started_at},
+                    )
+                    counts["expired_stale_cache_rows"] = int(expired or 0)
+                except Exception:
+                    pass
 
             # If we still have a cursor, we didn't finish; schedule a continuation run.
             if page_info:
