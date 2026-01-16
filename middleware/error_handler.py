@@ -105,8 +105,9 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             out_headers.update(dict(headers))
         except Exception:
             pass
-        if request_id:
-            out_headers["X-Request-Id"] = request_id
+        # NOTE: Do not set X-Request-Id here; StructuredLoggingMiddleware already
+        # injects X-Request-ID. Setting both variants can produce duplicate
+        # `x-request-id` headers after HTTP/2 normalization.
 
         # Prefer explicit error-code hints from headers.
         hinted = None
@@ -181,7 +182,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         return JSONResponse(
             status_code=error.error_code.http_status,
             content=error_dict,
-            headers={"X-Request-Id": request_id} if request_id else {}
+            headers={}
         )
     
     def _handle_http_exception(self, request: Request, exc: HTTPException) -> JSONResponse:
@@ -217,7 +218,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         return JSONResponse(
             status_code=exc.status_code,
             content=error_dict,
-            headers={"X-Request-Id": request_id} if request_id else {}
+            headers={}
         )
     
     def _handle_validation_error(self, request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -244,7 +245,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         return JSONResponse(
             status_code=400,
             content=error_dict,
-            headers={"X-Request-Id": request_id} if request_id else {}
+            headers={}
         )
     
     def _handle_unexpected_error(self, request: Request, exc: Exception) -> JSONResponse:
@@ -291,7 +292,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         return JSONResponse(
             status_code=500,
             content=error_dict,
-            headers={"X-Request-Id": request_id} if request_id else {}
+            headers={}
         )
     
     def _map_status_to_error_code(self, status_code: int) -> ErrorCode:
