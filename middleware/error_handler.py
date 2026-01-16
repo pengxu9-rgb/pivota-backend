@@ -257,7 +257,8 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         error_dict = create_error_response(
             error_code=ErrorCode.INTERNAL_SERVER_ERROR,
             message="An unexpected error occurred",
-            details={"type": type(exc).__name__} if logger.level <= 10 else {},  # Only in debug mode
+            # Safe to expose: exception class name only (no message/traceback).
+            details={"type": type(exc).__name__},
             request_id=request_id
         )
         
