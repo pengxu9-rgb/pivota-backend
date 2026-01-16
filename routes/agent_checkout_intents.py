@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from routes.agent_auth import AgentContext, get_agent_context
 from db.database import database
 import uuid
+from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 
 
 router = APIRouter(prefix="/agent/v1/checkout", tags=["agent-checkout"])
@@ -164,7 +165,9 @@ async def create_checkout_intent(
                     "prefill": json.dumps(prefill, ensure_ascii=False),
                 },
             )
-        except Exception:
+        except Exception as e:
+            if is_asyncpg_busy_error(e):
+                raise db_busy_http_exception()
             # Attempt a one-time self-heal (create table + retry insert).
             try:
                 await _ensure_checkout_intents_table()
@@ -182,7 +185,9 @@ async def create_checkout_intent(
                         "prefill": json.dumps(prefill, ensure_ascii=False),
                     },
                 )
-            except Exception:
+            except Exception as e2:
+                if is_asyncpg_busy_error(e2):
+                    raise db_busy_http_exception()
                 intent_id = None
 
     token = mint_checkout_token(
@@ -259,7 +264,9 @@ async def get_checkout_prefill(
             """,
             {"intent_id": intent_id, "agent_id": context.agent_id},
         )
-    except Exception:
+    except Exception as e:
+        if is_asyncpg_busy_error(e):
+            raise db_busy_http_exception()
         return {"prefill": None}
 
     if not row:
