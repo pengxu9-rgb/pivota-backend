@@ -8,8 +8,8 @@ set -euo pipefail
 # - PROOF_ISSUER_BASE_URL (optional; used only for /__build sanity)
 # - MERCHANT_ID (required)
 # - ORDER_ID (required)
-# - PLATFORM_PRODUCT_ID (required; used for read-path visibility check)
-# - VARIANT_ID (optional)
+# - PLATFORM_PRODUCT_ID (optional; if omitted, uses the first subject from the issued invitation)
+# - VARIANT_ID (optional; only used when PLATFORM_PRODUCT_ID is provided)
 #
 # Prompts:
 # - X_INTERNAL_KEY: internal key for /internal/reviews/v1/invitation/issue-from-order
@@ -24,8 +24,8 @@ ORDER_ID="${ORDER_ID:-}"
 PLATFORM_PRODUCT_ID="${PLATFORM_PRODUCT_ID:-}"
 VARIANT_ID="${VARIANT_ID:-}"
 
-if [[ -z "$REVIEWS_BASE_URL" || -z "$MERCHANT_ID" || -z "$ORDER_ID" || -z "$PLATFORM_PRODUCT_ID" ]]; then
-  echo "ERROR: missing env: REVIEWS_BASE_URL, MERCHANT_ID, ORDER_ID, PLATFORM_PRODUCT_ID" >&2
+if [[ -z "$REVIEWS_BASE_URL" || -z "$MERCHANT_ID" || -z "$ORDER_ID" ]]; then
+  echo "ERROR: missing env: REVIEWS_BASE_URL, MERCHANT_ID, ORDER_ID" >&2
   exit 2
 fi
 
@@ -49,11 +49,13 @@ echo "== issue invitation_token from order =="
 ISSUE_BODY="$(python3 -c 'import json,os
 mid=os.environ["MERCHANT_ID"]
 oid=os.environ["ORDER_ID"]
-pp=os.environ["PLATFORM_PRODUCT_ID"]
+pp=(os.environ.get("PLATFORM_PRODUCT_ID") or "").strip()
 vid=(os.environ.get("VARIANT_ID") or "").strip()
-body={"merchant_id":mid,"order_id":oid,"ttl_seconds":86400,"platform_product_id":pp}
-if vid:
-  body["variant_id"]=vid
+body={"merchant_id":mid,"order_id":oid,"ttl_seconds":86400}
+if pp:
+  body["platform_product_id"]=pp
+  if vid:
+    body["variant_id"]=vid
 print(json.dumps(body,separators=(",",":")))' )"
 _tmp_issue_body="$(mktemp "${TMPDIR:-/tmp}/reviews_inv_issue_body.XXXXXX")"
 _tmp_issue_hdr="$(mktemp "${TMPDIR:-/tmp}/reviews_inv_issue_hdr.XXXXXX")"
@@ -90,6 +92,31 @@ fi
 echo "issue_ok invitation_fp=$INV_FP"
 rm -f "$_tmp_issue_body" "$_tmp_issue_hdr" || true
 
+echo "== select subject for downstream checks =="
+SUBJECT_JSON="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json
+o=json.load(sys.stdin)
+if isinstance(o.get("subject"), dict):
+  print(json.dumps(o["subject"], separators=(",",":")))
+  raise SystemExit(0)
+items=o.get("items") or []
+if isinstance(items, list) and items and isinstance(items[0], dict):
+  subj=items[0].get("subject")
+  if isinstance(subj, dict):
+    print(json.dumps(subj, separators=(",",":")))
+    raise SystemExit(0)
+print("")' 2>/dev/null || true)"
+if [[ -z "$SUBJECT_JSON" ]]; then
+  echo "ERROR: failed to extract subject from invitation response" >&2
+  exit 1
+fi
+echo "subject=$SUBJECT_JSON"
+
+PLATFORM_PRODUCT_ID_USED="$(printf '%s' "$SUBJECT_JSON" | python3 -c 'import sys,json; o=json.load(sys.stdin); print((o.get("platform_product_id") or "").strip())' 2>/dev/null || true)"
+VARIANT_ID_USED="$(printf '%s' "$SUBJECT_JSON" | python3 -c 'import sys,json; o=json.load(sys.stdin); print((o.get("variant_id") or "").strip())' 2>/dev/null || true)"
+PLATFORM_USED="$(printf '%s' "$SUBJECT_JSON" | python3 -c 'import sys,json; o=json.load(sys.stdin); print((o.get("platform") or "shopify").strip())' 2>/dev/null || true)"
+[[ -n "$PLATFORM_PRODUCT_ID_USED" ]] || { echo "ERROR: subject missing platform_product_id" >&2; exit 1; }
+echo "subject_platform=$PLATFORM_USED platform_product_id=$PLATFORM_PRODUCT_ID_USED variant_id=${VARIANT_ID_USED:-<none>}"
+
 echo "== exchange invitation -> submission_token =="
 INVITATION_TOKEN="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("invitation_token",""))' 2>/dev/null || true)"
 [[ -n "$INVITATION_TOKEN" ]] || { echo "ERROR: missing invitation_token in response" >&2; exit 1; }
@@ -108,12 +135,14 @@ echo "== create buyer review (under_review) =="
 IDEMPOTENCY_KEY="$(python3 -c 'import os,base64; print(base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("="))')"
 CREATE_BODY="$(python3 -c 'import json,os
 mid=os.environ["MERCHANT_ID"]
-pp=os.environ["PLATFORM_PRODUCT_ID"]
-vid=(os.environ.get("VARIANT_ID") or "").strip()
-body={"merchant_id":mid,"platform":"shopify","platform_product_id":pp,"rating":5,"title":"Works","body":"Works as expected."}
+pp=os.environ["PLATFORM_PRODUCT_ID_USED"]
+platform=(os.environ.get("PLATFORM_USED") or "shopify").strip() or "shopify"
+vid=(os.environ.get("VARIANT_ID_USED") or "").strip()
+body={"merchant_id":mid,"platform":platform,"platform_product_id":pp,"rating":5,"title":"Works","body":"Works as expected."}
 if vid:
   body["variant_id"]=vid
 print(json.dumps(body,separators=(",",":")))' )"
+PLATFORM_PRODUCT_ID_USED="$PLATFORM_PRODUCT_ID_USED" VARIANT_ID_USED="$VARIANT_ID_USED" PLATFORM_USED="$PLATFORM_USED" \
 CREATE_RESP="$(curl --http1.1 --max-time 20 -sS -H "Authorization: Bearer $SUBMISSION_TOKEN" -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
   -H "Content-Type: application/json" \
   -d "$CREATE_BODY" \
@@ -143,13 +172,15 @@ echo "approved_ok"
 echo "== read path visible? =="
 CHECK_BODY="$(python3 -c 'import json,os
 mid=os.environ["MERCHANT_ID"]
-pp=os.environ["PLATFORM_PRODUCT_ID"]
-vid=(os.environ.get("VARIANT_ID") or "").strip()
-sku={"merchant_id":mid,"platform":"shopify","platform_product_id":pp}
+pp=os.environ["PLATFORM_PRODUCT_ID_USED"]
+platform=(os.environ.get("PLATFORM_USED") or "shopify").strip() or "shopify"
+vid=(os.environ.get("VARIANT_ID_USED") or "").strip()
+sku={"merchant_id":mid,"platform":platform,"platform_product_id":pp}
 if vid:
   sku["variant_id"]=vid
 body={"operation":"list_sku_reviews","payload":{"sku":sku,"filters":{"limit":50}}}
 print(json.dumps(body,separators=(",",":")))' )"
+PLATFORM_PRODUCT_ID_USED="$PLATFORM_PRODUCT_ID_USED" VARIANT_ID_USED="$VARIANT_ID_USED" PLATFORM_USED="$PLATFORM_USED" \
 CHECK_RESP="$(curl --http1.1 --max-time 20 -sS -H "Content-Type: application/json" \
   -d "$CHECK_BODY" \
   "$REVIEWS_BASE_URL/agent/shop/v1/invoke")"
