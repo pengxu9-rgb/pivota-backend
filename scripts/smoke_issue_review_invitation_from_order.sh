@@ -133,7 +133,7 @@ SUBMISSION_TOKEN="$(printf '%s' "$EXCHANGE_RESP" | python3 -c 'import sys,json; 
 
 echo "== create buyer review (under_review) =="
 IDEMPOTENCY_KEY="$(python3 -c 'import os,base64; print(base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("="))')"
-CREATE_BODY="$(python3 -c 'import json,os
+CREATE_BODY="$(MERCHANT_ID="$MERCHANT_ID" PLATFORM_PRODUCT_ID_USED="$PLATFORM_PRODUCT_ID_USED" VARIANT_ID_USED="$VARIANT_ID_USED" PLATFORM_USED="$PLATFORM_USED" python3 -c 'import json,os
 mid=os.environ["MERCHANT_ID"]
 pp=os.environ["PLATFORM_PRODUCT_ID_USED"]
 platform=(os.environ.get("PLATFORM_USED") or "shopify").strip() or "shopify"
@@ -170,7 +170,7 @@ curl --http1.1 --max-time 20 -sS -H "Authorization: Bearer $EMP_TOKEN" -H "Conte
 echo "approved_ok"
 
 echo "== read path visible? =="
-CHECK_BODY="$(python3 -c 'import json,os
+CHECK_BODY="$(MERCHANT_ID="$MERCHANT_ID" PLATFORM_PRODUCT_ID_USED="$PLATFORM_PRODUCT_ID_USED" VARIANT_ID_USED="$VARIANT_ID_USED" PLATFORM_USED="$PLATFORM_USED" python3 -c 'import json,os
 mid=os.environ["MERCHANT_ID"]
 pp=os.environ["PLATFORM_PRODUCT_ID_USED"]
 platform=(os.environ.get("PLATFORM_USED") or "shopify").strip() or "shopify"
