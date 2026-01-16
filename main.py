@@ -82,6 +82,7 @@ from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
 from routes.platform_onboarding_routes import router as platform_onboarding_router
 from routes.merchant_dashboard_routes import router as merchant_dashboard_router  # Original with fallback - STABLE
+from routes.admin_catalog_debug import router as admin_catalog_debug_router
 from routes.merchant_analytics_routes import router as merchant_analytics_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
@@ -543,6 +544,7 @@ if settings.platform_onboarding_v2_enabled:
 else:
     logger.info("⚠️ Platform Onboarding v2 is disabled (feature flag is false)")
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
+app.include_router(admin_catalog_debug_router)  # Internal catalog debug
 app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
 app.include_router(payout_router)  # Payout management
