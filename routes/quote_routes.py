@@ -7,6 +7,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from services.quote_service import QuoteError, QuoteService, parse_decimal_money
 from mvp.constants import EVENT_OFFER_GENERATED, SURFACE_BACKEND
 from mvp.events import emit_best_effort
+from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 
 
 router = APIRouter(prefix="/agent/v1/quotes", tags=["agent-quotes"])
@@ -35,8 +36,18 @@ async def preview_quote(
     except QuoteError as e:
         raise HTTPException(
             status_code=503 if e.code == "SHOPIFY_PRICING_UNAVAILABLE" else 400,
-            detail={"error": e.code, "message": e.message, "debug_id": e.debug_id, "details": getattr(e, "details", {})},
+            headers={"Retry-After": "1"} if e.code == "SHOPIFY_PRICING_UNAVAILABLE" else None,
+            detail={
+                "error": e.code,
+                "message": e.message,
+                "debug_id": e.debug_id,
+                "details": getattr(e, "details", {}),
+            },
         )
+    except Exception as e:
+        if is_asyncpg_busy_error(e):
+            raise db_busy_http_exception()
+        raise
 
     pricing = result["pricing"]
     presentment_currency = result.get("presentment_currency") or result["currency"]

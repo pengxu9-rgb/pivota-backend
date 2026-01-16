@@ -44,6 +44,7 @@ import httpx
 import uuid
 
 from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
+from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
@@ -57,22 +58,6 @@ def _get_order_create_lock(key: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _ORDER_CREATE_LOCKS[key] = lock
     return lock
-
-
-def _is_asyncpg_operation_in_progress_error(err: BaseException) -> bool:
-    """
-    asyncpg raises `InterfaceError: cannot perform operation: another operation is in progress`
-    when a connection is poisoned/busy (often after cancellations/timeouts). Treat as transient.
-    """
-    seen: set[int] = set()
-    cur: BaseException | None = err
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        msg = str(cur)
-        if "another operation is in progress" in msg:
-            return True
-        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
-    return False
 
 
 # ============================================================================
@@ -1420,7 +1405,7 @@ async def agent_create_order(
             except Exception as e:
                 # Emergency self-heal: if a pooled asyncpg connection is in a poisoned/busy state,
                 # reset the pool and retry once. Idempotency keys (when present) prevent duplicates.
-                if _is_asyncpg_operation_in_progress_error(e):
+                if is_asyncpg_busy_error(e):
                     try:
                         logger.warning(
                             "[agent_orders_create] asyncpg connection busy; resetting DB pool and retrying once"
@@ -1429,7 +1414,12 @@ async def agent_create_order(
                         await database.connect()
                     except Exception:
                         pass
-                    order_response = await create_new_order(order_request, background_tasks)
+                    try:
+                        order_response = await create_new_order(order_request, background_tasks)
+                    except Exception as e2:
+                        if is_asyncpg_busy_error(e2):
+                            raise db_busy_http_exception()
+                        raise
                 else:
                     raise
 
@@ -1733,6 +1723,12 @@ async def agent_create_order(
         
     except HTTPException as e:
         success = False
+        # If the handler wrapped an asyncpg busy error into a 500, surface a retryable 503 instead.
+        try:
+            if is_asyncpg_busy_error(e):
+                raise db_busy_http_exception()
+        except Exception:
+            pass
         # Quote-first telemetry: capture quote drift diagnostics distribution (no PII).
         try:
             detail = getattr(e, "detail", None)
@@ -1812,6 +1808,8 @@ async def agent_create_order(
         raise
     except Exception as e:
         success = False
+        if is_asyncpg_busy_error(e):
+            raise db_busy_http_exception()
         logger.error(f"Agent order creation error: {e}")
         try:
             from mvp.constants import EVENT_CHECKOUT_FAILED, SURFACE_BACKEND
