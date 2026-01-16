@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 import traceback
 import json
+from pathlib import Path
 
 from utils.error_codes import ErrorCode, PivotaAPIError, create_error_response
 from utils.logger import logger
@@ -252,13 +253,38 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         
         # Log full traceback for debugging
         logger.error(f"Unexpected error traceback:\n{traceback.format_exc()}")
-        
-        # Don't expose internal details in production
+
+        details = {"type": type(exc).__name__}
+        try:
+            frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+            selected = None
+            for f in reversed(frames or []):
+                filename = str(f.filename or "")
+                if "/site-packages/" in filename or "\\site-packages\\" in filename:
+                    continue
+                if filename.endswith((".py", ".pyc")):
+                    selected = f
+                    break
+            if selected is None and frames:
+                selected = frames[-1]
+            if selected is not None:
+                details["at"] = f"{Path(str(selected.filename)).name}:{selected.lineno} ({selected.name})"
+        except Exception:
+            pass
+
+        # Safe-ish messages for common developer errors (avoid including tracebacks or request payloads).
+        if isinstance(exc, (AttributeError, KeyError, TypeError, ValueError)):
+            try:
+                msg = str(exc)
+                if msg:
+                    details["message"] = msg[:240]
+            except Exception:
+                pass
+
         error_dict = create_error_response(
             error_code=ErrorCode.INTERNAL_SERVER_ERROR,
             message="An unexpected error occurred",
-            # Safe to expose: exception class name only (no message/traceback).
-            details={"type": type(exc).__name__},
+            details=details,
             request_id=request_id
         )
         
