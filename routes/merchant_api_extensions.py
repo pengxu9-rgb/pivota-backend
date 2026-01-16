@@ -1068,6 +1068,7 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
 
         # Aggregate product data
         product_cache_stats = None
+        product_cache_by_platform = None
         try:
             cache_query = """
                 SELECT 
@@ -1077,11 +1078,33 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
                 WHERE merchant_id = :merchant_id
             """
             product_cache_stats = await database.fetch_one(cache_query, {"merchant_id": merchant_id})
+
+            by_platform_query = """
+                SELECT platform,
+                       COUNT(*) AS total_cached,
+                       COUNT(CASE WHEN expires_at IS NULL OR expires_at > NOW() THEN 1 END) AS active_cached
+                FROM products_cache
+                WHERE merchant_id = :merchant_id
+                GROUP BY platform
+            """
+            product_cache_by_platform = await database.fetch_all(by_platform_query, {"merchant_id": merchant_id})
         except Exception:
             product_cache_stats = None
+            product_cache_by_platform = None
 
         total_cached = product_cache_stats["total_cached"] if product_cache_stats and product_cache_stats["total_cached"] else 0
         active_cached = product_cache_stats["active_cached"] if product_cache_stats and product_cache_stats["active_cached"] else 0
+        cache_counts_by_platform = {}
+        if product_cache_by_platform:
+            for row in product_cache_by_platform:
+                r = dict(row)
+                plat = (r.get("platform") or "").strip().lower()
+                if not plat:
+                    continue
+                cache_counts_by_platform[plat] = {
+                    "total": int(r.get("total_cached") or 0),
+                    "active": int(r.get("active_cached") or 0),
+                }
 
         sum_product_counts = sum((s.get("product_count") or 0) for s in store_list)
         total_requests = active_cached or total_cached or sum_product_counts
@@ -1116,7 +1139,13 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
                 "latency": latency_ms,
                 "latency_ms": latency_ms,
                 "uptime": uptime,
-                "product_count": store.get("product_count") or 0,
+                "product_count": (
+                    (cache_counts_by_platform.get((store.get("platform") or "").strip().lower(), {}) or {}).get("active") or 0
+                )
+                or (store.get("product_count") or 0),
+                "product_count_source": "products_cache"
+                if ((cache_counts_by_platform.get((store.get("platform") or "").strip().lower(), {}) or {}).get("active") or 0) > 0
+                else "merchant_stores",
                 "domain": store.get("domain"),
                 "last_sync": sync_dt.isoformat() if sync_dt else None
             })
@@ -1145,6 +1174,7 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
                 "last_sync": latest_sync,
                 "active_products": active_cached or sum_product_counts,
                 "total_products": sum_product_counts or active_cached,
+                "product_cache_counts_by_platform": cache_counts_by_platform,
                 "nodes": nodes
             }
         }

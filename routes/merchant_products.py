@@ -23,6 +23,7 @@ from db.product_quality import product_quality_snapshot
 from models.standard_product import StandardProduct
 from services.product_enrichment_pipeline import run_enrichment_for_product
 from utils.auth import get_current_user
+from sqlalchemy import or_
 
 router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
 
@@ -95,6 +96,7 @@ def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
 @router.get("")
 async def list_merchant_products(
     platform: Optional[str] = Query(None),
+    include_expired: bool = Query(False),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
@@ -113,10 +115,17 @@ async def list_merchant_products(
 
     offset = (page - 1) * page_size
 
-    # Base query from products_cache
+    # Base query from products_cache (default: only active rows)
     base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
     if platform:
         base_query = base_query.where(products_cache.c.platform == platform)
+    if not include_expired:
+        base_query = base_query.where(
+            or_(
+                products_cache.c.expires_at.is_(None),
+                products_cache.c.expires_at > datetime.now(),
+            )
+        )
 
     query = (
         base_query.order_by(products_cache.c.cached_at.desc())
