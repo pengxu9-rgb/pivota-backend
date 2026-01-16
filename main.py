@@ -254,6 +254,10 @@ from routes.shopify_promotions_sync_api import router as shopify_promotions_sync
 from routes.shopify_products_sync_api import router as shopify_products_sync_router
 from routes.outbound_links import router as outbound_links_router
 from routes.external_offers import router as external_offers_router
+from routes.prometheus_metrics import router as prometheus_metrics_router
+from routes.employee_reviews import router as employee_reviews_router
+from routes.buyer_reviews import router as buyer_reviews_router
+from routes.reviews_invitation_issuer import router as reviews_invitation_issuer_router
 
 # Service routers (only include what exists)
 try:
@@ -557,6 +561,9 @@ app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
 app.include_router(employee_finance_router)  # Employee finance endpoints
 app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
+app.include_router(employee_reviews_router)  # Employee Reviews Center (imports/governance)
+app.include_router(buyer_reviews_router)  # Buyer Reviews (submission; default disabled)
+app.include_router(reviews_invitation_issuer_router)  # Internal: mint invitation_token from paid orders
 app.include_router(employee_missing_router)  # Missing employee endpoints
 # app.include_router(agent_sdk_router)  # Replaced with fixed version
 app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
@@ -638,6 +645,7 @@ if DEBUG_MODE:
     app.include_router(debug_orders_agent_router)  # Debug orders by agent
 app.include_router(simulate_payments_router)  # Simulate payments for testing
 app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
+app.include_router(prometheus_metrics_router)  # /metrics (Prometheus scrape)
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
 app.include_router(dashboard_router)  # Dashboard API
@@ -1224,7 +1232,7 @@ async def build_info():
 @app.options("/{full_path:path}")
 async def options_passthrough(full_path: str, request: Request):
     origin = request.headers.get("Origin", "*")
-    allow_headers = "Content-Type, Authorization, X-API-Key, X-Request-Id"
+    allow_headers = "Content-Type, Authorization, X-API-Key, X-Request-Id, X-Buyer-Issuer-Key, Idempotency-Key"
     allow_methods = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
     return Response(
         status_code=200,

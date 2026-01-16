@@ -20,14 +20,18 @@ import os
 import re
 import time
 import unicodedata
+import mimetypes
 from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
+from db.database import database
+from models.reviews_refs import SkuRef as ReviewsSkuRef
 from services.product_query_service import get_products_hybrid
 from services.similarity_service import (
     SimilarityService,
@@ -46,6 +50,64 @@ logger = logging.getLogger(__name__)
 
 _MERCHANT_SHOPIFY_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
 _MERCHANT_SHOPIFY_CURRENCY_TTL_SECONDS = 6 * 60 * 60
+
+_REVIEW_MEDIA_IP_LIMIT_STORE: Dict[str, tuple[int, int]] = {}
+
+
+def _reviews_enabled() -> bool:
+    return os.getenv("REVIEWS_ENABLED", "true").lower() == "true"
+
+
+def _reviews_featured_enabled() -> bool:
+    return os.getenv("REVIEWS_FEATURED_ENABLED", "true").lower() == "true"
+
+
+def _reviews_default_view_override() -> Optional[str]:
+    v = (os.getenv("REVIEWS_DEFAULT_VIEW") or "").strip().lower()
+    if v in {"merchant", "group"}:
+        return v
+    return None
+
+
+def _reviews_media_rpm() -> int:
+    raw = (os.getenv("REVIEWS_MEDIA_RPM") or "").strip()
+    try:
+        v = int(raw) if raw else 120
+    except Exception:
+        v = 120
+    return max(1, min(v, 10_000))
+
+
+def _reviews_media_import_dir() -> str:
+    base = os.getenv("REVIEWS_IMPORT_DIR", os.path.join(os.getcwd(), "tmp", "reviews-imports"))
+    return os.path.realpath(base)
+
+
+def _review_media_client_ip(request: Request) -> str:
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip() or "unknown"
+    return (request.client.host if request.client else None) or "unknown"
+
+
+def _check_review_media_rate_limit(ip: str) -> bool:
+    rpm = _reviews_media_rpm()
+    window = int(time.time() // 60)
+    prev = _REVIEW_MEDIA_IP_LIMIT_STORE.get(ip)
+    if prev and prev[0] == window:
+        if prev[1] >= rpm:
+            return False
+        _REVIEW_MEDIA_IP_LIMIT_STORE[ip] = (window, prev[1] + 1)
+        return True
+    _REVIEW_MEDIA_IP_LIMIT_STORE[ip] = (window, 1)
+    return True
+
+
+def _set_media_cache_headers(resp: Response, etag: Optional[str]) -> None:
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    if etag:
+        resp.headers["ETag"] = f"\"{etag}\""
 
 
 def _get_cached_merchant_shopify_currency(merchant_id: str) -> Optional[str]:
@@ -195,6 +257,66 @@ class ProductRef(BaseModel):
 
 class GetProductDetailPayload(BaseModel):
     product: ProductRef
+
+
+class ListSkuReviewsFilters(BaseModel):
+    featured_only: bool = False
+    has_media: bool = False
+    rating: Optional[int] = None  # 1..5
+    limit: int = 20
+    cursor: Optional[str] = None
+
+
+class ListSkuReviewsPayload(BaseModel):
+    sku: ReviewsSkuRef
+    filters: Optional[ListSkuReviewsFilters] = None
+
+
+class ListGroupReviewsFilters(BaseModel):
+    merchant_ids: Optional[List[str]] = None
+    featured_only: bool = False
+    has_media: bool = False
+    limit: int = 20
+    cursor: Optional[str] = None
+
+
+class ListGroupReviewsPayload(BaseModel):
+    group_id: int
+    filters: Optional[ListGroupReviewsFilters] = None
+
+
+class ListGroupMerchantsPayload(BaseModel):
+    group_id: int
+
+
+class ListSellerFeedbackPayload(BaseModel):
+    merchant_id: str
+    limit: int = 20
+    cursor: Optional[str] = None
+
+
+class ReviewSubjectRef(BaseModel):
+    merchant_id: str
+    platform: str
+    platform_product_id: str
+    variant_id: Optional[str] = None
+
+
+class ListReviewEntrypointsPayload(BaseModel):
+    agent_id: Optional[str] = None
+    surface: Optional[str] = None
+    locale: Optional[str] = None
+    capabilities: Optional[Dict[str, Any]] = None
+    subject: Optional[ReviewSubjectRef] = None
+
+
+class ResolveReviewIntentPayload(BaseModel):
+    agent_id: Optional[str] = None
+    surface: Optional[str] = None
+    locale: Optional[str] = None
+    entrypoint_id: str
+    intent: str = Field(..., description="read | write")
+    subject: ReviewSubjectRef
 
 
 class OrderItem(BaseModel):
@@ -3138,12 +3260,39 @@ async def _handle_get_product_detail(
         else None
     )
 
+    review_summary = None
+    seller_feedback_summary = None
+    try:
+        if not _reviews_enabled():
+            raise RuntimeError("reviews_disabled")
+        from services.reviews_service import get_review_summary_for_sku, get_seller_feedback_summary
+        from observability.reviews_metrics import record_pdp_default_view
+
+        review_summary = await get_review_summary_for_sku(
+            merchant_id=merchant_id,
+            platform=str(match.platform),
+            platform_product_id=str(match.product_id or match.id),
+            variant_id=None,
+        )
+        seller_feedback_summary = await get_seller_feedback_summary(merchant_id)
+
+        dv = _reviews_default_view_override()
+        if dv and review_summary:
+            review_summary["default_view"] = dv
+        record_pdp_default_view(str(review_summary.get("default_view") or "merchant"))
+    except Exception:
+        # PDP should stay available even when reviews are degraded.
+        review_summary = None
+        seller_feedback_summary = None
+
     return {
         "product": {
             **base,
             "attributes": attributes or None,
             "options": options or None,
             "product_options": legacy_product_options,
+            "review_summary": review_summary,
+            "seller_feedback_summary": seller_feedback_summary,
         },
         "metadata": {
             "query_source": query_source,
@@ -3257,6 +3406,12 @@ async def invoke_shop_operation(
     Supported operations:
     - find_products
     - get_product_detail
+    - list_sku_reviews
+    - list_group_reviews
+    - list_group_merchants
+    - list_seller_feedback
+    - list_review_entrypoints
+    - resolve_review_intent
     - create_order       (demo-only)
     - submit_payment     (demo-only)
     - find_similar_products
@@ -3282,7 +3437,444 @@ async def invoke_shop_operation(
 
     if operation == "get_product_detail":
         payload = GetProductDetailPayload(**request.payload)
-        return await _handle_get_product_detail(payload.product, background_tasks)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.product.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            return await _handle_get_product_detail(payload.product, background_tasks)
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_sku_reviews":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListSkuReviewsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.sku.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import build_product_key, build_sku_key, list_product_reviews, list_sku_reviews
+
+            f = payload.filters or ListSkuReviewsFilters()
+            if bool(f.featured_only) and not _reviews_featured_enabled():
+                return {"items": [], "next_cursor": None, "limit": int(f.limit or 20)}
+            # If variant_id is omitted, treat as product-level listing across all variants.
+            if payload.sku.variant_id is None or str(payload.sku.variant_id).strip() == "":
+                product_key = build_product_key(
+                    merchant_id=payload.sku.merchant_id,
+                    platform=payload.sku.platform,
+                    platform_product_id=payload.sku.platform_product_id,
+                )
+                return await list_product_reviews(
+                    product_key=product_key,
+                    has_media=bool(f.has_media),
+                    rating=f.rating,
+                    limit=int(f.limit or 20),
+                    cursor=f.cursor,
+                )
+            sku_key = build_sku_key(
+                merchant_id=payload.sku.merchant_id,
+                platform=payload.sku.platform,
+                platform_product_id=payload.sku.platform_product_id,
+                variant_id=payload.sku.variant_id,
+            )
+            return await list_sku_reviews(
+                sku_key=sku_key,
+                featured_only=bool(f.featured_only),
+                has_media=bool(f.has_media),
+                rating=f.rating,
+                limit=int(f.limit or 20),
+                cursor=f.cursor,
+            )
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_group_reviews":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListGroupReviewsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.group_id = int(payload.group_id)
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import list_group_reviews
+
+            f = payload.filters or ListGroupReviewsFilters()
+            if bool(f.featured_only) and not _reviews_featured_enabled():
+                return {"items": [], "next_cursor": None, "limit": int(f.limit or 20)}
+            return await list_group_reviews(
+                group_id=int(payload.group_id),
+                merchant_ids=f.merchant_ids,
+                featured_only=bool(f.featured_only),
+                has_media=bool(f.has_media),
+                limit=int(f.limit or 20),
+                cursor=f.cursor,
+            )
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_group_merchants":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListGroupMerchantsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.group_id = int(payload.group_id)
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import get_group_counts_by_merchant
+
+            counts = await get_group_counts_by_merchant(int(payload.group_id))
+            return {"group_id": int(payload.group_id), "counts_by_merchant": counts}
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_seller_feedback":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = ListSellerFeedbackPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import list_seller_feedback
+
+            return await list_seller_feedback(
+                merchant_id=payload.merchant_id,
+                limit=int(payload.limit or 20),
+                cursor=payload.cursor,
+            )
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "list_review_entrypoints":
+        payload = ListReviewEntrypointsPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.subject.merchant_id if payload.subject else None
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            read_allowed = bool(_reviews_enabled())
+            write_allowed = False
+            write_reason = "BUYER_SUBMIT_DISABLED"
+            try:
+                from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
+
+                mid = ""
+                try:
+                    mid = (payload.subject.merchant_id if payload.subject else "") or ""
+                except Exception:
+                    mid = ""
+                buyer_enabled = bool(buyer_submit_enabled())
+                if not buyer_enabled:
+                    write_allowed = False
+                    write_reason = "BUYER_SUBMIT_DISABLED"
+                elif not mid:
+                    write_allowed = False
+                    write_reason = "MISSING_SUBJECT"
+                elif not bool(buyer_submit_merchant_allowed(mid)):
+                    write_allowed = False
+                    write_reason = "BUYER_SUBMIT_NOT_ALLOWED"
+                else:
+                    write_allowed = True
+                    write_reason = "OK"
+            except Exception:
+                write_allowed = False
+                write_reason = "BUYER_SUBMIT_DISABLED"
+
+            items: List[Dict[str, Any]] = []
+
+            # Read entrypoints (existing read path via invoke + review-media).
+            for eid, prio in (
+                ("PDP_SUMMARY", 100),
+                ("PDP_TAB", 90),
+                ("AGENT_CHAT_CARD", 80),
+                ("SEARCH_SNIPPET", 30),
+            ):
+                items.append(
+                    {
+                        "entrypoint_id": eid,
+                        "allowed": read_allowed,
+                        "reason": "OK" if read_allowed else "REVIEWS_DISABLED",
+                        "priority": prio,
+                        "launch_modes": ["EMBED_CONFIG"],
+                        "ui_spec": {"label": "Reviews"},
+                        "policy_tags": ["reviews.read"],
+                        "analytics_schema_version": 1,
+                        "tracking_required_fields": ["entrypoint_id", "surface", "agent_id", "intent"],
+                    }
+                )
+
+            # Write entrypoints (buyer submission flow, default gated by env flag).
+            items.append(
+                {
+                    "entrypoint_id": "PDP_WRITE_REVIEW",
+                    "allowed": write_allowed,
+                    "reason": write_reason,
+                    "priority": 70,
+                    "launch_modes": ["EMBED_CONFIG"],
+                    "ui_spec": {"label": "Write a review"},
+                    "policy_tags": ["reviews.write"],
+                    "analytics_schema_version": 1,
+                    "tracking_required_fields": ["entrypoint_id", "surface", "agent_id", "intent"],
+                }
+            )
+
+            return {"status": "success", "items": items}
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "resolve_review_intent":
+        payload = ResolveReviewIntentPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.subject.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            intent = (payload.intent or "").strip().lower()
+            if intent not in {"read", "write"}:
+                raise HTTPException(status_code=400, detail="INVALID_INTENT")
+
+            subject = payload.subject
+            merchant_id = (subject.merchant_id or "").strip()
+            platform = (subject.platform or "").strip().lower()
+            platform_product_id = (subject.platform_product_id or "").strip()
+            variant_id = (subject.variant_id or "").strip()
+
+            tracking = {
+                "entrypoint_id": payload.entrypoint_id,
+                "intent": intent,
+                "surface": payload.surface,
+                "agent_id": payload.agent_id,
+            }
+
+            if intent == "read":
+                allowed = bool(_reviews_enabled())
+                if not allowed:
+                    return {
+                        "status": "success",
+                        "allowed": False,
+                        "reason": "REVIEWS_DISABLED",
+                        "launch_mode": None,
+                        "target": None,
+                        "tracking": tracking,
+                    }
+                embed_config = {
+                    "type": "reviews_read",
+                    "invoke": {
+                        "operation": "list_sku_reviews",
+                        "payload": {
+                            "sku": {
+                                "merchant_id": merchant_id,
+                                "platform": platform,
+                                "platform_product_id": platform_product_id,
+                                "variant_id": variant_id or None,
+                            },
+                            "filters": {"limit": 20},
+                        },
+                    },
+                }
+                return {
+                    "status": "success",
+                    "allowed": True,
+                    "reason": "OK",
+                    "launch_mode": "EMBED_CONFIG",
+                    "target": {"embed_config": embed_config},
+                    "tracking": tracking,
+                }
+
+            # intent == "write"
+            write_allowed = False
+            try:
+                from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
+
+                buyer_enabled = bool(buyer_submit_enabled())
+                merchant_allowed = bool(buyer_submit_merchant_allowed(merchant_id))
+                write_allowed = buyer_enabled and merchant_allowed
+            except Exception:
+                write_allowed = False
+
+            if not write_allowed:
+                reason = "BUYER_SUBMIT_DISABLED"
+                try:
+                    from services.buyer_reviews_service import buyer_submit_enabled
+
+                    if bool(buyer_submit_enabled()):
+                        reason = "BUYER_SUBMIT_NOT_ALLOWED"
+                except Exception:
+                    reason = "BUYER_SUBMIT_DISABLED"
+                return {
+                    "status": "success",
+                    "allowed": False,
+                    "reason": reason,
+                    "launch_mode": None,
+                    "target": None,
+                    "tracking": tracking,
+                }
+
+            embed_config = {
+                "type": "buyer_review_submission",
+                "requirements": {
+                    "auth": "Bearer submission_token",
+                    "idempotency_header": "Idempotency-Key",
+                    "submission_token_issue": "server_side_only",
+                },
+                "endpoints": {
+                    "proof_exchange_path": "/buyer/reviews/v1/verification/exchange",
+                    "create_review_path": "/buyer/reviews/v1/reviews",
+                    "get_review_path_template": "/buyer/reviews/v1/reviews/{review_id}",
+                    "attach_media_path_template": "/buyer/reviews/v1/reviews/{review_id}/media",
+                },
+                "subject": {
+                    "merchant_id": merchant_id,
+                    "platform": platform,
+                    "platform_product_id": platform_product_id,
+                    "variant_id": variant_id or None,
+                },
+            }
+            return {
+                "status": "success",
+                "allowed": True,
+                "reason": "OK",
+                "launch_mode": "EMBED_CONFIG",
+                "target": {"embed_config": embed_config},
+                "tracking": tracking,
+            }
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
 
     if operation == "create_order":
         payload = CreateOrderPayload(**request.payload)
@@ -3379,3 +3971,160 @@ async def invoke_shop_operation(
         status_code=400,
         detail=f"Unsupported operation: {operation}",
     )
+
+
+@router.get("/review-media/{public_id}")
+async def get_review_media(public_id: str, request: Request) -> Response:
+    """
+    Serves imported review media by unguessable public_id.
+    Requires exp+sig query params (HMAC) and applies IP rate limiting.
+    """
+    started = time.time()
+    status_code = 200
+    bytes_served = 0
+    sig_fail_reason: Optional[str] = None
+    rate_limited = False
+    try:
+        if not _reviews_enabled():
+            status_code = 404
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        request.state.operation = "review_media"
+
+        ip = _review_media_client_ip(request)
+        if not _check_review_media_rate_limit(ip):
+            rate_limited = True
+            status_code = 429
+            raise HTTPException(status_code=429, detail="RATE_LIMITED")
+
+        exp_raw = (request.query_params.get("exp") or "").strip()
+        sig = (request.query_params.get("sig") or "").strip()
+        if not exp_raw or not sig:
+            status_code = 403
+            sig_fail_reason = "missing"
+            raise HTTPException(status_code=403, detail="SIGNATURE_REQUIRED")
+
+        try:
+            exp = int(exp_raw)
+        except Exception:
+            status_code = 403
+            sig_fail_reason = "bad_exp"
+            raise HTTPException(status_code=403, detail="BAD_SIGNATURE")
+
+        from services.reviews_service import verify_review_media_signature_with_reason, _allow_legacy_review_media_id
+
+        ok, reason = verify_review_media_signature_with_reason(public_id=public_id, exp=exp, sig=sig)
+        if not ok:
+            status_code = 403
+            sig_fail_reason = reason
+            raise HTTPException(status_code=403, detail="BAD_SIGNATURE")
+
+        media_row = await database.fetch_one(
+            """
+            SELECT m.id, m.public_id, m.type, m.file_path, m.file_hash
+            FROM media_assets m
+            JOIN product_reviews r ON r.id = m.review_id
+            WHERE m.status = 'active'
+              AND r.status = 'active'
+              AND (
+                m.public_id = :pid
+                OR (:allow_legacy = true AND m.public_id IS NULL AND m.id = :legacy_id)
+              )
+            LIMIT 1
+            """,
+            {
+                "pid": str(public_id),
+                "allow_legacy": bool(_allow_legacy_review_media_id()),
+                "legacy_id": int(public_id) if public_id.isdigit() else -1,
+            },
+        )
+        if not media_row:
+            status_code = 404
+            raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
+
+        etag = str(media_row["file_hash"] or "").strip() or None
+        if etag and (request.headers.get("if-none-match") or "").strip() == f"\"{etag}\"":
+            resp = Response(status_code=304)
+            _set_media_cache_headers(resp, etag)
+            return resp
+
+        file_path_raw = str(media_row["file_path"] or "").strip()
+
+        # S3-backed media: file_path is stored as `s3://bucket/key`.
+        if file_path_raw.startswith("s3://"):
+            try:
+                import asyncio
+                from starlette.concurrency import iterate_in_threadpool
+                from starlette.responses import StreamingResponse
+
+                import boto3
+            except Exception:
+                status_code = 500
+                raise HTTPException(status_code=500, detail="MEDIA_STORAGE_UNAVAILABLE")
+
+            # Parse `s3://bucket/key`
+            try:
+                rest = file_path_raw[len("s3://") :]
+                bucket, key = rest.split("/", 1)
+            except Exception:
+                status_code = 404
+                raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
+
+            endpoint_url = (os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip() or None
+            region = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "").strip() or None
+            client = boto3.client("s3", region_name=region, endpoint_url=endpoint_url)
+
+            try:
+                obj = await asyncio.to_thread(client.get_object, Bucket=bucket, Key=key)
+                body = obj["Body"]
+                content_type = (obj.get("ContentType") or "").strip() or "application/octet-stream"
+                content_length = obj.get("ContentLength")
+            except Exception:
+                status_code = 404
+                raise HTTPException(status_code=404, detail="MEDIA_FILE_MISSING")
+
+            # Streaming body is blocking; run iteration in a threadpool.
+            resp = StreamingResponse(
+                iterate_in_threadpool(body.iter_chunks(chunk_size=1024 * 1024)),
+                media_type=content_type,
+            )
+            if content_length is not None:
+                try:
+                    resp.headers["Content-Length"] = str(int(content_length))
+                except Exception:
+                    pass
+            _set_media_cache_headers(resp, etag)
+            return resp
+
+        # Default: local disk media under REVIEWS_IMPORT_DIR.
+        file_path = os.path.realpath(file_path_raw)
+        if not file_path or not os.path.exists(file_path):
+            status_code = 404
+            raise HTTPException(status_code=404, detail="MEDIA_FILE_MISSING")
+
+        # Safety: only serve from REVIEWS_IMPORT_DIR.
+        base = _reviews_media_import_dir()
+        if not file_path.startswith(base + os.sep) and file_path != base:
+            status_code = 404
+            raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
+
+        media_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        bytes_served = int(os.path.getsize(file_path)) if os.path.exists(file_path) else 0
+        resp = FileResponse(file_path, media_type=media_type)
+        _set_media_cache_headers(resp, etag)
+        return resp
+    except HTTPException as e:
+        status_code = int(e.status_code)
+        raise
+    finally:
+        try:
+            from observability.reviews_metrics import record_media_request
+
+            record_media_request(
+                status_code=status_code,
+                duration_seconds=max(0.0, time.time() - started),
+                bytes_served=bytes_served,
+                sig_fail_reason=sig_fail_reason,
+                rate_limited=rate_limited,
+            )
+        except Exception:
+            pass

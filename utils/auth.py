@@ -4,8 +4,8 @@ Handles JWT token creation, validation, and user authentication
 """
 
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
-from fastapi import Depends, HTTPException, status
+from typing import Dict, Any, Optional, Iterable, List
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import bcrypt
@@ -342,6 +342,102 @@ def validate_entity_access(user_role: str, user_entity_id: str, requested_entity
     
     return False
 
+
+# ============================================================================
+# Employee permissions (Reviews Center + other employee-only APIs)
+# ============================================================================
+
+
+def has_permission(current_user: Dict[str, Any], required_permission: str) -> bool:
+    """
+    Permission matcher for employee-only APIs.
+
+    Semantics:
+    - super_admin/admin: allow all (but still require employee_id on employee routes).
+    - explicit permissions list supports:
+      - exact match: "reviews.read"
+      - wildcard prefix: "reviews.*" matches "reviews.group.manage"
+    """
+    perm = (required_permission or "").strip()
+    if not perm:
+        return True
+
+    role = (current_user.get("role") or "").strip().lower()
+    if role in {"super_admin", "admin"}:
+        return True
+
+    raw = current_user.get("permissions") or []
+    if isinstance(raw, str):
+        perms: List[str] = [p.strip() for p in raw.split(",") if p.strip()]
+    elif isinstance(raw, list):
+        perms = [str(p).strip() for p in raw if str(p).strip()]
+    else:
+        perms = []
+
+    if perm in perms:
+        return True
+    for p in perms:
+        if p.endswith(".*") and perm.startswith(p[:-1]):
+            return True
+    return False
+
+
+def require_employee_permissions(required_permissions: Iterable[str]):
+    """
+    FastAPI dependency for employee-only endpoints.
+
+    Requirements:
+    - JWT must represent an employee identity (role in EMPLOYEE_ROLES)
+    - Must include employee_id claim (prevents accidentally accepting user tokens)
+    - Reads permissions from the token's "permissions" claim (employees.permissions)
+    """
+    required = [str(p).strip() for p in required_permissions if str(p).strip()]
+
+    async def _dep(
+        request: Request = None,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> Dict[str, Any]:
+        # NOTE: FastAPI injects Request only when the annotation is exactly Request.
+        role = (current_user.get("role") or "").strip().lower()
+        if role not in {r.lower() for r in EMPLOYEE_ROLES}:
+            raise HTTPException(status_code=403, detail="EMPLOYEE_REQUIRED")
+
+        employee_id = current_user.get("employee_id") or current_user.get("employeeId")
+        if not employee_id:
+            raise HTTPException(status_code=403, detail="EMPLOYEE_ID_REQUIRED")
+
+        missing = [p for p in required if not has_permission(current_user, p)]
+        if missing:
+            # Best-effort: emit an authz denied metric with low-cardinality endpoint template.
+            try:
+                if request is None:  # pragma: no cover
+                    raise RuntimeError("no_request_context")
+                from observability.reviews_metrics import record_employee_authz_denied
+
+                route = request.scope.get("route")
+                endpoint = getattr(route, "path", None) or request.url.path
+                record_employee_authz_denied(endpoint=endpoint, required_permission=missing[0])
+            except Exception:
+                pass
+
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "MISSING_PERMISSIONS", "missing": missing},
+            )
+
+        # Populate common log context (safe; no PII).
+        try:
+            if request is None:  # pragma: no cover
+                raise RuntimeError("no_request_context")
+            request.state.operation = "employee"
+            request.state.actor_employee_id = str(employee_id)
+        except Exception:
+            pass
+
+        return current_user
+
+    return _dep
+
 # ============================================================================
 # LEGACY COMPATIBILITY (for old code)
 # ============================================================================
@@ -370,4 +466,3 @@ def create_jwt_token(user_id: str, role: str, entity_id: Optional[str] = None) -
             data["agent_id"] = entity_id
     
     return create_access_token(data)
-

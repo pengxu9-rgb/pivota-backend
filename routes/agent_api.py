@@ -4,8 +4,8 @@ Agent 专用 API 路由
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
@@ -41,6 +41,8 @@ from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
 from db.products import get_cached_products
 import httpx
 import uuid
+
+from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
@@ -2002,6 +2004,58 @@ async def agent_get_order(
             error_message=str(e)
         )
         raise HTTPException(status_code=500, detail="Failed to get order")
+
+
+class IssueOrderReviewInvitationsRequest(BaseModel):
+    platform_product_id: Optional[str] = None
+    variant_id: Optional[str] = None
+    ttl_seconds: int = Field(24 * 3600, ge=300, le=7 * 24 * 3600)
+
+
+@router.post("/orders/{order_id}/reviews/invitations")
+async def agent_issue_review_invitations_from_order(
+    order_id: str,
+    body: IssueOrderReviewInvitationsRequest,
+    response: Response,
+    buyer_ref: Optional[str] = None,
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
+):
+    """
+    Mint browser-safe invitation_token(s) for a paid order.
+
+    This endpoint is intended for checkout/order detail UIs to offer "Write a review"
+    without exposing internal issuer keys to browsers. Tokens are single-use via the
+    exchange endpoint and can be minted per line-item (product/variant).
+    """
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    order = await get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if str(order.get("agent_id") or "") != str(context.agent_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+    stored_agent_user_ref = _order_agent_user_ref(order)
+    if stored_agent_user_ref:
+        if not agent_user or not _agent_user_matches_order_ref(stored_ref=stored_agent_user_ref, agent_user=agent_user):
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+    elif buyer_ref:
+        stored = (order.get("metadata") or {}).get("buyer_ref")
+        allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
+        if str(stored or "") not in allowed_refs:
+            raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+    return await mint_invitations_from_paid_order(
+        merchant_id=str(order.get("merchant_id") or "").strip(),
+        order=order,
+        ttl_seconds=int(body.ttl_seconds),
+        platform_product_id=body.platform_product_id,
+        variant_id=body.variant_id,
+        verification="verified_buyer",
+    )
 
 
 @router.get("/orders")
