@@ -220,9 +220,10 @@ async def get_merchant_stores(
                 {"merchant_id": merchant_id},
             )
             for r in cache_rows or []:
-                plat = (r.get("platform") or "").strip().lower()
+                rr = dict(r)
+                plat = (rr.get("platform") or "").strip().lower()
                 if plat:
-                    cache_counts_by_platform[plat] = int(r.get("active_cached") or 0)
+                    cache_counts_by_platform[plat] = int(rr.get("active_cached") or 0)
         except Exception:
             cache_counts_by_platform = {}
 

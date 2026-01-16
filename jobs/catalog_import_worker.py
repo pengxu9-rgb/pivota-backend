@@ -227,7 +227,8 @@ async def _best_effort_update_store_product_count(
         )
         if not row:
             return
-        store_id = row.get("store_id")
+        store_row = dict(row)
+        store_id = store_row.get("store_id")
         if not store_id:
             return
 
