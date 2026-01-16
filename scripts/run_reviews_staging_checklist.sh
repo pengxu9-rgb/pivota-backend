@@ -15,6 +15,8 @@ set -euo pipefail
 # - PROOF_ISSUER_INTERNAL_KEY (otherwise prompted by child script)
 # - EMPLOYEE_JWT_SECRET_KEY or JWT_SECRET_KEY (otherwise prompted by child script)
 # - MEDIA_FILE_PATH or MOCK_MEDIA_DIR
+# - RUN_REMOVE_TEST=true|false (default: false)
+# - WAIT_FOR_REDEPLOY=true|false (default: false)
 #
 # Example:
 #   REVIEWS_BASE_URL=... PROOF_ISSUER_BASE_URL=... MERCHANT_ID=... PLATFORM_PRODUCT_ID=... ./scripts/run_reviews_staging_checklist.sh
@@ -27,6 +29,10 @@ PLATFORM_PRODUCT_ID="${PLATFORM_PRODUCT_ID:-}"
 VARIANT_ID="${VARIANT_ID:-}"
 DENY_MERCHANT_ID="${DENY_MERCHANT_ID:-merch_not_allowed}"
 METRICS_BEARER_TOKEN="${METRICS_BEARER_TOKEN:-}"
+PROOF_ISSUER_INTERNAL_KEY="${PROOF_ISSUER_INTERNAL_KEY:-}"
+EMPLOYEE_JWT_SECRET_KEY="${EMPLOYEE_JWT_SECRET_KEY:-${JWT_SECRET_KEY:-}}"
+RUN_REMOVE_TEST="${RUN_REMOVE_TEST:-false}"
+WAIT_FOR_REDEPLOY="${WAIT_FOR_REDEPLOY:-false}"
 
 command -v curl >/dev/null 2>&1 || { echo "ERROR: curl not found" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found" >&2; exit 1; }
@@ -105,6 +111,16 @@ BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$MERCHANT_ID" PLATFORM="$PLATFORM" PLA
   /bin/bash "$(dirname "${BASH_SOURCE[0]}")/verify_reviews_buyer_canary.sh"
 echo
 
+if [[ -z "${PROOF_ISSUER_INTERNAL_KEY:-}" ]]; then
+  read -r -s -p "X-Internal-Key (proof issuer): " PROOF_ISSUER_INTERNAL_KEY
+  echo
+fi
+
+if [[ -z "${EMPLOYEE_JWT_SECRET_KEY:-}" ]]; then
+  read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " EMPLOYEE_JWT_SECRET_KEY
+  echo
+fi
+
 echo "== [B2] gating deny-case (expect write_allowed=false) =="
 if [[ "${REQUIRE_DENY_CASE:-}" == "true" ]]; then
   BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$DENY_MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" EXPECT_WRITE_ALLOWED=false \
@@ -116,12 +132,12 @@ fi
 echo
 
 echo "== [C] proof issuer -> exchange replay =="
-PROOF_ISSUER_BASE_URL="$PROOF_ISSUER_BASE_URL" REVIEWS_BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" \
+PROOF_ISSUER_BASE_URL="$PROOF_ISSUER_BASE_URL" PROOF_ISSUER_INTERNAL_KEY="$PROOF_ISSUER_INTERNAL_KEY" REVIEWS_BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" \
   /bin/bash "$(dirname "${BASH_SOURCE[0]}")/smoke_reviews_proof_issuer_exchange.sh"
 echo
 
 echo "== [D] buyer E2E via proof issuer (media + approve + read path) =="
-PROOF_ISSUER_BASE_URL="$PROOF_ISSUER_BASE_URL" REVIEWS_BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" \
+PROOF_ISSUER_BASE_URL="$PROOF_ISSUER_BASE_URL" PROOF_ISSUER_INTERNAL_KEY="$PROOF_ISSUER_INTERNAL_KEY" EMPLOYEE_JWT_SECRET_KEY="$EMPLOYEE_JWT_SECRET_KEY" RUN_REMOVE_TEST="$RUN_REMOVE_TEST" WAIT_FOR_REDEPLOY="$WAIT_FOR_REDEPLOY" REVIEWS_BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" \
   /bin/bash "$(dirname "${BASH_SOURCE[0]}")/smoke_buyer_review_via_proof_issuer.sh"
 echo
 

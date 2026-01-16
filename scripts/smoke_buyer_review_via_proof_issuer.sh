@@ -15,6 +15,9 @@ set -euo pipefail
 # - MEDIA_FILE_PATH or MOCK_MEDIA_DIR (default: ~/Desktop/mock_review_media)
 # - PROOF_ISSUER_INTERNAL_KEY (otherwise prompts)
 # - EMPLOYEE_JWT_SECRET_KEY or JWT_SECRET_KEY (otherwise prompts)
+# - RUN_REMOVE_TEST=true|false (default: false) remove review after approval and verify read path + media deny
+# - WAIT_FOR_REDEPLOY=true|false (default: false) pause for redeploy then verify the same media public_id still readable (requires persistent storage)
+# - AUTO_APPROVE=true|false (default: true) stop before employee approval (useful for moderation queue testing)
 
 PROOF_ISSUER_BASE_URL="${PROOF_ISSUER_BASE_URL:-}"
 REVIEWS_BASE_URL="${REVIEWS_BASE_URL:-}"
@@ -23,6 +26,9 @@ PLATFORM="${PLATFORM:-shopify}"
 PLATFORM_PRODUCT_ID="${PLATFORM_PRODUCT_ID:-}"
 VARIANT_ID="${VARIANT_ID:-}"
 MEDIA_FILE_PATH="${MEDIA_FILE_PATH:-}"
+RUN_REMOVE_TEST="${RUN_REMOVE_TEST:-false}"
+WAIT_FOR_REDEPLOY="${WAIT_FOR_REDEPLOY:-false}"
+AUTO_APPROVE="${AUTO_APPROVE:-true}"
 
 command -v curl >/dev/null 2>&1 || { echo "ERROR: curl not found" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found" >&2; exit 1; }
@@ -165,6 +171,11 @@ PRE="$(curl -sS -H "Content-Type: application/json" \
 | python3 -c 'import sys,json; o=json.load(sys.stdin); rid=int(sys.argv[1]); items=o.get("items") or []; hit=[it for it in items if int(it.get("review_id") or -1)==rid]; print("found" if hit else "not_found")' "$REVIEW_ID")"
 echo "$PRE"
 
+if [[ "$AUTO_APPROVE" != "true" ]]; then
+  echo "AUTO_APPROVE=false stop_before_approval=1 review_id=$REVIEW_ID media_public_id=$MEDIA_PUBLIC_ID"
+  exit 0
+fi
+
 echo "== approve -> active (employee) =="
 EMPLOYEE_ID="emp_001"
 EMAIL="employee+smoke@pivota.invalid"
@@ -223,5 +234,50 @@ echo "== signature negative tests =="
 curl -sS -o /dev/null -w "missing_sig_status=%{http_code}\n" "$REVIEWS_BASE_URL/agent/shop/v1/review-media/$MEDIA_PUBLIC_ID"
 TAMPER_URL="$(printf '%s' "$SIGNED_URL" | python3 -c 'import sys,urllib.parse; u=sys.stdin.read().strip(); p=urllib.parse.urlsplit(u); q=urllib.parse.parse_qs(p.query); q["exp"]=[str(int(q.get("exp",[0])[0])+1)]; nq=urllib.parse.urlencode({k:v[0] for k,v in q.items()}); print(urllib.parse.urlunsplit((p.scheme,p.netloc,p.path,nq,p.fragment)))')"
 curl -sS -o /dev/null -w "tamper_exp_status=%{http_code}\n" "$TAMPER_URL"
+
+if [[ "$WAIT_FOR_REDEPLOY" == "true" ]]; then
+  echo "== redeploy persistence check =="
+  echo "NOW redeploy reviews backend (Railway), then press Enter."
+  read -r _
+
+  echo "== find NEW signed url for same public_id (after redeploy) =="
+  SIGNED_PATH2="$(curl -sS -H "Content-Type: application/json" \
+    -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\",\"variant_id\":\"$VARIANT_ID\"},\"filters\":{\"limit\":50}}}" \
+    "$REVIEWS_BASE_URL/agent/shop/v1/invoke" \
+  | python3 -c 'import sys,json; o=json.load(sys.stdin); pid=sys.argv[1]; items=o.get("items") or []; urls=[(m.get("url") or "") for it in items for m in (it.get("media") or []) if pid in (m.get("url") or "")]; print(urls[0] if urls else "")' "$MEDIA_PUBLIC_ID")"
+  [[ -n "$SIGNED_PATH2" ]] || { echo "ERROR: no signed media url found after redeploy for public_id=$MEDIA_PUBLIC_ID" >&2; exit 1; }
+  SIGNED_URL2="$REVIEWS_BASE_URL$SIGNED_PATH2"
+  echo "SIGNED_URL2=$SIGNED_URL2"
+
+  echo "== fetch after redeploy (expect 200) =="
+  IP4="9.9.6.$((RANDOM%200+1))"
+  CODE2="$(curl -sS -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: $IP4" -H "Cache-Control: no-cache" "$SIGNED_URL2")"
+  echo "status=$CODE2"
+  [[ "$CODE2" == "200" || "$CODE2" == "304" ]] || { echo "ERROR: media not readable after redeploy (status=$CODE2)" >&2; exit 1; }
+fi
+
+if [[ "$RUN_REMOVE_TEST" == "true" ]]; then
+  echo "== set removed (reason required) =="
+  curl -sS -H "Authorization: Bearer $EMP_TOKEN" -H "Content-Type: application/json" \
+    -d '{"status":"removed","reason":"buyer smoke remove"}' \
+    "$REVIEWS_BASE_URL/employee/reviews/v1/reviews/$REVIEW_ID/status" >/dev/null
+  echo "removed_ok"
+
+  echo "== post-remove visible on read path? (expect not_found) =="
+  POST_REMOVE="$(curl -sS -H "Content-Type: application/json" \
+    -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\",\"variant_id\":\"$VARIANT_ID\"},\"filters\":{\"limit\":50}}}" \
+    "$REVIEWS_BASE_URL/agent/shop/v1/invoke" \
+  | python3 -c 'import sys,json; o=json.load(sys.stdin); rid=int(sys.argv[1]); items=o.get("items") or []; hit=[it for it in items if int(it.get("review_id") or -1)==rid]; print("found" if hit else "not_found")' "$REVIEW_ID")"
+  echo "$POST_REMOVE"
+
+  echo "== post-remove signed media should NOT be readable (expect non-200; cache bypass) =="
+  IP3="9.9.7.$((RANDOM%200+1))"
+  CODE_REMOVED="$(curl -sS -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: $IP3" -H "Cache-Control: no-cache" "$SIGNED_URL")"
+  echo "status=$CODE_REMOVED"
+  if [[ "$CODE_REMOVED" == "200" || "$CODE_REMOVED" == "304" ]]; then
+    echo "ERROR: media still readable after removed (status=$CODE_REMOVED)" >&2
+    exit 1
+  fi
+fi
 
 echo "OK"
