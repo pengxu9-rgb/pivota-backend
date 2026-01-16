@@ -105,3 +105,63 @@ async def debug_merchant_catalog(
         "shopify_import_tasks": tasks_out,
     }
 
+
+@router.post("/merchant/{merchant_id}/reconcile-store-counts", response_model=Dict[str, Any])
+async def reconcile_store_product_counts(
+    merchant_id: str = Path(..., description="Internal merchant ID"),
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """
+    Backfill merchant_stores.product_count from products_cache active rows.
+
+    This is an operational helper when the UI depends on merchant_stores.product_count
+    but catalog imports only populated products_cache.
+    """
+    rows = await database.fetch_all(
+        """
+        SELECT platform,
+               COUNT(CASE WHEN expires_at IS NULL OR expires_at > NOW() THEN 1 END) AS active_cached
+        FROM products_cache
+        WHERE merchant_id = :merchant_id
+        GROUP BY platform
+        """,
+        {"merchant_id": merchant_id},
+    )
+    counts_by_platform: Dict[str, int] = {}
+    for r in rows or []:
+        d = dict(r)
+        plat = str(d.get("platform") or "").strip().lower()
+        if not plat:
+            continue
+        counts_by_platform[plat] = int(d.get("active_cached") or 0)
+
+    stores = await database.fetch_all(
+        """
+        SELECT store_id, platform, status, product_count
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND status IN ('active', 'connected')
+        ORDER BY connected_at DESC NULLS LAST
+        """,
+        {"merchant_id": merchant_id},
+    )
+
+    updated: List[Dict[str, Any]] = []
+    for s in stores or []:
+        sd = dict(s)
+        store_id = sd.get("store_id")
+        platform = str(sd.get("platform") or "").strip().lower()
+        target = counts_by_platform.get(platform, 0)
+        current = int(sd.get("product_count") or 0)
+        if store_id and current != target:
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET product_count = :count, last_sync = CURRENT_TIMESTAMP
+                WHERE store_id = :store_id
+                """,
+                {"count": target, "store_id": store_id},
+            )
+            updated.append({"store_id": store_id, "platform": platform, "from": current, "to": target})
+
+    return {"ok": True, "merchant_id": merchant_id, "counts_by_platform": counts_by_platform, "updated": updated}
