@@ -10,6 +10,9 @@ set -euo pipefail
 # - BASE_URL (default: https://web-production-fedb.up.railway.app)
 # - MERCHANT_ID (optional filter)
 # - LIMIT (default: 50)
+# - SET_REVIEW_ID (optional; if set, call employee status update)
+# - SET_STATUS (default: active; used with SET_REVIEW_ID)
+# - SET_REASON (default: "ops update"; used with SET_REVIEW_ID)
 #
 # Prompts (no echo):
 # - JWT_SECRET_KEY (to mint an employee JWT)
@@ -17,6 +20,9 @@ set -euo pipefail
 BASE_URL="${BASE_URL:-https://web-production-fedb.up.railway.app}"
 MERCHANT_ID="${MERCHANT_ID:-}"
 LIMIT="${LIMIT:-50}"
+SET_REVIEW_ID="${SET_REVIEW_ID:-}"
+SET_STATUS="${SET_STATUS:-active}"
+SET_REASON="${SET_REASON:-ops update}"
 
 command -v curl >/dev/null 2>&1 || { echo "ERROR: curl not found" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found" >&2; exit 1; }
@@ -36,6 +42,44 @@ sig=b64u(hmac.new(os.environ["JWT_SECRET_KEY"].encode(), msg.encode(), hashlib.s
 print(msg+"."+sig)'
 )"
 unset JWT_SECRET_KEY
+
+_set_status() {
+  local review_id="$1"
+  local status="$2"
+  local reason="$3"
+
+  if ! printf '%s' "$review_id" | python3 -c 'import sys; s=sys.stdin.read().strip(); sys.exit(0 if s.isdigit() else 1)'; then
+    echo "ERROR: SET_REVIEW_ID must be numeric (got: $review_id)" >&2
+    return 2
+  fi
+
+  local url="$BASE_URL/employee/reviews/v1/reviews/$review_id/status"
+  local tmp_body tmp_hdr http
+  tmp_body="$(mktemp "${TMPDIR:-/tmp}/reviews_set_status_body.XXXXXX")"
+  tmp_hdr="$(mktemp "${TMPDIR:-/tmp}/reviews_set_status_hdr.XXXXXX")"
+  http="$(curl --http1.1 -sS -D "$tmp_hdr" -o "$tmp_body" -w "%{http_code}" \
+    -H "Authorization: Bearer $EMP_TOKEN" -H "Content-Type: application/json" \
+    -d "{\"status\":\"$status\",\"reason\":\"$reason\"}" \
+    "$url" || true)"
+
+  if [[ "$http" != "200" ]]; then
+    echo "ERROR: set_status http_status=$http url=$url" >&2
+    head -n 20 "$tmp_hdr" >&2 || true
+    if [[ -s "$tmp_body" ]] && head -c 1 "$tmp_body" | grep -q '{'; then
+      echo "--- body (first 1024B) ---" >&2
+      head -c 1024 "$tmp_body" >&2 || true
+    fi
+    rm -f "$tmp_body" "$tmp_hdr" || true
+    return 2
+  fi
+
+  if python3 -c 'import sys,json; json.load(sys.stdin)' <"$tmp_body" >/dev/null 2>&1; then
+    echo "set_status_ok review_id=$review_id new_status=$status"
+  else
+    echo "set_status_ok review_id=$review_id new_status=$status (non-json body)"
+  fi
+  rm -f "$tmp_body" "$tmp_hdr" || true
+}
 
 _q() {
   local status="$1"
@@ -128,5 +172,11 @@ echo
 echo "== removed (buyer) =="
 REMOVED_JSON="$(_q removed buyer)"
 printf '%s' "$REMOVED_JSON" | _summarize
+
+if [[ -n "$SET_REVIEW_ID" ]]; then
+  echo
+  echo "== set status =="
+  _set_status "$SET_REVIEW_ID" "$SET_STATUS" "$SET_REASON"
+fi
 
 echo "OK"
