@@ -122,6 +122,14 @@ def _is_invalid_merchandise_id(err: ShopifyPricingError) -> bool:
         return False
 
 
+def _first_item_variant_id(items: List[Dict[str, Any]]) -> Optional[str]:
+    for it in items or []:
+        vid = str(it.get("variant_id") or "").strip()
+        if vid:
+            return vid
+    return None
+
+
 async def _rotate_storefront_token_best_effort(
     *,
     merchant_id: str,
@@ -194,6 +202,70 @@ class ShopifyStorefrontPricingService:
         v = str(raw).strip().lower()
         return v not in {"0", "false", "no", "off"}
 
+    async def _admin_graphql(
+        self,
+        *,
+        shop_domain: str,
+        admin_access_token: str,
+        query: str,
+        variables: Optional[Dict[str, Any]],
+        debug_id: str,
+    ) -> Dict[str, Any]:
+        url = f"https://{shop_domain}/admin/api/{self.api_version}/graphql.json"
+        headers = {"X-Shopify-Access-Token": admin_access_token, "Content-Type": "application/json"}
+        payload: Dict[str, Any] = {"query": query}
+        if variables is not None:
+            payload["variables"] = variables
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+        except Exception as e:
+            logger.warning({"debug_id": debug_id, "error": str(e)}, "Shopify Admin GraphQL request failed")
+            return {}
+
+        if resp.status_code >= 400:
+            logger.warning(
+                {
+                    "debug_id": debug_id,
+                    "status_code": resp.status_code,
+                    "x_request_id": resp.headers.get("x-request-id"),
+                },
+                "Shopify Admin GraphQL HTTP error",
+            )
+            return {}
+
+        data = resp.json() or {}
+        if data.get("errors"):
+            logger.warning({"debug_id": debug_id, "errors": data.get("errors")[:3]}, "Shopify Admin GraphQL errors")
+            return {}
+        return data.get("data") or {}
+
+    async def _admin_variant_exists(
+        self,
+        *,
+        shop_domain: str,
+        admin_access_token: str,
+        variant_id: str,
+        debug_id: str,
+    ) -> Optional[bool]:
+        if not shop_domain or not admin_access_token or not variant_id:
+            return None
+        query = """
+query($id: ID!) {
+  productVariant(id: $id) { id }
+}
+"""
+        data = await self._admin_graphql(
+            shop_domain=shop_domain,
+            admin_access_token=admin_access_token,
+            query=query,
+            variables={"id": _gid("ProductVariant", variant_id)},
+            debug_id=debug_id,
+        )
+        pv = (data.get("productVariant") if isinstance(data, dict) else None) or None
+        return bool(pv)
+
     async def preview_cart_quote(
         self,
         *,
@@ -218,7 +290,30 @@ class ShopifyStorefrontPricingService:
 
         shop_domain = store.get("domain") or ""
         storefront_token = _extract_storefront_token(store) or ""
-        if not shop_domain or not storefront_token:
+        if not shop_domain:
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                "Missing Shopify shop domain",
+                debug_id,
+            )
+
+        if not storefront_token and _rotate_allowed(merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s):
+            admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
+            if admin_access_token:
+                storefront_token = (
+                    await _rotate_storefront_token_best_effort(
+                        merchant_id=merchant_id,
+                        store_id=store.get("store_id") if isinstance(store.get("store_id"), str) else None,
+                        shop_domain=shop_domain,
+                        admin_access_token=admin_access_token,
+                        existing_credentials=store.get("api_credentials")
+                        if isinstance(store.get("api_credentials"), dict)
+                        else None,
+                    )
+                    or ""
+                )
+
+        if not storefront_token:
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
                 "Missing Shopify Storefront token (X-Shopify-Storefront-Access-Token)",
@@ -268,6 +363,42 @@ class ShopifyStorefrontPricingService:
                 else:
                     raise
             else:
+                if _is_invalid_merchandise_id(e):
+                    admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
+                    vid = _first_item_variant_id(items or [])
+                    exists = (
+                        await self._admin_variant_exists(
+                            shop_domain=shop_domain,
+                            admin_access_token=admin_access_token,
+                            variant_id=vid or "",
+                            debug_id=debug_id,
+                        )
+                        if admin_access_token and vid
+                        else None
+                    )
+                    hint = None
+                    if exists is True:
+                        hint = (
+                            "Variant exists in Shopify Admin but is not available to Storefront API. "
+                            "Ensure the product is published to the Online Store sales channel and that "
+                            "Storefront API access is enabled (incl. `unauthenticated_read_product_listings`)."
+                        )
+                    elif exists is False:
+                        hint = (
+                            "Variant not found in this Shopify store. Your product cache may be stale; "
+                            "resync products after reconnecting the store."
+                        )
+                    raise ShopifyPricingError(
+                        "SHOPIFY_PRICING_UNAVAILABLE",
+                        (hint or str(getattr(e, "message", None) or "Storefront cartCreate failed")),
+                        debug_id,
+                        details={
+                            "shop_domain": shop_domain,
+                            "variant_id": vid,
+                            "admin_variant_exists": exists,
+                            "cart_create_user_errors": getattr(e, "details", {}) or {},
+                        },
+                    )
                 raise
 
         country_for_prices = None
@@ -400,11 +531,23 @@ class ShopifyStorefrontPricingService:
                     }
                 )
             logger.warning({"debug_id": debug_id, "errors": safe_errors[:5]}, "Shopify Storefront GraphQL errors")
+            required_access: List[str] = []
+            for e in safe_errors:
+                msg = str(e.get("message") or "")
+                m = re.search(r"Required access: `([^`]+)`", msg)
+                if m:
+                    required_access.append(m.group(1))
+
+            details: Dict[str, Any] = {"errors": safe_errors[:5]}
+            if required_access:
+                details["required_access"] = sorted(set(required_access))
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
-                "Storefront GraphQL error",
+                "Storefront GraphQL error"
+                if not required_access
+                else f"Storefront access denied (missing scope: {details['required_access'][0]})",
                 debug_id,
-                details={"errors": safe_errors[:5]},
+                details=details,
             )
         return data.get("data") or {}
 
