@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
+import asyncio
 import json
 import os
 import time
@@ -46,6 +47,16 @@ from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
+
+_ORDER_CREATE_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _get_order_create_lock(key: str) -> asyncio.Lock:
+    lock = _ORDER_CREATE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ORDER_CREATE_LOCKS[key] = lock
+    return lock
 
 
 # ============================================================================
@@ -1365,10 +1376,30 @@ async def agent_create_order(
         # 设置 agent session ID
         if not order_request.agent_session_id:
             order_request.agent_session_id = f"{context.agent_id}_{int(datetime.utcnow().timestamp())}"
-        
-        # 调用标准订单创建
-        from routes.order_routes import create_new_order
-        order_response = await create_new_order(order_request, background_tasks)
+
+        # Safety: prevent silent default-SKU checkout for Shopify.
+        try:
+            store_info = await get_primary_store(order_request.merchant_id)
+        except Exception:
+            store_info = None
+        if str((store_info or {}).get("platform") or "").lower() == "shopify":
+            missing_variant = False
+            for item in (order_request.items or []):
+                if not getattr(item, "variant_id", None) or not str(getattr(item, "variant_id", "")).strip():
+                    missing_variant = True
+                    break
+            if missing_variant:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "VARIANT_REQUIRED",
+                        "message": "variant_id is required for Shopify checkout; select a SKU/variant before adding to cart.",
+                    },
+                )
+
+        # 调用标准订单创建 (serialize per-merchant to avoid concurrent order creation hazards)
+        async with _get_order_create_lock(order_request.merchant_id):
+            order_response = await create_new_order(order_request, background_tasks)
 
         # PCS v0.2-b (best-effort): emit internal fact for reducer replay (no PII).
         try:

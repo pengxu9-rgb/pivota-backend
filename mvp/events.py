@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 import threading
 import uuid
 from dataclasses import dataclass
@@ -79,6 +80,7 @@ class FileEventSink:
 class PostgresEventSink:
     def __init__(self):
         self._ready = False
+        self._ensure_lock = asyncio.Lock()
 
     def _try_get_db(self):
         try:
@@ -89,37 +91,38 @@ class PostgresEventSink:
             return None
 
     async def _ensure_table(self, db) -> None:
-        if self._ready:
-            return
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mvp_events (
-              id BIGSERIAL PRIMARY KEY,
-              event_id TEXT UNIQUE NOT NULL,
-              schema_version VARCHAR(10) NOT NULL,
-              event_type TEXT NOT NULL,
-              merchant_id VARCHAR(64),
-              occurred_at TIMESTAMPTZ NOT NULL,
-              received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              geo_json JSONB,
-              surface TEXT,
-              adapter TEXT,
-              risk_tier TEXT,
-              idempotency_key TEXT,
-              payload_json JSONB NOT NULL,
-              payload_sha256 CHAR(64) NOT NULL,
-              prev_chain_hash CHAR(64),
-              chain_hash CHAR(64) NOT NULL
-            );
-            """
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mvp_events_merchant_time ON mvp_events(merchant_id, occurred_at DESC);"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mvp_events_type_time ON mvp_events(event_type, occurred_at DESC);"
-        )
-        self._ready = True
+        async with self._ensure_lock:
+            if self._ready:
+                return
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mvp_events (
+                  id BIGSERIAL PRIMARY KEY,
+                  event_id TEXT UNIQUE NOT NULL,
+                  schema_version VARCHAR(10) NOT NULL,
+                  event_type TEXT NOT NULL,
+                  merchant_id VARCHAR(64),
+                  occurred_at TIMESTAMPTZ NOT NULL,
+                  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  geo_json JSONB,
+                  surface TEXT,
+                  adapter TEXT,
+                  risk_tier TEXT,
+                  idempotency_key TEXT,
+                  payload_json JSONB NOT NULL,
+                  payload_sha256 CHAR(64) NOT NULL,
+                  prev_chain_hash CHAR(64),
+                  chain_hash CHAR(64) NOT NULL
+                );
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mvp_events_merchant_time ON mvp_events(merchant_id, occurred_at DESC);"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mvp_events_type_time ON mvp_events(event_type, occurred_at DESC);"
+            )
+            self._ready = True
 
     async def _get_prev_chain_hash(self, db, merchant_id: str) -> Optional[str]:
         row = await db.fetch_one(
@@ -195,14 +198,22 @@ def _default_file_sink_path() -> str:
     return os.getenv("MVP_EVENTS_FILE", "mvp_events.jsonl")
 
 
+_DEFAULT_SINK: Optional[EventSink] = None
+
+
 def get_default_sink() -> EventSink:
+    global _DEFAULT_SINK
+    if _DEFAULT_SINK is not None:
+        return _DEFAULT_SINK
     prefer_db = os.getenv("MVP_EVENTS_SINK", "db").lower() != "file"
     if prefer_db:
         try:
-            return PostgresEventSink()
+            _DEFAULT_SINK = PostgresEventSink()
+            return _DEFAULT_SINK
         except Exception:
             pass
-    return FileEventSink(_default_file_sink_path())
+    _DEFAULT_SINK = FileEventSink(_default_file_sink_path())
+    return _DEFAULT_SINK
 
 
 @dataclass(frozen=True)
@@ -294,4 +305,3 @@ def emit_best_effort(
     except Exception:
         # Never break the primary business flow due to telemetry.
         return
-
