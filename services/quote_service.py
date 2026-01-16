@@ -311,26 +311,35 @@ class QuoteService:
                 "request_fingerprint": fingerprint,
             }
         )
-        await insert_quote(
-            {
-                "quote_id": quote_id,
-                "merchant_id": merchant_id,
-                "agent_id": agent_id,
-                "engine": result.engine,
-                "engine_ref": str(result.engine_ref),
-                "request_fingerprint": fingerprint,
-                "request_json": request_json,
-                "snapshot_json": snapshot_json,
-                "quote_hash_sha256": quote_hash_sha256,
-                "status": "active",
-                "expires_at": expires_at,
-                "consumed_at": None,
-                "created_at": now,
-                "updated_at": now,
-                "debug_id": (result.debug or {}).get("debug_id"),
-                "notes": None,
-            }
-        )
+        try:
+            await insert_quote(
+                {
+                    "quote_id": quote_id,
+                    "merchant_id": merchant_id,
+                    "agent_id": agent_id,
+                    "engine": result.engine,
+                    "engine_ref": str(result.engine_ref),
+                    "request_fingerprint": fingerprint,
+                    "request_json": request_json,
+                    "snapshot_json": snapshot_json,
+                    "quote_hash_sha256": quote_hash_sha256,
+                    "status": "active",
+                    "expires_at": expires_at,
+                    "consumed_at": None,
+                    "created_at": now,
+                    "updated_at": now,
+                    "debug_id": (result.debug or {}).get("debug_id"),
+                    "notes": None,
+                }
+            )
+        except Exception as e:
+            # Fail-open: quote persistence should not take down checkout/preview flows.
+            # Order create may still be gated by quote-first enforcement; ops should
+            # apply migration 033_quote_first.sql if persistence is required.
+            logger.warning(
+                "Failed to persist quote (best-effort)",
+                extra={"merchant_id": merchant_id, "quote_id": quote_id, "error": str(e)},
+            )
 
         return {
             "quote_id": quote_id,

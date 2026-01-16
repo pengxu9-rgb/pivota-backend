@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
 from middleware.structured_logging import StructuredLoggingMiddleware
+from middleware.error_handler import ErrorHandlerMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
@@ -358,6 +359,14 @@ async def startup_event():
     # Run any additional promotions-specific initialization (kept lightweight for now)
     await ensure_promotions_table()
 
+    # Ensure quote-first table exists (best-effort; does not raise).
+    try:
+        from db.quotes import ensure_quotes_table
+
+        await ensure_quotes_table()
+    except Exception as exc:
+        logger.warning(f"⚠️ Failed to ensure quotes table: {exc}")
+
     # Ensure webhook audit/idempotency table exists (best-effort; does not raise)
     await WebhookService.ensure_webhook_events_table()
 
@@ -433,6 +442,9 @@ app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_
 
 # Add structured logging middleware (logs all requests in JSON format)
 app.add_middleware(StructuredLoggingMiddleware)
+
+# Add unified error handler middleware (formats errors + includes request id)
+app.add_middleware(ErrorHandlerMiddleware)
 
 # Include available routers
 app.include_router(agent_router)
