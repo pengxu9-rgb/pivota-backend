@@ -292,6 +292,22 @@ async def merchant_connect_shopify(
                     "token": token_json,
                 }
             )
+
+        # Prevent stale recommendations/checkout attempts after reconnecting a Shopify store:
+        # cached product IDs from a previous shop can linger until TTL, which breaks pricing/checkout.
+        try:
+            await database.execute(
+                """
+                UPDATE products_cache
+                SET expires_at = NOW()
+                WHERE merchant_id = :merchant_id
+                  AND platform = 'shopify'
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                """,
+                {"merchant_id": request.merchant_id},
+            )
+        except Exception:
+            pass
         
         # Legacy MCP fields have been migrated to merchant_stores table
         # No need to update merchant_onboarding anymore
