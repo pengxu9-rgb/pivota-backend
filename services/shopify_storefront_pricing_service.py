@@ -321,6 +321,8 @@ query($id: ID!) {
             )
 
         use_buyer_country_for_pricing = self._use_buyer_country_for_pricing()
+        cart: Optional[StorefrontCartResult] = None
+        err: Optional[ShopifyPricingError] = None
         try:
             cart = await self._create_cart(
                 shop_domain=shop_domain,
@@ -333,38 +335,43 @@ query($id: ID!) {
                 debug_id=debug_id,
             )
         except ShopifyPricingError as e:
-            # Self-heal common misconfig: Storefront scopes enabled after token issuance.
-            if _is_invalid_merchandise_id(e) and _rotate_allowed(
-                merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s
-            ):
+            err = e
+
+        if err is not None:
+            if _is_invalid_merchandise_id(err):
                 admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
-                if admin_access_token and shop_domain:
+                rotated = False
+
+                # Self-heal common misconfig: Storefront scopes enabled after token issuance.
+                if admin_access_token and _rotate_allowed(merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s):
                     new_token = await _rotate_storefront_token_best_effort(
                         merchant_id=merchant_id,
                         store_id=store.get("store_id") if isinstance(store.get("store_id"), str) else None,
                         shop_domain=shop_domain,
                         admin_access_token=admin_access_token,
-                        existing_credentials=store.get("api_credentials") if isinstance(store.get("api_credentials"), dict) else None,
+                        existing_credentials=store.get("api_credentials")
+                        if isinstance(store.get("api_credentials"), dict)
+                        else None,
                     )
                     if new_token:
+                        rotated = True
                         storefront_token = new_token
-                        cart = await self._create_cart(
-                            shop_domain=shop_domain,
-                            storefront_token=storefront_token,
-                            items=items,
-                            discount_codes=discount_codes,
-                            shipping_address=shipping_address,
-                            selected_delivery_option=selected_delivery_option,
-                            use_buyer_country_for_pricing=use_buyer_country_for_pricing,
-                            debug_id=debug_id,
-                        )
-                    else:
-                        raise
-                else:
-                    raise
-            else:
-                if _is_invalid_merchandise_id(e):
-                    admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
+                        try:
+                            cart = await self._create_cart(
+                                shop_domain=shop_domain,
+                                storefront_token=storefront_token,
+                                items=items,
+                                discount_codes=discount_codes,
+                                shipping_address=shipping_address,
+                                selected_delivery_option=selected_delivery_option,
+                                use_buyer_country_for_pricing=use_buyer_country_for_pricing,
+                                debug_id=debug_id,
+                            )
+                            err = None
+                        except ShopifyPricingError as e2:
+                            err = e2
+
+                if err is not None:
                     vid = _first_item_variant_id(items or [])
                     exists = (
                         await self._admin_variant_exists(
@@ -390,16 +397,18 @@ query($id: ID!) {
                         )
                     raise ShopifyPricingError(
                         "SHOPIFY_PRICING_UNAVAILABLE",
-                        (hint or str(getattr(e, "message", None) or "Storefront cartCreate failed")),
+                        (hint or str(getattr(err, "message", None) or "Storefront cartCreate failed")),
                         debug_id,
                         details={
                             "shop_domain": shop_domain,
                             "variant_id": vid,
                             "admin_variant_exists": exists,
-                            "cart_create_user_errors": getattr(e, "details", {}) or {},
+                            "storefront_token_rotated": rotated,
+                            "cart_create_error": getattr(err, "details", {}) or {},
                         },
                     )
-                raise
+
+            raise err
 
         country_for_prices = None
         if use_buyer_country_for_pricing and shipping_address and isinstance(shipping_address, dict):
