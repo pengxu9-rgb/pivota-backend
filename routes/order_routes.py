@@ -1445,8 +1445,9 @@ async def create_shopify_order(order_id: str) -> bool:
             logger.error(f"[Shopify] Primary store is {store_info.get('platform')}, not Shopify for merchant {order['merchant_id']}")
             return False
 
-        shop_domain = store_info.get("domain")
-        access_token = store_info.get("api_key")
+        shop_domain_raw = store_info.get("domain")
+        shop_domain = _normalize_shopify_domain(str(shop_domain_raw or ""))
+        access_token = extract_shopify_access_token(store_info.get("api_key"))
         
         logger.info(
             "[Shopify] Store credentials: domain=%s has_token=%s",
@@ -1564,8 +1565,9 @@ async def create_shopify_order(order_id: str) -> bool:
                 "status": "success",
                 "amount": str(order_total),
                 "source_name": "external",
-                # Shopify expects a gateway string; fall back to "manual" if unknown.
-                "gateway": psp_used_for_txn or "manual",
+                # Use "manual" to avoid Shopify rejecting unknown gateway names when the merchant
+                # pays via an external PSP (Stripe/Adyen/etc) outside of Shopify Payments.
+                "gateway": "manual",
             }
             if currency_code and len(currency_code) == 3:
                 txn["currency"] = currency_code
@@ -1617,7 +1619,7 @@ async def create_shopify_order(order_id: str) -> bool:
             # Some Shopify configurations may reject embedded transactions on order create.
             # Fall back to creating the order without transactions to preserve fulfillment,
             # then the post-create reconciliation will attempt to add a transaction.
-            if response.status_code in (400, 401, 403, 422) and transactions_payload:
+            if response.status_code != 201 and transactions_payload:
                 try:
                     retry_payload = {"order": dict(shopify_order_data["order"])}
                     retry_payload["order"].pop("transactions", None)
