@@ -578,6 +578,11 @@ async def send_invitation_email_from_order(
     to_email = str(order.get("customer_email") or "").strip()
     if not to_email:
         raise HTTPException(status_code=400, detail="ORDER_EMAIL_MISSING")
+    to_email_lower = to_email.lower()
+    to_email_domain = ""
+    if "@" in to_email_lower:
+        to_email_domain = to_email_lower.split("@", 1)[1].strip()
+    to_email_fp = sha256(to_email_lower.encode("utf-8")).hexdigest()[:12] if to_email_lower else ""
 
     metadata = order.get("metadata") or {}
     if isinstance(metadata, dict):
@@ -670,6 +675,8 @@ async def send_invitation_email_from_order(
         "status": "success",
         "sent": True,
         "order_id": order_id,
+        "to_email_domain": to_email_domain or None,
+        "to_email_fp": to_email_fp or None,
         "subject_count": len(invitation_urls),
         "expires_at": int(minted.get("expires_at") or 0),
         "invitation_fps": invitation_fps[:3],
