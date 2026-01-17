@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hmac
 import os
+from hashlib import sha256
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -27,6 +28,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
+from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
 from db.orders import get_order
 from services.merchant_store_service import get_primary_store
 
@@ -81,6 +83,63 @@ def _invitation_url_for_token(invitation_token: str) -> Optional[str]:
     if not t:
         return None
     return f"{b}#invitation_token={quote(t, safe='')}"
+
+
+def _sendgrid_api_key() -> str:
+    return (os.getenv("SENDGRID_API_KEY") or "").strip()
+
+
+def _sendgrid_from_email() -> str:
+    return (os.getenv("FROM_EMAIL") or "noreply@pivota.ai").strip()
+
+
+def _sendgrid_template_id() -> str:
+    # Optional SendGrid dynamic template ID.
+    return (os.getenv("REVIEWS_INVITATION_SENDGRID_TEMPLATE_ID") or "").strip()
+
+
+async def _send_sendgrid_email(*, to_email: str, subject: str, text_body: str, template_data: Dict[str, Any]) -> None:
+    api_key = _sendgrid_api_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="SENDGRID_DISABLED")
+
+    to_email = (to_email or "").strip()
+    if not to_email:
+        raise HTTPException(status_code=400, detail="ORDER_EMAIL_MISSING")
+
+    from_email = _sendgrid_from_email()
+    if not from_email:
+        raise HTTPException(status_code=503, detail="SENDGRID_FROM_EMAIL_MISSING")
+
+    template_id = _sendgrid_template_id()
+    payload: Dict[str, Any] = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": from_email},
+    }
+
+    if template_id:
+        payload["template_id"] = template_id
+        payload["personalizations"][0]["dynamic_template_data"] = template_data
+    else:
+        payload["subject"] = subject
+        payload["content"] = [{"type": "text/plain", "value": text_body}]
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except Exception:
+        raise HTTPException(status_code=503, detail="SENDGRID_UNAVAILABLE")
+
+    # SendGrid returns 202 Accepted on success.
+    if resp.status_code not in {200, 202}:
+        raise HTTPException(status_code=503, detail="SENDGRID_UNAVAILABLE")
 
 
 async def _mint_invitation_via_proof_issuer(
@@ -229,6 +288,13 @@ async def issue_invitation_from_order(
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
 
+    # Debuggable, non-sensitive config surface for internal callers.
+    # Helps confirm env propagation without leaking tokens/PII.
+    link_base = _invitation_link_base_url().strip()
+    response.headers["X-Reviews-Invitation-Link-Configured"] = "1" if link_base else "0"
+    if link_base:
+        response.headers["X-Reviews-Invitation-Link-Base"] = link_base.rstrip("#")
+
     merchant_id = (body.merchant_id or "").strip()
     order_id = (body.order_id or "").strip()
     if not merchant_id or not order_id:
@@ -238,7 +304,7 @@ async def issue_invitation_from_order(
     if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
-    return await mint_invitations_from_paid_order(
+    out = await mint_invitations_from_paid_order(
         merchant_id=merchant_id,
         order=order,
         ttl_seconds=int(body.ttl_seconds),
@@ -246,3 +312,135 @@ async def issue_invitation_from_order(
         variant_id=body.variant_id,
         verification="verified_buyer",
     )
+    out["invitation_link_base_url_configured"] = bool(link_base)
+    if link_base:
+        out["invitation_link_base_url"] = link_base.rstrip("#")
+    return out
+
+
+class SendInvitationEmailFromOrderRequest(BaseModel):
+    merchant_id: str = Field(..., min_length=1)
+    order_id: str = Field(..., min_length=1)
+    ttl_seconds: int = Field(7 * 24 * 3600, ge=300, le=7 * 24 * 3600)
+    platform_product_id: Optional[str] = None
+    variant_id: Optional[str] = None
+    max_links: int = Field(3, ge=1, le=10)
+    force: bool = False
+
+
+@router.post("/invitation/send-email-from-order")
+async def send_invitation_email_from_order(
+    body: SendInvitationEmailFromOrderRequest,
+    response: Response,
+    x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
+) -> Dict[str, Any]:
+    """
+    Internal helper: mint invitation_token(s) for a paid order and send buyer email via SendGrid.
+
+    Security:
+    - Requires X-Internal-Key (server-side only).
+    - Never returns tokens or email addresses.
+    """
+    _require_internal_key(x_internal_key)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    # Debuggable, non-sensitive config surface for internal callers.
+    link_base = _invitation_link_base_url().strip()
+    response.headers["X-Reviews-Invitation-Link-Configured"] = "1" if link_base else "0"
+    if link_base:
+        response.headers["X-Reviews-Invitation-Link-Base"] = link_base.rstrip("#")
+
+    merchant_id = (body.merchant_id or "").strip()
+    order_id = (body.order_id or "").strip()
+    if not merchant_id or not order_id:
+        raise HTTPException(status_code=400, detail="INVALID_REQUEST")
+
+    if not buyer_submit_enabled():
+        raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
+    if not buyer_submit_merchant_allowed(merchant_id):
+        raise HTTPException(status_code=403, detail="BUYER_SUBMIT_NOT_ALLOWED")
+
+    # Ensure we have a safe landing URL (token placed in URL fragment).
+    if not link_base:
+        raise HTTPException(status_code=503, detail="INVITATION_LINK_DISABLED")
+
+    order = await get_order(order_id)
+    if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    to_email = str(order.get("customer_email") or "").strip()
+    if not to_email:
+        raise HTTPException(status_code=400, detail="ORDER_EMAIL_MISSING")
+
+    metadata = order.get("metadata") or {}
+    if isinstance(metadata, dict):
+        already_sent_at = str(metadata.get("reviews_invitation_email_sent_at") or "").strip()
+    else:
+        already_sent_at = ""
+
+    if already_sent_at and not body.force:
+        return {"status": "success", "sent": False, "reason": "ALREADY_SENT", "order_id": order_id}
+
+    minted = await mint_invitations_from_paid_order(
+        merchant_id=merchant_id,
+        order=order,
+        ttl_seconds=int(body.ttl_seconds),
+        platform_product_id=body.platform_product_id,
+        variant_id=body.variant_id,
+        verification="verified_buyer",
+    )
+
+    items: List[Dict[str, Any]] = []
+    if isinstance(minted.get("items"), list):
+        items = [x for x in minted["items"] if isinstance(x, dict)]
+    elif isinstance(minted.get("subject"), dict):
+        items = [minted]  # single-item shape
+
+    invitation_urls: List[str] = []
+    invitation_fps: List[str] = []
+    subjects: List[Dict[str, Any]] = []
+    for it in items:
+        url = str(it.get("invitation_url") or "").strip()
+        tok = str(it.get("invitation_token") or "").strip()
+        subj = it.get("subject")
+        if isinstance(subj, dict):
+            subjects.append(subj)
+        if url:
+            invitation_urls.append(url)
+        if tok:
+            invitation_fps.append(sha256(tok.encode("utf-8")).hexdigest()[:12])
+
+    if not invitation_urls:
+        raise HTTPException(status_code=503, detail="INVITATION_LINK_DISABLED")
+
+    invitation_urls = invitation_urls[: int(body.max_links)]
+
+    # Compose email.
+    email_subject = "How was your purchase? Leave a review"
+    text_body = "Write a review:\n" + "\n".join(invitation_urls) + "\n"
+    template_data = {
+        "merchant_id": merchant_id,
+        "order_id": order_id,
+        "invitation_url": invitation_urls[0],
+        "invitation_urls": invitation_urls,
+        "expires_at": int(minted.get("expires_at") or 0),
+    }
+
+    await _send_sendgrid_email(
+        to_email=to_email,
+        subject=email_subject,
+        text_body=text_body,
+        template_data=template_data,
+    )
+
+    return {
+        "status": "success",
+        "sent": True,
+        "order_id": order_id,
+        "subject_count": len(invitation_urls),
+        "expires_at": int(minted.get("expires_at") or 0),
+        "invitation_fps": invitation_fps[:3],
+        "invitation_link_base_url_configured": bool(link_base),
+        "invitation_link_base_url": link_base.rstrip("#") if link_base else None,
+    }
