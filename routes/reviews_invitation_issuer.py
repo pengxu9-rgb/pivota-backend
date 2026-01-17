@@ -297,7 +297,7 @@ async def _send_sendgrid_email(
     text_body: str,
     html_body: str,
     template_data: Dict[str, Any],
-) -> None:
+) -> Dict[str, Any]:
     api_key = _sendgrid_api_key()
     if not api_key:
         raise HTTPException(status_code=503, detail="SENDGRID_DISABLED")
@@ -346,6 +346,20 @@ async def _send_sendgrid_email(
     # SendGrid returns 202 Accepted on success.
     if resp.status_code not in {200, 202}:
         raise HTTPException(status_code=503, detail="SENDGRID_UNAVAILABLE")
+
+    # Best-effort: capture message id for debugging (non-PII).
+    msg_id = (
+        resp.headers.get("x-message-id")
+        or resp.headers.get("X-Message-Id")
+        or resp.headers.get("X-Message-ID")
+        or ""
+    ).strip()
+    return {
+        "sendgrid_status_code": resp.status_code,
+        "sendgrid_message_id": msg_id or None,
+        "sendgrid_template_used": bool(use_template),
+        "sendgrid_click_tracking_disabled": True,
+    }
 
 
 async def _mint_invitation_via_proof_issuer(
@@ -663,13 +677,28 @@ async def send_invitation_email_from_order(
         }
     )
 
-    await _send_sendgrid_email(
+    sendgrid_meta = await _send_sendgrid_email(
         to_email=to_email,
         subject=email_subject,
         text_body=text_body,
         html_body=html_body,
         template_data=template_data,
     )
+
+    # Best-effort: mark as sent to prevent duplicates.
+    try:
+        from datetime import datetime, timezone
+        from db.orders import update_order
+
+        new_meta: Dict[str, Any] = {}
+        if isinstance(metadata, dict):
+            new_meta = dict(metadata)
+        new_meta["reviews_invitation_email_sent_at"] = datetime.now(timezone.utc).isoformat()
+        if sendgrid_meta.get("sendgrid_message_id"):
+            new_meta["reviews_invitation_sendgrid_message_id"] = str(sendgrid_meta["sendgrid_message_id"])
+        await update_order(order_id, {"metadata": new_meta})
+    except Exception:
+        pass
 
     return {
         "status": "success",
@@ -683,4 +712,5 @@ async def send_invitation_email_from_order(
         "shortlink_base_url": _invitation_shortlink_base_url().strip() or None,
         "invitation_link_base_url_configured": bool(link_base),
         "invitation_link_base_url": link_base.rstrip("#") if link_base else None,
+        **sendgrid_meta,
     }
