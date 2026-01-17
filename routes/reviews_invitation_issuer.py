@@ -172,6 +172,18 @@ def _use_sendgrid_template() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _disable_sendgrid_click_tracking() -> bool:
+    """
+    Whether to disable SendGrid click tracking for invitation emails.
+
+    Default is enabled (i.e. we do NOT disable) because some recipient mail
+    gateways/filters are more likely to accept SendGrid-tracked links than
+    direct links to new domains.
+    """
+    raw = (os.getenv("REVIEWS_INVITATION_DISABLE_SENDGRID_CLICK_TRACKING") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _include_store_url_in_email() -> bool:
     raw = (os.getenv("REVIEWS_INVITATION_INCLUDE_STORE_URL") or "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -315,10 +327,11 @@ async def _send_sendgrid_email(
     payload: Dict[str, Any] = {
         "personalizations": [{"to": [{"email": to_email}]}],
         "from": {"email": from_email},
-        # Avoid very long visible URLs due to ESP click-tracking rewrite.
-        # We rely on our own shortlink redirect for click measurement.
-        "tracking_settings": {"click_tracking": {"enable": False, "enable_text": False}},
     }
+    click_tracking_disabled = False
+    if _disable_sendgrid_click_tracking():
+        payload["tracking_settings"] = {"click_tracking": {"enable": False, "enable_text": False}}
+        click_tracking_disabled = True
 
     if use_template:
         payload["template_id"] = template_id
@@ -358,7 +371,7 @@ async def _send_sendgrid_email(
         "sendgrid_status_code": resp.status_code,
         "sendgrid_message_id": msg_id or None,
         "sendgrid_template_used": bool(use_template),
-        "sendgrid_click_tracking_disabled": True,
+        "sendgrid_click_tracking_disabled": click_tracking_disabled,
     }
 
 
