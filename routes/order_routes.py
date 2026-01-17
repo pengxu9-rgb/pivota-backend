@@ -4,7 +4,7 @@ Pivota 核心业务流程：Agent 下单 → 支付 → 履约
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
@@ -46,6 +46,11 @@ from services.quote_service import (
 from services.shopify_transactions_service import (
     extract_shopify_access_token,
     ensure_external_payment_transaction_best_effort,
+)
+from routes.reviews_invitation_issuer import (
+    SendInvitationEmailFromOrderRequest,
+    send_invitation_email_from_order,
+    _internal_key as _reviews_invitation_internal_key,
 )
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -1849,6 +1854,7 @@ async def mark_order_as_shipped(
     order_id: str,
     tracking_number: str,
     carrier: Optional[str] = None,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(require_admin)
 ):
     """标记订单已发货"""
@@ -1869,6 +1875,37 @@ async def mark_order_as_shipped(
             "carrier": carrier
         }
     )
+
+    # 后台任务：订单发货后发送评价邀请邮件
+    async def send_review_invitation_task():
+        try:
+            internal_key = (_reviews_invitation_internal_key() or "").strip()
+            if not internal_key:
+                logger.info("Reviews invitation issuer disabled; skip send.")
+                return
+            req = SendInvitationEmailFromOrderRequest(
+                merchant_id=order["merchant_id"],
+                order_id=order_id,
+                ttl_seconds=7 * 24 * 3600,
+            )
+            await send_invitation_email_from_order(
+                body=req,
+                response=Response(),
+                x_internal_key=internal_key,
+            )
+            logger.info(
+                f"Reviews invitation email dispatched for order {order_id}"
+            )
+        except HTTPException as e:
+            logger.warning(
+                f"Reviews invitation skipped for order {order_id}: {e.detail}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Reviews invitation error for order {order_id}: {e}"
+            )
+
+    background_tasks.add_task(send_review_invitation_task)
     
     return {
         "status": "success",
