@@ -8,6 +8,7 @@ from sqlalchemy.sql import func
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import secrets
+import os
 
 from db.database import metadata, database
 
@@ -356,6 +357,60 @@ async def mark_order_shipped(
     carrier: Optional[str] = None
 ) -> bool:
     """标记订单已发货"""
+    async def _ensure_reviews_invitation_send_jobs_table_best_effort() -> None:
+        try:
+            await database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reviews_invitation_send_jobs (
+                  id BIGSERIAL PRIMARY KEY,
+                  merchant_id VARCHAR(64) NOT NULL,
+                  order_id VARCHAR(64) NOT NULL,
+                  send_at TIMESTAMPTZ NOT NULL,
+                  status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  last_attempt_at TIMESTAMPTZ NULL,
+                  sent_at TIMESTAMPTZ NULL,
+                  sendgrid_message_id TEXT NULL,
+                  last_error TEXT NULL,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        except Exception:
+            return
+        try:
+            await database.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reviews_invitation_send_jobs_due ON reviews_invitation_send_jobs (status, send_at)"
+            )
+        except Exception:
+            pass
+        try:
+            await database.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_reviews_invitation_send_jobs_order_status ON reviews_invitation_send_jobs (order_id, status)"
+            )
+        except Exception:
+            pass
+
+    def _invitation_send_delay_seconds() -> int:
+        raw = (os.getenv("REVIEWS_INVITATION_SEND_DELAY_SECONDS") or "").strip()
+        try:
+            val = int(raw) if raw else 0
+        except Exception:
+            val = 0
+        return max(0, val)
+
+    def _buyer_submit_enabled() -> bool:
+        return (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower() == "true"
+
+    def _buyer_submit_merchant_allowed(merchant_id: str) -> bool:
+        raw = (os.getenv("REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST") or "").strip()
+        if not raw:
+            return True
+        mid = (merchant_id or "").strip()
+        allow = {x.strip() for x in raw.split(",") if x.strip()}
+        return mid in allow
+
     query = (
         orders.update()
         .where(orders.c.order_id == order_id)
@@ -367,10 +422,38 @@ async def mark_order_shipped(
             shipped_at=datetime.now(),
             updated_at=datetime.now()
         )
-        .returning(orders.c.order_id)
+        .returning(orders.c.order_id, orders.c.merchant_id)
     )
     result = await database.fetch_one(query)
-    return result is not None
+    if not result:
+        return False
+
+    # Platform-agnostic delayed invitation scheduling: if delay is configured,
+    # enqueue a job for worker service to send the email later.
+    delay = _invitation_send_delay_seconds()
+    if delay > 0 and _buyer_submit_enabled():
+        try:
+            merchant_id = str(result.get("merchant_id") or "").strip()
+            if merchant_id and _buyer_submit_merchant_allowed(merchant_id):
+                await _ensure_reviews_invitation_send_jobs_table_best_effort()
+                await database.execute(
+                    """
+                    INSERT INTO reviews_invitation_send_jobs
+                      (merchant_id, order_id, send_at, status, updated_at)
+                    VALUES
+                      (:merchant_id, :order_id, NOW() + (:delay || ' seconds')::interval, 'pending', NOW())
+                    ON CONFLICT (order_id, status)
+                    DO UPDATE SET
+                      send_at = EXCLUDED.send_at,
+                      updated_at = NOW()
+                    """,
+                    {"merchant_id": merchant_id, "order_id": order_id, "delay": int(delay)},
+                )
+        except Exception:
+            # Do not block fulfillment on invitation scheduling failures.
+            pass
+
+    return True
 
 
 # ============================================================================
