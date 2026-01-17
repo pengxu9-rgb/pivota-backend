@@ -93,6 +93,7 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                 name,
                 domain,
                 api_key,
+                support_email,
                 status,
                 connected_at,
                 'merchant_stores' as source
@@ -102,7 +103,28 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
             ORDER BY connected_at DESC
         """
         
-        new_stores = await database.fetch_all(store_query, {"merchant_id": merchant_id})
+        try:
+            new_stores = await database.fetch_all(store_query, {"merchant_id": merchant_id})
+        except Exception as e:
+            # Backward compatibility: support_email column might not exist yet.
+            logger.error(f"Error fetching from merchant_stores (support_email): {e}")
+            store_query = """
+                SELECT 
+                    store_id,
+                    merchant_id,
+                    platform,
+                    name,
+                    domain,
+                    api_key,
+                    status,
+                    connected_at,
+                    'merchant_stores' as source
+                FROM merchant_stores
+                WHERE merchant_id = :merchant_id 
+                AND status IN ('active', 'connected')
+                ORDER BY connected_at DESC
+            """
+            new_stores = await database.fetch_all(store_query, {"merchant_id": merchant_id})
         
         # 解析 api_key 格式（支持 JSON 和纯字符串）
         for store in new_stores:

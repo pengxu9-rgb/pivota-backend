@@ -98,6 +98,97 @@ def _sendgrid_template_id() -> str:
     return (os.getenv("REVIEWS_INVITATION_SENDGRID_TEMPLATE_ID") or "").strip()
 
 
+def _support_email_default(*, store: Optional[Dict[str, Any]], from_email: str) -> str:
+    if isinstance(store, dict):
+        email = str(store.get("support_email") or "").strip()
+        if email:
+            return email
+    return (os.getenv("REVIEWS_INVITATION_SUPPORT_EMAIL") or from_email or "").strip()
+
+
+def _store_name_default(store: Optional[Dict[str, Any]]) -> str:
+    if isinstance(store, dict):
+        name = str(store.get("name") or "").strip()
+        if name:
+            return name
+    return (os.getenv("REVIEWS_INVITATION_STORE_NAME") or "our store").strip()
+
+
+def _store_url_default(store: Optional[Dict[str, Any]]) -> str:
+    if isinstance(store, dict):
+        domain = str(store.get("domain") or "").strip()
+        if domain:
+            if domain.startswith("http://") or domain.startswith("https://"):
+                return domain
+            return f"https://{domain}"
+    return (os.getenv("REVIEWS_INVITATION_STORE_URL") or "").strip()
+
+
+def _first_name_from_order(order: Dict[str, Any]) -> str:
+    raw = str(order.get("customer_name") or "").strip()
+    if not raw:
+        return ""
+    return raw.split()[0].strip()
+
+
+def _compose_invitation_email(
+    *,
+    first_name: str,
+    store_name: str,
+    review_link: str,
+    support_email: str,
+    store_url: str,
+) -> tuple[str, str, Dict[str, Any]]:
+    safe_first = (first_name or "").strip()
+    safe_store = (store_name or "our store").strip()
+    safe_link = (review_link or "").strip()
+    safe_support = (support_email or "").strip()
+    safe_store_url = (store_url or "").strip()
+
+    greeting = f"Hi {safe_first}," if safe_first else "Hi,"
+
+    closing_parts: List[str] = []
+    if safe_support:
+        closing_parts.append(safe_support)
+    if safe_store_url:
+        closing_parts.append(safe_store_url)
+    closing_line = " | ".join(closing_parts)
+
+    text_lines = [
+        greeting,
+        "",
+        f"Thanks again for your recent purchase from {safe_store}—we hope you’re loving it so far.",
+        "",
+        "If you have a minute, would you share your feedback by leaving a quick review? Your review helps other shoppers feel confident, and it helps us keep improving.",
+        "",
+        f"Leave your review here: {safe_link}",
+        "",
+        "As a thank-you, you’ll also help us decide what to stock and build next.",
+        "",
+        "Thanks for your time,",
+        safe_store,
+    ]
+    if closing_line:
+        text_lines.append(closing_line)
+
+    subject = f"How was your purchase from {safe_store}?"
+
+    template_data: Dict[str, Any] = {
+        "FirstName": safe_first,
+        "StoreName": safe_store,
+        "ReviewLink": safe_link,
+        "SupportEmail": safe_support,
+        "StoreURL": safe_store_url,
+        "first_name": safe_first,
+        "store_name": safe_store,
+        "review_link": safe_link,
+        "support_email": safe_support,
+        "store_url": safe_store_url,
+    }
+
+    return subject, "\n".join(text_lines).strip() + "\n", template_data
+
+
 async def _send_sendgrid_email(*, to_email: str, subject: str, text_body: str, template_data: Dict[str, Any]) -> None:
     api_key = _sendgrid_api_key()
     if not api_key:
@@ -417,15 +508,30 @@ async def send_invitation_email_from_order(
     invitation_urls = invitation_urls[: int(body.max_links)]
 
     # Compose email.
-    email_subject = "How was your purchase? Leave a review"
-    text_body = "Write a review:\n" + "\n".join(invitation_urls) + "\n"
-    template_data = {
-        "merchant_id": merchant_id,
-        "order_id": order_id,
-        "invitation_url": invitation_urls[0],
-        "invitation_urls": invitation_urls,
-        "expires_at": int(minted.get("expires_at") or 0),
-    }
+    store = await get_primary_store(merchant_id)
+    from_email = _sendgrid_from_email()
+    store_name = _store_name_default(store)
+    store_url = _store_url_default(store)
+    support_email = _support_email_default(store=store, from_email=from_email)
+    first_name = _first_name_from_order(order)
+
+    review_link = invitation_urls[0]
+    email_subject, text_body, template_data = _compose_invitation_email(
+        first_name=first_name,
+        store_name=store_name,
+        review_link=review_link,
+        support_email=support_email,
+        store_url=store_url,
+    )
+    template_data.update(
+        {
+            "merchant_id": merchant_id,
+            "order_id": order_id,
+            "invitation_url": review_link,
+            "invitation_urls": invitation_urls,
+            "expires_at": int(minted.get("expires_at") or 0),
+        }
+    )
 
     await _send_sendgrid_email(
         to_email=to_email,
