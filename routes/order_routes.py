@@ -1853,8 +1853,8 @@ async def trigger_shopify_order(
 async def mark_order_as_shipped(
     order_id: str,
     tracking_number: str,
-    carrier: Optional[str] = None,
     background_tasks: BackgroundTasks,
+    carrier: Optional[str] = None,
     current_user: dict = Depends(require_admin)
 ):
     """标记订单已发货"""
