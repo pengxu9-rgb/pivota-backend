@@ -4,7 +4,7 @@ Webhook 处理路由
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Request, HTTPException, Header
+from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 import stripe
@@ -23,8 +23,17 @@ from config.settings import settings
 from utils.logger import logger
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
+from routes.reviews_invitation_issuer import (
+    SendInvitationEmailFromOrderRequest,
+    _internal_key as _reviews_invitation_internal_key,
+    send_invitation_email_from_order,
+)
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+
+def _reviews_invitation_auto_send_on_shopify_fulfillment_enabled() -> bool:
+    raw = (os.getenv("REVIEWS_INVITATION_AUTO_SEND_ON_SHOPIFY_FULFILLMENT") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _stripe_minor_unit_factor(currency: Optional[str]) -> Decimal:
@@ -302,6 +311,7 @@ async def handle_stripe_webhook(
 async def handle_shopify_webhook(
     merchant_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     x_shopify_hmac_sha256: Optional[str] = Header(None),
     x_shopify_topic: Optional[str] = Header(None),
     x_shopify_shop_domain: Optional[str] = Header(None),
@@ -489,6 +499,35 @@ async def handle_shopify_webhook(
                     }
                 )
                 logger.info(f"Order {order_id} marked as shipped via webhook")
+
+                if _reviews_invitation_auto_send_on_shopify_fulfillment_enabled():
+                    async def send_review_invitation_task() -> None:
+                        try:
+                            internal_key = (_reviews_invitation_internal_key() or "").strip()
+                            if not internal_key:
+                                logger.info("Reviews invitation issuer disabled; skip send.")
+                                return
+                            req = SendInvitationEmailFromOrderRequest(
+                                merchant_id=merchant_id,
+                                order_id=order_id,
+                                ttl_seconds=7 * 24 * 3600,
+                            )
+                            await send_invitation_email_from_order(
+                                body=req,
+                                response=Response(),
+                                x_internal_key=internal_key,
+                            )
+                            logger.info(f"Reviews invitation email dispatched for order {order_id} (shopify webhook)")
+                        except HTTPException as e:
+                            logger.warning(
+                                f"Reviews invitation skipped for order {order_id} (shopify webhook): {e.detail}"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Reviews invitation error for order {order_id} (shopify webhook): {e}"
+                            )
+
+                    background_tasks.add_task(send_review_invitation_task)
 
         elif topic in ("orders/create", "orders/paid"):
             # Best-effort linkage: map Shopify order id -> Pivota order by orders.shopify_order_id

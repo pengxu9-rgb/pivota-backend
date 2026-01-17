@@ -4,7 +4,7 @@ Allow merchants to connect their own stores (Shopify, Wix, etc.)
 """
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
 from typing import Dict, Any, Optional
 import logging
 import httpx
@@ -951,6 +951,17 @@ async def merchant_update_store_support_email(
         raise HTTPException(status_code=403, detail="Can only update your own store")
 
     support_email = (request.support_email or "").strip() or None
+    if support_email is not None:
+        try:
+            support_email = TypeAdapter(EmailStr).validate_python(support_email)
+        except ValidationError:
+            raise HTTPException(status_code=400, detail="Invalid support_email")
+
+    # Backward compatibility: column may not exist on some deployments.
+    try:
+        await database.execute("ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT")
+    except Exception:
+        pass
 
     store_row = await database.fetch_one(
         """
