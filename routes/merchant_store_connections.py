@@ -107,6 +107,14 @@ class UpdateStoreSupportEmailRequest(BaseModel):
     support_email: Optional[str] = None
 
 
+class GetStoreSupportEmailResponse(BaseModel):
+    status: str
+    merchant_id: str
+    store_id: str
+    support_email: Optional[str] = None
+    effective_support_email: Optional[str] = None
+
+
 @router.post("/shopify/connect")
 async def merchant_connect_shopify(
     request: ConnectShopifyRequest,
@@ -987,4 +995,55 @@ async def merchant_update_store_support_email(
         "merchant_id": target_merchant_id,
         "store_id": store_row["store_id"],
         "support_email": support_email,
+    }
+
+
+@router.get("/stores/support-email", response_model=GetStoreSupportEmailResponse)
+async def merchant_get_store_support_email(
+    merchant_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get the current (and effective) support email used for review invitations."""
+    if current_user["role"] not in ["merchant", "employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
+    if not target_merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+        raise HTTPException(status_code=403, detail="Can only view your own store")
+
+    # Backward compatibility: column may not exist on some deployments.
+    try:
+        await database.execute("ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT")
+    except Exception:
+        pass
+
+    store_row = await database.fetch_one(
+        """
+        SELECT store_id, support_email
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND status IN ('active','connected')
+        ORDER BY connected_at DESC
+        LIMIT 1
+        """,
+        {"merchant_id": target_merchant_id},
+    )
+    if not store_row:
+        raise HTTPException(status_code=404, detail="No active store found")
+
+    support_email = (store_row.get("support_email") or "").strip() or None
+    effective = support_email
+    if not effective:
+        effective = (os.getenv("REVIEWS_INVITATION_SUPPORT_EMAIL") or "").strip() or None
+    if not effective:
+        effective = (os.getenv("FROM_EMAIL") or "").strip() or None
+
+    return {
+        "status": "success",
+        "merchant_id": target_merchant_id,
+        "store_id": store_row["store_id"],
+        "support_email": support_email,
+        "effective_support_email": effective,
     }
