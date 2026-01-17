@@ -102,6 +102,11 @@ class ConnectPrestaShopRequest(BaseModel):
     api_key: str
 
 
+class UpdateStoreSupportEmailRequest(BaseModel):
+    merchant_id: Optional[str] = None
+    support_email: Optional[str] = None
+
+
 @router.post("/shopify/connect")
 async def merchant_connect_shopify(
     request: ConnectShopifyRequest,
@@ -927,3 +932,48 @@ async def merchant_connect_prestashop(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to connect PrestaShop: {str(e)}")
+
+
+@router.post("/stores/support-email")
+async def merchant_update_store_support_email(
+    request: UpdateStoreSupportEmailRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Allow merchant to set a support email for review invitations."""
+    if current_user["role"] not in ["merchant", "employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    target_merchant_id = request.merchant_id or current_user.get("merchant_id")
+    if not target_merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+
+    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+        raise HTTPException(status_code=403, detail="Can only update your own store")
+
+    support_email = (request.support_email or "").strip() or None
+
+    store_row = await database.fetch_one(
+        """
+        SELECT store_id
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND status IN ('active','connected')
+        ORDER BY connected_at DESC
+        LIMIT 1
+        """,
+        {"merchant_id": target_merchant_id},
+    )
+    if not store_row:
+        raise HTTPException(status_code=404, detail="No active store found")
+
+    await database.execute(
+        "UPDATE merchant_stores SET support_email = :support_email WHERE store_id = :store_id",
+        {"support_email": support_email, "store_id": store_row["store_id"]},
+    )
+
+    return {
+        "status": "success",
+        "merchant_id": target_merchant_id,
+        "store_id": store_row["store_id"],
+        "support_email": support_email,
+    }
