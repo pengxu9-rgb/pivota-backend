@@ -65,6 +65,97 @@ def _proof_issuer_internal_key() -> str:
         or (os.getenv("REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY") or "").strip()
     )
 
+def _invitation_send_delay_seconds() -> int:
+    """
+    Delay between order shipped/fulfilled and invitation email send.
+
+    Default 0 keeps backward compatibility (send immediately where enabled).
+    """
+    raw = (os.getenv("REVIEWS_INVITATION_SEND_DELAY_SECONDS") or "").strip()
+    try:
+        val = int(raw) if raw else 0
+    except Exception:
+        val = 0
+    return max(0, val)
+
+
+async def _ensure_invitation_send_jobs_table_best_effort() -> None:
+    """
+    Best-effort schema ensure for delayed invitation email jobs.
+    Keeps prod/staging usable even if migrations are not applied yet.
+    """
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reviews_invitation_send_jobs (
+              id BIGSERIAL PRIMARY KEY,
+              merchant_id VARCHAR(64) NOT NULL,
+              order_id VARCHAR(64) NOT NULL,
+              send_at TIMESTAMPTZ NOT NULL,
+              status VARCHAR(32) NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_attempt_at TIMESTAMPTZ NULL,
+              sent_at TIMESTAMPTZ NULL,
+              sendgrid_message_id TEXT NULL,
+              last_error TEXT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+    except Exception:
+        return
+
+    try:
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reviews_invitation_send_jobs_due ON reviews_invitation_send_jobs (status, send_at)"
+        )
+    except Exception:
+        pass
+
+    try:
+        await database.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_reviews_invitation_send_jobs_order_status ON reviews_invitation_send_jobs (order_id, status)"
+        )
+    except Exception:
+        pass
+
+
+async def enqueue_invitation_email_send_job_from_order(*, merchant_id: str, order_id: str) -> bool:
+    """
+    Enqueue a delayed invitation email send job for an order (idempotent).
+
+    Returns True if a pending job exists after the call.
+    """
+    mid = (merchant_id or "").strip()
+    oid = (order_id or "").strip()
+    if not mid or not oid:
+        return False
+
+    await _ensure_invitation_send_jobs_table_best_effort()
+
+    delay = _invitation_send_delay_seconds()
+    # If delay is 0, callers should send immediately (compat); still allow enqueue for tests.
+    try:
+        await database.execute(
+            """
+            INSERT INTO reviews_invitation_send_jobs
+              (merchant_id, order_id, send_at, status, updated_at)
+            VALUES
+              (:merchant_id, :order_id, NOW() + (:delay || ' seconds')::interval, 'pending', NOW())
+            ON CONFLICT (order_id, status)
+            DO UPDATE SET
+              send_at = EXCLUDED.send_at,
+              updated_at = NOW()
+            """,
+            {"merchant_id": mid, "order_id": oid, "delay": int(delay)},
+        )
+    except Exception:
+        # Best-effort: do not fail order flows on enqueue errors.
+        return False
+
+    return True
+
 def _invitation_link_base_url() -> str:
     """
     Optional base URL for buyer review submission UI.

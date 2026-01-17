@@ -27,6 +27,8 @@ from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
     _internal_key as _reviews_invitation_internal_key,
     send_invitation_email_from_order,
+    _invitation_send_delay_seconds as _reviews_invitation_send_delay_seconds,
+    enqueue_invitation_email_send_job_from_order,
 )
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -506,6 +508,13 @@ async def handle_shopify_webhook(
                             internal_key = (_reviews_invitation_internal_key() or "").strip()
                             if not internal_key:
                                 logger.info("Reviews invitation issuer disabled; skip send.")
+                                return
+                            if _reviews_invitation_send_delay_seconds() > 0:
+                                ok = await enqueue_invitation_email_send_job_from_order(
+                                    merchant_id=merchant_id,
+                                    order_id=order_id,
+                                )
+                                logger.info(f"Reviews invitation job enqueued for order {order_id} ok={ok}")
                                 return
                             req = SendInvitationEmailFromOrderRequest(
                                 merchant_id=merchant_id,
