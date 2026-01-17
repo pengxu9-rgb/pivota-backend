@@ -29,13 +29,27 @@ fi
 
 REVIEWS_BASE_URL="${REVIEWS_BASE_URL%/}"
 
-read -rs "CHECKOUT_TOKEN?X-Checkout-Token (preferred; leave empty to use X-API-Key): " ; echo
-API_KEY=""
-if [[ -z "${CHECKOUT_TOKEN:-}" ]]; then
-  read -rs "API_KEY?X-API-Key: " ; echo
-fi
+CHECKOUT_TOKEN="${CHECKOUT_TOKEN:-}"
+API_KEY="${API_KEY:-}"
+JWT_SECRET_KEY="${JWT_SECRET_KEY:-}"
 
-read -rs "JWT_SECRET_KEY?JWT_SECRET_KEY (reviews backend Railway env): " ; echo
+if [[ -z "$CHECKOUT_TOKEN" && -z "$API_KEY" ]]; then
+  read -r -s -p "X-Checkout-Token (preferred; leave empty to use X-API-Key): " CHECKOUT_TOKEN
+  echo
+fi
+if [[ -z "$CHECKOUT_TOKEN" && -z "$API_KEY" ]]; then
+  read -r -s -p "X-API-Key: " API_KEY
+  echo
+fi
+if [[ -z "$JWT_SECRET_KEY" ]]; then
+  read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " JWT_SECRET_KEY
+  echo
+fi
+if [[ -z "$CHECKOUT_TOKEN" && -z "$API_KEY" ]]; then
+  echo "ERROR: missing auth: X-Checkout-Token or X-API-Key" >&2
+  exit 2
+fi
+[[ -n "$JWT_SECRET_KEY" ]] || { echo "ERROR: empty JWT_SECRET_KEY" >&2; exit 2; }
 
 AUTH_HEADERS=()
 if [[ -n "${CHECKOUT_TOKEN:-}" ]]; then

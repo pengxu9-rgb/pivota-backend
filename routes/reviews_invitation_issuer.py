@@ -19,6 +19,7 @@ Security:
 from __future__ import annotations
 
 import hmac
+import html
 import os
 import secrets
 from hashlib import sha256
@@ -160,6 +161,22 @@ def _sendgrid_template_id() -> str:
     return (os.getenv("REVIEWS_INVITATION_SENDGRID_TEMPLATE_ID") or "").strip()
 
 
+def _use_sendgrid_template() -> bool:
+    """
+    Whether to use SendGrid dynamic templates for review invitations.
+
+    Default is off to keep the copy controlled by code, and to avoid long visible
+    URLs when templates render raw links.
+    """
+    raw = (os.getenv("REVIEWS_INVITATION_USE_SENDGRID_TEMPLATE") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _include_store_url_in_email() -> bool:
+    raw = (os.getenv("REVIEWS_INVITATION_INCLUDE_STORE_URL") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _support_email_default(*, store: Optional[Dict[str, Any]], from_email: str) -> str:
     if isinstance(store, dict):
         email = str(store.get("support_email") or "").strip()
@@ -177,6 +194,8 @@ def _store_name_default(store: Optional[Dict[str, Any]]) -> str:
 
 
 def _store_url_default(store: Optional[Dict[str, Any]]) -> str:
+    if not _include_store_url_in_email():
+        return ""
     if isinstance(store, dict):
         domain = str(store.get("domain") or "").strip()
         if domain:
@@ -200,7 +219,7 @@ def _compose_invitation_email(
     review_link: str,
     support_email: str,
     store_url: str,
-) -> tuple[str, str, Dict[str, Any]]:
+) -> tuple[str, str, str, Dict[str, Any]]:
     safe_first = (first_name or "").strip()
     safe_store = (store_name or "our store").strip()
     safe_link = (review_link or "").strip()
@@ -235,6 +254,26 @@ def _compose_invitation_email(
 
     subject = f"How was your purchase from {safe_store}?"
 
+    # HTML version: show a short, friendly CTA instead of a long visible URL.
+    safe_link_html = html.escape(safe_link, quote=True)
+    safe_store_html = html.escape(safe_store, quote=True)
+    safe_first_html = html.escape(safe_first, quote=True)
+    greeting_html = f"Hi {safe_first_html}," if safe_first_html else "Hi,"
+
+    html_lines = [
+        f"<p>{greeting_html}</p>",
+        f"<p>Thanks again for your recent purchase from {safe_store_html}—we hope you’re loving it so far.</p>",
+        "<p>If you have a minute, would you share your feedback by leaving a quick review? "
+        "Your review helps other shoppers feel confident, and it helps us keep improving.</p>",
+        f'<p><a href="{safe_link_html}">Click here to leave your review!</a></p>',
+        "<p>As a thank-you, you’ll also help us decide what to stock and build next.</p>",
+        f"<p>Thanks for your time,<br>{safe_store_html}</p>",
+    ]
+    if safe_support:
+        html_lines.append(f"<p>{html.escape(safe_support, quote=True)}</p>")
+
+    html_body = "\n".join(html_lines).strip() + "\n"
+
     template_data: Dict[str, Any] = {
         "FirstName": safe_first,
         "StoreName": safe_store,
@@ -248,10 +287,17 @@ def _compose_invitation_email(
         "store_url": safe_store_url,
     }
 
-    return subject, "\n".join(text_lines).strip() + "\n", template_data
+    return subject, "\n".join(text_lines).strip() + "\n", html_body, template_data
 
 
-async def _send_sendgrid_email(*, to_email: str, subject: str, text_body: str, template_data: Dict[str, Any]) -> None:
+async def _send_sendgrid_email(
+    *,
+    to_email: str,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    template_data: Dict[str, Any],
+) -> None:
     api_key = _sendgrid_api_key()
     if not api_key:
         raise HTTPException(status_code=503, detail="SENDGRID_DISABLED")
@@ -265,17 +311,24 @@ async def _send_sendgrid_email(*, to_email: str, subject: str, text_body: str, t
         raise HTTPException(status_code=503, detail="SENDGRID_FROM_EMAIL_MISSING")
 
     template_id = _sendgrid_template_id()
+    use_template = bool(template_id and _use_sendgrid_template())
     payload: Dict[str, Any] = {
         "personalizations": [{"to": [{"email": to_email}]}],
         "from": {"email": from_email},
+        # Avoid very long visible URLs due to ESP click-tracking rewrite.
+        # We rely on our own shortlink redirect for click measurement.
+        "tracking_settings": {"click_tracking": {"enable": False, "enable_text": False}},
     }
 
-    if template_id:
+    if use_template:
         payload["template_id"] = template_id
         payload["personalizations"][0]["dynamic_template_data"] = template_data
     else:
         payload["subject"] = subject
-        payload["content"] = [{"type": "text/plain", "value": text_body}]
+        payload["content"] = [
+            {"type": "text/plain", "value": text_body},
+            {"type": "text/html", "value": html_body},
+        ]
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -588,7 +641,7 @@ async def send_invitation_email_from_order(
     first_name = _first_name_from_order(order)
 
     review_link = short_urls[0] if short_urls else invitation_urls[0]
-    email_subject, text_body, template_data = _compose_invitation_email(
+    email_subject, text_body, html_body, template_data = _compose_invitation_email(
         first_name=first_name,
         store_name=store_name,
         review_link=review_link,
@@ -609,6 +662,7 @@ async def send_invitation_email_from_order(
         to_email=to_email,
         subject=email_subject,
         text_body=text_body,
+        html_body=html_body,
         template_data=template_data,
     )
 
