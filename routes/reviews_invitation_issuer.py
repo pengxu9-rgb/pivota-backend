@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import hmac
 import os
+import secrets
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response
@@ -31,6 +32,7 @@ from pydantic import BaseModel, Field
 from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
 from db.orders import get_order
 from services.merchant_store_service import get_primary_store
+from db.database import database
 
 router = APIRouter(prefix="/internal/reviews/v1", tags=["internal-reviews-invitation"])
 
@@ -72,6 +74,66 @@ def _invitation_link_base_url() -> str:
     Using the URL fragment reduces accidental leakage via Referer headers.
     """
     return (os.getenv("REVIEWS_BUYER_INVITATION_LINK_BASE_URL") or "").strip()
+
+def _invitation_shortlink_base_url() -> str:
+    """
+    Optional base URL for short links (recommended for emails).
+
+    If not set, derives `https://{host}/r` from `REVIEWS_BUYER_INVITATION_LINK_BASE_URL` when possible.
+    """
+    explicit = (os.getenv("REVIEWS_BUYER_INVITATION_SHORTLINK_BASE_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+
+    base = _invitation_link_base_url().strip()
+    if not base:
+        return ""
+    parts = urlsplit(base)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}/r"
+    return ""
+
+
+async def _create_shortlink(
+    *,
+    merchant_id: str,
+    order_id: str,
+    invitation_token: str,
+    expires_at: int,
+) -> Optional[str]:
+    base = _invitation_shortlink_base_url().strip()
+    if not base:
+        return None
+
+    tok = (invitation_token or "").strip()
+    if not tok:
+        return None
+
+    # Best-effort insert; retry a few times on rare code collision.
+    for _ in range(5):
+        code = "rv_" + secrets.token_urlsafe(9).replace("-", "").replace("_", "")
+        code = code[:32]
+        try:
+            await database.execute(
+                """
+                INSERT INTO reviews_invitation_shortlinks
+                  (code, merchant_id, order_id, invitation_token, expires_at)
+                VALUES
+                  (:code, :merchant_id, :order_id, :invitation_token, to_timestamp(:exp))
+                """,
+                {
+                    "code": code,
+                    "merchant_id": merchant_id,
+                    "order_id": order_id,
+                    "invitation_token": tok,
+                    "exp": int(expires_at or 0),
+                },
+            )
+            return f"{base.rstrip('/')}/{quote(code, safe='')}"
+        except Exception:
+            continue
+
+    return None
 
 
 def _invitation_url_for_token(invitation_token: str) -> Optional[str]:
@@ -491,6 +553,7 @@ async def send_invitation_email_from_order(
     invitation_urls: List[str] = []
     invitation_fps: List[str] = []
     subjects: List[Dict[str, Any]] = []
+    short_urls: List[str] = []
     for it in items:
         url = str(it.get("invitation_url") or "").strip()
         tok = str(it.get("invitation_token") or "").strip()
@@ -501,11 +564,20 @@ async def send_invitation_email_from_order(
             invitation_urls.append(url)
         if tok:
             invitation_fps.append(sha256(tok.encode("utf-8")).hexdigest()[:12])
+            short_url = await _create_shortlink(
+                merchant_id=merchant_id,
+                order_id=order_id,
+                invitation_token=tok,
+                expires_at=int(minted.get("expires_at") or 0),
+            )
+            if short_url:
+                short_urls.append(short_url)
 
     if not invitation_urls:
         raise HTTPException(status_code=503, detail="INVITATION_LINK_DISABLED")
 
     invitation_urls = invitation_urls[: int(body.max_links)]
+    short_urls = short_urls[: int(body.max_links)]
 
     # Compose email.
     store = await get_primary_store(merchant_id)
@@ -515,7 +587,7 @@ async def send_invitation_email_from_order(
     support_email = _support_email_default(store=store, from_email=from_email)
     first_name = _first_name_from_order(order)
 
-    review_link = invitation_urls[0]
+    review_link = short_urls[0] if short_urls else invitation_urls[0]
     email_subject, text_body, template_data = _compose_invitation_email(
         first_name=first_name,
         store_name=store_name,
@@ -528,7 +600,7 @@ async def send_invitation_email_from_order(
             "merchant_id": merchant_id,
             "order_id": order_id,
             "invitation_url": review_link,
-            "invitation_urls": invitation_urls,
+            "invitation_urls": short_urls or invitation_urls,
             "expires_at": int(minted.get("expires_at") or 0),
         }
     )
@@ -547,6 +619,7 @@ async def send_invitation_email_from_order(
         "subject_count": len(invitation_urls),
         "expires_at": int(minted.get("expires_at") or 0),
         "invitation_fps": invitation_fps[:3],
+        "shortlink_base_url": _invitation_shortlink_base_url().strip() or None,
         "invitation_link_base_url_configured": bool(link_base),
         "invitation_link_base_url": link_base.rstrip("#") if link_base else None,
     }

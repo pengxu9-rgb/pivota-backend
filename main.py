@@ -259,6 +259,7 @@ from routes.prometheus_metrics import router as prometheus_metrics_router
 from routes.employee_reviews import router as employee_reviews_router
 from routes.buyer_reviews import router as buyer_reviews_router
 from routes.reviews_invitation_issuer import router as reviews_invitation_issuer_router
+from routes.reviews_invitation_shortlink import router as reviews_invitation_shortlink_router
 
 # Service routers (only include what exists)
 try:
@@ -566,6 +567,7 @@ app.include_router(mcp_mgmt_router)  # MCP management
 app.include_router(employee_reviews_router)  # Employee Reviews Center (imports/governance)
 app.include_router(buyer_reviews_router)  # Buyer Reviews (submission; default disabled)
 app.include_router(reviews_invitation_issuer_router)  # Internal: mint invitation_token from paid orders
+app.include_router(reviews_invitation_shortlink_router)  # Public: short links -> buyer review submission
 app.include_router(employee_missing_router)  # Missing employee endpoints
 # app.include_router(agent_sdk_router)  # Replaced with fixed version
 app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
