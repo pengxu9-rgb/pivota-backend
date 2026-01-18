@@ -7,8 +7,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import Response
-from fastapi import HTTPException
+import httpx
+from fastapi import HTTPException, Response
 
 # Ensure repo root is on sys.path when invoked as `python scripts/...`.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -16,6 +16,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from db.database import IS_POSTGRES, database
+from services.buyer_reviews_service import buyer_submit_enabled
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
     _internal_key as _invitation_internal_key,
@@ -23,6 +24,15 @@ from routes.reviews_invitation_issuer import (
     _ensure_invitation_send_jobs_table_best_effort,
     send_invitation_email_from_order,
 )
+
+def _reviews_base_url() -> str:
+    """
+    If set, process jobs by calling the web backend internal endpoint over HTTP.
+
+    This avoids environment drift between the worker service and the web service
+    (feature flags, allowlists, etc). If not set, falls back to in-process calls.
+    """
+    return (os.getenv("REVIEWS_BASE_URL") or "").strip().rstrip("/")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -156,6 +166,48 @@ async def _mark_retry_or_error(*, job_id: int, attempts: int, error: str, max_at
         return
 
 
+async def _send_via_http(
+    *,
+    base_url: str,
+    internal_key: str,
+    merchant_id: str,
+    order_id: str,
+    ttl_seconds: int,
+) -> Dict[str, Any]:
+    url = f"{base_url}/internal/reviews/v1/invitation/send-email-from-order"
+    headers = {"X-Internal-Key": internal_key, "Content-Type": "application/json"}
+    payload = {
+        "merchant_id": (merchant_id or "").strip(),
+        "order_id": (order_id or "").strip(),
+        "ttl_seconds": int(ttl_seconds),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+    except Exception:
+        raise HTTPException(status_code=503, detail="INVITATION_ISSUER_UNAVAILABLE")
+
+    if resp.status_code != 200:
+        detail: str = ""
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                err = data.get("error") or {}
+                if isinstance(err, dict):
+                    detail = str(err.get("code") or err.get("message") or "").strip()
+                if not detail:
+                    detail = str(data.get("detail") or "").strip()
+        except Exception:
+            detail = ""
+        raise HTTPException(status_code=resp.status_code, detail=detail or "INVITATION_ISSUER_FAILED")
+
+    try:
+        data = resp.json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 async def _process_one(job: Dict[str, Any], *, internal_key: str, max_attempts: int) -> Dict[str, Any]:
     job_id = int(job.get("id") or 0)
     merchant_id = str(job.get("merchant_id") or "").strip()
@@ -163,15 +215,25 @@ async def _process_one(job: Dict[str, Any], *, internal_key: str, max_attempts: 
     attempts = int(job.get("attempts") or 0)
 
     try:
-        resp = await send_invitation_email_from_order(
-            body=SendInvitationEmailFromOrderRequest(
+        base_url = _reviews_base_url()
+        if base_url:
+            resp = await _send_via_http(
+                base_url=base_url,
+                internal_key=internal_key,
                 merchant_id=merchant_id,
                 order_id=order_id,
                 ttl_seconds=7 * 24 * 3600,
-            ),
-            response=Response(),
-            x_internal_key=internal_key,
-        )
+            )
+        else:
+            resp = await send_invitation_email_from_order(
+                body=SendInvitationEmailFromOrderRequest(
+                    merchant_id=merchant_id,
+                    order_id=order_id,
+                    ttl_seconds=7 * 24 * 3600,
+                ),
+                response=Response(),
+                x_internal_key=internal_key,
+            )
         sendgrid_message_id = None
         if isinstance(resp, dict):
             sendgrid_message_id = str(resp.get("sendgrid_message_id") or "").strip() or None
@@ -200,6 +262,12 @@ async def main() -> int:
         if not internal_key:
             print("disabled=1 reason=missing_internal_key")
             return 0
+
+        base_url = _reviews_base_url()
+        if base_url:
+            print("mode=http base_url_configured=1")
+        else:
+            print(f"mode=in_process buyer_submit_enabled={int(buyer_submit_enabled())}")
 
         delay = _invitation_send_delay_seconds()
         worker_enabled = (os.getenv("REVIEWS_INVITATION_WORKER_ENABLED") or "").strip().lower() in {

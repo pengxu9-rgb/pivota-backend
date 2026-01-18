@@ -5,6 +5,8 @@ set -euo pipefail
 #
 # Env:
 # - DATABASE_URL (required)
+# - REVIEWS_BASE_URL (optional): if set, worker calls the web backend internal endpoint over HTTP
+#   instead of running invitation issuance/sending logic in-process (recommended to avoid env drift).
 # - REVIEWS_INVITATION_WORKER_ENABLED=true to enable immediate sends via worker (optional)
 # - REVIEWS_INVITATION_SEND_DELAY_SECONDS (>0 to enable delayed sends; optional)
 # - SLEEP_SECONDS (optional, default: 60)
