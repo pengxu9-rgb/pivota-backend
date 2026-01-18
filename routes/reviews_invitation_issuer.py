@@ -142,7 +142,7 @@ async def enqueue_invitation_email_send_job_from_order(*, merchant_id: str, orde
             INSERT INTO reviews_invitation_send_jobs
               (merchant_id, order_id, send_at, status, updated_at)
             VALUES
-              (:merchant_id, :order_id, NOW() + (:delay || ' seconds')::interval, 'pending', NOW())
+              (:merchant_id, :order_id, NOW() + (:delay * interval '1 second'), 'pending', NOW())
             ON CONFLICT (order_id, status)
             DO UPDATE SET
               send_at = EXCLUDED.send_at,

@@ -139,7 +139,7 @@ async def _mark_retry_or_error(*, job_id: int, attempts: int, error: str, max_at
             UPDATE reviews_invitation_send_jobs
             SET status='pending',
                 last_error=:err,
-                send_at=NOW() + (:backoff || ' seconds')::interval,
+                send_at=NOW() + (:backoff * interval '1 second'),
                 updated_at=NOW()
             WHERE id=:id
             """,
