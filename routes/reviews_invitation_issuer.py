@@ -734,6 +734,7 @@ class EnqueueInvitationSendJobRequest(BaseModel):
     merchant_id: str = Field(..., min_length=1)
     order_id: str = Field(..., min_length=1)
     force_reschedule: bool = False
+    send_now: bool = False
 
 
 @router.post("/invitation/enqueue-send-job")
@@ -753,6 +754,7 @@ async def enqueue_invitation_send_job(
         merchant_id=(body.merchant_id or "").strip(),
         order_id=(body.order_id or "").strip(),
         force_reschedule=bool(body.force_reschedule),
+        send_now=bool(body.send_now),
     )
     return {"status": "success", **out}
 

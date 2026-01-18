@@ -30,7 +30,7 @@ REVIEWS_BASE_URL="${REVIEWS_BASE_URL%/}"
 
 echo "== enqueue send job (force_reschedule) =="
 curl --http1.1 -sS -H "Content-Type: application/json" -H "X-Internal-Key: $X_INTERNAL_KEY" \
-  -d "{\"merchant_id\":\"$MERCHANT_ID\",\"order_id\":\"$ORDER_ID\",\"force_reschedule\":true}" \
+  -d "{\"merchant_id\":\"$MERCHANT_ID\",\"order_id\":\"$ORDER_ID\",\"force_reschedule\":true,\"send_now\":true}" \
   "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/enqueue-send-job" \
   | python3 -c 'import sys,json; o=json.load(sys.stdin); print("status=",o.get("status"),"ok=",o.get("ok"),"reason=",o.get("reason"))'
 

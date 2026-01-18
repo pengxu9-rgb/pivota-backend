@@ -68,6 +68,7 @@ async def enqueue_invitation_send_job_from_order(
     merchant_id: str,
     order_id: str,
     force_reschedule: bool = False,
+    send_now: bool = False,
 ) -> Dict[str, Any]:
     """
     Enqueue a delayed invitation email send job for an order (idempotent).
@@ -121,11 +122,11 @@ async def enqueue_invitation_send_job_from_order(
                 await database.execute(
                     """
                     UPDATE reviews_invitation_send_jobs
-                    SET send_at = NOW() + (:delay * interval '1 second'),
+                    SET send_at = CASE WHEN :send_now THEN NOW() ELSE NOW() + (:delay * interval '1 second') END,
                         updated_at = NOW()
                     WHERE id = :id AND status = 'pending'
                     """,
-                    {"id": int(existing.get("id") or 0), "delay": int(delay)},
+                    {"id": int(existing.get("id") or 0), "delay": int(delay), "send_now": bool(send_now)},
                 )
                 return {"ok": True, "reason": "RESCHEDULED", "job_id": int(existing.get("id") or 0)}
     except Exception:
@@ -137,15 +138,14 @@ async def enqueue_invitation_send_job_from_order(
             INSERT INTO reviews_invitation_send_jobs
               (merchant_id, order_id, send_at, status, updated_at)
             VALUES
-              (:merchant_id, :order_id, NOW() + (:delay * interval '1 second'), 'pending', NOW())
+              (:merchant_id, :order_id, CASE WHEN :send_now THEN NOW() ELSE NOW() + (:delay * interval '1 second') END, 'pending', NOW())
             ON CONFLICT (order_id, status)
             DO UPDATE SET
               send_at = EXCLUDED.send_at,
               updated_at = NOW()
             """,
-            {"merchant_id": mid, "order_id": oid, "delay": int(delay)},
+            {"merchant_id": mid, "order_id": oid, "delay": int(delay), "send_now": bool(send_now)},
         )
         return {"ok": True, "reason": "ENQUEUED"}
     except Exception:
         return {"ok": False, "reason": "DB_ERROR"}
-
