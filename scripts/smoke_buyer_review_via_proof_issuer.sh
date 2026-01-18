@@ -238,15 +238,11 @@ echo "approved_ok"
 
 _list_reviews_json() {
   local variant="${1:-}"
-  local sku_json
+  local variant_json
   if [[ -n "$variant" ]]; then
-    sku_json="$(python3 - <<'PY' <<<"$variant"
-import json,sys
-print(json.dumps({"variant_id":sys.stdin.read().strip()}))
-PY
-)"
+    variant_json="$(python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' <<<"$variant")"
     curl -sS -H "Content-Type: application/json" \
-      -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\",\"variant_id\":$sku_json},\"filters\":{\"limit\":50}}}" \
+      -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\",\"variant_id\":$variant_json},\"filters\":{\"limit\":50}}}" \
       "$REVIEWS_BASE_URL/agent/shop/v1/invoke"
   else
     curl -sS -H "Content-Type: application/json" \
