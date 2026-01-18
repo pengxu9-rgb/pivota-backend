@@ -190,7 +190,13 @@ async def main() -> int:
             return 0
 
         delay = _invitation_send_delay_seconds()
-        if delay <= 0:
+        worker_enabled = (os.getenv("REVIEWS_INVITATION_WORKER_ENABLED") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if delay <= 0 and not worker_enabled:
             print("disabled=1 reason=delay_disabled")
             return 0
 
@@ -216,4 +222,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-

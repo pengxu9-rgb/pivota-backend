@@ -411,6 +411,10 @@ async def mark_order_shipped(
         allow = {x.strip() for x in raw.split(",") if x.strip()}
         return mid in allow
 
+    def _invitation_worker_enabled() -> bool:
+        raw = (os.getenv("REVIEWS_INVITATION_WORKER_ENABLED") or "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
     query = (
         orders.update()
         .where(orders.c.order_id == order_id)
@@ -428,12 +432,21 @@ async def mark_order_shipped(
     if not result:
         return False
 
-    # Platform-agnostic delayed invitation scheduling: if delay is configured,
-    # enqueue a job for worker service to send the email later.
+    # Platform-agnostic invitation scheduling: enqueue a job for a worker service to send the email.
+    # - If delay > 0: send later (typical).
+    # - If delay == 0 but worker is enabled: send ASAP via worker (non-blocking for fulfillment path).
     delay = _invitation_send_delay_seconds()
-    if delay > 0 and _buyer_submit_enabled():
+    if (delay > 0 or _invitation_worker_enabled()) and _buyer_submit_enabled():
         try:
-            merchant_id = str(result.get("merchant_id") or "").strip()
+            merchant_id = ""
+            try:
+                merchant_id = str(result["merchant_id"] or "").strip()
+            except Exception:
+                try:
+                    merchant_id = str(dict(result).get("merchant_id") or "").strip()
+                except Exception:
+                    merchant_id = ""
+
             if merchant_id and _buyer_submit_merchant_allowed(merchant_id):
                 await _ensure_reviews_invitation_send_jobs_table_best_effort()
                 await database.execute(

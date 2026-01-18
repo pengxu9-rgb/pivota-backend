@@ -5,7 +5,8 @@ set -euo pipefail
 #
 # Env:
 # - DATABASE_URL (required)
-# - REVIEWS_INVITATION_SEND_DELAY_SECONDS (required; >0 to enable)
+# - REVIEWS_INVITATION_WORKER_ENABLED=true to enable immediate sends via worker (optional)
+# - REVIEWS_INVITATION_SEND_DELAY_SECONDS (>0 to enable delayed sends; optional)
 # - SLEEP_SECONDS (optional, default: 60)
 # - PORT (optional, default: 8080) healthcheck port
 #
@@ -16,11 +17,6 @@ PORT="${PORT:-8080}"
 
 if [[ -z "${DATABASE_URL:-}" ]]; then
   echo "ERROR: missing DATABASE_URL" >&2
-  exit 2
-fi
-
-if [[ -z "${REVIEWS_INVITATION_SEND_DELAY_SECONDS:-}" ]]; then
-  echo "ERROR: missing REVIEWS_INVITATION_SEND_DELAY_SECONDS (set to >0 to enable)" >&2
   exit 2
 fi
 
@@ -81,4 +77,3 @@ while true; do
   "$PY" scripts/process_due_reviews_invitation_send_jobs.py || true
   sleep "$SLEEP_SECONDS"
 done
-
