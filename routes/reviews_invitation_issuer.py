@@ -22,6 +22,7 @@ import hmac
 import html
 import os
 import secrets
+import time
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlsplit
@@ -30,6 +31,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
+from observability.reviews_metrics import record_invitation_issue, record_invitation_send
 from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
 from db.orders import get_order
 from services.merchant_store_service import get_primary_store
@@ -133,6 +135,35 @@ async def enqueue_invitation_email_send_job_from_order(*, merchant_id: str, orde
         return False
 
     await _ensure_invitation_send_jobs_table_best_effort()
+
+    # Dedupe: if we've already sent (or are currently sending) for this order,
+    # do not create a new pending job.
+    try:
+        existing = await database.fetch_one(
+            """
+            SELECT status
+            FROM reviews_invitation_send_jobs
+            WHERE order_id = :order_id AND status IN ('sent', 'processing', 'pending')
+            ORDER BY
+              CASE status
+                WHEN 'sent' THEN 1
+                WHEN 'processing' THEN 2
+                WHEN 'pending' THEN 3
+                ELSE 99
+              END ASC
+            LIMIT 1
+            """,
+            {"order_id": oid},
+        )
+        if existing:
+            st = str(existing["status"] or "").strip()
+            if st == "sent":
+                return False
+            if st in {"processing", "pending"}:
+                return True
+    except Exception:
+        # Best-effort: do not fail order flows on dedupe query errors.
+        pass
 
     delay = _invitation_send_delay_seconds()
     # If delay is 0, callers should send immediately (compat); still allow enqueue for tests.
@@ -608,7 +639,12 @@ async def issue_invitation_from_order(
     response: Response,
     x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
 ) -> Dict[str, Any]:
-    _require_internal_key(x_internal_key)
+    t0 = time.monotonic()
+    try:
+        _require_internal_key(x_internal_key)
+    except HTTPException as e:
+        record_invitation_issue(result="error", reason=str(e.detail or "UNAUTHORIZED"), duration_seconds=time.monotonic() - t0)
+        raise
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
 
@@ -622,23 +658,34 @@ async def issue_invitation_from_order(
     merchant_id = (body.merchant_id or "").strip()
     order_id = (body.order_id or "").strip()
     if not merchant_id or not order_id:
+        record_invitation_issue(result="error", reason="INVALID_REQUEST", duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=400, detail="INVALID_REQUEST")
 
     order = await get_order(order_id)
     if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
+        record_invitation_issue(result="error", reason="NOT_FOUND", duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
-    out = await mint_invitations_from_paid_order(
-        merchant_id=merchant_id,
-        order=order,
-        ttl_seconds=int(body.ttl_seconds),
-        platform_product_id=body.platform_product_id,
-        variant_id=body.variant_id,
-        verification="verified_buyer",
-    )
+    try:
+        out = await mint_invitations_from_paid_order(
+            merchant_id=merchant_id,
+            order=order,
+            ttl_seconds=int(body.ttl_seconds),
+            platform_product_id=body.platform_product_id,
+            variant_id=body.variant_id,
+            verification="verified_buyer",
+        )
+    except HTTPException as e:
+        record_invitation_issue(result="error", reason=str(e.detail or "ERROR"), duration_seconds=time.monotonic() - t0)
+        raise
+    except Exception:
+        record_invitation_issue(result="error", reason="ERROR", duration_seconds=time.monotonic() - t0)
+        raise
+
     out["invitation_link_base_url_configured"] = bool(link_base)
     if link_base:
         out["invitation_link_base_url"] = link_base.rstrip("#")
+    record_invitation_issue(result="success", reason="ok", duration_seconds=time.monotonic() - t0)
     return out
 
 
@@ -665,7 +712,12 @@ async def send_invitation_email_from_order(
     - Requires X-Internal-Key (server-side only).
     - Never returns tokens or email addresses.
     """
-    _require_internal_key(x_internal_key)
+    t0 = time.monotonic()
+    try:
+        _require_internal_key(x_internal_key)
+    except HTTPException as e:
+        record_invitation_send(result="error", reason=str(e.detail or "UNAUTHORIZED"), sent=False, duration_seconds=time.monotonic() - t0)
+        raise
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
 
@@ -678,23 +730,29 @@ async def send_invitation_email_from_order(
     merchant_id = (body.merchant_id or "").strip()
     order_id = (body.order_id or "").strip()
     if not merchant_id or not order_id:
+        record_invitation_send(result="error", reason="INVALID_REQUEST", sent=False, duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=400, detail="INVALID_REQUEST")
 
     if not buyer_submit_enabled():
+        record_invitation_send(result="error", reason="BUYER_SUBMIT_DISABLED", sent=False, duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
     if not buyer_submit_merchant_allowed(merchant_id):
+        record_invitation_send(result="error", reason="BUYER_SUBMIT_NOT_ALLOWED", sent=False, duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=403, detail="BUYER_SUBMIT_NOT_ALLOWED")
 
     # Ensure we have a safe landing URL (token placed in URL fragment).
     if not link_base:
+        record_invitation_send(result="error", reason="INVITATION_LINK_DISABLED", sent=False, duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=503, detail="INVITATION_LINK_DISABLED")
 
     order = await get_order(order_id)
     if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
+        record_invitation_send(result="error", reason="NOT_FOUND", sent=False, duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
     to_email = str(order.get("customer_email") or "").strip()
     if not to_email:
+        record_invitation_send(result="error", reason="ORDER_EMAIL_MISSING", sent=False, duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=400, detail="ORDER_EMAIL_MISSING")
     to_email_lower = to_email.lower()
     to_email_domain = ""
@@ -709,6 +767,7 @@ async def send_invitation_email_from_order(
         already_sent_at = ""
 
     if already_sent_at and not body.force:
+        record_invitation_send(result="success", reason="ALREADY_SENT", sent=False, duration_seconds=time.monotonic() - t0)
         return {"status": "success", "sent": False, "reason": "ALREADY_SENT", "order_id": order_id}
 
     minted = await mint_invitations_from_paid_order(
@@ -750,6 +809,7 @@ async def send_invitation_email_from_order(
                 short_urls.append(short_url)
 
     if not invitation_urls:
+        record_invitation_send(result="error", reason="INVITATION_LINK_DISABLED", sent=False, duration_seconds=time.monotonic() - t0)
         raise HTTPException(status_code=503, detail="INVITATION_LINK_DISABLED")
 
     invitation_urls = invitation_urls[: int(body.max_links)]
@@ -781,13 +841,20 @@ async def send_invitation_email_from_order(
         }
     )
 
-    sendgrid_meta = await _send_sendgrid_email(
-        to_email=to_email,
-        subject=email_subject,
-        text_body=text_body,
-        html_body=html_body,
-        template_data=template_data,
-    )
+    try:
+        sendgrid_meta = await _send_sendgrid_email(
+            to_email=to_email,
+            subject=email_subject,
+            text_body=text_body,
+            html_body=html_body,
+            template_data=template_data,
+        )
+    except HTTPException as e:
+        record_invitation_send(result="error", reason=str(e.detail or "SEND_FAILED"), sent=False, duration_seconds=time.monotonic() - t0)
+        raise
+    except Exception:
+        record_invitation_send(result="error", reason="SEND_FAILED", sent=False, duration_seconds=time.monotonic() - t0)
+        raise
 
     # Best-effort: mark as sent to prevent duplicates.
     try:
@@ -804,6 +871,7 @@ async def send_invitation_email_from_order(
     except Exception:
         pass
 
+    record_invitation_send(result="success", reason="ok", sent=True, duration_seconds=time.monotonic() - t0)
     return {
         "status": "success",
         "sent": True,

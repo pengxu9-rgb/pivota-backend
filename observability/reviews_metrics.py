@@ -128,6 +128,28 @@ try:
         buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
     )
 
+    reviews_invitation_issue_total = Counter(
+        "reviews_invitation_issue_total",
+        "Invitation issue-from-order attempts (by result + reason).",
+        ["result", "reason"],
+    )
+    reviews_invitation_issue_duration_seconds = Histogram(
+        "reviews_invitation_issue_duration_seconds",
+        "Invitation issue-from-order duration (seconds).",
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+    )
+
+    reviews_invitation_send_total = Counter(
+        "reviews_invitation_send_total",
+        "Invitation send-email-from-order attempts (by result + reason + sent).",
+        ["result", "reason", "sent"],
+    )
+    reviews_invitation_send_duration_seconds = Histogram(
+        "reviews_invitation_send_duration_seconds",
+        "Invitation send-email-from-order duration (seconds).",
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+    )
+
 except Exception:  # pragma: no cover
     # Prometheus client not installed or metrics disabled; provide no-ops.
     Counter = Histogram = None  # type: ignore
@@ -152,6 +174,10 @@ except Exception:  # pragma: no cover
     reviews_buyer_create_duration_seconds = None
     reviews_buyer_media_upload_total = None
     reviews_buyer_media_upload_duration_seconds = None
+    reviews_invitation_issue_total = None
+    reviews_invitation_issue_duration_seconds = None
+    reviews_invitation_send_total = None
+    reviews_invitation_send_duration_seconds = None
 
 
 def record_invoke_request(*, operation: str, status_code: int, duration_seconds: float, error_type: Optional[str] = None) -> None:
@@ -231,3 +257,17 @@ def record_buyer_media_upload(*, result: str, reason: str, duration_seconds: flo
         reviews_buyer_media_upload_total.labels(result=str(result), reason=str(reason)).inc()
     if reviews_buyer_media_upload_duration_seconds is not None:
         reviews_buyer_media_upload_duration_seconds.observe(max(0.0, float(duration_seconds)))
+
+
+def record_invitation_issue(*, result: str, reason: str, duration_seconds: float) -> None:
+    if reviews_invitation_issue_total is not None:
+        reviews_invitation_issue_total.labels(result=str(result), reason=str(reason)).inc()
+    if reviews_invitation_issue_duration_seconds is not None:
+        reviews_invitation_issue_duration_seconds.observe(max(0.0, float(duration_seconds)))
+
+
+def record_invitation_send(*, result: str, reason: str, sent: bool, duration_seconds: float) -> None:
+    if reviews_invitation_send_total is not None:
+        reviews_invitation_send_total.labels(result=str(result), reason=str(reason), sent=str(bool(sent)).lower()).inc()
+    if reviews_invitation_send_duration_seconds is not None:
+        reviews_invitation_send_duration_seconds.observe(max(0.0, float(duration_seconds)))

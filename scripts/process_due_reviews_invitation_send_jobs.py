@@ -115,7 +115,7 @@ async def _claim_due_jobs(*, limit: int) -> List[Dict[str, Any]]:
     return out
 
 
-async def _mark_sent(*, job_id: int, sendgrid_message_id: Optional[str]) -> None:
+async def _mark_sent(*, job_id: int, sendgrid_message_id: Optional[str]) -> bool:
     try:
         await database.execute(
             """
@@ -124,12 +124,13 @@ async def _mark_sent(*, job_id: int, sendgrid_message_id: Optional[str]) -> None
                 sent_at=NOW(),
                 updated_at=NOW(),
                 sendgrid_message_id=:msg
-            WHERE id=:id
+            WHERE id=:id AND status='processing'
             """,
             {"id": int(job_id), "msg": (sendgrid_message_id or "").strip() or None},
         )
+        return True
     except Exception:
-        return
+        return False
 
 
 async def _mark_retry_or_error(*, job_id: int, attempts: int, error: str, max_attempts: int) -> None:
@@ -164,6 +165,64 @@ async def _mark_retry_or_error(*, job_id: int, attempts: int, error: str, max_at
         )
     except Exception:
         return
+
+
+async def _mark_cancelled(*, job_id: int, error: str) -> None:
+    err = (error or "")[:512]
+    try:
+        await database.execute(
+            """
+            UPDATE reviews_invitation_send_jobs
+            SET status='cancelled', last_error=:err, updated_at=NOW()
+            WHERE id=:id
+            """,
+            {"id": int(job_id), "err": err},
+        )
+        return
+    except Exception:
+        # Unique index is (order_id, status); if a cancelled row already exists for this order,
+        # fall back to error status so we don't keep retrying.
+        try:
+            await database.execute(
+                """
+                UPDATE reviews_invitation_send_jobs
+                SET status='error', last_error=:err, updated_at=NOW()
+                WHERE id=:id
+                """,
+                {"id": int(job_id), "err": err},
+            )
+        except Exception:
+            return
+
+
+async def _cancel_pending_duplicates_best_effort() -> int:
+    """
+    Best-effort dedupe cleanup:
+    - Cancel pending jobs for orders that already have a sent job.
+    - Cancel pending jobs for orders with an in-flight processing job.
+    """
+    try:
+        return await database.execute(
+            """
+            UPDATE reviews_invitation_send_jobs j
+            SET status='cancelled',
+                last_error=COALESCE(j.last_error, 'CANCELLED_DUPLICATE'),
+                updated_at=NOW()
+            WHERE j.status='pending'
+              AND (
+                EXISTS (
+                  SELECT 1 FROM reviews_invitation_send_jobs s
+                  WHERE s.order_id=j.order_id AND s.status='sent'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM reviews_invitation_send_jobs p
+                  WHERE p.order_id=j.order_id AND p.status='processing'
+                )
+              )
+            """,
+        )
+    except Exception:
+        return 0
 
 
 async def _send_via_http(
@@ -244,11 +303,34 @@ async def _process_one(job: Dict[str, Any], *, internal_key: str, max_attempts: 
         except asyncio.TimeoutError:
             raise HTTPException(status_code=503, detail="INVITATION_SEND_TIMEOUT")
 
+        if isinstance(resp, dict):
+            sent_val = resp.get("sent")
+            if sent_val is False:
+                reason = str(resp.get("reason") or "NOT_SENT").strip()
+                await _mark_cancelled(job_id=job_id, error=f"CANCELLED:{reason}")
+                return {"id": job_id, "result": "cancelled", "reason": reason}
+
         sendgrid_message_id = None
         if isinstance(resp, dict):
             sendgrid_message_id = str(resp.get("sendgrid_message_id") or "").strip() or None
-        await _mark_sent(job_id=job_id, sendgrid_message_id=sendgrid_message_id)
-        return {"id": job_id, "result": "sent"}
+        ok = await _mark_sent(job_id=job_id, sendgrid_message_id=sendgrid_message_id)
+        if ok:
+            return {"id": job_id, "result": "sent"}
+
+        # If we failed to mark sent (e.g. another job already sent), cancel to avoid retry loops.
+        try:
+            exists = await database.fetch_one(
+                "SELECT 1 FROM reviews_invitation_send_jobs WHERE order_id=:order_id AND status='sent' LIMIT 1",
+                {"order_id": order_id},
+            )
+        except Exception:
+            exists = None
+        if exists:
+            await _mark_cancelled(job_id=job_id, error="CANCELLED_DUPLICATE_SENT")
+            return {"id": job_id, "result": "cancelled", "reason": "DUPLICATE_SENT"}
+
+        # Otherwise, treat as a transient DB issue.
+        raise HTTPException(status_code=503, detail="DB_UPDATE_FAILED")
     except Exception as e:
         err = ""
         if isinstance(e, HTTPException):
@@ -295,6 +377,7 @@ async def main() -> int:
         stale_seconds = _env_int("REVIEWS_INVITATION_JOB_STALE_SECONDS", 1800)
 
         await _reset_stale_processing(stale_seconds=stale_seconds)
+        await _cancel_pending_duplicates_best_effort()
         jobs = await _claim_due_jobs(limit=limit)
 
         processed: List[Dict[str, Any]] = []
