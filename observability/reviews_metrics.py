@@ -16,6 +16,14 @@ try:
 
     from prometheus_client import Counter, Histogram  # type: ignore
 
+    def _existing_collector(name: str):
+        try:
+            from prometheus_client import REGISTRY  # type: ignore
+
+            return getattr(REGISTRY, "_names_to_collectors", {}).get(name)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
     reviews_invoke_requests_total = Counter(
         "reviews_invoke_requests_total",
         "Reviews Center invoke requests (by operation + status).",
@@ -128,27 +136,41 @@ try:
         buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
     )
 
-    reviews_invitation_issue_total = Counter(
-        "reviews_invitation_issue_total",
-        "Invitation issue-from-order attempts (by result + reason).",
-        ["result", "reason"],
-    )
-    reviews_invitation_issue_duration_seconds = Histogram(
-        "reviews_invitation_issue_duration_seconds",
-        "Invitation issue-from-order duration (seconds).",
-        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
-    )
+    try:
+        reviews_invitation_issue_total = Counter(
+            "reviews_invitation_issue_total",
+            "Invitation issue-from-order attempts (by result + reason).",
+            ["result", "reason"],
+        )
+    except ValueError:  # already registered (e.g. double-import under a different module name)
+        reviews_invitation_issue_total = _existing_collector("reviews_invitation_issue_total")
 
-    reviews_invitation_send_total = Counter(
-        "reviews_invitation_send_total",
-        "Invitation send-email-from-order attempts (by result + reason + sent).",
-        ["result", "reason", "sent"],
-    )
-    reviews_invitation_send_duration_seconds = Histogram(
-        "reviews_invitation_send_duration_seconds",
-        "Invitation send-email-from-order duration (seconds).",
-        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
-    )
+    try:
+        reviews_invitation_issue_duration_seconds = Histogram(
+            "reviews_invitation_issue_duration_seconds",
+            "Invitation issue-from-order duration (seconds).",
+            buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+        )
+    except ValueError:
+        reviews_invitation_issue_duration_seconds = _existing_collector("reviews_invitation_issue_duration_seconds")
+
+    try:
+        reviews_invitation_send_total = Counter(
+            "reviews_invitation_send_total",
+            "Invitation send-email-from-order attempts (by result + reason + sent).",
+            ["result", "reason", "sent"],
+        )
+    except ValueError:
+        reviews_invitation_send_total = _existing_collector("reviews_invitation_send_total")
+
+    try:
+        reviews_invitation_send_duration_seconds = Histogram(
+            "reviews_invitation_send_duration_seconds",
+            "Invitation send-email-from-order duration (seconds).",
+            buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+        )
+    except ValueError:
+        reviews_invitation_send_duration_seconds = _existing_collector("reviews_invitation_send_duration_seconds")
 
 except Exception:  # pragma: no cover
     # Prometheus client not installed or metrics disabled; provide no-ops.
