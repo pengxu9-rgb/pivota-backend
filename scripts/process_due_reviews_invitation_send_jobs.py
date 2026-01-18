@@ -216,16 +216,20 @@ async def _process_one(job: Dict[str, Any], *, internal_key: str, max_attempts: 
 
     try:
         base_url = _reviews_base_url()
-        if base_url:
-            resp = await _send_via_http(
-                base_url=base_url,
-                internal_key=internal_key,
-                merchant_id=merchant_id,
-                order_id=order_id,
-                ttl_seconds=7 * 24 * 3600,
-            )
-        else:
-            resp = await send_invitation_email_from_order(
+        send_timeout = _env_int("REVIEWS_INVITATION_JOB_SEND_TIMEOUT_SECONDS", 30)
+        if send_timeout <= 0:
+            send_timeout = 30
+
+        async def _do_send() -> Dict[str, Any]:
+            if base_url:
+                return await _send_via_http(
+                    base_url=base_url,
+                    internal_key=internal_key,
+                    merchant_id=merchant_id,
+                    order_id=order_id,
+                    ttl_seconds=7 * 24 * 3600,
+                )
+            return await send_invitation_email_from_order(
                 body=SendInvitationEmailFromOrderRequest(
                     merchant_id=merchant_id,
                     order_id=order_id,
@@ -234,6 +238,12 @@ async def _process_one(job: Dict[str, Any], *, internal_key: str, max_attempts: 
                 response=Response(),
                 x_internal_key=internal_key,
             )
+
+        try:
+            resp = await asyncio.wait_for(_do_send(), timeout=float(send_timeout))
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=503, detail="INVITATION_SEND_TIMEOUT")
+
         sendgrid_message_id = None
         if isinstance(resp, dict):
             sendgrid_message_id = str(resp.get("sendgrid_message_id") or "").strip() or None
