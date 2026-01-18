@@ -29,10 +29,17 @@ fi
 REVIEWS_BASE_URL="${REVIEWS_BASE_URL%/}"
 
 echo "== enqueue send job (force_reschedule) =="
-curl --http1.1 -sS -H "Content-Type: application/json" -H "X-Internal-Key: $X_INTERNAL_KEY" \
+ENQ_RESP="$(curl --http1.1 -sS -H "Content-Type: application/json" -H "X-Internal-Key: $X_INTERNAL_KEY" \
   -d "{\"merchant_id\":\"$MERCHANT_ID\",\"order_id\":\"$ORDER_ID\",\"force_reschedule\":true,\"send_now\":true}" \
-  "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/enqueue-send-job" \
-  | python3 -c 'import sys,json; o=json.load(sys.stdin); print("status=",o.get("status"),"ok=",o.get("ok"),"reason=",o.get("reason"))'
+  "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/enqueue-send-job")"
+
+python3 -c 'import sys,json; o=json.loads(sys.stdin.read()); print("status=",o.get("status"),"ok=",o.get("ok"),"reason=",o.get("reason"))' <<<"$ENQ_RESP"
+
+ENQ_REASON="$(python3 -c 'import sys,json; o=json.loads(sys.stdin.read()); print((o.get("reason") or "").strip())' <<<"$ENQ_RESP" 2>/dev/null || true)"
+if [[ "$ENQ_REASON" == "ALREADY_SENT" ]]; then
+  echo "OK (already sent; dedup working)"
+  exit 0
+fi
 
 deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
 

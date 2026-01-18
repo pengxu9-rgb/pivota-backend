@@ -110,14 +110,20 @@ async def enqueue_invitation_send_job_from_order(
             {"order_id": oid},
         )
         if existing:
-            st = str(existing.get("status") or "").strip()
+            try:
+                st = str(existing["status"] or "").strip()
+                existing_id = int(existing["id"] or 0)
+            except Exception:
+                d = dict(existing) if existing is not None else {}
+                st = str(d.get("status") or "").strip()
+                existing_id = int(d.get("id") or 0)
             if st == "sent":
                 return {"ok": False, "reason": "ALREADY_SENT"}
             if st == "processing":
-                return {"ok": True, "reason": "ALREADY_PROCESSING", "job_id": int(existing.get("id") or 0)}
+                return {"ok": True, "reason": "ALREADY_PROCESSING", "job_id": existing_id}
             if st == "pending":
                 if not force_reschedule:
-                    return {"ok": True, "reason": "ALREADY_PENDING", "job_id": int(existing.get("id") or 0)}
+                    return {"ok": True, "reason": "ALREADY_PENDING", "job_id": existing_id}
                 # Reschedule pending job (best-effort).
                 await database.execute(
                     """
@@ -126,9 +132,9 @@ async def enqueue_invitation_send_job_from_order(
                         updated_at = NOW()
                     WHERE id = :id AND status = 'pending'
                     """,
-                    {"id": int(existing.get("id") or 0), "delay": int(delay), "send_now": bool(send_now)},
+                    {"id": existing_id, "delay": int(delay), "send_now": bool(send_now)},
                 )
-                return {"ok": True, "reason": "RESCHEDULED", "job_id": int(existing.get("id") or 0)}
+                return {"ok": True, "reason": "RESCHEDULED", "job_id": existing_id}
     except Exception:
         pass
 
