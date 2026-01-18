@@ -121,13 +121,16 @@ if [[ -z "${EMPLOYEE_JWT_SECRET_KEY:-}" ]]; then
   echo
 fi
 
-echo "== [B2] gating deny-case (expect write_allowed=false) =="
+echo "== [B2] gating deny-case (optional) =="
 if [[ "${REQUIRE_DENY_CASE:-}" == "true" ]]; then
+  echo "deny_case_enforced=1 (expect write_allowed=false)"
   BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$DENY_MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" EXPECT_WRITE_ALLOWED=false \
     /bin/bash "$(dirname "${BASH_SOURCE[0]}")/verify_reviews_buyer_canary.sh"
 else
-  BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$DENY_MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" EXPECT_WRITE_ALLOWED=false \
-    /bin/bash "$(dirname "${BASH_SOURCE[0]}")/verify_reviews_buyer_canary.sh" || echo "deny_case_skip=1 (set REQUIRE_DENY_CASE=true to enforce)"
+  echo "deny_case_skip=1 (set REQUIRE_DENY_CASE=true to enforce)"
+  # Still run the check for visibility, but do not assert a specific outcome.
+  BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$DENY_MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" \
+    /bin/bash "$(dirname "${BASH_SOURCE[0]}")/verify_reviews_buyer_canary.sh" || true
 fi
 echo
 
