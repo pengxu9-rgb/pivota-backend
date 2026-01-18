@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import Response
+
+# Ensure repo root is on sys.path when invoked as `python scripts/...`.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from db.database import IS_POSTGRES, database
 from routes.reviews_invitation_issuer import (
