@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from db.database import database
 from services.merchant_store_service import get_primary_store
 from services.shopify_integration_verify import register_webhooks_best_effort, verify_shopify_integration
+from services.shopify_transactions_service import extract_shopify_access_token
 from utils.auth import get_current_employee
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ async def ops_resubscribe_shopify_webhooks(
         raise HTTPException(status_code=400, detail="Primary store is not Shopify")
 
     shop_domain = store_info.get("domain") or ""
-    access_token = store_info.get("api_key") or ""
+    access_token = extract_shopify_access_token(store_info.get("api_key")) or ""
     if not shop_domain or not access_token:
         raise HTTPException(status_code=400, detail="Missing Shopify credentials")
 
