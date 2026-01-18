@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import Response
+from fastapi import HTTPException
 
 # Ensure repo root is on sys.path when invoked as `python scripts/...`.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -177,7 +178,12 @@ async def _process_one(job: Dict[str, Any], *, internal_key: str, max_attempts: 
         await _mark_sent(job_id=job_id, sendgrid_message_id=sendgrid_message_id)
         return {"id": job_id, "result": "sent"}
     except Exception as e:
-        await _mark_retry_or_error(job_id=job_id, attempts=attempts, error=str(e), max_attempts=max_attempts)
+        err = ""
+        if isinstance(e, HTTPException):
+            err = f"HTTPException:{e.status_code}:{e.detail}"
+        else:
+            err = f"{type(e).__name__}:{e}"
+        await _mark_retry_or_error(job_id=job_id, attempts=attempts, error=err, max_attempts=max_attempts)
         return {"id": job_id, "result": "error"}
 
 
