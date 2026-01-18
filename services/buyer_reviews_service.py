@@ -149,7 +149,8 @@ async def _exchange_invitation_token_for_proof_token(invitation_token: str) -> s
 
 
 def buyer_submit_enabled() -> bool:
-    return (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower() == "true"
+    raw = (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 def buyer_submit_internal_issuer_enabled() -> bool:
     # Internal-only token issuer for staging/dev smoke tests.
