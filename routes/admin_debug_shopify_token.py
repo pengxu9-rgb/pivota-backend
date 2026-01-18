@@ -3,15 +3,19 @@ Admin Debug Endpoint for Shopify Token Issues
 """
 import logging
 import json
+import hashlib
 from fastapi import APIRouter, HTTPException
+from fastapi import Depends
 from db.database import database
 import httpx
+
+from utils.auth import require_admin
 
 router = APIRouter(prefix="/admin/debug", tags=["Admin Debug"])
 logger = logging.getLogger(__name__)
 
 @router.get("/shopify-token/{merchant_id}")
-async def debug_shopify_token(merchant_id: str):
+async def debug_shopify_token(merchant_id: str, current_user: dict = Depends(require_admin)):
     """
     Debug Shopify token storage and parsing
     Shows how token is stored and how it's being parsed
@@ -24,11 +28,9 @@ async def debug_shopify_token(merchant_id: str):
                 platform,
                 domain,
                 name,
-                api_key,
                 status,
                 connected_at,
-                LENGTH(api_key) as token_length,
-                SUBSTRING(api_key, 1, 50) as token_preview
+                LENGTH(api_key) as token_length
             FROM merchant_stores
             WHERE merchant_id = :merchant_id 
                 AND platform = 'shopify'
@@ -44,14 +46,23 @@ async def debug_shopify_token(merchant_id: str):
                 "message": "No Shopify store found for this merchant"
             }
         
-        api_key = store["api_key"]
+        # Read raw token separately to avoid accidental leakage in debug SQL.
+        api_key = await database.fetch_val(
+            """
+            SELECT api_key
+            FROM merchant_stores
+            WHERE store_id = :store_id
+            """,
+            {"store_id": store["store_id"]},
+        )
         
         # Analyze token format
+        api_key_str = api_key if isinstance(api_key, str) else ""
         token_analysis = {
             "raw_type": type(api_key).__name__,
-            "raw_length": len(api_key) if api_key else 0,
-            "starts_with_brace": api_key.strip().startswith("{") if api_key else False,
-            "preview": api_key[:100] if api_key else None
+            "raw_length": len(api_key_str) if api_key_str else 0,
+            "starts_with_brace": api_key_str.strip().startswith("{") if api_key_str else False,
+            "raw_sha256_fp": hashlib.sha256(api_key_str.encode("utf-8")).hexdigest()[:12] if api_key_str else None,
         }
         
         # Try to parse as JSON
@@ -60,19 +71,19 @@ async def debug_shopify_token(merchant_id: str):
         
         if api_key:
             # Method 1: Direct use (plain token)
-            if not api_key.strip().startswith("{"):
-                parsed_token = api_key
+            if isinstance(api_key, str) and not api_key.strip().startswith("{"):
+                parsed_token = api_key.strip()
                 parse_method = "direct"
             else:
                 # Method 2: JSON parse
                 try:
-                    parsed = json.loads(api_key)
-                    parsed_token = parsed.get("access_token") or parsed.get("token") or api_key
+                    parsed = json.loads(api_key_str)
+                    parsed_token = parsed.get("access_token") or parsed.get("token")
                     parse_method = "json"
                     token_analysis["json_parsed"] = True
                     token_analysis["json_keys"] = list(parsed.keys())
                 except Exception as e:
-                    parsed_token = api_key
+                    parsed_token = None
                     parse_method = "fallback"
                     token_analysis["json_parse_error"] = str(e)
         
@@ -105,6 +116,7 @@ async def debug_shopify_token(merchant_id: str):
         return {
             "status": "success",
             "merchant_id": merchant_id,
+            "requested_by": current_user.get("sub"),
             "store_info": {
                 "store_id": store["store_id"],
                 "domain": store["domain"],
@@ -116,7 +128,9 @@ async def debug_shopify_token(merchant_id: str):
             "parsing": {
                 "method_used": parse_method,
                 "parsed_token_length": len(parsed_token) if parsed_token else 0,
-                "parsed_token_preview": parsed_token[:20] + "..." if parsed_token and len(parsed_token) > 20 else parsed_token
+                "parsed_token_sha256_fp": hashlib.sha256(parsed_token.encode("utf-8")).hexdigest()[:12]
+                if parsed_token
+                else None,
             },
             "api_test": test_result,
             "diagnosis": _diagnose_shopify_issue(test_result, token_analysis) if test_result else None
@@ -177,5 +191,4 @@ def _diagnose_shopify_issue(test_result: dict, token_analysis: dict) -> dict:
             "issue": test_result.get("error", "Unknown error"),
             "fix": "Check network connectivity and Shopify status"
         }
-
 
