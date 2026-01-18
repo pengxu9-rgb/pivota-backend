@@ -1885,7 +1885,14 @@ async def mark_order_as_shipped(
             if not internal_key:
                 logger.info("Reviews invitation issuer disabled; skip send.")
                 return
-            if _reviews_invitation_send_delay_seconds() > 0:
+            delay = _reviews_invitation_send_delay_seconds()
+            worker_enabled = (os.getenv("REVIEWS_INVITATION_WORKER_ENABLED") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if delay > 0 or worker_enabled:
                 ok = await enqueue_invitation_email_send_job_from_order(
                     merchant_id=order["merchant_id"],
                     order_id=order_id,
