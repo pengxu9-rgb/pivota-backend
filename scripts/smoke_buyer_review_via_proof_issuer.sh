@@ -202,22 +202,64 @@ print(s+"."+sig)')"
 unset JWT_SECRET_KEY
 curl -sS -H "Authorization: Bearer $EMP_TOKEN" -H "Content-Type: application/json" \
   -d '{"status":"active","reason":"buyer smoke approve"}' \
-  "$REVIEWS_BASE_URL/employee/reviews/v1/reviews/$REVIEW_ID/status" >/dev/null
+  "$REVIEWS_BASE_URL/employee/reviews/v1/reviews/$REVIEW_ID/status" \
+| python3 -c 'import sys,json; o=json.load(sys.stdin); ok=(o.get("status")=="success"); print("approve_api_ok=1" if ok else "approve_api_ok=0"); sys.exit(0 if ok else 1)'
 echo "approved_ok"
 
+_list_reviews_json() {
+  local variant="${1:-}"
+  local sku_json
+  if [[ -n "$variant" ]]; then
+    sku_json="$(python3 - <<'PY' <<<"$variant"
+import json,sys
+print(json.dumps({"variant_id":sys.stdin.read().strip()}))
+PY
+)"
+    curl -sS -H "Content-Type: application/json" \
+      -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\",\"variant_id\":$sku_json},\"filters\":{\"limit\":50}}}" \
+      "$REVIEWS_BASE_URL/agent/shop/v1/invoke"
+  else
+    curl -sS -H "Content-Type: application/json" \
+      -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\"},\"filters\":{\"limit\":50}}}" \
+      "$REVIEWS_BASE_URL/agent/shop/v1/invoke"
+  fi
+}
+
+_poll_until_visible() {
+  local max_tries="${1:-20}"
+  local sleep_s="${2:-1}"
+  local try=1
+  local last_json=""
+  while [[ $try -le $max_tries ]]; do
+    last_json="$(_list_reviews_json "$VARIANT_ID" || true)"
+    if [[ -n "$last_json" ]]; then
+      if printf '%s' "$last_json" | python3 -c 'import sys,json; o=json.load(sys.stdin); rid=int(sys.argv[1]); items=o.get("items") or []; print("found" if any(int(it.get("review_id") or -1)==rid for it in items) else "not_found")' "$REVIEW_ID" | grep -q '^found$'; then
+        printf '%s' "$last_json"
+        return 0
+      fi
+    fi
+    sleep "$sleep_s" || true
+    try=$((try+1))
+  done
+  printf '%s' "$last_json"
+  return 1
+}
+
 echo "== post-check visible on read path (should be found) =="
-POST="$(curl -sS -H "Content-Type: application/json" \
-  -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\",\"variant_id\":\"$VARIANT_ID\"},\"filters\":{\"limit\":50}}}" \
-  "$REVIEWS_BASE_URL/agent/shop/v1/invoke" \
-| python3 -c 'import sys,json; o=json.load(sys.stdin); rid=int(sys.argv[1]); items=o.get("items") or []; hit=[it for it in items if int(it.get("review_id") or -1)==rid]; print("found" if hit else "not_found")' "$REVIEW_ID")"
-echo "$POST"
+POST_JSON="$(_poll_until_visible 25 1)" || true
+POST_STATE="$(printf '%s' "$POST_JSON" | python3 -c 'import sys,json; o=json.load(sys.stdin); rid=int(sys.argv[1]); items=o.get("items") or []; print("found" if any(int(it.get("review_id") or -1)==rid for it in items) else "not_found")' "$REVIEW_ID" 2>/dev/null || echo "not_found")"
+echo "$POST_STATE"
+if [[ "$POST_STATE" != "found" ]]; then
+  echo "ERROR: approved review not visible on read path after polling" >&2
+  echo "HINT: possible cache/index delay or approval failure; dumping last list_sku_reviews response (truncated)..." >&2
+  printf '%s' "$POST_JSON" | head -c 800 >&2 || true
+  echo >&2
+  exit 1
+fi
 
 echo "== fetch signed media URL via read path =="
-SIGNED_PATH="$(curl -sS -H "Content-Type: application/json" \
-  -d "{\"operation\":\"list_sku_reviews\",\"payload\":{\"sku\":{\"merchant_id\":\"$MERCHANT_ID\",\"platform\":\"$PLATFORM\",\"platform_product_id\":\"$PLATFORM_PRODUCT_ID\",\"variant_id\":\"$VARIANT_ID\"},\"filters\":{\"limit\":50}}}" \
-  "$REVIEWS_BASE_URL/agent/shop/v1/invoke" \
-| python3 -c 'import sys,json; o=json.load(sys.stdin); pid=sys.argv[1]; items=o.get("items") or []; urls=[(m.get("url") or "") for it in items for m in (it.get("media") or []) if pid in (m.get("url") or "")]; print(urls[0] if urls else "")' "$MEDIA_PUBLIC_ID")"
-[[ -n "$SIGNED_PATH" ]] || { echo "ERROR: no signed media url found in list_sku_reviews" >&2; exit 1; }
+SIGNED_PATH="$(printf '%s' "$POST_JSON" | python3 -c 'import sys,json; o=json.load(sys.stdin); pid=sys.argv[1]; items=o.get("items") or []; urls=[(m.get("url") or "") for it in items for m in (it.get("media") or []) if pid in (m.get("url") or "")]; print(urls[0] if urls else "")' "$MEDIA_PUBLIC_ID" 2>/dev/null || true)"
+[[ -n "$SIGNED_PATH" ]] || { echo "ERROR: no signed media url found in list_sku_reviews (media may still be pending activation)" >&2; exit 1; }
 SIGNED_URL="$REVIEWS_BASE_URL$SIGNED_PATH"
 echo "SIGNED_URL=$SIGNED_URL"
 
