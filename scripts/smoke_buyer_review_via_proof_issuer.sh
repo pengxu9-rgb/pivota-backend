@@ -78,7 +78,7 @@ if [[ ! -f "$MEDIA_FILE_PATH" ]]; then
 fi
 echo "media_file=$MEDIA_FILE_PATH"
 
-INTERNAL_KEY="${PROOF_ISSUER_INTERNAL_KEY:-}"
+INTERNAL_KEY="${PROOF_ISSUER_INTERNAL_KEY:-${REVIEWS_PROOF_ISSUER_INTERNAL_KEY:-${REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY:-}}}"
 if [[ -z "$INTERNAL_KEY" ]]; then
   read -r -s -p "X-Internal-Key (proof issuer): " INTERNAL_KEY
   echo
@@ -109,6 +109,10 @@ unset INTERNAL_KEY
 PROOF_TOKEN="$(printf '%s' "$ISSUE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("proof_token",""))')"
 if [[ -z "$PROOF_TOKEN" ]]; then
   echo "ERROR: no proof_token from issuer" >&2
+  if printf '%s' "$ISSUE_RESP" | grep -q 'UNAUTHORIZED'; then
+    echo "HINT: wrong proof-issuer internal key. Use the key from the proof-issuer service (not the web backend invitation key)." >&2
+    echo "      You can set PROOF_ISSUER_INTERNAL_KEY (or REVIEWS_PROOF_ISSUER_INTERNAL_KEY)." >&2
+  fi
   echo "$ISSUE_RESP" >&2
   exit 1
 fi
