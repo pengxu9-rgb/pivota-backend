@@ -50,16 +50,9 @@ while true; do
   body="$(curl --http1.1 -sS -H "X-Internal-Key: $X_INTERNAL_KEY" \
     "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/jobs/by-order?order_id=$ORDER_ID")"
 
-  status="$(python3 - <<'PY' <<<"$body"
-import json,sys
-o=json.loads(sys.stdin.read() or "{}")
-items=o.get("items") or []
-st=""
-if items:
-  st=str(items[0].get("status") or "")
-print(st)
-PY
-)"
+  status="$(python3 -c 'import json,sys; raw=sys.stdin.read() or "{}"; \
+o=json.loads(raw); items=o.get("items") or []; \
+print(str((items[0].get("status") if items else "") or ""))' <<<"$body" 2>/dev/null || true)"
 
   echo "job_status=$status"
   if [[ "$status" == "sent" || "$status" == "cancelled" || "$status" == "error" ]]; then
@@ -70,4 +63,3 @@ PY
 
   sleep "$POLL_SECONDS"
 done
-
