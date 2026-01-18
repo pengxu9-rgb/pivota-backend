@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+# Smoke: enqueue an invitation send job and wait for the worker to mark it sent/cancelled/error.
+#
+# Required env:
+# - REVIEWS_BASE_URL (e.g. https://web-production-fedb.up.railway.app)
+# - MERCHANT_ID
+# - ORDER_ID
+# - X_INTERNAL_KEY (invitation issuer internal key)
+#
+# Optional env:
+# - TIMEOUT_SECONDS (default 180)
+# - POLL_SECONDS (default 10)
+
+REVIEWS_BASE_URL="${REVIEWS_BASE_URL:-}"
+MERCHANT_ID="${MERCHANT_ID:-}"
+ORDER_ID="${ORDER_ID:-}"
+X_INTERNAL_KEY="${X_INTERNAL_KEY:-}"
+
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-180}"
+POLL_SECONDS="${POLL_SECONDS:-10}"
+
+if [[ -z "$REVIEWS_BASE_URL" || -z "$MERCHANT_ID" || -z "$ORDER_ID" || -z "$X_INTERNAL_KEY" ]]; then
+  echo "ERROR: missing env: REVIEWS_BASE_URL, MERCHANT_ID, ORDER_ID, X_INTERNAL_KEY" >&2
+  exit 2
+fi
+
+REVIEWS_BASE_URL="${REVIEWS_BASE_URL%/}"
+
+echo "== enqueue send job (force_reschedule) =="
+curl --http1.1 -sS -H "Content-Type: application/json" -H "X-Internal-Key: $X_INTERNAL_KEY" \
+  -d "{\"merchant_id\":\"$MERCHANT_ID\",\"order_id\":\"$ORDER_ID\",\"force_reschedule\":true}" \
+  "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/enqueue-send-job" \
+  | python3 -c 'import sys,json; o=json.load(sys.stdin); print("status=",o.get("status"),"ok=",o.get("ok"),"reason=",o.get("reason"))'
+
+deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
+
+echo "== wait for job status (sent/cancelled/error) =="
+while true; do
+  now=$(date +%s)
+  if (( now > deadline )); then
+    echo "ERROR: timeout waiting for job terminal status" >&2
+    curl --http1.1 -sS -H "X-Internal-Key: $X_INTERNAL_KEY" \
+      "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/jobs/by-order?order_id=$ORDER_ID" \
+      | python3 -m json.tool | head -n 120
+    exit 1
+  fi
+
+  body="$(curl --http1.1 -sS -H "X-Internal-Key: $X_INTERNAL_KEY" \
+    "$REVIEWS_BASE_URL/internal/reviews/v1/invitation/jobs/by-order?order_id=$ORDER_ID")"
+
+  status="$(python3 - <<'PY' <<<"$body"
+import json,sys
+o=json.loads(sys.stdin.read() or "{}")
+items=o.get("items") or []
+st=""
+if items:
+  st=str(items[0].get("status") or "")
+print(st)
+PY
+)"
+
+  echo "job_status=$status"
+  if [[ "$status" == "sent" || "$status" == "cancelled" || "$status" == "error" ]]; then
+    echo "$body" | python3 -m json.tool | head -n 120
+    echo "OK"
+    exit 0
+  fi
+
+  sleep "$POLL_SECONDS"
+done
+

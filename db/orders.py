@@ -11,6 +11,7 @@ import secrets
 import os
 
 from db.database import metadata, database
+from services.reviews_invitation_send_jobs_service import enqueue_invitation_send_job_from_order
 
 
 # ============================================================================
@@ -249,7 +250,26 @@ async def update_order_status(
     status: str, 
     **additional_fields
 ) -> bool:
-    """更新订单状态（防御性：只能前进，不能回退）"""
+    """更新订单状态（防御性：只能前进，不能回退）
+
+    Side-effect (best-effort): when an order transitions into a "completed" or
+    shipped/delivered fulfillment state, enqueue a review invitation email job
+    for the worker to process.
+    """
+    before = None
+    try:
+        before = await database.fetch_one(
+            """
+            SELECT merchant_id, status, fulfillment_status, payment_status
+            FROM orders
+            WHERE order_id = :order_id
+            LIMIT 1
+            """,
+            {"order_id": order_id},
+        )
+    except Exception:
+        before = None
+
     update_data = {"status": status, "updated_at": datetime.now()}
     update_data.update(additional_fields)
 
@@ -264,8 +284,45 @@ async def update_order_status(
     ).values(**update_data)
     
     result = await database.execute(query)
-    # Handle None result from PostgreSQL
-    return result is not None and result > 0
+    ok = result is not None and result > 0
+
+    # Best-effort invitation enqueue on completion/shipping transitions.
+    if ok:
+        try:
+            after = await database.fetch_one(
+                """
+                SELECT merchant_id, status, fulfillment_status, payment_status
+                FROM orders
+                WHERE order_id = :order_id
+                LIMIT 1
+                """,
+                {"order_id": order_id},
+            )
+        except Exception:
+            after = None
+
+        try:
+            if before and after:
+                before_status = str(before.get("status") or "").strip().lower()
+                after_status = str(after.get("status") or "").strip().lower()
+                before_ful = str(before.get("fulfillment_status") or "").strip().lower()
+                after_ful = str(after.get("fulfillment_status") or "").strip().lower()
+                after_paid = str(after.get("payment_status") or "").strip().lower() == "paid"
+                merchant_id = str(after.get("merchant_id") or "").strip()
+
+                transitioned_completed = before_status != "completed" and after_status == "completed"
+                transitioned_fulfilled = before_ful != after_ful and after_ful in {"shipped", "delivered"}
+
+                if merchant_id and after_paid and (transitioned_completed or transitioned_fulfilled):
+                    await enqueue_invitation_send_job_from_order(
+                        merchant_id=merchant_id,
+                        order_id=order_id,
+                        force_reschedule=False,
+                    )
+        except Exception:
+            pass
+
+    return ok
 
 
 async def update_payment_info(
@@ -347,8 +404,34 @@ async def update_fulfillment_info(
     ).values(**update_data)
     
     result = await database.execute(query)
-    # Handle None result from PostgreSQL
-    return result is not None and result > 0
+    ok = result is not None and result > 0
+
+    # Best-effort: enqueue invitation when fulfillment becomes shipped/delivered.
+    if ok and fulfillment_status:
+        try:
+            row = await database.fetch_one(
+                """
+                SELECT merchant_id, payment_status, fulfillment_status
+                FROM orders
+                WHERE order_id = :order_id
+                LIMIT 1
+                """,
+                {"order_id": order_id},
+            )
+            if row:
+                paid = str(row.get("payment_status") or "").strip().lower() == "paid"
+                ful = str(row.get("fulfillment_status") or "").strip().lower()
+                merchant_id = str(row.get("merchant_id") or "").strip()
+                if paid and merchant_id and ful in {"shipped", "delivered"}:
+                    await enqueue_invitation_send_job_from_order(
+                        merchant_id=merchant_id,
+                        order_id=order_id,
+                        force_reschedule=False,
+                    )
+        except Exception:
+            pass
+
+    return ok
 
 
 async def mark_order_shipped(
@@ -357,64 +440,6 @@ async def mark_order_shipped(
     carrier: Optional[str] = None
 ) -> bool:
     """标记订单已发货"""
-    async def _ensure_reviews_invitation_send_jobs_table_best_effort() -> None:
-        try:
-            await database.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reviews_invitation_send_jobs (
-                  id BIGSERIAL PRIMARY KEY,
-                  merchant_id VARCHAR(64) NOT NULL,
-                  order_id VARCHAR(64) NOT NULL,
-                  send_at TIMESTAMPTZ NOT NULL,
-                  status VARCHAR(32) NOT NULL DEFAULT 'pending',
-                  attempts INTEGER NOT NULL DEFAULT 0,
-                  last_attempt_at TIMESTAMPTZ NULL,
-                  sent_at TIMESTAMPTZ NULL,
-                  sendgrid_message_id TEXT NULL,
-                  last_error TEXT NULL,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
-            )
-        except Exception:
-            return
-        try:
-            await database.execute(
-                "CREATE INDEX IF NOT EXISTS idx_reviews_invitation_send_jobs_due ON reviews_invitation_send_jobs (status, send_at)"
-            )
-        except Exception:
-            pass
-        try:
-            await database.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ux_reviews_invitation_send_jobs_order_status ON reviews_invitation_send_jobs (order_id, status)"
-            )
-        except Exception:
-            pass
-
-    def _invitation_send_delay_seconds() -> int:
-        raw = (os.getenv("REVIEWS_INVITATION_SEND_DELAY_SECONDS") or "").strip()
-        try:
-            val = int(raw) if raw else 0
-        except Exception:
-            val = 0
-        return max(0, val)
-
-    def _buyer_submit_enabled() -> bool:
-        return (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower() == "true"
-
-    def _buyer_submit_merchant_allowed(merchant_id: str) -> bool:
-        raw = (os.getenv("REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST") or "").strip()
-        if not raw:
-            return True
-        mid = (merchant_id or "").strip()
-        allow = {x.strip() for x in raw.split(",") if x.strip()}
-        return mid in allow
-
-    def _invitation_worker_enabled() -> bool:
-        raw = (os.getenv("REVIEWS_INVITATION_WORKER_ENABLED") or "").strip().lower()
-        return raw in {"1", "true", "yes", "on"}
-
     query = (
         orders.update()
         .where(orders.c.order_id == order_id)
@@ -432,39 +457,18 @@ async def mark_order_shipped(
     if not result:
         return False
 
-    # Platform-agnostic invitation scheduling: enqueue a job for a worker service to send the email.
-    # - If delay > 0: send later (typical).
-    # - If delay == 0 but worker is enabled: send ASAP via worker (non-blocking for fulfillment path).
-    delay = _invitation_send_delay_seconds()
-    if (delay > 0 or _invitation_worker_enabled()) and _buyer_submit_enabled():
-        try:
-            merchant_id = ""
-            try:
-                merchant_id = str(result["merchant_id"] or "").strip()
-            except Exception:
-                try:
-                    merchant_id = str(dict(result).get("merchant_id") or "").strip()
-                except Exception:
-                    merchant_id = ""
-
-            if merchant_id and _buyer_submit_merchant_allowed(merchant_id):
-                await _ensure_reviews_invitation_send_jobs_table_best_effort()
-                await database.execute(
-                    """
-                    INSERT INTO reviews_invitation_send_jobs
-                      (merchant_id, order_id, send_at, status, updated_at)
-                    VALUES
-                      (:merchant_id, :order_id, NOW() + (:delay * interval '1 second'), 'pending', NOW())
-                    ON CONFLICT (order_id, status)
-                    DO UPDATE SET
-                      send_at = EXCLUDED.send_at,
-                      updated_at = NOW()
-                    """,
-                    {"merchant_id": merchant_id, "order_id": order_id, "delay": int(delay)},
-                )
-        except Exception:
-            # Do not block fulfillment on invitation scheduling failures.
-            pass
+    # Best-effort invitation scheduling: enqueue a job for a worker service to send the email.
+    try:
+        merchant_id = str(result.get("merchant_id") or "").strip()
+        if merchant_id:
+            await enqueue_invitation_send_job_from_order(
+                merchant_id=merchant_id,
+                order_id=order_id,
+                force_reschedule=False,
+            )
+    except Exception:
+        # Do not block fulfillment on invitation scheduling failures.
+        pass
 
     return True
 

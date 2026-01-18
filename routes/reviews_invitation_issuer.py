@@ -33,6 +33,9 @@ from pydantic import BaseModel, Field
 
 from observability.reviews_metrics import record_invitation_issue, record_invitation_send
 from services.buyer_reviews_service import buyer_submit_enabled, buyer_submit_merchant_allowed
+from services.reviews_invitation_send_jobs_service import (
+    enqueue_invitation_send_job_from_order as _enqueue_invitation_send_job_from_order,
+)
 from db.orders import get_order
 from services.merchant_store_service import get_primary_store
 from db.database import database
@@ -316,7 +319,26 @@ def _support_email_default(*, store: Optional[Dict[str, Any]], from_email: str) 
         email = str(store.get("support_email") or "").strip()
         if email:
             return email
-    return (os.getenv("REVIEWS_INVITATION_SUPPORT_EMAIL") or from_email or "").strip()
+    # Allow operators to intentionally set an empty support email (omit footer).
+    if "REVIEWS_INVITATION_SUPPORT_EMAIL" in os.environ:
+        return (os.environ.get("REVIEWS_INVITATION_SUPPORT_EMAIL") or "").strip()
+
+    # Backward-compatible fallback (opt-in).
+    raw = (os.getenv("REVIEWS_INVITATION_SUPPORT_EMAIL_FALLBACK_TO_FROM_EMAIL") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return (from_email or "").strip()
+
+    return ""
+
+
+def _sendgrid_from_name() -> str:
+    return (os.getenv("REVIEWS_INVITATION_FROM_NAME") or "").strip()
+
+
+def _reply_to_support_email_enabled() -> bool:
+    raw = (os.getenv("REVIEWS_INVITATION_REPLY_TO_SUPPORT_EMAIL") or "").strip().lower()
+    # Default on: makes replies go to support when provided.
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _store_name_default(store: Optional[Dict[str, Any]]) -> str:
@@ -431,6 +453,7 @@ async def _send_sendgrid_email(
     text_body: str,
     html_body: str,
     template_data: Dict[str, Any],
+    reply_to_email: Optional[str] = None,
 ) -> Dict[str, Any]:
     api_key = _sendgrid_api_key()
     if not api_key:
@@ -446,10 +469,18 @@ async def _send_sendgrid_email(
 
     template_id = _sendgrid_template_id()
     use_template = bool(template_id and _use_sendgrid_template())
+    from_name = _sendgrid_from_name()
     payload: Dict[str, Any] = {
         "personalizations": [{"to": [{"email": to_email}]}],
         "from": {"email": from_email},
     }
+    if from_name:
+        payload["from"]["name"] = from_name
+
+    if _reply_to_support_email_enabled():
+        reply = (reply_to_email or "").strip()
+        if reply:
+            payload["reply_to"] = {"email": reply}
     click_tracking_disabled = False
     if _disable_sendgrid_click_tracking():
         payload["tracking_settings"] = {"click_tracking": {"enable": False, "enable_text": False}}
@@ -699,6 +730,123 @@ class SendInvitationEmailFromOrderRequest(BaseModel):
     force: bool = False
 
 
+class EnqueueInvitationSendJobRequest(BaseModel):
+    merchant_id: str = Field(..., min_length=1)
+    order_id: str = Field(..., min_length=1)
+    force_reschedule: bool = False
+
+
+@router.post("/invitation/enqueue-send-job")
+async def enqueue_invitation_send_job(
+    body: EnqueueInvitationSendJobRequest,
+    response: Response,
+    x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
+) -> Dict[str, Any]:
+    """
+    Internal helper to enqueue a send job (useful for ops/testing without SQL access).
+    """
+    _require_internal_key(x_internal_key)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    out = await _enqueue_invitation_send_job_from_order(
+        merchant_id=(body.merchant_id or "").strip(),
+        order_id=(body.order_id or "").strip(),
+        force_reschedule=bool(body.force_reschedule),
+    )
+    return {"status": "success", **out}
+
+
+@router.get("/invitation/jobs/stats")
+async def invitation_send_jobs_stats(
+    response: Response,
+    x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
+) -> Dict[str, Any]:
+    """
+    Lightweight, non-PII stats for alerting/ops dashboards.
+
+    This is intentionally internal-only and does not expose order ids or emails.
+    """
+    _require_internal_key(x_internal_key)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    await _ensure_invitation_send_jobs_table_best_effort()
+
+    counts: Dict[str, int] = {}
+    try:
+        rows = await database.fetch_all(
+            "SELECT status, COUNT(*)::bigint AS n FROM reviews_invitation_send_jobs GROUP BY status"
+        )
+        for r in rows:
+            try:
+                counts[str(r.get("status") or "").strip() or "unknown"] = int(r.get("n") or 0)
+            except Exception:
+                continue
+    except Exception:
+        counts = {}
+
+    pending_oldest_seconds: Optional[int] = None
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT EXTRACT(EPOCH FROM (NOW() - MIN(send_at)))::bigint AS age
+            FROM reviews_invitation_send_jobs
+            WHERE status='pending'
+            """
+        )
+        if row and row.get("age") is not None:
+            pending_oldest_seconds = max(0, int(row.get("age") or 0))
+    except Exception:
+        pending_oldest_seconds = None
+
+    return {
+        "status": "success",
+        "counts": counts,
+        "pending_oldest_seconds": pending_oldest_seconds,
+    }
+
+
+@router.get("/invitation/jobs/by-order")
+async def invitation_send_jobs_by_order(
+    order_id: str,
+    response: Response,
+    x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
+) -> Dict[str, Any]:
+    """
+    Internal debug endpoint to inspect send-job statuses for a specific order.
+    No PII; intended for ops verification without SQL access.
+    """
+    _require_internal_key(x_internal_key)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    oid = (order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="INVALID_REQUEST")
+
+    await _ensure_invitation_send_jobs_table_best_effort()
+    rows = await database.fetch_all(
+        """
+        SELECT id, status, attempts, send_at, last_attempt_at, sent_at, last_error
+        FROM reviews_invitation_send_jobs
+        WHERE order_id = :order_id
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        {"order_id": oid},
+    )
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        err = str(d.get("last_error") or "")
+        if err:
+            d["last_error"] = err[:256]
+        items.append(d)
+
+    return {"status": "success", "order_id": oid, "items": items}
+
+
 @router.post("/invitation/send-email-from-order")
 async def send_invitation_email_from_order(
     body: SendInvitationEmailFromOrderRequest,
@@ -734,11 +882,11 @@ async def send_invitation_email_from_order(
         raise HTTPException(status_code=400, detail="INVALID_REQUEST")
 
     if not buyer_submit_enabled():
-        record_invitation_send(result="error", reason="BUYER_SUBMIT_DISABLED", sent=False, duration_seconds=time.monotonic() - t0)
-        raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
+        record_invitation_send(result="success", reason="BUYER_SUBMIT_DISABLED", sent=False, duration_seconds=time.monotonic() - t0)
+        return {"status": "success", "sent": False, "reason": "BUYER_SUBMIT_DISABLED", "order_id": order_id}
     if not buyer_submit_merchant_allowed(merchant_id):
-        record_invitation_send(result="error", reason="BUYER_SUBMIT_NOT_ALLOWED", sent=False, duration_seconds=time.monotonic() - t0)
-        raise HTTPException(status_code=403, detail="BUYER_SUBMIT_NOT_ALLOWED")
+        record_invitation_send(result="success", reason="BUYER_SUBMIT_NOT_ALLOWED", sent=False, duration_seconds=time.monotonic() - t0)
+        return {"status": "success", "sent": False, "reason": "BUYER_SUBMIT_NOT_ALLOWED", "order_id": order_id}
 
     # Ensure we have a safe landing URL (token placed in URL fragment).
     if not link_base:
@@ -848,6 +996,7 @@ async def send_invitation_email_from_order(
             text_body=text_body,
             html_body=html_body,
             template_data=template_data,
+            reply_to_email=support_email,
         )
     except HTTPException as e:
         record_invitation_send(result="error", reason=str(e.detail or "SEND_FAILED"), sent=False, duration_seconds=time.monotonic() - t0)

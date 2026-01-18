@@ -332,11 +332,31 @@ async def _process_one(job: Dict[str, Any], *, internal_key: str, max_attempts: 
         # Otherwise, treat as a transient DB issue.
         raise HTTPException(status_code=503, detail="DB_UPDATE_FAILED")
     except Exception as e:
-        err = ""
         if isinstance(e, HTTPException):
-            err = f"HTTPException:{e.status_code}:{e.detail}"
-        else:
-            err = f"{type(e).__name__}:{e}"
+            detail = str(e.detail or "").strip()
+            # Non-retryable failures should cancel the job to avoid retry loops.
+            non_retryable_details = {
+                "BUYER_SUBMIT_DISABLED",
+                "BUYER_SUBMIT_NOT_ALLOWED",
+                "ORDER_NOT_PAID",
+                "ORDER_EMAIL_MISSING",
+                "ORDER_ITEMS_MISSING",
+                "NOT_FOUND",
+                "PRODUCT_NOT_FOUND",
+                "INVITATION_LINK_DISABLED",
+                "SENDGRID_DISABLED",
+            }
+            if e.status_code in {400, 403, 404} and (
+                detail in non_retryable_details or detail.startswith("BUYER_SUBMIT_") or detail.startswith("ORDER_")
+            ):
+                await _mark_cancelled(job_id=job_id, error=f"CANCELLED:{detail or e.status_code}")
+                return {"id": job_id, "result": "cancelled", "reason": detail or str(e.status_code)}
+
+            err = f"HTTPException:{e.status_code}:{detail}"
+            await _mark_retry_or_error(job_id=job_id, attempts=attempts, error=err, max_attempts=max_attempts)
+            return {"id": job_id, "result": "error"}
+
+        err = f"{type(e).__name__}:{e}"
         await _mark_retry_or_error(job_id=job_id, attempts=attempts, error=err, max_attempts=max_attempts)
         return {"id": job_id, "result": "error"}
 

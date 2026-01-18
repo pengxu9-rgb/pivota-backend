@@ -54,6 +54,9 @@ from routes.reviews_invitation_issuer import (
     _invitation_send_delay_seconds as _reviews_invitation_send_delay_seconds,
     enqueue_invitation_email_send_job_from_order,
 )
+from services.reviews_invitation_send_jobs_service import (
+    enqueue_invitation_send_job_from_order as enqueue_reviews_invitation_send_job_from_order,
+)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -1893,9 +1896,10 @@ async def mark_order_as_shipped(
                 "on",
             }
             if delay > 0 or worker_enabled:
-                ok = await enqueue_invitation_email_send_job_from_order(
+                ok = await enqueue_reviews_invitation_send_job_from_order(
                     merchant_id=order["merchant_id"],
                     order_id=order_id,
+                    force_reschedule=False,
                 )
                 logger.info(f"Reviews invitation job enqueued for order {order_id} ok={ok}")
                 return
