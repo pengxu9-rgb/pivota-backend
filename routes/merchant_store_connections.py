@@ -1033,7 +1033,15 @@ async def merchant_get_store_support_email(
     if not store_row:
         raise HTTPException(status_code=404, detail="No active store found")
 
-    support_email = (store_row.get("support_email") or "").strip() or None
+    support_email_raw = None
+    try:
+        support_email_raw = store_row["support_email"]
+    except Exception:
+        try:
+            support_email_raw = dict(store_row).get("support_email")
+        except Exception:
+            support_email_raw = None
+    support_email = (str(support_email_raw or "").strip() or None)
     effective = support_email
     if not effective:
         effective = (os.getenv("REVIEWS_INVITATION_SUPPORT_EMAIL") or "").strip() or None
