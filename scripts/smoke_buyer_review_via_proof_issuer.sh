@@ -200,10 +200,40 @@ s=b64u(json.dumps(hdr,separators=(",",":")).encode())+"."+b64u(json.dumps(pl,sep
 sig=b64u(hmac.new(os.environ["JWT_SECRET_KEY"].encode(), s.encode(), hashlib.sha256).digest())
 print(s+"."+sig)')"
 unset JWT_SECRET_KEY
-curl -sS -H "Authorization: Bearer $EMP_TOKEN" -H "Content-Type: application/json" \
+
+APPROVE_HDR="$(mktemp "${TMPDIR:-/tmp}/approve_hdr.XXXXXX")"
+APPROVE_BODY="$(mktemp "${TMPDIR:-/tmp}/approve_body.XXXXXX")"
+APPROVE_CODE="$(curl -sS -D "$APPROVE_HDR" -o "$APPROVE_BODY" -w '%{http_code}' \
+  -H "Authorization: Bearer $EMP_TOKEN" -H "Content-Type: application/json" \
   -d '{"status":"active","reason":"buyer smoke approve"}' \
-  "$REVIEWS_BASE_URL/employee/reviews/v1/reviews/$REVIEW_ID/status" \
-| python3 -c 'import sys,json; o=json.load(sys.stdin); ok=(o.get("status")=="success"); print("approve_api_ok=1" if ok else "approve_api_ok=0"); sys.exit(0 if ok else 1)'
+  "$REVIEWS_BASE_URL/employee/reviews/v1/reviews/$REVIEW_ID/status" || true)"
+
+REQ_ID="$(awk -F': ' 'tolower($1)=="x-request-id"{print $2}' "$APPROVE_HDR" | tr -d '\r' | head -n 1)"
+if [[ "$APPROVE_CODE" == "200" ]]; then
+  if python3 - <<'PY' <"$APPROVE_BODY" >/dev/null
+import json,sys
+o=json.load(sys.stdin)
+assert o.get("status")=="success"
+PY
+  then
+    echo "approve_api_ok=1"
+  else
+    echo "approve_api_ok=0"
+    echo "ERROR: approval returned http=200 but status!=success (x-request-id=${REQ_ID:-})" >&2
+    head -c 1200 "$APPROVE_BODY" >&2 || true
+    echo >&2
+    rm -f "$APPROVE_HDR" "$APPROVE_BODY" || true
+    exit 1
+  fi
+else
+  echo "approve_api_ok=0"
+  echo "ERROR: approval failed http=$APPROVE_CODE (x-request-id=${REQ_ID:-})" >&2
+  head -c 1200 "$APPROVE_BODY" >&2 || true
+  echo >&2
+  rm -f "$APPROVE_HDR" "$APPROVE_BODY" || true
+  exit 1
+fi
+rm -f "$APPROVE_HDR" "$APPROVE_BODY" || true
 echo "approved_ok"
 
 _list_reviews_json() {
