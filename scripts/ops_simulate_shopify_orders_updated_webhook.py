@@ -40,11 +40,15 @@ def _die(msg: str) -> None:
 
 
 def _read_database_url(path: str) -> str:
-    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
-    m = re.search(r"(postgres(?:ql)?://\\S+)", raw)
+    raw = open(path, "rb").read()
+    text = raw.decode("utf-8", errors="ignore")
+    m = re.search(r"(postgres(?:ql)?://[^\s\"']+)", text)
     if not m:
         _die("ERROR: could not find postgresql://... in database url file")
-    return m.group(1).strip().strip('"').strip("'")
+    url = m.group(1).strip().strip('"').strip("'")
+    # Trim trailing junk (common when copy/paste from rich text)
+    url = re.sub(r"[^A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$", "", url).rstrip("}").strip()
+    return url
 
 
 def _fp(value: str) -> str:
@@ -251,14 +255,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Simulate Shopify orders/updated webhook using real Shopify order payload.")
     ap.add_argument("--base-url", required=True, help="Backend base URL, e.g. https://web-production-fedb.up.railway.app")
     ap.add_argument("--order-id", required=True, help="Pivota order id, e.g. ORD_...")
-    ap.add_argument("--database-url-file", required=True, help="File containing postgresql://... (can include extra text)")
+    ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""), help="Postgres DATABASE_URL (overrides --database-url-file)")
+    ap.add_argument("--database-url-file", default=os.getenv("DATABASE_URL_FILE", ""), help="File containing postgresql://... (can include extra text)")
     ap.add_argument("--api-version", default="2024-07", help="Shopify Admin API version (default: 2024-07)")
     ap.add_argument("--client-secret", default="", help="Shopify app client secret (fallback: env SHOPIFY_CLIENT_SECRET)")
     args = ap.parse_args()
 
     client_secret = (args.client_secret or os.getenv("SHOPIFY_CLIENT_SECRET") or "").strip()
 
-    database_url = _read_database_url(args.database_url_file)
+    database_url = (args.database_url or "").strip()
+    if not database_url:
+        if not args.database_url_file:
+            _die("ERROR: missing database url (set --database-url or --database-url-file)")
+        database_url = _read_database_url(args.database_url_file)
     conn = psycopg2.connect(database_url)
     conn.autocommit = True
     try:
