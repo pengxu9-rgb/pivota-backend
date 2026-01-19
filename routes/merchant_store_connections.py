@@ -39,6 +39,9 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
     "orders/fulfilled",
 ]
 
+_STOREFRONT_AUTO_CREATE_DENIED_UNTIL: Dict[str, float] = {}
+_STOREFRONT_AUTO_CREATE_DENIED_TTL_SECONDS = 24 * 3600
+
 
 class ConnectShopifyRequest(BaseModel):
     merchant_id: str
@@ -60,12 +63,28 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
     Requires the custom app to have Storefront API enabled on Shopify side.
     """
     try:
+        shop_domain_lc = (shop_domain or "").strip().lower()
+        if shop_domain_lc:
+            import time
+
+            denied_until = _STOREFRONT_AUTO_CREATE_DENIED_UNTIL.get(shop_domain_lc, 0.0)
+            if denied_until and denied_until > time.time():
+                return None
+
         url = f"https://{shop_domain}/admin/api/2024-07/storefront_access_tokens.json"
         headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
         payload = {"storefront_access_token": {"title": "Pivota Pricing"}}
         async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code not in (200, 201):
+            # Common "expected" failures:
+            # - 401/403: missing scope/permission for Storefront token creation
+            # - 404: Storefront API not enabled on the app / endpoint unavailable for this shop
+            # We silently skip and avoid spamming Shopify on every reconnect.
+            if shop_domain_lc and resp.status_code in (401, 403, 404):
+                _STOREFRONT_AUTO_CREATE_DENIED_UNTIL[shop_domain_lc] = time.time() + float(
+                    _STOREFRONT_AUTO_CREATE_DENIED_TTL_SECONDS
+                )
             return None
         data = resp.json() or {}
         storefront = data.get("storefront_access_token") if isinstance(data, dict) else None
