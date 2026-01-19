@@ -172,6 +172,15 @@ try:
     except ValueError:
         reviews_invitation_send_duration_seconds = _existing_collector("reviews_invitation_send_duration_seconds")
 
+    try:
+        reviews_shopify_webhook_total = Counter(
+            "reviews_shopify_webhook_total",
+            "Shopify webhook ingestion attempts (by result + reason + topic).",
+            ["result", "reason", "topic"],
+        )
+    except ValueError:
+        reviews_shopify_webhook_total = _existing_collector("reviews_shopify_webhook_total")
+
 except Exception:  # pragma: no cover
     # Prometheus client not installed or metrics disabled; provide no-ops.
     Counter = Histogram = None  # type: ignore
@@ -200,6 +209,7 @@ except Exception:  # pragma: no cover
     reviews_invitation_issue_duration_seconds = None
     reviews_invitation_send_total = None
     reviews_invitation_send_duration_seconds = None
+    reviews_shopify_webhook_total = None
 
 
 def record_invoke_request(*, operation: str, status_code: int, duration_seconds: float, error_type: Optional[str] = None) -> None:
@@ -293,3 +303,12 @@ def record_invitation_send(*, result: str, reason: str, sent: bool, duration_sec
         reviews_invitation_send_total.labels(result=str(result), reason=str(reason), sent=str(bool(sent)).lower()).inc()
     if reviews_invitation_send_duration_seconds is not None:
         reviews_invitation_send_duration_seconds.observe(max(0.0, float(duration_seconds)))
+
+
+def record_shopify_webhook(*, result: str, reason: str, topic: str) -> None:
+    if reviews_shopify_webhook_total is not None:
+        reviews_shopify_webhook_total.labels(
+            result=str(result),
+            reason=str(reason),
+            topic=str(topic or "unknown"),
+        ).inc()

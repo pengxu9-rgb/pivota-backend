@@ -23,6 +23,7 @@ from config.settings import settings
 from utils.logger import logger
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
+from observability.reviews_metrics import record_shopify_webhook
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
     _internal_key as _reviews_invitation_internal_key,
@@ -331,11 +332,43 @@ async def handle_shopify_webhook(
 	    """
     try:
         payload = await request.body()
+        topic = x_shopify_topic or "unknown"
         
         # 获取商户信息
         merchant = await get_merchant_onboarding(merchant_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
+
+        got_canon = _canonicalize_shop_domain(x_shopify_shop_domain)
+
+        # Build Shopify store allowlist and (optional) per-store webhook secret mapping.
+        # Note: the shop domain comes from an untrusted header, so we ONLY use it to select
+        # a secret after confirming it matches a connected Shopify store for this merchant.
+        stores = []
+        try:
+            stores = await get_merchant_active_stores(merchant_id)
+        except Exception as e:
+            logger.warning("Shopify webhook store lookup failed merchant=%s err=%s", merchant_id, str(e)[:160])
+            stores = []
+
+        allowed_domains: Dict[str, Dict[str, Any]] = {}
+        for store in stores or []:
+            if (store.get("platform") or "").lower() != "shopify":
+                continue
+            dom = _canonicalize_shop_domain(store.get("domain"))
+            if dom:
+                allowed_domains[dom] = store
+
+        matched_store = allowed_domains.get(got_canon) if got_canon else None
+        store_secret: str = ""
+        if matched_store:
+            creds = matched_store.get("api_credentials") or {}
+            if isinstance(creds, dict):
+                for k in ("webhook_secret", "client_secret", "api_secret_key", "shopify_client_secret"):
+                    v = creds.get(k)
+                    if isinstance(v, str) and v.strip():
+                        store_secret = v.strip()
+                        break
 
         # Verify signature (strict in production; must use raw request body).
         instance_id = socket.gethostname()
@@ -344,10 +377,9 @@ async def handle_shopify_webhook(
             or os.getenv("ENVIRONMENT", "").lower() == "production"
             or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
         )
-        merchant_secret = merchant.get("shopify_webhook_secret")
         app_secret = getattr(settings, "shopify_client_secret", None)
-        shopify_secret = merchant_secret or app_secret or ""
-        secret_source = "merchant" if merchant_secret else ("app_env" if app_secret else "none")
+        shopify_secret = store_secret or app_secret or ""
+        secret_source = "store_credentials" if store_secret else ("app_env" if app_secret else "none")
         secret_len = len(shopify_secret) if shopify_secret else 0
         secret_sha256_prefix = (
             hashlib.sha256(shopify_secret.encode("utf-8")).hexdigest()[:10]
@@ -358,9 +390,9 @@ async def handle_shopify_webhook(
         debug_meta = {
             "merchant_id": merchant_id,
             "instance": instance_id,
-            "topic": x_shopify_topic or "unknown",
+            "topic": topic,
             "webhook_id": x_shopify_webhook_id,
-            "shop_domain": _canonicalize_shop_domain(x_shopify_shop_domain) if x_shopify_shop_domain else None,
+            "shop_domain": got_canon,
             "has_shop_domain_header": bool(x_shopify_shop_domain),
             "has_hmac_header": bool(x_shopify_hmac_sha256),
             "has_webhook_id_header": bool(x_shopify_webhook_id),
@@ -372,12 +404,39 @@ async def handle_shopify_webhook(
         }
         if is_production:
             if not x_shopify_shop_domain:
+                record_shopify_webhook(result="error", reason="missing_shop_domain", topic=topic)
                 logger.warning("Shopify webhook rejected: missing shop domain header %s", debug_meta)
                 raise HTTPException(status_code=401, detail="Missing Shopify shop domain")
+            if not allowed_domains:
+                record_shopify_webhook(result="error", reason="no_shopify_store", topic=topic)
+                logger.error(
+                    "Shopify webhook rejected: no Shopify store configured merchant=%s topic=%s got=%s",
+                    merchant_id,
+                    topic,
+                    got_canon,
+                )
+                raise HTTPException(status_code=400, detail="No Shopify store connected")
+            if got_canon and got_canon not in allowed_domains:
+                record_shopify_webhook(result="error", reason="shop_domain_mismatch", topic=topic)
+                logger.error(
+                    "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",
+                    merchant_id,
+                    sorted(list(allowed_domains.keys())),
+                    got_canon,
+                    topic,
+                )
+                raise HTTPException(status_code=403, detail="Shop domain mismatch")
             if not shopify_secret:
-                logger.error("SHOPIFY_CLIENT_SECRET is not configured; cannot verify Shopify webhooks in production")
+                record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
+                logger.error(
+                    "Shopify webhook verification secret missing merchant=%s topic=%s source=%s",
+                    merchant_id,
+                    topic,
+                    secret_source,
+                )
                 raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
             if not x_shopify_hmac_sha256:
+                record_shopify_webhook(result="error", reason="missing_hmac", topic=topic)
                 logger.warning("Shopify webhook rejected: missing HMAC header %s", debug_meta)
                 raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
 
@@ -387,6 +446,7 @@ async def handle_shopify_webhook(
             header_hmac_base64=x_shopify_hmac_sha256,
         )
         if is_production and not signature_verified:
+            record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
             # This commonly indicates env drift across instances (different SHOPIFY_CLIENT_SECRET).
             meta = dict(debug_meta)
             if x_shopify_hmac_sha256:
@@ -396,46 +456,7 @@ async def handle_shopify_webhook(
 
         # Parse event
         data = json.loads(payload)
-        topic = x_shopify_topic or "unknown"
         shop_domain = x_shopify_shop_domain or merchant.get("mcp_shop_domain") or "unknown"
-
-        # Anti-cross-tenant poisoning: validate shop_domain matches a connected Shopify store domain.
-        #
-        # NOTE: Do NOT rely on "primary store" being Shopify. Many merchants can have multiple
-        # stores/platforms; primary is merely the newest connected store in our DB.
-        try:
-            stores = await get_merchant_active_stores(merchant_id)
-            allowed_domains = set()
-            for store in stores or []:
-                if (store.get("platform") or "").lower() != "shopify":
-                    continue
-                dom = _canonicalize_shop_domain(store.get("domain"))
-                if dom:
-                    allowed_domains.add(dom)
-
-            if is_production:
-                got_canon = _canonicalize_shop_domain(x_shopify_shop_domain)
-                if not allowed_domains:
-                    logger.error(
-                        "Shopify webhook rejected: no Shopify store configured merchant=%s topic=%s got=%s",
-                        merchant_id,
-                        topic,
-                        got_canon,
-                    )
-                    raise HTTPException(status_code=400, detail="No Shopify store connected")
-                if got_canon and got_canon not in allowed_domains:
-                    logger.error(
-                        "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",
-                        merchant_id,
-                        sorted(list(allowed_domains)),
-                        got_canon,
-                        topic,
-                    )
-                    raise HTTPException(status_code=403, detail="Shop domain mismatch")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"Shop domain validation skipped merchant={merchant_id}: {e}")
 
         # Occurred_at is best-effort; Shopify may provide X-Shopify-Triggered-At.
         occurred_at: Optional[datetime] = None
@@ -457,13 +478,16 @@ async def handle_shopify_webhook(
                 signature_verified=signature_verified,
             )
             if is_dup:
+                record_shopify_webhook(result="success", reason="duplicate", topic=topic)
                 return {"status": "success", "topic": topic, "duplicate": True}
         except Exception as e:
             # In production, fail so Shopify will retry and we don't lose the audit trail.
             logger.warning(f"PCS webhook event persistence failed merchant={merchant_id} topic={topic}: {e}")
             if is_production:
+                record_shopify_webhook(result="error", reason="persist_failed", topic=topic)
                 raise HTTPException(status_code=500, detail="Webhook event persistence unavailable")
 
+        record_shopify_webhook(result="success", reason="ok", topic=topic)
         logger.info(f"Received Shopify webhook for {merchant_id}: {topic}")
         if topic in ("orders/fulfilled", "fulfillments/create", "fulfillments/update"):
             # 履约更新（订单级 or fulfillment 级）

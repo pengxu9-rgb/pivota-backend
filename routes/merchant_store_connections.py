@@ -23,6 +23,10 @@ class ConnectShopifyRequest(BaseModel):
     merchant_id: str
     shop_domain: str
     access_token: str
+    # Optional: Shopify webhook HMAC secret (API secret key for the app that owns the webhooks).
+    # If omitted, we fall back to the global SHOPIFY_CLIENT_SECRET (official app). For custom apps,
+    # this should be provided so we can verify webhooks.
+    webhook_secret: Optional[str] = None
     # Optional: Storefront token for quote/checkout pricing (Storefront Cart API).
     # If omitted, backend will try to auto-create one using the Admin token.
     storefront_access_token: Optional[str] = None
@@ -269,6 +273,9 @@ async def merchant_connect_shopify(
                 storefront_token_verified = None
 
         token_blob: Dict[str, Any] = {"access_token": request.access_token}
+        webhook_secret = (request.webhook_secret or "").strip()
+        if webhook_secret:
+            token_blob["webhook_secret"] = webhook_secret
         if storefront_token:
             token_blob["storefront_access_token"] = storefront_token
         token_json = json.dumps(token_blob, ensure_ascii=False)

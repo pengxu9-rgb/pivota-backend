@@ -49,6 +49,19 @@ def _parse_store_access_token(api_key_raw: str) -> str:
     return raw
 
 
+def _parse_token_blob(api_key_raw: str) -> Dict[str, Any]:
+    raw = (api_key_raw or "").strip()
+    if not raw:
+        return {}
+    if raw.startswith("{"):
+        try:
+            d = json.loads(raw)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+    return {"access_token": raw}
+
+
 def _fetch_shopify_order(
     *, shop_domain: str, access_token: str, api_version: str, shopify_order_id: str
 ) -> Dict[str, Any]:
@@ -165,11 +178,15 @@ def main() -> int:
         )
     store = cur.fetchone() or {}
     shop_domain = (store.get("shop_domain") or "").strip()
-    access_token = _parse_store_access_token(store.get("api_key") or "")
+    token_blob = _parse_token_blob(str(store.get("api_key") or ""))
+    access_token = _parse_store_access_token(str(store.get("api_key") or ""))
+    webhook_secret = str(token_blob.get("webhook_secret") or "").strip()
     out["shopify_store"] = {
         "shop_domain": shop_domain or None,
         "access_token_len": len(access_token),
         "access_token_fp": _fp(access_token),
+        "webhook_secret_present": bool(webhook_secret),
+        "webhook_secret_fp": _fp(webhook_secret),
     }
 
     # Shopify order status (read-only)
