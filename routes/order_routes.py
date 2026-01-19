@@ -1788,13 +1788,19 @@ async def debug_order_data(
         
         credentials_info = {}
         if store_info:
+            api_key_raw = store_info.get("api_key") or ""
+            api_key_fp = None
+            try:
+                if api_key_raw:
+                    api_key_fp = hashlib.sha256(str(api_key_raw).encode("utf-8")).hexdigest()[:12]
+            except Exception:
+                api_key_fp = None
             credentials_info = {
                 "platform": store_info.get("platform"),
                 "domain": store_info.get("domain"),
                 "has_api_key": bool(store_info.get("api_key")),
-                "api_key_length": len(store_info.get("api_key", "")),
-                "api_key_prefix": store_info.get("api_key", "")[:15] if store_info.get("api_key") else None,
-                "api_key_suffix": store_info.get("api_key", "")[-10:] if store_info.get("api_key") else None,
+                "api_key_length": len(api_key_raw) if api_key_raw else 0,
+                "api_key_fp": api_key_fp,
                 "status": store_info.get("status"),
                 "store_id": store_info.get("store_id")
             }
@@ -1808,7 +1814,6 @@ async def debug_order_data(
                 "items": str(type(order.get("items"))),
                 "items_count": len(order.get("items", [])),
                 "shipping_address": str(type(order.get("shipping_address"))),
-                "customer_email": order.get("customer_email"),
             }
         }
     except Exception as e:
