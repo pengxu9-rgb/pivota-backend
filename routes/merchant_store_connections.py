@@ -587,6 +587,7 @@ async def shopify_oauth_callback(request: Request):
     )
     if not state_row:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_not_found)")
+    state_row = dict(state_row)
     if state_row.get("used_at"):
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_already_used)")
     expires_at = state_row.get("expires_at")
