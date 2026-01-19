@@ -79,6 +79,21 @@ def _fp(value: str) -> Optional[str]:
         return None
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
+def _detect_merchant_stores_domain_column(cur) -> str:
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='merchant_stores'
+        """,
+    )
+    cols = {str(r["column_name"]) for r in (cur.fetchall() or [])}
+    if "shop_domain" in cols:
+        return "shop_domain"
+    if "domain" in cols:
+        return "domain"
+    raise SystemExit("ERROR: merchant_stores has neither shop_domain nor domain column")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check whether Shopify fulfillment is syncing into Pivota.")
@@ -102,6 +117,7 @@ def main() -> int:
 
     conn = psycopg2.connect(database_url)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    domain_col = _detect_merchant_stores_domain_column(cur)
 
     cur.execute(
         """
@@ -128,8 +144,8 @@ def main() -> int:
     store_id = str(order.get("store_id") or "").strip() or None
     if store_id:
         cur.execute(
-            """
-            SELECT shop_domain, api_key
+            f"""
+            SELECT {domain_col} AS shop_domain, api_key
             FROM merchant_stores
             WHERE store_id=%s
             LIMIT 1
@@ -138,8 +154,8 @@ def main() -> int:
         )
     else:
         cur.execute(
-            """
-            SELECT shop_domain, api_key
+            f"""
+            SELECT {domain_col} AS shop_domain, api_key
             FROM merchant_stores
             WHERE merchant_id=%s AND platform='shopify' AND status IN ('active','connected')
             ORDER BY connected_at DESC NULLS LAST, created_at DESC

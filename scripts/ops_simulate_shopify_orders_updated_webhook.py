@@ -94,10 +94,23 @@ def _load_order(conn, order_id: str) -> OrderRow:
 
 
 def _load_shopify_store(conn, store_id: str) -> ShopifyStore:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='merchant_stores'
+            """,
+        )
+        cols = {str(r[0]) for r in (cur.fetchall() or [])}
+    domain_col = "shop_domain" if "shop_domain" in cols else ("domain" if "domain" in cols else None)
+    if not domain_col:
+        _die("ERROR: merchant_stores has neither shop_domain nor domain column")
+
     row = _pg_fetch_one(
         conn,
-        """
-        SELECT shop_domain, api_key
+        f"""
+        SELECT {domain_col} AS shop_domain, api_key
         FROM merchant_stores
         WHERE store_id = %s
         LIMIT 1
@@ -123,6 +136,50 @@ def _load_shopify_store(conn, store_id: str) -> ShopifyStore:
         _die(f"ERROR: store has no access_token configured: {store_id}")
 
     return ShopifyStore(shop_domain=shop_domain, access_token=access_token)
+
+def _pick_shopify_store_for_merchant(conn, merchant_id: str) -> ShopifyStore:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='merchant_stores'
+            """,
+        )
+        cols = {str(r[0]) for r in (cur.fetchall() or [])}
+    domain_col = "shop_domain" if "shop_domain" in cols else ("domain" if "domain" in cols else None)
+    if not domain_col:
+        _die("ERROR: merchant_stores has neither shop_domain nor domain column")
+
+    row = _pg_fetch_one(
+        conn,
+        f"""
+        SELECT store_id, {domain_col} AS shop_domain, api_key
+        FROM merchant_stores
+        WHERE merchant_id=%s AND platform='shopify' AND status IN ('active','connected')
+        ORDER BY connected_at DESC NULLS LAST, created_at DESC
+        LIMIT 1
+        """,
+        (merchant_id,),
+    )
+    if not row:
+        _die(f"ERROR: no active Shopify store for merchant_id={merchant_id}")
+    store_id = str(row.get("store_id") or "").strip() or "<unknown>"
+    store = _load_shopify_store(conn, store_id) if store_id != "<unknown>" else ShopifyStore(shop_domain=str(row.get("shop_domain") or ""), access_token="")
+    if not store.access_token:
+        api_key = row.get("api_key")
+        if isinstance(api_key, str):
+            try:
+                api_key = json.loads(api_key)
+            except Exception:
+                api_key = {}
+        if not isinstance(api_key, dict):
+            api_key = {}
+        access_token = str(api_key.get("access_token") or "").strip()
+        if not access_token:
+            _die(f"ERROR: store has no access_token configured (picked store_id={store_id})")
+        store = ShopifyStore(shop_domain=str(row.get("shop_domain") or ""), access_token=access_token)
+    return store
 
 
 def _shopify_get_order(store: ShopifyStore, shopify_order_id: str, api_version: str) -> dict[str, Any]:
@@ -208,12 +265,10 @@ def main() -> int:
         before = _load_order(conn, args.order_id)
         if not before.merchant_id:
             _die("ERROR: order has empty merchant_id (unexpected)")
-        if not before.store_id:
-            _die("ERROR: order has empty store_id (bind order to a store first)")
         if not before.shopify_order_id:
             _die("ERROR: order has empty shopify_order_id (Shopify order id required)")
 
-        store = _load_shopify_store(conn, before.store_id)
+        store = _load_shopify_store(conn, before.store_id) if before.store_id else _pick_shopify_store_for_merchant(conn, before.merchant_id)
 
         print(f"order_id={before.order_id} merchant_id={before.merchant_id} store_id={before.store_id}")
         print(f"pivota_before: status={before.status} payment={before.payment_status} fulfillment={before.fulfillment_status} tracking={bool(before.tracking_number)}")
@@ -257,4 +312,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
