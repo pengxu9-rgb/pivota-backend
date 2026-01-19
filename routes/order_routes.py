@@ -3,7 +3,7 @@
 Pivota 核心业务流程：Agent 下单 → 支付 → 履约
 """
 
-from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store, get_store_by_id
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal, ROUND_HALF_UP
@@ -1477,8 +1477,14 @@ async def create_shopify_order(order_id: str) -> bool:
             logger.error(f"[Shopify] Merchant {order['merchant_id']} not found")
             return False
         
-        # 获取主店铺（需要包含 domain 与 api_key）
-        store_info = await get_primary_store(order["merchant_id"])
+        # Prefer the store bound to the order at checkout time. Using the "primary store" can break
+        # when a merchant connects multiple stores (tokens/domains are shop-scoped).
+        store_info = None
+        order_store_id = str(order.get("store_id") or "").strip()
+        if order_store_id:
+            store_info = await get_store_by_id(order_store_id, merchant_id=order["merchant_id"])
+        if not store_info:
+            store_info = await get_primary_store(order["merchant_id"])
         if not store_info:
             logger.error(f"[Shopify] Primary store not found for merchant {order['merchant_id']}")
             return False

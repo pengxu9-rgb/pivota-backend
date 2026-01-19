@@ -235,6 +235,73 @@ async def get_primary_store(merchant_id: str) -> Optional[Dict[str, Any]]:
     return stores[0] if stores else None
 
 
+async def get_store_by_id(store_id: str, *, merchant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a specific store connection by store_id and normalize credentials.
+
+    NOTE: Orders are bound to a store_id at checkout time. Downstream jobs (Shopify sync,
+    invites, etc.) should prefer that store_id over "primary store" to avoid cross-store
+    token/domain mismatches when a merchant connects multiple stores.
+    """
+    if not store_id or str(store_id).strip() == "":
+        return None
+
+    params: Dict[str, Any] = {"store_id": store_id}
+    merchant_clause = ""
+    if merchant_id:
+        merchant_clause = "AND merchant_id = :merchant_id"
+        params["merchant_id"] = merchant_id
+
+    # Backward compatibility: support_email column may not exist in some DBs yet.
+    query = f"""
+        SELECT
+            store_id,
+            merchant_id,
+            platform,
+            name,
+            domain,
+            api_key,
+            support_email,
+            status,
+            connected_at,
+            'merchant_stores' as source
+        FROM merchant_stores
+        WHERE store_id = :store_id
+        {merchant_clause}
+        LIMIT 1
+    """
+    try:
+        row = await database.fetch_one(query, params)
+    except Exception:
+        query = f"""
+            SELECT
+                store_id,
+                merchant_id,
+                platform,
+                name,
+                domain,
+                api_key,
+                status,
+                connected_at,
+                'merchant_stores' as source
+            FROM merchant_stores
+            WHERE store_id = :store_id
+            {merchant_clause}
+            LIMIT 1
+        """
+        row = await database.fetch_one(query, params)
+
+    if not row:
+        return None
+
+    store_dict = dict(row)
+    original_key = store_dict.get("api_key", "")
+    store_dict["api_key_raw"] = original_key
+    store_dict["api_credentials"] = parse_api_credentials(original_key)
+    store_dict["api_key"] = parse_api_key(original_key)
+    return store_dict
+
+
 async def has_any_store_connected(merchant_id: str) -> bool:
     """
     Check if merchant has any store connected (new or legacy system)
