@@ -602,6 +602,56 @@ async def handle_shopify_webhook(
             )
             logger.info(f"Shopify order {shopify_order_id} updated")
 
+            # Compatibility: some shops/apps only reliably emit orders/updated when fulfillment changes.
+            # If Shopify indicates fulfilled here, converge Pivota order state to shipped.
+            try:
+                raw_fulfillment_status = str(fulfillment_status or "").strip().lower()
+                if raw_fulfillment_status == "fulfilled" and pivota:
+                    current = await database.fetch_one(
+                        "SELECT order_id, fulfillment_status, tracking_number FROM orders WHERE shopify_order_id = :shopify_order_id",
+                        {"shopify_order_id": shopify_order_id},
+                    )
+                    if current:
+                        current_status = str(current.get("fulfillment_status") or "").strip().lower()
+                        if current_status not in {"shipped", "delivered"}:
+                            tracking_numbers: list[str] = []
+                            carrier: Optional[str] = None
+                            for fulfillment in (data.get("fulfillments") or []) or []:
+                                if isinstance(fulfillment, dict):
+                                    if not carrier:
+                                        carrier = fulfillment.get("tracking_company") or fulfillment.get("tracking_company_name")
+                                    if isinstance(fulfillment.get("tracking_numbers"), list):
+                                        tracking_numbers.extend(
+                                            [str(x) for x in (fulfillment.get("tracking_numbers") or []) if x]
+                                        )
+                                    if fulfillment.get("tracking_number"):
+                                        tracking_numbers.append(str(fulfillment.get("tracking_number")))
+                                    if fulfillment.get("tracking_info") and isinstance(fulfillment.get("tracking_info"), dict):
+                                        ti = fulfillment.get("tracking_info") or {}
+                                        if not carrier:
+                                            carrier = ti.get("company") or ti.get("tracking_company") or ti.get("carrier")
+                                        if ti.get("number"):
+                                            tracking_numbers.append(str(ti.get("number")))
+                            tracking_number = ", ".join(dict.fromkeys(tracking_numbers)) if tracking_numbers else None
+                            await mark_order_shipped(
+                                str(current.get("order_id")),
+                                tracking_number,
+                                carrier=carrier,
+                            )
+                            await log_order_event(
+                                event_type="fulfillment_via_order_updated_webhook",
+                                order_id=str(current.get("order_id")),
+                                merchant_id=merchant_id,
+                                metadata={
+                                    "shopify_order_id": shopify_order_id,
+                                    "tracking_numbers": tracking_numbers,
+                                    "carrier": carrier,
+                                },
+                            )
+                            logger.info(f"Order {current.get('order_id')} marked as shipped via orders/updated webhook")
+            except Exception as e:
+                logger.warning(f"orders/updated fulfillment convergence skipped for shopify_order_id={shopify_order_id}: {e}")
+
         elif topic in ("refunds/create", "orders/refunded"):
             platform_order_id = str(data.get("order_id") or data.get("id") or "")
             from db.database import database

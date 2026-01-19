@@ -129,7 +129,7 @@ if [[ "${REQUIRE_DENY_CASE:-}" == "true" ]]; then
 else
   echo "deny_case_skip=1 (set REQUIRE_DENY_CASE=true to enforce)"
   # Still run the check for visibility, but do not assert a specific outcome.
-  BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$DENY_MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" \
+  BASE_URL="$REVIEWS_BASE_URL" MERCHANT_ID="$DENY_MERCHANT_ID" PLATFORM="$PLATFORM" PLATFORM_PRODUCT_ID="$PLATFORM_PRODUCT_ID" VARIANT_ID="$VARIANT_ID" EXPECT_WRITE_ALLOWED="" \
     /bin/bash "$(dirname "${BASH_SOURCE[0]}")/verify_reviews_buyer_canary.sh" || true
 fi
 echo
