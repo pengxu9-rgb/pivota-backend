@@ -835,6 +835,7 @@ async def logout():
 
 @router.get("/orders/list", response_model=OrdersListResponse)
 async def list_orders(
+    response: Response,
     principal: AccountsPrincipal = Depends(get_accounts_principal),
     cursor: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
@@ -853,6 +854,11 @@ async def list_orders(
     - Merchant staff: requires memberships (not yet populated in production).
     """
     try:
+        # This endpoint is user-specific; never cache at the edge/browser.
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+
         offset = int(cursor or 0)
 
         where_clauses = []
@@ -1005,8 +1011,15 @@ async def list_orders(
 
 @router.get("/orders/{order_id}")
 async def get_order_detail(
-    order_id: str, principal: AccountsPrincipal = Depends(get_accounts_principal)
+    order_id: str,
+    response: Response,
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
 ):
+    # This endpoint is user-specific; never cache at the edge/browser.
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
     order = await database.fetch_one(
         orders_table.select().where(orders_table.c.order_id == order_id)
     )
