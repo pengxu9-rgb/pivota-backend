@@ -708,6 +708,73 @@ class VerifyShopifyIntegrationRequest(BaseModel):
     api_version: Optional[str] = None
 
 
+@router.get("/shopify/token/diagnostic")
+async def shopify_token_diagnostic(
+    merchant_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Diagnostic: verify Shopify token validity and required scopes without leaking secrets.
+    """
+    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
+    if not target_merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+        raise HTTPException(status_code=403, detail="Can only access your own merchant")
+
+    store = await get_primary_store(target_merchant_id)
+    if not store or (store.get("platform") or "").lower() != "shopify":
+        raise HTTPException(status_code=400, detail="No Shopify store connected")
+
+    shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip().lower()
+    access_token = (store.get("api_key") or "").strip()
+    if not access_token:
+        creds = store.get("api_credentials") or {}
+        access_token = str(creds.get("access_token") or "").strip()
+    if not shop_domain or not access_token:
+        raise HTTPException(status_code=400, detail="Missing Shopify credentials")
+
+    scopes_status: Optional[int] = None
+    shop_status: Optional[int] = None
+    scopes: list[str] = []
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        scopes_resp = await client.get(
+            f"https://{shop_domain}/admin/oauth/access_scopes.json",
+            headers={"X-Shopify-Access-Token": access_token},
+        )
+        scopes_status = scopes_resp.status_code
+        if scopes_status == 200:
+            data = scopes_resp.json() or {}
+            scopes = [str(s.get("handle")) for s in (data.get("access_scopes") or []) if s.get("handle")]
+
+        shop_resp = await client.get(
+            f"https://{shop_domain}/admin/api/2024-07/shop.json",
+            headers={"X-Shopify-Access-Token": access_token},
+        )
+        shop_status = shop_resp.status_code
+
+    scope_set = set(scopes)
+    return {
+        "status": "success",
+        "merchant_id": target_merchant_id,
+        "shop_domain": shop_domain,
+        "auth_ok": shop_status == 200,
+        "shop_status_code": shop_status,
+        "scopes_status_code": scopes_status,
+        "scope_summary": {
+            "read_products": "read_products" in scope_set,
+            "read_orders": "read_orders" in scope_set,
+            "read_fulfillments": "read_fulfillments" in scope_set,
+            "read_customers": "read_customers" in scope_set,
+        },
+        "scope_count": len(scope_set),
+    }
+
+
 class ShopifyWebhookEventOut(BaseModel):
     id: int
     merchant_id: str
