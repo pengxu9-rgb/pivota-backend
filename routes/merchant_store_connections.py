@@ -121,7 +121,7 @@ def _validate_myshopify_domain(value: str) -> str:
     if not shop:
         raise HTTPException(status_code=400, detail="shop is required")
     # Basic guard: allow only the canonical myshopify domain during OAuth.
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\\.myshopify\\.com", shop):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", shop):
         raise HTTPException(status_code=400, detail="shop must be a *.myshopify.com domain")
     return shop
 
