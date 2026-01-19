@@ -872,7 +872,7 @@ async def merchant_connect_shopify(
             raise HTTPException(status_code=400, detail="Invalid Shopify response")
         
         shop_info = shop_data["shop"]
-        canonical_myshopify_domain = shop_info.get("myshopify_domain") or request.shop_domain
+        canonical_myshopify_domain = (shop_info.get("myshopify_domain") or request.shop_domain or "").strip().lower()
         logger.info(f"✅ Shopify credentials verified for {canonical_myshopify_domain}")
 
         # Storefront token strategy:
@@ -897,6 +897,9 @@ async def merchant_connect_shopify(
         )
 
         existing_creds: Dict[str, Any] = {}
+        if existing:
+            # databases.fetch_one returns a Record; normalize to dict for .get access
+            existing = dict(existing)
         if existing and (existing.get("api_key") or ""):
             try:
                 parsed = json.loads(existing.get("api_key") or "")
