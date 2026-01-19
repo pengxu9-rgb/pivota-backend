@@ -648,7 +648,7 @@ async def handle_shopify_webhook(
                     )
                     if current:
                         phase = "check_current_status"
-                        current_status = str(current.get("fulfillment_status") or "").strip().lower()
+                        current_status = str(current["fulfillment_status"] if "fulfillment_status" in current else "").strip().lower()
                         if current_status not in {"shipped", "delivered"}:
                             phase = "extract_tracking"
                             tracking_numbers: list[str] = []
@@ -672,7 +672,7 @@ async def handle_shopify_webhook(
                             phase = "mark_order_shipped"
                             tracking_number = ", ".join(dict.fromkeys(tracking_numbers)) if tracking_numbers else None
                             shipped_ok = await mark_order_shipped(
-                                str(current.get("order_id")),
+                                str(current["order_id"]),
                                 tracking_number,
                                 carrier=carrier,
                             )
@@ -680,7 +680,7 @@ async def handle_shopify_webhook(
                                 phase = "mark_order_shipped_returned_false"
                                 await log_order_event(
                                     event_type="shopify_fulfillment_convergence_failed",
-                                    order_id=str(current.get("order_id")),
+                                    order_id=str(current["order_id"]),
                                     merchant_id=merchant_id,
                                     metadata={
                                         "shopify_order_id": shopify_order_id,
@@ -692,13 +692,13 @@ async def handle_shopify_webhook(
                                 logger.warning(
                                     "orders/updated fulfillment convergence failed: mark_order_shipped returned false shopify_order_id=%s order_id=%s",
                                     shopify_order_id,
-                                    str(current.get("order_id")),
+                                    str(current["order_id"]),
                                 )
                                 return {"status": "success", "topic": topic}
                             phase = "log_success_event"
                             await log_order_event(
                                 event_type="fulfillment_via_order_updated_webhook",
-                                order_id=str(current.get("order_id")),
+                                order_id=str(current["order_id"]),
                                 merchant_id=merchant_id,
                                 metadata={
                                     "shopify_order_id": shopify_order_id,
@@ -706,7 +706,7 @@ async def handle_shopify_webhook(
                                     "carrier": carrier,
                                 },
                             )
-                            logger.info(f"Order {current.get('order_id')} marked as shipped via orders/updated webhook")
+                            logger.info(f"Order {current['order_id']} marked as shipped via orders/updated webhook")
             except Exception as e:
                 # Persist a minimal error breadcrumb into the immutable order events table so ops can debug
                 # without relying on Railway logs. Keep it short and non-PII.
