@@ -1091,13 +1091,25 @@ async def get_order_detail(
             {"order_id": order_id},
         )
         for pr in payment_rows:
+            pr_status = pr["status"]
+            # Best-effort: if the order is already marked paid but the raw payment
+            # record is still "processing", surface it as succeeded in the
+            # customer-facing API to avoid confusing UI states.
+            try:
+                if (
+                    str(pr_status or "").lower() in {"processing", "requires_action"}
+                    and payment_status_mapped == "paid"
+                ):
+                    pr_status = "succeeded"
+            except Exception:
+                pass
             payment_records.append(
                 {
                     "payment_id": pr["payment_id"],
                     "provider": pr["psp_type"],
                     "amount_minor": _amount_to_minor(pr["amount"]),
                     "currency": pr["currency"],
-                    "status": pr["status"],
+                    "status": pr_status,
                     "payment_intent_id": pr["payment_intent_id"],
                 }
             )
