@@ -32,6 +32,7 @@ class OrderRow:
 class ShopifyStore:
     shop_domain: str
     access_token: str
+    webhook_secret: str = ""
 
 
 def _die(msg: str) -> None:
@@ -134,8 +135,9 @@ def _load_shopify_store(conn, store_id: str) -> ShopifyStore:
     access_token = str(api_key.get("access_token") or "").strip()
     if not access_token:
         _die(f"ERROR: store has no access_token configured: {store_id}")
+    webhook_secret = str(api_key.get("webhook_secret") or "").strip()
 
-    return ShopifyStore(shop_domain=shop_domain, access_token=access_token)
+    return ShopifyStore(shop_domain=shop_domain, access_token=access_token, webhook_secret=webhook_secret)
 
 def _pick_shopify_store_for_merchant(conn, merchant_id: str) -> ShopifyStore:
     with conn.cursor() as cur:
@@ -255,8 +257,6 @@ def main() -> int:
     args = ap.parse_args()
 
     client_secret = (args.client_secret or os.getenv("SHOPIFY_CLIENT_SECRET") or "").strip()
-    if not client_secret:
-        _die("ERROR: missing Shopify client secret (set --client-secret or env SHOPIFY_CLIENT_SECRET)")
 
     database_url = _read_database_url(args.database_url_file)
     conn = psycopg2.connect(database_url)
@@ -269,10 +269,19 @@ def main() -> int:
             _die("ERROR: order has empty shopify_order_id (Shopify order id required)")
 
         store = _load_shopify_store(conn, before.store_id) if before.store_id else _pick_shopify_store_for_merchant(conn, before.merchant_id)
+        secret = (store.webhook_secret or client_secret or "").strip()
+        if not secret:
+            _die(
+                "ERROR: no webhook secret available. Set per-store webhook_secret in merchant_stores.api_key JSON "
+                "or pass --client-secret / env SHOPIFY_CLIENT_SECRET."
+            )
 
         print(f"order_id={before.order_id} merchant_id={before.merchant_id} store_id={before.store_id}")
         print(f"pivota_before: status={before.status} payment={before.payment_status} fulfillment={before.fulfillment_status} tracking={bool(before.tracking_number)}")
-        print(f"shop_domain={store.shop_domain} access_token_len={len(store.access_token)} access_token_fp={_fp(store.access_token)}")
+        print(
+            f"shop_domain={store.shop_domain} access_token_len={len(store.access_token)} "
+            f"access_token_fp={_fp(store.access_token)} webhook_secret_present={bool(store.webhook_secret)}"
+        )
 
         shopify_order = _shopify_get_order(store, before.shopify_order_id, args.api_version)
         print(
@@ -290,7 +299,7 @@ def main() -> int:
             merchant_id=before.merchant_id,
             shop_domain=store.shop_domain,
             topic="orders/updated",
-            secret=client_secret,
+            secret=secret,
             payload_obj=shopify_order,
         )
         print(f"webhook_http={http_status}")

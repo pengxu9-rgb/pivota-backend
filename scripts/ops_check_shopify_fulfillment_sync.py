@@ -245,9 +245,14 @@ def main() -> int:
     shopify_f = str(s_order.get("fulfillment_status") or "").strip().lower()
     if shopify_f in {"fulfilled", "partial"} and pivota_f not in {"shipped", "fulfilled"}:
         diagnosis.append("Shopify shows fulfilled but Pivota is not shipped -> webhook not ingested or processed.")
-        diagnosis.append(
-            "Next: confirm SHOPIFY_CLIENT_SECRET matches the Shopify app secret for the app that registered webhooks."
-        )
+        if out.get("shopify_store", {}).get("webhook_secret_present"):
+            diagnosis.append(
+                "Webhook secret is configured for this store. Next: ensure backend is deployed with per-store webhook_secret support and check /metrics reviews_shopify_webhook_total{reason=...}."
+            )
+        else:
+            diagnosis.append(
+                "Next: configure webhook signing secret for this store (merchant_stores.api_key JSON webhook_secret) or use a single official Shopify app so global SHOPIFY_CLIENT_SECRET can verify."
+            )
         diagnosis.append(
             "Also: update fulfillment tracking in Shopify to trigger a fresh fulfillments/update webhook (Shopify won't replay old events)."
         )
