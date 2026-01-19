@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     shopify_client_id: Optional[str] = os.getenv("SHOPIFY_CLIENT_ID")
     shopify_client_secret: Optional[str] = os.getenv("SHOPIFY_CLIENT_SECRET")
     shopify_redirect_uri: Optional[str] = os.getenv("SHOPIFY_REDIRECT_URI")
+    # Signing key for no-login install links (one-time signed tokens).
+    # If empty, we fall back to JWT_SECRET_KEY (not ideal, but keeps deployments working).
+    shopify_install_link_signing_key: Optional[str] = os.getenv("SHOPIFY_INSTALL_LINK_SIGNING_KEY")
     # Needed for: product sync + creating manual sale/refund records on orders.
     # Note: webhook subscription requires `write_webhooks`.
     shopify_scopes: str = os.getenv(

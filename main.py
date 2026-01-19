@@ -948,6 +948,22 @@ async def startup():
             await database.execute(
                 "CREATE INDEX IF NOT EXISTS idx_shopify_oauth_states_lookup ON shopify_oauth_states(merchant_id, shop_domain, expires_at)"
             )
+
+            # One-time install-link tokens (no-login distribution). Tokens are signed and we persist only sha256(jti).
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS shopify_install_tokens (
+                    jti_sha256 VARCHAR(64) PRIMARY KEY,
+                    merchant_id VARCHAR(50) NOT NULL,
+                    shop_domain VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    used_at TIMESTAMP WITH TIME ZONE,
+                    used_request_id TEXT
+                )
+            """)
+            await database.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shopify_install_tokens_lookup ON shopify_install_tokens(merchant_id, shop_domain, expires_at)"
+            )
             
             await database.execute("""
                 CREATE TABLE IF NOT EXISTS merchant_psps (
