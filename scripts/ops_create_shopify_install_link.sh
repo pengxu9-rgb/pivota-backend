@@ -51,17 +51,21 @@ resp="$(curl -sS -X POST \
   --data "$payload" \
   "${BASE_URL%/}/integrations/shopify/install-links")"
 
-printf '%s' "$resp" | python3 - <<'PY'
-import json, sys
-raw=sys.stdin.read()
+RESP="$resp" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("RESP", "")
 try:
-    data=json.loads(raw)
+    data = json.loads(raw)
 except Exception:
     print(raw)
     raise SystemExit(1)
+
 if data.get("status") != "success":
     print(json.dumps(data, ensure_ascii=False))
     raise SystemExit(1)
+
 print(data.get("install_url") or "")
 PY
-

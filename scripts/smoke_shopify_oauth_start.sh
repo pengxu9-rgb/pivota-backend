@@ -15,11 +15,12 @@ resp="$(curl -sS \
   -H "Authorization: Bearer ${MERCHANT_TOKEN}" \
   "${BASE_URL%/}/integrations/shopify/oauth/start?shop=${SHOP_DOMAIN}")"
 
-printf '%s' "$resp" | python3 - <<'PY'
+RESP="$resp" python3 - <<'PY'
 import json
+import os
 import sys
 
-raw = sys.stdin.read()
+raw = os.environ.get("RESP", "")
 try:
     data = json.loads(raw)
 except Exception:
