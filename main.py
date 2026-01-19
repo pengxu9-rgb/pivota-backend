@@ -932,6 +932,22 @@ async def startup():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Shopify OAuth anti-replay state store.
+            # We store only the SHA256 hash of the `state` sent to Shopify.
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS shopify_oauth_states (
+                    state_sha256 VARCHAR(64) PRIMARY KEY,
+                    merchant_id VARCHAR(50) NOT NULL,
+                    shop_domain VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    used_at TIMESTAMP WITH TIME ZONE
+                )
+            """)
+            await database.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shopify_oauth_states_lookup ON shopify_oauth_states(merchant_id, shop_domain, expires_at)"
+            )
             
             await database.execute("""
                 CREATE TABLE IF NOT EXISTS merchant_psps (

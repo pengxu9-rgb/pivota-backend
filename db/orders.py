@@ -431,8 +431,8 @@ async def update_fulfillment_info(
     fulfillment_status: Optional[str] = None
 ) -> bool:
     """更新履约信息"""
-    update_data = {"updated_at": datetime.now()}
-    
+    update_data: Dict[str, Any] = {"updated_at": datetime.now()}
+
     if shopify_order_id:
         update_data["shopify_order_id"] = shopify_order_id
     if tracking_number:
@@ -441,12 +441,10 @@ async def update_fulfillment_info(
         update_data["carrier"] = carrier
     if fulfillment_status:
         update_data["fulfillment_status"] = fulfillment_status
-    
-    query = orders.update().where(
-        orders.c.order_id == order_id
-    ).values(**update_data)
-    
-    result = await database.execute(query)
+
+    result = await database.execute(
+        orders.update().where(orders.c.order_id == order_id).values(**update_data)
+    )
     ok = result is not None and result > 0
 
     # Best-effort: enqueue invitation when fulfillment becomes shipped/delivered.

@@ -3,20 +3,40 @@ Merchant Store Connections
 Allow merchants to connect their own stores (Shopify, Wix, etc.)
 """
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
 from typing import Dict, Any, Optional
 import logging
 import httpx
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import os
+import re
+import secrets
+from urllib.parse import urlparse, urlencode
 
 from db.database import database
 from utils.auth import get_current_user
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/integrations", tags=["Merchant Integrations"])
+
+_SHOPIFY_OAUTH_STATE_TTL_SECONDS = 10 * 60
+_SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS_DEFAULT = {"merch_efbc46b4619cfbdf"}
+_SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
+    "orders/create",
+    "orders/updated",
+    "orders/paid",
+    "orders/cancelled",
+    "fulfillments/create",
+    "fulfillments/update",
+    "orders/fulfilled",
+]
 
 
 class ConnectShopifyRequest(BaseModel):
@@ -52,6 +72,357 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
         return token.strip() if isinstance(token, str) and token.strip() else None
     except Exception:
         return None
+
+
+def _allowed_oauth_merchants() -> set[str]:
+    raw = (os.getenv("SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS") or "").strip()
+    if not raw:
+        return set(_SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS_DEFAULT)
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or "").strip().lower()
+        return host or None
+    except Exception:
+        return raw.lower()
+
+
+def _validate_myshopify_domain(value: str) -> str:
+    shop = (_canonicalize_shop_domain(value) or "").strip().lower()
+    if not shop:
+        raise HTTPException(status_code=400, detail="shop is required")
+    # Basic guard: allow only the canonical myshopify domain during OAuth.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\\.myshopify\\.com", shop):
+        raise HTTPException(status_code=400, detail="shop must be a *.myshopify.com domain")
+    return shop
+
+
+def _shopify_oauth_authorize_url(*, shop_domain: str, state: str) -> str:
+    client_id = (settings.shopify_client_id or "").strip()
+    redirect_uri = (settings.shopify_redirect_uri or "").strip()
+    scopes = (settings.shopify_scopes or "").strip()
+    if not client_id or not redirect_uri or not scopes:
+        raise HTTPException(status_code=500, detail="Shopify OAuth is not configured")
+    params = {
+        "client_id": client_id,
+        "scope": scopes,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    return f"https://{shop_domain}/admin/oauth/authorize?{urlencode(params)}"
+
+
+def _shopify_oauth_verify_hmac(*, request: Request, secret: str) -> bool:
+    secret = (secret or "").strip()
+    if not secret:
+        return False
+    qp = request.query_params
+    received = qp.get("hmac") or ""
+    if not received:
+        return False
+    items = [(k, v) for (k, v) in qp.multi_items() if k not in ("hmac", "signature")]
+    items.sort(key=lambda kv: kv[0])
+    message = "&".join([f"{k}={v}" for (k, v) in items])
+    digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, received)
+
+
+def _shopify_webhook_callback_base_url(request: Request) -> str:
+    env = (os.getenv("SHOPIFY_WEBHOOK_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or "").strip()
+    if env:
+        return env.rstrip("/")
+    redirect_uri = (settings.shopify_redirect_uri or "").strip()
+    if redirect_uri:
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return str(request.base_url).rstrip("/")
+
+
+async def _upsert_shopify_store_credentials(
+    *,
+    merchant_id: str,
+    myshopify_domain: str,
+    shop_name: str,
+    access_token: str,
+    storefront_token: Optional[str],
+    webhook_secret: Optional[str] = None,
+) -> str:
+    existing = await database.fetch_one(
+        """
+        SELECT store_id, api_key
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND platform = 'shopify'
+          AND domain = :domain
+        """,
+        {"merchant_id": merchant_id, "domain": myshopify_domain},
+    )
+
+    existing_creds: Dict[str, Any] = {}
+    if existing and (existing.get("api_key") or ""):
+        try:
+            parsed = json.loads(existing.get("api_key") or "")
+            if isinstance(parsed, dict):
+                existing_creds = parsed
+        except Exception:
+            existing_creds = {}
+
+    token_blob: Dict[str, Any] = {"access_token": access_token}
+    if webhook_secret:
+        token_blob["webhook_secret"] = webhook_secret
+    if storefront_token:
+        token_blob["storefront_access_token"] = storefront_token
+    # Preserve prior storefront token if we didn't re-create one.
+    if not token_blob.get("storefront_access_token"):
+        stored = (
+            existing_creds.get("storefront_access_token")
+            if isinstance(existing_creds.get("storefront_access_token"), str)
+            else None
+        ) or (existing_creds.get("storefront_token") if isinstance(existing_creds.get("storefront_token"), str) else None)
+        if stored and str(stored).strip():
+            token_blob["storefront_access_token"] = str(stored).strip()
+
+    token_blob["installed_at"] = datetime.now(timezone.utc).isoformat()
+    token_json = json.dumps(token_blob, ensure_ascii=False)
+
+    if existing:
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET name = :name,
+                domain = :domain,
+                api_key = :api_key,
+                status = 'active',
+                connected_at = CURRENT_TIMESTAMP,
+                last_sync = CURRENT_TIMESTAMP
+            WHERE store_id = :store_id
+            """,
+            {
+                "store_id": existing["store_id"],
+                "name": shop_name,
+                "domain": myshopify_domain,
+                "api_key": token_json,
+            },
+        )
+        return str(existing["store_id"])
+
+    store_id = f"store_{merchant_id[:8]}_{int(datetime.now().timestamp())}"
+    await database.execute(
+        """
+        INSERT INTO merchant_stores
+          (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+        VALUES
+          (:store_id, :merchant_id, 'shopify', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
+        """,
+        {
+            "store_id": store_id,
+            "merchant_id": merchant_id,
+            "domain": myshopify_domain,
+            "name": shop_name,
+            "api_key": token_json,
+        },
+    )
+    return store_id
+
+
+@router.get("/shopify/oauth/start")
+async def shopify_oauth_start(
+    shop: str = Query(..., description="Shop domain, e.g. your-shop.myshopify.com"),
+    merchant_id: Optional[str] = Query(None, description="Merchant id (employee/admin only)"),
+    redirect: bool = Query(False, description="If true, 302 redirect to Shopify"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Start Shopify OAuth install.
+    Requires a Pivota JWT (merchant/employee/admin).
+    """
+    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
+    if not target_merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+    if target_merchant_id not in _allowed_oauth_merchants():
+        raise HTTPException(status_code=403, detail="Merchant not enabled for Shopify OAuth yet")
+
+    shop_domain = _validate_myshopify_domain(shop)
+
+    state = secrets.token_urlsafe(32)
+    state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
+
+    # Best-effort: ensure table exists (for local/dev environments that skipped startup tasks).
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopify_oauth_states (
+                state_sha256 VARCHAR(64) PRIMARY KEY,
+                merchant_id VARCHAR(50) NOT NULL,
+                shop_domain VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                used_at TIMESTAMP WITH TIME ZONE
+            )
+            """
+        )
+    except Exception:
+        pass
+
+    await database.execute(
+        """
+        INSERT INTO shopify_oauth_states (state_sha256, merchant_id, shop_domain, expires_at)
+        VALUES (:state_sha256, :merchant_id, :shop_domain, :expires_at)
+        """,
+        {
+            "state_sha256": state_sha,
+            "merchant_id": target_merchant_id,
+            "shop_domain": shop_domain,
+            "expires_at": expires_at,
+        },
+    )
+
+    url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
+    if redirect:
+        return RedirectResponse(url=url, status_code=302)
+    return {
+        "status": "success",
+        "merchant_id": target_merchant_id,
+        "shop_domain": shop_domain,
+        "authorization_url": url,
+        "state_sha256_prefix": state_sha[:10],
+        "expires_in_seconds": _SHOPIFY_OAUTH_STATE_TTL_SECONDS,
+    }
+
+
+@router.get("/shopify/oauth/callback")
+async def shopify_oauth_callback(request: Request):
+    """
+    Shopify OAuth callback (unauthenticated; validated via HMAC + state anti-replay).
+    """
+    shop_domain = _validate_myshopify_domain(request.query_params.get("shop") or "")
+    code = (request.query_params.get("code") or "").strip()
+    state = (request.query_params.get("state") or "").strip()
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing required OAuth params")
+
+    app_secret = (settings.shopify_client_secret or "").strip()
+    if not _shopify_oauth_verify_hmac(request=request, secret=app_secret):
+        raise HTTPException(status_code=401, detail="Invalid Shopify OAuth signature")
+
+    state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
+
+    consumed = await database.fetch_one(
+        """
+        UPDATE shopify_oauth_states
+        SET used_at = NOW()
+        WHERE state_sha256 = :state_sha256
+          AND used_at IS NULL
+          AND expires_at > NOW()
+          AND shop_domain = :shop_domain
+        RETURNING merchant_id, shop_domain
+        """,
+        {"state_sha256": state_sha, "shop_domain": shop_domain},
+    )
+    if not consumed:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+
+    merchant_id = str(consumed["merchant_id"])
+
+    token_url = f"https://{shop_domain}/admin/oauth/access_token"
+    token_payload = {
+        "client_id": (settings.shopify_client_id or "").strip(),
+        "client_secret": app_secret,
+        "code": code,
+    }
+    if not token_payload["client_id"] or not token_payload["client_secret"]:
+        raise HTTPException(status_code=500, detail="Shopify OAuth is not configured")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        token_resp = await client.post(token_url, json=token_payload)
+    if token_resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to exchange Shopify access token")
+    token_data = token_resp.json() or {}
+    access_token = (token_data.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Shopify token response missing access_token")
+
+    # Fetch canonical shop info (myshopify_domain + name).
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        shop_resp = await client.get(
+            f"https://{shop_domain}/admin/api/2024-07/shop.json",
+            headers={"X-Shopify-Access-Token": access_token},
+        )
+    if shop_resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Shopify token verification failed")
+    shop_json = shop_resp.json() or {}
+    shop_info = shop_json.get("shop") if isinstance(shop_json, dict) else None
+    if not isinstance(shop_info, dict):
+        raise HTTPException(status_code=400, detail="Invalid Shopify shop response")
+
+    canonical_myshopify_domain = (shop_info.get("myshopify_domain") or shop_domain).strip().lower()
+    shop_name = (shop_info.get("name") or canonical_myshopify_domain).strip()
+
+    # Optional Storefront token: best-effort create so quotes/checkout can work.
+    storefront_token = await _create_storefront_access_token_best_effort(
+        shop_domain=canonical_myshopify_domain,
+        access_token=access_token,
+    )
+
+    store_id = await _upsert_shopify_store_credentials(
+        merchant_id=merchant_id,
+        myshopify_domain=canonical_myshopify_domain,
+        shop_name=shop_name,
+        access_token=access_token,
+        storefront_token=storefront_token,
+    )
+
+    # Register required webhooks right after OAuth.
+    webhooks_report: Dict[str, Any] = {"attempted": False}
+    try:
+        from services.shopify_integration_verify import register_webhooks_best_effort
+
+        callback_base_url = _shopify_webhook_callback_base_url(request)
+        webhooks_report = {
+            "attempted": True,
+            "callback_base_url": callback_base_url,
+            **(
+                await register_webhooks_best_effort(
+                    shop_domain=canonical_myshopify_domain,
+                    access_token=access_token,
+                    merchant_id=merchant_id,
+                    callback_base_url=callback_base_url,
+                    topics=list(_SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS),
+                    api_version="2024-07",
+                )
+            ),
+        }
+    except Exception as e:
+        logger.warning("Shopify webhook registration failed merchant=%s shop=%s err=%s", merchant_id, canonical_myshopify_domain, str(e)[:200])
+        webhooks_report = {"attempted": True, "error": "webhook_registration_failed"}
+
+    access_token_fp = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:10]
+    return {
+        "status": "success",
+        "merchant_id": merchant_id,
+        "shop_domain": canonical_myshopify_domain,
+        "store_id": store_id,
+        "access_token_sha256_prefix": access_token_fp,
+        "storefront_token_present": bool(storefront_token),
+        "webhooks": webhooks_report,
+    }
 
 
 class ShopifySyncRequest(BaseModel):

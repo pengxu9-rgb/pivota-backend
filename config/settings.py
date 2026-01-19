@@ -36,7 +36,11 @@ class Settings(BaseSettings):
     shopify_client_secret: Optional[str] = os.getenv("SHOPIFY_CLIENT_SECRET")
     shopify_redirect_uri: Optional[str] = os.getenv("SHOPIFY_REDIRECT_URI")
     # Needed for: product sync + creating manual sale/refund records on orders.
-    shopify_scopes: str = os.getenv("SHOPIFY_SCOPES", "read_products,read_orders,write_orders")
+    # Note: webhook subscription requires `write_webhooks`.
+    shopify_scopes: str = os.getenv(
+        "SHOPIFY_SCOPES",
+        "read_products,read_orders,read_fulfillments,write_orders,write_webhooks",
+    )
     
     # Wix
     wix_api_key: Optional[str] = os.getenv("WIX_API_KEY")
