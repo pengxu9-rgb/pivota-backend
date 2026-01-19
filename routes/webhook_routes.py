@@ -638,15 +638,19 @@ async def handle_shopify_webhook(
             # Compatibility: some shops/apps only reliably emit orders/updated when fulfillment changes.
             # If Shopify indicates fulfilled here, converge Pivota order state to shipped.
             try:
+                phase = "start"
                 raw_fulfillment_status = str(fulfillment_status or "").strip().lower()
                 if raw_fulfillment_status == "fulfilled" and pivota:
+                    phase = "load_current"
                     current = await database.fetch_one(
                         "SELECT order_id, fulfillment_status, tracking_number FROM orders WHERE shopify_order_id = :shopify_order_id",
                         {"shopify_order_id": shopify_order_id},
                     )
                     if current:
+                        phase = "check_current_status"
                         current_status = str(current.get("fulfillment_status") or "").strip().lower()
                         if current_status not in {"shipped", "delivered"}:
+                            phase = "extract_tracking"
                             tracking_numbers: list[str] = []
                             carrier: Optional[str] = None
                             for fulfillment in (data.get("fulfillments") or []) or []:
@@ -665,6 +669,7 @@ async def handle_shopify_webhook(
                                             carrier = ti.get("company") or ti.get("tracking_company") or ti.get("carrier")
                                         if ti.get("number"):
                                             tracking_numbers.append(str(ti.get("number")))
+                            phase = "mark_order_shipped"
                             tracking_number = ", ".join(dict.fromkeys(tracking_numbers)) if tracking_numbers else None
                             shipped_ok = await mark_order_shipped(
                                 str(current.get("order_id")),
@@ -672,6 +677,7 @@ async def handle_shopify_webhook(
                                 carrier=carrier,
                             )
                             if not shipped_ok:
+                                phase = "mark_order_shipped_returned_false"
                                 await log_order_event(
                                     event_type="shopify_fulfillment_convergence_failed",
                                     order_id=str(current.get("order_id")),
@@ -689,6 +695,7 @@ async def handle_shopify_webhook(
                                     str(current.get("order_id")),
                                 )
                                 return {"status": "success", "topic": topic}
+                            phase = "log_success_event"
                             await log_order_event(
                                 event_type="fulfillment_via_order_updated_webhook",
                                 order_id=str(current.get("order_id")),
@@ -712,6 +719,7 @@ async def handle_shopify_webhook(
                             "shopify_order_id": shopify_order_id,
                             "topic": topic,
                             "fulfillment_status": fulfillment_status,
+                            "phase": locals().get("phase", "unknown"),
                             "error_type": type(e).__name__,
                             "error": str(e)[:200],
                         },
