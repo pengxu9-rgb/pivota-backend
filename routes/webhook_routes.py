@@ -307,6 +307,95 @@ async def handle_stripe_webhook(
 
 
 # ============================================================================
+# Shopify GDPR Webhooks (static endpoint for Partner Dashboard configuration)
+# ============================================================================
+
+@router.post("/shopify/gdpr")
+async def handle_shopify_gdpr_webhook(
+    request: Request,
+    x_shopify_hmac_sha256: Optional[str] = Header(None),
+    x_shopify_topic: Optional[str] = Header(None),
+    x_shopify_shop_domain: Optional[str] = Header(None),
+):
+    """
+    Shopify data privacy webhooks:
+    - customers/data_request
+    - customers/redact
+    - shop/redact
+    Must be configured in Shopify Partner Dashboard with a static URL.
+    """
+    payload = await request.body()
+    topic = x_shopify_topic or "unknown"
+    shop_domain = _canonicalize_shop_domain(x_shopify_shop_domain)
+
+    app_secret = (settings.shopify_client_secret or "").strip()
+    if not app_secret:
+        record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
+        raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
+    if not x_shopify_hmac_sha256:
+        record_shopify_webhook(result="error", reason="missing_hmac", topic=topic)
+        raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
+    if not verify_shopify_hmac(secret=app_secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256):
+        record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
+        raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
+
+    merchant_id: Optional[str] = None
+    if shop_domain:
+        try:
+            from db.database import database
+
+            row = await database.fetch_one(
+                """
+                SELECT merchant_id
+                FROM merchant_stores
+                WHERE platform = 'shopify' AND lower(domain) = :domain
+                ORDER BY connected_at DESC
+                LIMIT 1
+                """,
+                {"domain": shop_domain},
+            )
+            if row:
+                merchant_id = row["merchant_id"]
+            else:
+                row = await database.fetch_one(
+                    """
+                    SELECT merchant_id
+                    FROM merchant_onboarding
+                    WHERE lower(mcp_shop_domain) = :domain
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    {"domain": shop_domain},
+                )
+                if row:
+                    merchant_id = row["merchant_id"]
+        except Exception as e:
+            logger.warning("GDPR webhook merchant lookup failed shop=%s err=%s", shop_domain, str(e)[:200])
+
+    payload_keys: list[str] = []
+    try:
+        data = json.loads(payload.decode("utf-8"))
+        if isinstance(data, dict):
+            payload_keys = list(data.keys())
+    except Exception:
+        payload_keys = []
+
+    if merchant_id:
+        try:
+            await log_order_event(
+                event_type="gdpr_webhook",
+                order_id=f"gdpr_{merchant_id}",
+                merchant_id=merchant_id,
+                metadata={"topic": topic, "payload_keys": payload_keys, "shop_domain": shop_domain},
+            )
+        except Exception as e:
+            logger.warning("GDPR webhook log failed merchant=%s err=%s", merchant_id, str(e)[:200])
+
+    record_shopify_webhook(result="success", reason="ok", topic=topic)
+    return {"status": "success", "topic": topic}
+
+
+# ============================================================================
 # Shopify Webhooks
 # ============================================================================
 
@@ -489,6 +578,42 @@ async def handle_shopify_webhook(
 
         record_shopify_webhook(result="success", reason="ok", topic=topic)
         logger.info(f"Received Shopify webhook for {merchant_id}: {topic}")
+        if topic == "app/uninstalled":
+            try:
+                from db.database import database
+
+                canon_domain = _canonicalize_shop_domain(shop_domain)
+                if canon_domain:
+                    await database.execute(
+                        """
+                        UPDATE merchant_stores
+                        SET status = 'disconnected',
+                            api_key = NULL,
+                            last_sync = NOW()
+                        WHERE merchant_id = :merchant_id
+                          AND platform = 'shopify'
+                          AND lower(domain) = :domain
+                        """,
+                        {"merchant_id": merchant_id, "domain": canon_domain},
+                    )
+                await database.execute(
+                    """
+                    UPDATE merchant_onboarding
+                    SET mcp_connected = FALSE,
+                        mcp_access_token = NULL
+                    WHERE merchant_id = :merchant_id
+                    """,
+                    {"merchant_id": merchant_id},
+                )
+                await log_order_event(
+                    event_type="shopify_app_uninstalled",
+                    order_id=f"shopify_app_uninstalled_{merchant_id}",
+                    merchant_id=merchant_id,
+                    metadata={"shop_domain": canon_domain or shop_domain},
+                )
+            except Exception as e:
+                logger.warning("Shopify app uninstall cleanup failed merchant=%s err=%s", merchant_id, str(e)[:200])
+            return {"status": "success", "topic": topic}
         if topic in ("orders/fulfilled", "fulfillments/create", "fulfillments/update"):
             # 履约更新（订单级 or fulfillment 级）
             tracking_numbers = []
@@ -1013,6 +1138,8 @@ async def register_shopify_webhooks(
             "fulfillments/update",
             # Legacy support
             "orders/fulfilled",
+            # Uninstall
+            "app/uninstalled",
             # Refunds (preferred)
             "refunds/create",
             # Money movement (refund funds settled / payment settled signals)

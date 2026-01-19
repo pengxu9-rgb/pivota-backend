@@ -37,6 +37,7 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
     "fulfillments/create",
     "fulfillments/update",
     "orders/fulfilled",
+    "app/uninstalled",
 ]
 
 _STOREFRONT_AUTO_CREATE_DENIED_UNTIL: Dict[str, float] = {}
