@@ -366,18 +366,61 @@ async def update_payment_info(
 
 async def mark_order_paid(order_id: str) -> bool:
     """标记订单已支付"""
-    query = orders.update().where(
-        orders.c.order_id == order_id
-    ).values(
-        status="paid",
-        payment_status="paid",
-        paid_at=datetime.now(),
-        updated_at=datetime.now()
+    now = datetime.now()
+    query = (
+        orders.update()
+        .where(orders.c.order_id == order_id)
+        .values(status="paid", payment_status="paid", paid_at=now, updated_at=now)
     )
-    
+
     result = await database.execute(query)
-    # Handle None result from PostgreSQL
-    return result is not None and result > 0
+    ok = result is not None and result > 0
+
+    # Best-effort: converge `payments.status` for this order so customer-facing APIs
+    # don't show stale "processing" after the PSP webhook confirms payment.
+    if ok:
+        try:
+            row = await database.fetch_one(
+                """
+                SELECT payment_intent_id
+                FROM orders
+                WHERE order_id = :order_id
+                LIMIT 1
+                """,
+                {"order_id": order_id},
+            )
+            payment_intent_id = None
+            if row:
+                try:
+                    payment_intent_id = row["payment_intent_id"]
+                except Exception:
+                    payment_intent_id = None
+
+            if payment_intent_id:
+                await database.execute(
+                    """
+                    UPDATE payments
+                    SET status = 'succeeded'
+                    WHERE order_id = :order_id
+                      AND payment_intent_id = :payment_intent_id
+                      AND status <> 'succeeded'
+                    """,
+                    {"order_id": order_id, "payment_intent_id": payment_intent_id},
+                )
+            else:
+                await database.execute(
+                    """
+                    UPDATE payments
+                    SET status = 'succeeded'
+                    WHERE order_id = :order_id
+                      AND status IN ('processing', 'requires_action')
+                    """,
+                    {"order_id": order_id},
+                )
+        except Exception:
+            pass
+
+    return ok
 
 
 async def update_fulfillment_info(
