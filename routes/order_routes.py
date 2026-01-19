@@ -824,6 +824,16 @@ async def create_new_order(
             # 促销信息统一挂在 metadata.promotions 下
             order_metadata["promotions"] = {**existing_promos, **promo_meta}
 
+        # Bind order to the current store connection (if any) so downstream Shopify sync
+        # does not accidentally use a different store after a merchant connects another store.
+        store_id_value: Optional[str] = None
+        try:
+            primary_store = await get_primary_store(order_request.merchant_id)
+            if primary_store and primary_store.get("store_id"):
+                store_id_value = str(primary_store.get("store_id"))
+        except Exception:
+            store_id_value = None
+
         order_data = {
             "merchant_id": order_request.merchant_id,
             "customer_email": order_request.customer_email,
@@ -840,7 +850,7 @@ async def create_new_order(
             "metadata": order_metadata,
             "psp_used": psp_type,  # Record which PSP provider is used (lowercase)
             # Legacy fields (optional, can be null)
-            "store_id": None,
+            "store_id": store_id_value,
             "psp_id": psp_id_value,  # Include actual PSP ID for metrics tracking
             "payment_method": None
         }
