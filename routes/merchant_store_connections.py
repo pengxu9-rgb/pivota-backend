@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/integrations", tags=["Merchant Integrations"])
 
-_SHOPIFY_OAUTH_STATE_TTL_SECONDS = 10 * 60
+_SHOPIFY_OAUTH_STATE_TTL_SECONDS = 30 * 60
 _SHOPIFY_INSTALL_TOKEN_TTL_SECONDS = 15 * 60
 _SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS_DEFAULT = {"merch_efbc46b4619cfbdf"}
 _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
@@ -577,23 +577,24 @@ async def shopify_oauth_callback(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Shopify OAuth signature")
 
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
-
-    consumed = await database.fetch_one(
+    state_row = await database.fetch_one(
         """
-        UPDATE shopify_oauth_states
-        SET used_at = NOW()
+        SELECT merchant_id, shop_domain, expires_at, used_at
+        FROM shopify_oauth_states
         WHERE state_sha256 = :state_sha256
-          AND used_at IS NULL
-          AND expires_at > NOW()
-          AND shop_domain = :shop_domain
-        RETURNING merchant_id, shop_domain
         """,
-        {"state_sha256": state_sha, "shop_domain": shop_domain},
+        {"state_sha256": state_sha},
     )
-    if not consumed:
-        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+    if not state_row:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_not_found)")
+    if state_row.get("used_at"):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_already_used)")
+    expires_at = state_row.get("expires_at")
+    if expires_at and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_expired)")
 
-    merchant_id = str(consumed["merchant_id"])
+    merchant_id = str(state_row["merchant_id"])
+    stored_shop_domain = (state_row.get("shop_domain") or "").strip().lower()
 
     token_url = f"https://{shop_domain}/admin/oauth/access_token"
     token_payload = {
@@ -628,6 +629,22 @@ async def shopify_oauth_callback(request: Request):
 
     canonical_myshopify_domain = (shop_info.get("myshopify_domain") or shop_domain).strip().lower()
     shop_name = (shop_info.get("name") or canonical_myshopify_domain).strip()
+    if stored_shop_domain and stored_shop_domain not in {canonical_myshopify_domain, shop_domain}:
+        raise HTTPException(status_code=400, detail="OAuth shop mismatch (reason=shop_domain_mismatch)")
+
+    consumed = await database.fetch_one(
+        """
+        UPDATE shopify_oauth_states
+        SET used_at = NOW()
+        WHERE state_sha256 = :state_sha256
+          AND used_at IS NULL
+          AND expires_at > NOW()
+        RETURNING merchant_id
+        """,
+        {"state_sha256": state_sha},
+    )
+    if not consumed:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_consumption_failed)")
 
     # Optional Storefront token: best-effort create so quotes/checkout can work.
     storefront_token = await _create_storefront_access_token_best_effort(
