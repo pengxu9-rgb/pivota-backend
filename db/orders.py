@@ -460,7 +460,10 @@ async def update_fulfillment_info(
                 {"order_id": order_id},
             )
             if row:
-                paid = str((row["payment_status"] if row else "") or "").strip().lower() == "paid"
+                paid = (
+                    str((row["payment_status"] if row else "") or "").strip().lower()
+                    == "paid"
+                )
                 ful = str((row["fulfillment_status"] if row else "") or "").strip().lower()
                 merchant_id = str((row["merchant_id"] if row else "") or "").strip()
                 if paid and merchant_id and ful in {"shipped", "delivered"}:
