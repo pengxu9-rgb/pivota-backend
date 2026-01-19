@@ -440,7 +440,11 @@ async def mark_order_shipped(
     carrier: Optional[str] = None
 ) -> bool:
     """标记订单已发货"""
-    query = (
+    # NOTE: `database.fetch_one()` on SQLAlchemy UPDATE + RETURNING can behave differently
+    # across driver/adapter versions. Use `execute()` for the mutation and fetch merchant_id
+    # with a follow-up SELECT for consistency.
+    updated_at = datetime.now()
+    result = await database.execute(
         orders.update()
         .where(orders.c.order_id == order_id)
         .values(
@@ -448,18 +452,21 @@ async def mark_order_shipped(
             fulfillment_status="shipped",
             tracking_number=tracking_number,
             carrier=carrier,
-            shipped_at=datetime.now(),
-            updated_at=datetime.now()
+            shipped_at=updated_at,
+            updated_at=updated_at,
         )
-        .returning(orders.c.order_id, orders.c.merchant_id)
     )
-    result = await database.fetch_one(query)
-    if not result:
+    ok = result is not None and result > 0
+    if not ok:
         return False
+    row = await database.fetch_one(
+        "SELECT merchant_id FROM orders WHERE order_id = :order_id LIMIT 1",
+        {"order_id": order_id},
+    )
 
     # Best-effort invitation scheduling: enqueue a job for a worker service to send the email.
     try:
-        merchant_id = str(result.get("merchant_id") or "").strip()
+        merchant_id = str((row or {}).get("merchant_id") or "").strip()
         if merchant_id:
             await enqueue_invitation_send_job_from_order(
                 merchant_id=merchant_id,

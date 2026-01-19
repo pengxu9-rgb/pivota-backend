@@ -492,6 +492,7 @@ async def handle_shopify_webhook(
         if topic in ("orders/fulfilled", "fulfillments/create", "fulfillments/update"):
             # 履约更新（订单级 or fulfillment 级）
             tracking_numbers = []
+            carrier: Optional[str] = None
 
             # fulfillments/* 通常是 fulfillment object，包含 order_id + tracking_numbers
             if topic.startswith("fulfillments/") and data.get("order_id"):
@@ -500,11 +501,18 @@ async def handle_shopify_webhook(
                     tracking_numbers.extend([str(x) for x in data.get("tracking_numbers") if x])
                 if data.get("tracking_number"):
                     tracking_numbers.append(str(data.get("tracking_number")))
+                carrier = data.get("tracking_company") or data.get("tracking_company_name") or data.get("carrier")
             else:
                 # orders/fulfilled 通常是 order object，包含 fulfillments[]
                 shopify_order_id = str(data.get("id"))
                 for fulfillment in data.get("fulfillments", []) or []:
-                    tracking_numbers.extend(fulfillment.get("tracking_numbers", []) or [])
+                    if isinstance(fulfillment, dict):
+                        if not carrier:
+                            carrier = fulfillment.get("tracking_company") or fulfillment.get("tracking_company_name")
+                        if isinstance(fulfillment.get("tracking_numbers"), list):
+                            tracking_numbers.extend([str(x) for x in (fulfillment.get("tracking_numbers") or []) if x])
+                        if fulfillment.get("tracking_number"):
+                            tracking_numbers.append(str(fulfillment.get("tracking_number")))
             # 更新 Pivota 订单
             query = "SELECT * FROM orders WHERE shopify_order_id = :shopify_order_id"
             from db.database import database
@@ -512,16 +520,17 @@ async def handle_shopify_webhook(
 
             if result:
                 order_id = result["order_id"]
-                tracking_number = ", ".join(tracking_numbers) if tracking_numbers else None
+                tracking_number = ", ".join(dict.fromkeys(tracking_numbers)) if tracking_numbers else None
 
-                await mark_order_shipped(order_id, tracking_number)
+                await mark_order_shipped(order_id, tracking_number, carrier=carrier)
                 await log_order_event(
                     event_type="fulfillment_webhook",
                     order_id=order_id,
                     merchant_id=merchant_id,
                     metadata={
                         "shopify_order_id": shopify_order_id,
-                        "tracking_numbers": tracking_numbers
+                        "tracking_numbers": tracking_numbers,
+                        "carrier": carrier,
                     }
                 )
                 logger.info(f"Order {order_id} marked as shipped via webhook")
@@ -657,11 +666,29 @@ async def handle_shopify_webhook(
                                         if ti.get("number"):
                                             tracking_numbers.append(str(ti.get("number")))
                             tracking_number = ", ".join(dict.fromkeys(tracking_numbers)) if tracking_numbers else None
-                            await mark_order_shipped(
+                            shipped_ok = await mark_order_shipped(
                                 str(current.get("order_id")),
                                 tracking_number,
                                 carrier=carrier,
                             )
+                            if not shipped_ok:
+                                await log_order_event(
+                                    event_type="shopify_fulfillment_convergence_failed",
+                                    order_id=str(current.get("order_id")),
+                                    merchant_id=merchant_id,
+                                    metadata={
+                                        "shopify_order_id": shopify_order_id,
+                                        "topic": topic,
+                                        "fulfillment_status": fulfillment_status,
+                                        "reason": "mark_order_shipped_returned_false",
+                                    },
+                                )
+                                logger.warning(
+                                    "orders/updated fulfillment convergence failed: mark_order_shipped returned false shopify_order_id=%s order_id=%s",
+                                    shopify_order_id,
+                                    str(current.get("order_id")),
+                                )
+                                return {"status": "success", "topic": topic}
                             await log_order_event(
                                 event_type="fulfillment_via_order_updated_webhook",
                                 order_id=str(current.get("order_id")),
@@ -674,7 +701,27 @@ async def handle_shopify_webhook(
                             )
                             logger.info(f"Order {current.get('order_id')} marked as shipped via orders/updated webhook")
             except Exception as e:
-                logger.warning(f"orders/updated fulfillment convergence skipped for shopify_order_id={shopify_order_id}: {e}")
+                # Persist a minimal error breadcrumb into the immutable order events table so ops can debug
+                # without relying on Railway logs. Keep it short and non-PII.
+                try:
+                    await log_order_event(
+                        event_type="shopify_fulfillment_convergence_error",
+                        order_id=pivota_order_id,
+                        merchant_id=merchant_id,
+                        metadata={
+                            "shopify_order_id": shopify_order_id,
+                            "topic": topic,
+                            "fulfillment_status": fulfillment_status,
+                            "error_type": type(e).__name__,
+                            "error": str(e)[:200],
+                        },
+                    )
+                except Exception:
+                    pass
+                logger.exception(
+                    "orders/updated fulfillment convergence error shopify_order_id=%s",
+                    shopify_order_id,
+                )
 
         elif topic in ("refunds/create", "orders/refunded"):
             platform_order_id = str(data.get("order_id") or data.get("id") or "")
