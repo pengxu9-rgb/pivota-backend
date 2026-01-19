@@ -38,41 +38,31 @@ fi
 
 FORCE="${FORCE:-0}"
 
-order_json="$("$PSQL_BIN" "$DATABASE_URL" -X -tA -c \
-  "SELECT json_build_object(
-      'order_id', order_id,
-      'merchant_id', merchant_id,
-      'store_id', COALESCE(store_id,''),
-      'shopify_order_id', COALESCE(shopify_order_id,''),
-      'status', status,
-      'payment_status', payment_status,
-      'fulfillment_status', COALESCE(fulfillment_status,'')
-    )::text
+merchant_id="${MERCHANT_ID:-}"
+existing_store_id=""
+
+row="$("$PSQL_BIN" "$DATABASE_URL" -X -tA -c \
+  "SELECT
+     COALESCE(merchant_id,'') || '|' || COALESCE(store_id,'')
    FROM orders
    WHERE order_id='${ORDER_ID}'
    LIMIT 1;")"
 
-if [[ -z "$order_json" ]]; then
+if [[ -z "$row" ]]; then
   echo "ERROR: order not found: $ORDER_ID" >&2
   exit 1
 fi
 
-merchant_id="$(python3 - <<'PY' <<<"$order_json"
-import json,sys
-o=json.loads(sys.stdin.read())
-print(o.get("merchant_id","") or "")
-PY
-)"
-
-existing_store_id="$(python3 - <<'PY' <<<"$order_json"
-import json,sys
-o=json.loads(sys.stdin.read())
-print(o.get("store_id","") or "")
-PY
-)"
+if [[ -z "$merchant_id" ]]; then
+  merchant_id="${row%%|*}"
+fi
+existing_store_id="${row#*|}"
 
 if [[ -z "$merchant_id" ]]; then
-  echo "ERROR: order has empty merchant_id (unexpected)" >&2
+  echo "ERROR: order has empty merchant_id (unexpected). Dumping safe order fields:" >&2
+  "$PSQL_BIN" "$DATABASE_URL" -X -P pager=off -c \
+    "SELECT order_id, merchant_id, store_id, shopify_order_id, status, payment_status, fulfillment_status
+     FROM orders WHERE order_id='${ORDER_ID}' LIMIT 1;" >&2
   exit 1
 fi
 
@@ -109,7 +99,9 @@ fi
 
 if [[ -n "$existing_store_id" && "$FORCE" != "1" ]]; then
   echo "OK: order already has store_id=$existing_store_id (set FORCE=1 to overwrite)" >&2
-  echo "$order_json" | python3 -m json.tool
+  "$PSQL_BIN" "$DATABASE_URL" -X -P pager=off -c \
+    "SELECT order_id, merchant_id, store_id, shopify_order_id, status, payment_status, fulfillment_status
+     FROM orders WHERE order_id='${ORDER_ID}' LIMIT 1;"
   exit 0
 fi
 
@@ -128,4 +120,3 @@ echo ""
 "$PSQL_BIN" "$DATABASE_URL" -X -P pager=off -c \
   "SELECT order_id, merchant_id, store_id, shopify_order_id, status, payment_status, fulfillment_status
    FROM orders WHERE order_id='${ORDER_ID}';"
-
