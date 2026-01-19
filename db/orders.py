@@ -448,32 +448,29 @@ async def update_fulfillment_info(
     ok = result is not None and result > 0
 
     # Best-effort: enqueue invitation when fulfillment becomes shipped/delivered.
-	    if ok and fulfillment_status:
-	        try:
-	            row = await database.fetch_one(
-	                """
-	                SELECT merchant_id, payment_status, fulfillment_status
-	                FROM orders
-	                WHERE order_id = :order_id
-	                LIMIT 1
-	                """,
-	                {"order_id": order_id},
-	            )
-	            if row:
-	                paid = (
-	                    str((row["payment_status"] if row else "") or "").strip().lower()
-	                    == "paid"
-	                )
-	                ful = str((row["fulfillment_status"] if row else "") or "").strip().lower()
-	                merchant_id = str((row["merchant_id"] if row else "") or "").strip()
-	                if paid and merchant_id and ful in {"shipped", "delivered"}:
-	                    await enqueue_invitation_send_job_from_order(
-	                        merchant_id=merchant_id,
-	                        order_id=order_id,
-	                        force_reschedule=False,
-	                    )
-	        except Exception:
-	            pass
+    if ok and fulfillment_status:
+        try:
+            row = await database.fetch_one(
+                """
+                SELECT merchant_id, payment_status, fulfillment_status
+                FROM orders
+                WHERE order_id = :order_id
+                LIMIT 1
+                """,
+                {"order_id": order_id},
+            )
+            if row:
+                paid = str((row["payment_status"] if row else "") or "").strip().lower() == "paid"
+                ful = str((row["fulfillment_status"] if row else "") or "").strip().lower()
+                merchant_id = str((row["merchant_id"] if row else "") or "").strip()
+                if paid and merchant_id and ful in {"shipped", "delivered"}:
+                    await enqueue_invitation_send_job_from_order(
+                        merchant_id=merchant_id,
+                        order_id=order_id,
+                        force_reschedule=False,
+                    )
+        except Exception:
+            pass
 
     return ok
 
@@ -508,16 +505,16 @@ async def mark_order_shipped(
         {"order_id": order_id},
     )
 
-	    # Best-effort invitation scheduling: enqueue a job for a worker service to send the email.
-	    try:
-	        merchant_id = str((row["merchant_id"] if row else "") or "").strip()
-	        if merchant_id:
-	            await enqueue_invitation_send_job_from_order(
-	                merchant_id=merchant_id,
-	                order_id=order_id,
-	                force_reschedule=False,
-	            )
-	    except Exception:
+    # Best-effort invitation scheduling: enqueue a job for a worker service to send the email.
+    try:
+        merchant_id = str((row["merchant_id"] if row else "") or "").strip()
+        if merchant_id:
+            await enqueue_invitation_send_job_from_order(
+                merchant_id=merchant_id,
+                order_id=order_id,
+                force_reschedule=False,
+            )
+    except Exception:
         # Do not block fulfillment on invitation scheduling failures.
         pass
 
