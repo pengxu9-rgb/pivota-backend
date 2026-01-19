@@ -514,7 +514,9 @@ def _map_payment_status(raw_status: Optional[str]) -> str:
 
 def _map_fulfillment_status(raw_status: Optional[str]) -> str:
     raw = (raw_status or "").lower()
-    if raw in {"fulfilled", "delivered"}:
+    # Backend uses `shipped` as the main fulfillment transition; map it to `fulfilled`
+    # for the customer-facing API so that "paid + shipped" is treated as completed.
+    if raw in {"fulfilled", "delivered", "shipped"}:
         return "fulfilled"
     if raw in {"partially_fulfilled", "partial"}:
         return "partially_fulfilled"
