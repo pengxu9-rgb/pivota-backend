@@ -187,3 +187,110 @@ async def get_product_by_key(
             "merchants_selling": 1,
         },
     }
+
+
+@router.get("/{product_key}/reviews")
+async def list_product_reviews(
+    product_key: str,
+    variant_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    current_user: dict = Depends(get_current_employee),
+):
+    """
+    List reviews for a product_key (merchant/platform/platform_product_id).
+
+    Notes:
+    - Uses Reviews Center table `product_reviews` when present.
+    - If the table is missing in an environment, returns an empty list (degraded) instead of 500.
+    """
+    parts = [p.strip() for p in (product_key or "").split("|")]
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
+
+    merchant_id, platform, platform_product_id = parts
+    values: Dict[str, Any] = {
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "platform_product_id": platform_product_id,
+        "limit": limit,
+    }
+    variant_clause = ""
+    if variant_id:
+        values["variant_id"] = str(variant_id).strip()
+        variant_clause = " AND (variant_id = :variant_id)"
+
+    try:
+        rows = await database.fetch_all(
+            f"""
+            SELECT
+              id,
+              merchant_id,
+              platform,
+              platform_product_id,
+              variant_id,
+              rating,
+              title,
+              body,
+              body_redacted,
+              status,
+              risk_flags,
+              media_count,
+              created_at,
+              updated_at
+            FROM product_reviews
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND platform_product_id = :platform_product_id
+              {variant_clause}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """,
+            values,
+        )
+    except Exception as exc:
+        # Degrade gracefully in deployments where Reviews Center tables are not present.
+        msg = str(exc)
+        if "product_reviews" in msg and ("does not exist" in msg or "UndefinedTable" in msg):
+            return {
+                "status": "degraded",
+                "items": [],
+                "debug_errors": ["product_reviews table missing"],
+            }
+        return {
+            "status": "degraded",
+            "items": [],
+            "debug_errors": [f"reviews query failed: {msg[:200]}"],
+        }
+
+    items = []
+    status_counts: Dict[str, int] = {}
+    for r in rows:
+        r = dict(r)
+        st = (r.get("status") or "unknown").strip().lower()
+        status_counts[st] = status_counts.get(st, 0) + 1
+        items.append(
+            {
+                "id": int(r["id"]),
+                "merchant_id": r.get("merchant_id"),
+                "platform": r.get("platform"),
+                "platform_product_id": r.get("platform_product_id"),
+                "variant_id": r.get("variant_id"),
+                "rating": r.get("rating"),
+                "title": r.get("title"),
+                "body": r.get("body_redacted") or r.get("body"),
+                "status": r.get("status"),
+                "media_count": r.get("media_count") or 0,
+                "risk_flags": r.get("risk_flags"),
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None,
+            }
+        )
+
+    return {
+        "status": "success",
+        "items": items,
+        "counts": {
+            "total": len(items),
+            "by_status": status_counts,
+        },
+    }
