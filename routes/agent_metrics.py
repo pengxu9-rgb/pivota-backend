@@ -30,9 +30,13 @@ async def get_metrics_summary(
         
         # Resolve agent_id from JWT or X-API-Key
         agent_id = None
+        employee_context = False
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
+                role = payload.get("role")
+                if role in ["super_admin", "admin", "employee", "outsourced"]:
+                    employee_context = True
                 agent_id = payload.get("agent_id")
             except:
                 pass
@@ -43,63 +47,106 @@ async def get_metrics_summary(
             )
             if agent_row:
                 agent_id = agent_row["agent_id"]
-        if not agent_id:
+        if not agent_id and not employee_context:
             raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
-        
-        # Query real data from agent_usage_logs for this agent (single aggregate query)
-        usage_row = await database.fetch_one(
-            """
-            SELECT
-                COUNT(*)::bigint as total_requests,
-                SUM(CASE WHEN timestamp >= :last_hour THEN 1 ELSE 0 END)::bigint as requests_last_hour,
-                SUM(CASE WHEN timestamp >= :last_24h THEN 1 ELSE 0 END)::bigint as requests_last_24h,
-                SUM(CASE WHEN timestamp >= :last_24h AND status_code < 400 THEN 1 ELSE 0 END)::bigint as success_last_24h,
-                AVG(CASE WHEN timestamp >= :last_24h THEN response_time_ms END) as avg_response_time_ms
-            FROM agent_usage_logs
-            WHERE agent_id = :agent_id
-            """,
-            {"agent_id": agent_id, "last_hour": last_hour, "last_24h": last_24h}
-        )
-        usage = dict(usage_row) if usage_row else {}
+
+        status_label = "healthy"
+        internal_errors: List[str] = []
+
+        # Query real data from agent_usage_logs (agent-scoped or global)
+        agent_filter = " AND agent_id = :agent_id" if agent_id else ""
+        params = {
+            "agent_id": agent_id,
+            "last_hour": last_hour,
+            "last_24h": last_24h,
+            "last_30d": last_30d,
+            "last_7d": now - timedelta(days=7),
+        }
+        try:
+            usage_row = await database.fetch_one(
+                f"""
+                SELECT
+                    COUNT(*)::bigint as total_requests,
+                    SUM(CASE WHEN timestamp >= :last_hour THEN 1 ELSE 0 END)::bigint as requests_last_hour,
+                    SUM(CASE WHEN timestamp >= :last_24h THEN 1 ELSE 0 END)::bigint as requests_last_24h,
+                    SUM(CASE WHEN timestamp >= :last_7d THEN 1 ELSE 0 END)::bigint as requests_last_7d,
+                    SUM(CASE WHEN timestamp >= :last_24h AND status_code < 400 THEN 1 ELSE 0 END)::bigint as success_last_24h,
+                    AVG(CASE WHEN timestamp >= :last_24h THEN response_time_ms END) as avg_response_time_ms,
+                    COUNT(DISTINCT CASE WHEN timestamp >= :last_24h THEN agent_id END)::bigint as active_agents_last_24h
+                FROM agent_usage_logs
+                WHERE 1=1 {agent_filter}
+                """,
+                params
+            )
+            usage = dict(usage_row) if usage_row else {}
+        except Exception as e:
+            usage = {}
+            status_label = "degraded"
+            internal_errors.append(f"agent_usage_logs query failed: {str(e)}")
         total_requests = int(usage.get("total_requests") or 0)
         hour_requests = int(usage.get("requests_last_hour") or 0)
         day_requests = int(usage.get("requests_last_24h") or 0)
+        week_requests = int(usage.get("requests_last_7d") or 0)
         success_count = int(usage.get("success_last_24h") or 0)
         success_rate = (success_count / day_requests * 100) if day_requests > 0 else 100.0
         avg_response_time = usage.get("avg_response_time_ms") or 0
+        active_agents = int(usage.get("active_agents_last_24h") or 0)
         
         # Top endpoints (last 24h)
-        top_endpoint_rows = await database.fetch_all(
-            """SELECT endpoint, COUNT(*) as count 
-               FROM agent_usage_logs 
-               WHERE agent_id = :agent_id AND timestamp >= :since 
-               GROUP BY endpoint 
-               ORDER BY count DESC 
-               LIMIT 5""",
-            {"agent_id": agent_id, "since": last_24h}
-        )
-        top_endpoints = [{"endpoint": row["endpoint"], "count": row["count"]} for row in top_endpoint_rows]
-        
-        active_agents = 1
-        errors = []
+        try:
+            top_endpoint_rows = await database.fetch_all(
+                f"""SELECT endpoint, COUNT(*) as count 
+                   FROM agent_usage_logs 
+                   WHERE timestamp >= :since {agent_filter}
+                   GROUP BY endpoint 
+                   ORDER BY count DESC 
+                   LIMIT 5""",
+                {**params, "since": last_24h}
+            )
+            top_endpoints = [{"endpoint": row["endpoint"], "count": row["count"]} for row in top_endpoint_rows]
+        except Exception as e:
+            top_endpoints = []
+            status_label = "degraded"
+            internal_errors.append(f"top_endpoints query failed: {str(e)}")
 
-        orders_row = await database.fetch_one(
-            """
-            SELECT
-                SUM(CASE WHEN created_at >= :last_24h THEN 1 ELSE 0 END)::bigint as count_last_24h,
-                COALESCE(SUM(CASE WHEN created_at >= :last_24h AND payment_status = 'paid' THEN total ELSE 0 END), 0) as revenue_last_24h,
-                COALESCE(SUM(CASE WHEN created_at >= :last_30d AND payment_status = 'paid' THEN total ELSE 0 END), 0) as revenue_last_30d,
-                COUNT(*)::bigint as total_orders,
-                SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END)::bigint as total_paid_orders,
-                COALESCE(SUM(CASE WHEN payment_status = 'paid' THEN total ELSE 0 END), 0) as total_revenue,
-                COUNT(DISTINCT merchant_id)::bigint as merchant_count
-            FROM orders
-            WHERE (is_deleted IS NULL OR is_deleted = FALSE)
-              AND agent_id = :agent_id
-            """,
-            {"agent_id": agent_id, "last_24h": last_24h, "last_30d": last_30d}
-        )
-        orders = dict(orders_row) if orders_row else {}
+        try:
+            error_rows = await database.fetch_all(
+                f"""SELECT status_code, COUNT(*) as count
+                   FROM agent_usage_logs
+                   WHERE status_code >= 400 AND timestamp >= :since {agent_filter}
+                   GROUP BY status_code
+                   ORDER BY count DESC
+                   LIMIT 5""",
+                {**params, "since": last_24h}
+            )
+            errors = [{"status_code": row["status_code"], "count": row["count"]} for row in error_rows]
+        except Exception as e:
+            errors = []
+            status_label = "degraded"
+            internal_errors.append(f"error breakdown query failed: {str(e)}")
+
+        try:
+            orders_row = await database.fetch_one(
+                f"""
+                SELECT
+                    SUM(CASE WHEN created_at >= :last_24h THEN 1 ELSE 0 END)::bigint as count_last_24h,
+                    COALESCE(SUM(CASE WHEN created_at >= :last_24h AND payment_status = 'paid' THEN total ELSE 0 END), 0) as revenue_last_24h,
+                    COALESCE(SUM(CASE WHEN created_at >= :last_30d AND payment_status = 'paid' THEN total ELSE 0 END), 0) as revenue_last_30d,
+                    COUNT(*)::bigint as total_orders,
+                    SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END)::bigint as total_paid_orders,
+                    COALESCE(SUM(CASE WHEN payment_status = 'paid' THEN total ELSE 0 END), 0) as total_revenue,
+                    COUNT(DISTINCT merchant_id)::bigint as merchant_count
+                FROM orders
+                WHERE (is_deleted IS NULL OR is_deleted = FALSE)
+                  {agent_filter}
+                """,
+                params
+            )
+            orders = dict(orders_row) if orders_row else {}
+        except Exception as e:
+            orders = {}
+            status_label = "degraded"
+            internal_errors.append(f"orders query failed: {str(e)}")
         orders_count_24h = int(orders.get("count_last_24h") or 0)
         revenue_24h = float(orders.get("revenue_last_24h") or 0)
         revenue_30d = float(orders.get("revenue_last_30d") or 0)
@@ -109,20 +156,20 @@ async def get_metrics_summary(
         merchant_count = int(orders.get("merchant_count") or 0)
         
         return {
-            "status": "healthy",
+            "status": status_label,
             "timestamp": now.isoformat(),
             "overview": {
                 "total_requests": total_requests,
                 "requests_last_hour": hour_requests,
                 "requests_last_24h": day_requests,
-                "requests_last_7d": 0,  # Can add if needed
+                "requests_last_7d": week_requests,
             },
             "performance": {
                 "success_rate_24h": round(success_rate, 2),
                 "avg_response_time_ms": round(float(avg_response_time), 2) if avg_response_time else 0,
             },
             "agents": {
-                "active_last_24h": active_agents,
+                "active_last_24h": active_agents if employee_context else (active_agents or 1),
             },
             "orders": {
                 # Last 24h metrics
@@ -145,14 +192,43 @@ async def get_metrics_summary(
             "errors": [
                 {"status_code": row["status_code"], "count": row["count"]} 
                 for row in errors
-            ]
+            ],
+            "debug_errors": internal_errors,
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         return {
-            "status": "error",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
+            "status": "degraded",
+            "timestamp": datetime.now().isoformat(),
+            "overview": {
+                "total_requests": 0,
+                "requests_last_hour": 0,
+                "requests_last_24h": 0,
+                "requests_last_7d": 0,
+            },
+            "performance": {
+                "success_rate_24h": 0,
+                "avg_response_time_ms": 0,
+            },
+            "agents": {
+                "active_last_24h": 0,
+            },
+            "orders": {
+                "count_last_24h": 0,
+                "revenue_last_24h": 0.0,
+                "revenue_last_30d": 0.0,
+                "total_orders": 0,
+                "total_paid_orders": 0,
+                "total_revenue": 0.0,
+            },
+            "merchants": {
+                "total_count": 0,
+            },
+            "top_endpoints": [],
+            "errors": [],
+            "debug_errors": [str(e)],
         }
 
 
