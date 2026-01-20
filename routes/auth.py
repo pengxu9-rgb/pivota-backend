@@ -4,6 +4,7 @@ Clean and simple authentication system for Pivota
 """
 
 import logging
+import json
 from datetime import datetime
 from textwrap import dedent
 from typing import Optional
@@ -287,7 +288,46 @@ async def login(data: LoginRequest):
                     raise
             if agent_record:
                 agent_id = agent_record['agent_id']
-        
+
+        employee_id = None
+        employee_permissions: list = []
+        if user['role'] in ['super_admin', 'admin', 'employee', 'outsourced']:
+            try:
+                employee_record = await database.fetch_one(
+                    "SELECT employee_id, permissions FROM employees WHERE email = :email",
+                    {"email": user['email']}
+                )
+                if employee_record:
+                    employee_id = employee_record.get('employee_id')
+                    raw_permissions = employee_record.get('permissions')
+                    if raw_permissions is None:
+                        employee_permissions = []
+                    elif isinstance(raw_permissions, list):
+                        employee_permissions = raw_permissions
+                    elif isinstance(raw_permissions, str):
+                        try:
+                            employee_permissions = json.loads(raw_permissions)
+                        except Exception:
+                            employee_permissions = []
+                    else:
+                        try:
+                            employee_permissions = list(raw_permissions)
+                        except Exception:
+                            employee_permissions = []
+            except Exception as e:
+                if 'permissions' in str(e) or 'employees' in str(e):
+                    try:
+                        employee_record = await database.fetch_one(
+                            "SELECT employee_id FROM employees WHERE email = :email",
+                            {"email": user['email']}
+                        )
+                        if employee_record:
+                            employee_id = employee_record.get('employee_id')
+                    except Exception:
+                        pass
+                else:
+                    raise
+
         # Create JWT token
         token_data = {
             "sub": user['email'],
@@ -299,6 +339,10 @@ async def login(data: LoginRequest):
             token_data["merchant_id"] = merchant_id
         if agent_id:
             token_data["agent_id"] = agent_id
+        if employee_id:
+            token_data["employee_id"] = employee_id
+        if employee_permissions:
+            token_data["permissions"] = employee_permissions
         
         token = create_access_token(token_data)
         
@@ -312,6 +356,10 @@ async def login(data: LoginRequest):
             user_response["merchant_id"] = merchant_id
         if agent_id:
             user_response["agent_id"] = agent_id
+        if employee_id:
+            user_response["employee_id"] = employee_id
+        if employee_permissions:
+            user_response["permissions"] = employee_permissions
         
         return LoginResponse(
             success=True,

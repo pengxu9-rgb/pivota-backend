@@ -7,7 +7,7 @@ from typing import Optional, List
 from datetime import datetime, timedelta
 from textwrap import dedent
 import logging
-from utils.auth import get_current_user
+from utils.auth import get_current_user, hash_password as hash_user_password
 from db.database import database
 from config.settings import settings
 import uuid
@@ -18,6 +18,8 @@ import random
 
 router = APIRouter()
 logger = logging.getLogger("employees_security")
+
+MANAGED_EMPLOYEE_ROLES = ["employee", "admin", "super_admin", "outsourced"]
 
 # Helper functions for password management
 def generate_temp_password(length: int = 12) -> str:
@@ -190,9 +192,11 @@ async def create_employee(
     
     try:
         # Validate role
-        valid_roles = ["employee", "admin", "manager", "super_admin", "outsourced"]
-        if request.role not in valid_roles:
-            raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}")
+        if request.role not in MANAGED_EMPLOYEE_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid role. Must be one of: {', '.join(MANAGED_EMPLOYEE_ROLES)}"
+            )
         
         # Check if employee exists
         check_query = "SELECT employee_id FROM employees WHERE email = :email"
@@ -205,6 +209,7 @@ async def create_employee(
         employee_id = f"emp_{uuid.uuid4().hex[:8]}"
         temp_password = generate_temp_password()
         hashed_password = hash_password(temp_password)
+        user_password_hash = hash_user_password(temp_password)
         
         # Insert employee with password
         insert_query = """
@@ -225,6 +230,26 @@ async def create_employee(
             "status": "active",
             "created_at": datetime.now()
         })
+
+        # Best-effort: sync employee into users table for auth login
+        try:
+            users_insert = """
+                INSERT INTO users (
+                    email, password_hash, full_name, role, active
+                ) VALUES (
+                    :email, :password_hash, :full_name, :role, :active
+                )
+                ON CONFLICT (email) DO NOTHING
+            """
+            await database.execute(users_insert, {
+                "email": request.email,
+                "password_hash": user_password_hash,
+                "full_name": request.name,
+                "role": request.role,
+                "active": True,
+            })
+        except Exception as exc:
+            logger.error("[Employees] Failed to sync users table: %s", exc)
 
         email_status = _send_employee_welcome_email(
             request.email,
@@ -281,6 +306,11 @@ async def update_employee(
             updates.append("name = :name")
             params["name"] = name
         if role:
+            if role not in MANAGED_EMPLOYEE_ROLES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid role. Must be one of: {', '.join(MANAGED_EMPLOYEE_ROLES)}"
+                )
             updates.append("role = :role")
             params["role"] = role
         if department:
@@ -490,7 +520,6 @@ async def update_security_settings(
             "max_login_attempts": max_login_attempts
         }
     }
-
 
 
 
