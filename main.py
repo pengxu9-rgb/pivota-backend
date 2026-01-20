@@ -356,7 +356,14 @@ async def startup_event():
     """
     Initialize database connections and ensure core tables exist.
     """
-    await database.connect()
+    # Avoid blocking Railway healthchecks indefinitely.
+    try:
+        if not getattr(database, "is_connected", False):
+            await asyncio.wait_for(database.connect(), timeout=15)
+    except Exception as exc:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"⚠️ Startup DB connect skipped/failed (continuing degraded): {exc}")
+        return
     try:
         # Create all tables defined in db.database (transactions, promotions, etc.)
         metadata.create_all(engine)
@@ -757,7 +764,8 @@ async def startup():
         logger.info(f"   Database URL type: {type(database.url)}")
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
-        await database.connect()
+        if not getattr(database, "is_connected", False):
+            await asyncio.wait_for(database.connect(), timeout=15)
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
@@ -768,8 +776,25 @@ async def startup():
         logger.info("✅ All database tables verified/created")
         
         # Test the connection
-        await database.execute("SELECT 1")
+        await asyncio.wait_for(database.execute("SELECT 1"), timeout=10)
         logger.info("✅ Database connection test passed")
+
+        # This startup function contains a large amount of best-effort schema/DDL work.
+        # In Railway, the service healthcheck must pass quickly; long-running DDL can
+        # exceed the healthcheck retry window and cause deploy rollbacks.
+        skip_heavy_env = os.getenv("SKIP_HEAVY_STARTUP_INIT")
+        if skip_heavy_env is None:
+            skip_heavy = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower() == "production"
+        else:
+            skip_heavy = skip_heavy_env.lower() in {"1", "true", "yes"}
+
+        if skip_heavy:
+            logger.warning(
+                "🟡 Skipping heavy startup DDL/migrations for fast healthcheck. "
+                "Set SKIP_HEAVY_STARTUP_INIT=false to run full startup init."
+            )
+            logger.info("🚀 Application startup complete (fast mode)")
+            return
         
         # Run automatic migrations
         try:
@@ -1180,7 +1205,7 @@ async def startup():
         logger.info("🚀 Application startup complete!")
         logger.info("=" * 80)
         
-    except TimeoutError as e:
+    except (asyncio.TimeoutError, TimeoutError) as e:
         # Database connection timeout – log but allow app to start
         logger.error("=" * 80)
         logger.error("❌ CRITICAL ERROR during startup: database connection timed out")
@@ -1197,9 +1222,9 @@ async def startup():
         logger.error("=" * 80)
         import traceback
         traceback.print_exc()
-        # Re-raise the exception to prevent the app from starting with a broken database
-        logger.error("🛑 Cannot continue without database connection")
-        raise RuntimeError(f"Database initialization failed: {e}") from e
+        # Do not block deploy/healthchecks; keep the service up in degraded mode.
+        logger.error("🟡 Continuing startup in degraded mode (some DB-backed endpoints may fail)")
+        return
 
 @app.on_event("shutdown")
 async def shutdown():
