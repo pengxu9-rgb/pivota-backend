@@ -56,12 +56,13 @@ async def get_metrics_summary(
         # Query real data from agent_usage_logs (agent-scoped or global)
         agent_filter = " AND agent_id = :agent_id" if agent_id else ""
         params = {
-            "agent_id": agent_id,
             "last_hour": last_hour,
             "last_24h": last_24h,
             "last_30d": last_30d,
             "last_7d": now - timedelta(days=7),
         }
+        if agent_id:
+            params["agent_id"] = agent_id
         try:
             usage_row = await database.fetch_one(
                 f"""
