@@ -5,8 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
+from textwrap import dedent
+import logging
 from utils.auth import get_current_user
 from db.database import database
+from config.settings import settings
 import uuid
 import secrets
 import hashlib
@@ -14,6 +17,7 @@ import string
 import random
 
 router = APIRouter()
+logger = logging.getLogger("employees_security")
 
 # Helper functions for password management
 def generate_temp_password(length: int = 12) -> str:
@@ -25,6 +29,76 @@ def hash_password(password: str) -> str:
     """Hash password using SHA256"""
     salt = "pivota_employee_salt_v1"
     return hashlib.sha256(f"{password}{salt}".encode()).hexdigest()
+
+def _send_employee_welcome_email(email: str, name: str, temp_password: str) -> str:
+    """
+    Best-effort email sender for newly created employee accounts.
+    Returns: "sent", "failed", or "skipped".
+    """
+    api_key = getattr(settings, "sendgrid_api_key", None)
+    if not api_key:
+        logger.info(
+            "[Employees] SENDGRID_API_KEY not configured; "
+            "skipping employee welcome email send"
+        )
+        return "skipped"
+
+    from_email = getattr(settings, "from_email", "noreply@pivota.ai")
+    subject = "Your Pivota employee account"
+    text_content = (
+        f"Hi {name},\n\n"
+        "Your Pivota employee account has been created.\n\n"
+        f"Email: {email}\n"
+        f"Temporary password: {temp_password}\n\n"
+        "Please sign in and change your password on first login.\n"
+        "If you did not expect this email, please contact your administrator."
+    )
+    html_content = dedent(
+        f"""
+        <p>Hi {name},</p>
+        <p>Your Pivota employee account has been created.</p>
+        <p><strong>Email:</strong> {email}<br/>
+        <strong>Temporary password:</strong> {temp_password}</p>
+        <p>Please sign in and change your password on first login.</p>
+        <p>If you did not expect this email, please contact your administrator.</p>
+        """
+    ).strip()
+
+    try:
+        import requests
+
+        response = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "personalizations": [{"to": [{"email": email}]}],
+                "from": {"email": from_email, "name": "Pivota"},
+                "subject": subject,
+                "content": [
+                    {"type": "text/plain", "value": text_content},
+                    {"type": "text/html", "value": html_content},
+                ],
+            },
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            logger.error(
+                "[Employees] Failed to send welcome email via SendGrid: "
+                "status=%s body=%s",
+                response.status_code,
+                response.text,
+            )
+            return "failed"
+        logger.info("[Employees] Welcome email sent via SendGrid to %s", email)
+        return "sent"
+    except Exception as exc:
+        logger.error(
+            "[Employees] Exception while sending welcome email: %s", exc
+        )
+        return "failed"
 
 # ============== Employees Management ==============
 
@@ -151,14 +225,34 @@ async def create_employee(
             "status": "active",
             "created_at": datetime.now()
         })
-        
-        return {
+
+        email_status = _send_employee_welcome_email(
+            request.email,
+            request.name,
+            temp_password,
+        )
+
+        response = {
             "status": "success",
             "message": "Employee created successfully",
             "employee_id": employee_id,
-            "temporary_password": temp_password,
-            "note": "Please share this temporary password with the employee. They should change it on first login."
+            "email_status": email_status,
         }
+
+        if email_status == "sent":
+            response["note"] = (
+                "Temporary password sent to the employee via email. "
+                "They should change it on first login."
+            )
+        else:
+            response["temporary_password"] = temp_password
+            response["note"] = (
+                "Email delivery was not confirmed. "
+                "Please share this temporary password with the employee. "
+                "They should change it on first login."
+            )
+
+        return response
     
     except HTTPException:
         raise
@@ -396,7 +490,6 @@ async def update_security_settings(
             "max_login_attempts": max_login_attempts
         }
     }
-
 
 
 
