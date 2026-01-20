@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+import asyncio
 import base64
 import hashlib
 import httpx
@@ -723,30 +724,47 @@ mutation($input: CartInput!) {
 
         # Best-effort: attach a delivery address and fetch delivery options.
         if cart_id and country and postal:
+            delivery_timeout_s = float(os.getenv("SHOPIFY_STOREFRONT_DELIVERY_TIMEOUT_SECONDS", "8") or "8")
+            delivery_timeout_s = max(0.5, delivery_timeout_s)
             try:
-                delivery_options, selected = await self._attach_address_and_select_delivery_best_effort(
-                    shop_domain=shop_domain,
-                    storefront_token=storefront_token,
-                    cart_id=cart_id,
-                    country=country,
-                    postal=postal,
-                    city=city,
-                    province=province,
-                    address1=address1,
-                    address2=address2,
-                    selected_delivery_option=selected_delivery_option,
-                    debug_id=debug_id,
+                async def _delivery_work() -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], Optional[StorefrontCartResult]]:
+                    opts, sel = await self._attach_address_and_select_delivery_best_effort(
+                        shop_domain=shop_domain,
+                        storefront_token=storefront_token,
+                        cart_id=cart_id,
+                        country=country,
+                        postal=postal,
+                        city=city,
+                        province=province,
+                        address1=address1,
+                        address2=address2,
+                        selected_delivery_option=selected_delivery_option,
+                        debug_id=debug_id,
+                    )
+
+                    # Refresh totals after delivery selection.
+                    refreshed = await self._get_cart_cost(
+                        shop_domain=shop_domain,
+                        storefront_token=storefront_token,
+                        cart_id=cart_id,
+                        debug_id=debug_id,
+                    )
+                    return opts, sel, refreshed
+
+                delivery_options, selected, refreshed = await asyncio.wait_for(
+                    _delivery_work(), timeout=delivery_timeout_s
                 )
 
-                # Refresh totals after delivery selection.
-                refreshed = await self._get_cart_cost(
-                    shop_domain=shop_domain, storefront_token=storefront_token, cart_id=cart_id, debug_id=debug_id
-                )
                 if refreshed:
                     subtotal = refreshed.subtotal
                     total = refreshed.total
                     tax = refreshed.tax
                     currency = refreshed.currency
+            except asyncio.TimeoutError:
+                logger.info(
+                    {"debug_id": debug_id, "timeout_seconds": delivery_timeout_s},
+                    "Storefront delivery options timed out; continuing without delivery selection",
+                )
             except ShopifyPricingError as e:
                 # Delivery address/options are best-effort; keep the quote usable even if
                 # the Storefront schema differs across shops/versions.

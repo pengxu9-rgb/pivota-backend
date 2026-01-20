@@ -413,6 +413,13 @@ class QuoteService:
             # Optional: allow a small time budget (env) for fast stores so promos can apply immediately.
             # Read dynamically so ops can tune without code changes, and tests can patch env.
             wait_seconds = max(0.0, float(os.getenv("PROMOTIONS_SYNC_QUOTE_WAIT_SECONDS", "0")))
+            # Safety guard: keep quote preview responsive even if env is misconfigured.
+            # This can be overridden in ops via PROMOTIONS_SYNC_QUOTE_WAIT_MAX_SECONDS.
+            max_wait_seconds = max(0.0, float(os.getenv("PROMOTIONS_SYNC_QUOTE_WAIT_MAX_SECONDS", "2") or "2"))
+            if max_wait_seconds > 0:
+                wait_seconds = min(wait_seconds, max_wait_seconds)
+            else:
+                wait_seconds = 0.0
             if wait_seconds > 0:
                 try:
                     summary = await asyncio.wait_for(

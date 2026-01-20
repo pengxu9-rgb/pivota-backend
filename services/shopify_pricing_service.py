@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncio
 import hashlib
 import httpx
+import os
 
 from services.merchant_store_service import get_primary_store
 from utils.logger import logger
@@ -433,12 +435,26 @@ class ShopifyPricingService:
                     missing_compare_at.append(str(li.get("variant_id")))
 
         # Cap the number of fallback calls to avoid N+1 explosions.
-        missing_compare_at = list(dict.fromkeys(missing_compare_at))[:20]
+        max_compare_at_variants = int(os.getenv("SHOPIFY_COMPARE_AT_LOOKUP_MAX_VARIANTS", "5") or "5")
+        max_compare_at_variants = max(0, max_compare_at_variants)
+        missing_compare_at = list(dict.fromkeys(missing_compare_at))[:max_compare_at_variants]
         compare_at_by_variant: Dict[str, Optional[str]] = {}
         if missing_compare_at:
-            compare_at_by_variant = await self._fetch_compare_at_prices(
-                shop_domain=shop_domain, access_token=access_token, variant_ids=missing_compare_at
-            )
+            budget_s = float(os.getenv("SHOPIFY_COMPARE_AT_LOOKUP_BUDGET_SECONDS", "2.5") or "2.5")
+            budget_s = max(0.1, budget_s)
+            try:
+                compare_at_by_variant = await asyncio.wait_for(
+                    self._fetch_compare_at_prices(
+                        shop_domain=shop_domain,
+                        access_token=access_token,
+                        variant_ids=missing_compare_at,
+                    ),
+                    timeout=budget_s,
+                )
+            except asyncio.TimeoutError:
+                compare_at_by_variant = {}
+            except Exception:
+                compare_at_by_variant = {}
 
         def d(v: Any) -> Decimal:
             try:
@@ -512,7 +528,9 @@ class ShopifyPricingService:
                 out[vid] = None
                 _compare_at_cache.set(vid, None)
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        request_timeout_s = float(os.getenv("SHOPIFY_COMPARE_AT_LOOKUP_REQUEST_TIMEOUT_SECONDS", "2") or "2")
+        request_timeout_s = max(0.5, request_timeout_s)
+        async with httpx.AsyncClient(timeout=request_timeout_s) as client:
             for vid in variant_ids:
                 await fetch_one(client, vid)
 

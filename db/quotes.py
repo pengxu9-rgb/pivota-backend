@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -33,11 +34,21 @@ quotes = Table(
 )
 
 
+_QUOTES_DDL_READY = False
+_QUOTES_DDL_LOCK = asyncio.Lock()
+
+
 async def ensure_quotes_table() -> None:
     """
     Best-effort defensive DDL. Production normally relies on metadata.create_all(engine)
     during startup, but this avoids hard failures if that import ordering changes.
     """
+    global _QUOTES_DDL_READY
+    if _QUOTES_DDL_READY:
+        return
+    async with _QUOTES_DDL_LOCK:
+        if _QUOTES_DDL_READY:
+            return
     try:
         # NOTE: Keep each statement separate; some drivers reject multi-statement executes.
         statements = [
@@ -76,6 +87,7 @@ async def ensure_quotes_table() -> None:
         # Best-effort; if this fails, inserts will surface the error with context.
         logger.warning("ensure_quotes_table failed (best-effort)", extra={"error": str(e)})
         return
+    _QUOTES_DDL_READY = True
 
 
 async def insert_quote(row: Dict[str, Any]) -> None:
