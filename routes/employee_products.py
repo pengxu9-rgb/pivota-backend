@@ -116,6 +116,9 @@ async def _ensure_external_seeds_table() -> None:
           id TEXT PRIMARY KEY,
           market TEXT NOT NULL,
           tool TEXT NOT NULL DEFAULT '*',
+          utm_template TEXT NULL,
+          partner_type TEXT NULL,
+          disclosure_text TEXT NULL,
           destination_url TEXT NOT NULL,
           canonical_url TEXT NULL,
           domain TEXT NULL,
@@ -148,6 +151,15 @@ async def _ensure_external_seeds_table() -> None:
             )
         except Exception:
             pass
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS utm_template TEXT;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS partner_type TEXT;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS disclosure_text TEXT;"
+    )
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_status ON external_product_seeds(status);"
     )
@@ -257,6 +269,8 @@ class CreateExternalSeedRequest(BaseModel):
     attach_product_key: Optional[str] = None
     attach_variant_id: Optional[str] = None
     utm_template: Optional[str] = None
+    partner_type: Optional[str] = None
+    disclosure_text: Optional[str] = None
     # Optional manual overrides / richer product seed fields (for employee curation).
     title: Optional[str] = None
     image_url: Optional[str] = None
@@ -283,6 +297,9 @@ class UpdateExternalSeedRequest(BaseModel):
     price_currency: Optional[str] = None
     availability: Optional[str] = None
     variants: Optional[List[Dict[str, Any]]] = None
+    utm_template: Optional[str] = None
+    partner_type: Optional[str] = None
+    disclosure_text: Optional[str] = None
 
 
 class PreviewExternalSeedRequest(BaseModel):
@@ -378,7 +395,8 @@ async def list_external_seeds(
     rows = await database.fetch_all(
         f"""
         SELECT
-          id, market, tool, destination_url, canonical_url, domain, title, image_url,
+          id, market, tool, utm_template, partner_type, disclosure_text,
+          destination_url, canonical_url, domain, title, image_url,
           price_amount, price_currency, availability,
           seed_data,
           status, notes, created_by_employee_id,
@@ -400,6 +418,9 @@ async def list_external_seeds(
                 "id": r.get("id"),
                 "market": r.get("market"),
                 "tool": r.get("tool"),
+                "utm_template": r.get("utm_template") or seed_data.get("utm_template"),
+                "partner_type": r.get("partner_type") or seed_data.get("partner_type"),
+                "disclosure_text": r.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,
                 "destination_url": r.get("destination_url"),
                 "canonical_url": r.get("canonical_url"),
                 "domain": r.get("domain"),
@@ -465,6 +486,9 @@ async def create_external_seed(
     price_amount = body.price_amount if body.price_amount is not None else snap_price_amount
     price_currency = (body.price_currency or "").strip() or snap_price_currency
     availability = (body.availability or "").strip() or snap_availability
+    utm_template = (body.utm_template or "").strip() or None
+    partner_type = (body.partner_type or "").strip() or None
+    disclosure_text = (body.disclosure_text or "").strip() or DEFAULT_DISCLOSURE_TEXT
 
     seed_data: Dict[str, Any] = {
         "external_product_id": _stable_external_product_id(canonical_url or dest),
@@ -475,6 +499,9 @@ async def create_external_seed(
         "image_url": image_url,
         "availability": availability,
         "variants": body.variants or [],
+        "utm_template": utm_template,
+        "partner_type": partner_type,
+        "disclosure_text": disclosure_text,
         "source": "employee_seed",
         "snapshot": {
             "canonical_url": canonical_url,
@@ -490,12 +517,14 @@ async def create_external_seed(
     await database.execute(
         """
         INSERT INTO external_product_seeds (
-          id, market, tool, destination_url, canonical_url, domain, title, image_url,
+          id, market, tool, utm_template, partner_type, disclosure_text,
+          destination_url, canonical_url, domain, title, image_url,
           price_amount, price_currency, availability,
           seed_data,
           status, notes, created_by_employee_id, attached_product_key, attached_variant_id
         ) VALUES (
-          :id, :market, :tool, :destination_url, :canonical_url, :domain, :title, :image_url,
+          :id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
+          :destination_url, :canonical_url, :domain, :title, :image_url,
           :price_amount, :price_currency, :availability,
           :seed_data,
           'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id
@@ -505,6 +534,9 @@ async def create_external_seed(
             "id": seed_id,
             "market": market,
             "tool": tool,
+            "utm_template": utm_template,
+            "partner_type": partner_type,
+            "disclosure_text": disclosure_text,
             "destination_url": dest,
             "canonical_url": canonical_url,
             "domain": domain,
@@ -540,6 +572,9 @@ async def create_external_seed(
             "id": seed_id,
             "market": market,
             "tool": tool,
+            "utm_template": utm_template,
+            "partner_type": partner_type,
+            "disclosure_text": disclosure_text,
             "destination_url": dest,
             "canonical_url": canonical_url,
             "domain": domain,
@@ -558,7 +593,7 @@ async def create_external_seed(
             },
             "variants": _seed_variants(seed_data),
         },
-        "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": DEFAULT_DISCLOSURE_TEXT},
+        "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
     }
 
 
@@ -582,19 +617,23 @@ async def get_external_seed(
         market=row.get("market"),
         tool=row.get("tool"),
         destination_url=row.get("canonical_url") or row.get("destination_url"),
-        utm_template=None,
+        utm_template=row.get("utm_template") or seed_data.get("utm_template"),
         ctx={
             "seedId": row.get("id"),
             **({"productKey": row.get("attached_product_key")} if row.get("attached_product_key") else {}),
             **({"variantId": row.get("attached_variant_id")} if row.get("attached_variant_id") else {}),
         },
     )
+    disclosure_text = row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
     return {
         "status": "success",
         "seed": {
             "id": row.get("id"),
             "market": row.get("market"),
             "tool": row.get("tool"),
+            "utm_template": row.get("utm_template") or seed_data.get("utm_template"),
+            "partner_type": row.get("partner_type") or seed_data.get("partner_type"),
+            "disclosure_text": disclosure_text,
             "destination_url": row.get("destination_url"),
             "canonical_url": row.get("canonical_url"),
             "domain": row.get("domain"),
@@ -619,7 +658,7 @@ async def get_external_seed(
                 "category": seed_data.get("category") or seed_data.get("product", {}).get("category"),
             },
         },
-        "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": DEFAULT_DISCLOSURE_TEXT},
+        "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
     }
 
 
@@ -650,6 +689,12 @@ async def update_external_seed(
         seed_data["category"] = body.category
     if body.variants is not None:
         seed_data["variants"] = body.variants
+    if body.utm_template is not None:
+        seed_data["utm_template"] = (body.utm_template or "").strip() or None
+    if body.partner_type is not None:
+        seed_data["partner_type"] = (body.partner_type or "").strip() or None
+    if body.disclosure_text is not None:
+        seed_data["disclosure_text"] = (body.disclosure_text or "").strip() or DEFAULT_DISCLOSURE_TEXT
 
     updates: Dict[str, Any] = {"id": seed_id}
     set_clauses: List[str] = []
@@ -666,6 +711,15 @@ async def update_external_seed(
     if body.status is not None:
         updates["status"] = str(body.status).strip() or "active"
         set_clauses.append("status = :status")
+    if body.utm_template is not None:
+        updates["utm_template"] = (body.utm_template or "").strip() or None
+        set_clauses.append("utm_template = :utm_template")
+    if body.partner_type is not None:
+        updates["partner_type"] = (body.partner_type or "").strip() or None
+        set_clauses.append("partner_type = :partner_type")
+    if body.disclosure_text is not None:
+        updates["disclosure_text"] = (body.disclosure_text or "").strip() or DEFAULT_DISCLOSURE_TEXT
+        set_clauses.append("disclosure_text = :disclosure_text")
 
     # Compatibility: keep summary columns in sync for existing list views.
     if body.title is not None:
@@ -780,14 +834,15 @@ async def refresh_external_seed(
         market=market,
         tool=tool,
         destination_url=canonical_url or dest,
-        utm_template=None,
+        utm_template=row.get("utm_template") or seed_data.get("utm_template"),
         ctx={
             "seedId": seed_id,
             **({"productKey": row.get("attached_product_key")} if row.get("attached_product_key") else {}),
             **({"variantId": row.get("attached_variant_id")} if row.get("attached_variant_id") else {}),
         },
     )
-    return {"status": "success", "action": {"type": "redirect", "redirect_url": redirect_url}}
+    disclosure_text = row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
+    return {"status": "success", "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text}}
 
 
 class AttachSeedRequest(BaseModel):
@@ -842,6 +897,7 @@ async def list_attached_external_links(
         f"""
         SELECT id, market, tool, destination_url, canonical_url, domain, title, image_url,
                price_amount, price_currency, availability,
+               utm_template, partner_type, disclosure_text,
                notes, attached_variant_id, created_at
         FROM external_product_seeds
         WHERE {where}
@@ -859,18 +915,22 @@ async def list_attached_external_links(
             market=r.get("market"),
             tool=r.get("tool"),
             destination_url=r.get("canonical_url") or r.get("destination_url"),
-            utm_template=None,
+            utm_template=r.get("utm_template"),
             ctx={
                 "seedId": r.get("id"),
                 "productKey": product_key,
                 "variantId": r.get("attached_variant_id") or "∅",
             },
         )
+        disclosure_text = r.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
         items.append(
             {
                 "id": r.get("id"),
                 "market": r.get("market"),
                 "tool": r.get("tool"),
+                "utm_template": r.get("utm_template"),
+                "partner_type": r.get("partner_type"),
+                "disclosure_text": disclosure_text,
                 "destination_url": r.get("destination_url"),
                 "canonical_url": r.get("canonical_url"),
                 "domain": r.get("domain"),
@@ -881,7 +941,7 @@ async def list_attached_external_links(
                 "notes": r.get("notes"),
                 "attached_variant_id": r.get("attached_variant_id") or "∅",
                 "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
-                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": DEFAULT_DISCLOSURE_TEXT},
+                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
             }
         )
     return {"status": "success", "items": items}
@@ -893,6 +953,9 @@ class CreateAttachedExternalLinkRequest(BaseModel):
     tool: Optional[str] = None
     variant_id: Optional[str] = None
     notes: Optional[str] = None
+    utm_template: Optional[str] = None
+    partner_type: Optional[str] = None
+    disclosure_text: Optional[str] = None
 
 
 @router.post("/{product_key}/external-links")
@@ -911,6 +974,9 @@ async def create_attached_external_link(
             market=body.market,
             tool=body.tool,
             notes=body.notes,
+            utm_template=body.utm_template,
+            partner_type=body.partner_type,
+            disclosure_text=body.disclosure_text,
             attach_product_key=pk,
             attach_variant_id=(body.variant_id or "∅"),
         ),
