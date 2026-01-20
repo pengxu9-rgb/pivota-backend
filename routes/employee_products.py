@@ -669,6 +669,22 @@ async def get_product_by_key(
         },
     }
 
+@router.get("/{merchant_id}/{platform}/{platform_product_id}")
+async def get_product_by_triplet(
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """
+    Product detail by explicit triplet path params.
+
+    This is a convenience wrapper for the employee portal to avoid embedding the composite
+    `product_key` (merchant|platform|platform_product_id) into a single URL segment.
+    """
+    product_key = f"{merchant_id}|{platform}|{platform_product_id}"
+    return await get_product_by_key(product_key=product_key, current_user=current_user)
+
 
 @router.get("/{product_key}/reviews")
 async def list_product_reviews(
