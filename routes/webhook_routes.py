@@ -10,7 +10,6 @@ from urllib.parse import urlparse
 import stripe
 import os
 import hmac
-import hashlib
 import json
 import socket
 from datetime import datetime
@@ -467,14 +466,24 @@ async def handle_shopify_webhook(
             or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
         )
         app_secret = getattr(settings, "shopify_client_secret", None)
-        shopify_secret = store_secret or app_secret or ""
-        secret_source = "store_credentials" if store_secret else ("app_env" if app_secret else "none")
-        secret_len = len(shopify_secret) if shopify_secret else 0
-        secret_sha256_prefix = (
-            hashlib.sha256(shopify_secret.encode("utf-8")).hexdigest()[:10]
-            if shopify_secret
-            else None
-        )
+        app_secret = app_secret.strip() if isinstance(app_secret, str) else ""
+        store_secret = store_secret.strip() if isinstance(store_secret, str) else ""
+
+        # Webhook signatures are generated using the Shopify app's shared secret. In practice, we may
+        # have BOTH an app-level secret (env) and a per-store override (DB) during migrations or when
+        # merchants reconnect via different onboarding flows. Accept when ANY known secret matches.
+        secret_candidates: list[tuple[str, str]] = []
+        if store_secret:
+            secret_candidates.append(("store_credentials", store_secret))
+        if app_secret and app_secret != store_secret:
+            secret_candidates.append(("app_env", app_secret))
+
+        secret_source = secret_candidates[0][0] if secret_candidates else "none"
+        secret_len = len(secret_candidates[0][1]) if secret_candidates else 0
+        has_store_secret = bool(store_secret)
+        has_app_secret = bool(app_secret)
+        store_secret_len = len(store_secret) if store_secret else 0
+        app_secret_len = len(app_secret) if app_secret else 0
 
         debug_meta = {
             "merchant_id": merchant_id,
@@ -489,7 +498,11 @@ async def handle_shopify_webhook(
             "user_agent": request.headers.get("user-agent"),
             "secret_source": secret_source,
             "secret_len": secret_len,
-            "secret_sha256_prefix": secret_sha256_prefix,
+            "has_store_secret": has_store_secret,
+            "has_app_secret": has_app_secret,
+            "store_secret_len": store_secret_len,
+            "app_secret_len": app_secret_len,
+            "secret_candidate_count": len(secret_candidates),
         }
         if is_production:
             if not x_shopify_shop_domain:
@@ -515,7 +528,7 @@ async def handle_shopify_webhook(
                     topic,
                 )
                 raise HTTPException(status_code=403, detail="Shop domain mismatch")
-            if not shopify_secret:
+            if not secret_candidates:
                 record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
                 logger.error(
                     "Shopify webhook verification secret missing merchant=%s topic=%s source=%s",
@@ -529,11 +542,14 @@ async def handle_shopify_webhook(
                 logger.warning("Shopify webhook rejected: missing HMAC header %s", debug_meta)
                 raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
 
-        signature_verified = verify_shopify_hmac(
-            secret=shopify_secret,
-            payload=payload,
-            header_hmac_base64=x_shopify_hmac_sha256,
-        )
+        signature_verified = False
+        verified_source = None
+        for source, secret in secret_candidates:
+            if verify_shopify_hmac(secret=secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256):
+                signature_verified = True
+                verified_source = source
+                break
+        debug_meta["verified_secret_source"] = verified_source
         if is_production and not signature_verified:
             record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
             # This commonly indicates env drift across instances (different SHOPIFY_CLIENT_SECRET).
