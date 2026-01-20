@@ -211,10 +211,15 @@ async def _execute_seed_data_stmt(query: str, values: Dict[str, Any]) -> None:
         await database.execute(query, values)
     except Exception as exc:
         msg = str(exc)
-        if not _SEED_DATA_FORCE_TEXT and "expected str" in msg and "seed_data" in msg:
+        seed_data = values.get("seed_data")
+        if (
+            not _SEED_DATA_FORCE_TEXT
+            and isinstance(seed_data, dict)
+            and ("expected str" in msg or "got dict" in msg or "query argument" in msg)
+        ):
             _SEED_DATA_FORCE_TEXT = True
             retry_values = dict(values)
-            retry_values["seed_data"] = json.dumps(values.get("seed_data") or {})
+            retry_values["seed_data"] = json.dumps(seed_data or {})
             await database.execute(query, retry_values)
             return
         raise
