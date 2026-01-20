@@ -16,7 +16,10 @@ import httpx
 from fastapi import HTTPException, Request
 
 from db.database import database
+from db.orders import get_order
+from db.products import products_cache
 from db.reviews_center import buyer_review_idempotency_keys, buyer_review_ownership, buyer_review_submission_jtis, media_assets, product_reviews
+from services.merchant_store_service import get_primary_store
 from services.reviews_service import VARIANT_ID_SENTINEL, _reviews_media_s3_put, build_product_key, build_sku_key
 
 
@@ -74,6 +77,212 @@ def _as_iso_datetime(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return value
     return None
+
+
+def _first_present(row: Any, keys: Sequence[str]) -> Any:
+    for key in keys:
+        val = _row_get(row, key)
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        return val
+    return None
+
+
+def _coerce_items(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return []
+    if isinstance(value, list):
+        return [it for it in value if isinstance(it, dict)]
+    return []
+
+
+def _extract_image_from_product_data(product_data: Any, variant_id: Optional[str]) -> Optional[str]:
+    if not product_data:
+        return None
+    if isinstance(product_data, str):
+        try:
+            product_data = json.loads(product_data)
+        except Exception:
+            return None
+    if not isinstance(product_data, dict):
+        return None
+    vid = (variant_id or "").strip()
+    if vid:
+        variants = product_data.get("variants")
+        if isinstance(variants, list):
+            for v in variants:
+                if not isinstance(v, dict):
+                    continue
+                if str(v.get("variant_id") or v.get("id") or "").strip() == vid:
+                    img = str(v.get("image_url") or "").strip()
+                    if img:
+                        return img
+    img = str(product_data.get("image_url") or "").strip()
+    if img:
+        return img
+    images = product_data.get("images")
+    if isinstance(images, list) and images:
+        first = str(images[0] or "").strip()
+        return first or None
+    return None
+
+
+async def _fetch_product_cache(merchant_id: str, platform: str, platform_product_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        row = await database.fetch_one(
+            products_cache.select().where(
+                (products_cache.c.merchant_id == merchant_id)
+                & (products_cache.c.platform == platform)
+                & (products_cache.c.platform_product_id == platform_product_id)
+            )
+        )
+    except Exception:
+        return None
+    if not row:
+        return None
+    data = _row_get(row, "product_data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _prune_empty(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned: Dict[str, Any] = {}
+    for key, val in payload.items():
+        if val is None or val == "" or val == [] or val == {}:
+            continue
+        cleaned[key] = val
+    return cleaned
+
+
+async def _build_order_summary(
+    *,
+    merchant_id: str,
+    order_id: Optional[str],
+    subjects: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    oid = (order_id or "").strip()
+    if not oid:
+        return None
+
+    order = await get_order(oid)
+    if not order:
+        return None
+    order_mid = str(_row_get(order, "merchant_id") or "").strip()
+    if order_mid and order_mid != (merchant_id or "").strip():
+        return None
+
+    items = _coerce_items(_row_get(order, "items"))
+    order_platform = str(_first_present(order, ["platform", "order_platform", "source_platform"]) or "").strip().lower()
+    if not order_platform and subjects:
+        order_platform = str(subjects[0].get("platform") or "").strip().lower()
+
+    store = await get_primary_store(merchant_id)
+    merchant_name = str((store or {}).get("name") or "").strip() or str((store or {}).get("domain") or "").strip()
+    merchant_domain = str((store or {}).get("domain") or "").strip()
+    store_platform = str((store or {}).get("platform") or "").strip().lower()
+    if store_platform and not order_platform:
+        order_platform = store_platform
+
+    item_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for it in items:
+        pp = str(it.get("product_id") or it.get("platform_product_id") or "").strip()
+        if not pp:
+            continue
+        vid = str(it.get("variant_id") or "").strip()
+        item_map[(pp, vid)] = it
+
+    cache_by_product: Dict[str, Optional[Dict[str, Any]]] = {}
+    out_items: List[Dict[str, Any]] = []
+    for s in subjects:
+        pp = str(s.get("platform_product_id") or "").strip()
+        if not pp:
+            continue
+        vid = str(s.get("variant_id") or "").strip()
+        key = (pp, vid)
+        it = item_map.get(key) or item_map.get((pp, "")) or {}
+
+        title = str(
+            it.get("title")
+            or it.get("product_title")
+            or it.get("name")
+            or it.get("product_name")
+            or ""
+        ).strip()
+        variant_title = str(it.get("variant_title") or it.get("variant") or "").strip()
+        quantity = it.get("quantity")
+        if quantity is None:
+            quantity = it.get("qty") or it.get("count")
+        try:
+            quantity = int(quantity) if quantity is not None else None
+        except Exception:
+            quantity = None
+
+        image_url = str(it.get("image_url") or it.get("image") or it.get("imageUrl") or "").strip()
+
+        product_data = cache_by_product.get(pp)
+        if product_data is None and pp not in cache_by_product:
+            product_data = await _fetch_product_cache(merchant_id, order_platform or s.get("platform") or "", pp)
+            cache_by_product[pp] = product_data
+        if product_data:
+            if not title:
+                title = str(product_data.get("title") or "").strip()
+            if not image_url:
+                image_url = _extract_image_from_product_data(product_data, vid) or ""
+
+        out_items.append(
+            _prune_empty(
+                {
+                    "platform_product_id": pp,
+                    "variant_id": vid or None,
+                    "title": title,
+                    "variant_title": variant_title,
+                    "quantity": quantity,
+                    "image_url": image_url,
+                }
+            )
+        )
+
+    summary = _prune_empty(
+        {
+            "order_id": oid,
+            "order_number": _first_present(order, ["order_number", "number", "order_no"]),
+            "platform_order_id": _first_present(
+                order,
+                ["platform_order_id", "shopify_order_id", "external_order_id", "platform_id"],
+            ),
+            "status": _first_present(order, ["status", "fulfillment_status", "order_status"]),
+            "payment_status": _first_present(order, ["payment_status", "financial_status", "payment_state"]),
+            "created_at": _as_iso_datetime(
+                _first_present(order, ["created_at", "created_at_utc", "ordered_at", "placed_at"])
+            ),
+            "paid_at": _as_iso_datetime(_first_present(order, ["paid_at", "paid_at_utc", "captured_at"])),
+            "shipped_at": _as_iso_datetime(_first_present(order, ["shipped_at", "shipped_at_utc"])),
+            "delivered_at": _as_iso_datetime(_first_present(order, ["delivered_at", "delivered_at_utc"])),
+            "currency": _first_present(order, ["currency", "currency_code"]),
+            "total_price": _first_present(order, ["total_price", "total_amount", "grand_total"]),
+            "merchant": _prune_empty(
+                {
+                    "name": merchant_name,
+                    "domain": merchant_domain,
+                    "platform": order_platform,
+                }
+            ),
+            "items": out_items,
+        }
+    )
+
+    return summary or None
 
 
 def _signing_secret() -> bytes:
@@ -418,6 +627,7 @@ async def exchange_proof_for_submission_token(
     request: Request,
     proof_token: str,
     ttl_seconds: int,
+    order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not buyer_submit_enabled():
         raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
@@ -444,13 +654,21 @@ async def exchange_proof_for_submission_token(
     max_ttl = max(60, min(int(ttl_seconds or 900), 3600))
     exp = min(int(verified.exp), now + max_ttl)
 
-    return _mint_submission_token(
+    token_payload = _mint_submission_token(
         merchant_id=verified.merchant_id,
         subjects=list(verified.subjects),
         verification=verified.verification,
         ttl_seconds=max_ttl,
         exp_override=exp,
     )
+    order_summary = await _build_order_summary(
+        merchant_id=verified.merchant_id,
+        order_id=order_id,
+        subjects=verified.subjects,
+    )
+    if order_summary:
+        token_payload["order_summary"] = order_summary
+    return token_payload
 
 
 def issue_submission_token(

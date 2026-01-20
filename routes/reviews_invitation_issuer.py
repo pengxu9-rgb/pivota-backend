@@ -262,7 +262,7 @@ async def _create_shortlink(
     return None
 
 
-def _invitation_url_for_token(invitation_token: str) -> Optional[str]:
+def _invitation_url_for_token(invitation_token: str, *, order_id: Optional[str] = None) -> Optional[str]:
     base = _invitation_link_base_url().strip()
     if not base:
         return None
@@ -270,6 +270,10 @@ def _invitation_url_for_token(invitation_token: str) -> Optional[str]:
     t = (invitation_token or "").strip()
     if not t:
         return None
+    oid = (order_id or "").strip()
+    if oid:
+        joiner = "&" if "?" in b else "?"
+        return f"{b}{joiner}order_id={quote(oid, safe='')}#invitation_token={quote(t, safe='')}"
     return f"{b}#invitation_token={quote(t, safe='')}"
 
 
@@ -534,6 +538,7 @@ async def _mint_invitation_via_proof_issuer(
     subjects: List[Dict[str, Any]],
     ttl_seconds: int,
     verification: str,
+    order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     base = _proof_issuer_base_url().rstrip("/")
     key = _proof_issuer_internal_key()
@@ -571,7 +576,7 @@ async def _mint_invitation_via_proof_issuer(
         raise HTTPException(status_code=503, detail="PROOF_ISSUER_UNAVAILABLE")
 
     out: Dict[str, Any] = {"invitation_token": token, "expires_at": exp}
-    url = _invitation_url_for_token(token)
+    url = _invitation_url_for_token(token, order_id=order_id)
     if url:
         out["invitation_url"] = url
     return out
@@ -590,6 +595,7 @@ async def mint_invitations_from_paid_order(
     platform_product_id: Optional[str] = None,
     variant_id: Optional[str] = None,
     verification: str = "verified_buyer",
+    order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Core logic: extract product/variant subjects from an order and mint invitation tokens.
@@ -640,6 +646,7 @@ async def mint_invitations_from_paid_order(
     if not subjects:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
+    order_id_value = (order_id or "").strip() or str(order.get("order_id") or "").strip()
     out_items: List[Dict[str, Any]] = []
     for s in subjects:
         minted = await _mint_invitation_via_proof_issuer(
@@ -647,6 +654,7 @@ async def mint_invitations_from_paid_order(
             subjects=[s],
             ttl_seconds=int(ttl_seconds),
             verification=verification,
+            order_id=order_id_value,
         )
         out_items.append({"subject": s, **minted})
 
@@ -705,6 +713,7 @@ async def issue_invitation_from_order(
             platform_product_id=body.platform_product_id,
             variant_id=body.variant_id,
             verification="verified_buyer",
+            order_id=order_id,
         )
     except HTTPException as e:
         record_invitation_issue(result="error", reason=str(e.detail or "ERROR"), duration_seconds=time.monotonic() - t0)

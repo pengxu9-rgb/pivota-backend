@@ -58,6 +58,7 @@ async def buyer_issue_token(
 
 class ExchangeProofRequest(BaseModel):
     ttl_seconds: int = Field(900, ge=60, le=3600)
+    order_id: Optional[str] = None
 
 
 @router.post("/verification/exchange")
@@ -73,6 +74,7 @@ async def buyer_exchange_proof(
             request=request,
             proof_token=proof_token,
             ttl_seconds=int(body.ttl_seconds),
+            order_id=(body.order_id or "").strip() or None,
         )
         record_buyer_exchange(result="success", reason="ok", duration_seconds=(time.perf_counter() - start))
         return result
