@@ -55,14 +55,8 @@ async def get_metrics_summary(
 
         # Query real data from agent_usage_logs (agent-scoped or global)
         agent_filter = " AND agent_id = :agent_id" if agent_id else ""
-        params = {
-            "last_hour": last_hour,
-            "last_24h": last_24h,
-            "last_30d": last_30d,
-            "last_7d": now - timedelta(days=7),
-        }
-        if agent_id:
-            params["agent_id"] = agent_id
+        last_7d = now - timedelta(days=7)
+        agent_params = {"agent_id": agent_id} if agent_id else {}
         try:
             usage_row = await database.fetch_one(
                 f"""
@@ -77,7 +71,12 @@ async def get_metrics_summary(
                 FROM agent_usage_logs
                 WHERE 1=1 {agent_filter}
                 """,
-                params
+                {
+                    "last_hour": last_hour,
+                    "last_24h": last_24h,
+                    "last_7d": last_7d,
+                    **agent_params,
+                }
             )
             usage = dict(usage_row) if usage_row else {}
         except Exception as e:
@@ -102,7 +101,7 @@ async def get_metrics_summary(
                    GROUP BY endpoint 
                    ORDER BY count DESC 
                    LIMIT 5""",
-                {**params, "since": last_24h}
+                {"since": last_24h, **agent_params}
             )
             top_endpoints = [{"endpoint": row["endpoint"], "count": row["count"]} for row in top_endpoint_rows]
         except Exception as e:
@@ -118,7 +117,7 @@ async def get_metrics_summary(
                    GROUP BY status_code
                    ORDER BY count DESC
                    LIMIT 5""",
-                {**params, "since": last_24h}
+                {"since": last_24h, **agent_params}
             )
             errors = [{"status_code": row["status_code"], "count": row["count"]} for row in error_rows]
         except Exception as e:
@@ -141,7 +140,11 @@ async def get_metrics_summary(
                 WHERE (is_deleted IS NULL OR is_deleted = FALSE)
                   {agent_filter}
                 """,
-                params
+                {
+                    "last_24h": last_24h,
+                    "last_30d": last_30d,
+                    **agent_params,
+                }
             )
             orders = dict(orders_row) if orders_row else {}
         except Exception as e:
