@@ -1499,6 +1499,15 @@ async def create_shopify_order(order_id: str) -> bool:
         if not order:
             logger.error(f"[Shopify] Order {order_id} not found")
             return False
+
+        existing_shopify_order_id = str(order.get("shopify_order_id") or "").strip()
+        if existing_shopify_order_id:
+            logger.info(
+                "[Shopify] Order already linked (order_id=%s shopify_order_id=%s); skip create",
+                order_id,
+                existing_shopify_order_id,
+            )
+            return True
         
         logger.info(
             "[Shopify] Order data: merchant_id=%s items_count=%s has_email=%s",
