@@ -344,6 +344,10 @@ def _is_stale(last_checked_at: Optional[datetime]) -> bool:
     last_checked_at = _as_aware_utc(last_checked_at)
     if not last_checked_at:
         return True
+    # Some deployments return naive datetimes from the DB; normalize to UTC
+    # so comparisons against aware timestamps do not raise.
+    if last_checked_at.tzinfo is None:
+        last_checked_at = last_checked_at.replace(tzinfo=timezone.utc)
     return last_checked_at < (_now() - timedelta(days=MAX_AGE_DAYS))
 
 

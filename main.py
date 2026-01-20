@@ -428,6 +428,19 @@ else:
     allow_origin_regex = ".*"
     allow_origins = []
 
+# Add usage logging middleware (tracks Agent API calls)
+app.add_middleware(UsageLoggerMiddleware)
+
+# Add rate limiting middleware for agent API (env-configurable)
+app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_rpm)
+
+# Add structured logging middleware (logs all requests in JSON format)
+app.add_middleware(StructuredLoggingMiddleware)
+
+# Add unified error handler middleware (formats errors + includes request id)
+app.add_middleware(ErrorHandlerMiddleware)
+
+# CORS should be outermost so error responses still include headers.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -448,18 +461,6 @@ app.add_middleware(
 import logging
 logger = logging.getLogger(__name__)
 logger.info(f"🌐 CORS configured: allow_origins={allow_origins}, allow_origin_regex={allow_origin_regex}")
-
-# Add usage logging middleware (tracks Agent API calls)
-app.add_middleware(UsageLoggerMiddleware)
-
-# Add rate limiting middleware for agent API (env-configurable)
-app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_rpm)
-
-# Add structured logging middleware (logs all requests in JSON format)
-app.add_middleware(StructuredLoggingMiddleware)
-
-# Add unified error handler middleware (formats errors + includes request id)
-app.add_middleware(ErrorHandlerMiddleware)
 
 # Include available routers
 app.include_router(agent_router)

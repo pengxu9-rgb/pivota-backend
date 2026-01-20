@@ -241,16 +241,23 @@ async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
     if not dest_domain:
         return False
 
-    rows = await database.fetch_all(
-        select(outbound_link_allowed_domains.c.domain)
-        .where(
-            and_(
-                outbound_link_allowed_domains.c.market == market,
-                outbound_link_allowed_domains.c.status == "active",
+    try:
+        rows = await database.fetch_all(
+            select(outbound_link_allowed_domains.c.domain)
+            .where(
+                and_(
+                    outbound_link_allowed_domains.c.market == market,
+                    outbound_link_allowed_domains.c.status == "active",
+                )
             )
+            .order_by(outbound_link_allowed_domains.c.domain.asc())
         )
-        .order_by(outbound_link_allowed_domains.c.domain.asc())
-    )
+    except Exception as exc:
+        # Degrade gracefully if allowlist table is missing in a given environment.
+        msg = str(exc)
+        if "outbound_link_allowed_domains" in msg and ("does not exist" in msg or "UndefinedTable" in msg):
+            return True
+        raise
     allowed = [str(dict(r).get("domain") or "").strip().lower() for r in rows]
     allowed = [d for d in allowed if d]
     if not allowed:
