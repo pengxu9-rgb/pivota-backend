@@ -4,11 +4,12 @@ Pivota 核心业务流程：Agent 下单 → 支付 → 履约
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store, get_store_by_id
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, Header, status
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from urllib.parse import urlencode
+import asyncio
 import time
 import hashlib
 import httpx
@@ -27,7 +28,7 @@ from db.orders import (
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from db.database import database
-from utils.auth import require_admin, get_current_user
+from utils.auth import require_admin, get_current_user, decode_token
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
@@ -57,6 +58,30 @@ from routes.reviews_invitation_issuer import (
 from services.reviews_invitation_send_jobs_service import (
     enqueue_invitation_send_job_from_order as enqueue_reviews_invitation_send_job_from_order,
 )
+
+
+async def require_admin_or_key(
+    authorization: Optional[str] = Header(None),
+    x_admin_key: Optional[str] = Header(None, alias="X-ADMIN-KEY"),
+) -> Dict[str, Any]:
+    """
+    Allow either:
+    - Admin JWT (Authorization: Bearer ...), or
+    - Internal admin key (X-ADMIN-KEY) for operational/debug endpoints.
+
+    Note: keep this dependency narrowly scoped to internal helper endpoints.
+    """
+    expected = (os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip()
+    if expected and x_admin_key and x_admin_key == expected:
+        return {"role": "admin", "sub": "admin_key"}
+
+    if authorization and authorization.startswith("Bearer "):
+        payload = decode_token(authorization[7:])
+        if payload.get("role") in {"admin", "super_admin"}:
+            return payload
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -1632,7 +1657,7 @@ async def create_shopify_order(order_id: str) -> bool:
             if external_payment_ref:
                 txn["authorization"] = external_payment_ref
             transactions_payload = [txn]
-        
+
         shopify_order_data = {
             "order": {
                 # Email is required for receipts; keep optional in payload in case a legacy order row is missing it.
@@ -1652,7 +1677,7 @@ async def create_shopify_order(order_id: str) -> bool:
                 # Many templates reference billing_address.* for the buyer identity.
                 "billing_address": shopify_shipping,
                 "note": f"Pivota Order ID: {order_id}",
-                "tags": "pivota,agent-order"
+                "tags": f"pivota,agent-order,pivota_order_id:{order_id}",
             }
         }
         
@@ -1673,7 +1698,8 @@ async def create_shopify_order(order_id: str) -> bool:
         )
         
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=shopify_order_data, headers=headers, timeout=10.0)
+            request_payload: Dict[str, Any] = shopify_order_data
+            response = await client.post(url, json=request_payload, headers=headers, timeout=10.0)
             # Some Shopify configurations may reject embedded transactions on order create.
             # Fall back to creating the order without transactions to preserve fulfillment,
             # then the post-create reconciliation will attempt to add a transaction.
@@ -1681,9 +1707,26 @@ async def create_shopify_order(order_id: str) -> bool:
                 try:
                     retry_payload = {"order": dict(shopify_order_data["order"])}
                     retry_payload["order"].pop("transactions", None)
-                    response = await client.post(url, json=retry_payload, headers=headers, timeout=10.0)
+                    request_payload = retry_payload
+                    response = await client.post(url, json=request_payload, headers=headers, timeout=10.0)
                 except Exception:
                     pass
+
+            # Retry once for clearly transient Shopify errors (rate limit / 5xx).
+            if response.status_code in {429, 500, 502, 503, 504}:
+                delay_s = 1.0
+                retry_after = (response.headers.get("Retry-After") or response.headers.get("retry-after") or "").strip()
+                if retry_after.isdigit():
+                    delay_s = float(min(max(int(retry_after), 1), 5))
+                logger.warning(
+                    "[Shopify] Transient response=%s retry_after=%s; retrying in %.1fs order_id=%s",
+                    response.status_code,
+                    retry_after or None,
+                    delay_s,
+                    order_id,
+                )
+                await asyncio.sleep(delay_s)
+                response = await client.post(url, json=request_payload, headers=headers, timeout=10.0)
             
             logger.info(f"[Shopify] API response: {response.status_code}")
             
@@ -1749,7 +1792,6 @@ async def create_shopify_order(order_id: str) -> bool:
                     }
                 )
                 return False
-                
     except Exception as e:
         logger.error(f"[Shopify] ❌ Exception in create_shopify_order: {type(e).__name__}: {e}", exc_info=True)
         
@@ -1824,7 +1866,7 @@ async def debug_order_data(
 @router.post("/{order_id}/create-shopify")
 async def trigger_shopify_order(
     order_id: str,
-    current_user: dict = Depends(require_admin)
+    _: dict = Depends(require_admin_or_key)
 ):
     """Manually trigger Shopify order creation for debugging"""
     order = await get_order(order_id)

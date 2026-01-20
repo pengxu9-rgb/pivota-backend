@@ -1881,45 +1881,64 @@ async def agent_confirm_payment(
         if not context.can_access_merchant(order["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized for this order")
         
-        # 检查是否已支付
-        if order.get("payment_status") == "paid":
-            return {"status": "success", "message": "Order already paid"}
-        
-        # 标记订单已支付
-        await mark_order_paid(order_id)
-
-        # PCS: freeze order snapshot evidence (best-effort; does not block confirm)
-        try:
-            await create_order_snapshot_evidence_pack(order_id, triggered_by="agent_confirm_payment")
-        except Exception as e:
-            logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
-        
-        # [Phase 6.2] 自动触发 commission 计算
-        if order.get("agent_id"):
-            async def trigger_commission():
-                try:
-                    from services.order_commission_service import OrderCommissionService
-                    from db.database import database
-                    service = OrderCommissionService(database)
-                    await service.calculate_commission_for_order(order_id)
-                    logger.info(f"✅ Commission auto-calculated for order {order_id}")
-                except Exception as e:
-                    logger.error(f"Commission auto-calculation failed for {order_id}: {e}")
-            
-            background_tasks.add_task(trigger_commission)
-        
-        # 记录支付成功事件
-        await log_order_event(
-            event_type="payment_succeeded",
-            order_id=order_id,
-            merchant_id=order["merchant_id"],
-            metadata={
-                "payment_intent_id": order.get("payment_intent_id"),
-                "amount": float(order["total"]),
-                "currency": order["currency"],
-                "confirmed_by": "agent"
+        already_paid = order.get("payment_status") == "paid"
+        if already_paid and order.get("shopify_order_id"):
+            return {
+                "status": "success",
+                "message": "Order already paid",
+                "order_id": order_id,
+                "shopify_sync": "already_exists",
+                "shopify_order_id": order.get("shopify_order_id"),
             }
-        )
+        
+        if not already_paid:
+            # 标记订单已支付
+            await mark_order_paid(order_id)
+
+            # PCS: freeze order snapshot evidence (best-effort; does not block confirm)
+            try:
+                await create_order_snapshot_evidence_pack(order_id, triggered_by="agent_confirm_payment")
+            except Exception as e:
+                logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
+        
+            # [Phase 6.2] 自动触发 commission 计算
+            if order.get("agent_id"):
+                async def trigger_commission():
+                    try:
+                        from services.order_commission_service import OrderCommissionService
+                        from db.database import database
+                        service = OrderCommissionService(database)
+                        await service.calculate_commission_for_order(order_id)
+                        logger.info(f"✅ Commission auto-calculated for order {order_id}")
+                    except Exception as e:
+                        logger.error(f"Commission auto-calculation failed for {order_id}: {e}")
+                
+                background_tasks.add_task(trigger_commission)
+        
+            # 记录支付成功事件
+            await log_order_event(
+                event_type="payment_succeeded",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={
+                    "payment_intent_id": order.get("payment_intent_id"),
+                    "amount": float(order["total"]),
+                    "currency": order["currency"],
+                    "confirmed_by": "agent"
+                }
+            )
+        else:
+            # Order is already paid, but we still want to (re)attempt Shopify order creation
+            # when shopify_order_id is missing (e.g., prior sync failed).
+            try:
+                await log_order_event(
+                    event_type="shopify_sync_retry_requested",
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                    metadata={"requested_by": "agent_confirm_payment"},
+                )
+            except Exception:
+                pass
         
         # 获取商户信息用于 Shopify 同步
         merchant = await get_merchant_onboarding(order["merchant_id"])
@@ -1932,6 +1951,11 @@ async def agent_confirm_payment(
             """创建 Shopify 订单通知商户发货"""
             try:
                 logger.info(f"[Background] Starting Shopify order creation for {order_id}")
+
+                latest = await get_order(order_id)
+                if latest and latest.get("shopify_order_id"):
+                    logger.info(f"[Background] Shopify order already exists for {order_id}; skip")
+                    return
                 
                 # 获取主店铺信息以决定是否同步到 Shopify
                 store_info = await get_primary_store(order["merchant_id"])
@@ -1969,7 +1993,7 @@ async def agent_confirm_payment(
         
         return {
             "status": "success",
-            "message": "Payment confirmed, Shopify order creation initiated",
+            "message": "Payment confirmed, Shopify order creation initiated" if not already_paid else "Shopify order creation initiated",
             "order_id": order_id,
             "payment_intent_id": order.get("payment_intent_id"),
             "shopify_sync": "initiated" if merchant and True else "not_configured"
@@ -1978,6 +2002,8 @@ async def agent_confirm_payment(
     except HTTPException:
         raise
     except Exception as e:
+        if is_asyncpg_busy_error(e):
+            raise db_busy_http_exception()
         logger.error(f"Agent payment confirmation error: {e}")
         raise HTTPException(status_code=500, detail=f"Payment confirmation failed: {str(e)}")
 
