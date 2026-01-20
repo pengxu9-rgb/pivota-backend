@@ -15,6 +15,12 @@ from models.order_response import format_order_for_response
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Payment status normalization:
+# - "status" is the order lifecycle (pending/completed/fulfilled/etc.)
+# - "payment_status" is the payment lifecycle (unpaid/pending/paid/etc.)
+# Merchant dashboards should treat revenue as "paid/confirmed" only.
+PAID_PAYMENT_STATUSES_SQL = "('paid','completed','succeeded','success','settled','partially_refunded')"
+
 # Demo data for merchant dashboard
 DEMO_MERCHANT_DATA = {
     "merch_208139f7600dbf42": {
@@ -140,9 +146,9 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
         stats_query = """
             SELECT 
                 COUNT(*) as total_orders,
-                COALESCE(SUM(amount), 0) as total_revenue
+                COALESCE(SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as total_revenue
             FROM orders
-            WHERE merchant_id = :merchant_id
+            WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
         """
         stats = await database.fetch_one(stats_query, {"merchant_id": merchant_id})
         
@@ -500,13 +506,16 @@ async def get_merchant_analytics(
         # Get analytics from real orders
         analytics_query = """
             SELECT 
-                COUNT(*) as total_orders,
-                COALESCE(SUM(total), 0) as total_revenue,
-                COALESCE(AVG(total), 0) as avg_order_value,
+                COUNT(*) as total_orders_all_time,
+                COALESCE(SUM(total), 0) as gmv_all_time,
+                COALESCE(SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_all_time,
+                SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_all_time,
+                COALESCE(AVG(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE NULL END), 0) as avg_order_value_all_time,
                 COUNT(DISTINCT customer_email) as total_customers,
-                SUM(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 ELSE 0 END) as successful_orders,
                 SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
-                SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END) as revenue_last_30_days
+                COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END), 0) as gmv_last_30_days,
+                SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_last_30_days,
+                COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_last_30_days
             FROM orders
             WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
         """
@@ -538,8 +547,14 @@ async def get_merchant_analytics(
             SELECT 
                 COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days' 
                           AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as orders_prev_30,
-                SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days' 
-                        AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END) as revenue_prev_30
+                COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days' 
+                        AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END), 0) as gmv_prev_30,
+                SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
+                        AND created_at < CURRENT_DATE - INTERVAL '30 days'
+                        AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_prev_30,
+                COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days' 
+                        AND created_at < CURRENT_DATE - INTERVAL '30 days'
+                        AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_prev_30
             FROM orders
             WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
         """
@@ -547,21 +562,33 @@ async def get_merchant_analytics(
         
         order_growth = 0
         revenue_growth = 0
+        gmv_growth = 0
         
         if growth and analytics:
             orders_prev_30 = growth["orders_prev_30"] or 0
-            revenue_prev_30 = float(growth["revenue_prev_30"] or 0)
             orders_last_30 = analytics["orders_last_30_days"] or 0
-            revenue_last_30 = float(analytics["revenue_last_30_days"] or 0)
+            confirmed_revenue_prev_30 = float(growth["confirmed_revenue_prev_30"] or 0)
+            confirmed_revenue_last_30 = float(analytics["confirmed_revenue_last_30_days"] or 0)
+            gmv_prev_30 = float(growth["gmv_prev_30"] or 0)
+            gmv_last_30 = float(analytics["gmv_last_30_days"] or 0)
 
             if orders_prev_30 > 0:
                 order_growth = ((orders_last_30 - orders_prev_30) / orders_prev_30) * 100
-            if revenue_prev_30 > 0:
-                revenue_growth = ((revenue_last_30 - revenue_prev_30) / revenue_prev_30) * 100
+            if confirmed_revenue_prev_30 > 0:
+                revenue_growth = ((confirmed_revenue_last_30 - confirmed_revenue_prev_30) / confirmed_revenue_prev_30) * 100
+            if gmv_prev_30 > 0:
+                gmv_growth = ((gmv_last_30 - gmv_prev_30) / gmv_prev_30) * 100
         
         # Calculate Analytics rates
-        total_orders = analytics["total_orders"] if analytics else 0
-        successful_orders = analytics["successful_orders"] if analytics else 0
+        total_orders_all_time = analytics["total_orders_all_time"] if analytics else 0
+        paid_orders_all_time = analytics["paid_orders_all_time"] if analytics else 0
+        gmv_all_time = float(analytics["gmv_all_time"] or 0) if analytics else 0.0
+        confirmed_revenue_all_time = float(analytics["confirmed_revenue_all_time"] or 0) if analytics else 0.0
+
+        total_orders = analytics["orders_last_30_days"] if analytics else 0
+        paid_orders = analytics["paid_orders_last_30_days"] if analytics else 0
+        gmv = float(analytics["gmv_last_30_days"] or 0) if analytics else 0.0
+        confirmed_revenue = float(analytics["confirmed_revenue_last_30_days"] or 0) if analytics else 0.0
         
         # Order Generation Rate: (orders created / total attempts) * 100
         # For now, assume total_orders = attempts
@@ -571,25 +598,43 @@ async def get_merchant_analytics(
         order_placement_rate = 100.0 if total_orders > 0 else 0.0
         
         # Payment Success Rate: (paid orders / total orders) * 100
-        payment_success_rate = round((successful_orders / total_orders * 100), 1) if total_orders > 0 else 0.0
+        payment_success_rate = round((paid_orders / total_orders * 100), 1) if total_orders > 0 else 0.0
+
+        average_order_value = round((confirmed_revenue / paid_orders), 2) if paid_orders > 0 else 0.0
         
         # Format response
         data = {
             "total_orders": total_orders,
-            "total_revenue": float(analytics["total_revenue"]) if analytics else 0,
+            "total_revenue": confirmed_revenue,
             "total_customers": analytics["total_customers"] if analytics else 0,
-            "average_order_value": float(analytics["avg_order_value"]) if analytics else 0,
+            "average_order_value": average_order_value,
             "order_growth": round(order_growth, 1),
             "revenue_growth": round(revenue_growth, 1),
+            "gmv_growth": round(gmv_growth, 1),
             "recent_orders": recent_orders,
-            "conversion_rate": round((successful_orders / total_orders * 100), 1) if total_orders > 0 else 0,
+            "conversion_rate": payment_success_rate,
             # Analytics page specific fields
             "order_generation_rate": order_generation_rate,
             "total_order_attempts": total_orders,
             "order_placement_rate": order_placement_rate,
             "total_orders_placed": total_orders,
             "payment_success_rate": payment_success_rate,
-            "total_payments_succeeded": successful_orders
+            "total_payments_succeeded": paid_orders,
+            # Explicit breakdowns (avoid ambiguous "total_revenue" semantics)
+            "order_breakdown": {
+                "total": total_orders,
+                "paid": paid_orders,
+                "all_time_total": total_orders_all_time,
+                "all_time_paid": paid_orders_all_time,
+            },
+            "revenue_breakdown": {
+                "confirmed": confirmed_revenue,
+                "gmv": gmv,
+                "all_time_confirmed": confirmed_revenue_all_time,
+                "all_time_gmv": gmv_all_time,
+            },
+            "confirmed_revenue": confirmed_revenue,
+            "gmv": gmv,
         }
         
         # Get actual product count from products_cache (only non-expired)
