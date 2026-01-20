@@ -97,6 +97,26 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _now_db() -> datetime:
+    """
+    Return a DB-safe datetime for columns that may be `timestamp` (without tz) in some environments.
+
+    We have seen production tables drift from `timestamptz` to `timestamp` historically; asyncpg
+    will error if an offset-aware datetime is bound to a `timestamp` column.
+    """
+    return _now().replace(tzinfo=None)
+
+
+def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    try:
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return dt
+
 def _parse_price(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
@@ -310,7 +330,7 @@ def _row_to_snapshot(row: Dict[str, Any]) -> ExternalOfferSnapshot:
         price_amount=float(row["price_amount"]) if row.get("price_amount") is not None else None,
         price_currency=row.get("price_currency"),
         availability=row.get("availability") or "unknown",
-        last_checked_at=row.get("last_checked_at"),
+        last_checked_at=_as_aware_utc(row.get("last_checked_at")),
         evidence=row.get("evidence"),
         override_title=row.get("override_title"),
         override_brand=row.get("override_brand"),
@@ -321,6 +341,7 @@ def _row_to_snapshot(row: Dict[str, Any]) -> ExternalOfferSnapshot:
 
 
 def _is_stale(last_checked_at: Optional[datetime]) -> bool:
+    last_checked_at = _as_aware_utc(last_checked_at)
     if not last_checked_at:
         return True
     return last_checked_at < (_now() - timedelta(days=MAX_AGE_DAYS))
@@ -350,6 +371,7 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
 
         rid = f"eo_{url_hash[:24]}"
         now = _now()
+        now_db = _now_db()
         evidence = {"provider": extracted.get("evidence_provider") or "manual", "fetchedAt": now.isoformat(), "snapshotId": (existing or {}).get("id") or rid}
         if existing:
             stmt = (
@@ -365,8 +387,8 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
                     price_currency=currency,
                     availability=extracted.get("availability") or "unknown",
                     evidence=evidence,
-                    last_checked_at=now,
-                    updated_at=now,
+                    last_checked_at=now_db,
+                    updated_at=now_db,
                 )
             )
             await database.execute(stmt)
@@ -386,7 +408,7 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
                     "price_currency": currency,
                     "availability": extracted.get("availability") or "unknown",
                     "evidence": evidence,
-                    "last_checked_at": now,
+                    "last_checked_at": now_db,
                 },
             )
 

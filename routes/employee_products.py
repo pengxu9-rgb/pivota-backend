@@ -13,6 +13,7 @@ NOTE (v0):
 from typing import Any, Dict, List, Optional
 import json
 import hashlib
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -302,7 +303,27 @@ async def preview_external_seed(
     try:
         snapshot = await resolve_external_offer(market=market, url=dest, force_refresh=bool(body.force_refresh))
     except Exception as exc:
-        return {"status": "degraded", "error": f"snapshot_failed: {str(exc)[:200]}", "preview": {"url": dest}}
+        parsed = urlparse(dest)
+        domain = parsed.hostname or None
+        path_tail = (parsed.path or "").rstrip("/").split("/")[-1]
+        guess = path_tail.replace("-", " ").replace("_", " ").strip()
+        guess_title = guess.title() if guess else None
+        return {
+            "status": "degraded",
+            "error": f"snapshot_failed: {str(exc)[:200]}",
+            "preview": {
+                "url": dest,
+                "canonical_url": dest,
+                "domain": domain,
+                "external_product_id": _stable_external_product_id(dest),
+                "title": guess_title,
+                "image_url": None,
+                "price_amount": None,
+                "price_currency": None,
+                "availability": None,
+                "domain_allowed": True,
+            },
+        }
 
     canonical_url = getattr(snapshot, "canonical_url", None) or dest
     domain = getattr(snapshot, "domain", None)
