@@ -257,6 +257,7 @@ from routes.outbound_links import router as outbound_links_router
 from routes.external_offers import router as external_offers_router
 from routes.prometheus_metrics import router as prometheus_metrics_router
 from routes.employee_reviews import router as employee_reviews_router
+from routes.employee_products import router as employee_products_router
 from routes.buyer_reviews import router as buyer_reviews_router
 from routes.reviews_invitation_issuer import router as reviews_invitation_issuer_router
 from routes.reviews_invitation_shortlink import router as reviews_invitation_shortlink_router
@@ -562,6 +563,7 @@ app.include_router(admin_cleanup_router)  # Admin cleanup (no auth)
 app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
 app.include_router(employee_finance_router)  # Employee finance endpoints
+app.include_router(employee_products_router)  # Employee products endpoints (MVP)
 app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
 app.include_router(employee_reviews_router)  # Employee Reviews Center (imports/governance)
