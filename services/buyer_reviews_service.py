@@ -16,7 +16,6 @@ import httpx
 from fastapi import HTTPException, Request
 
 from db.database import database
-from db.orders import get_order
 from db.products import products_cache
 from db.reviews_center import buyer_review_idempotency_keys, buyer_review_ownership, buyer_review_submission_jtis, media_assets, product_reviews
 from services.merchant_store_service import get_primary_store
@@ -174,6 +173,7 @@ async def _build_order_summary(
     oid = (order_id or "").strip()
     if not oid:
         return None
+    from db.orders import get_order
 
     order = await get_order(oid)
     if not order:
