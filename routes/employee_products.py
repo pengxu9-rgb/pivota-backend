@@ -11,6 +11,7 @@ NOTE (v0):
 """
 
 from typing import Any, Dict, List, Optional
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -32,12 +33,45 @@ from services.outbound_links_service import (
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
+def _to_iso(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    try:
+        iso = getattr(val, "isoformat", None)
+        if callable(iso):
+            return iso()
+    except Exception:
+        pass
+    try:
+        return str(val)
+    except Exception:
+        return None
+
+
+def _ensure_dict(val: Any) -> Dict[str, Any]:
+    """
+    products_cache.product_data is expected to be JSON, but some environments may store it as a JSON string.
+    Normalize to a dict so downstream parsing doesn't 500.
+    """
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
 
 def _as_product_card(row: Dict[str, Any]) -> Dict[str, Any]:
     merchant_id = row.get("merchant_id")
     platform = row.get("platform")
     platform_product_id = row.get("platform_product_id")
-    product_data = row.get("product_data") or {}
+    product_data = _ensure_dict(row.get("product_data"))
 
     try:
         sp = StandardProduct.parse_obj(product_data)
@@ -65,8 +99,8 @@ def _as_product_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "image_url": image_url,
         "variants_count": len(variants) if isinstance(variants, list) else 0,
         "price": {"value": price, "currency": currency},
-        "cached_at": row.get("cached_at").isoformat() if row.get("cached_at") else None,
-        "expires_at": row.get("expires_at").isoformat() if row.get("expires_at") else None,
+        "cached_at": _to_iso(row.get("cached_at")),
+        "expires_at": _to_iso(row.get("expires_at")),
     }
 
 async def _ensure_external_seeds_table() -> None:
@@ -565,13 +599,20 @@ async def search_products(
     else:
         rows = await database.fetch_all(f"{base}{clause}{order_limit}", values)
 
-    cards = [_as_product_card(dict(r)) for r in rows]
+    cards: List[Dict[str, Any]] = []
+    debug_errors: List[str] = []
+    for r in rows:
+        try:
+            cards.append(_as_product_card(dict(r)))
+        except Exception as exc:
+            debug_errors.append(f"card_parse_failed: {str(exc)}")
     next_after_id = int(rows[-1]["id"]) if rows else None
 
     return {
-        "status": "success",
+        "status": "degraded" if debug_errors else "success",
         "items": cards,
         "next": {"after_id": next_after_id},
+        **({"debug_errors": debug_errors[:10]} if debug_errors else {}),
     }
 
 
@@ -599,7 +640,7 @@ async def get_product_by_key(
         raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
 
     row = dict(row)
-    product_data = row.get("product_data") or {}
+    product_data = _ensure_dict(row.get("product_data"))
 
     # Parse best-effort StandardProduct for normalized fields, but return the raw JSON as well.
     try:
@@ -614,8 +655,8 @@ async def get_product_by_key(
         "merchant_id": merchant_id,
         "platform": platform,
         "platform_product_id": platform_product_id,
-        "cached_at": row.get("cached_at").isoformat() if row.get("cached_at") else None,
-        "expires_at": row.get("expires_at").isoformat() if row.get("expires_at") else None,
+        "cached_at": _to_iso(row.get("cached_at")),
+        "expires_at": _to_iso(row.get("expires_at")),
         "product": normalized,
         "raw": product_data,
         # v0 placeholders for the employee page; these will be replaced by rollups/index later.
