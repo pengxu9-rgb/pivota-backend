@@ -284,6 +284,53 @@ class UpdateExternalSeedRequest(BaseModel):
     variants: Optional[List[Dict[str, Any]]] = None
 
 
+class PreviewExternalSeedRequest(BaseModel):
+    destination_url: str = Field(..., min_length=1)
+    market: Optional[str] = None
+    force_refresh: bool = False
+
+
+@router.post("/external-seeds/preview")
+async def preview_external_seed(
+    body: PreviewExternalSeedRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    market = _normalize_market(body.market)
+    dest = _require_http_url(body.destination_url)
+
+    snapshot = None
+    try:
+        snapshot = await resolve_external_offer(market=market, url=dest, force_refresh=bool(body.force_refresh))
+    except Exception as exc:
+        return {"status": "degraded", "error": f"snapshot_failed: {str(exc)[:200]}", "preview": {"url": dest}}
+
+    canonical_url = getattr(snapshot, "canonical_url", None) or dest
+    domain = getattr(snapshot, "domain", None)
+
+    # Preview is best-effort and does not persist anything.
+    domain_allowed = True
+    try:
+        domain_allowed = await _is_domain_allowed(market=market, destination_url=canonical_url)
+    except Exception:
+        domain_allowed = True
+
+    return {
+        "status": "success",
+        "preview": {
+            "url": dest,
+            "canonical_url": canonical_url,
+            "domain": domain,
+            "external_product_id": _stable_external_product_id(canonical_url),
+            "title": getattr(snapshot, "title", None),
+            "image_url": getattr(snapshot, "image_url", None),
+            "price_amount": getattr(snapshot, "price_amount", None),
+            "price_currency": getattr(snapshot, "price_currency", None),
+            "availability": getattr(snapshot, "availability", None),
+            "domain_allowed": domain_allowed,
+        },
+    }
+
+
 @router.get("/external-seeds")
 async def list_external_seeds(
     q: Optional[str] = Query(default=None),
