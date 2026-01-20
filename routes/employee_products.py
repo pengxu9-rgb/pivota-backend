@@ -196,6 +196,30 @@ def _ensure_json_obj(val: Any) -> Dict[str, Any]:
     return {}
 
 
+_SEED_DATA_FORCE_TEXT = False
+
+
+def _seed_data_payload(seed_data: Dict[str, Any]) -> Any:
+    if _SEED_DATA_FORCE_TEXT:
+        return json.dumps(seed_data)
+    return seed_data
+
+
+async def _execute_seed_data_stmt(query: str, values: Dict[str, Any]) -> None:
+    global _SEED_DATA_FORCE_TEXT
+    try:
+        await database.execute(query, values)
+    except Exception as exc:
+        msg = str(exc)
+        if not _SEED_DATA_FORCE_TEXT and "expected str" in msg and "seed_data" in msg:
+            _SEED_DATA_FORCE_TEXT = True
+            retry_values = dict(values)
+            retry_values["seed_data"] = json.dumps(values.get("seed_data") or {})
+            await database.execute(query, retry_values)
+            return
+        raise
+
+
 def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     variants = seed_data.get("variants")
     if isinstance(variants, list):
@@ -514,7 +538,7 @@ async def create_external_seed(
         },
     }
 
-    await database.execute(
+    await _execute_seed_data_stmt(
         """
         INSERT INTO external_product_seeds (
           id, market, tool, utm_template, partner_type, disclosure_text,
@@ -545,7 +569,7 @@ async def create_external_seed(
             "price_amount": price_amount,
             "price_currency": price_currency,
             "availability": availability,
-            "seed_data": seed_data,
+            "seed_data": _seed_data_payload(seed_data),
             "notes": body.notes,
             "created_by_employee_id": str(employee_id) if employee_id else None,
             "attached_product_key": attached_product_key,
@@ -738,11 +762,11 @@ async def update_external_seed(
         updates["availability"] = body.availability
         set_clauses.append("availability = :availability")
 
-    updates["seed_data"] = seed_data
+    updates["seed_data"] = _seed_data_payload(seed_data)
     set_clauses.append("seed_data = :seed_data")
     set_clauses.append("updated_at = NOW()")
 
-    await database.execute(
+    await _execute_seed_data_stmt(
         f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
         updates,
     )
@@ -803,7 +827,7 @@ async def refresh_external_seed(
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
 
-    await database.execute(
+    await _execute_seed_data_stmt(
         """
         UPDATE external_product_seeds
         SET canonical_url = :canonical_url,
@@ -826,7 +850,7 @@ async def refresh_external_seed(
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
-            "seed_data": seed_data,
+            "seed_data": _seed_data_payload(seed_data),
         },
     )
     redirect_url = await _make_redirect_url(
