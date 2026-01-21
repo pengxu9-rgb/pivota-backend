@@ -25,6 +25,7 @@ import mimetypes
 from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
@@ -626,6 +627,163 @@ def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return variants
 
 
+def _seed_domain_from_url(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return ""
+    host = (parsed.netloc or "").strip()
+    if not host:
+        return ""
+    if "@" in host:
+        host = host.split("@")[-1]
+    if ":" in host:
+        host = host.split(":")[0]
+    return host.lower()
+
+
+def _format_domain_display_name(domain: str) -> str:
+    host = (domain or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for prefix in ("m.", "shop.", "store."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+            break
+    if not host:
+        return "Official Site"
+    label = host.split(".")[0]
+    label = re.sub(r"[^a-z0-9]+", " ", label).strip()
+    if not label:
+        return "Official Site"
+    name = " ".join(part.capitalize() for part in label.split())
+    return f"{name} Official Site"
+
+
+def _external_seed_display_name(row: Dict[str, Any], seed_data: Dict[str, Any]) -> str:
+    for key in ("merchant_name", "brand", "vendor", "store_name"):
+        raw = row.get(key) or seed_data.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    domain = (
+        row.get("domain")
+        or seed_data.get("domain")
+        or _seed_domain_from_url(seed_data.get("canonical_url") or seed_data.get("destination_url"))
+        or _seed_domain_from_url(row.get("canonical_url") or row.get("destination_url"))
+    )
+    return _format_domain_display_name(str(domain))
+
+
+def _normalize_offer_title(text: str) -> str:
+    if not text:
+        return ""
+    ascii_text = _strip_accents(text.lower())
+    ascii_text = re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
+    return ascii_text
+
+
+def _offer_price_key(price: Any) -> Optional[int]:
+    if price is None:
+        return None
+    try:
+        value = float(price)
+    except Exception:
+        return None
+    if value <= 0:
+        return None
+    return int(round(value * 100))
+
+
+def _build_offer_keys(title: str, price: Any, currency: str, vendor: Optional[str]) -> set[str]:
+    keys: set[str] = set()
+    title_key = _normalize_offer_title(title)
+    if not title_key:
+        return keys
+    currency_key = (currency or "USD").upper()
+    price_key = _offer_price_key(price)
+    base = f"{title_key}|{currency_key}|{price_key}" if price_key is not None else f"{title_key}|{currency_key}"
+    keys.add(base)
+    if vendor:
+        vendor_key = _normalize_offer_title(vendor)
+        if vendor_key:
+            keys.add(
+                f"{title_key}|{vendor_key}|{currency_key}|{price_key}"
+                if price_key is not None
+                else f"{title_key}|{vendor_key}|{currency_key}"
+            )
+    return keys
+
+
+def _collect_internal_offer_keys(items: List[Any]) -> tuple[set[str], set[str]]:
+    offer_keys: set[str] = set()
+    ids: set[str] = set()
+    for item in items:
+        if isinstance(item, StandardProduct):
+            title = item.title or ""
+            price = item.price
+            currency = item.currency or "USD"
+            vendor = item.vendor
+            if item.product_id:
+                ids.add(str(item.product_id))
+            if item.id:
+                ids.add(str(item.id))
+            for v in item.variants or []:
+                vid = getattr(v, "variant_id", None) or getattr(v, "id", None)
+                if vid:
+                    ids.add(str(vid))
+            offer_keys.update(_build_offer_keys(title, price, currency, vendor))
+        elif isinstance(item, dict):
+            title = item.get("title") or item.get("name") or ""
+            price = item.get("price")
+            if isinstance(price, dict):
+                price = price.get("amount") or price.get("value")
+            currency = item.get("currency") or item.get("price", {}).get("currency") or "USD"
+            vendor = item.get("vendor") or item.get("brand")
+            pid = item.get("product_id") or item.get("id")
+            if pid:
+                ids.add(str(pid))
+            for v in item.get("variants") or []:
+                if isinstance(v, dict):
+                    vid = v.get("variant_id") or v.get("id") or v.get("sku")
+                else:
+                    vid = getattr(v, "variant_id", None) or getattr(v, "id", None)
+                if vid:
+                    ids.add(str(vid))
+            offer_keys.update(_build_offer_keys(title, price, currency, vendor))
+    return offer_keys, ids
+
+
+def _filter_external_seed_wrappers(
+    wrappers: list[dict[str, Any]],
+    offer_keys: set[str],
+    internal_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not wrappers:
+        return []
+    filtered: list[dict[str, Any]] = []
+    for wrapper in wrappers:
+        product = wrapper.get("product") or {}
+        if not isinstance(product, dict):
+            filtered.append(wrapper)
+            continue
+        if product.get("attached_product_key") or product.get("attached_variant_id"):
+            continue
+        external_id = product.get("product_id") or product.get("external_product_id")
+        if external_id and str(external_id) in internal_ids:
+            continue
+        title = product.get("title") or ""
+        price = product.get("price")
+        currency = product.get("currency") or "USD"
+        vendor = product.get("vendor") or product.get("brand") or product.get("merchant_name")
+        external_keys = _build_offer_keys(str(title), price, str(currency), str(vendor) if vendor else None)
+        if external_keys and offer_keys.intersection(external_keys):
+            continue
+        filtered.append(wrapper)
+    return filtered
+
+
 async def _make_external_redirect_url(
     *,
     market: str,
@@ -665,6 +823,7 @@ def _external_seed_to_shop_product(
     price_currency = row.get("price_currency") or seed_data.get("price_currency") or "USD"
     availability = row.get("availability") or seed_data.get("availability") or "unknown"
     variants = _normalize_seed_variants(seed_data)
+    merchant_name = _external_seed_display_name(row, seed_data)
     external_product_id = seed_data.get("external_product_id") or _stable_external_product_id(
         row.get("canonical_url") or row.get("destination_url")
     )
@@ -677,6 +836,7 @@ def _external_seed_to_shop_product(
         "id": external_product_id,
         "product_id": external_product_id,
         "merchant_id": None,
+        "merchant_name": merchant_name,
         "title": title or "External product",
         "description": seed_data.get("description") or "",
         "price": price_amount or 0,
@@ -691,6 +851,8 @@ def _external_seed_to_shop_product(
         "external_destination_url": row.get("destination_url"),
         "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text"),
         "partner_type": row.get("partner_type") or seed_data.get("partner_type"),
+        "attached_product_key": row.get("attached_product_key") or seed_data.get("attached_product_key"),
+        "attached_variant_id": row.get("attached_variant_id") or seed_data.get("attached_variant_id"),
         "source": "external_seed",
         "orderable": False,
     }
@@ -1900,7 +2062,7 @@ async def _handle_find_products_multi(
             external_seed_wrappers.append(
                 {
                     "product": product,
-                    "merchant_name": None,
+                    "merchant_name": product.get("merchant_name"),
                     "relevance_score": score,
                 }
             )
@@ -2116,7 +2278,15 @@ async def _handle_find_products_multi(
                     continue
 
         if external_seed_wrappers:
-            mapped.extend([w["product"] for w in external_seed_wrappers])
+            offer_keys, internal_ids = _collect_internal_offer_keys(mapped)
+            external_seed_wrappers = _filter_external_seed_wrappers(
+                external_seed_wrappers,
+                offer_keys,
+                internal_ids,
+            )
+            if external_seed_wrappers:
+                external_products = [w["product"] for w in external_seed_wrappers]
+                mapped = external_products + mapped
 
         start_idx = (page - 1) * limit
         page_items = mapped[start_idx : start_idx + limit]
@@ -2563,7 +2733,19 @@ async def _handle_find_products_multi(
         )
 
     if external_seed_wrappers:
-        filtered_products.extend(external_seed_wrappers)
+        internal_products = []
+        for wrapper in filtered_products:
+            product_item = wrapper.get("product") if isinstance(wrapper, dict) else None
+            if isinstance(product_item, (StandardProduct, dict)):
+                internal_products.append(product_item)
+        offer_keys, internal_ids = _collect_internal_offer_keys(internal_products)
+        external_seed_wrappers = _filter_external_seed_wrappers(
+            external_seed_wrappers,
+            offer_keys,
+            internal_ids,
+        )
+        if external_seed_wrappers:
+            filtered_products.extend(external_seed_wrappers)
 
     if toys_intent_query:
         toy_candidates = [p for p in filtered_products if p.get("is_toy_like")]
