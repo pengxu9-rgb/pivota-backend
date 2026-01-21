@@ -14,6 +14,7 @@ Path: POST /agent/shop/v1/invoke
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -40,6 +41,12 @@ from services.similarity_service import (
     similarity_service,
 )
 from services.similarity_config import get_similarity_scoring_weights
+from services.outbound_links_service import (
+    DEFAULT_UTM_TEMPLATE,
+    _is_domain_allowed,
+    apply_utm,
+    make_redirect_token,
+)
 from models.standard_product import StandardProduct, ProductStatus
 from services.agent_task_manager import AgentTaskManager
 
@@ -565,6 +572,128 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
         base["all_deals"] = all_deals
 
     return base
+
+
+def _stable_external_product_id(url: str) -> str:
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    return "ext_" + hashlib.sha256(u.encode("utf-8")).hexdigest()[:24]
+
+
+def _ensure_seed_data_obj(val: Any) -> Dict[str, Any]:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = seed_data.get("variants")
+    if not isinstance(raw, list):
+        return []
+
+    variants: List[Dict[str, Any]] = []
+    for idx, v in enumerate(raw):
+        if not isinstance(v, dict):
+            continue
+        variant_id = v.get("variant_id") or v.get("id") or v.get("sku") or f"ext_variant_{idx + 1}"
+        price_amount = v.get("price_amount") or v.get("price") or v.get("amount") or v.get("value")
+        price_currency = v.get("price_currency") or v.get("currency")
+        variants.append(
+            {
+                "variant_id": str(variant_id),
+                "title": v.get("title") or v.get("name"),
+                "price": {
+                    "price_amount": price_amount,
+                    "currency": price_currency,
+                },
+                "availability": v.get("availability"),
+                "image_url": v.get("image_url") or v.get("image"),
+                "options": v.get("options") or {},
+            }
+        )
+        if len(variants) >= 30:
+            break
+    return variants
+
+
+async def _make_external_redirect_url(
+    *,
+    market: str,
+    tool: str,
+    destination_url: str,
+    utm_template: Optional[str],
+    ctx: Dict[str, Any],
+) -> Optional[str]:
+    dest_with_utm = apply_utm(
+        destination_url,
+        utm_template or DEFAULT_UTM_TEMPLATE,
+        {"market": market, "tool": tool},
+    )
+    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+        return None
+    token = make_redirect_token(
+        {
+            "market": market,
+            "tool": tool,
+            "dest": dest_with_utm,
+            "ctx": ctx,
+        }
+    )
+    base = (os.getenv("PUBLIC_BASE_URL") or os.getenv("BASE_URL") or AGENT_API_BASE).rstrip("/")
+    return f"{base}/r?token={token}"
+
+
+def _external_seed_to_shop_product(
+    *,
+    row: Dict[str, Any],
+    seed_data: Dict[str, Any],
+    redirect_url: Optional[str],
+) -> Dict[str, Any]:
+    title = row.get("title") or seed_data.get("title") or row.get("canonical_url") or row.get("destination_url")
+    image_url = row.get("image_url") or seed_data.get("image_url")
+    price_amount = row.get("price_amount") if row.get("price_amount") is not None else seed_data.get("price_amount")
+    price_currency = row.get("price_currency") or seed_data.get("price_currency") or "USD"
+    availability = row.get("availability") or seed_data.get("availability") or "unknown"
+    variants = _normalize_seed_variants(seed_data)
+    external_product_id = seed_data.get("external_product_id") or _stable_external_product_id(
+        row.get("canonical_url") or row.get("destination_url")
+    )
+
+    in_stock = True
+    if isinstance(availability, str):
+        in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
+
+    return {
+        "id": external_product_id,
+        "product_id": external_product_id,
+        "merchant_id": None,
+        "title": title or "External product",
+        "description": seed_data.get("description") or "",
+        "price": price_amount or 0,
+        "currency": price_currency,
+        "image_url": image_url,
+        "platform": "external",
+        "availability": availability,
+        "in_stock": in_stock,
+        "variants": variants,
+        "external_seed_id": row.get("id"),
+        "external_redirect_url": redirect_url,
+        "external_destination_url": row.get("destination_url"),
+        "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text"),
+        "partner_type": row.get("partner_type") or seed_data.get("partner_type"),
+        "source": "external_seed",
+        "orderable": False,
+    }
 
 
 def _is_status_active(status: Any) -> bool:
@@ -1328,18 +1457,7 @@ async def _handle_find_products_multi(
         )
     merchant_map = {row["merchant_id"]: row["business_name"] for row in merchant_rows}
 
-    if not merchant_map:
-        return {
-            "products": [],
-            "total": 0,
-            "page": page,
-            "page_size": 0,
-            "metadata": {
-                "query_source": "cache_multi",
-                "fetched_at": datetime.utcnow().isoformat(),
-                "merchants_searched": 0,
-            },
-        }
+    has_merchants = bool(merchant_map)
 
     # Cold start & intent detection.
     q_raw = filters.query or ""
@@ -1697,6 +1815,112 @@ async def _handle_find_products_multi(
                 },
             }
 
+    external_seed_wrappers: list[dict[str, Any]] = []
+    try:
+        seed_limit = min(max(limit * max(page, 1) * 2, 30), 200)
+        seed_params: Dict[str, Any] = {"limit": seed_limit}
+        seed_where = "status = 'active'"
+        if q_lower:
+            seed_where += (
+                " AND (LOWER(COALESCE(title,'')) LIKE :like"
+                " OR LOWER(COALESCE(domain,'')) LIKE :like"
+                " OR LOWER(COALESCE(canonical_url,'')) LIKE :like"
+                " OR LOWER(COALESCE(destination_url,'')) LIKE :like)"
+            )
+            seed_params["like"] = f"%{q_lower}%"
+
+        seed_rows = await database.fetch_all(
+            f"""
+            SELECT *
+            FROM external_product_seeds
+            WHERE {seed_where}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """,
+            seed_params,
+        )
+
+        seen_external_ids: set[str] = set()
+        for row in seed_rows:
+            row_dict = dict(row) if isinstance(row, dict) else {}
+            seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
+            dest = row_dict.get("destination_url") or seed_data.get("destination_url")
+            if not isinstance(dest, str) or not dest.startswith(("http://", "https://")):
+                continue
+
+            canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or dest
+            external_id = seed_data.get("external_product_id") or _stable_external_product_id(canonical_url or dest)
+            if not external_id or external_id in seen_external_ids:
+                continue
+
+            title = row_dict.get("title") or seed_data.get("title") or ""
+            domain = row_dict.get("domain") or seed_data.get("domain") or ""
+            blob = " ".join([title, domain, canonical_url or "", dest]).lower().strip()
+            blob_ascii = _strip_accents(blob)
+            blob_compact = re.sub(r"[^a-z0-9]+", "", blob_ascii)
+
+            if q_lower:
+                if q_lower in blob:
+                    score = 0.85
+                elif q_compact and q_compact in blob_compact:
+                    score = 0.7
+                elif _fuzzy_token_match(q_tokens, _tokenize(blob_ascii), max_dist=1):
+                    score = 0.6
+                else:
+                    continue
+            else:
+                score = 0.15
+
+            price_amount = row_dict.get("price_amount") or seed_data.get("price_amount")
+            if filters.price_min is not None and price_amount is not None and price_amount < filters.price_min:
+                continue
+            if filters.price_max is not None and price_amount is not None and price_amount > filters.price_max:
+                continue
+
+            availability = row_dict.get("availability") or seed_data.get("availability") or "unknown"
+            if filters.in_stock_only and isinstance(availability, str):
+                if availability.lower() in {"out_of_stock", "outofstock", "sold_out"}:
+                    continue
+
+            redirect_url = await _make_external_redirect_url(
+                market=str(row_dict.get("market") or "US"),
+                tool=str(row_dict.get("tool") or "*"),
+                destination_url=dest,
+                utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
+                ctx={"seedId": row_dict.get("id")},
+            )
+            if not redirect_url:
+                continue
+
+            product = _external_seed_to_shop_product(
+                row=row_dict,
+                seed_data=seed_data,
+                redirect_url=redirect_url,
+            )
+            external_seed_wrappers.append(
+                {
+                    "product": product,
+                    "merchant_name": None,
+                    "relevance_score": score,
+                }
+            )
+            seen_external_ids.add(external_id)
+    except Exception as e:
+        logger.info("multi.external_seeds.failed", extra={"error": str(e)})
+
+    if not has_merchants and not external_seed_wrappers:
+        return {
+            "products": [],
+            "total": 0,
+            "page": page,
+            "page_size": 0,
+            "metadata": {
+                "query_source": "cache_multi",
+                "fetched_at": datetime.utcnow().isoformat(),
+                "merchants_searched": 0,
+            },
+        }
+
     # Cold start: empty query falls back to creator/global top sellers and cache/live fallbacks.
     if not q:
         source = "creator_top_sellers"
@@ -1891,6 +2115,9 @@ async def _handle_find_products_multi(
                 except Exception:
                     continue
 
+        if external_seed_wrappers:
+            mapped.extend([w["product"] for w in external_seed_wrappers])
+
         start_idx = (page - 1) * limit
         page_items = mapped[start_idx : start_idx + limit]
         return {
@@ -1934,80 +2161,81 @@ async def _handle_find_products_multi(
     # Recall boost: when the user asks a specific query (e.g. a character name),
     # searching only a small "top-N" slice per merchant can miss relevant items.
     # Pull additional candidates directly from products_cache using cheap text matching.
-    try:
-        anchor_terms: List[str] = []
-        if "labubu" in q_ascii:
-            anchor_terms = ["labubu"]
-        elif q_tokens:
-            anchor_terms = [q_tokens[0]]
-            if len(q_tokens) > 1 and len(q_tokens[1]) >= 4:
-                anchor_terms.append(q_tokens[1])
-        elif len(q_compact) >= 4:
-            anchor_terms = [q_compact]
+    if merchant_map:
+        try:
+            anchor_terms: List[str] = []
+            if "labubu" in q_ascii:
+                anchor_terms = ["labubu"]
+            elif q_tokens:
+                anchor_terms = [q_tokens[0]]
+                if len(q_tokens) > 1 and len(q_tokens[1]) >= 4:
+                    anchor_terms.append(q_tokens[1])
+            elif len(q_compact) >= 4:
+                anchor_terms = [q_compact]
 
-        if anchor_terms:
-            likes = [f"%{t.lower()}%" for t in anchor_terms if t]
-            # Clamp so we don't overfetch too much from cache.
-            cache_limit = min(max(limit * max(page, 1) * 6, 120), 900)
+            if anchor_terms:
+                likes = [f"%{t.lower()}%" for t in anchor_terms if t]
+                # Clamp so we don't overfetch too much from cache.
+                cache_limit = min(max(limit * max(page, 1) * 6, 120), 900)
 
-            where_clauses: List[str] = []
-            params: Dict[str, Any] = {
-                "merchant_ids": list(merchant_map.keys()),
-                "cache_limit": cache_limit,
-            }
-            for idx, like in enumerate(likes):
-                key = f"like_{idx}"
-                params[key] = like
-                where_clauses.append(
-                    "("
-                    "LOWER(COALESCE(product_data->>'title','')) LIKE :" + key
-                    + " OR LOWER(COALESCE(product_data->>'description','')) LIKE :" + key
-                    + " OR LOWER(COALESCE(product_data->>'product_type','')) LIKE :" + key
-                    + " OR LOWER(COALESCE(product_data->>'sku','')) LIKE :" + key
-                    + ")"
+                where_clauses: List[str] = []
+                params: Dict[str, Any] = {
+                    "merchant_ids": list(merchant_map.keys()),
+                    "cache_limit": cache_limit,
+                }
+                for idx, like in enumerate(likes):
+                    key = f"like_{idx}"
+                    params[key] = like
+                    where_clauses.append(
+                        "("
+                        "LOWER(COALESCE(product_data->>'title','')) LIKE :" + key
+                        + " OR LOWER(COALESCE(product_data->>'description','')) LIKE :" + key
+                        + " OR LOWER(COALESCE(product_data->>'product_type','')) LIKE :" + key
+                        + " OR LOWER(COALESCE(product_data->>'sku','')) LIKE :" + key
+                        + ")"
+                    )
+                    # Variant SKUs are nested; for SKU-like queries we allow a bounded JSON text scan.
+                    if sku_like_query:
+                        where_clauses.append("LOWER(CAST(product_data AS TEXT)) LIKE :" + key)
+
+                rows = await database.fetch_all(
+                    """
+                    SELECT merchant_id, product_data
+                    FROM products_cache
+                    WHERE (expires_at IS NULL OR expires_at > NOW())
+                      AND merchant_id = ANY(:merchant_ids)
+                      AND ("""
+                    + " OR ".join(where_clauses)
+                    + """)
+                    ORDER BY cached_at DESC
+                    LIMIT :cache_limit
+                    """,
+                    params,
                 )
-                # Variant SKUs are nested; for SKU-like queries we allow a bounded JSON text scan.
-                if sku_like_query:
-                    where_clauses.append("LOWER(CAST(product_data AS TEXT)) LIKE :" + key)
 
-            rows = await database.fetch_all(
-                """
-                SELECT merchant_id, product_data
-                FROM products_cache
-                WHERE (expires_at IS NULL OR expires_at > NOW())
-                  AND merchant_id = ANY(:merchant_ids)
-                  AND ("""
-                + " OR ".join(where_clauses)
-                + """)
-                ORDER BY cached_at DESC
-                LIMIT :cache_limit
-                """,
-                params,
-            )
-
-            for row in rows:
-                mid = row.get("merchant_id") if isinstance(row, dict) else None
-                if not mid:
-                    continue
-                product_data = row.get("product_data") if isinstance(row, dict) else None
-                if isinstance(product_data, str):
+                for row in rows:
+                    mid = row.get("merchant_id") if isinstance(row, dict) else None
+                    if not mid:
+                        continue
+                    product_data = row.get("product_data") if isinstance(row, dict) else None
+                    if isinstance(product_data, str):
+                        try:
+                            product_data = json.loads(product_data)
+                        except Exception:
+                            continue
+                    if not isinstance(product_data, dict):
+                        continue
                     try:
-                        product_data = json.loads(product_data)
+                        prod = StandardProduct(**product_data)
+                        prod.merchant_id = prod.merchant_id or str(mid)
+                        merchant_products.append((prod, merchant_map.get(str(mid), "")))
                     except Exception:
                         continue
-                if not isinstance(product_data, dict):
-                    continue
-                try:
-                    prod = StandardProduct(**product_data)
-                    prod.merchant_id = prod.merchant_id or str(mid)
-                    merchant_products.append((prod, merchant_map.get(str(mid), "")))
-                except Exception:
-                    continue
-    except Exception as e:
-        logger.info(
-            "multi.cache_query_boost.failed",
-            extra={"query": q, "error": str(e)},
-        )
+        except Exception as e:
+            logger.info(
+                "multi.cache_query_boost.failed",
+                extra={"query": q, "error": str(e)},
+            )
 
     # In-memory filtering and simple relevance scoring (reuse Agent API logic)
     filtered_products: list[dict[str, Any]] = []
@@ -2334,6 +2562,9 @@ async def _handle_find_products_multi(
             }
         )
 
+    if external_seed_wrappers:
+        filtered_products.extend(external_seed_wrappers)
+
     if toys_intent_query:
         toy_candidates = [p for p in filtered_products if p.get("is_toy_like")]
         filtered_products = toy_candidates if toy_candidates else []
@@ -2351,12 +2582,18 @@ async def _handle_find_products_multi(
     # Map to Shopping contract; inject merchant_id into result
     out_products = []
     for item_wrapper in page_items:
-        sp: StandardProduct = item_wrapper["product"]
+        product_item = item_wrapper.get("product")
         merchant_name = item_wrapper.get("merchant_name")
 
-        item = _standard_to_shop_product(sp)
-        # add merchant name if we have it
-        item["merchant_name"] = merchant_name
+        if isinstance(product_item, StandardProduct):
+            item = _standard_to_shop_product(product_item)
+        elif isinstance(product_item, dict):
+            item = dict(product_item)
+        else:
+            continue
+
+        if merchant_name and not item.get("merchant_name"):
+            item["merchant_name"] = merchant_name
         out_products.append(item)
 
     # Fallback: if primary query returned nothing, surface top-sellers instead
