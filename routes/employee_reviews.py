@@ -25,6 +25,7 @@ from services.reviews_service import (
     generate_featured_reviews_for_group,
     get_group_counts_by_merchant,
     list_employee_audit_logs,
+    _signed_media_url,
     remove_group_member,
     redact_review,
     remove_review_media,
@@ -613,6 +614,7 @@ async def employee_list_reviews_for_moderation(
 )
 async def employee_list_review_media(
     review_id: int,
+    request: Request,
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
 ) -> Dict[str, Any]:
     rows = await database.fetch_all(
@@ -620,4 +622,12 @@ async def employee_list_review_media(
         .where((media_assets.c.review_id == int(review_id)) & (media_assets.c.status == "active"))
         .order_by(media_assets.c.id.asc())
     )
-    return {"items": [dict(r) for r in rows]}
+    base = str(request.base_url).rstrip("/")
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        signed = _signed_media_url(public_id=item.get("public_id"), media_id=item.get("id"))
+        if signed:
+            item["url"] = f"{base}{signed}" if signed.startswith("/") else signed
+        items.append(item)
+    return {"items": items}
