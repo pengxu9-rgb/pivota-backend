@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import json
 import hashlib
 from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -22,7 +23,7 @@ import uuid
 from db.database import database
 from db.products import products_cache
 from models.standard_product import StandardProduct
-from utils.auth import get_current_employee
+from utils.auth import get_current_employee, require_employee_permissions
 
 from services.external_offers_service import resolve_external_offer
 from services.outbound_links_service import (
@@ -32,6 +33,8 @@ from services.outbound_links_service import (
     apply_utm,
     make_redirect_token,
 )
+from db.reviews_center import product_reviews
+from services.reviews_service import build_product_key, build_sku_key
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
@@ -1328,6 +1331,77 @@ async def get_product_by_triplet(
     """
     product_key = f"{merchant_id}|{platform}|{platform_product_id}"
     return await get_product_by_key(product_key=product_key, current_user=current_user)
+
+
+class CreateManualReviewRequest(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+    title: Optional[str] = Field(default=None, max_length=200)
+    body: Optional[str] = Field(default=None, max_length=5000)
+    variant_id: Optional[str] = None
+    status: Optional[str] = None
+
+
+@router.post("/{product_key}/reviews")
+async def create_manual_review(
+    product_key: str,
+    body: CreateManualReviewRequest,
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.create.manual"])),
+):
+    parts = [p.strip() for p in (product_key or "").split("|")]
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
+
+    merchant_id, platform, platform_product_id = parts
+    status = (body.status or "under_review").strip().lower()
+    if status not in {"active", "folded", "removed", "under_review"}:
+        raise HTTPException(status_code=400, detail="INVALID_STATUS")
+
+    variant_id = (body.variant_id or "").strip() or None
+    pk = build_product_key(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+    )
+    sk = build_sku_key(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        variant_id=variant_id,
+    )
+
+    now = datetime.now(timezone.utc)
+    ext_review_id = f"manual:{uuid.uuid4().hex}"
+
+    review_id = await database.execute(
+        product_reviews.insert().values(
+            product_key=pk,
+            sku_key=sk,
+            merchant_id=merchant_id,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            variant_id=variant_id,
+            group_id=None,
+            author_user_id=None,
+            source_type="manual",
+            source_system="employee",
+            external_review_id=ext_review_id,
+            dedupe_key=ext_review_id,
+            verification="unverified",
+            rating=int(body.rating),
+            title=(body.title or "").strip() or None,
+            body=(body.body or "").strip() or None,
+            media_count=0,
+            risk_flags=None,
+            status=status,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    return {
+        "status": "success",
+        "review_id": int(review_id) if review_id is not None else None,
+    }
 
 
 @router.get("/{product_key}/reviews")
