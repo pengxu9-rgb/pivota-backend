@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncio
 import logging
 from textwrap import dedent
 
@@ -77,6 +78,26 @@ def _error(status_code: int, code: str, message: str) -> HTTPException:
         status_code=status_code,
         detail={"error": {"code": code, "message": message}},
     )
+
+
+async def _ensure_database_connected() -> None:
+    """
+    Ensure `database` is connected before running queries.
+
+    In production we usually connect during startup, but transient DB/network issues can
+    leave the app in a degraded state where `databases.Database` raises AssertionError.
+    """
+    if getattr(database, "is_connected", False):
+        return
+    try:
+        await asyncio.wait_for(database.connect(), timeout=3)
+    except Exception as exc:
+        logger.warning(f"Database not available for request (connect failed): {exc}")
+        raise _error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "TEMPORARY_UNAVAILABLE",
+            "Temporary database unavailable. Please retry shortly.",
+        )
 
 
 def _get_client_ip(request: Request) -> str:
@@ -767,10 +788,19 @@ async def verify_login(body: VerifyRequest, request: Request):
 
 @router.get("/auth/me")
 async def get_me(principal: AccountsPrincipal = Depends(get_accounts_principal)):
+    await _ensure_database_connected()
     # Reload user from DB to get memberships and flags
-    user_row = await database.fetch_one(
-        shop_users.select().where(shop_users.c.id == principal.user_id)
-    )
+    try:
+        user_row = await database.fetch_one(
+            shop_users.select().where(shop_users.c.id == principal.user_id)
+        )
+    except AssertionError as exc:
+        logger.warning(f"Database assertion in /auth/me (degraded): {exc}")
+        raise _error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "TEMPORARY_UNAVAILABLE",
+            "Temporary database unavailable. Please retry shortly.",
+        )
     if not user_row:
         raise _error(
             status.HTTP_401_UNAUTHORIZED,
