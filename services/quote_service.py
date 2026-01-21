@@ -214,6 +214,16 @@ class QuoteService:
             )
         except ShopifyPricingError as e:
             storefront_err = e
+            # Do not fall back to other engines when Shopify explicitly rejects inventory.
+            # Our checkout creates orders via Shopify Admin API (not Shopify checkout), so we must
+            # treat these as hard failures to avoid charging buyers for unavailable items.
+            if e.code in {"OUT_OF_STOCK", "INSUFFICIENT_INVENTORY"}:
+                raise QuoteError(
+                    e.code,
+                    e.message,
+                    debug_id=e.debug_id,
+                    details=getattr(e, "details", {}) or {},
+                )
             attempts.append(
                 {
                     "engine": "shopify_storefront_cart",

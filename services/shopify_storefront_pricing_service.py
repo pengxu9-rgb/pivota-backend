@@ -267,6 +267,156 @@ query($id: ID!) {
         pv = (data.get("productVariant") if isinstance(data, dict) else None) or None
         return bool(pv)
 
+    async def _admin_fetch_variant_inventory(
+        self,
+        *,
+        shop_domain: str,
+        admin_access_token: str,
+        variant_ids: List[str],
+        debug_id: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Best-effort inventory signal for enforcing Shopify inventoryPolicy=DENY.
+
+        Notes:
+        - Admin API is authoritative for inventory policy. We only enforce when:
+          - inventory is tracked, AND
+          - inventoryPolicy == DENY, AND
+          - inventoryQuantity is available.
+        - If the Admin API call fails (401/403/etc), return {} and fail-open.
+        """
+        ids = []
+        for vid in variant_ids or []:
+            s = str(vid or "").strip()
+            if not s:
+                continue
+            ids.append(_gid("ProductVariant", s))
+        # de-dup (stable)
+        ids = list(dict.fromkeys(ids))
+        if not ids:
+            return {}
+
+        query = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on ProductVariant {
+      legacyResourceId
+      inventoryQuantity
+      inventoryPolicy
+      inventoryItem { tracked }
+    }
+  }
+}
+"""
+        data = await self._admin_graphql(
+            shop_domain=shop_domain,
+            admin_access_token=admin_access_token,
+            query=query,
+            variables={"ids": ids},
+            debug_id=debug_id,
+        )
+        nodes = (data.get("nodes") if isinstance(data, dict) else None) or []
+        if not isinstance(nodes, list):
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            legacy = n.get("legacyResourceId")
+            if legacy is None:
+                continue
+            vid = str(legacy).strip()
+            if not vid:
+                continue
+            inv_qty = n.get("inventoryQuantity")
+            policy = n.get("inventoryPolicy")
+            tracked = None
+            try:
+                inv_item = n.get("inventoryItem") or {}
+                tracked = inv_item.get("tracked") if isinstance(inv_item, dict) else None
+            except Exception:
+                tracked = None
+            out[vid] = {
+                "inventory_quantity": inv_qty,
+                "inventory_policy": policy,
+                "inventory_tracked": tracked,
+            }
+        return out
+
+    async def _enforce_inventory_policy_best_effort(
+        self,
+        *,
+        shop_domain: str,
+        admin_access_token: str,
+        items: List[Dict[str, Any]],
+        debug_id: str,
+    ) -> None:
+        variant_ids: List[str] = []
+        for it in items or []:
+            vid = str((it or {}).get("variant_id") or "").strip()
+            if vid:
+                variant_ids.append(vid)
+        variant_ids = list(dict.fromkeys(variant_ids))
+        if not variant_ids:
+            return
+
+        inv = await self._admin_fetch_variant_inventory(
+            shop_domain=shop_domain,
+            admin_access_token=admin_access_token,
+            variant_ids=variant_ids,
+            debug_id=debug_id,
+        )
+        if not inv:
+            return
+
+        for it in items or []:
+            vid = str((it or {}).get("variant_id") or "").strip()
+            qty = int((it or {}).get("quantity") or 0)
+            if not vid or qty <= 0:
+                continue
+            meta = inv.get(vid) or {}
+            policy = str(meta.get("inventory_policy") or "").upper()
+            tracked = meta.get("inventory_tracked")
+            if tracked is False:
+                continue
+            if policy != "DENY":
+                continue
+            inv_qty = meta.get("inventory_quantity")
+            if inv_qty is None:
+                continue
+            try:
+                available = int(inv_qty)
+            except Exception:
+                continue
+
+            if available <= 0:
+                raise ShopifyPricingError(
+                    "OUT_OF_STOCK",
+                    "Item is out of stock",
+                    debug_id,
+                    details={
+                        "shop_domain": shop_domain,
+                        "variant_id": vid,
+                        "requested_quantity": qty,
+                        "available_quantity": available,
+                        "inventory_policy": policy,
+                    },
+                )
+            if available < qty:
+                raise ShopifyPricingError(
+                    "INSUFFICIENT_INVENTORY",
+                    "Not enough inventory available",
+                    debug_id,
+                    details={
+                        "shop_domain": shop_domain,
+                        "variant_id": vid,
+                        "requested_quantity": qty,
+                        "available_quantity": available,
+                        "inventory_policy": policy,
+                    },
+                )
+
     async def preview_cart_quote(
         self,
         *,
@@ -409,7 +559,24 @@ query($id: ID!) {
                         },
                     )
 
-            raise err
+                raise err
+
+        # Inventory enforcement (best-effort): Shopify Admin inventoryPolicy=DENY must not be oversold.
+        # This is critical because we create Shopify orders via Admin API (not Shopify checkout),
+        # which can otherwise bypass storefront "sold out" restrictions.
+        try:
+            admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
+            if admin_access_token:
+                await self._enforce_inventory_policy_best_effort(
+                    shop_domain=shop_domain,
+                    admin_access_token=admin_access_token,
+                    items=items,
+                    debug_id=debug_id,
+                )
+        except ShopifyPricingError:
+            raise
+        except Exception:
+            pass
 
         country_for_prices = None
         if use_buyer_country_for_pricing and shipping_address and isinstance(shipping_address, dict):
