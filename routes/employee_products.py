@@ -1456,6 +1456,66 @@ async def _compute_product_metrics(
             gmv_30d = float(row.get("gmv_30d") or 0)
     except Exception as exc:
         debug_errors.append(f"orders metrics failed: {str(exc)[:200]}")
+        # Fallback: fetch recent orders and filter in Python (MVP-safe, slower).
+        try:
+            currency_clause = " AND currency = :currency" if currency else ""
+            rows = await database.fetch_all(
+                f"""
+                SELECT order_id, created_at, payment_status, total, currency, items
+                FROM orders
+                WHERE (is_deleted IS NULL OR is_deleted = FALSE)
+                  AND merchant_id = :merchant_id
+                  AND created_at >= :last_30d
+                  {currency_clause}
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "last_30d": last_30d,
+                    "currency": currency,
+                },
+            )
+            sales_7d = 0
+            sales_30d = 0
+            gmv_7d = 0.0
+            gmv_30d = 0.0
+            for row in rows or []:
+                r = dict(row)
+                if (r.get("payment_status") or "").lower() != "paid":
+                    continue
+                items = r.get("items")
+                if isinstance(items, str):
+                    try:
+                        items = json.loads(items)
+                    except Exception:
+                        items = None
+                if isinstance(items, dict):
+                    items = [items]
+                if not isinstance(items, list):
+                    continue
+                match = False
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    pid = item.get("product_id")
+                    if pid == product_id or pid == platform_product_id:
+                        match = True
+                        break
+                if not match:
+                    continue
+                created_at = r.get("created_at")
+                total = r.get("total") or 0
+                try:
+                    total_f = float(total)
+                except Exception:
+                    total_f = 0.0
+                if created_at and created_at >= last_7d:
+                    sales_7d += 1
+                    gmv_7d += total_f
+                sales_30d += 1
+                gmv_30d += total_f
+            debug_errors = []
+        except Exception as fallback_exc:
+            debug_errors.append(f"orders metrics fallback failed: {str(fallback_exc)[:200]}")
 
     metrics = {
         "sales_7d": sales_7d,
