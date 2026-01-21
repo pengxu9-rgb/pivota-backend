@@ -402,7 +402,12 @@ def require_employee_permissions(required_permissions: Iterable[str]):
         if role not in {r.lower() for r in EMPLOYEE_ROLES}:
             raise HTTPException(status_code=403, detail="EMPLOYEE_REQUIRED")
 
-        employee_id = current_user.get("employee_id") or current_user.get("employeeId")
+        employee_id = (
+            current_user.get("employee_id")
+            or current_user.get("employeeId")
+            or current_user.get("user_id")
+            or current_user.get("sub")
+        )
         if not employee_id:
             raise HTTPException(status_code=403, detail="EMPLOYEE_ID_REQUIRED")
 
