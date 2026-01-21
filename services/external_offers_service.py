@@ -1,4 +1,5 @@
 import hashlib
+import html as html_lib
 import json
 import os
 import re
@@ -242,6 +243,96 @@ def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[
     return variants
 
 
+def _detect_currency_from_text(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("$"):
+        return "USD"
+    if text.startswith("€"):
+        return "EUR"
+    if text.startswith("£"):
+        return "GBP"
+    if text.startswith("¥"):
+        return "JPY"
+    # Fallback: match currency codes in text.
+    m = re.search(r"\b([A-Z]{3})\b", text)
+    return m.group(1) if m else None
+
+
+def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str]) -> list[Dict[str, Any]]:
+    attr_patterns = [
+        r'data-product-skus-value="([^"]+)"',
+        r"data-product-skus-value='([^']+)'",
+    ]
+    raw_attr = None
+    for pattern in attr_patterns:
+        match = re.search(pattern, html)
+        if match:
+            raw_attr = match.group(1)
+            break
+
+    if not raw_attr:
+        return []
+
+    try:
+        decoded = html_lib.unescape(raw_attr)
+        payload = json.loads(decoded)
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+
+    variants: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for sku in payload:
+        if not isinstance(sku, dict):
+            continue
+        variant_id = (
+            sku.get("id")
+            or sku.get("sku")
+            or sku.get("sku_id")
+            or sku.get("variant_id")
+            or sku.get("variantId")
+        )
+        if not variant_id:
+            continue
+        variant_id = str(variant_id).strip()
+        if not variant_id or variant_id in seen:
+            continue
+
+        title = sku.get("size") or sku.get("name") or sku.get("title")
+        price_amount = sku.get("price_with_discount") or sku.get("price")
+        if price_amount is None:
+            price_amount = sku.get("price_with_discount_with_currency_code") or sku.get("price_with_currency_code")
+        currency = (
+            sku.get("price_currency")
+            or sku.get("priceCurrency")
+            or _detect_currency_from_text(sku.get("price_with_discount_with_currency_code"))
+            or _detect_currency_from_text(sku.get("price_with_currency_code"))
+            or fallback_currency
+        )
+
+        availability_raw = sku.get("inventory_status") or sku.get("availability")
+        availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
+
+        variants.append(
+            {
+                "variant_id": variant_id,
+                "title": str(title).strip() if title else None,
+                "price_amount": _parse_price(str(price_amount)) if price_amount is not None else None,
+                "price_currency": str(currency).strip().upper() if currency else None,
+                "availability": availability,
+            }
+        )
+        seen.add(variant_id)
+        if len(variants) >= MAX_VARIANTS:
+            break
+
+    return variants
+
+
 def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
     variants: list[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -384,6 +475,9 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     parsed_jsonld = _parse_jsonld_texts(p.jsonld)
     jsonld = _extract_jsonld_offer(parsed_jsonld)
     variants = _extract_jsonld_variants(parsed_jsonld)
+    if not variants:
+        fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
+        variants = _extract_variants_from_data_attrs(html, fallback_currency)
 
     # JSON-LD is preferred when it provides structured offers.
     out = {
@@ -394,7 +488,9 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         "price_amount": _parse_price(jsonld.get("price_raw")) or _parse_price(price),
         "price_currency": (jsonld.get("currency") or currency or "").strip().upper() or None,
         "availability": _availability_from_raw(jsonld.get("availability_raw")),
-        "evidence_provider": "jsonld" if jsonld.get("price_raw") or jsonld.get("title") else ("og" if title or image else "manual"),
+        "evidence_provider": "jsonld"
+        if jsonld.get("price_raw") or jsonld.get("title")
+        else ("data_attr" if variants else ("og" if title or image else "manual")),
         "variants": variants,
     }
     return out
