@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import json
 import hashlib
 from urllib.parse import urlparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -108,6 +108,36 @@ def _as_product_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "expires_at": _to_iso(row.get("expires_at")),
     }
 
+
+def _extract_product_summary(product_data: Dict[str, Any], platform_product_id: str) -> Dict[str, Any]:
+    try:
+        sp = StandardProduct.parse_obj(product_data)
+        title = sp.title
+        image_url = sp.image_url or (sp.images[0] if sp.images else None)
+        product_id = sp.product_id or sp.id or platform_product_id
+        variants = sp.variants or []
+        currency = getattr(sp, "currency", None) or product_data.get("currency")
+        price = getattr(sp, "price", None)
+        availability = getattr(sp, "in_stock", None)
+    except Exception:
+        title = product_data.get("title") or product_data.get("name") or platform_product_id
+        image_url = product_data.get("image_url") or None
+        product_id = product_data.get("product_id") or product_data.get("id") or platform_product_id
+        variants = product_data.get("variants") or []
+        currency = product_data.get("currency")
+        price = product_data.get("price")
+        availability = product_data.get("in_stock") if "in_stock" in product_data else product_data.get("availability")
+
+    return {
+        "title": title,
+        "image_url": image_url,
+        "product_id": product_id,
+        "variants": variants if isinstance(variants, list) else [],
+        "currency": currency,
+        "price": price,
+        "availability": availability,
+    }
+
 async def _ensure_external_seeds_table() -> None:
     """
     Minimal storage for employee-managed external seeds.
@@ -174,6 +204,31 @@ async def _ensure_external_seeds_table() -> None:
     )
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_created_at ON external_product_seeds(created_at DESC);"
+    )
+
+
+async def _ensure_primary_offers_table() -> None:
+    """
+    Primary offer selection per product_key (employee curation).
+    Runtime DDL keeps MVP deploys unblocked.
+    """
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS employee_product_primary_offers (
+          product_key TEXT PRIMARY KEY,
+          offer_id TEXT NOT NULL,
+          offer_type TEXT NOT NULL,
+          created_by_employee_id TEXT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_type ON employee_product_primary_offers(offer_type);"
+    )
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_updated ON employee_product_primary_offers(updated_at DESC);"
     )
 
 
@@ -245,6 +300,14 @@ def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> 
     return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
 
 
+def _seed_merchant_display_name(seed_data: Dict[str, Any], domain: Optional[str]) -> Optional[str]:
+    val = seed_data.get("merchant_display_name") or seed_data.get("brand") or domain
+    if isinstance(val, str):
+        val = val.strip()
+        return val or None
+    return None
+
+
 def _normalize_market(market: Optional[str]) -> str:
     m = str(market or "").strip().upper()
     return m or "US"
@@ -304,6 +367,7 @@ class CreateExternalSeedRequest(BaseModel):
     partner_type: Optional[str] = None
     disclosure_text: Optional[str] = None
     # Optional manual overrides / richer product seed fields (for employee curation).
+    merchant_display_name: Optional[str] = None
     title: Optional[str] = None
     image_url: Optional[str] = None
     product_id: Optional[str] = None
@@ -320,6 +384,7 @@ class UpdateExternalSeedRequest(BaseModel):
     notes: Optional[str] = None
     market: Optional[str] = None
     tool: Optional[str] = None
+    merchant_display_name: Optional[str] = None
     title: Optional[str] = None
     image_url: Optional[str] = None
     product_id: Optional[str] = None
@@ -454,6 +519,7 @@ async def list_external_seeds(
     for r in rows:
         r = dict(r)
         seed_data = _ensure_json_obj(r.get("seed_data"))
+        merchant_display_name = _seed_merchant_display_name(seed_data, r.get("domain"))
         items.append(
             {
                 "id": r.get("id"),
@@ -467,6 +533,7 @@ async def list_external_seeds(
                 "domain": r.get("domain"),
                 "title": seed_data.get("title") or r.get("title"),
                 "image_url": seed_data.get("image_url") or r.get("image_url"),
+                "merchant_display_name": merchant_display_name,
                 "price": _seed_primary_price(r, seed_data),
                 "availability": seed_data.get("availability") or r.get("availability"),
                 "product": {
@@ -576,6 +643,8 @@ async def create_external_seed(
 
         seed_data = dict(existing_seed_data)
         seed_data["external_product_id"] = _stable_external_product_id(canonical_url or dest)
+        if body.merchant_display_name is not None:
+            seed_data["merchant_display_name"] = (body.merchant_display_name or "").strip() or None
         if body.product_id is not None:
             seed_data["product_id"] = (body.product_id or "").strip() or None
         if body.brand is not None:
@@ -682,6 +751,7 @@ async def create_external_seed(
         seed_id = _seed_id()
         seed_data: Dict[str, Any] = {
             "external_product_id": _stable_external_product_id(match_url),
+            "merchant_display_name": (body.merchant_display_name or "").strip() or None,
             "product_id": (body.product_id or "").strip() or None,
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
@@ -770,6 +840,7 @@ async def create_external_seed(
             "domain": domain,
             "title": title,
             "image_url": image_url,
+            "merchant_display_name": _seed_merchant_display_name(seed_data, domain),
             "price": {"amount": price_amount, "currency": price_currency},
             "availability": availability,
             "notes": notes if existing_row else body.notes,
@@ -829,6 +900,7 @@ async def get_external_seed(
             "domain": row.get("domain"),
             "title": seed_data.get("title") or row.get("title"),
             "image_url": seed_data.get("image_url") or row.get("image_url"),
+            "merchant_display_name": _seed_merchant_display_name(seed_data, row.get("domain")),
             "price": _seed_primary_price(row, seed_data),
             "availability": seed_data.get("availability") or row.get("availability"),
             "status": row.get("status"),
@@ -901,6 +973,8 @@ async def update_external_seed(
     if body.status is not None:
         updates["status"] = str(body.status).strip() or "active"
         set_clauses.append("status = :status")
+    if body.merchant_display_name is not None:
+        seed_data["merchant_display_name"] = (body.merchant_display_name or "").strip() or None
     if body.utm_template is not None:
         updates["utm_template"] = (body.utm_template or "").strip() or None
         set_clauses.append("utm_template = :utm_template")
@@ -1094,6 +1168,7 @@ async def list_attached_external_links(
         SELECT id, market, tool, destination_url, canonical_url, domain, title, image_url,
                price_amount, price_currency, availability,
                utm_template, partner_type, disclosure_text,
+               seed_data,
                notes, attached_variant_id, created_at
         FROM external_product_seeds
         WHERE {where}
@@ -1106,6 +1181,8 @@ async def list_attached_external_links(
     items = []
     for r in rows:
         r = dict(r)
+        seed_data = _ensure_json_obj(r.get("seed_data"))
+        merchant_display_name = _seed_merchant_display_name(seed_data, r.get("domain"))
         redirect_url = await _make_redirect_url(
             request=request,
             market=r.get("market"),
@@ -1132,7 +1209,8 @@ async def list_attached_external_links(
                 "domain": r.get("domain"),
                 "title": r.get("title"),
                 "image_url": r.get("image_url"),
-                "price": {"amount": r.get("price_amount"), "currency": r.get("price_currency")},
+                "merchant_display_name": merchant_display_name,
+                "price": _seed_primary_price(r, seed_data),
                 "availability": r.get("availability"),
                 "notes": r.get("notes"),
                 "attached_variant_id": r.get("attached_variant_id") or "∅",
@@ -1179,6 +1257,335 @@ async def create_attached_external_link(
         request=request,
         current_user=current_user,
     )
+
+
+class SetPrimaryOfferRequest(BaseModel):
+    offer_id: str = Field(..., min_length=1)
+    offer_type: str = Field(..., min_length=1)
+
+
+def _build_merchant_offer(
+    *,
+    product_key: str,
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+    product_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    summary = _extract_product_summary(product_data, platform_product_id)
+    variants = summary.get("variants") or []
+    return {
+        "id": product_key,
+        "source": "merchant_product",
+        "product_key": product_key,
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "platform_product_id": platform_product_id,
+        "product_id": summary.get("product_id") or platform_product_id,
+        "title": summary.get("title"),
+        "image_url": summary.get("image_url"),
+        "price": {"amount": summary.get("price"), "currency": summary.get("currency")},
+        "availability": summary.get("availability"),
+        "variants_count": len(variants),
+    }
+
+
+async def _build_external_seed_offers(
+    *,
+    product_key: str,
+    request: Request,
+    variant_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    await _ensure_external_seeds_table()
+    values: Dict[str, Any] = {"pk": product_key}
+    where = "attached_product_key = :pk AND status = 'active'"
+    if variant_id:
+        values["vid"] = str(variant_id).strip()
+        where += " AND attached_variant_id = :vid"
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT
+          id, market, tool, destination_url, canonical_url, domain, title, image_url,
+          price_amount, price_currency, availability,
+          utm_template, partner_type, disclosure_text,
+          seed_data,
+          attached_variant_id, created_at, updated_at
+        FROM external_product_seeds
+        WHERE {where}
+        ORDER BY created_at DESC
+        """,
+        values,
+    )
+
+    offers: List[Dict[str, Any]] = []
+    for r in rows:
+        r = dict(r)
+        seed_data = _ensure_json_obj(r.get("seed_data"))
+        redirect_url = await _make_redirect_url(
+            request=request,
+            market=r.get("market"),
+            tool=r.get("tool"),
+            destination_url=r.get("canonical_url") or r.get("destination_url"),
+            utm_template=r.get("utm_template") or seed_data.get("utm_template"),
+            ctx={
+                "seedId": r.get("id"),
+                "productKey": product_key,
+                "variantId": r.get("attached_variant_id") or "∅",
+            },
+        )
+        disclosure_text = r.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
+        offers.append(
+            {
+                "id": r.get("id"),
+                "source": "external_seed",
+                "seed_id": r.get("id"),
+                "market": r.get("market"),
+                "tool": r.get("tool"),
+                "utm_template": r.get("utm_template") or seed_data.get("utm_template"),
+                "partner_type": r.get("partner_type") or seed_data.get("partner_type"),
+                "disclosure_text": disclosure_text,
+                "destination_url": r.get("destination_url"),
+                "canonical_url": r.get("canonical_url"),
+                "domain": r.get("domain"),
+                "title": seed_data.get("title") or r.get("title"),
+                "image_url": seed_data.get("image_url") or r.get("image_url"),
+                "merchant_display_name": _seed_merchant_display_name(seed_data, r.get("domain")),
+                "price": _seed_primary_price(r, seed_data),
+                "availability": seed_data.get("availability") or r.get("availability"),
+                "variants_count": len(_seed_variants(seed_data)),
+                "attached_variant_id": r.get("attached_variant_id") or "∅",
+                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+            }
+        )
+    return offers
+
+
+async def _get_primary_offer(product_key: str) -> Optional[Dict[str, Any]]:
+    await _ensure_primary_offers_table()
+    row = await database.fetch_one(
+        "SELECT product_key, offer_id, offer_type, created_by_employee_id, updated_at FROM employee_product_primary_offers WHERE product_key = :pk",
+        {"pk": product_key},
+    )
+    return dict(row) if row else None
+
+
+async def _set_primary_offer(
+    *,
+    product_key: str,
+    offer_id: str,
+    offer_type: str,
+    employee_id: Optional[str],
+) -> None:
+    await _ensure_primary_offers_table()
+    await database.execute(
+        """
+        INSERT INTO employee_product_primary_offers (product_key, offer_id, offer_type, created_by_employee_id)
+        VALUES (:pk, :offer_id, :offer_type, :employee_id)
+        ON CONFLICT (product_key)
+        DO UPDATE SET
+          offer_id = EXCLUDED.offer_id,
+          offer_type = EXCLUDED.offer_type,
+          created_by_employee_id = EXCLUDED.created_by_employee_id,
+          updated_at = NOW()
+        """,
+        {
+            "pk": product_key,
+            "offer_id": offer_id,
+            "offer_type": offer_type,
+            "employee_id": employee_id,
+        },
+    )
+
+
+async def _compute_product_metrics(
+    *,
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+    product_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    last_7d = now - timedelta(days=7)
+    last_30d = now - timedelta(days=30)
+    currency = product_data.get("currency") or "USD"
+    product_id = product_data.get("product_id") or product_data.get("id") or platform_product_id
+    debug_errors: List[str] = []
+
+    sales_7d = 0
+    sales_30d = 0
+    gmv_7d = 0.0
+    gmv_30d = 0.0
+
+    try:
+        currency_clause = " AND o.currency = :currency" if currency else ""
+        row = await database.fetch_one(
+            f"""
+            SELECT
+              COUNT(DISTINCT o.order_id) FILTER (
+                WHERE o.created_at >= :last_7d AND o.payment_status = 'paid'
+              )::bigint AS sales_7d,
+              COUNT(DISTINCT o.order_id) FILTER (
+                WHERE o.created_at >= :last_30d AND o.payment_status = 'paid'
+              )::bigint AS sales_30d,
+              COALESCE(SUM(CASE WHEN o.created_at >= :last_7d AND o.payment_status = 'paid' THEN o.total ELSE 0 END), 0) AS gmv_7d,
+              COALESCE(SUM(CASE WHEN o.created_at >= :last_30d AND o.payment_status = 'paid' THEN o.total ELSE 0 END), 0) AS gmv_30d
+            FROM orders o
+            WHERE (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+              AND o.merchant_id = :merchant_id
+              {currency_clause}
+              AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(COALESCE(o.items::jsonb, '[]'::jsonb)) item
+                WHERE (item->>'product_id' = :product_id OR item->>'product_id' = :platform_product_id)
+              )
+            """,
+            {
+                "last_7d": last_7d,
+                "last_30d": last_30d,
+                "merchant_id": merchant_id,
+                "product_id": product_id,
+                "platform_product_id": platform_product_id,
+                "currency": currency,
+            },
+        )
+        if row:
+            sales_7d = int(row.get("sales_7d") or 0)
+            sales_30d = int(row.get("sales_30d") or 0)
+            gmv_7d = float(row.get("gmv_7d") or 0)
+            gmv_30d = float(row.get("gmv_30d") or 0)
+    except Exception as exc:
+        debug_errors.append(f"orders metrics failed: {str(exc)[:200]}")
+
+    metrics = {
+        "sales_7d": sales_7d,
+        "sales_30d": sales_30d,
+        "gmv_7d": {"currency": currency, "amount": gmv_7d},
+        "gmv_30d": {"currency": currency, "amount": gmv_30d},
+        "merchants_selling": 1,
+    }
+    if debug_errors:
+        metrics["debug_errors"] = debug_errors
+    return metrics
+
+
+@router.get("/{product_key}/offers")
+async def list_product_offers(
+    product_key: str,
+    request: Request,
+    variant_id: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_employee),
+):
+    parts = [p.strip() for p in (product_key or "").split("|")]
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
+
+    merchant_id, platform, platform_product_id = parts
+    row = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
+
+    row = dict(row)
+    product_data = _ensure_dict(row.get("product_data"))
+    offers = [_build_merchant_offer(
+        product_key=product_key,
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        product_data=product_data,
+    )]
+    external_offers = await _build_external_seed_offers(
+        product_key=product_key, request=request, variant_id=variant_id
+    )
+    offers.extend(external_offers)
+
+    primary = await _get_primary_offer(product_key)
+    if primary:
+        primary_offer = {
+            "offer_id": primary.get("offer_id"),
+            "offer_type": primary.get("offer_type"),
+            "updated_at": _to_iso(primary.get("updated_at")),
+        }
+    else:
+        primary_offer = {
+            "offer_id": product_key if offers else None,
+            "offer_type": "merchant_product" if offers else None,
+        }
+
+    return {"status": "success", "items": offers, "primary": primary_offer}
+
+
+@router.post("/{product_key}/offers/primary")
+async def set_primary_offer(
+    product_key: str,
+    body: SetPrimaryOfferRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    offer_type_raw = (body.offer_type or "").strip()
+    offer_id = (body.offer_id or "").strip()
+    if offer_type_raw in {"merchant", "merchant_product"}:
+        offer_type = "merchant_product"
+    elif offer_type_raw in {"external", "external_seed"}:
+        offer_type = "external_seed"
+    else:
+        raise HTTPException(status_code=400, detail="INVALID_OFFER_TYPE")
+
+    if offer_type == "merchant_product":
+        offer_id = product_key
+    else:
+        await _ensure_external_seeds_table()
+        row = await database.fetch_one(
+            "SELECT id FROM external_product_seeds WHERE id = :id AND status = 'active'",
+            {"id": offer_id},
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="OFFER_NOT_FOUND")
+
+    employee_id = current_user.get("employee_id") or current_user.get("employeeId")
+    await _set_primary_offer(
+        product_key=product_key,
+        offer_id=offer_id,
+        offer_type=offer_type,
+        employee_id=str(employee_id) if employee_id else None,
+    )
+    return {"status": "success"}
+
+
+@router.get("/{product_key}/metrics")
+async def get_product_metrics(
+    product_key: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    parts = [p.strip() for p in (product_key or "").split("|")]
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
+
+    merchant_id, platform, platform_product_id = parts
+    row = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
+
+    product_data = _ensure_dict(dict(row).get("product_data"))
+    metrics = await _compute_product_metrics(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        product_data=product_data,
+    )
+    status = "degraded" if metrics.get("debug_errors") else "success"
+    return {"status": status, "metrics": metrics}
 
 
 @router.get("/search")
@@ -1296,6 +1703,13 @@ async def get_product_by_key(
     except Exception:
         normalized = None
 
+    metrics = await _compute_product_metrics(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        product_data=product_data,
+    )
+
     return {
         "status": "success",
         "product_key": product_key,
@@ -1306,14 +1720,7 @@ async def get_product_by_key(
         "expires_at": _to_iso(row.get("expires_at")),
         "product": normalized,
         "raw": product_data,
-        # v0 placeholders for the employee page; these will be replaced by rollups/index later.
-        "metrics": {
-            "sales_7d": 0,
-            "sales_30d": 0,
-            "gmv_7d": {"currency": product_data.get("currency") or "USD", "amount": 0},
-            "gmv_30d": {"currency": product_data.get("currency") or "USD", "amount": 0},
-            "merchants_selling": 1,
-        },
+        "metrics": metrics,
     }
 
 @router.get("/{merchant_id}/{platform}/{platform_product_id}")
