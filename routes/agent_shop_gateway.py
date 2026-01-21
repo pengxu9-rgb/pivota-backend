@@ -4024,7 +4024,7 @@ async def get_review_media(public_id: str, request: Request) -> Response:
             FROM media_assets m
             JOIN product_reviews r ON r.id = m.review_id
             WHERE m.status = 'active'
-              AND r.status = 'active'
+              AND r.status IN ('active', 'under_review', 'folded')
               AND (
                 m.public_id = :pid
                 OR (:allow_legacy = true AND m.public_id IS NULL AND m.id = :legacy_id)
