@@ -532,6 +532,23 @@ async def _send_sendgrid_email(
     }
 
 
+def _invitation_link_base_url() -> str:
+    return (
+        (os.getenv("REVIEWS_INVITATION_LINK_BASE_URL") or "").strip()
+        or (os.getenv("REVIEWS_INVITATION_LINK_BASE") or "").strip()
+    )
+
+
+def _build_invitation_url(invitation_token: str, *, order_id: Optional[str] = None) -> Optional[str]:
+    base = _invitation_link_base_url().rstrip("/")
+    if not base:
+        return None
+    oid = (order_id or "").strip()
+    if oid:
+        return f"{base}?order_id={quote(oid)}#invitation_token={quote(invitation_token)}"
+    return f"{base}#invitation_token={quote(invitation_token)}"
+
+
 async def _mint_invitation_via_proof_issuer(
     *,
     merchant_id: str,
@@ -646,6 +663,7 @@ async def mint_invitations_from_paid_order(
     if not subjects:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
+    link_base = _invitation_link_base_url().rstrip("/")
     order_id_value = (order_id or "").strip() or str(order.get("order_id") or "").strip()
     out_items: List[Dict[str, Any]] = []
     for s in subjects:
@@ -656,7 +674,16 @@ async def mint_invitations_from_paid_order(
             verification=verification,
             order_id=order_id_value,
         )
-        out_items.append({"subject": s, **minted})
+        invitation_url = _build_invitation_url(minted["invitation_token"], order_id=order_id_value)
+        out_items.append(
+            {
+                "subject": s,
+                **minted,
+                "invitation_link_base_url_configured": bool(link_base),
+                "invitation_link_base_url": link_base or None,
+                "invitation_url": invitation_url,
+            }
+        )
 
     if len(out_items) == 1:
         return {"status": "success", **out_items[0]}
@@ -936,6 +963,7 @@ async def send_invitation_email_from_order(
         platform_product_id=body.platform_product_id,
         variant_id=body.variant_id,
         verification="verified_buyer",
+        order_id=order_id,
     )
 
     items: List[Dict[str, Any]] = []

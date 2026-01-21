@@ -4,10 +4,10 @@ Pivota 核心业务流程：Agent 下单 → 支付 → 履约
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store, get_store_by_id
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, Header, status
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, Header, Query, status
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 import asyncio
 import time
@@ -15,6 +15,7 @@ import hashlib
 import httpx
 import os
 import json
+from sqlalchemy import and_, or_, select
 
 from models.order import (
     CreateOrderRequest, OrderResponse, PaymentConfirmRequest, 
@@ -25,10 +26,11 @@ from db.orders import (
     update_order_status, update_payment_info, mark_order_paid, 
     update_fulfillment_info, mark_order_shipped, get_order_stats
 )
+from db.orders import orders as orders_table
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from db.database import database
-from utils.auth import require_admin, get_current_user, decode_token
+from utils.auth import require_admin, require_admin_or_key, get_current_user
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
@@ -58,37 +60,6 @@ from routes.reviews_invitation_issuer import (
 from services.reviews_invitation_send_jobs_service import (
     enqueue_invitation_send_job_from_order as enqueue_reviews_invitation_send_job_from_order,
 )
-
-
-async def require_admin_or_key(
-    authorization: Optional[str] = Header(None),
-    x_admin_key: Optional[str] = Header(None, alias="X-ADMIN-KEY"),
-) -> Dict[str, Any]:
-    """
-    Allow either:
-    - Admin JWT (Authorization: Bearer ...), or
-    - Internal admin key (X-ADMIN-KEY) for operational/debug endpoints.
-
-    Note: keep this dependency narrowly scoped to internal helper endpoints.
-    """
-    allowed_keys = {
-        k.strip()
-        for k in [
-            os.getenv("ADMIN_API_KEY"),
-            os.getenv("PROMOTIONS_ADMIN_KEY"),
-        ]
-        if isinstance(k, str) and k.strip()
-    }
-    if allowed_keys and x_admin_key and x_admin_key.strip() in allowed_keys:
-        return {"role": "admin", "sub": "admin_key"}
-
-    if authorization and authorization.startswith("Bearer "):
-        payload = decode_token(authorization[7:])
-        if payload.get("role") in {"admin", "super_admin"}:
-            return payload
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
-
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -1500,66 +1471,117 @@ async def create_shopify_order(order_id: str) -> bool:
     - 记录事件日志用于后续重试
     """
     try:
-        logger.info(f"[Shopify] Starting order creation for {order_id}")
-        
+        logger.info("[Shopify] Starting order creation for %s", order_id)
+
         order = await get_order(order_id)
         if not order:
-            logger.error(f"[Shopify] Order {order_id} not found")
+            logger.error("[Shopify] Order %s not found", order_id)
             return False
 
         existing_shopify_order_id = str(order.get("shopify_order_id") or "").strip()
         if existing_shopify_order_id:
             logger.info(
-                "[Shopify] Order already linked (order_id=%s shopify_order_id=%s); skip create",
+                "[Shopify] Order already linked: order_id=%s shopify_order_id=%s",
                 order_id,
                 existing_shopify_order_id,
             )
             return True
-        
+
+        if order.get("payment_status") != "paid":
+            logger.warning(
+                "[Shopify] Skip create (not paid): order_id=%s payment_status=%s",
+                order_id,
+                order.get("payment_status"),
+            )
+            return False
         logger.info(
             "[Shopify] Order data: merchant_id=%s items_count=%s has_email=%s",
             order.get("merchant_id"),
             len(order.get("items", []) or []),
             bool(str(order.get("customer_email") or "").strip()),
         )
-        
+
         merchant = await get_merchant_onboarding(order["merchant_id"])
         if not merchant:
-            logger.error(f"[Shopify] Merchant {order['merchant_id']} not found")
-            return False
-        
-        # Prefer the store bound to the order at checkout time. Using the "primary store" can break
-        # when a merchant connects multiple stores (tokens/domains are shop-scoped).
-        store_info = None
-        order_store_id = str(order.get("store_id") or "").strip()
-        if order_store_id:
-            store_info = await get_store_by_id(order_store_id, merchant_id=order["merchant_id"])
-        if not store_info:
-            store_info = await get_primary_store(order["merchant_id"])
-        if not store_info:
-            logger.error(f"[Shopify] Primary store not found for merchant {order['merchant_id']}")
-            return False
-            
-        if store_info.get("platform") != "shopify":
-            logger.error(f"[Shopify] Primary store is {store_info.get('platform')}, not Shopify for merchant {order['merchant_id']}")
+            logger.error("[Shopify] Merchant %s not found", order["merchant_id"])
             return False
 
-        shop_domain_raw = store_info.get("domain")
-        shop_domain = _normalize_shopify_domain(str(shop_domain_raw or ""))
-        access_token = extract_shopify_access_token(store_info.get("api_key"))
-        
-        logger.info(
-            "[Shopify] Store credentials: domain=%s has_token=%s",
-            shop_domain,
-            bool(access_token),
-        )
-        
-        if not shop_domain or not access_token:
-            logger.error(f"[Shopify] Missing credentials for merchant {order['merchant_id']}: domain={bool(shop_domain)}, token={bool(access_token)}")
+        from services.shopify_graphql_client import shopify_admin_graphql
+        from db.orders import update_order as update_order_row
+
+        pivota_tag = f"pivota_order_id:{order_id}"
+
+        def _token_fingerprint(token: str | None) -> str | None:
+            if not token:
+                return None
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+        async def _find_existing_order_id_best_effort(
+            *, shop_domain: str, access_token: str
+        ) -> str | None:
+            query = """
+            query($query: String!) {
+              orders(first: 1, query: $query) {
+                edges {
+                  node {
+                    legacyResourceId
+                  }
+                }
+              }
+            }
+            """
+            try:
+                data = await shopify_admin_graphql(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    query=query,
+                    variables={"query": f"tag:{pivota_tag}"},
+                    api_version="2024-07",
+                    timeout_s=10.0,
+                )
+                orders_node = data.get("orders") if isinstance(data, dict) else None
+                edges = orders_node.get("edges") if isinstance(orders_node, dict) else None
+                if isinstance(edges, list) and edges:
+                    node = (edges[0] or {}).get("node") or {}
+                    legacy = node.get("legacyResourceId")
+                    legacy_str = str(legacy).strip() if legacy is not None else ""
+                    return legacy_str or None
+            except Exception:
+                return None
+            return None
+
+        # Choose candidate stores:
+        # - Prefer the order.store_id if it points at a Shopify store row
+        # - Fall back to any active Shopify store for the merchant
+        stores = await get_merchant_active_stores(order["merchant_id"])
+        shopify_stores = [s for s in (stores or []) if (s or {}).get("platform") == "shopify"]
+        if not shopify_stores:
+            logger.error("[Shopify] No active Shopify store for merchant %s", order["merchant_id"])
             return False
-        
-        logger.info(f"[Shopify] Using store: {shop_domain}")
-        
+
+        bound_store_id = str(order.get("store_id") or "").strip() or None
+        bound_store = None
+        if bound_store_id:
+            for s in shopify_stores:
+                if str((s or {}).get("store_id") or "") == bound_store_id:
+                    bound_store = s
+                    break
+
+        candidates: List[Dict[str, Any]] = []
+        if bound_store:
+            candidates.append(bound_store)
+
+        bound_domain = (bound_store or {}).get("domain") if bound_store else None
+        for s in shopify_stores:
+            if s in candidates:
+                continue
+            if bound_domain and (s or {}).get("domain") == bound_domain:
+                candidates.append(s)
+        for s in shopify_stores:
+            if s in candidates:
+                continue
+            candidates.append(s)
+
         # 构造 Shopify 订单数据
         # Priority: Use variant_id if available (from real Shopify products)
         # Fallback: Use title-based custom line items (for testing/manual orders)
@@ -1693,180 +1715,194 @@ async def create_shopify_order(order_id: str) -> bool:
                 # Many templates reference billing_address.* for the buyer identity.
                 "billing_address": shopify_shipping,
                 "note": f"Pivota Order ID: {order_id}",
-                "tags": f"pivota,agent-order,pivota_order_id:{order_id}",
+                "tags": ",".join(["pivota", "agent-order", pivota_tag])
             }
         }
-        
+
+        async def _finalize_success(
+            *,
+            shopify_order_id: str,
+            store_used: Dict[str, Any],
+            shop_domain: str,
+            access_token: str,
+            event_type: str,
+        ) -> bool:
+            await update_fulfillment_info(
+                order_id=order_id,
+                shopify_order_id=shopify_order_id,
+                fulfillment_status="processing",
+            )
+            store_id_used = str((store_used or {}).get("store_id") or "").strip() or None
+            if store_id_used and store_id_used != bound_store_id:
+                try:
+                    await update_order_row(order_id, {"store_id": store_id_used})
+                except Exception:
+                    pass
+
+            await log_order_event(
+                event_type=event_type,
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={
+                    "shopify_order_id": shopify_order_id,
+                    "store_id": store_id_used,
+                    "domain": shop_domain,
+                    "api_key_fp": _token_fingerprint(access_token),
+                },
+            )
+
+            # Best-effort reconciliation: record external PSP payment as a Shopify transaction.
+            try:
+                psp_used = order.get("psp_used") or merchant.get("psp_type") or None
+                payment_ref = order.get("payment_intent_id") or None
+                await ensure_external_payment_transaction_best_effort(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    shopify_order_id=shopify_order_id,
+                    psp_used=psp_used,
+                    external_payment_ref=payment_ref,
+                    amount=float(order.get("total") or 0),
+                    currency=str(order.get("currency") or "USD"),
+                    pivota_order_id=order_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Shopify] Payment transaction sync failed order_id=%s shopify_order_id=%s err=%s",
+                    order_id,
+                    shopify_order_id,
+                    str(e),
+                )
+
+            logger.info(
+                "[Shopify] ✅ Shopify order linked: order_id=%s shopify_order_id=%s store_id=%s domain=%s",
+                order_id,
+                shopify_order_id,
+                store_id_used,
+                shop_domain,
+            )
+            return True
+
         # NOTE: Shopify REST Admin API is on a legacy track; keep as-is for v0.1,
         # but plan migration to GraphQL Admin Orders API if you intend to ship as a public app.
-        # 调用 Shopify API
-        url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
-        headers = {
-            "X-Shopify-Access-Token": access_token,
-            "Content-Type": "application/json"
-        }
-        
-        logger.info(
-            "[Shopify] Calling API: %s (line_items_count=%s has_email=%s)",
-            url,
-            len(shopify_order_data["order"].get("line_items") or []),
-            bool(customer_email),
-        )
-        
         async with httpx.AsyncClient() as client:
-            async def _post_with_token(token: str) -> httpx.Response:
-                local_headers = {
-                    "X-Shopify-Access-Token": token,
-                    "Content-Type": "application/json",
-                }
-                request_payload: Dict[str, Any] = shopify_order_data
-                resp = await client.post(url, json=request_payload, headers=local_headers, timeout=10.0)
+            last_error: str | None = None
+            for store in candidates:
+                shop_domain_raw = str((store or {}).get("domain") or "").strip()
+                shop_domain = _normalize_shopify_domain(shop_domain_raw)
+                access_token = extract_shopify_access_token((store or {}).get("api_key_raw") or (store or {}).get("api_key"))
+                store_id = str((store or {}).get("store_id") or "").strip() or None
 
-                # Some Shopify configurations may reject embedded transactions on order create.
-                # Fall back to creating the order without transactions to preserve fulfillment,
-                # then the post-create reconciliation will attempt to add a transaction.
-                if resp.status_code != 201 and transactions_payload:
-                    try:
-                        retry_payload = {"order": dict(shopify_order_data["order"])}
-                        retry_payload["order"].pop("transactions", None)
-                        request_payload = retry_payload
-                        resp = await client.post(url, json=request_payload, headers=local_headers, timeout=10.0)
-                    except Exception:
-                        pass
+                if not shop_domain or not access_token:
+                    continue
 
-                # Retry once for clearly transient Shopify errors (rate limit / 5xx).
-                if resp.status_code in {429, 500, 502, 503, 504}:
-                    delay_s = 1.0
-                    retry_after = (resp.headers.get("Retry-After") or resp.headers.get("retry-after") or "").strip()
-                    if retry_after.isdigit():
-                        delay_s = float(min(max(int(retry_after), 1), 5))
-                    logger.warning(
-                        "[Shopify] Transient response=%s retry_after=%s; retrying in %.1fs order_id=%s",
-                        resp.status_code,
-                        retry_after or None,
-                        delay_s,
-                        order_id,
-                    )
-                    await asyncio.sleep(delay_s)
-                    resp = await client.post(url, json=request_payload, headers=local_headers, timeout=10.0)
-
-                return resp
-
-            response = await _post_with_token(access_token)
-
-            # Recovery: if the order is bound to an old store_id whose token was revoked (common after
-            # app uninstall/reinstall), try other active store rows for the same merchant+domain.
-            if response.status_code in {401, 403} and order_store_id:
-                try:
-                    from services.merchant_store_service import get_merchant_active_stores
-
-                    candidates = await get_merchant_active_stores(order["merchant_id"])
-                    domain_norm = _normalize_shopify_domain(shop_domain)
-                    seen_fps: set[str] = set()
-                    # Always include the current token first to avoid duplicates.
-                    try:
-                        seen_fps.add(hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:12])
-                    except Exception:
-                        pass
-
-                    for s in candidates or []:
-                        if str((s.get("platform") or "")).lower() != "shopify":
-                            continue
-                        if _normalize_shopify_domain(str(s.get("domain") or "")) != domain_norm:
-                            continue
-                        if str(s.get("store_id") or "").strip() == str(store_info.get("store_id") or "").strip():
-                            continue
-                        tok = extract_shopify_access_token(s.get("api_key_raw") or s.get("api_key")) or ""
-                        if not tok:
-                            continue
-                        fp = None
-                        try:
-                            fp = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:12]
-                        except Exception:
-                            fp = None
-                        if fp and fp in seen_fps:
-                            continue
-                        if fp:
-                            seen_fps.add(fp)
-
-                        logger.warning(
-                            "[Shopify] Auth failed with bound token; retrying with alternate store token "
-                            "(order_id=%s bound_store_id=%s alt_store_id=%s alt_token_fp=%s)",
-                            order_id,
-                            store_info.get("store_id"),
-                            s.get("store_id"),
-                            fp,
-                        )
-                        response = await _post_with_token(tok)
-                        if response.status_code not in {401, 403}:
-                            break
-                except Exception as e:
-                    logger.warning("[Shopify] Alternate-token recovery failed order_id=%s err=%s", order_id, str(e))
-
-            logger.info(f"[Shopify] API response: {response.status_code}")
-            
-            if response.status_code == 201:
-                shopify_order = response.json()["order"]
-                shopify_order_id = str(shopify_order["id"])
-                
-                logger.info(f"[Shopify] ✅ Order created: {shopify_order_id}")
-                
-                # 更新 Pivota 订单的 Shopify 订单 ID
-                await update_fulfillment_info(
-                    order_id=order_id,
-                    shopify_order_id=shopify_order_id,
-                    fulfillment_status="processing"
-                )
-                
-                logger.info(f"[Shopify] Updated Pivota order {order_id} with shopify_order_id={shopify_order_id}")
-                
-                # 记录事件
-                await log_order_event(
-                    event_type="shopify_order_created",
-                    order_id=order_id,
-                    merchant_id=order["merchant_id"],
-                    metadata={"shopify_order_id": shopify_order_id}
+                token_fp = _token_fingerprint(access_token)
+                logger.info(
+                    "[Shopify] Attempt create: order_id=%s store_id=%s domain=%s token_fp=%s",
+                    order_id,
+                    store_id,
+                    shop_domain,
+                    token_fp,
                 )
 
-                # Best-effort reconciliation: record external PSP payment as a Shopify transaction.
-                try:
-                    psp_used = order.get("psp_used") or merchant.get("psp_type") or None
-                    payment_ref = order.get("payment_intent_id") or None
-                    await ensure_external_payment_transaction_best_effort(
+                # Idempotency guardrail: if Shopify already has an order with our tag, reuse it.
+                existing_id = await _find_existing_order_id_best_effort(
+                    shop_domain=shop_domain, access_token=access_token
+                )
+                if existing_id:
+                    return await _finalize_success(
+                        shopify_order_id=existing_id,
+                        store_used=store,
                         shop_domain=shop_domain,
                         access_token=access_token,
-                        shopify_order_id=shopify_order_id,
-                        psp_used=psp_used,
-                        external_payment_ref=payment_ref,
-                        amount=float(order.get("total") or 0),
-                        currency=str(order.get("currency") or "USD"),
-                        pivota_order_id=order_id,
+                        event_type="shopify_order_reused",
                     )
-                except Exception as e:
-                    logger.warning(
-                        "[Shopify] Payment transaction sync failed order_id=%s shopify_order_id=%s err=%s",
-                        order_id,
-                        shopify_order_id,
-                        str(e),
+
+                url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
+                headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+
+                # Retry once on transient upstream failures.
+                for attempt in range(2):
+                    try:
+                        response = await client.post(
+                            url,
+                            json=shopify_order_data,
+                            headers=headers,
+                            timeout=12.0,
+                        )
+                    except Exception as e:
+                        last_error = f"{type(e).__name__}: {str(e)}"
+                        if attempt == 0:
+                            continue
+                        await log_order_event(
+                            event_type="shopify_order_error",
+                            order_id=order_id,
+                            merchant_id=order["merchant_id"],
+                            metadata={
+                                "store_id": store_id,
+                                "domain": shop_domain,
+                                "api_key_fp": token_fp,
+                                "error": last_error,
+                            },
+                        )
+                        return False
+
+                    logger.info("[Shopify] API response: %s", response.status_code)
+
+                    if response.status_code == 201:
+                        shopify_order = response.json().get("order") or {}
+                        shopify_order_id = str(shopify_order.get("id") or "").strip()
+                        if not shopify_order_id:
+                            last_error = "Missing Shopify order id in response"
+                            break
+                        return await _finalize_success(
+                            shopify_order_id=shopify_order_id,
+                            store_used=store,
+                            shop_domain=shop_domain,
+                            access_token=access_token,
+                            event_type="shopify_order_created",
+                        )
+
+                    # Auth errors: try another store row (stale token recovery).
+                    if response.status_code in (401, 403):
+                        error_msg = (response.text or "")[:800]
+                        await log_order_event(
+                            event_type="shopify_order_failed",
+                            order_id=order_id,
+                            merchant_id=order["merchant_id"],
+                            metadata={
+                                "status_code": response.status_code,
+                                "store_id": store_id,
+                                "domain": shop_domain,
+                                "api_key_fp": token_fp,
+                                "error": error_msg,
+                            },
+                        )
+                        last_error = f"Auth failed {response.status_code}"
+                        break
+
+                    # Retryable upstream issues.
+                    if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                        continue
+
+                    error_msg = (response.text or "")[:800]
+                    await log_order_event(
+                        event_type="shopify_order_failed",
+                        order_id=order_id,
+                        merchant_id=order["merchant_id"],
+                        metadata={
+                            "status_code": response.status_code,
+                            "store_id": store_id,
+                            "domain": shop_domain,
+                            "api_key_fp": token_fp,
+                            "error": error_msg,
+                        },
                     )
-                
-                logger.info(f"[Shopify] ✅ Successfully created Shopify order {shopify_order_id} for Pivota order {order_id}")
-                return True
-            else:
-                error_msg = response.text[:500]
-                logger.error(f"[Shopify] ❌ API error: {response.status_code} - {error_msg}")
-                
-                # 记录失败事件
-                await log_order_event(
-                    event_type="shopify_order_failed",
-                    order_id=order_id,
-                    merchant_id=order["merchant_id"],
-                    metadata={
-                        "status_code": response.status_code,
-                        "error": error_msg
-                    }
-                )
-                return False
+                    last_error = f"Shopify API error {response.status_code}"
+                    break
+
+            if last_error:
+                logger.error("[Shopify] ❌ Failed to create order_id=%s err=%s", order_id, last_error)
+            return False
     except Exception as e:
         logger.error(f"[Shopify] ❌ Exception in create_shopify_order: {type(e).__name__}: {e}", exc_info=True)
         
@@ -1891,7 +1927,7 @@ async def create_shopify_order(order_id: str) -> bool:
 @router.get("/{order_id}/debug")
 async def debug_order_data(
     order_id: str,
-    _: dict = Depends(require_admin_or_key)
+    _: dict = Depends(require_admin_or_key),
 ):
     """调试端点：查看订单的原始数据结构和Shopify credentials"""
     try:
@@ -1899,33 +1935,46 @@ async def debug_order_data(
         if not order:
             return {"error": "Order not found"}
         
-        from services.merchant_store_service import get_primary_store, get_store_by_id
-
         order_store_id = str(order.get("store_id") or "").strip() or None
-        bound_store = None
-        if order_store_id:
-            bound_store = await get_store_by_id(order_store_id, merchant_id=order["merchant_id"])
+
+        # Primary (latest active) store for this merchant.
+        from services.merchant_store_service import get_primary_store
         primary_store = await get_primary_store(order["merchant_id"])
 
-        def _store_credentials(store: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        # Bound store referenced by the order row (may be stale/inactive).
+        bound_store = None
+        if order_store_id:
+            try:
+                row = await database.fetch_one(
+                    """
+                    SELECT store_id, platform, domain, api_key, status, connected_at
+                    FROM merchant_stores
+                    WHERE store_id = :store_id
+                    LIMIT 1
+                    """,
+                    {"store_id": order_store_id},
+                )
+                if row:
+                    bound_store = dict(row)
+                    bound_store["api_key_raw"] = bound_store.get("api_key")
+                    bound_store["source"] = "merchant_stores"
+            except Exception:
+                bound_store = None
+
+        def _summarize_store(store: Dict[str, Any] | None) -> Dict[str, Any]:
             if not store:
                 return {}
-            api_key_raw = store.get("api_key_raw") or store.get("api_key") or ""
-            api_key_fp = None
-            try:
-                if api_key_raw:
-                    api_key_fp = hashlib.sha256(str(api_key_raw).encode("utf-8")).hexdigest()[:12]
-            except Exception:
-                api_key_fp = None
+            token = extract_shopify_access_token((store or {}).get("api_key_raw") or (store or {}).get("api_key"))
+            token_fp = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12] if token else None
             return {
                 "store_id": store.get("store_id"),
                 "platform": store.get("platform"),
                 "domain": store.get("domain"),
                 "status": store.get("status"),
-                "has_api_key": bool(store.get("api_key")),
-                "api_key_length": len(str(api_key_raw)) if api_key_raw else 0,
-                "api_key_fp": api_key_fp,
                 "source": store.get("source"),
+                "has_api_key": bool(token),
+                "api_key_length": len(token) if token else 0,
+                "api_key_fp": token_fp,
             }
         
         # 检查数据类型
@@ -1933,12 +1982,13 @@ async def debug_order_data(
             "order_id": order_id,
             "merchant_id": order["merchant_id"],
             "order_store_id": order_store_id,
-            "bound_store": _store_credentials(bound_store),
-            "primary_store": _store_credentials(primary_store),
+            "bound_store": _summarize_store(bound_store),
+            "primary_store": _summarize_store(primary_store),
             "data_types": {
                 "items": str(type(order.get("items"))),
                 "items_count": len(order.get("items", [])),
                 "shipping_address": str(type(order.get("shipping_address"))),
+                "has_customer_email": bool(str(order.get("customer_email") or "").strip()),
             }
         }
     except Exception as e:
@@ -1949,7 +1999,7 @@ async def debug_order_data(
 @router.post("/{order_id}/create-shopify")
 async def trigger_shopify_order(
     order_id: str,
-    _: dict = Depends(require_admin_or_key)
+    _: dict = Depends(require_admin_or_key),
 ):
     """Manually trigger Shopify order creation for debugging"""
     order = await get_order(order_id)
@@ -1999,6 +2049,84 @@ async def trigger_shopify_order(
     except Exception as e:
         logger.error(f"Exception in trigger_shopify_order: {type(e).__name__}: {e}", exc_info=True)
         return {"status": "error", "error": str(e), "error_type": type(e).__name__}
+
+
+@router.post("/reconcile-missing-shopify")
+async def reconcile_missing_shopify_orders(
+    merchant_id: Optional[str] = Query(None, description="Optional merchant_id to scope reconciliation"),
+    limit: int = Query(50, ge=1, le=500),
+    min_age_seconds: int = Query(
+        120,
+        ge=0,
+        le=7 * 24 * 3600,
+        description="Only reconcile orders paid at least this many seconds ago",
+    ),
+    dry_run: bool = Query(False),
+    current_user: dict = Depends(require_admin_or_key),
+):
+    """
+    Ops endpoint: reconcile paid orders that are missing `shopify_order_id`.
+
+    This is a guardrail against transient failures (DB busy, timeouts, stale store rows).
+    Intended to be called by a cron/scheduler or manually during incidents.
+    """
+    cutoff = datetime.utcnow() - timedelta(seconds=int(min_age_seconds))
+
+    conditions = [
+        orders_table.c.is_deleted.is_(False),
+        orders_table.c.payment_status == "paid",
+        or_(orders_table.c.shopify_order_id.is_(None), orders_table.c.shopify_order_id == ""),
+        or_(
+            and_(orders_table.c.paid_at.isnot(None), orders_table.c.paid_at <= cutoff),
+            and_(orders_table.c.paid_at.is_(None), orders_table.c.created_at <= cutoff),
+        ),
+    ]
+    if merchant_id:
+        conditions.append(orders_table.c.merchant_id == merchant_id)
+
+    query = (
+        select([orders_table.c.order_id])
+        .where(and_(*conditions))
+        .order_by(orders_table.c.created_at.asc())
+        .limit(int(limit))
+    )
+    rows = await database.fetch_all(query)
+    order_ids = [str(r["order_id"]) for r in (rows or []) if r and r.get("order_id")]
+
+    if dry_run:
+        return {
+            "status": "success",
+            "dry_run": True,
+            "merchant_id": merchant_id,
+            "cutoff_utc": cutoff.isoformat() + "Z",
+            "candidates": order_ids,
+            "count": len(order_ids),
+        }
+
+    succeeded: List[str] = []
+    failed: List[Dict[str, Any]] = []
+    for oid in order_ids:
+        try:
+            ok = await create_shopify_order(oid)
+            if ok:
+                succeeded.append(oid)
+            else:
+                failed.append({"order_id": oid, "error": "create_shopify_order returned false"})
+        except Exception as e:
+            failed.append({"order_id": oid, "error": f"{type(e).__name__}: {str(e)}"})
+
+    return {
+        "status": "success",
+        "dry_run": False,
+        "merchant_id": merchant_id,
+        "cutoff_utc": cutoff.isoformat() + "Z",
+        "attempted": len(order_ids),
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+        "succeeded_orders": succeeded,
+        "failed_orders": failed[:50],
+    }
+
 
 @router.post("/{order_id}/ship")
 async def mark_order_as_shipped(

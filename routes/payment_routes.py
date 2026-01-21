@@ -386,16 +386,33 @@ async def checkout_webhook(
         if not order:
             await WebhookService.update_event_status(event_id, "failed", "Order not found")
             raise HTTPException(status_code=404, detail="Order not found")
-        
+
         # Check if already paid (idempotency at order level)
         if order.get("payment_status") == "paid":
-            logger.info(f"Order {order_id} already paid, marking webhook as processed")
+            shopify_sync = "already_linked" if order.get("shopify_order_id") else "initiated"
+            if not order.get("shopify_order_id"):
+
+                async def create_shopify_order_task_already_paid():
+                    try:
+                        store_info = await get_primary_store(order["merchant_id"])
+                        if store_info and store_info.get("platform") == "shopify":
+                            await create_shopify_order(order_id)
+                    except Exception as e:
+                        logger.error(f"[Checkout webhook] Shopify sync failed for {order_id}: {e}")
+
+                background_tasks.add_task(create_shopify_order_task_already_paid)
+
+            logger.info(
+                f"Order {order_id} already paid, marking webhook as processed (shopify_sync={shopify_sync})"
+            )
             await WebhookService.update_event_status(event_id, "processed")
             return {
                 "status": "already_paid",
                 "event_id": event_id,
                 "order_id": order_id,
-                "message": "Order already marked as paid"
+                "shopify_sync": shopify_sync,
+                "shopify_order_id": order.get("shopify_order_id"),
+                "message": "Order already marked as paid",
             }
         
         # Update payment info if transaction id present

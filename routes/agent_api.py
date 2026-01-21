@@ -1868,54 +1868,96 @@ async def agent_confirm_payment(
 ):
     """确认支付并触发 Shopify 订单创建（Agent 调用）"""
     try:
-        from routes.order_routes import mark_order_paid, create_shopify_order, log_order_event, get_order
-        from routes.merchant_onboarding_routes import get_merchant_onboarding
+        from routes.order_routes import create_shopify_order, get_order, log_order_event, mark_order_paid
+        from services.merchant_store_service import get_primary_store
         from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
         
-        # 获取订单
         order = await get_order(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        
-        # 验证访问权限
+
         if not context.can_access_merchant(order["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized for this order")
-        
+
+        store_info = await get_primary_store(order["merchant_id"])
+        can_shopify_sync = bool(store_info) and str((store_info or {}).get("platform") or "").strip().lower() == "shopify" and bool(
+            str((store_info or {}).get("api_key") or "").strip()
+        )
+
         already_paid = order.get("payment_status") == "paid"
-        if already_paid and order.get("shopify_order_id"):
+        if already_paid:
+            if not order.get("shopify_order_id") and can_shopify_sync:
+                try:
+                    await log_order_event(
+                        event_type="shopify_sync_retry_requested",
+                        order_id=order_id,
+                        merchant_id=order["merchant_id"],
+                        metadata={"requested_by": "agent_confirm_payment"},
+                    )
+                except Exception:
+                    pass
+
+                background_tasks.add_task(create_shopify_order, order_id)
+
+                background_tasks.add_task(
+                    log_agent_request,
+                    context=context,
+                    status_code=200,
+                    merchant_id=order["merchant_id"],
+                    order_id=order_id,
+                )
+
+                return {
+                    "status": "success",
+                    "message": "Order already paid; Shopify sync initiated",
+                    "order_id": order_id,
+                    "payment_intent_id": order.get("payment_intent_id"),
+                    "shopify_sync": "initiated",
+                }
+
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=order["merchant_id"],
+                order_id=order_id,
+            )
+
             return {
                 "status": "success",
                 "message": "Order already paid",
                 "order_id": order_id,
-                "shopify_sync": "already_exists",
+                "payment_intent_id": order.get("payment_intent_id"),
+                "shopify_sync": "already_linked" if order.get("shopify_order_id") else ("not_configured" if not can_shopify_sync else "missing_shopify_order_id"),
                 "shopify_order_id": order.get("shopify_order_id"),
             }
-        
-        if not already_paid:
-            # 标记订单已支付
-            await mark_order_paid(order_id)
 
-            # PCS: freeze order snapshot evidence (best-effort; does not block confirm)
-            try:
-                await create_order_snapshot_evidence_pack(order_id, triggered_by="agent_confirm_payment")
-            except Exception as e:
-                logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
-        
-            # [Phase 6.2] 自动触发 commission 计算
-            if order.get("agent_id"):
-                async def trigger_commission():
-                    try:
-                        from services.order_commission_service import OrderCommissionService
-                        from db.database import database
-                        service = OrderCommissionService(database)
-                        await service.calculate_commission_for_order(order_id)
-                        logger.info(f"✅ Commission auto-calculated for order {order_id}")
-                    except Exception as e:
-                        logger.error(f"Commission auto-calculation failed for {order_id}: {e}")
-                
-                background_tasks.add_task(trigger_commission)
-        
-            # 记录支付成功事件
+        await mark_order_paid(order_id)
+
+        # PCS: freeze order snapshot evidence (best-effort; does not block confirm)
+        try:
+            await create_order_snapshot_evidence_pack(order_id, triggered_by="agent_confirm_payment")
+        except Exception as e:
+            logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
+
+        # [Phase 6.2] 自动触发 commission 计算
+        if order.get("agent_id"):
+
+            async def trigger_commission():
+                try:
+                    from services.order_commission_service import OrderCommissionService
+                    from db.database import database
+
+                    service = OrderCommissionService(database)
+                    await service.calculate_commission_for_order(order_id)
+                    logger.info(f"✅ Commission auto-calculated for order {order_id}")
+                except Exception as e:
+                    logger.error(f"Commission auto-calculation failed for {order_id}: {e}")
+
+            background_tasks.add_task(trigger_commission)
+
+        # 记录支付成功事件（best-effort; do not fail confirm if event logging hits DB busy）
+        try:
             await log_order_event(
                 event_type="payment_succeeded",
                 order_id=order_id,
@@ -1924,63 +1966,14 @@ async def agent_confirm_payment(
                     "payment_intent_id": order.get("payment_intent_id"),
                     "amount": float(order["total"]),
                     "currency": order["currency"],
-                    "confirmed_by": "agent"
-                }
+                    "confirmed_by": "agent",
+                },
             )
-        else:
-            # Order is already paid, but we still want to (re)attempt Shopify order creation
-            # when shopify_order_id is missing (e.g., prior sync failed).
-            try:
-                await log_order_event(
-                    event_type="shopify_sync_retry_requested",
-                    order_id=order_id,
-                    merchant_id=order["merchant_id"],
-                    metadata={"requested_by": "agent_confirm_payment"},
-                )
-            except Exception:
-                pass
-        
-        # 获取商户信息用于 Shopify 同步
-        merchant = await get_merchant_onboarding(order["merchant_id"])
-        
-        # 后台任务：创建 Shopify 订单（直接调用，避免嵌套异步）
-        from services.merchant_store_service import get_primary_store
-        from routes.order_routes import create_shopify_order
-        
-        async def create_shopify_order_task():
-            """创建 Shopify 订单通知商户发货"""
-            try:
-                logger.info(f"[Background] Starting Shopify order creation for {order_id}")
+        except Exception:
+            pass
 
-                latest = await get_order(order_id)
-                if latest and latest.get("shopify_order_id"):
-                    logger.info(f"[Background] Shopify order already exists for {order_id}; skip")
-                    return
-                
-                # 获取主店铺信息以决定是否同步到 Shopify
-                store_info = await get_primary_store(order["merchant_id"])
-                logger.info(f"[Background] Store info: platform={store_info.get('platform') if store_info else 'None'}, has_token={bool(store_info.get('api_key')) if store_info else False}")
-                
-                if not store_info:
-                    logger.warning(f"[Background] No store info found for merchant {order['merchant_id']}")
-                    return
-                    
-                if store_info.get("platform") != "shopify":
-                    logger.info(f"[Background] Merchant not connected to Shopify, skipping order sync")
-                    return
-                
-                logger.info(f"[Background] Calling create_shopify_order for {order_id}")
-                success = await create_shopify_order(order_id)
-                
-                if success:
-                    logger.info(f"[Background] ✅ Shopify order created successfully for {order_id}")
-                else:
-                    logger.error(f"[Background] ❌ Failed to create Shopify order for {order_id}")
-                    
-            except Exception as e:
-                logger.error(f"[Background] Error in Shopify order creation task: {type(e).__name__}: {e}", exc_info=True)
-        
-        background_tasks.add_task(create_shopify_order_task)
+        if can_shopify_sync:
+            background_tasks.add_task(create_shopify_order, order_id)
         
         # 记录请求
         background_tasks.add_task(
@@ -1993,10 +1986,10 @@ async def agent_confirm_payment(
         
         return {
             "status": "success",
-            "message": "Payment confirmed, Shopify order creation initiated" if not already_paid else "Shopify order creation initiated",
+            "message": "Payment confirmed, Shopify order creation initiated" if can_shopify_sync else "Payment confirmed",
             "order_id": order_id,
             "payment_intent_id": order.get("payment_intent_id"),
-            "shopify_sync": "initiated" if merchant and True else "not_configured"
+            "shopify_sync": "initiated" if can_shopify_sync else "not_configured",
         }
         
     except HTTPException:

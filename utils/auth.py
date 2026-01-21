@@ -5,7 +5,7 @@ Handles JWT token creation, validation, and user authentication
 
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Iterable, List
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import bcrypt
@@ -19,6 +19,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
 # Security scheme
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 # ============================================================================
 # PASSWORD HASHING
@@ -178,6 +179,40 @@ async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)
             detail="Admin access required"
         )
     return current_user
+
+
+async def require_admin_or_key(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    x_admin_key: Optional[str] = Header(None, alias="X-ADMIN-KEY"),
+) -> Dict[str, Any]:
+    """
+    Allow either:
+    - `X-ADMIN-KEY` header (ADMIN_API_KEY or PROMOTIONS_ADMIN_KEY), or
+    - Bearer JWT with admin/super_admin role
+    """
+    expected_keys = [
+        (os.getenv("ADMIN_API_KEY") or "").strip(),
+        (os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip(),
+    ]
+    expected_keys = [k for k in expected_keys if k]
+
+    if x_admin_key and expected_keys and x_admin_key in expected_keys:
+        return {"sub": "admin_key", "email": "admin_key@local", "role": "admin"}
+
+    if credentials and credentials.credentials:
+        # Reuse existing JWT decode logic.
+        payload = decode_token(credentials.credentials)
+        if payload.get("role") not in ["admin", "super_admin"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin access required",
+            )
+        return payload
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+    )
 
 
 async def get_current_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
