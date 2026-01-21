@@ -496,7 +496,6 @@ async def create_external_seed(
     market = _normalize_market(body.market)
     tool = _normalize_tool(body.tool)
     dest = _require_http_url(body.destination_url)
-    seed_id = _seed_id()
 
     employee_id = current_user.get("employee_id") or current_user.get("employeeId")
     attached_product_key = (body.attach_product_key or "").strip() or None
@@ -518,6 +517,21 @@ async def create_external_seed(
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
 
+    match_url = canonical_url or dest
+    existing_row = await database.fetch_one(
+        """
+        SELECT *
+        FROM external_product_seeds
+        WHERE status = 'active'
+          AND market = :market
+          AND tool = :tool
+          AND (canonical_url = :match_url OR destination_url = :match_url)
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+        """,
+        {"market": market, "tool": tool, "match_url": match_url},
+    )
+
     # Merge: employee-provided fields override snapshot-derived values.
     title = (body.title or "").strip() or snap_title
     image_url = (body.image_url or "").strip() or snap_image_url
@@ -528,75 +542,210 @@ async def create_external_seed(
     partner_type = (body.partner_type or "").strip() or None
     disclosure_text = (body.disclosure_text or "").strip() or DEFAULT_DISCLOSURE_TEXT
 
-    seed_data: Dict[str, Any] = {
-        "external_product_id": _stable_external_product_id(canonical_url or dest),
-        "product_id": (body.product_id or "").strip() or None,
-        "brand": (body.brand or "").strip() or None,
-        "category": (body.category or "").strip() or None,
-        "title": title,
-        "image_url": image_url,
-        "availability": availability,
-        "variants": body.variants or [],
-        "utm_template": utm_template,
-        "partner_type": partner_type,
-        "disclosure_text": disclosure_text,
-        "source": "employee_seed",
-        "snapshot": {
-            "canonical_url": canonical_url,
-            "domain": domain,
-            "title": snap_title,
-            "image_url": snap_image_url,
-            "price_amount": snap_price_amount,
-            "price_currency": snap_price_currency,
-            "availability": snap_availability,
-        },
-    }
+    if existing_row:
+        row = dict(existing_row)
+        seed_id = row.get("id")
+        existing_seed_data = _ensure_json_obj(row.get("seed_data"))
+        canonical_url = canonical_url or row.get("canonical_url")
+        domain = domain or row.get("domain")
 
-    await _execute_seed_data_stmt(
-        """
-        INSERT INTO external_product_seeds (
-          id, market, tool, utm_template, partner_type, disclosure_text,
-          destination_url, canonical_url, domain, title, image_url,
-          price_amount, price_currency, availability,
-          seed_data,
-          status, notes, created_by_employee_id, attached_product_key, attached_variant_id
-        ) VALUES (
-          :id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
-          :destination_url, :canonical_url, :domain, :title, :image_url,
-          :price_amount, :price_currency, :availability,
-          :seed_data,
-          'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id
+        title = title or existing_seed_data.get("title") or row.get("title")
+        image_url = image_url or existing_seed_data.get("image_url") or row.get("image_url")
+        if price_amount is None:
+            price_amount = row.get("price_amount")
+        if not price_currency:
+            price_currency = row.get("price_currency")
+        availability = availability or existing_seed_data.get("availability") or row.get("availability")
+        utm_template = utm_template or row.get("utm_template") or existing_seed_data.get("utm_template")
+        partner_type = partner_type or row.get("partner_type") or existing_seed_data.get("partner_type")
+        disclosure_text = (
+            disclosure_text
+            or row.get("disclosure_text")
+            or existing_seed_data.get("disclosure_text")
+            or DEFAULT_DISCLOSURE_TEXT
         )
-        """,
-        {
-            "id": seed_id,
-            "market": market,
-            "tool": tool,
+
+        attached_product_key = attached_product_key or row.get("attached_product_key")
+        attached_variant_id = attached_variant_id or row.get("attached_variant_id")
+        notes = body.notes if body.notes is not None else row.get("notes")
+        market = market or row.get("market")
+        tool = tool or row.get("tool")
+
+        seed_data = dict(existing_seed_data)
+        seed_data["external_product_id"] = _stable_external_product_id(canonical_url or dest)
+        if body.product_id is not None:
+            seed_data["product_id"] = (body.product_id or "").strip() or None
+        if body.brand is not None:
+            seed_data["brand"] = (body.brand or "").strip() or None
+        if body.category is not None:
+            seed_data["category"] = (body.category or "").strip() or None
+        seed_data["title"] = title
+        seed_data["image_url"] = image_url
+        seed_data["availability"] = availability
+        seed_data["utm_template"] = utm_template
+        seed_data["partner_type"] = partner_type
+        seed_data["disclosure_text"] = disclosure_text
+        seed_data["source"] = seed_data.get("source") or "employee_seed"
+        seed_data.setdefault("snapshot", {})
+        seed_data["snapshot"].update(
+            {
+                "canonical_url": canonical_url,
+                "domain": domain,
+                "title": snap_title,
+                "image_url": snap_image_url,
+                "price_amount": snap_price_amount,
+                "price_currency": snap_price_currency,
+                "availability": snap_availability,
+            }
+        )
+        if body.variants is not None and body.variants:
+            seed_data["variants"] = body.variants
+        elif not seed_data.get("variants"):
+            evidence = getattr(snapshot, "evidence", None)
+            if isinstance(evidence, dict):
+                snap_variants = evidence.get("variants")
+                if isinstance(snap_variants, list) and snap_variants:
+                    seed_data["variants"] = snap_variants
+
+        match_url = canonical_url or dest
+
+        await _execute_seed_data_stmt(
+            """
+            UPDATE external_product_seeds
+            SET market = :market,
+                tool = :tool,
+                utm_template = :utm_template,
+                partner_type = :partner_type,
+                disclosure_text = :disclosure_text,
+                destination_url = :destination_url,
+                canonical_url = :canonical_url,
+                domain = :domain,
+                title = :title,
+                image_url = :image_url,
+                price_amount = :price_amount,
+                price_currency = :price_currency,
+                availability = :availability,
+                seed_data = :seed_data,
+                notes = :notes,
+                created_by_employee_id = :created_by_employee_id,
+                attached_product_key = :attached_product_key,
+                attached_variant_id = :attached_variant_id,
+                updated_at = NOW()
+            WHERE id = :id
+            """,
+            {
+                "id": seed_id,
+                "market": market,
+                "tool": tool,
+                "utm_template": utm_template,
+                "partner_type": partner_type,
+                "disclosure_text": disclosure_text,
+                "destination_url": dest,
+                "canonical_url": canonical_url,
+                "domain": domain,
+                "title": title,
+                "image_url": image_url,
+                "price_amount": price_amount,
+                "price_currency": price_currency,
+                "availability": availability,
+                "seed_data": _seed_data_payload(seed_data),
+                "notes": notes,
+                "created_by_employee_id": str(employee_id) if employee_id else None,
+                "attached_product_key": attached_product_key,
+                "attached_variant_id": attached_variant_id,
+            },
+        )
+        await database.execute(
+            """
+            UPDATE external_product_seeds
+            SET status = 'disabled',
+                notes = COALESCE(notes, '') || :note,
+                updated_at = NOW()
+            WHERE id <> :id
+              AND status = 'active'
+              AND market = :market
+              AND tool = :tool
+              AND (canonical_url = :match_url OR destination_url = :match_url)
+            """,
+            {
+                "id": seed_id,
+                "market": market,
+                "tool": tool,
+                "match_url": match_url,
+                "note": f" superseded_by:{seed_id}",
+            },
+        )
+    else:
+        seed_id = _seed_id()
+        seed_data: Dict[str, Any] = {
+            "external_product_id": _stable_external_product_id(match_url),
+            "product_id": (body.product_id or "").strip() or None,
+            "brand": (body.brand or "").strip() or None,
+            "category": (body.category or "").strip() or None,
+            "title": title,
+            "image_url": image_url,
+            "availability": availability,
+            "variants": body.variants or [],
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
-            "destination_url": dest,
-            "canonical_url": canonical_url,
-            "domain": domain,
-            "title": title,
-            "image_url": image_url,
-            "price_amount": price_amount,
-            "price_currency": price_currency,
-            "availability": availability,
-            "seed_data": _seed_data_payload(seed_data),
-            "notes": body.notes,
-            "created_by_employee_id": str(employee_id) if employee_id else None,
-            "attached_product_key": attached_product_key,
-            "attached_variant_id": attached_variant_id,
-        },
-    )
+            "source": "employee_seed",
+            "snapshot": {
+                "canonical_url": canonical_url,
+                "domain": domain,
+                "title": snap_title,
+                "image_url": snap_image_url,
+                "price_amount": snap_price_amount,
+                "price_currency": snap_price_currency,
+                "availability": snap_availability,
+            },
+        }
+
+        await _execute_seed_data_stmt(
+            """
+            INSERT INTO external_product_seeds (
+              id, market, tool, utm_template, partner_type, disclosure_text,
+              destination_url, canonical_url, domain, title, image_url,
+              price_amount, price_currency, availability,
+              seed_data,
+              status, notes, created_by_employee_id, attached_product_key, attached_variant_id
+            ) VALUES (
+              :id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
+              :destination_url, :canonical_url, :domain, :title, :image_url,
+              :price_amount, :price_currency, :availability,
+              :seed_data,
+              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id
+            )
+            """,
+            {
+                "id": seed_id,
+                "market": market,
+                "tool": tool,
+                "utm_template": utm_template,
+                "partner_type": partner_type,
+                "disclosure_text": disclosure_text,
+                "destination_url": dest,
+                "canonical_url": canonical_url,
+                "domain": domain,
+                "title": title,
+                "image_url": image_url,
+                "price_amount": price_amount,
+                "price_currency": price_currency,
+                "availability": availability,
+                "seed_data": _seed_data_payload(seed_data),
+                "notes": body.notes,
+                "created_by_employee_id": str(employee_id) if employee_id else None,
+                "attached_product_key": attached_product_key,
+                "attached_variant_id": attached_variant_id,
+            },
+        )
 
     redirect_url = await _make_redirect_url(
         request=request,
         market=market,
         tool=tool,
         destination_url=canonical_url or dest,
-        utm_template=body.utm_template,
+        utm_template=utm_template,
         ctx={
             "seedId": seed_id,
             **({"productKey": attached_product_key} if attached_product_key else {}),
@@ -614,13 +763,13 @@ async def create_external_seed(
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
             "destination_url": dest,
-            "canonical_url": canonical_url,
+            "canonical_url": canonical_url or dest,
             "domain": domain,
             "title": title,
             "image_url": image_url,
             "price": {"amount": price_amount, "currency": price_currency},
             "availability": availability,
-            "notes": body.notes,
+            "notes": notes if existing_row else body.notes,
             "attached_product_key": attached_product_key,
             "attached_variant_id": attached_variant_id,
             "product": {
