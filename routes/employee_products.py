@@ -367,6 +367,7 @@ async def preview_external_seed(
                 "price_amount": None,
                 "price_currency": None,
                 "availability": None,
+                "variants": [],
                 "domain_allowed": True,
             },
         }
@@ -381,6 +382,13 @@ async def preview_external_seed(
     except Exception:
         domain_allowed = True
 
+    variants = []
+    evidence = getattr(snapshot, "evidence", None)
+    if isinstance(evidence, dict):
+        raw_variants = evidence.get("variants")
+        if isinstance(raw_variants, list):
+            variants = raw_variants
+
     return {
         "status": "success",
         "preview": {
@@ -393,6 +401,7 @@ async def preview_external_seed(
             "price_amount": getattr(snapshot, "price_amount", None),
             "price_currency": getattr(snapshot, "price_currency", None),
             "availability": getattr(snapshot, "availability", None),
+            "variants": variants,
             "domain_allowed": domain_allowed,
         },
     }
@@ -831,6 +840,12 @@ async def refresh_external_seed(
         seed_data["image_url"] = snap_image_url
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
+    if not seed_data.get("variants"):
+        evidence = getattr(snapshot, "evidence", None)
+        if isinstance(evidence, dict):
+            snap_variants = evidence.get("variants")
+            if isinstance(snap_variants, list) and snap_variants:
+                seed_data["variants"] = snap_variants
 
     await _execute_seed_data_stmt(
         """

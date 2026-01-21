@@ -130,26 +130,160 @@ def _parse_price(value: Optional[str]) -> Optional[float]:
         return None
 
 
-def _extract_jsonld_offer(json_texts: list[str]) -> Dict[str, Any]:
-    def iter_nodes(obj: Any):
-        if isinstance(obj, dict):
-            yield obj
-            for v in obj.values():
-                yield from iter_nodes(v)
-        elif isinstance(obj, list):
-            for it in obj:
-                yield from iter_nodes(it)
+MAX_VARIANTS = int(os.getenv("EXTERNAL_OFFER_MAX_VARIANTS") or "50")
 
+
+def _parse_jsonld_texts(json_texts: list[str]) -> list[Any]:
     parsed_objs: list[Any] = []
     for raw in json_texts:
         try:
             parsed_objs.append(json.loads(raw))
         except Exception:
             continue
+    return parsed_objs
 
+
+def _iter_jsonld_nodes(obj: Any):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _iter_jsonld_nodes(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            yield from _iter_jsonld_nodes(it)
+
+
+def _offer_price_and_currency(offer: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    price = offer.get("price") or offer.get("lowPrice") or offer.get("highPrice")
+    currency = offer.get("priceCurrency")
+
+    spec = offer.get("priceSpecification")
+    if isinstance(spec, dict):
+        price = price or spec.get("price") or spec.get("minPrice") or spec.get("maxPrice")
+        currency = currency or spec.get("priceCurrency")
+    elif isinstance(spec, list) and spec:
+        first = spec[0] if isinstance(spec[0], dict) else None
+        if first:
+            price = price or first.get("price") or first.get("minPrice") or first.get("maxPrice")
+            currency = currency or first.get("priceCurrency")
+
+    return (str(price).strip() if price is not None else None, str(currency).strip().upper() if currency else None)
+
+
+def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[Dict[str, Any]]:
+    if offers is None:
+        return []
+
+    offer_list: list[Any] = []
+    if isinstance(offers, list):
+        offer_list = offers
+    elif isinstance(offers, dict):
+        nested = offers.get("offers")
+        if isinstance(nested, list):
+            offer_list = nested
+        else:
+            offer_list = [offers]
+
+    variants: list[Dict[str, Any]] = []
+    for idx, offer in enumerate(offer_list):
+        if not isinstance(offer, dict):
+            continue
+        item = offer.get("itemOffered")
+        if isinstance(item, list) and item:
+            item = item[0]
+        if not isinstance(item, dict):
+            item = {}
+
+        variant_id = (
+            offer.get("sku")
+            or offer.get("skuId")
+            or offer.get("productID")
+            or offer.get("mpn")
+            or offer.get("gtin13")
+            or item.get("sku")
+            or item.get("skuId")
+            or item.get("productID")
+            or item.get("mpn")
+            or item.get("gtin13")
+            or offer.get("@id")
+            or item.get("@id")
+            or f"offer_{idx + 1}"
+        )
+
+        title = offer.get("name") or item.get("name")
+        if not title:
+            attrs = []
+            for key in ("size", "color", "model", "material", "pattern"):
+                val = item.get(key) or offer.get(key)
+                if val:
+                    attrs.append(str(val))
+            if attrs:
+                title = " / ".join(attrs)
+            elif product_name:
+                title = product_name
+
+        price_raw, currency = _offer_price_and_currency(offer)
+        availability_raw = offer.get("availability") or item.get("availability")
+        availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
+
+        variants.append(
+            {
+                "variant_id": str(variant_id),
+                "title": str(title).strip() if title else None,
+                "price_amount": _parse_price(price_raw) if price_raw else None,
+                "price_currency": currency,
+                "availability": availability,
+            }
+        )
+
+        if len(variants) >= MAX_VARIANTS:
+            break
+
+    return variants
+
+
+def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
+    variants: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for root in parsed_objs:
+        for node in _iter_jsonld_nodes(root):
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type")
+            if isinstance(t, list):
+                tset = {str(x).lower() for x in t}
+            else:
+                tset = {str(t).lower()} if t else set()
+
+            product_name = node.get("name") if isinstance(node.get("name"), str) else None
+            if "product" in tset:
+                variants += _offer_variants_from_node(node.get("offers"), product_name)
+            elif "offer" in tset:
+                variants += _offer_variants_from_node(node, product_name)
+
+            if len(variants) >= MAX_VARIANTS:
+                break
+        if len(variants) >= MAX_VARIANTS:
+            break
+
+    normalized: list[Dict[str, Any]] = []
+    for v in variants:
+        vid = str(v.get("variant_id") or "").strip()
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        normalized.append(v)
+        if len(normalized) >= MAX_VARIANTS:
+            break
+
+    return normalized
+
+
+def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
     for root in parsed_objs:
-        for node in iter_nodes(root):
+        for node in _iter_jsonld_nodes(root):
             t = node.get("@type") if isinstance(node, dict) else None
             if isinstance(t, list):
                 tset = {str(x).lower() for x in t}
@@ -247,7 +381,9 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     price = meta("property:product:price:amount", "property:og:price:amount", "property:product:price") or None
     currency = meta("property:product:price:currency", "property:og:price:currency") or None
 
-    jsonld = _extract_jsonld_offer(p.jsonld)
+    parsed_jsonld = _parse_jsonld_texts(p.jsonld)
+    jsonld = _extract_jsonld_offer(parsed_jsonld)
+    variants = _extract_jsonld_variants(parsed_jsonld)
 
     # JSON-LD is preferred when it provides structured offers.
     out = {
@@ -259,6 +395,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         "price_currency": (jsonld.get("currency") or currency or "").strip().upper() or None,
         "availability": _availability_from_raw(jsonld.get("availability_raw")),
         "evidence_provider": "jsonld" if jsonld.get("price_raw") or jsonld.get("title") else ("og" if title or image else "manual"),
+        "variants": variants,
     }
     return out
 
@@ -376,7 +513,14 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
         rid = f"eo_{url_hash[:24]}"
         now = _now()
         now_db = _now_db()
-        evidence = {"provider": extracted.get("evidence_provider") or "manual", "fetchedAt": now.isoformat(), "snapshotId": (existing or {}).get("id") or rid}
+        evidence = {
+            "provider": extracted.get("evidence_provider") or "manual",
+            "fetchedAt": now.isoformat(),
+            "snapshotId": (existing or {}).get("id") or rid,
+        }
+        variants = extracted.get("variants") or []
+        if variants:
+            evidence["variants"] = variants[:MAX_VARIANTS]
         if existing:
             stmt = (
                 update(external_offer_snapshots)
