@@ -71,8 +71,15 @@ async def require_admin_or_key(
 
     Note: keep this dependency narrowly scoped to internal helper endpoints.
     """
-    expected = (os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip()
-    if expected and x_admin_key and x_admin_key == expected:
+    allowed_keys = {
+        k.strip()
+        for k in [
+            os.getenv("ADMIN_API_KEY"),
+            os.getenv("PROMOTIONS_ADMIN_KEY"),
+        ]
+        if isinstance(k, str) and k.strip()
+    }
+    if allowed_keys and x_admin_key and x_admin_key.strip() in allowed_keys:
         return {"role": "admin", "sub": "admin_key"}
 
     if authorization and authorization.startswith("Bearer "):
@@ -1707,36 +1714,95 @@ async def create_shopify_order(order_id: str) -> bool:
         )
         
         async with httpx.AsyncClient() as client:
-            request_payload: Dict[str, Any] = shopify_order_data
-            response = await client.post(url, json=request_payload, headers=headers, timeout=10.0)
-            # Some Shopify configurations may reject embedded transactions on order create.
-            # Fall back to creating the order without transactions to preserve fulfillment,
-            # then the post-create reconciliation will attempt to add a transaction.
-            if response.status_code != 201 and transactions_payload:
-                try:
-                    retry_payload = {"order": dict(shopify_order_data["order"])}
-                    retry_payload["order"].pop("transactions", None)
-                    request_payload = retry_payload
-                    response = await client.post(url, json=request_payload, headers=headers, timeout=10.0)
-                except Exception:
-                    pass
+            async def _post_with_token(token: str) -> httpx.Response:
+                local_headers = {
+                    "X-Shopify-Access-Token": token,
+                    "Content-Type": "application/json",
+                }
+                request_payload: Dict[str, Any] = shopify_order_data
+                resp = await client.post(url, json=request_payload, headers=local_headers, timeout=10.0)
 
-            # Retry once for clearly transient Shopify errors (rate limit / 5xx).
-            if response.status_code in {429, 500, 502, 503, 504}:
-                delay_s = 1.0
-                retry_after = (response.headers.get("Retry-After") or response.headers.get("retry-after") or "").strip()
-                if retry_after.isdigit():
-                    delay_s = float(min(max(int(retry_after), 1), 5))
-                logger.warning(
-                    "[Shopify] Transient response=%s retry_after=%s; retrying in %.1fs order_id=%s",
-                    response.status_code,
-                    retry_after or None,
-                    delay_s,
-                    order_id,
-                )
-                await asyncio.sleep(delay_s)
-                response = await client.post(url, json=request_payload, headers=headers, timeout=10.0)
-            
+                # Some Shopify configurations may reject embedded transactions on order create.
+                # Fall back to creating the order without transactions to preserve fulfillment,
+                # then the post-create reconciliation will attempt to add a transaction.
+                if resp.status_code != 201 and transactions_payload:
+                    try:
+                        retry_payload = {"order": dict(shopify_order_data["order"])}
+                        retry_payload["order"].pop("transactions", None)
+                        request_payload = retry_payload
+                        resp = await client.post(url, json=request_payload, headers=local_headers, timeout=10.0)
+                    except Exception:
+                        pass
+
+                # Retry once for clearly transient Shopify errors (rate limit / 5xx).
+                if resp.status_code in {429, 500, 502, 503, 504}:
+                    delay_s = 1.0
+                    retry_after = (resp.headers.get("Retry-After") or resp.headers.get("retry-after") or "").strip()
+                    if retry_after.isdigit():
+                        delay_s = float(min(max(int(retry_after), 1), 5))
+                    logger.warning(
+                        "[Shopify] Transient response=%s retry_after=%s; retrying in %.1fs order_id=%s",
+                        resp.status_code,
+                        retry_after or None,
+                        delay_s,
+                        order_id,
+                    )
+                    await asyncio.sleep(delay_s)
+                    resp = await client.post(url, json=request_payload, headers=local_headers, timeout=10.0)
+
+                return resp
+
+            response = await _post_with_token(access_token)
+
+            # Recovery: if the order is bound to an old store_id whose token was revoked (common after
+            # app uninstall/reinstall), try other active store rows for the same merchant+domain.
+            if response.status_code in {401, 403} and order_store_id:
+                try:
+                    from services.merchant_store_service import get_merchant_active_stores
+
+                    candidates = await get_merchant_active_stores(order["merchant_id"])
+                    domain_norm = _normalize_shopify_domain(shop_domain)
+                    seen_fps: set[str] = set()
+                    # Always include the current token first to avoid duplicates.
+                    try:
+                        seen_fps.add(hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:12])
+                    except Exception:
+                        pass
+
+                    for s in candidates or []:
+                        if str((s.get("platform") or "")).lower() != "shopify":
+                            continue
+                        if _normalize_shopify_domain(str(s.get("domain") or "")) != domain_norm:
+                            continue
+                        if str(s.get("store_id") or "").strip() == str(store_info.get("store_id") or "").strip():
+                            continue
+                        tok = extract_shopify_access_token(s.get("api_key_raw") or s.get("api_key")) or ""
+                        if not tok:
+                            continue
+                        fp = None
+                        try:
+                            fp = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:12]
+                        except Exception:
+                            fp = None
+                        if fp and fp in seen_fps:
+                            continue
+                        if fp:
+                            seen_fps.add(fp)
+
+                        logger.warning(
+                            "[Shopify] Auth failed with bound token; retrying with alternate store token "
+                            "(order_id=%s bound_store_id=%s alt_store_id=%s alt_token_fp=%s)",
+                            order_id,
+                            store_info.get("store_id"),
+                            s.get("store_id"),
+                            fp,
+                        )
+                        response = await _post_with_token(tok)
+                        if response.status_code not in {401, 403}:
+                            break
+                except Exception as e:
+                    logger.warning("[Shopify] Alternate-token recovery failed order_id=%s err=%s", order_id, str(e))
+
             logger.info(f"[Shopify] API response: {response.status_code}")
             
             if response.status_code == 201:
@@ -1825,7 +1891,7 @@ async def create_shopify_order(order_id: str) -> bool:
 @router.get("/{order_id}/debug")
 async def debug_order_data(
     order_id: str,
-    current_user: dict = Depends(require_admin)
+    _: dict = Depends(require_admin_or_key)
 ):
     """调试端点：查看订单的原始数据结构和Shopify credentials"""
     try:
@@ -1833,34 +1899,42 @@ async def debug_order_data(
         if not order:
             return {"error": "Order not found"}
         
-        # 获取 Shopify credentials
-        from services.merchant_store_service import get_primary_store
-        store_info = await get_primary_store(order["merchant_id"])
-        
-        credentials_info = {}
-        if store_info:
-            api_key_raw = store_info.get("api_key") or ""
+        from services.merchant_store_service import get_primary_store, get_store_by_id
+
+        order_store_id = str(order.get("store_id") or "").strip() or None
+        bound_store = None
+        if order_store_id:
+            bound_store = await get_store_by_id(order_store_id, merchant_id=order["merchant_id"])
+        primary_store = await get_primary_store(order["merchant_id"])
+
+        def _store_credentials(store: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            if not store:
+                return {}
+            api_key_raw = store.get("api_key_raw") or store.get("api_key") or ""
             api_key_fp = None
             try:
                 if api_key_raw:
                     api_key_fp = hashlib.sha256(str(api_key_raw).encode("utf-8")).hexdigest()[:12]
             except Exception:
                 api_key_fp = None
-            credentials_info = {
-                "platform": store_info.get("platform"),
-                "domain": store_info.get("domain"),
-                "has_api_key": bool(store_info.get("api_key")),
-                "api_key_length": len(api_key_raw) if api_key_raw else 0,
+            return {
+                "store_id": store.get("store_id"),
+                "platform": store.get("platform"),
+                "domain": store.get("domain"),
+                "status": store.get("status"),
+                "has_api_key": bool(store.get("api_key")),
+                "api_key_length": len(str(api_key_raw)) if api_key_raw else 0,
                 "api_key_fp": api_key_fp,
-                "status": store_info.get("status"),
-                "store_id": store_info.get("store_id")
+                "source": store.get("source"),
             }
         
         # 检查数据类型
         return {
             "order_id": order_id,
             "merchant_id": order["merchant_id"],
-            "shopify_credentials": credentials_info,
+            "order_store_id": order_store_id,
+            "bound_store": _store_credentials(bound_store),
+            "primary_store": _store_credentials(primary_store),
             "data_types": {
                 "items": str(type(order.get("items"))),
                 "items_count": len(order.get("items", [])),
