@@ -11,7 +11,6 @@ import secrets
 import os
 
 from db.database import metadata, database
-from services.reviews_invitation_send_jobs_service import enqueue_invitation_send_job_from_order
 
 
 # ============================================================================
@@ -314,6 +313,10 @@ async def update_order_status(
                 transitioned_fulfilled = before_ful != after_ful and after_ful in {"shipped", "delivered"}
 
                 if merchant_id and after_paid and (transitioned_completed or transitioned_fulfilled):
+                    from services.reviews_invitation_send_jobs_service import (
+                        enqueue_invitation_send_job_from_order,
+                    )
+
                     await enqueue_invitation_send_job_from_order(
                         merchant_id=merchant_id,
                         order_id=order_id,
