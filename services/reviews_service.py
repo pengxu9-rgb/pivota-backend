@@ -107,27 +107,30 @@ async def _resolve_products_cache_triplet_by_variant_id(*, variant_id: str) -> O
         return None
 
     try:
-        row = await database.fetch_one(
-            """
-            SELECT merchant_id, platform, platform_product_id
-            FROM products_cache
-            WHERE EXISTS (
-              SELECT 1
-              FROM jsonb_array_elements(
-                CASE
-                  WHEN jsonb_typeof(products_cache.product_data::jsonb->'variants') = 'array'
-                    THEN products_cache.product_data::jsonb->'variants'
-                  WHEN jsonb_typeof(products_cache.product_data::jsonb->'raw'->'variants') = 'array'
-                    THEN products_cache.product_data::jsonb->'raw'->'variants'
-                  ELSE '[]'::jsonb
-                END
-              ) AS v
-              WHERE v->>'variant_id' = :vid OR v->>'id' = :vid OR v->>'sku' = :vid
-            )
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            {"vid": vid},
+        row = await asyncio.wait_for(
+            database.fetch_one(
+                """
+                SELECT merchant_id, platform, platform_product_id
+                FROM products_cache
+                WHERE EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(
+                    CASE
+                      WHEN jsonb_typeof(products_cache.product_data::jsonb->'variants') = 'array'
+                        THEN products_cache.product_data::jsonb->'variants'
+                      WHEN jsonb_typeof(products_cache.product_data::jsonb->'raw'->'variants') = 'array'
+                        THEN products_cache.product_data::jsonb->'raw'->'variants'
+                      ELSE '[]'::jsonb
+                    END
+                  ) AS v
+                  WHERE v->>'variant_id' = :vid OR v->>'id' = :vid OR v->>'sku' = :vid
+                )
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                {"vid": vid},
+            ),
+            timeout=1.5,
         )
     except Exception:
         return None
