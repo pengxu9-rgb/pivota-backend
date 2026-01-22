@@ -2,7 +2,7 @@
 SDK-Ready Agent API Endpoints - COMPREHENSIVE FIX
 Properly handles all database schema issues and edge cases
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -20,10 +20,227 @@ from services.agent_ranking_service import (
     compute_agent_ranking_score,
     serialize_features_for_log,
 )
+from services.outbound_links_service import (
+    DEFAULT_DISCLOSURE_TEXT,
+    DEFAULT_UTM_TEMPLATE,
+    _is_domain_allowed,
+    apply_utm,
+    make_redirect_token,
+)
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
+
+EXTERNAL_SEED_MERCHANT_ID = "external_seed"
+DEFAULT_EXTERNAL_SEED_MARKET = "US"
+
+
+def _stable_external_product_id(url: str) -> str:
+    import hashlib
+
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    return "ext_" + hashlib.sha256(u.encode("utf-8")).hexdigest()[:24]
+
+
+def _ensure_json_obj(val: Any) -> Dict[str, Any]:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    variants = seed_data.get("variants")
+    if isinstance(variants, list):
+        return [v for v in variants if isinstance(v, dict)]
+    return []
+
+
+def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> Dict[str, Any]:
+    variants = _seed_variants(seed_data)
+    for v in variants:
+        amt = v.get("price_amount")
+        cur = v.get("price_currency") or v.get("currency")
+        if amt is not None:
+            try:
+                return {"amount": float(amt), "currency": str(cur or "") or None}
+            except Exception:
+                return {"amount": amt, "currency": str(cur or "") or None}
+    return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
+
+
+def _request_base_url(req: Request) -> str:
+    return str(req.base_url).rstrip("/")
+
+
+async def _build_external_seed_product(
+    *,
+    req: Request,
+    seed_row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    seed_id = str(seed_row.get("id") or "").strip()
+    if not seed_id:
+        return None
+
+    market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
+    tool = str(seed_row.get("tool") or "*").strip() or "*"
+    destination_url = str(seed_row.get("destination_url") or "").strip()
+    if not destination_url.startswith("http://") and not destination_url.startswith("https://"):
+        return None
+
+    seed_data = _ensure_json_obj(seed_row.get("seed_data"))
+    canonical_url = str(seed_row.get("canonical_url") or "").strip() or None
+    title = seed_data.get("title") or seed_row.get("title") or None
+    image_url = seed_data.get("image_url") or seed_row.get("image_url") or None
+
+    external_product_id = (
+        str(seed_row.get("external_product_id") or "").strip()
+        or str(seed_data.get("external_product_id") or "").strip()
+        or _stable_external_product_id(canonical_url or destination_url)
+    )
+    if not external_product_id:
+        return None
+
+    disclosure_text = seed_row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
+    utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
+
+    dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
+    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+        return None
+
+    token = make_redirect_token(
+        {
+            "market": market,
+            "tool": tool,
+            "dest": dest_with_utm,
+            "ctx": {
+                "source": "external_seed",
+                "external_seed_id": seed_id,
+                "external_product_id": external_product_id,
+            },
+        }
+    )
+    external_redirect_url = f"{_request_base_url(req)}/r?token={token}"
+
+    primary_price = _seed_primary_price(seed_row, seed_data)
+    price_amount = primary_price.get("amount")
+    price_currency = primary_price.get("currency") or "USD"
+    try:
+        price = float(price_amount) if price_amount is not None else 0.0
+    except Exception:
+        price = 0.0
+
+    variant = {
+        "id": external_product_id,
+        "variant_id": external_product_id,
+        "title": "Default",
+        "price": price,
+        "currency": price_currency,
+        "inventory_quantity": 999,
+        "in_stock": True,
+    }
+
+    return {
+        "id": external_product_id,
+        "product_id": external_product_id,
+        "merchant_id": EXTERNAL_SEED_MERCHANT_ID,
+        "merchant_name": "External",
+        "platform": "external",
+        "platform_product_id": external_product_id,
+        "title": title or destination_url,
+        "name": title or destination_url,
+        "description": str(seed_data.get("description") or "") or "",
+        "price": price,
+        "currency": price_currency,
+        "image_url": image_url,
+        "in_stock": True,
+        "inventory_quantity": 999,
+        "product_type": "external",
+        "source": "external_seed",
+        "external_seed_id": seed_id,
+        "external_redirect_url": external_redirect_url,
+        "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
+        "variants": [variant],
+    }
+
+
+async def _load_external_seed_products_for_search(
+    *,
+    req: Request,
+    query: Optional[str],
+    limit: int,
+    offset: int,
+) -> List[Dict[str, Any]]:
+    q = str(query or "").strip()
+    where = ["status = :status", "attached_product_key IS NULL", "market = :market"]
+    values: Dict[str, Any] = {
+        "status": "active",
+        "market": DEFAULT_EXTERNAL_SEED_MARKET,
+        "limit": limit,
+        "offset": offset,
+    }
+    if q:
+        values["q_like"] = f"%{q}%"
+        where.append(
+            "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
+        )
+
+    rows = []
+    try:
+        rows = await database.fetch_all(
+            f"""
+            SELECT
+              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+              destination_url, canonical_url, domain, title, image_url,
+              price_amount, price_currency, availability,
+              seed_data,
+              status, notes, created_by_employee_id,
+              attached_product_key, attached_variant_id,
+              created_at, updated_at
+            FROM external_product_seeds
+            WHERE {" AND ".join(where)}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit OFFSET :offset
+            """,
+            values,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
+            return []
+        raise
+
+    products: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        seed_row = dict(row)
+        seed_data = _ensure_json_obj(seed_row.get("seed_data"))
+        external_product_id = (
+            str(seed_row.get("external_product_id") or "").strip()
+            or str(seed_data.get("external_product_id") or "").strip()
+            or _stable_external_product_id(seed_row.get("canonical_url") or seed_row.get("destination_url") or "")
+        )
+        if not external_product_id or external_product_id in seen:
+            continue
+        seen.add(external_product_id)
+        try:
+            prod = await _build_external_seed_product(req=req, seed_row=seed_row)
+            if prod:
+                products.append(prod)
+        except Exception:
+            continue
+    return products
 
 # ============================================================================
 # HEALTH CHECK
@@ -237,6 +454,7 @@ async def list_merchants(
 
 @router.get("/products/search")
 async def search_products(
+    req: Request,
     merchant_id: Optional[str] = None,
     query: Optional[str] = None,
     category: Optional[str] = None,
@@ -250,6 +468,24 @@ async def search_products(
     """Search products - supports cross-merchant search with quality-aware ranking"""
     try:
         logger.info("agent_sdk_fixed_search_entry")
+
+        if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+            external_products = await _load_external_seed_products_for_search(
+                req=req,
+                query=query,
+                limit=limit,
+                offset=offset,
+            )
+            return {
+                "status": "success",
+                "products": external_products,
+                "pagination": {
+                    "total": offset + len(external_products),
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": len(external_products) == limit,
+                },
+            }
 
         # Build WHERE clauses
         where_clauses = []
@@ -418,6 +654,52 @@ async def search_products(
             reverse=True,
         )
         product_list = ranked_candidates
+
+        if offset == 0:
+            try:
+                external_seed_limit = min(200, max(20, int(limit or 20) * 5))
+                external_seed_products = await _load_external_seed_products_for_search(
+                    req=req,
+                    query=query,
+                    limit=external_seed_limit,
+                    offset=0,
+                )
+                if external_seed_products:
+                    query_lower = str(query or "").strip().lower()
+                    existing_ids = {
+                        str(p.get("product_id") or p.get("id") or "") for p in ranked_candidates
+                    }
+                    for p in external_seed_products:
+                        pid = str(p.get("product_id") or p.get("id") or "")
+                        if not pid or pid in existing_ids:
+                            continue
+                        rel = 1.0
+                        if query_lower:
+                            title = str(p.get("title") or "").lower()
+                            desc = str(p.get("description") or "").lower()
+                            if query_lower in title:
+                                rel = 1.0 if title == query_lower else 0.9
+                            elif query_lower in desc:
+                                rel = 0.7
+                            else:
+                                continue
+
+                        p["relevance_score"] = rel
+                        p["ranking_score"] = float(rel) * 0.8
+                        p["ranking_features"] = {"source": "external_seed"}
+                        ranked_candidates.append(p)
+                        existing_ids.add(pid)
+
+                    ranked_candidates.sort(
+                        key=lambda x: (
+                            x.get("ranking_score") is not None,
+                            x.get("ranking_score", x.get("relevance_score", 0)),
+                        ),
+                        reverse=True,
+                    )
+                    product_list = ranked_candidates[:limit]
+            except Exception as e:
+                logger.debug(f"Failed to load external seed products: {e}", exc_info=True)
         
         response = {
             "status": "success",

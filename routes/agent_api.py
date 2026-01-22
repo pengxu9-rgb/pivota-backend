@@ -4,7 +4,7 @@ Agent 专用 API 路由
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response, Request
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
@@ -29,6 +29,13 @@ from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
 from services.quote_service import QuoteError
+from services.outbound_links_service import (
+    DEFAULT_DISCLOSURE_TEXT,
+    DEFAULT_UTM_TEMPLATE,
+    _is_domain_allowed,
+    apply_utm,
+    make_redirect_token,
+)
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -51,6 +58,9 @@ router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
 
 _ORDER_CREATE_LOCKS: Dict[str, asyncio.Lock] = {}
 
+EXTERNAL_SEED_MERCHANT_ID = "external_seed"
+DEFAULT_EXTERNAL_SEED_MARKET = "US"
+
 
 def _get_order_create_lock(key: str) -> asyncio.Lock:
     lock = _ORDER_CREATE_LOCKS.get(key)
@@ -63,6 +73,278 @@ def _get_order_create_lock(key: str) -> asyncio.Lock:
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+def _stable_external_product_id(url: str) -> str:
+    import hashlib
+
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    return "ext_" + hashlib.sha256(u.encode("utf-8")).hexdigest()[:24]
+
+
+def _ensure_json_obj(val: Any) -> Dict[str, Any]:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    variants = seed_data.get("variants")
+    if isinstance(variants, list):
+        return [v for v in variants if isinstance(v, dict)]
+    return []
+
+
+def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> Dict[str, Any]:
+    variants = _seed_variants(seed_data)
+    for v in variants:
+        amt = v.get("price_amount")
+        cur = v.get("price_currency") or v.get("currency")
+        if amt is not None:
+            try:
+                return {"amount": float(amt), "currency": str(cur or "") or None}
+            except Exception:
+                return {"amount": amt, "currency": str(cur or "") or None}
+    return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
+
+
+def _request_base_url(req: Request) -> str:
+    return str(req.base_url).rstrip("/")
+
+
+async def _build_external_seed_product(
+    *,
+    req: Request,
+    seed_row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    seed_id = str(seed_row.get("id") or "").strip()
+    if not seed_id:
+        return None
+
+    market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
+    tool = str(seed_row.get("tool") or "*").strip() or "*"
+    destination_url = str(seed_row.get("destination_url") or "").strip()
+    if not destination_url.startswith("http://") and not destination_url.startswith("https://"):
+        return None
+
+    seed_data = _ensure_json_obj(seed_row.get("seed_data"))
+    canonical_url = str(seed_row.get("canonical_url") or "").strip() or None
+    title = seed_data.get("title") or seed_row.get("title") or None
+    image_url = seed_data.get("image_url") or seed_row.get("image_url") or None
+
+    external_product_id = (
+        str(seed_row.get("external_product_id") or "").strip()
+        or str(seed_data.get("external_product_id") or "").strip()
+        or _stable_external_product_id(canonical_url or destination_url)
+    )
+    if not external_product_id:
+        return None
+
+    disclosure_text = (
+        seed_row.get("disclosure_text")
+        or seed_data.get("disclosure_text")
+        or DEFAULT_DISCLOSURE_TEXT
+    )
+    utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
+
+    dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
+    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+        return None
+
+    token = make_redirect_token(
+        {
+            "market": market,
+            "tool": tool,
+            "dest": dest_with_utm,
+            "ctx": {
+                "source": "external_seed",
+                "external_seed_id": seed_id,
+                "external_product_id": external_product_id,
+            },
+        }
+    )
+    external_redirect_url = f"{_request_base_url(req)}/r?token={token}"
+
+    primary_price = _seed_primary_price(seed_row, seed_data)
+    price_amount = primary_price.get("amount")
+    price_currency = primary_price.get("currency") or "USD"
+    try:
+        price = float(price_amount) if price_amount is not None else 0.0
+    except Exception:
+        price = 0.0
+
+    variant = {
+        "id": external_product_id,
+        "variant_id": external_product_id,
+        "title": "Default",
+        "price": price,
+        "currency": price_currency,
+        "inventory_quantity": 999,
+        "in_stock": True,
+    }
+
+    return {
+        "id": external_product_id,
+        "product_id": external_product_id,
+        "merchant_id": EXTERNAL_SEED_MERCHANT_ID,
+        "merchant_name": "External",
+        "platform": "external",
+        "platform_product_id": external_product_id,
+        "title": title or destination_url,
+        "description": str(seed_data.get("description") or "") or "",
+        "price": price,
+        "currency": price_currency,
+        "image_url": image_url,
+        "in_stock": True,
+        "inventory_quantity": 999,
+        "product_type": "external",
+        "source": "external_seed",
+        "external_seed_id": seed_id,
+        "external_redirect_url": external_redirect_url,
+        "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
+        "variants": [variant],
+    }
+
+
+async def _load_external_seed_products_for_search(*, req: Request, query: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    """
+    Load employee-managed external products (unattached external seeds) and surface as first-class products.
+    """
+    q = str(query or "").strip()
+    where = ["status = :status", "attached_product_key IS NULL", "market = :market"]
+    values: Dict[str, Any] = {"status": "active", "market": DEFAULT_EXTERNAL_SEED_MARKET, "limit": limit}
+    if q:
+        values["q_like"] = f"%{q}%"
+        where.append(
+            "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
+        )
+
+    try:
+        rows = await database.fetch_all(
+            f"""
+            SELECT
+              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+              destination_url, canonical_url, domain, title, image_url,
+              price_amount, price_currency, availability,
+              seed_data,
+              status, notes, created_by_employee_id,
+              attached_product_key, attached_variant_id,
+              created_at, updated_at
+            FROM external_product_seeds
+            WHERE {" AND ".join(where)}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """,
+            values,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
+            return []
+        raise
+
+    products: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        seed_row = dict(row)
+        seed_data = _ensure_json_obj(seed_row.get("seed_data"))
+        external_product_id = (
+            str(seed_row.get("external_product_id") or "").strip()
+            or str(seed_data.get("external_product_id") or "").strip()
+            or _stable_external_product_id(seed_row.get("canonical_url") or seed_row.get("destination_url") or "")
+        )
+        if not external_product_id or external_product_id in seen:
+            continue
+        seen.add(external_product_id)
+        try:
+            prod = await _build_external_seed_product(req=req, seed_row=seed_row)
+            if prod:
+                products.append(prod)
+        except Exception:
+            continue
+    return products
+
+
+async def _load_external_seed_product_by_product_id(*, req: Request, product_id: str) -> Optional[Dict[str, Any]]:
+    pid = str(product_id or "").strip()
+    if not pid:
+        return None
+
+    row = None
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT
+              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+              destination_url, canonical_url, domain, title, image_url,
+              price_amount, price_currency, availability,
+              seed_data,
+              status, notes, created_by_employee_id,
+              attached_product_key, attached_variant_id,
+              created_at, updated_at
+            FROM external_product_seeds
+            WHERE status = 'active'
+              AND attached_product_key IS NULL
+              AND (
+                external_product_id = :pid
+                OR id = :pid
+                OR seed_data->>'external_product_id' = :pid
+              )
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            {"pid": pid},
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
+            return None
+        if "->>" in msg and ("operator does not exist" in msg or "UndefinedFunction" in msg):
+            try:
+                row = await database.fetch_one(
+                    """
+                    SELECT
+                      id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+                      destination_url, canonical_url, domain, title, image_url,
+                      price_amount, price_currency, availability,
+                      seed_data,
+                      status, notes, created_by_employee_id,
+                      attached_product_key, attached_variant_id,
+                      created_at, updated_at
+                    FROM external_product_seeds
+                    WHERE status = 'active'
+                      AND attached_product_key IS NULL
+                      AND (external_product_id = :pid OR id = :pid)
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    {"pid": pid},
+                )
+            except Exception as exc2:
+                msg2 = str(exc2)
+                if "external_product_seeds" in msg2 and ("does not exist" in msg2 or "UndefinedTable" in msg2 or "relation" in msg2):
+                    return None
+                raise
+        else:
+            raise
+
+    if not row:
+        return None
+    try:
+        return await _build_external_seed_product(req=req, seed_row=dict(row))
+    except Exception:
+        return None
+
 
 def _normalize_buyer_ref(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -515,6 +797,7 @@ async def agent_get_shopify_webhook_events(
 
 @router.get("/products/search")
 async def agent_search_products(
+    req: Request,
     background_tasks: BackgroundTasks,
     merchant_id: Optional[str] = None,  # Now optional for cross-merchant search
     merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
@@ -552,10 +835,13 @@ async def agent_search_products(
         merchants_to_search = []
         
         if merchant_id:
-            # Single merchant search (backward compatible)
-            if not context.can_access_merchant(merchant_id):
-                raise HTTPException(status_code=403, detail="Not authorized for this merchant")
-            merchants_to_search = [merchant_id]
+            if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+                merchants_to_search = []
+            else:
+                # Single merchant search (backward compatible)
+                if not context.can_access_merchant(merchant_id):
+                    raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+                merchants_to_search = [merchant_id]
         elif merchant_ids:
             # Multiple specific merchants
             for mid in merchant_ids:
@@ -613,6 +899,19 @@ async def agent_search_products(
                 # Log but continue with other merchants
                 logger.warning(f"Failed to get products from {mid}: {e}")
                 continue
+
+        # Add employee-managed external products (unattached external seeds) as first-class products.
+        try:
+            external_seed_limit = min(200, max(20, int(limit or 20) * 5))
+            external_seed_products = await _load_external_seed_products_for_search(
+                req=req,
+                query=query,
+                limit=external_seed_limit,
+            )
+            if external_seed_products:
+                all_products.extend(external_seed_products)
+        except Exception as e:
+            logger.warning(f"Failed to load external seed products: {e}")
 
         ranking_config = get_agent_ranking_config()
 
@@ -675,6 +974,23 @@ async def agent_search_products(
                 product["relevance_score"] = relevance_score
             else:
                 product["relevance_score"] = 1.0
+
+            is_external_seed = (
+                product.get("source") == "external_seed"
+                or product.get("merchant_id") == EXTERNAL_SEED_MERCHANT_ID
+            )
+
+            if is_external_seed:
+                platform_product_id = str(product.get("product_id") or product.get("id") or "")
+                if not platform_product_id:
+                    continue
+                try:
+                    product["ranking_score"] = float(product.get("relevance_score", 0.0)) * 0.8
+                except Exception:
+                    product["ranking_score"] = product.get("relevance_score", 0.0)
+                product["ranking_features"] = {"source": "external_seed"}
+                ranked_candidates.append(product)
+                continue
 
             # Build feature vector for ranking
             platform = product.get("platform") or "unknown"
@@ -843,11 +1159,24 @@ async def agent_search_products(
 async def agent_get_product(
     merchant_id: str,
     product_id: str,
+    req: Request,
     background_tasks: BackgroundTasks,
     context: AgentContext = Depends(get_agent_context),
 ):
     """获取单个产品详情"""
     try:
+        if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+            prod = await _load_external_seed_product_by_product_id(req=req, product_id=product_id)
+            if not prod:
+                raise HTTPException(status_code=404, detail="Product not found")
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id,
+            )
+            return {"status": "success", "product": prod}
+
         # 验证商户访问权限
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
@@ -935,6 +1264,9 @@ async def agent_validate_cart(
     - 税费估算
     """
     try:
+        if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+            raise HTTPException(status_code=400, detail="EXTERNAL_PRODUCT_CHECKOUT_DISABLED")
+
         # 验证商户访问权限
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
@@ -1097,6 +1429,9 @@ async def agent_create_order(
     自动添加 Agent 追踪信息
     集成 Agent Governance 治理检查
     """
+    if order_request.merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+        raise HTTPException(status_code=400, detail="EXTERNAL_PRODUCT_CHECKOUT_DISABLED")
+
     # STEP 1: Governance validation (before main logic)
     from services.agent_governance import agent_governance
     await agent_governance.validate_request(context.agent_id)
