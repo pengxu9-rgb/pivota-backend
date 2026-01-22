@@ -115,7 +115,11 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     - Records best-effort click telemetry
     - 302 to the destination URL (already includes UTM if configured)
     """
-    payload = parse_and_verify_redirect_token(token)
+    try:
+        payload = parse_and_verify_redirect_token(token)
+    except Exception as exc:
+        code = str(getattr(exc, "args", ["INVALID_TOKEN"])[0] or "INVALID_TOKEN")
+        raise HTTPException(status_code=400, detail=code) from exc
     dest = str(payload.get("dest") or "")
     if not dest.startswith("http://") and not dest.startswith("https://"):
         raise HTTPException(status_code=400, detail="INVALID_DEST")
@@ -148,7 +152,11 @@ async def impression_endpoint(req: Request, body: ImpressionRequest) -> Dict[str
     Callers should pass the same `token` embedded in the redirect URL (GET /r?token=...).
     This avoids leaking raw destination URLs to clients while still allowing analytics.
     """
-    payload = parse_and_verify_redirect_token(body.token)
+    try:
+        payload = parse_and_verify_redirect_token(body.token)
+    except Exception as exc:
+        code = str(getattr(exc, "args", ["INVALID_TOKEN"])[0] or "INVALID_TOKEN")
+        raise HTTPException(status_code=400, detail=code) from exc
     dest = str(payload.get("dest") or "")
     if not dest.startswith("http://") and not dest.startswith("https://"):
         raise HTTPException(status_code=400, detail="INVALID_DEST")
@@ -997,7 +1005,11 @@ async def public_traffic_report(
     scope (market/tool/domain + optional time range). This endpoint returns only aggregated
     metrics (no IP/user-agent).
     """
-    payload = parse_and_verify_report_token(token)
+    try:
+        payload = parse_and_verify_report_token(token)
+    except Exception as exc:
+        code = str(getattr(exc, "args", ["INVALID_TOKEN"])[0] or "INVALID_TOKEN")
+        raise HTTPException(status_code=400, detail=code) from exc
     market = normalize_market(payload.get("market"))
     tool = normalize_tool(payload.get("tool"))
     dest_domain = str(payload.get("destDomain") or "").strip().lower().lstrip(".")
