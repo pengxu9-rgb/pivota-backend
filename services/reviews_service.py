@@ -2005,6 +2005,10 @@ async def validate_import_batch(
     batch = await database.fetch_one(import_batches.select().where(import_batches.c.id == bid))
     if not batch:
         raise HTTPException(status_code=404, detail="BATCH_NOT_FOUND")
+    batch_status = _as_text(_row_get(batch, "status")).lower()
+    if batch_status in {"validating", "validated", "committed"}:
+        # Prevent concurrent or repeated validate runs from duplicating import_items.
+        raise HTTPException(status_code=409, detail="BATCH_ALREADY_VALIDATED")
 
     merchant_id = _as_text(batch["merchant_id"])
     source_system = _as_text(batch["source_system"])
