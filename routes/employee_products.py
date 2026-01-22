@@ -493,28 +493,77 @@ async def list_external_seeds(
     if q:
         q = q.strip()
         if q:
-            where.append(
-                "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
-            )
+            values["q"] = q
             values["q_like"] = f"%{q}%"
+            where.append(
+                "("
+                "destination_url ILIKE :q_like"
+                " OR canonical_url ILIKE :q_like"
+                " OR domain ILIKE :q_like"
+                " OR title ILIKE :q_like"
+                " OR id = :q"
+                " OR seed_data->>'external_product_id' = :q"
+                " OR seed_data->>'product_id' = :q"
+                " OR seed_data->'product'->>'product_id' = :q"
+                " OR EXISTS ("
+                "   SELECT 1"
+                "   FROM jsonb_array_elements(seed_data->'variants') AS v"
+                "   WHERE (v->>'variant_id' = :q OR v->>'id' = :q OR v->>'sku' = :q)"
+                " )"
+                ")"
+            )
 
-    rows = await database.fetch_all(
-        f"""
-        SELECT
-          id, market, tool, utm_template, partner_type, disclosure_text,
-          destination_url, canonical_url, domain, title, image_url,
-          price_amount, price_currency, availability,
-          seed_data,
-          status, notes, created_by_employee_id,
-          attached_product_key, attached_variant_id,
-          created_at, updated_at
-        FROM external_product_seeds
-        WHERE {" AND ".join(where)}
-        ORDER BY created_at DESC
-        LIMIT :limit
-        """,
-        values,
-    )
+    try:
+        rows = await database.fetch_all(
+            f"""
+            SELECT
+              id, market, tool, utm_template, partner_type, disclosure_text,
+              destination_url, canonical_url, domain, title, image_url,
+              price_amount, price_currency, availability,
+              seed_data,
+              status, notes, created_by_employee_id,
+              attached_product_key, attached_variant_id,
+              created_at, updated_at
+            FROM external_product_seeds
+            WHERE {" AND ".join(where)}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """,
+            values,
+        )
+    except Exception:
+        # Fallback for non-Postgres environments: drop JSONB variant/id filters.
+        where_fallback = ["status = :status"]
+        values_fallback: Dict[str, Any] = {"status": status, "limit": limit}
+        if attached is True:
+            where_fallback.append("attached_product_key IS NOT NULL")
+        elif attached is False:
+            where_fallback.append("attached_product_key IS NULL")
+        if q:
+            q2 = q.strip()
+            if q2:
+                where_fallback.append(
+                    "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
+                )
+                values_fallback["q_like"] = f"%{q2}%"
+
+        rows = await database.fetch_all(
+            f"""
+            SELECT
+              id, market, tool, utm_template, partner_type, disclosure_text,
+              destination_url, canonical_url, domain, title, image_url,
+              price_amount, price_currency, availability,
+              seed_data,
+              status, notes, created_by_employee_id,
+              attached_product_key, attached_variant_id,
+              created_at, updated_at
+            FROM external_product_seeds
+            WHERE {" AND ".join(where_fallback)}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """,
+            values_fallback,
+        )
     items = []
     for r in rows:
         r = dict(r)
@@ -1694,7 +1743,12 @@ async def search_products(
                 " OR product_data->>'product_id' = :q"
                 " OR product_data->>'id' = :q"
                 " OR product_data->>'title' ILIKE :q_like"
-                " OR product_data->>'name' ILIKE :q_like)"
+                " OR product_data->>'name' ILIKE :q_like"
+                " OR EXISTS ("
+                "   SELECT 1"
+                "   FROM jsonb_array_elements(product_data::jsonb->'variants') AS v"
+                "   WHERE (v->>'variant_id' = :q OR v->>'id' = :q OR v->>'sku' = :q)"
+                " ))"
             )
             values["q"] = q
             values["q_like"] = f"%{q}%"
