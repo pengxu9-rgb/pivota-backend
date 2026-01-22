@@ -1858,6 +1858,85 @@ def _import_storage_dir() -> str:
     return base
 
 
+def _reviews_import_s3_endpoint_url() -> Optional[str]:
+    v = (os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip()
+    return v or None
+
+
+def _reviews_import_s3_region() -> Optional[str]:
+    v = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "").strip()
+    return v or None
+
+
+def _reviews_import_delete_on_commit() -> bool:
+    return str(os.getenv("REVIEWS_IMPORT_DELETE_ON_COMMIT") or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _is_s3_uri(path: str) -> bool:
+    return path.startswith("s3://")
+
+
+def _parse_s3_uri(path: str) -> Tuple[str, str]:
+    # Expect s3://bucket/key
+    stripped = path.replace("s3://", "", 1)
+    parts = stripped.split("/", 1)
+    if len(parts) != 2:
+        raise ValueError("invalid_s3_uri")
+    return parts[0], parts[1]
+
+
+def _reviews_import_s3_client():
+    try:
+        import boto3
+    except Exception as exc:
+        raise RuntimeError("boto3_missing") from exc
+    return boto3.client(
+        "s3",
+        region_name=_reviews_import_s3_region(),
+        endpoint_url=_reviews_import_s3_endpoint_url(),
+    )
+
+
+def _read_import_file_bytes(path: str, *, missing_error: str) -> Tuple[bytes, str]:
+    if not path:
+        raise HTTPException(status_code=400, detail=missing_error)
+    if _is_s3_uri(path):
+        try:
+            bucket, key = _parse_s3_uri(path)
+            client = _reviews_import_s3_client()
+            obj = client.get_object(Bucket=bucket, Key=key)
+            raw = obj["Body"].read()
+            return raw, os.path.basename(key) or "reviews.csv"
+        except Exception as exc:
+            logger.warning("reviews.import.s3.read_failed %s", type(exc).__name__)
+            raise HTTPException(status_code=400, detail=missing_error) from exc
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=400, detail=missing_error)
+
+    with open(path, "rb") as f:
+        raw = f.read()
+    return raw, os.path.basename(path) or "reviews.csv"
+
+
+def _delete_import_file(path: Optional[str]) -> None:
+    if not path:
+        return
+    if _is_s3_uri(path):
+        try:
+            bucket, key = _parse_s3_uri(path)
+            client = _reviews_import_s3_client()
+            client.delete_object(Bucket=bucket, Key=key)
+        except Exception as exc:
+            logger.warning("reviews.import.s3.delete_failed %s", type(exc).__name__)
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        return
+
+
 async def attach_import_files(
     *,
     actor: Dict[str, Any],
@@ -1906,14 +1985,12 @@ async def validate_import_batch(
 
     merchant_id = _as_text(batch["merchant_id"])
     source_system = _as_text(batch["source_system"])
+    reviews_file_path = _as_text(_row_get(batch, "reviews_file_path"))
     if not source_system:
         raise HTTPException(status_code=400, detail="BATCH_SOURCE_SYSTEM_MISSING")
     path = _as_text(_row_get(batch, "reviews_file_path"))
-    if not path or not os.path.exists(path):
-        raise HTTPException(status_code=400, detail="REVIEWS_FILE_MISSING")
-
-    raw = open(path, "rb").read()
-    fmt = _detect_format(os.path.basename(path), None)
+    raw, filename = _read_import_file_bytes(path, missing_error="REVIEWS_FILE_MISSING")
+    fmt = _detect_format(filename, None)
     rows = _read_jsonl(raw) if fmt == "jsonl" else _read_csv(raw)
 
     report = ImportReport(errors=[])
@@ -2331,13 +2408,16 @@ async def commit_import_batch(
     # Load media zip (optional). Convention: files are referenced by filename in each row.
     media_zip_path = _as_text(_row_get(batch, "media_zip_path"))
     media_blob: Dict[str, bytes] = {}
-    if media_zip_path and os.path.exists(media_zip_path):
+    if media_zip_path:
         try:
-            with zipfile.ZipFile(media_zip_path, "r") as zf:
+            media_raw, _ = _read_import_file_bytes(media_zip_path, missing_error="MEDIA_ZIP_MISSING")
+            with zipfile.ZipFile(io.BytesIO(media_raw), "r") as zf:
                 for name in zf.namelist():
                     if name.endswith("/") or "__MACOSX" in name:
                         continue
                     media_blob[os.path.basename(name)] = zf.read(name)
+        except HTTPException:
+            media_blob = {}
         except Exception:
             media_blob = {}
 
@@ -2589,6 +2669,10 @@ async def commit_import_batch(
         )
     except Exception:
         pass
+    if _reviews_import_delete_on_commit():
+        _delete_import_file(reviews_file_path)
+        _delete_import_file(media_zip_path)
+
     return {
         "status": "success",
         "batch_id": bid,
