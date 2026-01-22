@@ -273,12 +273,15 @@ async def employee_upload_import_files(
 async def employee_validate_import_batch(
     batch_id: int,
     request: Request,
+    replace_existing: bool = Query(default=False),
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.import.create"])),
 ) -> Dict[str, Any]:
     request.state.operation = "reviews.import.validate"
     started = time.time()
     try:
-        out = await validate_import_batch(actor=actor, batch_id=int(batch_id))
+        out = await validate_import_batch(
+            actor=actor, batch_id=int(batch_id), replace_existing=bool(replace_existing)
+        )
         record_import_validate(result="success", reason="ok", duration_seconds=max(0.0, time.time() - started))
         record_employee_action(action="reviews.import.validate", result="success")
         return out

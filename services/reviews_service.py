@@ -1629,6 +1629,7 @@ class ImportReport:
     downgraded_to_product_level: int = 0
     rejected: int = 0
     deduped: int = 0
+    replaced: int = 0
     group_resolved_gtin: int = 0
     group_resolved_mpn: int = 0
     group_resolved_none: int = 0
@@ -1641,6 +1642,7 @@ class ImportReport:
             "downgraded_to_product_level": self.downgraded_to_product_level,
             "rejected": self.rejected,
             "deduped": self.deduped,
+            "replaced": self.replaced,
             "group_resolve_stats": {
                 "GTIN": self.group_resolved_gtin,
                 "BRAND_MPN": self.group_resolved_mpn,
@@ -1996,6 +1998,7 @@ async def validate_import_batch(
     *,
     actor: Dict[str, Any],
     batch_id: int,
+    replace_existing: bool = False,
 ) -> Dict[str, Any]:
     started_at = time.time()
     bid = int(batch_id)
@@ -2036,6 +2039,8 @@ async def validate_import_batch(
                     "deduped": 0,
                     "rejected": 0,
                     "downgraded_to_product_level": 0,
+                    "replaced": 0,
+                    "replace_existing": bool(replace_existing),
                 },
                 updated_at=_now(),
             )
@@ -2205,11 +2210,17 @@ async def validate_import_batch(
             if not _is_unique_violation(exc):
                 raise
             # If a row with the same (merchant_id, source_system, external_review_id) already exists
-            # (likely from a previous batch), don't 500. Record it as a rejected duplicate and
-            # store it with a NULL external_review_id to avoid unique index collisions, while
-            # keeping the original external_review_id inside payload_json for debugging.
-            report.deduped += 1
-            report.errors.append({"row": idx, "error": "duplicate_external_review_id"})
+            # (likely from a previous batch), don't 500. If replace_existing is enabled, allow
+            # this row to proceed through commit as a replacement; otherwise mark as deduped.
+            if replace_existing:
+                report.replaced += 1
+                status = "replace"
+                error_reason = "replace_existing"
+            else:
+                report.deduped += 1
+                status = "deduped"
+                error_reason = "duplicate_external_review_id"
+                report.errors.append({"row": idx, "error": "duplicate_external_review_id"})
             await database.execute(
                 import_items.insert().values(
                     batch_id=bid,
@@ -2218,14 +2229,14 @@ async def validate_import_batch(
                     external_review_id=None,
                     external_user_id=_as_text(payload.get("external_user_id") or payload.get("user_id")) or None,
                     payload_json=payload,
-                    match_product_key=None,
-                    match_sku_key=None,
-                    match_confidence=0.0,
+                    match_product_key=match_product_key,
+                    match_sku_key=match_sku_key,
+                    match_confidence=match_confidence,
                     group_id=None,
                     group_confidence=0.0,
                     dedupe_key=dedupe_key,
-                    status="deduped",
-                    error_reason="duplicate_external_review_id",
+                    status=status,
+                    error_reason=error_reason,
                     created_at=_now(),
                     updated_at=_now(),
                 )
@@ -2247,6 +2258,8 @@ async def validate_import_batch(
                             "deduped": report.deduped,
                             "rejected": report.rejected,
                             "downgraded_to_product_level": report.downgraded_to_product_level,
+                            "replaced": report.replaced,
+                            "replace_existing": bool(replace_existing),
                         },
                         updated_at=_now(),
                     )
@@ -2256,6 +2269,7 @@ async def validate_import_batch(
 
     report_dict = report.to_dict()
     report_dict["processed"] = total_rows
+    report_dict["replace_existing"] = bool(replace_existing)
     await database.execute(
         import_batches.update()
         .where(import_batches.c.id == bid)
@@ -2285,6 +2299,7 @@ async def validate_import_batch(
                         "downgraded_to_product_level": report_dict.get("downgraded_to_product_level"),
                         "rejected": report_dict.get("rejected"),
                         "deduped": report_dict.get("deduped"),
+                        "replaced": report_dict.get("replaced"),
                     },
                     "group_resolve": report_dict.get("group_resolve"),
                     "elapsed_ms": elapsed_ms,
@@ -2422,6 +2437,8 @@ async def commit_import_batch(
 
     merchant_id = _as_text(batch["merchant_id"])
     source_system = _as_text(batch["source_system"])
+    report_json = _row_get(batch, "report_json")
+    replace_existing = bool(report_json.get("replace_existing")) if isinstance(report_json, dict) else False
     if not source_system:
         raise HTTPException(status_code=400, detail="BATCH_SOURCE_SYSTEM_MISSING")
 
@@ -2451,9 +2468,10 @@ async def commit_import_batch(
 
     imported = 0
     rejected = 0
+    replaced = 0
     for r in rows:
         status = str(_row_get(r, "status") or "")
-        if status in {"rejected", "imported", "deduped"}:
+        if status in {"rejected", "imported", "deduped", "replaced"}:
             if status == "rejected":
                 rejected += 1
             continue
@@ -2598,15 +2616,60 @@ async def commit_import_batch(
                     updated_at=_now(),
                 )
             )
+            created_new = True
         except Exception as e:
-            # Most likely duplicate import; mark as rejected to keep idempotency.
-            rejected += 1
-            await database.execute(
-                import_items.update()
-                .where(import_items.c.id == int(r["id"]))
-                .values(status="rejected", error_reason="duplicate_import", updated_at=_now())
-            )
-            continue
+            if replace_existing and ext_review_id and _is_unique_violation(e):
+                existing = await database.fetch_one(
+                    product_reviews.select()
+                    .where(product_reviews.c.merchant_id == merchant_id)
+                    .where(product_reviews.c.source_system == source_system)
+                    .where(product_reviews.c.external_review_id == ext_review_id)
+                )
+                if existing:
+                    new_review_id = int(existing["id"])
+                    created_new = False
+                    replaced += 1
+                    await database.execute(
+                        product_reviews.update()
+                        .where(product_reviews.c.id == new_review_id)
+                        .values(
+                            product_key=pk,
+                            sku_key=sk,
+                            merchant_id=merchant_id,
+                            platform=platform,
+                            platform_product_id=platform_product_id,
+                            variant_id=variant_id,
+                            group_id=group_id,
+                            author_user_id=author_id,
+                            source_type="imported",
+                            source_system=source_system,
+                            external_review_id=ext_review_id,
+                            dedupe_key=dedupe_key,
+                            verification=verification,
+                            rating=rating_int,
+                            title=title,
+                            body=body,
+                            status="active",
+                            updated_at=_now(),
+                        )
+                    )
+                else:
+                    rejected += 1
+                    await database.execute(
+                        import_items.update()
+                        .where(import_items.c.id == int(r["id"]))
+                        .values(status="rejected", error_reason="duplicate_import", updated_at=_now())
+                    )
+                    continue
+            else:
+                # Most likely duplicate import; mark as rejected to keep idempotency.
+                rejected += 1
+                await database.execute(
+                    import_items.update()
+                    .where(import_items.c.id == int(r["id"]))
+                    .values(status="rejected", error_reason="duplicate_import", updated_at=_now())
+                )
+                continue
 
         # Attach media files (optional). Convention: payload lists filenames in media_files[] or media_1... etc.
         media_files = _extract_media_filenames(payload)
@@ -2645,17 +2708,25 @@ async def commit_import_batch(
             media_inserted += 1
 
         if media_inserted:
+            base_media_count = int(_row_get(existing, "media_count") or 0) if not created_new else 0
             await database.execute(
                 product_reviews.update()
                 .where(product_reviews.c.id == int(new_review_id))
-                .values(media_count=media_inserted, updated_at=_now())
+                .values(media_count=base_media_count + media_inserted, updated_at=_now())
             )
 
-        imported += 1
+        if created_new:
+            imported += 1
         await database.execute(
             import_items.update()
             .where(import_items.c.id == int(r["id"]))
-            .values(status="imported", match_product_key=pk, match_sku_key=sk, updated_at=_now())
+            .values(
+                status="imported" if created_new else "replaced",
+                error_reason=None,
+                match_product_key=pk,
+                match_sku_key=sk,
+                updated_at=_now(),
+            )
         )
 
     await database.execute(
@@ -2698,6 +2769,7 @@ async def commit_import_batch(
         "batch_id": bid,
         "imported": imported,
         "rejected": rejected,
+        "replaced": replaced,
     }
 
 
