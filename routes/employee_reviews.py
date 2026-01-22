@@ -159,19 +159,21 @@ async def employee_list_import_batches(
     for r in rows:
         bid = int(r["id"])
         by_status = counts_by_batch.get(bid, {})
+        created_at = r["created_at"] if "created_at" in r else None
+        updated_at = r["updated_at"] if "updated_at" in r else None
         items.append(
             {
                 "id": bid,
-                "merchant_id": r.get("merchant_id"),
-                "source_system": r.get("source_system"),
-                "status": r.get("status"),
-                "created_by_employee_id": r.get("created_by_employee_id"),
-                "has_reviews_file": bool(r.get("has_reviews_file")),
-                "has_media_zip": bool(r.get("has_media_zip")),
-                "report": r.get("report_json") if isinstance(r.get("report_json"), dict) else None,
+                "merchant_id": r["merchant_id"],
+                "source_system": r["source_system"],
+                "status": r["status"],
+                "created_by_employee_id": r["created_by_employee_id"],
+                "has_reviews_file": bool(r["has_reviews_file"]),
+                "has_media_zip": bool(r["has_media_zip"]),
+                "report": r["report_json"] if isinstance(r["report_json"], dict) else None,
                 "counts": {"total": sum(by_status.values()), "by_status": by_status},
-                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
-                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None,
+                "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else (str(created_at) if created_at else None),
+                "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else (str(updated_at) if updated_at else None),
             }
         )
 
@@ -356,24 +358,25 @@ async def employee_download_import_report_csv(
     )
     writer.writeheader()
     for r in rows:
-        payload = r.get("payload_json") if isinstance(r.get("payload_json"), dict) else {}
-        ext_id = r.get("external_review_id") or payload.get("external_review_id") or payload.get("review_id") or payload.get("id")
+        payload_raw = r["payload_json"]
+        payload = payload_raw if isinstance(payload_raw, dict) else {}
+        ext_id = r["external_review_id"] or payload.get("external_review_id") or payload.get("review_id") or payload.get("id")
         writer.writerow(
             {
                 "id": int(r["id"]),
-                "merchant_id": r.get("merchant_id"),
-                "source_system": r.get("source_system"),
+                "merchant_id": r["merchant_id"],
+                "source_system": r["source_system"],
                 "external_review_id": ext_id,
-                "status": r.get("status"),
-                "error_reason": r.get("error_reason"),
+                "status": r["status"],
+                "error_reason": r["error_reason"],
                 "platform": payload.get("platform"),
                 "platform_product_id": payload.get("platform_product_id") or payload.get("product_id"),
                 "variant_id": payload.get("variant_id"),
-                "match_product_key": r.get("match_product_key"),
-                "match_sku_key": r.get("match_sku_key"),
-                "match_confidence": r.get("match_confidence"),
-                "group_id": r.get("group_id"),
-                "group_confidence": r.get("group_confidence"),
+                "match_product_key": r["match_product_key"],
+                "match_sku_key": r["match_sku_key"],
+                "match_confidence": r["match_confidence"],
+                "group_id": r["group_id"],
+                "group_confidence": r["group_confidence"],
             }
         )
 
