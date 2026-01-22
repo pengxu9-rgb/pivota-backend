@@ -118,6 +118,17 @@ def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> 
     return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
 
 
+def _availability_to_in_stock(availability: Any) -> bool:
+    if availability is None:
+        return True
+    if isinstance(availability, bool):
+        return availability
+    raw = str(availability).strip().lower()
+    if not raw:
+        return True
+    return raw not in {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
+
+
 def _request_base_url(req: Request) -> str:
     return str(req.base_url).rstrip("/")
 
@@ -183,15 +194,56 @@ async def _build_external_seed_product(
     except Exception:
         price = 0.0
 
-    variant = {
-        "id": external_product_id,
-        "variant_id": external_product_id,
-        "title": "Default",
-        "price": price,
-        "currency": price_currency,
-        "inventory_quantity": 999,
-        "in_stock": True,
-    }
+    seed_variants = _seed_variants(seed_data)
+    variants: List[Dict[str, Any]] = []
+    seen_variant_ids: set[str] = set()
+    for idx, v in enumerate(seed_variants):
+        raw_variant_id = v.get("variant_id") or v.get("id") or v.get("sku")
+        variant_id = str(raw_variant_id or "").strip() or f"{external_product_id}_{idx + 1}"
+        if variant_id in seen_variant_ids:
+            continue
+        seen_variant_ids.add(variant_id)
+
+        raw_amount = v.get("price_amount")
+        if raw_amount is None:
+            raw_amount = v.get("price") or v.get("amount") or v.get("value")
+        raw_currency = v.get("price_currency") or v.get("currency") or price_currency
+
+        try:
+            variant_price = float(raw_amount) if raw_amount is not None else price
+        except Exception:
+            variant_price = price
+
+        availability = v.get("availability")
+        in_stock = _availability_to_in_stock(availability)
+
+        variants.append(
+            {
+                "id": variant_id,
+                "variant_id": variant_id,
+                "title": v.get("title") or v.get("name") or f"Variant {idx + 1}",
+                "price": variant_price,
+                "currency": str(raw_currency or "USD").strip() or "USD",
+                "inventory_quantity": 999 if in_stock else 0,
+                "in_stock": in_stock,
+                **({"availability": availability} if availability is not None else {}),
+            }
+        )
+        if len(variants) >= 30:
+            break
+
+    if not variants:
+        variants = [
+            {
+                "id": external_product_id,
+                "variant_id": external_product_id,
+                "title": "Default",
+                "price": price,
+                "currency": price_currency,
+                "inventory_quantity": 999,
+                "in_stock": True,
+            }
+        ]
 
     return {
         "id": external_product_id,
@@ -212,7 +264,7 @@ async def _build_external_seed_product(
         "external_seed_id": seed_id,
         "external_redirect_url": external_redirect_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
-        "variants": [variant],
+        "variants": variants,
     }
 
 
