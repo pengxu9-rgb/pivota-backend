@@ -1682,7 +1682,19 @@ def _read_jsonl(raw: bytes) -> List[Dict[str, Any]]:
 def _normalize_csv_fieldname(name: Any) -> str:
     if name is None:
         return ""
-    return str(name).strip().lstrip("\ufeff")
+    raw = str(name).strip().lstrip("\ufeff")
+    if not raw:
+        return ""
+    # Normalize common CSV header variants to snake_case.
+    raw = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw)
+    normalized = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    alias = {
+        "externalreviewid": "external_review_id",
+        "external_reviewid": "external_review_id",
+        "reviewid": "review_id",
+        "review_id": "review_id",
+    }
+    return alias.get(normalized, normalized)
 
 
 def _read_csv(raw: bytes) -> List[Dict[str, Any]]:
