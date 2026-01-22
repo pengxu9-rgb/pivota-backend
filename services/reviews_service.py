@@ -2658,6 +2658,27 @@ async def reprocess_import_batch(
                     updated_at=_now(),
                 )
             )
+
+            # Keep import_items aligned so the UI/report reflect the resolved attachment target.
+            payload_new = dict(payload)
+            current_platform = _as_text(payload_new.get("platform")).strip().lower() or None
+            current_pid = _as_text(payload_new.get("platform_product_id") or payload_new.get("product_id")).strip() or None
+            if current_platform and current_platform != resolved_platform:
+                payload_new.setdefault("source_platform", current_platform)
+            if current_pid and current_pid != resolved_platform_product_id:
+                payload_new.setdefault("source_platform_product_id", current_pid)
+            payload_new["platform"] = resolved_platform
+            payload_new["platform_product_id"] = resolved_platform_product_id
+            await database.execute(
+                import_items.update()
+                .where(import_items.c.id == int(it["id"]))
+                .values(
+                    payload_json=payload_new,
+                    match_product_key=pk,
+                    match_sku_key=sk,
+                    updated_at=_now(),
+                )
+            )
             updated += 1
 
         return {
