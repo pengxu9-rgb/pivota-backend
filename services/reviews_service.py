@@ -1679,9 +1679,17 @@ def _read_jsonl(raw: bytes) -> List[Dict[str, Any]]:
     return out
 
 
+def _normalize_csv_fieldname(name: Any) -> str:
+    if name is None:
+        return ""
+    return str(name).strip().lstrip("\ufeff")
+
+
 def _read_csv(raw: bytes) -> List[Dict[str, Any]]:
     text = raw.decode("utf-8", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames:
+        reader.fieldnames = [_normalize_csv_fieldname(n) for n in reader.fieldnames]
     return [dict(r) for r in reader]
 
 
@@ -2188,7 +2196,7 @@ async def validate_import_batch(
             # (likely from a previous batch), don't 500. Record it as a rejected duplicate and
             # store it with a NULL external_review_id to avoid unique index collisions, while
             # keeping the original external_review_id inside payload_json for debugging.
-            report.rejected += 1
+            report.deduped += 1
             report.errors.append({"row": idx, "error": "duplicate_external_review_id"})
             await database.execute(
                 import_items.insert().values(
@@ -2204,7 +2212,7 @@ async def validate_import_batch(
                     group_id=None,
                     group_confidence=0.0,
                     dedupe_key=dedupe_key,
-                    status="rejected",
+                    status="deduped",
                     error_reason="duplicate_external_review_id",
                     created_at=_now(),
                     updated_at=_now(),
@@ -2433,7 +2441,7 @@ async def commit_import_batch(
     rejected = 0
     for r in rows:
         status = str(_row_get(r, "status") or "")
-        if status in {"rejected", "imported"}:
+        if status in {"rejected", "imported", "deduped"}:
             if status == "rejected":
                 rejected += 1
             continue

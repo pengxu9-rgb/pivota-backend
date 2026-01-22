@@ -392,6 +392,7 @@ async def employee_download_import_report_csv(
 
     import csv
     import io
+    import json
 
     out = io.StringIO()
     writer = csv.DictWriter(
@@ -417,6 +418,13 @@ async def employee_download_import_report_csv(
     for r in rows:
         payload_raw = r["payload_json"]
         payload = payload_raw if isinstance(payload_raw, dict) else {}
+        if isinstance(payload_raw, str):
+            try:
+                parsed = json.loads(payload_raw)
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
         ext_id = r["external_review_id"] or payload.get("external_review_id") or payload.get("review_id") or payload.get("id")
         writer.writerow(
             {
