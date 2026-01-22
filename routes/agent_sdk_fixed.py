@@ -220,6 +220,11 @@ async def _build_external_seed_product(
 
         availability = v.get("availability")
         in_stock = _availability_to_in_stock(availability)
+        image_url = v.get("image_url") or v.get("image")
+        if isinstance(image_url, str):
+            image_url = image_url.strip() or None
+        else:
+            image_url = None
 
         variants.append(
             {
@@ -231,6 +236,7 @@ async def _build_external_seed_product(
                 "inventory_quantity": 999 if in_stock else 0,
                 "in_stock": in_stock,
                 **({"availability": availability} if availability is not None else {}),
+                **({"image_url": image_url} if image_url else {}),
             }
         )
         if len(variants) >= 30:

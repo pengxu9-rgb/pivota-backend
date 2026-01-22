@@ -265,27 +265,8 @@ def _detect_currency_from_text(raw: Optional[str]) -> Optional[str]:
 
 
 def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str]) -> list[Dict[str, Any]]:
-    attr_patterns = [
-        r'data-product-skus-value="([^"]+)"',
-        r"data-product-skus-value='([^']+)'",
-    ]
-    raw_attr = None
-    for pattern in attr_patterns:
-        match = re.search(pattern, html)
-        if match:
-            raw_attr = match.group(1)
-            break
-
-    if not raw_attr:
-        return []
-
-    try:
-        decoded = html_lib.unescape(raw_attr)
-        payload = json.loads(decoded)
-    except Exception:
-        return []
-
-    if not isinstance(payload, list):
+    payload = _extract_skus_payload_from_data_attrs(html)
+    if not payload:
         return []
 
     variants: list[Dict[str, Any]] = []
@@ -321,6 +302,17 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
         availability_raw = sku.get("inventory_status") or sku.get("availability")
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
 
+        image_url = None
+        raw_images = sku.get("images") or sku.get("image_urls") or sku.get("imageUrl") or sku.get("imageURL")
+        if isinstance(raw_images, list) and raw_images:
+            first_img = raw_images[0]
+            if isinstance(first_img, str):
+                image_url = first_img.strip() or None
+            elif isinstance(first_img, dict):
+                raw_url = first_img.get("url") or first_img.get("image_url")
+                if isinstance(raw_url, str) and raw_url.strip():
+                    image_url = raw_url.strip()
+
         variants.append(
             {
                 "variant_id": variant_id,
@@ -328,6 +320,7 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
                 "price_amount": _parse_price(str(price_amount)) if price_amount is not None else None,
                 "price_currency": str(currency).strip().upper() if currency else None,
                 "availability": availability,
+                **({"image_url": image_url} if image_url else {}),
             }
         )
         seen.add(variant_id)
@@ -335,6 +328,77 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
             break
 
     return variants
+
+
+def _extract_skus_payload_from_data_attrs(html: str) -> list[dict[str, Any]]:
+    attr_patterns = [
+        r'data-product-skus-value="([^"]+)"',
+        r"data-product-skus-value='([^']+)'",
+    ]
+    raw_attr = None
+    for pattern in attr_patterns:
+        match = re.search(pattern, html)
+        if match:
+            raw_attr = match.group(1)
+            break
+
+    if not raw_attr:
+        return []
+
+    try:
+        decoded = html_lib.unescape(raw_attr)
+        payload = json.loads(decoded)
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+    return [p for p in payload if isinstance(p, dict)]
+
+
+def _extract_image_urls_from_data_attrs(html: str, base_url: str) -> list[str]:
+    payload = _extract_skus_payload_from_data_attrs(html)
+    if not payload:
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def normalize(url: Any) -> Optional[str]:
+        if not url:
+            return None
+        if isinstance(url, str):
+            s = url.strip()
+        elif isinstance(url, dict):
+            raw = url.get("url") or url.get("image_url")
+            s = str(raw).strip() if raw else ""
+        else:
+            return None
+        if not s:
+            return None
+        if s.startswith("//"):
+            try:
+                scheme = urlparse(base_url).scheme or "https"
+            except Exception:
+                scheme = "https"
+            s = f"{scheme}:{s}"
+        if not s.startswith(("http://", "https://")):
+            s = urljoin(base_url, s)
+        return s if s.startswith(("http://", "https://")) else None
+
+    for sku in payload:
+        raw_images = sku.get("images") or sku.get("image_urls") or []
+        if not isinstance(raw_images, list):
+            continue
+        for raw in raw_images:
+            resolved = normalize(raw)
+            if not resolved or resolved in seen:
+                continue
+            seen.add(resolved)
+            urls.append(resolved)
+            if len(urls) >= MAX_IMAGES:
+                return urls
+    return urls
 
 
 def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
@@ -571,6 +635,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     jsonld = _extract_jsonld_offer(parsed_jsonld)
     jsonld_image_urls = _extract_jsonld_image_urls(parsed_jsonld, canonical)
     meta_image_urls = _extract_meta_image_urls(p, canonical)
+    data_attr_image_urls = _extract_image_urls_from_data_attrs(html, canonical)
     variants = _extract_jsonld_variants(parsed_jsonld)
     if not variants:
         fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
@@ -582,7 +647,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     if preferred:
         image_urls.append(preferred)
         seen_images.add(preferred)
-    for url in jsonld_image_urls + meta_image_urls:
+    for url in jsonld_image_urls + meta_image_urls + data_attr_image_urls:
         if not url or url in seen_images:
             continue
         seen_images.add(url)

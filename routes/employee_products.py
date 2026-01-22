@@ -1453,7 +1453,7 @@ async def refresh_external_seed(
         seed_data["title"] = snap_title
     if not seed_data.get("image_url"):
         seed_data["image_url"] = snap_image_url
-    if not seed_data.get("image_urls") and snap_image_urls:
+    if snap_image_urls:
         seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
