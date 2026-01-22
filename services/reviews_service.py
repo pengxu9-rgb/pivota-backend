@@ -78,6 +78,18 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return default
 
 
+def _is_unique_violation(exc: Exception) -> bool:
+    """
+    Best-effort detector for Postgres unique constraint errors across drivers.
+    We avoid importing driver-specific exception classes here.
+    """
+    name = type(exc).__name__
+    if name in {"UniqueViolationError", "IntegrityError"}:
+        return True
+    msg = str(exc).lower()
+    return "duplicate key value violates unique constraint" in msg or "unique constraint" in msg
+
+
 def _as_datetime(value: Any) -> Optional[datetime]:
     """
     Coerce DB-returned timestamps to `datetime`.
@@ -1861,34 +1873,38 @@ async def validate_import_batch(
         if id_err:
             report.rejected += 1
             report.errors.append({"row": idx, "error": id_err})
-            await database.execute(
-                import_items.insert().values(
-                    batch_id=bid,
-                    merchant_id=merchant_id,
-                    source_system=source_system,
-                    external_review_id=ext_review_id or None,
-                    external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
-                    payload_json=row,
-                    match_product_key=None,
-                    match_sku_key=None,
-                    match_confidence=0.0,
-                    group_id=None,
-                    group_confidence=0.0,
-                    dedupe_key=compute_import_dedupe_key(
+            try:
+                await database.execute(
+                    import_items.insert().values(
+                        batch_id=bid,
                         merchant_id=merchant_id,
                         source_system=source_system,
-                        external_review_id=ext_review_id,
-                        platform=platform,
-                        platform_product_id=platform_product_id,
-                        variant_id=variant_id,
-                        created_at=row.get("created_at"),
-                    ),
-                    status="rejected",
-                    error_reason=id_err,
-                    created_at=_now(),
-                    updated_at=_now(),
+                        external_review_id=ext_review_id or None,
+                        external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
+                        payload_json=row,
+                        match_product_key=None,
+                        match_sku_key=None,
+                        match_confidence=0.0,
+                        group_id=None,
+                        group_confidence=0.0,
+                        dedupe_key=compute_import_dedupe_key(
+                            merchant_id=merchant_id,
+                            source_system=source_system,
+                            external_review_id=ext_review_id,
+                            platform=platform,
+                            platform_product_id=platform_product_id,
+                            variant_id=variant_id,
+                            created_at=row.get("created_at"),
+                        ),
+                        status="rejected",
+                        error_reason=id_err,
+                        created_at=_now(),
+                        updated_at=_now(),
+                    )
                 )
-            )
+            except Exception as exc:
+                if not _is_unique_violation(exc):
+                    raise
             continue
         if ext_review_id:
             if ext_review_id in seen_external:
@@ -1959,26 +1975,56 @@ async def validate_import_batch(
             created_at=row.get("created_at"),
         )
 
-        await database.execute(
-            import_items.insert().values(
-                batch_id=bid,
-                merchant_id=merchant_id,
-                source_system=source_system,
-                external_review_id=ext_review_id or None,
-                external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
-                payload_json=row,
-                match_product_key=match_product_key,
-                match_sku_key=match_sku_key,
-                match_confidence=match_confidence,
-                group_id=resolved_group_id,
-                group_confidence=resolved_group_conf,
-                dedupe_key=dedupe_key,
-                status=status,
-                error_reason=error_reason,
-                created_at=_now(),
-                updated_at=_now(),
+        try:
+            await database.execute(
+                import_items.insert().values(
+                    batch_id=bid,
+                    merchant_id=merchant_id,
+                    source_system=source_system,
+                    external_review_id=ext_review_id or None,
+                    external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
+                    payload_json=row,
+                    match_product_key=match_product_key,
+                    match_sku_key=match_sku_key,
+                    match_confidence=match_confidence,
+                    group_id=resolved_group_id,
+                    group_confidence=resolved_group_conf,
+                    dedupe_key=dedupe_key,
+                    status=status,
+                    error_reason=error_reason,
+                    created_at=_now(),
+                    updated_at=_now(),
+                )
             )
-        )
+        except Exception as exc:
+            if not _is_unique_violation(exc):
+                raise
+            # If a row with the same (merchant_id, source_system, external_review_id) already exists
+            # (likely from a previous batch), don't 500. Record it as a rejected duplicate and
+            # store it with a NULL external_review_id to avoid unique index collisions, while
+            # keeping the original external_review_id inside payload_json for debugging.
+            report.rejected += 1
+            report.errors.append({"row": idx, "error": "duplicate_external_review_id"})
+            await database.execute(
+                import_items.insert().values(
+                    batch_id=bid,
+                    merchant_id=merchant_id,
+                    source_system=source_system,
+                    external_review_id=None,
+                    external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
+                    payload_json=row,
+                    match_product_key=None,
+                    match_sku_key=None,
+                    match_confidence=0.0,
+                    group_id=None,
+                    group_confidence=0.0,
+                    dedupe_key=dedupe_key,
+                    status="rejected",
+                    error_reason="duplicate_external_review_id",
+                    created_at=_now(),
+                    updated_at=_now(),
+                )
+            )
 
     report_dict = report.to_dict()
     await database.execute(
