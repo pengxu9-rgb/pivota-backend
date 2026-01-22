@@ -38,6 +38,8 @@ from models.reviews_refs import VARIANT_ID_SENTINEL
 
 logger = logging.getLogger(__name__)
 
+GLOBAL_IMPORT_MERCHANT_ID = "merch_global"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -1754,7 +1756,7 @@ async def create_import_batch(
     mid = _as_text(merchant_id)
     ss = _as_text(source_system)
     if not mid:
-        raise HTTPException(status_code=400, detail="MISSING_MERCHANT_ID")
+        mid = GLOBAL_IMPORT_MERCHANT_ID
     if not ss:
         raise HTTPException(status_code=400, detail="MISSING_SOURCE_SYSTEM")
     bid = await database.execute(

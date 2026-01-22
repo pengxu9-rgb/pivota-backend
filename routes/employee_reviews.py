@@ -64,7 +64,7 @@ async def _save_upload(file: UploadFile, *, dir_path: str, name_hint: str) -> st
 
 
 class CreateImportBatchRequest(BaseModel):
-    merchant_id: str = Field(..., min_length=1)
+    merchant_id: Optional[str] = None
     source_system: str = Field(..., min_length=1)
 
 
@@ -76,7 +76,11 @@ async def employee_create_import_batch(
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.import.create"])),
 ) -> Dict[str, Any]:
     try:
-        out = await create_import_batch(actor=actor, merchant_id=body.merchant_id, source_system=body.source_system)
+        out = await create_import_batch(
+            actor=actor,
+            merchant_id=body.merchant_id or "",
+            source_system=body.source_system,
+        )
         record_employee_action(action="reviews.import.create", result="success")
         return out
     except Exception:
