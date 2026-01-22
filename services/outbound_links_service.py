@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
-from sqlalchemy import and_, desc, or_, select
+from sqlalchemy import and_, desc, func, or_, select
 
 from db.database import database
 from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
@@ -196,7 +196,9 @@ async def _select_best_rule(
     scope: str,
     scope_id: str,
 ) -> Optional[Dict[str, Any]]:
-    now = datetime.now(timezone.utc)
+    # Use a DB-side "now" to avoid tz-aware/naive mismatches across deployments where
+    # outbound_link_rules.start_at/end_at may have been created as TIMESTAMP or TIMESTAMPTZ.
+    now = func.now()
     # Allow tool="*" fallback.
     stmt = (
         select(outbound_link_rules)
