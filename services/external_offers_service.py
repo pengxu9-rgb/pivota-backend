@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from sqlalchemy import and_, select, update
@@ -25,6 +25,7 @@ class _MetaParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.meta: Dict[Tuple[str, str], str] = {}
+        self.meta_list: Dict[Tuple[str, str], list[str]] = {}
         self.title: Optional[str] = None
         self._in_title = False
         self.links: Dict[str, str] = {}
@@ -41,7 +42,9 @@ class _MetaParser(HTMLParser):
             elif a.get("name"):
                 key = f"name:{a.get('name')}"
             if key and a.get("content"):
-                self.meta[(tag, key.lower())] = a.get("content") or ""
+                content = a.get("content") or ""
+                self.meta[(tag, key.lower())] = content
+                self.meta_list.setdefault((tag, key.lower()), []).append(content)
         elif tag.lower() == "title":
             self._in_title = True
         elif tag.lower() == "link":
@@ -132,6 +135,7 @@ def _parse_price(value: Optional[str]) -> Optional[float]:
 
 
 MAX_VARIANTS = int(os.getenv("EXTERNAL_OFFER_MAX_VARIANTS") or "50")
+MAX_IMAGES = int(os.getenv("EXTERNAL_OFFER_MAX_IMAGES") or "20")
 
 
 def _parse_jsonld_texts(json_texts: list[str]) -> list[Any]:
@@ -371,6 +375,97 @@ def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
     return normalized
 
 
+def _extract_jsonld_image_urls(parsed_objs: list[Any], base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def normalize(url: Any) -> Optional[str]:
+        if not url:
+            return None
+        if isinstance(url, str):
+            s = url.strip()
+        elif isinstance(url, dict):
+            raw = url.get("url") or url.get("contentUrl") or url.get("content_url")
+            s = str(raw).strip() if raw else ""
+        else:
+            return None
+        if not s:
+            return None
+        if s.startswith("//"):
+            try:
+                scheme = urlparse(base_url).scheme or "https"
+            except Exception:
+                scheme = "https"
+            s = f"{scheme}:{s}"
+        if not s.startswith(("http://", "https://")):
+            s = urljoin(base_url, s)
+        return s if s.startswith(("http://", "https://")) else None
+
+    for root in parsed_objs:
+        for node in _iter_jsonld_nodes(root):
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type")
+            if isinstance(t, list):
+                tset = {str(x).lower() for x in t}
+            else:
+                tset = {str(t).lower()} if t else set()
+            if "product" not in tset:
+                continue
+            img = node.get("image")
+            candidates: list[Any] = []
+            if isinstance(img, list):
+                candidates = img
+            elif img is not None:
+                candidates = [img]
+
+            for candidate in candidates:
+                resolved = normalize(candidate)
+                if not resolved or resolved in seen:
+                    continue
+                seen.add(resolved)
+                urls.append(resolved)
+                if len(urls) >= MAX_IMAGES:
+                    return urls
+    return urls
+
+
+def _extract_meta_image_urls(parser: _MetaParser, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def normalize(url: str) -> Optional[str]:
+        s = str(url or "").strip()
+        if not s:
+            return None
+        if s.startswith("//"):
+            try:
+                scheme = urlparse(base_url).scheme or "https"
+            except Exception:
+                scheme = "https"
+            s = f"{scheme}:{s}"
+        if not s.startswith(("http://", "https://")):
+            s = urljoin(base_url, s)
+        return s if s.startswith(("http://", "https://")) else None
+
+    keys = [
+        "property:og:image",
+        "property:og:image:url",
+        "property:og:image:secure_url",
+        "name:twitter:image",
+    ]
+    for key in keys:
+        for raw in parser.meta_list.get(("meta", key), []):
+            resolved = normalize(raw)
+            if not resolved or resolved in seen:
+                continue
+            seen.add(resolved)
+            urls.append(resolved)
+            if len(urls) >= MAX_IMAGES:
+                return urls
+    return urls
+
+
 def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
     for root in parsed_objs:
@@ -467,24 +562,41 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
 
     canonical = p.links.get("canonical") or meta("property:og:url") or base_url
     title = meta("property:og:title", "name:twitter:title") or (p.title.strip() if p.title else None)
-    image = meta("property:og:image", "name:twitter:image")
+    image = meta("property:og:image", "property:og:image:secure_url", "name:twitter:image")
 
     price = meta("property:product:price:amount", "property:og:price:amount", "property:product:price") or None
     currency = meta("property:product:price:currency", "property:og:price:currency") or None
 
     parsed_jsonld = _parse_jsonld_texts(p.jsonld)
     jsonld = _extract_jsonld_offer(parsed_jsonld)
+    jsonld_image_urls = _extract_jsonld_image_urls(parsed_jsonld, canonical)
+    meta_image_urls = _extract_meta_image_urls(p, canonical)
     variants = _extract_jsonld_variants(parsed_jsonld)
     if not variants:
         fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
         variants = _extract_variants_from_data_attrs(html, fallback_currency)
+
+    image_urls: list[str] = []
+    seen_images: set[str] = set()
+    preferred = (jsonld.get("image_url") or "").strip()
+    if preferred:
+        image_urls.append(preferred)
+        seen_images.add(preferred)
+    for url in jsonld_image_urls + meta_image_urls:
+        if not url or url in seen_images:
+            continue
+        seen_images.add(url)
+        image_urls.append(url)
+        if len(image_urls) >= MAX_IMAGES:
+            break
 
     # JSON-LD is preferred when it provides structured offers.
     out = {
         "canonical_url": canonical,
         "title": jsonld.get("title") or title,
         "brand": jsonld.get("brand") or None,
-        "image_url": jsonld.get("image_url") or image,
+        "image_url": jsonld.get("image_url") or (image_urls[0] if image_urls else None) or image,
+        "image_urls": image_urls,
         "price_amount": _parse_price(jsonld.get("price_raw")) or _parse_price(price),
         "price_currency": (jsonld.get("currency") or currency or "").strip().upper() or None,
         "availability": _availability_from_raw(jsonld.get("availability_raw")),
@@ -617,6 +729,11 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
         variants = extracted.get("variants") or []
         if variants:
             evidence["variants"] = variants[:MAX_VARIANTS]
+        image_urls = extracted.get("image_urls") or []
+        if isinstance(image_urls, list):
+            cleaned = [str(u).strip() for u in image_urls if isinstance(u, str) and str(u).strip()]
+            if cleaned:
+                evidence["image_urls"] = cleaned[:MAX_IMAGES]
         if existing:
             stmt = (
                 update(external_offer_snapshots)

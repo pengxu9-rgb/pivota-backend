@@ -137,6 +137,10 @@ def test_agent_products_search_external_seed_includes_variants(
                     "price_currency": "USD",
                     "availability": "in_stock",
                     "seed_data": {
+                        "image_urls": [
+                            "https://example.com/img_1.jpg",
+                            "https://example.com/img_2.jpg",
+                        ],
                         "variants": [
                             {
                                 "variant_id": "v1",
@@ -177,6 +181,7 @@ def test_agent_products_search_external_seed_includes_variants(
     products = payload.get("products") or []
     external = next(p for p in products if p.get("merchant_id") == "external_seed")
     assert len(external.get("variants") or []) == 2
+    assert len(external.get("image_urls") or []) == 2
 
 
 def test_agent_product_detail_external_seed_includes_variants(
@@ -203,6 +208,10 @@ def test_agent_product_detail_external_seed_includes_variants(
                 "price_currency": "USD",
                 "availability": "in_stock",
                 "seed_data": {
+                    "image_urls": [
+                        "https://example.com/img_1.jpg",
+                        "https://example.com/img_2.jpg",
+                    ],
                     "variants": [
                         {
                             "variant_id": "v1",
@@ -242,6 +251,7 @@ def test_agent_product_detail_external_seed_includes_variants(
     product = payload.get("product") or {}
     assert product.get("merchant_id") == "external_seed"
     assert len(product.get("variants") or []) == 2
+    assert len(product.get("image_urls") or []) == 2
 
 
 def test_agent_products_search_cross_merchant_injects_external_seeds_by_domain(

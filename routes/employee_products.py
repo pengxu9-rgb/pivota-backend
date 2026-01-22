@@ -748,11 +748,15 @@ async def preview_external_seed(
         domain_allowed = True
 
     variants = []
+    image_urls: list[str] = []
     evidence = getattr(snapshot, "evidence", None)
     if isinstance(evidence, dict):
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list):
             variants = raw_variants
+        raw_images = evidence.get("image_urls") or evidence.get("images")
+        if isinstance(raw_images, list):
+            image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
 
     return {
         "status": "success",
@@ -763,6 +767,7 @@ async def preview_external_seed(
             "external_product_id": _stable_external_product_id(canonical_url),
             "title": getattr(snapshot, "title", None),
             "image_url": getattr(snapshot, "image_url", None),
+            "image_urls": image_urls,
             "price_amount": getattr(snapshot, "price_amount", None),
             "price_currency": getattr(snapshot, "price_currency", None),
             "availability": getattr(snapshot, "availability", None),
@@ -1421,6 +1426,13 @@ async def refresh_external_seed(
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
 
+    snap_image_urls: list[str] = []
+    evidence = getattr(snapshot, "evidence", None)
+    if isinstance(evidence, dict):
+        raw_images = evidence.get("image_urls") or evidence.get("images")
+        if isinstance(raw_images, list):
+            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
     seed_data["snapshot"].update(
@@ -1429,6 +1441,7 @@ async def refresh_external_seed(
             "domain": domain,
             "title": snap_title,
             "image_url": snap_image_url,
+            "image_urls": snap_image_urls,
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
@@ -1440,6 +1453,8 @@ async def refresh_external_seed(
         seed_data["title"] = snap_title
     if not seed_data.get("image_url"):
         seed_data["image_url"] = snap_image_url
+    if not seed_data.get("image_urls") and snap_image_urls:
+        seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
     if not seed_data.get("variants"):

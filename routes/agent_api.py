@@ -118,6 +118,38 @@ def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> 
     return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
 
 
+def _seed_image_urls(seed_data: Dict[str, Any]) -> List[str]:
+    raw = seed_data.get("image_urls")
+    if not isinstance(raw, list) or not raw:
+        raw = seed_data.get("images")
+    if not isinstance(raw, list) or not raw:
+        snapshot = seed_data.get("snapshot")
+        if isinstance(snapshot, dict):
+            raw = snapshot.get("image_urls") or snapshot.get("images")
+
+    if not isinstance(raw, list):
+        return []
+
+    urls: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        url = None
+        if isinstance(item, str):
+            url = item.strip()
+        elif isinstance(item, dict):
+            raw_url = item.get("url") or item.get("image_url")
+            url = str(raw_url).strip() if isinstance(raw_url, str) else None
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= 20:
+            break
+    return urls
+
+
 def _availability_to_in_stock(availability: Any) -> bool:
     if availability is None:
         return True
@@ -151,7 +183,8 @@ async def _build_external_seed_product(
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
     canonical_url = str(seed_row.get("canonical_url") or "").strip() or None
     title = seed_data.get("title") or seed_row.get("title") or None
-    image_url = seed_data.get("image_url") or seed_row.get("image_url") or None
+    image_urls = _seed_image_urls(seed_data)
+    image_url = seed_data.get("image_url") or seed_row.get("image_url") or (image_urls[0] if image_urls else None)
 
     external_product_id = (
         str(seed_row.get("external_product_id") or "").strip()
@@ -257,6 +290,7 @@ async def _build_external_seed_product(
         "price": price,
         "currency": price_currency,
         "image_url": image_url,
+        "image_urls": image_urls,
         "in_stock": True,
         "inventory_quantity": 999,
         "product_type": "external",
