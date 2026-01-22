@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import mimetypes
+import logging
 import time
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +42,7 @@ from utils.auth import require_employee_permissions
 
 
 router = APIRouter(prefix="/employee/reviews/v1", tags=["Employee Reviews"])
+logger = logging.getLogger(__name__)
 
 
 def _import_storage_dir() -> str:
@@ -48,7 +51,53 @@ def _import_storage_dir() -> str:
     return base
 
 
-async def _save_upload(file: UploadFile, *, dir_path: str, name_hint: str) -> str:
+def _reviews_import_s3_bucket() -> str:
+    return (os.getenv("REVIEWS_IMPORT_S3_BUCKET") or "").strip()
+
+
+def _reviews_import_s3_prefix() -> str:
+    return (os.getenv("REVIEWS_IMPORT_S3_PREFIX") or "reviews-imports").strip().strip("/")
+
+
+def _reviews_import_s3_endpoint_url() -> Optional[str]:
+    v = (os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip()
+    return v or None
+
+
+def _reviews_import_s3_region() -> Optional[str]:
+    v = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "").strip()
+    return v or None
+
+
+def _reviews_import_s3_put(*, local_path: str, batch_id: int, filename: str) -> Optional[str]:
+    bucket = _reviews_import_s3_bucket()
+    if not bucket:
+        return None
+    key = f\"{_reviews_import_s3_prefix()}/batch_{batch_id}/{filename}\"
+    try:
+        import boto3
+    except Exception:
+        logger.warning(\"reviews.import.s3.boto3_missing\")
+        return None
+    try:
+        content_type, _ = mimetypes.guess_type(filename)
+        extra_args = {\"ContentType\": content_type} if content_type else None
+        client = boto3.client(
+            \"s3\",
+            region_name=_reviews_import_s3_region(),
+            endpoint_url=_reviews_import_s3_endpoint_url(),
+        )
+        if extra_args:
+            client.upload_file(local_path, bucket, key, ExtraArgs=extra_args)
+        else:
+            client.upload_file(local_path, bucket, key)
+        return f\"s3://{bucket}/{key}\"
+    except Exception as exc:
+        logger.warning(\"reviews.import.s3.put_failed %s\", type(exc).__name__)
+        return None
+
+
+async def _save_upload(file: UploadFile, *, dir_path: str, name_hint: str, batch_id: int) -> str:
     os.makedirs(dir_path, exist_ok=True)
     filename = (file.filename or "").strip() or name_hint
     filename = os.path.basename(filename)
@@ -60,6 +109,14 @@ async def _save_upload(file: UploadFile, *, dir_path: str, name_hint: str) -> st
             if not chunk:
                 break
             f.write(chunk)
+    # If S3 is configured, upload and return s3:// URI, then delete local file.
+    s3_uri = _reviews_import_s3_put(local_path=path, batch_id=int(batch_id), filename=filename)
+    if s3_uri:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return s3_uri
     return path
 
 
@@ -192,10 +249,10 @@ async def employee_upload_import_files(
 ) -> Dict[str, Any]:
     bid = int(batch_id)
     base = os.path.join(_import_storage_dir(), "uploads", f"batch_{bid}")
-    reviews_path = await _save_upload(reviews_file, dir_path=base, name_hint="reviews.csv")
+    reviews_path = await _save_upload(reviews_file, dir_path=base, name_hint="reviews.csv", batch_id=bid)
     media_path = None
     if media_zip is not None:
-        media_path = await _save_upload(media_zip, dir_path=base, name_hint="media.zip")
+        media_path = await _save_upload(media_zip, dir_path=base, name_hint="media.zip", batch_id=bid)
     try:
         out = await attach_import_files(
             actor=actor,
