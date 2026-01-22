@@ -1919,6 +1919,31 @@ async def validate_import_batch(
     # Clear existing items for re-validate (safe; batch-local).
     await database.execute("DELETE FROM import_items WHERE batch_id = :bid", {"bid": bid})
 
+    total_rows = len(rows)
+    # Track progress in batch report_json so UI can show progress.
+    try:
+        await database.execute(
+            import_batches.update()
+            .where(import_batches.c.id == bid)
+            .values(
+                status="validating",
+                report_json={
+                    "status": "validating",
+                    "total": total_rows,
+                    "processed": 0,
+                    "matched": 0,
+                    "deduped": 0,
+                    "rejected": 0,
+                    "downgraded_to_product_level": 0,
+                },
+                updated_at=_now(),
+            )
+        )
+    except Exception:
+        pass
+
+    progress_every = 100
+
     for idx, row in enumerate(rows):
         report.total += 1
         payload: Dict[str, Any] = dict(row) if isinstance(row, dict) else {"raw": row}
@@ -2105,7 +2130,31 @@ async def validate_import_batch(
                 )
             )
 
+        # Best-effort progress update (every N rows).
+        if (idx + 1) % progress_every == 0 or (idx + 1) == total_rows:
+            try:
+                await database.execute(
+                    import_batches.update()
+                    .where(import_batches.c.id == bid)
+                    .values(
+                        status="validating",
+                        report_json={
+                            "status": "validating",
+                            "total": total_rows,
+                            "processed": idx + 1,
+                            "matched": report.matched,
+                            "deduped": report.deduped,
+                            "rejected": report.rejected,
+                            "downgraded_to_product_level": report.downgraded_to_product_level,
+                        },
+                        updated_at=_now(),
+                    )
+                )
+            except Exception:
+                pass
+
     report_dict = report.to_dict()
+    report_dict["processed"] = total_rows
     await database.execute(
         import_batches.update()
         .where(import_batches.c.id == bid)
