@@ -1852,6 +1852,9 @@ async def validate_import_batch(
     for idx, row in enumerate(rows):
         report.total += 1
         ext_review_id = _as_text(row.get("external_review_id") or row.get("review_id") or row.get("id"))
+        platform = _as_text(row.get("platform")).strip().lower() or None
+        platform_product_id = _as_text(row.get("platform_product_id") or row.get("product_id")).strip() or None
+        variant_id = _as_text(row.get("variant_id")).strip() or None
         id_err = validate_imported_identifiers(source_system=source_system, external_review_id=ext_review_id)
         if id_err:
             report.rejected += 1
@@ -1873,9 +1876,9 @@ async def validate_import_batch(
                         merchant_id=merchant_id,
                         source_system=source_system,
                         external_review_id=ext_review_id,
-                        platform=_as_text(row.get("platform")),
-                        platform_product_id=_as_text(row.get("platform_product_id") or row.get("product_id")),
-                        variant_id=_as_text(row.get("variant_id")) or None,
+                        platform=platform,
+                        platform_product_id=platform_product_id,
+                        variant_id=variant_id,
                         created_at=row.get("created_at"),
                     ),
                     status="rejected",
@@ -1890,10 +1893,6 @@ async def validate_import_batch(
                 report.deduped += 1
                 continue
             seen_external.add(ext_review_id)
-
-        platform = _as_text(row.get("platform"))
-        platform_product_id = _as_text(row.get("platform_product_id") or row.get("product_id"))
-        variant_id = _as_text(row.get("variant_id")) or None
 
         status = "pending"
         error_reason = None
@@ -2191,9 +2190,9 @@ async def commit_import_batch(
                     payload = parsed
             except Exception:
                 payload = {}
-        platform = _as_text(payload.get("platform"))
-        platform_product_id = _as_text(payload.get("platform_product_id") or payload.get("product_id"))
-        variant_id = _as_text(payload.get("variant_id")) or None
+        platform = _as_text(payload.get("platform")).strip().lower() or None
+        platform_product_id = _as_text(payload.get("platform_product_id") or payload.get("product_id")).strip() or None
+        variant_id = _as_text(payload.get("variant_id")).strip() or None
         if not platform or not platform_product_id:
             rejected += 1
             await database.execute(
@@ -2443,9 +2442,9 @@ async def reprocess_import_batch(
             continue
         payload_raw = _row_get(it, "payload_json")
         payload = payload_raw if isinstance(payload_raw, dict) else {}
-        platform = _as_text(payload.get("platform"))
-        platform_product_id = _as_text(payload.get("platform_product_id") or payload.get("product_id"))
-        variant_id = _as_text(payload.get("variant_id")) or None
+        platform = _as_text(payload.get("platform")).strip().lower() or None
+        platform_product_id = _as_text(payload.get("platform_product_id") or payload.get("product_id")).strip() or None
+        variant_id = _as_text(payload.get("variant_id")).strip() or None
         if not platform or not platform_product_id:
             continue
 
