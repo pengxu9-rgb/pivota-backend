@@ -34,7 +34,7 @@ from services.outbound_links_service import (
     make_redirect_token,
 )
 from db.reviews_center import product_reviews
-from services.reviews_service import build_product_key, build_sku_key
+from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
@@ -1956,6 +1956,7 @@ async def list_product_reviews(
     merchant_id, platform, platform_product_id = parts
     values: Dict[str, Any] = {
         "merchant_id": merchant_id,
+        "global_merchant_id": GLOBAL_IMPORT_MERCHANT_ID,
         "platform": platform,
         "platform_product_id": platform_product_id,
         "limit": limit,
@@ -1984,7 +1985,7 @@ async def list_product_reviews(
               created_at,
               updated_at
             FROM product_reviews
-            WHERE merchant_id = :merchant_id
+            WHERE merchant_id IN (:merchant_id, :global_merchant_id)
               AND platform = :platform
               AND platform_product_id = :platform_product_id
               {variant_clause}
