@@ -389,7 +389,6 @@ def has_permission(current_user: Dict[str, Any], required_permission: str) -> bo
 
     Semantics:
     - super_admin/admin: allow all (but still require employee_id on employee routes).
-    - employee: allow all `reviews.*` permissions (MVP: avoid blocking core internal workflows).
     - explicit permissions list supports:
       - exact match: "reviews.read"
       - wildcard prefix: "reviews.*" matches "reviews.group.manage"
@@ -400,8 +399,6 @@ def has_permission(current_user: Dict[str, Any], required_permission: str) -> bo
 
     role = (current_user.get("role") or "").strip().lower()
     if role in {"super_admin", "admin"}:
-        return True
-    if role in {"employee"} and perm.startswith("reviews."):
         return True
 
     raw = current_user.get("permissions") or []
