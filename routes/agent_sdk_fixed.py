@@ -102,6 +102,10 @@ async def _build_external_seed_product(
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
     canonical_url = str(seed_row.get("canonical_url") or "").strip() or None
     title = seed_data.get("title") or seed_row.get("title") or None
+    brand_raw = seed_data.get("brand") or None
+    if isinstance(brand_raw, dict):
+        brand_raw = brand_raw.get("name") or brand_raw.get("brand") or None
+    brand = str(brand_raw).strip() if isinstance(brand_raw, str) and brand_raw.strip() else None
     image_url = seed_data.get("image_url") or seed_row.get("image_url") or None
 
     external_product_id = (
@@ -118,6 +122,15 @@ async def _build_external_seed_product(
     dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
     if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
         return None
+
+    external_domain = str(seed_row.get("domain") or "").strip() or None
+    if not external_domain:
+        try:
+            from urllib.parse import urlparse
+
+            external_domain = urlparse(canonical_url or destination_url).hostname or None
+        except Exception:
+            external_domain = None
 
     token = make_redirect_token(
         {
@@ -170,7 +183,10 @@ async def _build_external_seed_product(
         "source": "external_seed",
         "external_seed_id": seed_id,
         "external_redirect_url": external_redirect_url,
+        "external_domain": external_domain,
+        "external_url": canonical_url or destination_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
+        "brand": brand,
         "variants": [variant],
     }
 
@@ -677,12 +693,26 @@ async def search_products(
                         if query_lower:
                             title = str(p.get("title") or "").lower()
                             desc = str(p.get("description") or "").lower()
+                            domain = str(p.get("external_domain") or "").lower()
+                            ext_url = str(p.get("external_url") or "").lower()
+                            brand = str(p.get("brand") or "").lower()
+                            haystack = " ".join([title, desc, brand, domain, ext_url]).strip()
                             if query_lower in title:
                                 rel = 1.0 if title == query_lower else 0.9
                             elif query_lower in desc:
                                 rel = 0.7
+                            elif query_lower in haystack:
+                                rel = 0.65
                             else:
-                                continue
+                                words = [w for w in query_lower.split() if w]
+                                if words:
+                                    matches = sum(1 for w in words if w in haystack)
+                                    if matches > 0:
+                                        rel = 0.5 + (matches / len(words)) * 0.3
+                                    else:
+                                        continue
+                                else:
+                                    continue
 
                         p["relevance_score"] = rel
                         p["ranking_score"] = float(rel) * 0.8
