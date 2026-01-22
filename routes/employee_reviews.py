@@ -73,17 +73,17 @@ def _reviews_import_s3_put(*, local_path: str, batch_id: int, filename: str) -> 
     bucket = _reviews_import_s3_bucket()
     if not bucket:
         return None
-    key = f\"{_reviews_import_s3_prefix()}/batch_{batch_id}/{filename}\"
+    key = f"{_reviews_import_s3_prefix()}/batch_{batch_id}/{filename}"
     try:
         import boto3
     except Exception:
-        logger.warning(\"reviews.import.s3.boto3_missing\")
+        logger.warning("reviews.import.s3.boto3_missing")
         return None
     try:
         content_type, _ = mimetypes.guess_type(filename)
-        extra_args = {\"ContentType\": content_type} if content_type else None
+        extra_args = {"ContentType": content_type} if content_type else None
         client = boto3.client(
-            \"s3\",
+            "s3",
             region_name=_reviews_import_s3_region(),
             endpoint_url=_reviews_import_s3_endpoint_url(),
         )
@@ -91,9 +91,9 @@ def _reviews_import_s3_put(*, local_path: str, batch_id: int, filename: str) -> 
             client.upload_file(local_path, bucket, key, ExtraArgs=extra_args)
         else:
             client.upload_file(local_path, bucket, key)
-        return f\"s3://{bucket}/{key}\"
+        return f"s3://{bucket}/{key}"
     except Exception as exc:
-        logger.warning(\"reviews.import.s3.put_failed %s\", type(exc).__name__)
+        logger.warning("reviews.import.s3.put_failed %s", type(exc).__name__)
         return None
 
 
