@@ -50,8 +50,8 @@ def test_extract_from_html_collects_images_from_data_product_skus_value() -> Non
             "price_currency": "USD",
             "inventory_status": "in_stock",
             "images": [
-                "https://example.com/a.jpg",
-                "https://example.com/b.jpg",
+                {"src": "https://example.com/a.jpg"},
+                {"src": "https://example.com/b.jpg"},
             ],
         }
     ]

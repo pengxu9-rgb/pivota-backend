@@ -309,7 +309,7 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
             if isinstance(first_img, str):
                 image_url = first_img.strip() or None
             elif isinstance(first_img, dict):
-                raw_url = first_img.get("url") or first_img.get("image_url")
+                raw_url = first_img.get("url") or first_img.get("image_url") or first_img.get("src")
                 if isinstance(raw_url, str) and raw_url.strip():
                     image_url = raw_url.strip()
 
@@ -370,7 +370,7 @@ def _extract_image_urls_from_data_attrs(html: str, base_url: str) -> list[str]:
         if isinstance(url, str):
             s = url.strip()
         elif isinstance(url, dict):
-            raw = url.get("url") or url.get("image_url")
+            raw = url.get("url") or url.get("image_url") or url.get("src")
             s = str(raw).strip() if raw else ""
         else:
             return None
