@@ -57,4 +57,3 @@ CREATE INDEX IF NOT EXISTS idx_external_product_seeds_external_product_id
 CREATE UNIQUE INDEX IF NOT EXISTS idx_external_product_seeds_active_unique
   ON external_product_seeds(market, tool, external_product_id)
   WHERE status = 'active' AND external_product_id IS NOT NULL;
-

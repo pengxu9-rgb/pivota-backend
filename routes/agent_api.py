@@ -257,7 +257,7 @@ async def _build_external_seed_product(
 
         variants.append(
             {
-                "id": variant_id,
+                "id": f"{external_product_id}:{variant_id}",
                 "variant_id": variant_id,
                 "title": v.get("title") or v.get("name") or f"Variant {idx + 1}",
                 "price": variant_price,
@@ -401,6 +401,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
         msg = str(exc)
         if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
             return None
+        # Backward compat: some deployments may have seed_data as TEXT.
         if "->>" in msg and ("operator does not exist" in msg or "UndefinedFunction" in msg):
             try:
                 row = await database.fetch_one(
@@ -436,7 +437,6 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
         return await _build_external_seed_product(req=req, seed_row=dict(row))
     except Exception:
         return None
-
 
 def _normalize_buyer_ref(value: Optional[str]) -> Optional[str]:
     if value is None:

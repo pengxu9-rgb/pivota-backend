@@ -138,6 +138,148 @@ MAX_VARIANTS = int(os.getenv("EXTERNAL_OFFER_MAX_VARIANTS") or "50")
 MAX_IMAGES = int(os.getenv("EXTERNAL_OFFER_MAX_IMAGES") or "20")
 
 
+_SIZE_TITLE_KEY_CANDIDATES = (
+    "size",
+    "size_label",
+    "sizeLabel",
+    "size_name",
+    "sizeName",
+    "size_description",
+    "sizeDescription",
+    "volume",
+    "volume_label",
+    "volumeLabel",
+    "volume_name",
+    "volumeName",
+    "dimension",
+    "dimensions",
+    "capacity",
+)
+
+
+_SIZE_VALUE_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:ml|mL|l|L|oz|fl\s*oz|g|kg|lb|lbs|cm|mm|in|inch|inches)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_size_label(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if "http://" in t or "https://" in t:
+        return False
+    # common in beauty: "30 ml", "1.7 oz", etc.
+    if _SIZE_VALUE_RE.search(t):
+        return True
+    # allow bare numbers for sites that already imply units (rare)
+    if re.fullmatch(r"\d+(?:\.\d+)?", t):
+        return True
+    return False
+
+
+def _normalize_variant_title(title: Optional[str]) -> Optional[str]:
+    if title is None:
+        return None
+    t = str(title).strip()
+    if not t:
+        return None
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _extract_size_label_from_sku(sku: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(sku, dict):
+        return None
+
+    # 1) direct candidates
+    for key in _SIZE_TITLE_KEY_CANDIDATES:
+        val = sku.get(key)
+        if isinstance(val, str) and _looks_like_size_label(val):
+            return _normalize_variant_title(val)
+
+    # 2) nested attributes dicts
+    for container_key in ("attributes", "attributeValues", "attribute_values", "props", "properties"):
+        attrs = sku.get(container_key)
+        if isinstance(attrs, dict):
+            for key in _SIZE_TITLE_KEY_CANDIDATES:
+                val = attrs.get(key)
+                if isinstance(val, str) and _looks_like_size_label(val):
+                    return _normalize_variant_title(val)
+            # common: {"size": {"label":"30 ml"}}
+            for key in _SIZE_TITLE_KEY_CANDIDATES:
+                val = attrs.get(key)
+                if isinstance(val, dict):
+                    for subkey in ("label", "value", "name", "displayValue", "display_value"):
+                        subv = val.get(subkey)
+                        if isinstance(subv, str) and _looks_like_size_label(subv):
+                            return _normalize_variant_title(subv)
+
+    # 3) variationAttributes style
+    var_attrs = sku.get("variationAttributes") or sku.get("variation_attributes") or sku.get("variationAttrs")
+    if isinstance(var_attrs, list):
+        for it in var_attrs:
+            if not isinstance(it, dict):
+                continue
+            attr_id = str(it.get("attributeId") or it.get("id") or it.get("name") or "").strip().lower()
+            display = str(it.get("displayName") or it.get("label") or "").strip().lower()
+            if "size" not in attr_id and "size" not in display and "volume" not in attr_id and "volume" not in display:
+                continue
+            for key in ("value", "displayValue", "display_value", "selectedValue", "selected_value", "name", "label"):
+                val = it.get(key)
+                if isinstance(val, str) and _looks_like_size_label(val):
+                    return _normalize_variant_title(val)
+                if isinstance(val, dict):
+                    for subkey in ("value", "label", "name", "displayValue", "display_value"):
+                        subv = val.get(subkey)
+                        if isinstance(subv, str) and _looks_like_size_label(subv):
+                            return _normalize_variant_title(subv)
+
+    # 4) last resort: recursive scan for short size-like strings
+    def _scan(obj: Any) -> Optional[str]:
+        if isinstance(obj, str):
+            if len(obj) <= 30 and _looks_like_size_label(obj):
+                return _normalize_variant_title(obj)
+            return None
+        if isinstance(obj, dict):
+            for v in obj.values():
+                out = _scan(v)
+                if out:
+                    return out
+        if isinstance(obj, list):
+            for v in obj:
+                out = _scan(v)
+                if out:
+                    return out
+        return None
+
+    return _scan(sku)
+
+
+def _variant_title_score(*, title: Optional[str], product_name: Optional[str]) -> int:
+    t = _normalize_variant_title(title)
+    if not t:
+        return 0
+    if product_name and t.strip().lower() == str(product_name).strip().lower():
+        return 0
+    if _looks_like_size_label(t):
+        return 3
+    if len(t) <= 12:
+        return 2
+    if len(t) <= 32:
+        return 1
+    return 0
+
+
+def _best_variant_title_score(variants: list[Dict[str, Any]], product_name: Optional[str]) -> int:
+    best = 0
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        best = max(best, _variant_title_score(title=v.get("title"), product_name=product_name))
+    return best
+
+
 def _parse_jsonld_texts(json_texts: list[str]) -> list[Any]:
     parsed_objs: list[Any] = []
     for raw in json_texts:
@@ -226,6 +368,16 @@ def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[
                 title = " / ".join(attrs)
             elif product_name:
                 title = product_name
+        # Prefer size-like labels over generic product titles when possible.
+        if product_name and isinstance(title, str) and title.strip().lower() == str(product_name).strip().lower():
+            size_like = None
+            for candidate in ("size", "volume", "capacity"):
+                v = item.get(candidate) or offer.get(candidate)
+                if isinstance(v, str) and _looks_like_size_label(v):
+                    size_like = v
+                    break
+            if size_like:
+                title = size_like
 
         price_raw, currency = _offer_price_and_currency(offer)
         availability_raw = offer.get("availability") or item.get("availability")
@@ -287,7 +439,7 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
         if not variant_id or variant_id in seen:
             continue
 
-        title = sku.get("size") or sku.get("name") or sku.get("title")
+        title = _extract_size_label_from_sku(sku) or sku.get("size") or sku.get("name") or sku.get("title")
         price_amount = sku.get("price_with_discount") or sku.get("price")
         if price_amount is None:
             price_amount = sku.get("price_with_discount_with_currency_code") or sku.get("price_with_currency_code")
@@ -543,6 +695,7 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
                 continue
 
             name = node.get("name") if isinstance(node, dict) else None
+            description = node.get("description") if isinstance(node, dict) else None
             brand = None
             b = node.get("brand") if isinstance(node, dict) else None
             if isinstance(b, dict):
@@ -570,6 +723,8 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
                 score += 1
             if image_url:
                 score += 1
+            if description:
+                score += 1
             if price and currency:
                 score += 2
             if availability:
@@ -579,6 +734,7 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
                 best = {
                     "_score": score,
                     "title": str(name).strip() if name else None,
+                    "description": str(description).strip() if isinstance(description, str) else None,
                     "brand": str(brand).strip() if brand else None,
                     "image_url": str(image_url).strip() if image_url else None,
                     "price_raw": str(price).strip() if price is not None else None,
@@ -627,6 +783,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     canonical = p.links.get("canonical") or meta("property:og:url") or base_url
     title = meta("property:og:title", "name:twitter:title") or (p.title.strip() if p.title else None)
     image = meta("property:og:image", "property:og:image:secure_url", "name:twitter:image")
+    description = meta("property:og:description", "name:description", "name:twitter:description")
 
     price = meta("property:product:price:amount", "property:og:price:amount", "property:product:price") or None
     currency = meta("property:product:price:currency", "property:og:price:currency") or None
@@ -636,10 +793,43 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     jsonld_image_urls = _extract_jsonld_image_urls(parsed_jsonld, canonical)
     meta_image_urls = _extract_meta_image_urls(p, canonical)
     data_attr_image_urls = _extract_image_urls_from_data_attrs(html, canonical)
-    variants = _extract_jsonld_variants(parsed_jsonld)
-    if not variants:
-        fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
-        variants = _extract_variants_from_data_attrs(html, fallback_currency)
+    variants_jsonld = _extract_jsonld_variants(parsed_jsonld)
+    fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
+    variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency)
+
+    variants: list[Dict[str, Any]] = []
+    if variants_jsonld and variants_data_attr:
+        # Prefer JSON-LD prices/availability but use data-attr titles when they are better (e.g. size labels).
+        title_map: Dict[str, str] = {}
+        for v in variants_data_attr:
+            vid = str(v.get("variant_id") or "").strip()
+            t = _normalize_variant_title(v.get("title"))
+            if vid and t:
+                title_map[vid] = t
+        merged: list[Dict[str, Any]] = []
+        for v in variants_jsonld:
+            if not isinstance(v, dict):
+                continue
+            vid = str(v.get("variant_id") or "").strip()
+            incoming_title = title_map.get(vid)
+            if incoming_title and _variant_title_score(title=incoming_title, product_name=jsonld.get("title") or title) > _variant_title_score(
+                title=v.get("title"), product_name=jsonld.get("title") or title
+            ):
+                vv = dict(v)
+                vv["title"] = incoming_title
+                merged.append(vv)
+            else:
+                merged.append(v)
+        variants = merged
+        # If JSON-LD variant titles are weak and data-attr variants are strong, prefer the data-attr list.
+        if _best_variant_title_score(variants_jsonld, jsonld.get("title") or title) < _best_variant_title_score(
+            variants_data_attr, jsonld.get("title") or title
+        ):
+            variants = variants_data_attr
+    elif variants_jsonld:
+        variants = variants_jsonld
+    elif variants_data_attr:
+        variants = variants_data_attr
 
     image_urls: list[str] = []
     seen_images: set[str] = set()
@@ -659,6 +849,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     out = {
         "canonical_url": canonical,
         "title": jsonld.get("title") or title,
+        "description": jsonld.get("description") or description,
         "brand": jsonld.get("brand") or None,
         "image_url": jsonld.get("image_url") or (image_urls[0] if image_urls else None) or image,
         "image_urls": image_urls,
@@ -791,6 +982,9 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
             "fetchedAt": now.isoformat(),
             "snapshotId": (existing or {}).get("id") or rid,
         }
+        description = extracted.get("description")
+        if isinstance(description, str) and description.strip():
+            evidence["description"] = description.strip()
         variants = extracted.get("variants") or []
         if variants:
             evidence["variants"] = variants[:MAX_VARIANTS]

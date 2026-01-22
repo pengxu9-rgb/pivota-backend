@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import hashlib
+import re
 from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 
@@ -302,6 +303,84 @@ def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+_SIZE_LIKE_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:ml|mL|l|L|oz|fl\s*oz|g|kg|lb|lbs|cm|mm|in|inch|inches)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_variant_title(title: Any) -> str:
+    if title is None:
+        return ""
+    s = str(title).strip()
+    return re.sub(r"\s+", " ", s)
+
+
+def _variant_title_score(*, title: Any, product_title: Optional[str]) -> int:
+    t = _normalize_variant_title(title)
+    if not t:
+        return 0
+    if product_title and t.lower() == str(product_title).strip().lower():
+        return 0
+    if "http://" in t or "https://" in t:
+        return 0
+    if _SIZE_LIKE_RE.search(t):
+        return 3
+    if len(t) <= 12:
+        return 2
+    if len(t) <= 32:
+        return 1
+    return 0
+
+
+def _best_variant_title_score(variants: List[Dict[str, Any]], product_title: Optional[str]) -> int:
+    best = 0
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        best = max(best, _variant_title_score(title=v.get("title"), product_title=product_title))
+    return best
+
+
+def _distinct_variant_titles(variants: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        t = _normalize_variant_title(v.get("title"))
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def _should_overwrite_seed_variants(
+    *,
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+    product_title: Optional[str],
+) -> bool:
+    if not incoming:
+        return False
+    if not existing:
+        return True
+
+    existing_score = _best_variant_title_score(existing, product_title)
+    incoming_score = _best_variant_title_score(incoming, product_title)
+    if incoming_score <= existing_score:
+        return False
+
+    # Overwrite only when existing titles are weak or degenerate.
+    if existing_score <= 1 and incoming_score >= 2:
+        return True
+
+    existing_titles = _distinct_variant_titles(existing)
+    incoming_titles = _distinct_variant_titles(incoming)
+    if len(existing_titles) <= 1 and len(incoming_titles) > 1:
+        return True
+
+    return False
+
+
 def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> Dict[str, Any]:
     variants = _seed_variants(seed_data)
     for v in variants:
@@ -381,6 +460,7 @@ class CreateExternalSeedRequest(BaseModel):
     # Optional manual overrides / richer product seed fields (for employee curation).
     merchant_display_name: Optional[str] = None
     title: Optional[str] = None
+    description: Optional[str] = None
     image_url: Optional[str] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
@@ -398,6 +478,7 @@ class UpdateExternalSeedRequest(BaseModel):
     tool: Optional[str] = None
     merchant_display_name: Optional[str] = None
     title: Optional[str] = None
+    description: Optional[str] = None
     image_url: Optional[str] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
@@ -489,6 +570,7 @@ async def import_external_seeds_csv(
             row_tool = _normalize_tool(row.get("tool") or default_tool)
 
             title = str(row.get("title") or "").strip() or None
+            description = str(row.get("description") or row.get("product_details") or "").strip() or None
             image_url = str(row.get("image_url") or row.get("imageUrl") or "").strip() or None
             availability = str(row.get("availability") or "").strip() or None
             utm_template = str(row.get("utm_template") or row.get("utmTemplate") or "").strip() or None
@@ -558,6 +640,8 @@ async def import_external_seeds_csv(
 
                 if title is not None:
                     seed_data["title"] = title
+                if description is not None:
+                    seed_data["description"] = description
                 if image_url is not None:
                     seed_data["image_url"] = image_url
                 if availability is not None:
@@ -642,6 +726,7 @@ async def import_external_seeds_csv(
             seed_data: Dict[str, Any] = {
                 "external_product_id": external_product_id,
                 "title": title,
+                "description": description,
                 "image_url": image_url,
                 "availability": availability,
                 "utm_template": utm_template,
@@ -728,7 +813,9 @@ async def preview_external_seed(
                 "domain": domain,
                 "external_product_id": _stable_external_product_id(dest),
                 "title": guess_title,
+                "description": None,
                 "image_url": None,
+                "image_urls": [],
                 "price_amount": None,
                 "price_currency": None,
                 "availability": None,
@@ -749,6 +836,7 @@ async def preview_external_seed(
 
     variants = []
     image_urls: list[str] = []
+    description = None
     evidence = getattr(snapshot, "evidence", None)
     if isinstance(evidence, dict):
         raw_variants = evidence.get("variants")
@@ -757,6 +845,9 @@ async def preview_external_seed(
         raw_images = evidence.get("image_urls") or evidence.get("images")
         if isinstance(raw_images, list):
             image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+        raw_desc = evidence.get("description")
+        if isinstance(raw_desc, str) and raw_desc.strip():
+            description = raw_desc.strip()
 
     return {
         "status": "success",
@@ -766,6 +857,7 @@ async def preview_external_seed(
             "domain": domain,
             "external_product_id": _stable_external_product_id(canonical_url),
             "title": getattr(snapshot, "title", None),
+            "description": description,
             "image_url": getattr(snapshot, "image_url", None),
             "image_urls": image_urls,
             "price_amount": getattr(snapshot, "price_amount", None),
@@ -948,6 +1040,16 @@ async def create_external_seed(
     snap_price_amount = getattr(snapshot, "price_amount", None) if snapshot else None
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
+    snap_description: Optional[str] = None
+    snap_variants: Optional[List[Dict[str, Any]]] = None
+    evidence = getattr(snapshot, "evidence", None) if snapshot else None
+    if isinstance(evidence, dict):
+        raw_desc = evidence.get("description")
+        if isinstance(raw_desc, str) and raw_desc.strip():
+            snap_description = raw_desc.strip()
+        raw_variants = evidence.get("variants")
+        if isinstance(raw_variants, list) and raw_variants:
+            snap_variants = [v for v in raw_variants if isinstance(v, dict)]
 
     match_url = canonical_url or dest
     existing_row = await database.fetch_one(
@@ -966,6 +1068,7 @@ async def create_external_seed(
 
     # Merge: employee-provided fields override snapshot-derived values.
     title = (body.title or "").strip() or snap_title
+    description = (body.description or "").strip() or snap_description
     image_url = (body.image_url or "").strip() or snap_image_url
     price_amount = body.price_amount if body.price_amount is not None else snap_price_amount
     price_currency = (body.price_currency or "").strip() or snap_price_currency
@@ -982,6 +1085,7 @@ async def create_external_seed(
         domain = domain or row.get("domain")
 
         title = title or existing_seed_data.get("title") or row.get("title")
+        description = description or existing_seed_data.get("description")
         image_url = image_url or existing_seed_data.get("image_url") or row.get("image_url")
         if price_amount is None:
             price_amount = row.get("price_amount")
@@ -1004,7 +1108,12 @@ async def create_external_seed(
         tool = tool or row.get("tool")
 
         seed_data = dict(existing_seed_data)
-        seed_data["external_product_id"] = _stable_external_product_id(canonical_url or dest)
+        external_product_id = (
+            row.get("external_product_id")
+            or seed_data.get("external_product_id")
+            or _stable_external_product_id(canonical_url or dest)
+        )
+        seed_data["external_product_id"] = external_product_id
         if body.merchant_display_name is not None:
             seed_data["merchant_display_name"] = (body.merchant_display_name or "").strip() or None
         if body.product_id is not None:
@@ -1014,6 +1123,7 @@ async def create_external_seed(
         if body.category is not None:
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
+        seed_data["description"] = description
         seed_data["image_url"] = image_url
         seed_data["availability"] = availability
         seed_data["utm_template"] = utm_template
@@ -1032,14 +1142,16 @@ async def create_external_seed(
                 "availability": snap_availability,
             }
         )
+        if snap_description:
+            seed_data["snapshot"]["description"] = snap_description
         if body.variants is not None and body.variants:
             seed_data["variants"] = body.variants
-        elif not seed_data.get("variants"):
-            evidence = getattr(snapshot, "evidence", None)
-            if isinstance(evidence, dict):
-                snap_variants = evidence.get("variants")
-                if isinstance(snap_variants, list) and snap_variants:
-                    seed_data["variants"] = snap_variants
+        elif snap_variants:
+            existing_variants = _seed_variants(seed_data)
+            if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
+                seed_data["variants"] = snap_variants
+            elif not existing_variants:
+                seed_data["variants"] = snap_variants
 
         match_url = canonical_url or dest
 
@@ -1070,7 +1182,7 @@ async def create_external_seed(
             """,
             {
                 "id": seed_id,
-                "external_product_id": seed_data.get("external_product_id") or _stable_external_product_id(match_url),
+                "external_product_id": external_product_id,
                 "market": market,
                 "tool": tool,
                 "utm_template": utm_template,
@@ -1113,16 +1225,18 @@ async def create_external_seed(
         )
     else:
         seed_id = _seed_id()
+        external_product_id = _stable_external_product_id(match_url)
         seed_data: Dict[str, Any] = {
-            "external_product_id": _stable_external_product_id(match_url),
+            "external_product_id": external_product_id,
             "merchant_display_name": (body.merchant_display_name or "").strip() or None,
             "product_id": (body.product_id or "").strip() or None,
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
             "title": title,
+            "description": description,
             "image_url": image_url,
             "availability": availability,
-            "variants": body.variants or [],
+            "variants": body.variants or (snap_variants or []),
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
@@ -1131,6 +1245,7 @@ async def create_external_seed(
                 "canonical_url": canonical_url,
                 "domain": domain,
                 "title": snap_title,
+                "description": snap_description,
                 "image_url": snap_image_url,
                 "price_amount": snap_price_amount,
                 "price_currency": snap_price_currency,
@@ -1156,7 +1271,7 @@ async def create_external_seed(
             """,
             {
                 "id": seed_id,
-                "external_product_id": seed_data.get("external_product_id") or _stable_external_product_id(match_url),
+                "external_product_id": external_product_id,
                 "market": market,
                 "tool": tool,
                 "utm_template": utm_template,
@@ -1316,6 +1431,8 @@ async def update_external_seed(
 
     if body.title is not None:
         seed_data["title"] = body.title
+    if body.description is not None:
+        seed_data["description"] = body.description
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
     if body.availability is not None:
