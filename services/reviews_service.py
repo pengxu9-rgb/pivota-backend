@@ -90,6 +90,61 @@ def _is_unique_violation(exc: Exception) -> bool:
     return "duplicate key value violates unique constraint" in msg or "unique constraint" in msg
 
 
+async def _resolve_products_cache_triplet_by_variant_id(*, variant_id: str) -> Optional[Dict[str, str]]:
+    """
+    Best-effort mapper for merchantless (GLOBAL) imports.
+
+    Given a `variant_id`, try to find a `products_cache` row whose `product_data` contains that variant,
+    then return `{merchant_id, platform, platform_product_id}` for attachment.
+
+    Notes:
+    - Implemented using Postgres JSONB functions. If the underlying DB doesn't support them, this
+      returns `None` (no hard failure).
+    - Intentionally "best-effort": this should never 500 import flows.
+    """
+    vid = _as_text(variant_id)
+    if not vid:
+        return None
+
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT merchant_id, platform, platform_product_id
+            FROM products_cache
+            WHERE EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(
+                CASE
+                  WHEN jsonb_typeof(products_cache.product_data::jsonb->'variants') = 'array'
+                    THEN products_cache.product_data::jsonb->'variants'
+                  WHEN jsonb_typeof(products_cache.product_data::jsonb->'raw'->'variants') = 'array'
+                    THEN products_cache.product_data::jsonb->'raw'->'variants'
+                  ELSE '[]'::jsonb
+                END
+              ) AS v
+              WHERE v->>'variant_id' = :vid OR v->>'id' = :vid OR v->>'sku' = :vid
+            )
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            {"vid": vid},
+        )
+    except Exception:
+        return None
+
+    if not row:
+        return None
+
+    try:
+        return {
+            "merchant_id": str(row["merchant_id"]),
+            "platform": str(row["platform"]),
+            "platform_product_id": str(row["platform_product_id"]),
+        }
+    except Exception:
+        return None
+
+
 def _as_datetime(value: Any) -> Optional[datetime]:
     """
     Coerce DB-returned timestamps to `datetime`.
@@ -1859,16 +1914,40 @@ async def validate_import_batch(
 
     report = ImportReport(errors=[])
     seen_external: set[str] = set()
+    variant_resolution_cache: Dict[str, Optional[Dict[str, str]]] = {}
 
     # Clear existing items for re-validate (safe; batch-local).
     await database.execute("DELETE FROM import_items WHERE batch_id = :bid", {"bid": bid})
 
     for idx, row in enumerate(rows):
         report.total += 1
-        ext_review_id = _as_text(row.get("external_review_id") or row.get("review_id") or row.get("id"))
-        platform = _as_text(row.get("platform")).strip().lower() or None
-        platform_product_id = _as_text(row.get("platform_product_id") or row.get("product_id")).strip() or None
-        variant_id = _as_text(row.get("variant_id")).strip() or None
+        payload: Dict[str, Any] = dict(row) if isinstance(row, dict) else {"raw": row}
+        ext_review_id = _as_text(payload.get("external_review_id") or payload.get("review_id") or payload.get("id"))
+        platform = _as_text(payload.get("platform")).strip().lower() or None
+        platform_product_id = _as_text(payload.get("platform_product_id") or payload.get("product_id")).strip() or None
+        variant_id = _as_text(payload.get("variant_id")).strip() or None
+
+        # Merchantless imports can auto-resolve the attachment target from an internal variant_id.
+        # This allows uploads from external sources (e.g. Amazon) to show up on our internal product pages.
+        if merchant_id == GLOBAL_IMPORT_MERCHANT_ID and variant_id:
+            if variant_id in variant_resolution_cache:
+                resolved = variant_resolution_cache[variant_id]
+            else:
+                resolved = await _resolve_products_cache_triplet_by_variant_id(variant_id=variant_id)
+                variant_resolution_cache[variant_id] = resolved
+
+            if resolved:
+                resolved_platform = _as_text(resolved.get("platform")).strip().lower() or None
+                resolved_platform_product_id = _as_text(resolved.get("platform_product_id")).strip() or None
+                if resolved_platform and resolved_platform_product_id:
+                    if platform and platform != resolved_platform:
+                        payload.setdefault("source_platform", platform)
+                    if platform_product_id and platform_product_id != resolved_platform_product_id:
+                        payload.setdefault("source_platform_product_id", platform_product_id)
+                    payload["platform"] = resolved_platform
+                    payload["platform_product_id"] = resolved_platform_product_id
+                    platform = resolved_platform
+                    platform_product_id = resolved_platform_product_id
         id_err = validate_imported_identifiers(source_system=source_system, external_review_id=ext_review_id)
         if id_err:
             report.rejected += 1
@@ -1880,8 +1959,8 @@ async def validate_import_batch(
                         merchant_id=merchant_id,
                         source_system=source_system,
                         external_review_id=ext_review_id or None,
-                        external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
-                        payload_json=row,
+                        external_user_id=_as_text(payload.get("external_user_id") or payload.get("user_id")) or None,
+                        payload_json=payload,
                         match_product_key=None,
                         match_sku_key=None,
                         match_confidence=0.0,
@@ -1894,7 +1973,7 @@ async def validate_import_batch(
                             platform=platform,
                             platform_product_id=platform_product_id,
                             variant_id=variant_id,
-                            created_at=row.get("created_at"),
+                            created_at=payload.get("created_at"),
                         ),
                         status="rejected",
                         error_reason=id_err,
@@ -1950,7 +2029,7 @@ async def validate_import_batch(
                 platform_product_id=platform_product_id,
                 variant_id=variant_id,
                 product=None,
-                payload=row,
+                payload=payload,
             )
             if group_hint:
                 resolved_group_conf = float(group_hint.get("confidence") or 0.0)
@@ -1972,7 +2051,7 @@ async def validate_import_batch(
             platform=platform,
             platform_product_id=platform_product_id,
             variant_id=variant_id,
-            created_at=row.get("created_at"),
+            created_at=payload.get("created_at"),
         )
 
         try:
@@ -1982,8 +2061,8 @@ async def validate_import_batch(
                     merchant_id=merchant_id,
                     source_system=source_system,
                     external_review_id=ext_review_id or None,
-                    external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
-                    payload_json=row,
+                    external_user_id=_as_text(payload.get("external_user_id") or payload.get("user_id")) or None,
+                    payload_json=payload,
                     match_product_key=match_product_key,
                     match_sku_key=match_sku_key,
                     match_confidence=match_confidence,
@@ -2011,8 +2090,8 @@ async def validate_import_batch(
                     merchant_id=merchant_id,
                     source_system=source_system,
                     external_review_id=None,
-                    external_user_id=_as_text(row.get("external_user_id") or row.get("user_id")) or None,
-                    payload_json=row,
+                    external_user_id=_as_text(payload.get("external_user_id") or payload.get("user_id")) or None,
+                    payload_json=payload,
                     match_product_key=None,
                     match_sku_key=None,
                     match_confidence=0.0,
@@ -2241,6 +2320,17 @@ async def commit_import_batch(
         platform = _as_text(payload.get("platform")).strip().lower() or None
         platform_product_id = _as_text(payload.get("platform_product_id") or payload.get("product_id")).strip() or None
         variant_id = _as_text(payload.get("variant_id")).strip() or None
+
+        # Merchantless imports: attach to our internal product pages by resolving from variant_id.
+        # This overrides source-provided platform/product ids (e.g. Amazon ASIN) when we can find a match.
+        if merchant_id == GLOBAL_IMPORT_MERCHANT_ID and variant_id:
+            resolved = await _resolve_products_cache_triplet_by_variant_id(variant_id=variant_id)
+            if resolved:
+                resolved_platform = _as_text(resolved.get("platform")).strip().lower() or None
+                resolved_platform_product_id = _as_text(resolved.get("platform_product_id")).strip() or None
+                if resolved_platform and resolved_platform_product_id:
+                    platform = resolved_platform
+                    platform_product_id = resolved_platform_product_id
         if not platform or not platform_product_id:
             rejected += 1
             await database.execute(
@@ -2465,12 +2555,120 @@ async def reprocess_import_batch(
 
     Supported:
     - variant_match: re-run validate_import_batch (rebuild import_items)
+    - relink_committed: for already-committed batches, re-attach imported reviews to internal products
+      by resolving `variant_id` against `products_cache` and updating `product_reviews` rows.
     - group_resolve: re-run group resolving for current import_items
     """
     bid = int(batch_id)
     mode_norm = _as_text(mode).lower()
     if mode_norm == "variant_match":
         return await validate_import_batch(actor=actor, batch_id=bid)
+
+    if mode_norm == "relink_committed":
+        batch = await database.fetch_one(import_batches.select().where(import_batches.c.id == bid))
+        if not batch:
+            raise HTTPException(status_code=404, detail="BATCH_NOT_FOUND")
+
+        merchant_id = _as_text(batch["merchant_id"])
+        source_system = _as_text(batch["source_system"])
+        if merchant_id != GLOBAL_IMPORT_MERCHANT_ID:
+            raise HTTPException(status_code=400, detail="RELINK_ONLY_SUPPORTED_FOR_GLOBAL_IMPORT")
+
+        items = await database.fetch_all(
+            import_items.select().where(import_items.c.batch_id == bid).order_by(import_items.c.id.asc())
+        )
+
+        updated = 0
+        skipped = 0
+        not_found_in_cache = 0
+        missing_review_row = 0
+        for it in items:
+            if str(_row_get(it, "status")) != "imported":
+                continue
+
+            payload_raw = _row_get(it, "payload_json")
+            payload: Dict[str, Any] = {}
+            if isinstance(payload_raw, dict):
+                payload = payload_raw
+            elif isinstance(payload_raw, str):
+                try:
+                    parsed = json.loads(payload_raw)
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except Exception:
+                    payload = {}
+
+            variant_id = _as_text(payload.get("variant_id")).strip() or None
+            if not variant_id:
+                skipped += 1
+                continue
+
+            ext_review_id = _as_text(
+                payload.get("external_review_id")
+                or payload.get("review_id")
+                or payload.get("id")
+                or _row_get(it, "external_review_id")
+            ) or None
+            if not ext_review_id:
+                skipped += 1
+                continue
+
+            resolved = await _resolve_products_cache_triplet_by_variant_id(variant_id=variant_id)
+            if not resolved:
+                not_found_in_cache += 1
+                continue
+
+            resolved_platform = _as_text(resolved.get("platform")).strip().lower() or None
+            resolved_platform_product_id = _as_text(resolved.get("platform_product_id")).strip() or None
+            if not resolved_platform or not resolved_platform_product_id:
+                not_found_in_cache += 1
+                continue
+
+            pk = build_product_key(
+                merchant_id=merchant_id,
+                platform=resolved_platform,
+                platform_product_id=resolved_platform_product_id,
+            )
+            sk = build_sku_key(
+                merchant_id=merchant_id,
+                platform=resolved_platform,
+                platform_product_id=resolved_platform_product_id,
+                variant_id=variant_id,
+            )
+
+            review_row = await database.fetch_one(
+                product_reviews.select().where(
+                    (product_reviews.c.merchant_id == merchant_id)
+                    & (product_reviews.c.source_system == source_system)
+                    & (product_reviews.c.external_review_id == ext_review_id)
+                )
+            )
+            if not review_row:
+                missing_review_row += 1
+                continue
+
+            await database.execute(
+                product_reviews.update()
+                .where(product_reviews.c.id == int(review_row["id"]))
+                .values(
+                    platform=resolved_platform,
+                    platform_product_id=resolved_platform_product_id,
+                    product_key=pk,
+                    sku_key=sk,
+                    updated_at=_now(),
+                )
+            )
+            updated += 1
+
+        return {
+            "status": "success",
+            "batch_id": bid,
+            "mode": mode_norm,
+            "updated": updated,
+            "skipped": skipped,
+            "not_found_in_products_cache": not_found_in_cache,
+            "missing_product_reviews_row": missing_review_row,
+        }
 
     if mode_norm != "group_resolve":
         raise HTTPException(status_code=400, detail="INVALID_REPROCESS_MODE")

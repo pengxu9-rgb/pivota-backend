@@ -280,7 +280,7 @@ async def employee_commit_import_batch(
 
 
 class ReprocessImportBatchRequest(BaseModel):
-    mode: str = Field(..., min_length=1)  # variant_match | group_resolve
+    mode: str = Field(..., min_length=1)  # variant_match | relink_committed | group_resolve
 
 
 @router.post("/import/batches/{batch_id}/reprocess")
