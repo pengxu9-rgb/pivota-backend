@@ -4,12 +4,12 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from db.database import database
-from db.reviews_center import media_assets, review_featured, review_group, review_group_membership
+from db.reviews_center import import_batches, import_items, media_assets, review_featured, review_group, review_group_membership
 from observability.reviews_metrics import (
     record_employee_action,
     record_import_commit,
@@ -86,6 +86,97 @@ async def employee_create_import_batch(
     except Exception:
         record_employee_action(action="reviews.import.create", result="fail")
         raise
+
+
+@router.get("/import/batches")
+async def employee_list_import_batches(
+    merchant_id: Optional[str] = None,
+    source_system: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(default=25, ge=1, le=200),
+    before_id: Optional[int] = Query(default=None, ge=1),
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.import.read"])),
+) -> Dict[str, Any]:
+    where: List[str] = []
+    values: Dict[str, Any] = {"limit": int(limit)}
+
+    merchant_id_norm = (merchant_id or "").strip()
+    source_system_norm = (source_system or "").strip()
+    status_norm = (status or "").strip().lower()
+
+    if merchant_id_norm:
+        where.append("merchant_id = :merchant_id")
+        values["merchant_id"] = merchant_id_norm
+    if source_system_norm:
+        where.append("source_system = :source_system")
+        values["source_system"] = source_system_norm
+    if status_norm:
+        where.append("status = :status")
+        values["status"] = status_norm
+    if before_id:
+        where.append("id < :before_id")
+        values["before_id"] = int(before_id)
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT
+          id,
+          merchant_id,
+          source_system,
+          status,
+          created_by_employee_id,
+          (reviews_file_path IS NOT NULL AND reviews_file_path <> '') AS has_reviews_file,
+          (media_zip_path IS NOT NULL AND media_zip_path <> '') AS has_media_zip,
+          report_json,
+          created_at,
+          updated_at
+        FROM import_batches
+        {("WHERE " + " AND ".join(where)) if where else ""}
+        ORDER BY id DESC
+        LIMIT :limit
+        """,
+        values,
+    )
+
+    batch_ids = [int(r["id"]) for r in rows] if rows else []
+    counts_by_batch: Dict[int, Dict[str, int]] = {}
+    if batch_ids:
+        count_rows = await database.fetch_all(
+            """
+            SELECT batch_id, status, COUNT(*)::int AS c
+            FROM import_items
+            WHERE batch_id = ANY(:batch_ids)
+            GROUP BY batch_id, status
+            """,
+            {"batch_ids": batch_ids},
+        )
+        for cr in count_rows:
+            bid = int(cr["batch_id"])
+            st = str(cr["status"] or "unknown")
+            counts_by_batch.setdefault(bid, {})[st] = int(cr["c"] or 0)
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        bid = int(r["id"])
+        by_status = counts_by_batch.get(bid, {})
+        items.append(
+            {
+                "id": bid,
+                "merchant_id": r.get("merchant_id"),
+                "source_system": r.get("source_system"),
+                "status": r.get("status"),
+                "created_by_employee_id": r.get("created_by_employee_id"),
+                "has_reviews_file": bool(r.get("has_reviews_file")),
+                "has_media_zip": bool(r.get("has_media_zip")),
+                "report": r.get("report_json") if isinstance(r.get("report_json"), dict) else None,
+                "counts": {"total": sum(by_status.values()), "by_status": by_status},
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None,
+            }
+        )
+
+    next_before_id = batch_ids[-1] if (len(batch_ids) == int(limit) and batch_ids) else None
+    return {"status": "success", "items": items, "next": {"before_id": next_before_id}}
 
 
 @router.post(
@@ -266,12 +357,13 @@ async def employee_download_import_report_csv(
     writer.writeheader()
     for r in rows:
         payload = r.get("payload_json") if isinstance(r.get("payload_json"), dict) else {}
+        ext_id = r.get("external_review_id") or payload.get("external_review_id") or payload.get("review_id") or payload.get("id")
         writer.writerow(
             {
                 "id": int(r["id"]),
                 "merchant_id": r.get("merchant_id"),
                 "source_system": r.get("source_system"),
-                "external_review_id": r.get("external_review_id"),
+                "external_review_id": ext_id,
                 "status": r.get("status"),
                 "error_reason": r.get("error_reason"),
                 "platform": payload.get("platform"),
