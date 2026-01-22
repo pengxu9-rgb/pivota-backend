@@ -165,3 +165,60 @@ def test_agent_products_search_cross_merchant_injects_external_seeds_by_domain(
     payload = res.json()
     products = payload.get("products") or []
     assert any(p.get("merchant_id") == "external_seed" for p in products)
+
+
+def test_agent_products_search_external_seed_compacts_spaced_query(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            if not values or values.get("q_compact_like") != "%tomford%":
+                return []
+            return [
+                {
+                    "id": "eps_test_tomford",
+                    "external_product_id": "ext_test_tomford",
+                    "market": "US",
+                    "tool": "*",
+                    "utm_template": None,
+                    "partner_type": None,
+                    "disclosure_text": None,
+                    "destination_url": "https://www.tomfordbeauty.com/product/figue-erotique-eau-de-parfum",
+                    "canonical_url": None,
+                    "domain": "tomfordbeauty.com",
+                    "title": "Figue Érotique Eau de Parfum",
+                    "image_url": None,
+                    "price_amount": 255,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "seed_data": {},
+                    "status": "active",
+                    "notes": None,
+                    "created_by_employee_id": None,
+                    "attached_product_key": None,
+                    "attached_variant_id": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            ]
+        return []
+
+    async def fake_fetch_one(query: str, values=None):
+        if "COUNT" in str(query):
+            return {"total": 0}
+        return None
+
+    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_sdk_fixed_module, "_is_domain_allowed", AsyncMock(return_value=True))
+
+    res = client.get(
+        "/agent/v1/products/search?query=tom%20ford&limit=20&offset=0&in_stock_only=false",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    products = payload.get("products") or []
+    assert any(p.get("merchant_id") == "external_seed" for p in products)

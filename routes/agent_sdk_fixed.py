@@ -208,9 +208,16 @@ async def _load_external_seed_products_for_search(
     }
     if q:
         values["q_like"] = f"%{q}%"
-        where.append(
+        clauses = [
             "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
-        )
+        ]
+        q_compact = "".join(q.split())
+        if q_compact and q_compact != q:
+            values["q_compact_like"] = f"%{q_compact}%"
+            clauses.append(
+                "(destination_url ILIKE :q_compact_like OR canonical_url ILIKE :q_compact_like OR domain ILIKE :q_compact_like OR title ILIKE :q_compact_like)"
+            )
+        where.append("(" + " OR ".join(clauses) + ")")
 
     rows = []
     try:
