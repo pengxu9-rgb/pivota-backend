@@ -523,6 +523,47 @@ def build_in_params(prefix: str, values: List[str]) -> (str, Dict[str, Any]):
         params[key] = v
     return ", ".join(placeholders), params
 
+
+def _context_can_access_merchant(context: Any, merchant_id: str) -> bool:
+    """
+    Defensive merchant-access check for AgentContext.
+
+    In production we observed rare cases where an instance attribute shadows the
+    `can_access_merchant` method (becoming None), causing `TypeError: 'NoneType' object is not callable`.
+    This helper preserves the intended semantics while failing closed when the
+    context shape is unexpected.
+    """
+    mid = str(merchant_id or "").strip()
+    if not mid:
+        return False
+
+    # Prefer instance method when present/callable.
+    fn = getattr(context, "can_access_merchant", None)
+    if callable(fn):
+        try:
+            return bool(fn(mid))
+        except Exception:
+            return False
+
+    # If an instance attribute shadowed the method, fall back to the class method.
+    cls_fn = getattr(type(context), "can_access_merchant", None)
+    if callable(cls_fn):
+        try:
+            return bool(cls_fn(context, mid))
+        except Exception:
+            return False
+
+    # Final fallback: use allowed_merchants if available.
+    if not hasattr(context, "allowed_merchants"):
+        return False
+    allowed = getattr(context, "allowed_merchants", None)
+    if allowed is None:
+        return True
+    try:
+        return mid in allowed
+    except Exception:
+        return False
+
 async def verify_merchant_active(merchant_id: str) -> Dict[str, Any]:
     """Verify merchant exists and is not deleted"""
     merchant = await get_merchant_onboarding(merchant_id)
@@ -1486,7 +1527,7 @@ async def agent_resolve_product_group(
 
     This powers the gateway's "one product + many seller offers" flow.
     """
-    if not context.can_access_merchant(merchant_id):
+    if not _context_can_access_merchant(context, merchant_id):
         raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
     normalized_platform = str(platform or "").strip().lower() or None
@@ -1536,7 +1577,7 @@ async def agent_resolve_product_group(
         members = []
         for r in member_rows or []:
             mid = str(r.get("merchant_id") or "").strip()
-            if not mid or not context.can_access_merchant(mid):
+            if not mid or not _context_can_access_merchant(context, mid):
                 continue
             members.append(
                 {
@@ -1549,6 +1590,95 @@ async def agent_resolve_product_group(
             )
 
         return {"status": "success", "product_group_id": product_group_id, "members": members}
+    except Exception as e:
+        message = str(e)
+        if "product_group_members" in message and ("does not exist" in message or "relation" in message):
+            return {
+                "status": "success",
+                "product_group_id": None,
+                "members": [],
+                "warning": "product_group_members table not found (migration not applied)",
+            }
+        raise
+
+
+@router.get("/product-groups/resolve-by-product-id")
+async def agent_resolve_product_group_by_product_id(
+    product_id: str = Query(..., description="Any member product_id (platform_product_id)"),
+    platform: Optional[str] = Query(None, description="Optional platform filter (shopify/wix/...)"),
+    limit: int = Query(default=50, le=200),
+    context: AgentContext = Depends(get_agent_context),
+) -> Dict[str, Any]:
+    """
+    Resolve a product group when the caller only has a product_id (platform_product_id).
+
+    This enables PDP links without a merchant_id by mapping product_id -> product_group_id
+    via product_group_members, then returning the group members.
+    """
+    normalized_platform = str(platform or "").strip().lower() or None
+    normalized_product_id = str(product_id or "").strip()
+    if not normalized_product_id:
+        raise HTTPException(status_code=400, detail="product_id is required")
+
+    try:
+        where_platform = "AND platform = :platform" if normalized_platform else ""
+        rows = await database.fetch_all(
+            f"""
+            SELECT product_group_id, merchant_id
+            FROM product_group_members
+            WHERE platform_product_id = :platform_product_id
+              {where_platform}
+            ORDER BY is_primary DESC, merchant_id ASC
+            LIMIT :limit
+            """,
+            {"platform_product_id": normalized_product_id, "platform": normalized_platform, "limit": limit},
+        )
+
+        resolved_group_id: Optional[str] = None
+        for r in rows or []:
+            gid = str(r.get("product_group_id") or "").strip()
+            mid = str(r.get("merchant_id") or "").strip()
+            if not gid or not mid:
+                continue
+            if _context_can_access_merchant(context, mid):
+                resolved_group_id = gid
+                break
+
+        if not resolved_group_id:
+            return {"status": "success", "product_group_id": None, "members": []}
+
+        member_rows = await database.fetch_all(
+            """
+            SELECT pgm.merchant_id,
+                   mo.business_name AS merchant_name,
+                   pgm.platform,
+                   pgm.platform_product_id AS product_id,
+                   pgm.is_primary
+            FROM product_group_members pgm
+            LEFT JOIN merchant_onboarding mo ON mo.merchant_id = pgm.merchant_id
+            WHERE pgm.product_group_id = :product_group_id
+            ORDER BY pgm.is_primary DESC, pgm.merchant_id ASC
+            LIMIT :limit
+            """,
+            {"product_group_id": resolved_group_id, "limit": limit},
+        )
+
+        members = []
+        for r in member_rows or []:
+            mid = str(r.get("merchant_id") or "").strip()
+            if not mid or not _context_can_access_merchant(context, mid):
+                continue
+            members.append(
+                {
+                    "merchant_id": mid,
+                    "merchant_name": r.get("merchant_name"),
+                    "product_id": str(r.get("product_id") or "").strip(),
+                    "platform": str(r.get("platform") or "").strip().lower() or None,
+                    "is_primary": bool(r.get("is_primary") or False),
+                }
+            )
+
+        return {"status": "success", "product_group_id": resolved_group_id, "members": members}
     except Exception as e:
         message = str(e)
         if "product_group_members" in message and ("does not exist" in message or "relation" in message):
@@ -1594,7 +1724,7 @@ async def agent_get_product_group(
         members = []
         for r in member_rows or []:
             mid = str(r.get("merchant_id") or "").strip()
-            if not mid or not context.can_access_merchant(mid):
+            if not mid or not _context_can_access_merchant(context, mid):
                 continue
             members.append(
                 {
