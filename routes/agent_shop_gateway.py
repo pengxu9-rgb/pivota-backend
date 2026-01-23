@@ -676,6 +676,16 @@ def _external_seed_display_name(row: Dict[str, Any], seed_data: Dict[str, Any]) 
     return _format_domain_display_name(str(domain))
 
 
+def _strip_accents(text: str) -> str:
+    if not text:
+        return ""
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(c)
+    )
+
+
 def _normalize_offer_title(text: str) -> str:
     if not text:
         return ""
@@ -1979,17 +1989,76 @@ async def _handle_find_products_multi(
 
     external_seed_wrappers: list[dict[str, Any]] = []
     try:
+        external_seed_stopwords = {
+            "a",
+            "an",
+            "and",
+            "buy",
+            "cart",
+            "checkout",
+            "find",
+            "for",
+            "item",
+            "items",
+            "me",
+            "of",
+            "or",
+            "please",
+            "product",
+            "products",
+            "recommend",
+            "recommendation",
+            "show",
+            "the",
+            "to",
+        }
+
+        def _external_seed_query_terms(raw_query: str) -> List[str]:
+            q_norm = str(raw_query or "").strip().lower()
+            if not q_norm:
+                return []
+            terms = re.findall(r"[a-z0-9]+", q_norm)
+            if not terms:
+                terms = [t for t in q_norm.split() if t]
+
+            filtered_terms: List[str] = []
+            for term in terms:
+                if term in external_seed_stopwords:
+                    continue
+                if len(term) <= 1:
+                    continue
+                if term not in filtered_terms:
+                    filtered_terms.append(term)
+                if len(filtered_terms) >= 8:
+                    break
+            return filtered_terms or terms[:4]
+
+        seed_query_terms = _external_seed_query_terms(q_ascii or q_lower)
+        seed_query_compacts = [
+            re.sub(r"[^a-z0-9]+", "", t.lower()) for t in seed_query_terms if t
+        ]
+        seed_query_compacts = [t for t in seed_query_compacts if t]
+
         seed_limit = min(max(limit * max(page, 1) * 2, 30), 200)
         seed_params: Dict[str, Any] = {"limit": seed_limit}
         seed_where = "status = 'active'"
         if q_lower:
-            seed_where += (
-                " AND (LOWER(COALESCE(title,'')) LIKE :like"
-                " OR LOWER(COALESCE(domain,'')) LIKE :like"
-                " OR LOWER(COALESCE(canonical_url,'')) LIKE :like"
-                " OR LOWER(COALESCE(destination_url,'')) LIKE :like)"
-            )
-            seed_params["like"] = f"%{q_lower}%"
+            terms = seed_query_terms or [q_lower]
+            where_clauses: List[str] = []
+            for idx, term in enumerate(terms[:8]):
+                key = f"like_{idx}"
+                seed_params[key] = f"%{term.lower()}%"
+                where_clauses.append(
+                    "("
+                    "LOWER(COALESCE(title,'')) LIKE :" + key
+                    + " OR LOWER(COALESCE(domain,'')) LIKE :" + key
+                    + " OR LOWER(COALESCE(canonical_url,'')) LIKE :" + key
+                    + " OR LOWER(COALESCE(destination_url,'')) LIKE :" + key
+                    + " OR LOWER(CAST(seed_data AS TEXT)) LIKE :" + key
+                    + ")"
+                )
+            if where_clauses:
+                seed_where += " AND (" + " OR ".join(where_clauses) + ")"
 
         seed_rows = await database.fetch_all(
             f"""
@@ -2017,16 +2086,21 @@ async def _handle_find_products_multi(
 
             title = row_dict.get("title") or seed_data.get("title") or ""
             domain = row_dict.get("domain") or seed_data.get("domain") or ""
-            blob = " ".join([title, domain, canonical_url or "", dest]).lower().strip()
+            brand = seed_data.get("brand") or seed_data.get("merchant_display_name") or ""
+            blob = " ".join([title, str(brand or ""), domain, canonical_url or "", dest]).lower().strip()
             blob_ascii = _strip_accents(blob)
             blob_compact = re.sub(r"[^a-z0-9]+", "", blob_ascii)
 
             if q_lower:
                 if q_lower in blob:
                     score = 0.85
+                elif seed_query_terms and any(t in blob for t in seed_query_terms):
+                    score = 0.75
                 elif q_compact and q_compact in blob_compact:
                     score = 0.7
-                elif _fuzzy_token_match(q_tokens, _tokenize(blob_ascii), max_dist=1):
+                elif seed_query_compacts and any(t in blob_compact for t in seed_query_compacts):
+                    score = 0.65
+                elif _fuzzy_token_match(seed_query_terms or q_tokens, _tokenize(blob_ascii), max_dist=1):
                     score = 0.6
                 else:
                     continue

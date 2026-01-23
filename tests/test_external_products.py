@@ -112,6 +112,92 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
     assert "/r?token=" in external.get("external_redirect_url")
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_matches_external_seeds_with_stopwords(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_row = {
+        "id": "eps_test_1",
+        "external_product_id": "ext_test_1",
+        "market": "US",
+        "tool": "*",
+        "utm_template": None,
+        "partner_type": None,
+        "disclosure_text": None,
+        "destination_url": "https://fentybeauty.com/products/gloss-bomb",
+        "canonical_url": "https://fentybeauty.com/products/gloss-bomb",
+        "domain": "fentybeauty.com",
+        # Title intentionally does NOT include the stopword "product".
+        "title": "Gloss Bomb",
+        "image_url": None,
+        "price_amount": 19.0,
+        "price_currency": "USD",
+        "availability": "in_stock",
+        "seed_data": {"brand": "Fenty Beauty"},
+        "status": "active",
+        "notes": None,
+        "created_by_employee_id": None,
+        "attached_product_key": None,
+        "attached_variant_id": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q:
+            values = values or {}
+            haystack = " ".join(
+                [
+                    seed_row.get("title") or "",
+                    seed_row.get("domain") or "",
+                    seed_row.get("canonical_url") or "",
+                    seed_row.get("destination_url") or "",
+                    str(seed_row.get("seed_data") or ""),
+                ]
+            ).lower()
+
+            like_terms = []
+            for key, val in values.items():
+                if str(key).startswith("like_"):
+                    term = str(val).strip("%").lower()
+                    if term:
+                        like_terms.append(term)
+            return [seed_row] if any(t in haystack for t in like_terms) else []
+
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+
+    async def fake_redirect_url(**_kwargs):
+        return "https://example.com/r?token=test"
+
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_redirect_url)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="fenty beauty product",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        )
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "creator-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert any(p.get("source") == "external_seed" for p in products)
+
+
 def test_agent_products_search_external_seed_includes_variants(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
