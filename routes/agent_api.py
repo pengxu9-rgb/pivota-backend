@@ -973,7 +973,7 @@ async def agent_search_products(
                     FROM products_cache pc
                     JOIN merchant_onboarding mo
                       ON mo.merchant_id = pc.merchant_id
-                    WHERE (pc.expires_at IS NULL OR pc.expires_at > NOW())
+                    WHERE pc.expires_at > NOW()
                       AND mo.status NOT IN ('deleted', 'rejected')
                       AND mo.psp_connected = true
                       {where_allowed}
@@ -1051,7 +1051,6 @@ async def agent_search_products(
                 # If the fast path fails for any reason, fall back to the
                 # standard per-merchant code path below.
                 logger.debug("agent_search_products browse fast path failed", exc_info=True)
-
         # Determine which merchants to search
         merchants_to_search = []
         
