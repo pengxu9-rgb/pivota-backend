@@ -83,6 +83,11 @@ def _ensure_dict(val: Any) -> Dict[str, Any]:
     return {}
 
 
+def _is_group_by_product_group(group_by: Optional[str]) -> bool:
+    v = (group_by or "").strip().lower()
+    return v in {"product_group", "product_group_id", "pg", "group", "true", "1"}
+
+
 def _as_product_card(row: Dict[str, Any]) -> Dict[str, Any]:
     merchant_id = row.get("merchant_id")
     platform = row.get("platform")
@@ -2723,12 +2728,44 @@ async def _compute_product_metrics(
         except Exception as fallback_exc:
             debug_errors.append(f"orders metrics fallback failed: {str(fallback_exc)[:200]}")
 
+    merchants_selling = 1
+    try:
+        pg_row = await database.fetch_one(
+            """
+            SELECT product_group_id
+            FROM product_group_members
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND platform_product_id = :platform_product_id
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+            },
+        )
+        product_group_id = str(pg_row["product_group_id"]) if pg_row and pg_row.get("product_group_id") else None
+        if product_group_id:
+            count_row = await database.fetch_one(
+                """
+                SELECT COUNT(DISTINCT merchant_id)::int AS sellers_count
+                FROM product_group_members
+                WHERE product_group_id = :product_group_id
+                """,
+                {"product_group_id": product_group_id},
+            )
+            if count_row:
+                merchants_selling = max(1, int(count_row.get("sellers_count") or 0))
+    except Exception:
+        merchants_selling = 1
+
     metrics = {
         "sales_7d": sales_7d,
         "sales_30d": sales_30d,
         "gmv_7d": {"currency": currency, "amount": gmv_7d},
         "gmv_30d": {"currency": currency, "amount": gmv_30d},
-        "merchants_selling": 1,
+        "merchants_selling": merchants_selling,
     }
     if debug_errors:
         metrics["debug_errors"] = debug_errors
@@ -2759,13 +2796,77 @@ async def list_product_offers(
 
     row = dict(row)
     product_data = _ensure_dict(row.get("product_data"))
-    offers = [_build_merchant_offer(
-        product_key=product_key,
-        merchant_id=merchant_id,
-        platform=platform,
-        platform_product_id=platform_product_id,
-        product_data=product_data,
-    )]
+
+    product_group_id: Optional[str] = None
+    try:
+        pg_row = await database.fetch_one(
+            """
+            SELECT product_group_id
+            FROM product_group_members
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND platform_product_id = :platform_product_id
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+            },
+        )
+        product_group_id = str(pg_row["product_group_id"]) if pg_row and pg_row.get("product_group_id") else None
+    except Exception:
+        product_group_id = None
+
+    merchant_offers: List[Dict[str, Any]] = []
+    if product_group_id:
+        try:
+            members = await database.fetch_all(
+                """
+                SELECT
+                  pgm.merchant_id,
+                  pgm.platform,
+                  pgm.platform_product_id,
+                  pgm.is_primary,
+                  pc.product_data
+                FROM product_group_members pgm
+                JOIN products_cache pc
+                  ON pc.merchant_id = pgm.merchant_id
+                 AND pc.platform = pgm.platform
+                 AND pc.platform_product_id = pgm.platform_product_id
+                WHERE pgm.product_group_id = :product_group_id
+                ORDER BY pgm.is_primary DESC, pgm.updated_at DESC
+                """,
+                {"product_group_id": product_group_id},
+            )
+            for m in members or []:
+                m = dict(m)
+                mk = f"{m.get('merchant_id')}|{m.get('platform')}|{m.get('platform_product_id')}"
+                md = _ensure_dict(m.get("product_data"))
+                merchant_offers.append(
+                    _build_merchant_offer(
+                        product_key=mk,
+                        merchant_id=str(m.get("merchant_id")),
+                        platform=str(m.get("platform")),
+                        platform_product_id=str(m.get("platform_product_id")),
+                        product_data=md,
+                    )
+                )
+        except Exception:
+            merchant_offers = []
+
+    if not merchant_offers:
+        merchant_offers = [
+            _build_merchant_offer(
+                product_key=product_key,
+                merchant_id=merchant_id,
+                platform=platform,
+                platform_product_id=platform_product_id,
+                product_data=product_data,
+            )
+        ]
+
+    offers = merchant_offers
     external_offers = await _build_external_seed_offers(
         product_key=product_key, request=request, variant_id=variant_id
     )
@@ -2784,7 +2885,12 @@ async def list_product_offers(
             "offer_type": "merchant_product" if offers else None,
         }
 
-    return {"status": "success", "items": offers, "primary": primary_offer}
+    return {
+        "status": "success",
+        "product_group_id": product_group_id,
+        "items": offers,
+        "primary": primary_offer,
+    }
 
 
 @router.post("/{product_key}/offers/primary")
@@ -2861,6 +2967,10 @@ async def search_products(
     platform: Optional[str] = Query(default=None),
     limit: int = Query(default=30, ge=1, le=100),
     after_id: Optional[int] = Query(default=None, description="Cursor: return rows with id < after_id"),
+    group_by: Optional[str] = Query(
+        default=None,
+        description="Optional grouping mode. Use `product_group` to group by product_group_members.product_group_id when available.",
+    ),
     current_user: dict = Depends(get_current_employee),
 ):
     """
@@ -2871,18 +2981,145 @@ async def search_products(
     - Pagination: keyset on products_cache.id (after_id).
     - Search: best-effort exact id match + title ILIKE when supported.
     """
+    use_product_groups = _is_group_by_product_group(group_by)
+
     where = []
+    where_group = []
     values: Dict[str, Any] = {"limit": limit}
 
     if merchant_id:
         where.append("merchant_id = :merchant_id")
+        where_group.append("pc.merchant_id = :merchant_id")
         values["merchant_id"] = merchant_id
     if platform:
         where.append("platform = :platform")
+        where_group.append("pc.platform = :platform")
         values["platform"] = platform
     if after_id is not None:
         where.append("id < :after_id")
+        where_group.append("pc.id < :after_id")
         values["after_id"] = after_id
+
+    debug_errors: List[str] = []
+
+    if use_product_groups:
+        try:
+            # Select one representative row per product_group_id (fallback to per-product key when missing).
+            group_key = "COALESCE(pgm.product_group_id, pc.merchant_id || '|' || pc.platform || '|' || pc.platform_product_id)"
+            base = f"""
+            SELECT *
+            FROM (
+              SELECT DISTINCT ON ({group_key})
+                pc.id,
+                pc.merchant_id,
+                pc.platform,
+                pc.platform_product_id,
+                pc.product_data,
+                pc.cached_at,
+                pc.expires_at,
+                pgm.product_group_id AS product_group_id
+              FROM products_cache pc
+              LEFT JOIN product_group_members pgm
+                ON pgm.merchant_id = pc.merchant_id
+               AND pgm.platform = pc.platform
+               AND pgm.platform_product_id = pc.platform_product_id
+            """
+            clause = f" WHERE {' AND '.join(where_group)}" if where_group else ""
+            # Order within group: prefer primary member, then newest cache row.
+            order_limit = f" ORDER BY {group_key}, pgm.is_primary DESC NULLS LAST, pc.id DESC"
+
+            rows: List[Dict[str, Any]] = []
+            if q:
+                q = q.strip()
+            if q:
+                # Best-effort: attempt title ILIKE + JSON product_id match (Postgres).
+                try:
+                    q_clause = (
+                        " (pc.platform_product_id = :q"
+                        " OR pc.product_data->>'product_id' = :q"
+                        " OR pc.product_data->>'id' = :q"
+                        " OR pc.product_data->>'title' ILIKE :q_like"
+                        " OR pc.product_data->>'name' ILIKE :q_like"
+                        " OR EXISTS ("
+                        "   SELECT 1"
+                        "   FROM jsonb_array_elements("
+                        "     CASE"
+                        "       WHEN jsonb_typeof(pc.product_data::jsonb->'variants') = 'array' THEN pc.product_data::jsonb->'variants'"
+                        "       ELSE '[]'::jsonb"
+                        "     END"
+                        "   ) AS v"
+                        "   WHERE (v->>'variant_id' = :q OR v->>'id' = :q OR v->>'sku' = :q)"
+                        " ))"
+                    )
+                    values["q"] = q
+                    values["q_like"] = f"%{q}%"
+                    rows = await database.fetch_all(
+                        f"{base}{clause}{' AND ' if clause else ' WHERE '}{q_clause}{order_limit}"
+                        f"\n            ) t\n            ORDER BY t.id DESC LIMIT :limit",
+                        values,
+                    )
+                except Exception:
+                    q_clause = (
+                        " (pc.platform_product_id = :q"
+                        " OR pc.product_data->>'product_id' = :q"
+                        " OR pc.product_data->>'id' = :q)"
+                    )
+                    values["q"] = q
+                    rows = await database.fetch_all(
+                        f"{base}{clause}{' AND ' if clause else ' WHERE '}{q_clause}{order_limit}"
+                        f"\n            ) t\n            ORDER BY t.id DESC LIMIT :limit",
+                        values,
+                    )
+            else:
+                rows = await database.fetch_all(
+                    f"{base}{clause}{order_limit}\n            ) t\n            ORDER BY t.id DESC LIMIT :limit",
+                    values,
+                )
+
+            seller_counts: Dict[str, int] = {}
+            group_ids = sorted({str(dict(r).get("product_group_id")) for r in rows if dict(r).get("product_group_id")})
+            if group_ids:
+                try:
+                    counts = await database.fetch_all(
+                        """
+                        SELECT product_group_id, COUNT(DISTINCT merchant_id)::int AS sellers_count
+                        FROM product_group_members
+                        WHERE product_group_id = ANY(:group_ids)
+                        GROUP BY product_group_id
+                        """,
+                        {"group_ids": group_ids},
+                    )
+                    for cr in counts or []:
+                        seller_counts[str(cr["product_group_id"])] = int(cr.get("sellers_count") or 0)
+                except Exception as exc:
+                    debug_errors.append(f"group_sellers_count_failed: {str(exc)[:200]}")
+
+            cards: List[Dict[str, Any]] = []
+            for r in rows:
+                try:
+                    rr = dict(r)
+                    card = _as_product_card(rr)
+                    pgid = rr.get("product_group_id")
+                    card["product_group_id"] = pgid
+                    if pgid:
+                        card["sellers_count"] = max(1, int(seller_counts.get(str(pgid)) or 0))
+                    else:
+                        card["sellers_count"] = 1
+                    cards.append(card)
+                except Exception as exc:
+                    debug_errors.append(f"card_parse_failed: {str(exc)}")
+
+            next_after_id = int(rows[-1]["id"]) if rows else None
+            return {
+                "status": "degraded" if debug_errors else "success",
+                "items": cards,
+                "next": {"after_id": next_after_id},
+                **({"debug_errors": debug_errors[:10]} if debug_errors else {}),
+            }
+        except Exception as exc:
+            # Degrade gracefully when the grouping table is unavailable or query fails.
+            debug_errors.append(f"group_by_failed: {str(exc)[:200]}")
+            use_product_groups = False
 
     base = "SELECT id, merchant_id, platform, platform_product_id, product_data, cached_at, expires_at FROM products_cache"
     clause = f" WHERE {' AND '.join(where)}" if where else ""
@@ -2930,7 +3167,6 @@ async def search_products(
         rows = await database.fetch_all(f"{base}{clause}{order_limit}", values)
 
     cards: List[Dict[str, Any]] = []
-    debug_errors: List[str] = []
     for r in rows:
         try:
             cards.append(_as_product_card(dict(r)))
