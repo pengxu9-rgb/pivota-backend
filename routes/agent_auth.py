@@ -7,6 +7,7 @@ from fastapi import HTTPException, Security, Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.security import APIKeyHeader
 from typing import Optional, Dict, Any
+import asyncio
 import time
 from datetime import datetime
 
@@ -73,7 +74,10 @@ async def get_agent_context(
         context = await _get_agent_context_from_checkout_token(request, checkout_token)
 
         # Apply the same rate/quota guards at the agent_id level.
-        rate_ok, current, limit = await check_rate_limit(context.agent_id)
+        rate_ok, current, limit = await check_rate_limit(
+            context.agent_id,
+            rate_limit=(context.agent.get("rate_limit") if isinstance(context.agent, dict) else None),
+        )
         if not rate_ok:
             raise HTTPException(
                 status_code=429,
@@ -85,7 +89,10 @@ async def get_agent_context(
                 },
             )
 
-        quota_ok, used, quota = await check_daily_quota(context.agent_id)
+        quota_ok, used, quota = await check_daily_quota(
+            context.agent_id,
+            daily_quota=(context.agent.get("daily_quota") if isinstance(context.agent, dict) else None),
+        )
         if not quota_ok:
             raise HTTPException(
                 status_code=429,
@@ -97,7 +104,11 @@ async def get_agent_context(
                 },
             )
 
-        await update_agent_stats(context.agent_id, increment_requests=1)
+        # Best-effort stats update; do not block the request on a hot row lock.
+        try:
+            asyncio.create_task(update_agent_stats(context.agent_id, increment_requests=1))
+        except Exception:
+            pass
         logger.info(f"Agent {context.agent_name} authenticated via checkout token for {request.url.path}")
         return context
 
@@ -154,7 +165,10 @@ async def get_agent_context(
         )
     
     # 5. 检查速率限制
-    rate_ok, current, limit = await check_rate_limit(agent["agent_id"])
+    rate_ok, current, limit = await check_rate_limit(
+        agent["agent_id"],
+        rate_limit=agent.get("rate_limit"),
+    )
     if not rate_ok:
         raise HTTPException(
             status_code=429,
@@ -167,7 +181,10 @@ async def get_agent_context(
         )
     
     # 6. 检查每日配额
-    quota_ok, used, quota = await check_daily_quota(agent["agent_id"])
+    quota_ok, used, quota = await check_daily_quota(
+        agent["agent_id"],
+        daily_quota=agent.get("daily_quota"),
+    )
     if not quota_ok:
         raise HTTPException(
             status_code=429,
@@ -183,7 +200,10 @@ async def get_agent_context(
     context = AgentContext(agent, request)
     
     # 8. 更新使用统计（异步，不阻塞）
-    await update_agent_stats(agent["agent_id"], increment_requests=1)
+    try:
+        asyncio.create_task(update_agent_stats(agent["agent_id"], increment_requests=1))
+    except Exception:
+        pass
     
     logger.info(f"Agent {agent['agent_name']} authenticated for {request.url.path}")
     
