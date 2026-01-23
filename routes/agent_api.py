@@ -1636,16 +1636,17 @@ async def agent_resolve_product_group(
 
         members = []
         for r in member_rows or []:
-            mid = str(r.get("merchant_id") or "").strip()
+            rd = dict(r) if r is not None else {}
+            mid = str(rd.get("merchant_id") or "").strip()
             if not mid or not _context_can_access_merchant(context, mid):
                 continue
             members.append(
                 {
                     "merchant_id": mid,
-                    "merchant_name": r.get("merchant_name"),
-                    "product_id": str(r.get("product_id") or "").strip(),
-                    "platform": str(r.get("platform") or "").strip().lower() or None,
-                    "is_primary": bool(r.get("is_primary") or False),
+                    "merchant_name": rd.get("merchant_name"),
+                    "product_id": str(rd.get("product_id") or "").strip(),
+                    "platform": str(rd.get("platform") or "").strip().lower() or None,
+                    "is_primary": bool(rd.get("is_primary") or False),
                 }
             )
 
@@ -1696,8 +1697,9 @@ async def agent_resolve_product_group_by_product_id(
 
         resolved_group_id: Optional[str] = None
         for r in rows or []:
-            gid = str(r.get("product_group_id") or "").strip()
-            mid = str(r.get("merchant_id") or "").strip()
+            rd = dict(r) if r is not None else {}
+            gid = str(rd.get("product_group_id") or "").strip()
+            mid = str(rd.get("merchant_id") or "").strip()
             if not gid or not mid:
                 continue
             if _context_can_access_merchant(context, mid):
@@ -1725,16 +1727,17 @@ async def agent_resolve_product_group_by_product_id(
 
         members = []
         for r in member_rows or []:
-            mid = str(r.get("merchant_id") or "").strip()
+            rd = dict(r) if r is not None else {}
+            mid = str(rd.get("merchant_id") or "").strip()
             if not mid or not _context_can_access_merchant(context, mid):
                 continue
             members.append(
                 {
                     "merchant_id": mid,
-                    "merchant_name": r.get("merchant_name"),
-                    "product_id": str(r.get("product_id") or "").strip(),
-                    "platform": str(r.get("platform") or "").strip().lower() or None,
-                    "is_primary": bool(r.get("is_primary") or False),
+                    "merchant_name": rd.get("merchant_name"),
+                    "product_id": str(rd.get("product_id") or "").strip(),
+                    "platform": str(rd.get("platform") or "").strip().lower() or None,
+                    "is_primary": bool(rd.get("is_primary") or False),
                 }
             )
 
@@ -1783,16 +1786,17 @@ async def agent_get_product_group(
 
         members = []
         for r in member_rows or []:
-            mid = str(r.get("merchant_id") or "").strip()
+            rd = dict(r) if r is not None else {}
+            mid = str(rd.get("merchant_id") or "").strip()
             if not mid or not _context_can_access_merchant(context, mid):
                 continue
             members.append(
                 {
                     "merchant_id": mid,
-                    "merchant_name": r.get("merchant_name"),
-                    "product_id": str(r.get("product_id") or "").strip(),
-                    "platform": str(r.get("platform") or "").strip().lower() or None,
-                    "is_primary": bool(r.get("is_primary") or False),
+                    "merchant_name": rd.get("merchant_name"),
+                    "product_id": str(rd.get("product_id") or "").strip(),
+                    "platform": str(rd.get("platform") or "").strip().lower() or None,
+                    "is_primary": bool(rd.get("is_primary") or False),
                 }
             )
 
