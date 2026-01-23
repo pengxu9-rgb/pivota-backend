@@ -6,7 +6,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -304,7 +304,8 @@ async def employee_validate_import_batch(
 
 
 class CommitImportBatchRequest(BaseModel):
-    reason: str = Field(..., min_length=1)
+    # Optional for ergonomics: allow commit without a JSON body (defaults to ops_import).
+    reason: str = Field("ops_import", min_length=1)
 
 
 @router.post(
@@ -312,9 +313,9 @@ class CommitImportBatchRequest(BaseModel):
 )
 async def employee_commit_import_batch(
     batch_id: int,
-    body: CommitImportBatchRequest,
     request: Request,
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.import.commit"])),
+    body: CommitImportBatchRequest = Body(default_factory=CommitImportBatchRequest),
 ) -> Dict[str, Any]:
     request.state.operation = "reviews.import.commit"
     started = time.time()
