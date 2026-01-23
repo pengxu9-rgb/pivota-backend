@@ -1157,6 +1157,16 @@ async def _handle_find_products_multi(
 
     page = filters.page or 1
     limit = min(filters.limit or 20, 100)
+    eval_enabled = bool(
+        isinstance(request_metadata, dict) and request_metadata.get("eval") is not None
+    )
+    try:
+        _recent_queries = (
+            list(user_ctx.recent_queries or []) if user_ctx else []
+        )  # type: ignore[union-attr]
+    except Exception:
+        _recent_queries = []
+    used_recent_queries_count = len([q for q in _recent_queries if str(q or "").strip()])
 
     def _tokenize(text: str) -> List[str]:
         if not text:
@@ -1171,6 +1181,43 @@ async def _handle_find_products_multi(
             for c in unicodedata.normalize("NFKD", text)
             if not unicodedata.combining(c)
         )
+
+    def _maybe_attach_eval_debug(
+        result: Dict[str, Any],
+        *,
+        rewritten_query: Optional[str] = None,
+        fallback_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not eval_enabled:
+            return result
+
+        if rewritten_query is None:
+            raw_q = (filters.query or "").strip()
+            rewritten_query = _strip_accents(raw_q.lower())
+
+        if fallback_reason is None:
+            meta = result.get("metadata")
+            if isinstance(meta, dict):
+                query_source = meta.get("query_source")
+                if isinstance(query_source, str) and "fallback" in query_source.lower():
+                    fallback_reason = query_source
+
+        debug_payload = {
+            "fallback_reason": fallback_reason,
+            "history_used": used_recent_queries_count > 0,
+            "used_recent_queries_count": used_recent_queries_count,
+            "rewritten_query": rewritten_query,
+        }
+
+        existing_debug = result.get("debug")
+        if isinstance(existing_debug, dict):
+            merged_debug = dict(existing_debug)
+            merged_debug.update(debug_payload)
+            result["debug"] = merged_debug
+        else:
+            result["debug"] = debug_payload
+
+        return result
 
     def _edit_distance_leq(a: str, b: str, max_dist: int) -> bool:
         """Return True if Levenshtein(a,b) <= max_dist (with early exit)."""
@@ -1628,7 +1675,6 @@ async def _handle_find_products_multi(
             """
         )
     merchant_map = {row["merchant_id"]: row["business_name"] for row in merchant_rows}
-
     has_merchants = bool(merchant_map)
 
     # Cold start & intent detection.
@@ -1972,20 +2018,23 @@ async def _handle_find_products_multi(
         if mapped:
             start_idx = (page - 1) * limit
             page_items = mapped[start_idx : start_idx + limit]
-            return {
-                "products": page_items,
-                "total": len(mapped),
-                "page": page,
-                "page_size": len(page_items),
-                "reply": reply_text,
-                "metadata": {
-                    "query_source": "creator_featured_cache",
-                    "fetched_at": datetime.utcnow().isoformat(),
-                    "merchants_searched": len(merchant_map),
-                    "creator_id": creator_id,
-                    "creator_name": creator_name,
+            return _maybe_attach_eval_debug(
+                {
+                    "products": page_items,
+                    "total": len(mapped),
+                    "page": page,
+                    "page_size": len(page_items),
+                    "reply": reply_text,
+                    "metadata": {
+                        "query_source": "creator_featured_cache",
+                        "fetched_at": datetime.utcnow().isoformat(),
+                        "merchants_searched": len(merchant_map),
+                        "creator_id": creator_id,
+                        "creator_name": creator_name,
+                    },
                 },
-            }
+                rewritten_query=q_ascii,
+            )
 
     external_seed_wrappers: list[dict[str, Any]] = []
     try:
@@ -2145,17 +2194,21 @@ async def _handle_find_products_multi(
         logger.info("multi.external_seeds.failed", extra={"error": str(e)})
 
     if not has_merchants and not external_seed_wrappers:
-        return {
-            "products": [],
-            "total": 0,
-            "page": page,
-            "page_size": 0,
-            "metadata": {
-                "query_source": "cache_multi",
-                "fetched_at": datetime.utcnow().isoformat(),
-                "merchants_searched": 0,
+        return _maybe_attach_eval_debug(
+            {
+                "products": [],
+                "total": 0,
+                "page": page,
+                "page_size": 0,
+                "metadata": {
+                    "query_source": "cache_multi",
+                    "fetched_at": datetime.utcnow().isoformat(),
+                    "merchants_searched": 0,
+                },
             },
-        }
+            rewritten_query=q_ascii,
+            fallback_reason="no_eligible_merchants",
+        )
 
     # Cold start: empty query falls back to creator/global top sellers and cache/live fallbacks.
     if not q:
@@ -2364,20 +2417,23 @@ async def _handle_find_products_multi(
 
         start_idx = (page - 1) * limit
         page_items = mapped[start_idx : start_idx + limit]
-        return {
-            "products": page_items,
-            "total": len(mapped),
-            "page": page,
-            "page_size": len(page_items),
-            "reply": reply_text,
-            "metadata": {
-                "query_source": source,
-                "fetched_at": datetime.utcnow().isoformat(),
-                "merchants_searched": len(merchant_map),
-                "creator_id": creator_id,
-                "creator_name": creator_name,
+        return _maybe_attach_eval_debug(
+            {
+                "products": page_items,
+                "total": len(mapped),
+                "page": page,
+                "page_size": len(page_items),
+                "reply": reply_text,
+                "metadata": {
+                    "query_source": source,
+                    "fetched_at": datetime.utcnow().isoformat(),
+                    "merchants_searched": len(merchant_map),
+                    "creator_id": creator_id,
+                    "creator_name": creator_name,
+                },
             },
-        }
+            rewritten_query=q_ascii,
+        )
 
     # How many products to fetch per merchant (before global filtering/pagination)
     # We fetch a bit more than the requested page size to have headroom for filtering.
@@ -2901,20 +2957,23 @@ async def _handle_find_products_multi(
 
             fallback_items = mapped[start_idx:end_idx]
             if mapped:
-                return {
-                    "products": fallback_items,
-                    "total": len(mapped),
-                    "page": page,
-                    "page_size": len(fallback_items),
-                    "reply": reply_text,
-                    "metadata": {
-                        "query_source": source,
-                        "fetched_at": datetime.utcnow().isoformat(),
-                        "merchants_searched": len(merchant_map),
-                        "creator_id": creator_id,
-                        "creator_name": creator_name,
+                return _maybe_attach_eval_debug(
+                    {
+                        "products": fallback_items,
+                        "total": len(mapped),
+                        "page": page,
+                        "page_size": len(fallback_items),
+                        "reply": reply_text,
+                        "metadata": {
+                            "query_source": source,
+                            "fetched_at": datetime.utcnow().isoformat(),
+                            "merchants_searched": len(merchant_map),
+                            "creator_id": creator_id,
+                            "creator_name": creator_name,
+                        },
                     },
-                }
+                    rewritten_query=q_ascii,
+                )
 
         # Tee-intent global fallback when there is no creator context.
         if tee_intent_query:
@@ -2950,20 +3009,23 @@ async def _handle_find_products_multi(
 
             fallback_items = mapped[start_idx:end_idx]
             if mapped:
-                return {
-                    "products": fallback_items,
-                    "total": len(mapped),
-                    "page": page,
-                    "page_size": len(fallback_items),
-                    "reply": reply_text,
-                    "metadata": {
-                        "query_source": source,
-                        "fetched_at": datetime.utcnow().isoformat(),
-                        "merchants_searched": len(merchant_map),
-                        "creator_id": creator_id,
-                        "creator_name": creator_name,
+                return _maybe_attach_eval_debug(
+                    {
+                        "products": fallback_items,
+                        "total": len(mapped),
+                        "page": page,
+                        "page_size": len(fallback_items),
+                        "reply": reply_text,
+                        "metadata": {
+                            "query_source": source,
+                            "fetched_at": datetime.utcnow().isoformat(),
+                            "merchants_searched": len(merchant_map),
+                            "creator_id": creator_id,
+                            "creator_name": creator_name,
+                        },
                     },
-                }
+                    rewritten_query=q_ascii,
+                )
 
     if not out_products and toys_intent_query:
         reply_text = reply_text or (
@@ -2973,21 +3035,24 @@ async def _handle_find_products_multi(
 
     history_used = bool(history_product_ids or history_terms)
 
-    return {
-        "products": out_products,
-        "total": total,
-        "page": page,
-        "page_size": len(out_products),
-        "reply": reply_text,
-        "metadata": {
-            "query_source": "cache_multi_intent",
-            "fetched_at": datetime.utcnow().isoformat(),
-            "merchants_searched": len(merchant_map),
-            "creator_id": creator_id,
-            "creator_name": creator_name,
-            "history_boost_applied": history_used,
+    return _maybe_attach_eval_debug(
+        {
+            "products": out_products,
+            "total": total,
+            "page": page,
+            "page_size": len(out_products),
+            "reply": reply_text,
+            "metadata": {
+                "query_source": "cache_multi_intent",
+                "fetched_at": datetime.utcnow().isoformat(),
+                "merchants_searched": len(merchant_map),
+                "creator_id": creator_id,
+                "creator_name": creator_name,
+                "history_boost_applied": history_used,
+            },
         },
-    }
+        rewritten_query=q_ascii,
+    )
 
 
 async def _handle_find_similar_products(
