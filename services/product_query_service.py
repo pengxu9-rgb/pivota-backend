@@ -202,11 +202,17 @@ async def _get_from_cache(
     """Get products from local cache for specific platform"""
     try:
         # Use existing cache function
-        cached = await get_cached_products(merchant_id, platform, include_expired=False)
+        cached = await get_cached_products(
+            merchant_id,
+            platform,
+            include_expired=False,
+            limit=limit,
+            offset=0,
+        )
         
         # Convert to StandardProduct objects
         products = []
-        for c in cached[:limit]:
+        for c in cached:
             product_data = c["product_data"]
             if isinstance(product_data, str):
                 product_data = json.loads(product_data)

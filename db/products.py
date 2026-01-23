@@ -158,7 +158,9 @@ merchant_analytics = Table(
 async def get_cached_products(
     merchant_id: str,
     platform: str,
-    include_expired: bool = False
+    include_expired: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     从缓存获取产品（Agent 只读）
@@ -172,6 +174,14 @@ async def get_cached_products(
         query = query.where(products_cache.c.expires_at > datetime.now())
     
     query = query.order_by(products_cache.c.cached_at.desc())
+
+    # Avoid loading the entire cache blob into memory when we only need a page.
+    # (Each row can contain large JSON payloads; fetching thousands of rows can
+    # easily exceed upstream timeouts.)
+    if isinstance(limit, int) and limit > 0:
+        query = query.limit(limit)
+        if isinstance(offset, int) and offset > 0:
+            query = query.offset(offset)
     
     results = await database.fetch_all(query)
     return [dict(r) for r in results]

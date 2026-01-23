@@ -1007,23 +1007,90 @@ async def agent_search_products(
 
         ranking_config = get_agent_ranking_config()
 
-        # Apply filters, build features and calculate scores
+        normalized_query = query.strip() if isinstance(query, str) else ""
+        normalized_category = category.strip() if isinstance(category, str) else ""
+        is_browse_mode = (
+            not normalized_query
+            and not normalized_category
+            and min_price is None
+            and max_price is None
+        )
+
+        # Browse mode (no query/filters): keep this endpoint fast for Agents.
+        # The Shopping Agent often calls `/products/search` with an empty query
+        # just to fetch a first page of products; doing N+1 enrichment queries
+        # can exceed upstream timeouts.
+        if is_browse_mode:
+            browse_candidates: List[Dict[str, Any]] = []
+            for product in all_products:
+                if in_stock_only and not product.get("in_stock", True):
+                    continue
+
+                price = float(product.get("price", 0) or 0)
+                if min_price and price < min_price:
+                    continue
+                if max_price and price > max_price:
+                    continue
+
+                product.setdefault("relevance_score", 1.0)
+                product.setdefault(
+                    "ranking_score", float(product.get("relevance_score", 1.0) or 1.0)
+                )
+                product.setdefault("ranking_features", {"mode": "browse"})
+                browse_candidates.append(product)
+
+            total = len(browse_candidates)
+            paginated_products = browse_candidates[offset : offset + limit]
+
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id or "cross_merchant_search",
+            )
+
+            return {
+                "status": "success",
+                "products": paginated_products,
+                "pagination": {
+                    "total_count": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "page": (offset // limit) + 1 if limit > 0 else 1,
+                    "total_pages": (total + limit - 1) // limit if limit > 0 else 1,
+                    "has_more": offset + limit < total,
+                },
+                "search_context": {
+                    "merchant_id": merchant_id,
+                    "merchant_ids": merchant_ids,
+                    "merchants_searched": len(merchants_to_search),
+                    "cross_merchant_search": merchant_id is None and not merchant_ids,
+                },
+                "filters_applied": {
+                    "query": query,
+                    "category": category,
+                    "min_price": min_price,
+                    "max_price": max_price,
+                    "in_stock_only": in_stock_only,
+                },
+            }
+
+        # Search mode: Apply filters, hydrate features, then compute ranking.
         ranked_candidates: List[Dict[str, Any]] = []
+        candidates: List[Dict[str, Any]] = []
+        candidate_features: List[AgentRankingFeatures] = []
 
         for product in all_products:
-            # 库存过滤
             if in_stock_only and not product.get("in_stock", True):
                 continue
-            
-            # 价格过滤
-            price = float(product.get("price", 0))
+
+            price = float(product.get("price", 0) or 0)
             if min_price and price < min_price:
                 continue
             if max_price and price > max_price:
                 continue
-            
-            # 类别过滤
-            if category:
+
+            if normalized_category:
                 product_category = (
                     " ".join(
                         [
@@ -1033,36 +1100,34 @@ async def agent_search_products(
                         ]
                     )
                 ).lower()
-                if category.lower() not in product_category:
+                if normalized_category.lower() not in product_category:
                     continue
-            
-            # 搜索查询 + 相关度评分（简单 keyword 匹配，可作为 rel_keyword）
+
             relevance_score = 1.0
-            if query:
-                query_lower = query.lower()
+            if normalized_query:
+                query_lower = normalized_query.lower()
                 title = product.get("title", "").lower()
                 description = product.get("description", "").lower()
                 tags = " ".join(product.get("tags") or []).lower()
                 product_type = (product.get("product_type") or "").lower()
                 haystack = " ".join([title, description, tags, product_type]).strip()
-                
-                # Calculate relevance
+
                 if query_lower in title:
-                    # Exact match in title = high score
                     relevance_score = 1.0 if query_lower == title else 0.9
                 elif query_lower in description:
                     relevance_score = 0.7
                 elif query_lower in tags or query_lower in product_type:
                     relevance_score = 0.75
                 else:
-                    # Check for partial word matches
                     query_words = query_terms or query_lower.split()
-                    matches = sum(1 for word in query_words if word and word in haystack)
+                    matches = sum(
+                        1 for word in query_words if word and word in haystack
+                    )
                     if matches > 0:
                         relevance_score = 0.5 + (matches / len(query_words)) * 0.3
                     else:
-                        continue  # No match, skip product
-                
+                        continue
+
                 product["relevance_score"] = relevance_score
             else:
                 product["relevance_score"] = 1.0
@@ -1071,55 +1136,88 @@ async def agent_search_products(
                 product.get("source") == "external_seed"
                 or product.get("merchant_id") == EXTERNAL_SEED_MERCHANT_ID
             )
-
             if is_external_seed:
-                platform_product_id = str(product.get("product_id") or product.get("id") or "")
+                platform_product_id = str(
+                    product.get("product_id") or product.get("id") or ""
+                )
                 if not platform_product_id:
                     continue
                 try:
-                    product["ranking_score"] = float(product.get("relevance_score", 0.0)) * 0.8
+                    product["ranking_score"] = (
+                        float(product.get("relevance_score", 0.0)) * 0.8
+                    )
                 except Exception:
                     product["ranking_score"] = product.get("relevance_score", 0.0)
                 product["ranking_features"] = {"source": "external_seed"}
                 ranked_candidates.append(product)
                 continue
 
-            # Build feature vector for ranking
             platform = product.get("platform") or "unknown"
             platform_product_id = str(
                 product.get("product_id") or product.get("id") or ""
             )
             if not platform_product_id:
-                # Skip products without a stable identifier
                 continue
 
             features = AgentRankingFeatures(
                 merchant_id=product.get("merchant_id"),
                 platform=platform,
                 platform_product_id=platform_product_id,
-                rel_semantic=relevance_score,  # Placeholder until true semantic score
+                rel_semantic=relevance_score,
                 rel_keyword=relevance_score,
                 rel_category_match=1.0
-                if category
-                and category.lower()
+                if normalized_category
+                and normalized_category.lower()
                 in (product.get("product_type") or "").lower()
                 else 0.0,
             )
 
-            # Enrich features with quality / enrichment data
-            await hydrate_quality_and_enrichment(features)
+            candidates.append(product)
+            candidate_features.append(features)
 
-            # Apply hard gating (quality / compliance)
+        # Hydrate quality/enrichment features concurrently (bounded).
+        try:
+            hydrate_concurrency = int(os.getenv("AGENT_RANKING_HYDRATE_CONCURRENCY", "8"))
+        except Exception:
+            hydrate_concurrency = 8
+        hydrate_concurrency = max(1, min(32, hydrate_concurrency))
+        sem = asyncio.Semaphore(hydrate_concurrency)
+
+        async def _hydrate_one(feats: AgentRankingFeatures) -> None:
+            async with sem:
+                await hydrate_quality_and_enrichment(feats)
+
+        try:
+            hydrate_timeout_s = float(os.getenv("AGENT_RANKING_HYDRATE_TIMEOUT_S", "8"))
+        except Exception:
+            hydrate_timeout_s = 8.0
+        if candidate_features:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*[_hydrate_one(f) for f in candidate_features]),
+                    timeout=max(1.0, hydrate_timeout_s),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "agent_search_products hydration timeout",
+                    extra={
+                        "event": "agent_search_products_hydration_timeout",
+                        "count": len(candidate_features),
+                        "timeout_s": hydrate_timeout_s,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    "agent_search_products hydration failed (non-fatal)",
+                    exc_info=True,
+                )
+
+        for product, features in zip(candidates, candidate_features):
             if not passes_agent_gating(features, ranking_config):
                 continue
-
-            # Compute final ranking score
             score = compute_agent_ranking_score(features, ranking_config)
             product["ranking_score"] = score
-            product["ranking_features"] = serialize_features_for_log(
-                features, score
-            )
-
+            product["ranking_features"] = serialize_features_for_log(features, score)
             ranked_candidates.append(product)
 
         # Sort by ranking score (fallback to relevance when missing)
