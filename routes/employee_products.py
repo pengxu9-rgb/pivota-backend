@@ -1544,11 +1544,19 @@ async def refresh_external_seed(
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
 
     snap_image_urls: list[str] = []
+    snap_description: Optional[str] = None
+    snap_variants: Optional[List[Dict[str, Any]]] = None
     evidence = getattr(snapshot, "evidence", None)
     if isinstance(evidence, dict):
         raw_images = evidence.get("image_urls") or evidence.get("images")
         if isinstance(raw_images, list):
             snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+        raw_desc = evidence.get("description")
+        if isinstance(raw_desc, str) and raw_desc.strip():
+            snap_description = raw_desc.strip()
+        raw_variants = evidence.get("variants")
+        if isinstance(raw_variants, list) and raw_variants:
+            snap_variants = [v for v in raw_variants if isinstance(v, dict)]
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
@@ -1557,6 +1565,7 @@ async def refresh_external_seed(
             "canonical_url": canonical_url,
             "domain": domain,
             "title": snap_title,
+            "description": snap_description,
             "image_url": snap_image_url,
             "image_urls": snap_image_urls,
             "price_amount": snap_price_amount,
@@ -1568,18 +1577,22 @@ async def refresh_external_seed(
     # Only overwrite curated fields if they are missing.
     if not seed_data.get("title"):
         seed_data["title"] = snap_title
+    if not seed_data.get("description"):
+        if snap_description:
+            seed_data["description"] = snap_description
     if not seed_data.get("image_url"):
         seed_data["image_url"] = snap_image_url
     if snap_image_urls:
         seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
-    if not seed_data.get("variants"):
-        evidence = getattr(snapshot, "evidence", None)
-        if isinstance(evidence, dict):
-            snap_variants = evidence.get("variants")
-            if isinstance(snap_variants, list) and snap_variants:
-                seed_data["variants"] = snap_variants
+    if snap_variants:
+        existing_variants = _seed_variants(seed_data)
+        product_title = seed_data.get("title") or snap_title
+        if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=product_title):
+            seed_data["variants"] = snap_variants
+        elif not existing_variants:
+            seed_data["variants"] = snap_variants
 
     await _execute_seed_data_stmt(
         """
