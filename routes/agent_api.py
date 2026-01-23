@@ -923,6 +923,135 @@ async def agent_search_products(
         category = overrides["category"]
         query_terms: List[str] = overrides["terms"]
 
+        normalized_query = query.strip() if isinstance(query, str) else ""
+        normalized_category = category.strip() if isinstance(category, str) else ""
+        is_browse_mode = (
+            not normalized_query
+            and not normalized_category
+            and min_price is None
+            and max_price is None
+        )
+
+        # Fast path: cross-merchant browse (empty query/filters).
+        #
+        # The shopping gateway sometimes calls this endpoint with an empty query just to
+        # fetch a first page. Iterating every merchant and loading per-merchant pools
+        # is slow; instead, read a recent slice directly from products_cache.
+        if (
+            is_browse_mode
+            and not merchant_id
+            and not merchant_ids
+            and (search_all_merchants is True)
+        ):
+            try:
+                allowed = (
+                    [m for m in (getattr(context, "allowed_merchants", None) or []) if m]
+                    if isinstance(getattr(context, "allowed_merchants", None), list)
+                    else []
+                )
+
+                page_limit = max(1, min(int(limit or 20), 100))
+                page_offset = max(0, int(offset or 0))
+
+                # Fetch one extra row to compute has_more without an expensive COUNT(*).
+                fetch_limit = page_limit + 1
+
+                where_allowed = ""
+                params: Dict[str, Any] = {
+                    "limit": fetch_limit,
+                    "offset": page_offset,
+                }
+                if allowed:
+                    where_allowed = "AND pc.merchant_id = ANY(:allowed_merchants)"
+                    params["allowed_merchants"] = allowed
+
+                rows = await database.fetch_all(
+                    """
+                    SELECT pc.merchant_id,
+                           mo.business_name AS merchant_name,
+                           pc.product_data
+                    FROM products_cache pc
+                    JOIN merchant_onboarding mo
+                      ON mo.merchant_id = pc.merchant_id
+                    WHERE (pc.expires_at IS NULL OR pc.expires_at > NOW())
+                      AND mo.status NOT IN ('deleted', 'rejected')
+                      AND mo.psp_connected = true
+                      {where_allowed}
+                    ORDER BY pc.id DESC
+                    LIMIT :limit
+                    OFFSET :offset
+                    """.format(where_allowed=where_allowed),
+                    params,
+                )
+
+                products: List[Dict[str, Any]] = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    pdata = row.get("product_data")
+                    if isinstance(pdata, str):
+                        try:
+                            pdata = json.loads(pdata)
+                        except Exception:
+                            continue
+                    if not isinstance(pdata, dict):
+                        continue
+
+                    if in_stock_only and not pdata.get("in_stock", True):
+                        continue
+
+                    pdata = dict(pdata)
+                    pdata["merchant_id"] = str(row.get("merchant_id") or pdata.get("merchant_id") or "")
+                    pdata["merchant_name"] = row.get("merchant_name") or pdata.get("merchant_name") or "Unknown"
+                    pdata.setdefault("relevance_score", 1.0)
+                    pdata.setdefault("ranking_score", 1.0)
+                    pdata.setdefault("ranking_features", {"mode": "browse_fastpath"})
+                    products.append(pdata)
+
+                    if len(products) >= fetch_limit:
+                        break
+
+                has_more = len(products) > page_limit
+                page_items = products[:page_limit]
+
+                background_tasks.add_task(
+                    log_agent_request,
+                    context=context,
+                    status_code=200,
+                    merchant_id="cross_merchant_search",
+                )
+
+                return {
+                    "status": "success",
+                    "products": page_items,
+                    "pagination": {
+                        # Avoid COUNT(*) in hot path; provide a lower bound.
+                        "total_count": page_offset + len(page_items) + (1 if has_more else 0),
+                        "limit": page_limit,
+                        "offset": page_offset,
+                        "page": (page_offset // page_limit) + 1 if page_limit > 0 else 1,
+                        "total_pages": (page_offset // page_limit) + 1 + (1 if has_more else 0),
+                        "has_more": has_more,
+                    },
+                    "search_context": {
+                        "merchant_id": None,
+                        "merchant_ids": allowed if allowed else None,
+                        "merchants_searched": None,
+                        "cross_merchant_search": True,
+                    },
+                    "filters_applied": {
+                        "query": query,
+                        "category": category,
+                        "min_price": min_price,
+                        "max_price": max_price,
+                        "in_stock_only": in_stock_only,
+                    },
+                }
+            except Exception:
+                # If the fast path fails for any reason, fall back to the
+                # standard per-merchant code path below.
+                logger.debug("agent_search_products browse fast path failed", exc_info=True)
+
         # Determine which merchants to search
         merchants_to_search = []
         
@@ -1006,15 +1135,6 @@ async def agent_search_products(
             logger.warning(f"Failed to load external seed products: {e}")
 
         ranking_config = get_agent_ranking_config()
-
-        normalized_query = query.strip() if isinstance(query, str) else ""
-        normalized_category = category.strip() if isinstance(category, str) else ""
-        is_browse_mode = (
-            not normalized_query
-            and not normalized_category
-            and min_price is None
-            and max_price is None
-        )
 
         # Browse mode (no query/filters): keep this endpoint fast for Agents.
         # The Shopping Agent often calls `/products/search` with an empty query
