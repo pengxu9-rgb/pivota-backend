@@ -6,7 +6,7 @@ Products Database - Defense-in-Depth Architecture
 
 from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Text, JSON, Float, BigInteger, Index
 from sqlalchemy.sql import func
-from db.database import metadata, database
+from db.database import IS_POSTGRES, metadata, database
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 import logging
@@ -155,6 +155,27 @@ merchant_analytics = Table(
 # CACHE OPERATIONS (缓存层操作)
 # ============================================================================
 
+def _dedupe_cached_products_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deduplicate products_cache rows by platform_product_id.
+
+    This is a defense-in-depth guard to avoid duplicate products showing up in
+    the merchant portal when concurrent sync jobs (or older data) create
+    multiple rows for the same platform product.
+    """
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for row in rows:
+        platform_product_id = str(row.get("platform_product_id") or "").strip()
+        if not platform_product_id:
+            deduped.append(row)
+            continue
+        if platform_product_id in seen:
+            continue
+        seen.add(platform_product_id)
+        deduped.append(row)
+    return deduped
+
 async def get_cached_products(
     merchant_id: str,
     platform: str,
@@ -184,7 +205,7 @@ async def get_cached_products(
             query = query.offset(offset)
     
     results = await database.fetch_all(query)
-    return [dict(r) for r in results]
+    return _dedupe_cached_products_rows([dict(r) for r in results])
 
 
 async def get_product_cache_row(
@@ -205,6 +226,7 @@ async def get_product_cache_row(
     if not include_expired:
         query = query.where(products_cache.c.expires_at > datetime.now())
 
+    query = query.order_by(products_cache.c.cached_at.desc(), products_cache.c.id.desc()).limit(1)
     row = await database.fetch_one(query)
     return dict(row) if row else None
 
@@ -219,7 +241,50 @@ async def upsert_product_cache(
     """
     更新产品缓存（后台任务调用，非 Agent）
     """
-    expires_at = datetime.now() + timedelta(seconds=ttl_seconds)
+    now = datetime.now()
+    expires_at = now + timedelta(seconds=ttl_seconds)
+
+    # Prefer atomic upsert to prevent duplicates under concurrent sync jobs.
+    # Falls back to a read-then-write pattern for non-Postgres engines or
+    # environments where the unique index has not been applied yet.
+    if IS_POSTGRES:
+        try:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            insert_stmt = pg_insert(products_cache).values(
+                merchant_id=merchant_id,
+                platform=platform,
+                platform_product_id=platform_product_id,
+                product_data=product_data,
+                cached_at=now,
+                expires_at=expires_at,
+                ttl_seconds=ttl_seconds,
+                cache_status="fresh",
+            )
+            upsert_stmt = (
+                insert_stmt.on_conflict_do_update(
+                    index_elements=["merchant_id", "platform", "platform_product_id"],
+                    set_={
+                        "product_data": product_data,
+                        "cached_at": now,
+                        "expires_at": expires_at,
+                        "ttl_seconds": ttl_seconds,
+                        "cache_status": "fresh",
+                    },
+                )
+                .returning(products_cache.c.id)
+            )
+
+            row = await database.fetch_one(upsert_stmt)
+            if row is None:
+                return 0
+            try:
+                return int(row["id"])
+            except Exception:
+                return int(row[0])
+        except Exception:
+            # Likely: unique index not present yet, or dialect mismatch in local dev.
+            pass
     
     # 检查是否存在
     query = products_cache.select().where(
@@ -235,7 +300,7 @@ async def upsert_product_cache(
             products_cache.c.id == existing["id"]
         ).values(
             product_data=product_data,
-            cached_at=datetime.now(),
+            cached_at=now,
             expires_at=expires_at,
             ttl_seconds=ttl_seconds,
             cache_status="fresh"
@@ -249,7 +314,7 @@ async def upsert_product_cache(
             platform=platform,
             platform_product_id=platform_product_id,
             product_data=product_data,
-            cached_at=datetime.now(),
+            cached_at=now,
             expires_at=expires_at,
             ttl_seconds=ttl_seconds,
             cache_status="fresh"
