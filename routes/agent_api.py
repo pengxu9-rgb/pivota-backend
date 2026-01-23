@@ -1058,6 +1058,7 @@ async def agent_search_products(
                 logger.debug("agent_search_products browse fast path failed", exc_info=True)
         # Determine which merchants to search
         merchants_to_search = []
+        merchant_name_by_id: Dict[str, str] = {}
         
         if merchant_id:
             if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
@@ -1097,33 +1098,92 @@ async def agent_search_products(
                 """
                 merchant_rows = await database.fetch_all(query_merchants)
                 merchants_to_search = [row["merchant_id"] for row in merchant_rows]
+                merchant_name_by_id = {
+                    row["merchant_id"]: row.get("business_name") or "Unknown" for row in merchant_rows
+                }
 
         # Collect products from all target merchants
         all_products: List[Dict[str, Any]] = []
-        
-        for mid in merchants_to_search:
+
+        # Multi-merchant fetch can be slow when done sequentially (N+1 DB queries,
+        # plus optional realtime calls). For cross-merchant search we force cache-only
+        # and fetch concurrently to keep tail latency bounded.
+        is_multi_merchant_scope = len(merchants_to_search) > 1
+        force_cache_only = is_multi_merchant_scope
+
+        # When callers provide multiple merchant_ids (or the agent has a multi-merchant
+        # allowed list), avoid per-merchant verification queries; instead, fetch a
+        # compact merchant_id->name map in one query and filter out inactive merchants.
+        if force_cache_only and merchants_to_search and not merchant_name_by_id:
             try:
-                # Verify merchant is active
-                merchant = await verify_merchant_active(mid)
-
-                # Use hybrid query service (cache + realtime) to fetch products
-                products, query_source, _ = await get_products_hybrid(
-                    merchant_id=mid,
-                    limit=limit,
-                    agent_id=context.agent_id,
-                    background_tasks=background_tasks,
+                rows = await database.fetch_all(
+                    """
+	                    SELECT merchant_id, business_name
+	                    FROM merchant_onboarding
+	                    WHERE merchant_id = ANY(:merchant_ids)
+	                      AND status NOT IN ('deleted', 'rejected')
+	                      AND psp_connected = true
+	                    """,
+                    {"merchant_ids": merchants_to_search},
                 )
+                merchant_name_by_id = {
+                    row["merchant_id"]: row.get("business_name") or "Unknown" for row in rows
+                }
+                merchants_to_search = list(merchant_name_by_id.keys())
+            except Exception:
+                logger.debug("agent_search_products merchant name batch lookup failed", exc_info=True)
 
-                for sp in products:
-                    prod_dict = sp.dict()
-                    prod_dict["merchant_id"] = mid
-                    prod_dict["merchant_name"] = merchant.get("business_name", "Unknown")
-                    prod_dict["query_source"] = query_source
-                    all_products.append(prod_dict)
-            except Exception as e:
-                # Log but continue with other merchants
-                logger.warning(f"Failed to get products from {mid}: {e}")
-                continue
+        try:
+            fetch_concurrency = int(os.getenv("AGENT_SEARCH_FETCH_CONCURRENCY", "12"))
+        except Exception:
+            fetch_concurrency = 12
+        fetch_concurrency = max(1, min(32, fetch_concurrency))
+        fetch_sem = asyncio.Semaphore(fetch_concurrency)
+
+        per_merchant_limit = min(50, max(10, int(limit or 20)))
+
+        async def _fetch_products_for_merchant(mid: str) -> List[Dict[str, Any]]:
+            async with fetch_sem:
+                try:
+                    merchant_name = merchant_name_by_id.get(mid)
+                    if not merchant_name and not force_cache_only:
+                        merchant = await verify_merchant_active(mid)
+                        merchant_name = merchant.get("business_name", "Unknown")
+
+                    products, query_source, _ = await get_products_hybrid(
+                        merchant_id=mid,
+                        limit=per_merchant_limit,
+                        agent_id=context.agent_id,
+                        background_tasks=background_tasks,
+                        force_cache_only=force_cache_only,
+                    )
+
+                    out: List[Dict[str, Any]] = []
+                    for sp in products:
+                        prod_dict = sp.dict()
+                        prod_dict["merchant_id"] = mid
+                        prod_dict["merchant_name"] = merchant_name or prod_dict.get("merchant_name") or "Unknown"
+                        prod_dict["query_source"] = query_source
+                        out.append(prod_dict)
+                    return out
+                except Exception as e:
+                    logger.warning(f"Failed to get products from {mid}: {e}")
+                    return []
+
+        if merchants_to_search:
+            try:
+                results = await asyncio.gather(*[_fetch_products_for_merchant(mid) for mid in merchants_to_search])
+                for chunk in results:
+                    if chunk:
+                        all_products.extend(chunk)
+            except Exception:
+                # Non-fatal: fall back to sequential fetch.
+                logger.debug("agent_search_products concurrent fetch failed; falling back to sequential", exc_info=True)
+                for mid in merchants_to_search:
+                    try:
+                        all_products.extend(await _fetch_products_for_merchant(mid))
+                    except Exception:
+                        continue
 
         # Add employee-managed external products (unattached external seeds) as first-class products.
         try:

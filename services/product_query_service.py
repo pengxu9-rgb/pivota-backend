@@ -117,9 +117,6 @@ async def get_products_hybrid(
     query_source = "cache"  # Default
     
     try:
-        # Step 1: Get merchant configuration
-        config = await get_merchant_realtime_config(merchant_id)
-
         # For special callers (e.g. creator surfaces) we may want to bypass
         # realtime entirely and rely on the cache catalog breadth. In this
         # mode we ignore platform scoping because production cache rows
@@ -127,6 +124,9 @@ async def get_products_hybrid(
         if force_cache_only:
             products = await _get_from_cache_all_platforms(merchant_id, limit)
             return products, "cache_all_platforms", None
+
+        # Step 1: Get merchant configuration
+        config = await get_merchant_realtime_config(merchant_id)
 
         if not config:
             logger.warning(f"No config found for merchant {merchant_id}, using cache for all platforms")
