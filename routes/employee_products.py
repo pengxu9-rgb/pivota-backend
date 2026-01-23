@@ -82,6 +82,44 @@ def _ensure_dict(val: Any) -> Dict[str, Any]:
             return {}
     return {}
 
+async def _fetch_latest_products_cache_row(
+    *,
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+    include_expired: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch the newest products_cache row for a (merchant_id, platform, platform_product_id).
+
+    Defense-in-depth:
+    - Prefer non-expired rows (expires_at NULL or > now) unless include_expired=True.
+    - Always order by cached_at/id desc so in the presence of legacy duplicates we
+      pick the freshest row deterministically.
+    """
+    base = (
+        products_cache.select()
+        .where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+        .order_by(products_cache.c.cached_at.desc(), products_cache.c.id.desc())
+        .limit(1)
+    )
+
+    if not include_expired:
+        now = datetime.now()
+        active = base.where(
+            products_cache.c.expires_at.is_(None) | (products_cache.c.expires_at > now)
+        )
+        row = await database.fetch_one(active)
+        if row:
+            return dict(row)
+
+    row = await database.fetch_one(base)
+    return dict(row) if row else None
+
 
 def _is_group_by_product_group(group_by: Optional[str]) -> bool:
     v = (group_by or "").strip().lower()
@@ -2784,17 +2822,14 @@ async def list_product_offers(
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
 
     merchant_id, platform, platform_product_id = parts
-    row = await database.fetch_one(
-        products_cache.select().where(
-            (products_cache.c.merchant_id == merchant_id)
-            & (products_cache.c.platform == platform)
-            & (products_cache.c.platform_product_id == platform_product_id)
-        )
+    row = await _fetch_latest_products_cache_row(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
 
-    row = dict(row)
     product_data = _ensure_dict(row.get("product_data"))
 
     product_group_id: Optional[str] = None
@@ -2939,17 +2974,15 @@ async def get_product_metrics(
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
 
     merchant_id, platform, platform_product_id = parts
-    row = await database.fetch_one(
-        products_cache.select().where(
-            (products_cache.c.merchant_id == merchant_id)
-            & (products_cache.c.platform == platform)
-            & (products_cache.c.platform_product_id == platform_product_id)
-        )
+    row = await _fetch_latest_products_cache_row(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
 
-    product_data = _ensure_dict(dict(row).get("product_data"))
+    product_data = _ensure_dict(row.get("product_data"))
     metrics = await _compute_product_metrics(
         merchant_id=merchant_id,
         platform=platform,
@@ -2971,6 +3004,7 @@ async def search_products(
         default=None,
         description="Optional grouping mode. Use `product_group` to group by product_group_members.product_group_id when available.",
     ),
+    include_expired: bool = Query(default=False, description="Include expired cache rows"),
     current_user: dict = Depends(get_current_employee),
 ):
     """
@@ -2999,6 +3033,9 @@ async def search_products(
         where.append("id < :after_id")
         where_group.append("pc.id < :after_id")
         values["after_id"] = after_id
+    if not include_expired:
+        where.append("(expires_at IS NULL OR expires_at > NOW())")
+        where_group.append("(pc.expires_at IS NULL OR pc.expires_at > NOW())")
 
     debug_errors: List[str] = []
 
@@ -3167,9 +3204,16 @@ async def search_products(
         rows = await database.fetch_all(f"{base}{clause}{order_limit}", values)
 
     cards: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
     for r in rows:
         try:
-            cards.append(_as_product_card(dict(r)))
+            card = _as_product_card(dict(r))
+            key = card.get("product_key")
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            cards.append(card)
         except Exception as exc:
             debug_errors.append(f"card_parse_failed: {str(exc)}")
     next_after_id = int(rows[-1]["id"]) if rows else None
@@ -3195,17 +3239,15 @@ async def get_product_by_key(
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
 
     merchant_id, platform, platform_product_id = parts
-    row = await database.fetch_one(
-        products_cache.select().where(
-            (products_cache.c.merchant_id == merchant_id)
-            & (products_cache.c.platform == platform)
-            & (products_cache.c.platform_product_id == platform_product_id)
-        )
+    row = await _fetch_latest_products_cache_row(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        include_expired=True,
     )
     if not row:
         raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
 
-    row = dict(row)
     product_data = _ensure_dict(row.get("product_data"))
 
     # Parse best-effort StandardProduct for normalized fields, but return the raw JSON as well.
