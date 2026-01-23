@@ -11,6 +11,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from utils.logger import logger
 import secrets
 import json
+import re
 
 from services.agent_ranking_service import (
     AgentRankingFeatures,
@@ -34,6 +35,31 @@ router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
+
+_EXTERNAL_SEED_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "buy",
+    "cart",
+    "checkout",
+    "find",
+    "for",
+    "item",
+    "items",
+    "me",
+    "of",
+    "or",
+    "please",
+    "product",
+    "products",
+    "recommend",
+    "recommendation",
+    "show",
+    "the",
+    "to",
+    "with",
+}
 
 
 def _stable_external_product_id(url: str) -> str:
@@ -78,6 +104,27 @@ def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> 
             except Exception:
                 return {"amount": amt, "currency": str(cur or "") or None}
     return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
+
+
+def _seed_search_terms(raw_query: str) -> List[str]:
+    q = str(raw_query or "").strip()
+    if not q:
+        return []
+    terms = re.findall(r"[a-z0-9]+", q.lower())
+    if not terms:
+        terms = [t for t in q.lower().split() if t]
+
+    filtered: List[str] = []
+    for t in terms:
+        if t in _EXTERNAL_SEED_QUERY_STOPWORDS:
+            continue
+        if len(t) <= 1:
+            continue
+        if t not in filtered:
+            filtered.append(t)
+        if len(filtered) >= 8:
+            break
+    return filtered or terms[:4]
 
 
 def _seed_image_urls(seed_data: Dict[str, Any]) -> List[str]:
@@ -301,13 +348,41 @@ async def _load_external_seed_products_for_search(
     if q:
         values["q_like"] = f"%{q}%"
         clauses = [
-            "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
+            "("
+            "destination_url ILIKE :q_like "
+            "OR canonical_url ILIKE :q_like "
+            "OR domain ILIKE :q_like "
+            "OR title ILIKE :q_like "
+            "OR CAST(seed_data AS TEXT) ILIKE :q_like"
+            ")"
         ]
         q_compact = "".join(q.split())
         if q_compact and q_compact != q:
             values["q_compact_like"] = f"%{q_compact}%"
             clauses.append(
-                "(destination_url ILIKE :q_compact_like OR canonical_url ILIKE :q_compact_like OR domain ILIKE :q_compact_like OR title ILIKE :q_compact_like)"
+                "("
+                "destination_url ILIKE :q_compact_like "
+                "OR canonical_url ILIKE :q_compact_like "
+                "OR domain ILIKE :q_compact_like "
+                "OR title ILIKE :q_compact_like "
+                "OR CAST(seed_data AS TEXT) ILIKE :q_compact_like"
+                ")"
+            )
+
+        terms = _seed_search_terms(q)
+        for idx, term in enumerate(terms):
+            if not term:
+                continue
+            key = f"q_term_{idx}"
+            values[key] = f"%{term}%"
+            clauses.append(
+                "("
+                f"destination_url ILIKE :{key} "
+                f"OR canonical_url ILIKE :{key} "
+                f"OR domain ILIKE :{key} "
+                f"OR title ILIKE :{key} "
+                f"OR CAST(seed_data AS TEXT) ILIKE :{key}"
+                ")"
             )
         where.append("(" + " OR ".join(clauses) + ")")
 

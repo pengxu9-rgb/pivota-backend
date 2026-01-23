@@ -364,3 +364,56 @@ def test_agent_products_search_external_seed_compacts_spaced_query(
     payload = res.json()
     products = payload.get("products") or []
     assert any(p.get("merchant_id") == "external_seed" for p in products)
+
+
+def test_agent_products_search_external_seed_ignores_stopword_product(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            assert values is not None
+            # Ensure the query is tokenized so long NL strings still match.
+            assert values.get("q_term_0") == "%fenty%"
+            assert values.get("q_term_1") == "%beauty%"
+            return [
+                {
+                    "id": "eps_test_fenty",
+                    "external_product_id": "ext_test_fenty",
+                    "market": "US",
+                    "tool": "*",
+                    "utm_template": None,
+                    "partner_type": None,
+                    "disclosure_text": None,
+                    "destination_url": "https://example.com/product/fenty",
+                    "canonical_url": None,
+                    "domain": "example.com",
+                    "title": "Gloss Bomb Universal Lip Luminizer",
+                    "image_url": None,
+                    "price_amount": 24,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "seed_data": {"brand": "Fenty Beauty"},
+                    "status": "active",
+                    "notes": None,
+                    "created_by_employee_id": None,
+                    "attached_product_key": None,
+                    "attached_variant_id": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_sdk_fixed_module, "_is_domain_allowed", AsyncMock(return_value=True))
+
+    res = client.get(
+        "/agent/v1/products/search?merchant_id=external_seed&query=fenty%20beauty%20product&limit=20&offset=0",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    products = payload.get("products") or []
+    assert any(p.get("merchant_id") == "external_seed" for p in products)
