@@ -956,13 +956,14 @@ async def agent_search_products(
                 # Fetch one extra row to compute has_more without an expensive COUNT(*).
                 fetch_limit = page_limit + 1
 
-                where_allowed = ""
-                params: Dict[str, Any] = {
-                    "limit": fetch_limit,
-                    "offset": page_offset,
-                }
+                # Oversample candidates so we can apply merchant filters without
+                # forcing the database to sort/join the entire products_cache table.
+                candidate_limit = min(500, fetch_limit * 25)
+
+                subquery_where_allowed = ""
+                params: Dict[str, Any] = {"candidate_limit": candidate_limit, "offset": page_offset}
                 if allowed:
-                    where_allowed = "AND pc.merchant_id = ANY(:allowed_merchants)"
+                    subquery_where_allowed = "AND merchant_id = ANY(:allowed_merchants)"
                     params["allowed_merchants"] = allowed
 
                 rows = await database.fetch_all(
@@ -970,17 +971,21 @@ async def agent_search_products(
                     SELECT pc.merchant_id,
                            mo.business_name AS merchant_name,
                            pc.product_data
-                    FROM products_cache pc
+                    FROM (
+                      SELECT id, merchant_id, product_data
+                      FROM products_cache
+                      WHERE expires_at > NOW()
+                      {subquery_where_allowed}
+                      ORDER BY id DESC
+                      LIMIT :candidate_limit
+                      OFFSET :offset
+                    ) pc
                     JOIN merchant_onboarding mo
                       ON mo.merchant_id = pc.merchant_id
-                    WHERE pc.expires_at > NOW()
-                      AND mo.status NOT IN ('deleted', 'rejected')
+                    WHERE mo.status NOT IN ('deleted', 'rejected')
                       AND mo.psp_connected = true
-                      {where_allowed}
                     ORDER BY pc.id DESC
-                    LIMIT :limit
-                    OFFSET :offset
-                    """.format(where_allowed=where_allowed),
+                    """.format(subquery_where_allowed=subquery_where_allowed),
                     params,
                 )
 
