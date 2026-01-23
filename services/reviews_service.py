@@ -203,6 +203,49 @@ def build_sku_key(
     return f"{product_key}|{v}"
 
 
+def _parse_product_key(product_key: str) -> Optional[Tuple[str, str, str]]:
+    parts = _as_text(product_key).split("|", 2)
+    if len(parts) != 3 or not all(parts):
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def _parse_sku_key(sku_key: str) -> Optional[Tuple[str, str, str, str]]:
+    parts = _as_text(sku_key).split("|", 3)
+    if len(parts) != 4 or not all(parts):
+        return None
+    return parts[0], parts[1], parts[2], parts[3]
+
+
+def _global_product_key_for_product_key(product_key: str) -> Optional[str]:
+    parsed = _parse_product_key(product_key)
+    if not parsed:
+        return None
+    merchant_id, platform, platform_product_id = parsed
+    if merchant_id == GLOBAL_IMPORT_MERCHANT_ID:
+        return None
+    return build_product_key(
+        merchant_id=GLOBAL_IMPORT_MERCHANT_ID,
+        platform=platform,
+        platform_product_id=platform_product_id,
+    )
+
+
+def _global_sku_key_for_sku_key(sku_key: str) -> Optional[str]:
+    parsed = _parse_sku_key(sku_key)
+    if not parsed:
+        return None
+    merchant_id, platform, platform_product_id, variant_id = parsed
+    if merchant_id == GLOBAL_IMPORT_MERCHANT_ID:
+        return None
+    return build_sku_key(
+        merchant_id=GLOBAL_IMPORT_MERCHANT_ID,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        variant_id=variant_id,
+    )
+
+
 def _encode_cursor(created_at: Any, review_id: int) -> str:
     """
     Encode a stable cursor for pagination: `${timestamp}|${id}` (base64url).
@@ -513,6 +556,25 @@ async def get_review_summary_for_sku(
         platform_product_id=platform_product_id,
         variant_id=variant_id,
     )
+    global_product_key = (
+        build_product_key(
+            merchant_id=GLOBAL_IMPORT_MERCHANT_ID,
+            platform=platform,
+            platform_product_id=platform_product_id,
+        )
+        if _as_text(merchant_id) != GLOBAL_IMPORT_MERCHANT_ID
+        else None
+    )
+    global_sku_key = (
+        build_sku_key(
+            merchant_id=GLOBAL_IMPORT_MERCHANT_ID,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            variant_id=variant_id,
+        )
+        if _as_text(merchant_id) != GLOBAL_IMPORT_MERCHANT_ID
+        else None
+    )
 
     # PDP calls this with variant_id=None. In that case, we want product-level aggregation
     # across all variants (not only sku_key ending with the '∅' sentinel).
@@ -529,7 +591,8 @@ async def get_review_summary_for_sku(
         merchant_row = await database.fetch_one(
             """
             SELECT COUNT(*)::int AS total,
-                   COALESCE(SUM(media_count), 0)::int AS media_count
+                   COALESCE(SUM(media_count), 0)::int AS media_count,
+                   COALESCE(AVG(rating), 0)::float AS avg_rating
             FROM product_reviews
             WHERE product_key = :pk AND status = 'active'
             """,
@@ -539,7 +602,8 @@ async def get_review_summary_for_sku(
         merchant_row = await database.fetch_one(
             """
             SELECT COUNT(*)::int AS total,
-                   COALESCE(SUM(media_count), 0)::int AS media_count
+                   COALESCE(SUM(media_count), 0)::int AS media_count,
+                   COALESCE(AVG(rating), 0)::float AS avg_rating
             FROM product_reviews
             WHERE sku_key = :sku_key AND status = 'active'
             """,
@@ -547,6 +611,33 @@ async def get_review_summary_for_sku(
         )
     merchant_review_count = int(merchant_row["total"] or 0) if merchant_row else 0
     merchant_media_count = int(merchant_row["media_count"] or 0) if merchant_row else 0
+
+    global_review_count = 0
+    global_media_count = 0
+    if global_product_key and is_product_level:
+        global_row = await database.fetch_one(
+            """
+            SELECT COUNT(*)::int AS total,
+                   COALESCE(SUM(media_count), 0)::int AS media_count
+            FROM product_reviews
+            WHERE product_key = :pk AND status = 'active'
+            """,
+            {"pk": global_product_key},
+        )
+        global_review_count = int(global_row["total"] or 0) if global_row else 0
+        global_media_count = int(global_row["media_count"] or 0) if global_row else 0
+    if global_sku_key and (not is_product_level):
+        global_row = await database.fetch_one(
+            """
+            SELECT COUNT(*)::int AS total,
+                   COALESCE(SUM(media_count), 0)::int AS media_count
+            FROM product_reviews
+            WHERE sku_key = :sku_key AND status = 'active'
+            """,
+            {"sku_key": global_sku_key},
+        )
+        global_review_count = int(global_row["total"] or 0) if global_row else 0
+        global_media_count = int(global_row["media_count"] or 0) if global_row else 0
 
     group_total_review_count = 0
     group_media_count = 0
@@ -559,7 +650,8 @@ async def get_review_summary_for_sku(
         group_row = await database.fetch_one(
             """
             SELECT COUNT(*)::int AS total,
-                   COALESCE(SUM(media_count), 0)::int AS media_count
+                   COALESCE(SUM(media_count), 0)::int AS media_count,
+                   COALESCE(AVG(rating), 0)::float AS avg_rating
             FROM product_reviews
             WHERE group_id = :gid AND status = 'active'
             """,
@@ -622,16 +714,118 @@ async def get_review_summary_for_sku(
 
     has_group = group_id is not None
 
+    # PDP-facing summary: provide the normalized fields expected by clients.
+    #
+    # Important: include GLOBAL_IMPORT_MERCHANT_ID (merchantless imports) in the default view so
+    # imported reviews show up on merchant PDPs even before/without full group resolution.
+    scope_params: Dict[str, Any] = {}
+    scope_or: List[str] = []
+    if has_group:
+        scope_or.append("r.group_id = :gid")
+        scope_params["gid"] = int(group_id)
+    if is_product_level:
+        scope_or.append("r.product_key = :pk")
+        scope_params["pk"] = product_key
+        if global_product_key:
+            scope_or.append("r.product_key = :gpk")
+            scope_params["gpk"] = global_product_key
+    else:
+        scope_or.append("r.sku_key = :sk")
+        scope_params["sk"] = sku_key
+        if global_sku_key:
+            scope_or.append("r.sku_key = :gsk")
+            scope_params["gsk"] = global_sku_key
+    scope_where_sql = " OR ".join(scope_or) if scope_or else "FALSE"
+
+    scope_row = await database.fetch_one(
+        f"""
+        SELECT COUNT(*)::int AS total,
+               COALESCE(AVG(r.rating), 0)::float AS avg_rating
+        FROM product_reviews r
+        WHERE r.status = 'active' AND ({scope_where_sql})
+        """,
+        scope_params,
+    )
+    review_count = int(scope_row["total"] or 0) if scope_row else 0
+    rating = float(scope_row["avg_rating"] or 0.0) if scope_row else 0.0
+    if rating < 0:
+        rating = 0.0
+    if rating > 5:
+        rating = 5.0
+
+    dist_rows = await database.fetch_all(
+        f"""
+        SELECT r.rating::int AS rating, COUNT(*)::int AS c
+        FROM product_reviews r
+        WHERE r.status = 'active' AND ({scope_where_sql})
+        GROUP BY r.rating
+        ORDER BY r.rating DESC
+        """,
+        scope_params,
+    )
+    by_star: Dict[int, int] = {}
+    for dr in dist_rows:
+        try:
+            stars = int(dr["rating"] or 0)
+        except Exception:
+            stars = 0
+        if stars <= 0:
+            continue
+        by_star[stars] = int(dr["c"] or 0)
+    star_distribution = []
+    if review_count > 0:
+        for stars in range(5, 0, -1):
+            c = int(by_star.get(stars, 0))
+            star_distribution.append(
+                {
+                    "stars": stars,
+                    "count": c,
+                    "percent": (float(c) / float(review_count)) * 100.0 if review_count else 0.0,
+                }
+            )
+
+    preview_rows = await database.fetch_all(
+        f"""
+        SELECT r.id, r.merchant_id, r.rating,
+               COALESCE(NULLIF(r.body_redacted, ''), r.body) AS body_effective,
+               r.created_at
+        FROM product_reviews r
+        WHERE r.status = 'active' AND ({scope_where_sql})
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT 3
+        """,
+        scope_params,
+    )
+    preview_items: List[Dict[str, Any]] = []
+    for pr in preview_rows:
+        preview_items.append(
+            {
+                "review_id": int(pr["id"]),
+                "merchant_id": str(pr["merchant_id"]),
+                "rating": int(pr["rating"] or 0),
+                "text_snippet": _safe_snippet(pr["body_effective"]),
+                "created_at": _as_iso_datetime(_row_get(pr, "created_at")),
+            }
+        )
+
     return {
         "has_group": has_group,
         "group_id": group_id,
         "group_total_review_count": group_total_review_count,
         "merchant_review_count": merchant_review_count,
+        "global_review_count": global_review_count,
         "media_count": group_media_count if has_group else merchant_media_count,
+        "global_media_count": global_media_count,
         "featured_review_count": featured_review_count,
         "top_featured_preview": top_featured_preview,
         "counts_by_merchant": counts_by_merchant,
         "default_view": "group" if has_group else "merchant",
+        # Normalized, client-friendly summary fields.
+        "scale": 5,
+        "rating": rating,
+        "review_count": review_count,
+        "star_distribution": star_distribution,
+        "preview_items": preview_items,
         "product_key": product_key,
         "sku_key": sku_key,
     }
@@ -784,8 +978,13 @@ async def list_sku_reviews(
     limit = max(1, min(int(limit or 20), 50))
     cursor_pair = _decode_cursor(cursor or "")
 
-    where = ["r.sku_key = :sku_key", "r.status = 'active'"]
-    params: Dict[str, Any] = {"sku_key": sku_key}
+    global_sku_key = _global_sku_key_for_sku_key(sku_key)
+    if global_sku_key:
+        where = ["(r.sku_key = :sku_key OR r.sku_key = :global_sku_key)", "r.status = 'active'"]
+        params: Dict[str, Any] = {"sku_key": sku_key, "global_sku_key": global_sku_key}
+    else:
+        where = ["r.sku_key = :sku_key", "r.status = 'active'"]
+        params = {"sku_key": sku_key}
 
     if has_media:
         where.append("r.media_count > 0")
@@ -889,8 +1088,13 @@ async def list_product_reviews(
     limit = max(1, min(int(limit or 20), 50))
     cursor_pair = _decode_cursor(cursor or "")
 
-    where = ["r.product_key = :pk", "r.status = 'active'"]
-    params: Dict[str, Any] = {"pk": product_key}
+    global_product_key = _global_product_key_for_product_key(product_key)
+    if global_product_key:
+        where = ["(r.product_key = :pk OR r.product_key = :global_pk)", "r.status = 'active'"]
+        params: Dict[str, Any] = {"pk": product_key, "global_pk": global_product_key}
+    else:
+        where = ["r.product_key = :pk", "r.status = 'active'"]
+        params = {"pk": product_key}
 
     if has_media:
         where.append("r.media_count > 0")
