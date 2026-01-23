@@ -2783,7 +2783,7 @@ async def _compute_product_metrics(
                 "platform_product_id": platform_product_id,
             },
         )
-        product_group_id = str(pg_row["product_group_id"]) if pg_row and pg_row.get("product_group_id") else None
+        product_group_id = str(pg_row["product_group_id"]) if pg_row and pg_row["product_group_id"] else None
         if product_group_id:
             count_row = await database.fetch_one(
                 """
@@ -2794,7 +2794,7 @@ async def _compute_product_metrics(
                 {"product_group_id": product_group_id},
             )
             if count_row:
-                merchants_selling = max(1, int(count_row.get("sellers_count") or 0))
+                merchants_selling = max(1, int(count_row["sellers_count"] or 0))
     except Exception:
         merchants_selling = 1
 
@@ -2849,7 +2849,7 @@ async def list_product_offers(
                 "platform_product_id": platform_product_id,
             },
         )
-        product_group_id = str(pg_row["product_group_id"]) if pg_row and pg_row.get("product_group_id") else None
+        product_group_id = str(pg_row["product_group_id"]) if pg_row and pg_row["product_group_id"] else None
     except Exception:
         product_group_id = None
 
@@ -3127,7 +3127,7 @@ async def search_products(
                         {"group_ids": group_ids},
                     )
                     for cr in counts or []:
-                        seller_counts[str(cr["product_group_id"])] = int(cr.get("sellers_count") or 0)
+                        seller_counts[str(cr["product_group_id"])] = int(cr["sellers_count"] or 0)
                 except Exception as exc:
                     debug_errors.append(f"group_sellers_count_failed: {str(exc)[:200]}")
 
