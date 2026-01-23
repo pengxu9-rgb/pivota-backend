@@ -2949,6 +2949,8 @@ async def commit_import_batch(
 
         if created_new:
             imported += 1
+        else:
+            replaced += 1
         await database.execute(
             import_items.update()
             .where(import_items.c.id == int(r["id"]))
@@ -2966,15 +2968,19 @@ async def commit_import_batch(
         .where(import_batches.c.id == bid)
         .values(status="committed", updated_at=_now())
     )
-    await _audit(
-        actor=actor,
-        action="reviews.import.commit",
-        target_type="import_batch",
-        target_id=str(bid),
-        reason=_as_text(reason),
-        before=None,
-        after={"imported": imported, "rejected": rejected},
-    )
+    try:
+        await _audit(
+            actor=actor,
+            action="reviews.import.commit",
+            target_type="import_batch",
+            target_id=str(bid),
+            reason=_as_text(reason),
+            before=None,
+            after={"imported": imported, "rejected": rejected, "replaced": replaced},
+        )
+    except Exception:
+        # Best-effort: never fail a commit after writing data, even if audit logging is misconfigured.
+        pass
     try:
         elapsed_ms = int((time.time() - started_at) * 1000)
         logger.info(

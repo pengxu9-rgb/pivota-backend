@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import mimetypes
 import logging
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+def _coerce_json_dict(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+    return None
 
 
 def _import_storage_dir() -> str:
@@ -231,7 +244,7 @@ async def employee_list_import_batches(
                 "created_by_employee_id": r["created_by_employee_id"],
                 "has_reviews_file": bool(r["has_reviews_file"]),
                 "has_media_zip": bool(r["has_media_zip"]),
-                "report": r["report_json"] if isinstance(r["report_json"], dict) else None,
+                "report": _coerce_json_dict(r["report_json"]),
                 "counts": {"total": sum(by_status.values()), "by_status": by_status},
                 "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else (str(created_at) if created_at else None),
                 "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else (str(updated_at) if updated_at else None),
@@ -322,7 +335,7 @@ async def _commit_import_batch_background(*, actor: Dict[str, Any], batch_id: in
         try:
             batch = await database.fetch_one(import_batches.select().where(import_batches.c.id == int(batch_id)))
             report_json = batch["report_json"] if batch and "report_json" in batch else None
-            report: Dict[str, Any] = dict(report_json) if isinstance(report_json, dict) else {}
+            report: Dict[str, Any] = _coerce_json_dict(report_json) or {}
             report["commit_error"] = {
                 "type": type(e).__name__,
                 "message": str(e)[:200],
