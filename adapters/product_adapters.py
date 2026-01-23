@@ -661,7 +661,9 @@ class WixProductAdapter:
                 "Content-Type": "application/json"
             }
             
-            payload = {"query": {"paging": {"limit": min(limit, 100)}}}
+            # Wix products query does NOT include `variants` by default even when a product has
+            # productOptions/manageVariants=true. We must opt in.
+            payload = {"query": {"paging": {"limit": min(limit, 100)}}, "includeVariants": True}
             
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, json=payload, headers=headers)
