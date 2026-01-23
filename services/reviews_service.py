@@ -2006,7 +2006,7 @@ async def validate_import_batch(
     if not batch:
         raise HTTPException(status_code=404, detail="BATCH_NOT_FOUND")
     batch_status = _as_text(_row_get(batch, "status")).lower()
-    if batch_status in {"validating", "validated", "committed"}:
+    if batch_status in {"validating", "validated", "committing", "committed"}:
         # Prevent concurrent or repeated validate runs from duplicating import_items.
         raise HTTPException(status_code=409, detail="BATCH_ALREADY_VALIDATED")
 
@@ -2436,8 +2436,20 @@ async def commit_import_batch(
     batch = await database.fetch_one(import_batches.select().where(import_batches.c.id == bid))
     if not batch:
         raise HTTPException(status_code=404, detail="BATCH_NOT_FOUND")
-    if str(_row_get(batch, "status")) not in {"validated", "uploaded", "created"}:
+    batch_status = str(_row_get(batch, "status") or "").lower()
+    if batch_status not in {"validated", "uploaded", "created", "committing"}:
         raise HTTPException(status_code=400, detail="BATCH_STATUS_INVALID")
+    # Mark as committing early so the UI can reflect progress and we can avoid accidental double-commits.
+    if batch_status != "committing":
+        try:
+            await database.execute(
+                import_batches.update()
+                .where(import_batches.c.id == bid)
+                .values(status="committing", updated_at=_now())
+            )
+        except Exception:
+            # Best-effort; commit can still proceed.
+            pass
 
     merchant_id = _as_text(batch["merchant_id"])
     source_system = _as_text(batch["source_system"])

@@ -4,9 +4,10 @@ import os
 import mimetypes
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -43,6 +44,9 @@ from utils.auth import require_employee_permissions
 
 router = APIRouter(prefix="/employee/reviews/v1", tags=["Employee Reviews"])
 logger = logging.getLogger(__name__)
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _import_storage_dir() -> str:
@@ -307,30 +311,31 @@ class CommitImportBatchRequest(BaseModel):
     # Optional for ergonomics: allow commit without a JSON body (defaults to ops_import).
     reason: str = Field("ops_import", min_length=1)
 
-
-@router.post(
-    "/import/batches/{batch_id}/commit",
-)
-async def employee_commit_import_batch(
-    batch_id: int,
-    request: Request,
-    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.import.commit"])),
-    body: CommitImportBatchRequest = Body(default_factory=CommitImportBatchRequest),
-) -> Dict[str, Any]:
-    request.state.operation = "reviews.import.commit"
+async def _commit_import_batch_background(*, actor: Dict[str, Any], batch_id: int, reason: str) -> None:
     started = time.time()
     succeeded = False
     try:
-        out = await commit_import_batch(actor=actor, batch_id=int(batch_id), reason=body.reason)
+        await commit_import_batch(actor=actor, batch_id=int(batch_id), reason=reason)
         succeeded = True
-        record_employee_action(action="reviews.import.commit", result="success")
-        return out
-    except HTTPException as e:
-        record_employee_action(action="reviews.import.commit", result="fail")
-        raise
-    except Exception:
-        record_employee_action(action="reviews.import.commit", result="fail")
-        raise
+    except Exception as e:
+        # Best-effort: record failure state so the UI isn't stuck on "committing" forever.
+        try:
+            batch = await database.fetch_one(import_batches.select().where(import_batches.c.id == int(batch_id)))
+            report_json = batch["report_json"] if batch and "report_json" in batch else None
+            report: Dict[str, Any] = dict(report_json) if isinstance(report_json, dict) else {}
+            report["commit_error"] = {
+                "type": type(e).__name__,
+                "message": str(e)[:200],
+                "at": _now().isoformat(),
+            }
+            await database.execute(
+                import_batches.update()
+                .where(import_batches.c.id == int(batch_id))
+                .values(status="commit_failed", report_json=report, updated_at=_now())
+            )
+        except Exception:
+            pass
+        logger.exception("reviews.import.commit.failed batch_id=%s", batch_id)
     finally:
         record_import_commit(
             result="success" if succeeded else "fail",
@@ -338,6 +343,53 @@ async def employee_commit_import_batch(
             duration_seconds=max(0.0, time.time() - started),
             succeeded=succeeded,
         )
+
+
+@router.post(
+    "/import/batches/{batch_id}/commit",
+)
+async def employee_commit_import_batch(
+    batch_id: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.import.commit"])),
+    body: CommitImportBatchRequest = Body(default_factory=CommitImportBatchRequest),
+) -> Dict[str, Any]:
+    request.state.operation = "reviews.import.commit"
+    try:
+        bid = int(batch_id)
+        # Atomically mark as committing to prevent double-clicks from starting multiple commits.
+        transitioned = await database.fetch_one(
+            """
+            UPDATE import_batches
+            SET status = 'committing', updated_at = NOW()
+            WHERE id = :bid AND status IN ('validated', 'uploaded', 'created', 'commit_failed')
+            RETURNING id
+            """,
+            {"bid": bid},
+        )
+        if not transitioned:
+            existing = await database.fetch_one(import_batches.select().where(import_batches.c.id == bid))
+            if not existing:
+                raise HTTPException(status_code=404, detail="BATCH_NOT_FOUND")
+            st = str(existing["status"] or "").lower()
+            if st in {"committing", "committed"}:
+                record_employee_action(action="reviews.import.commit", result="noop")
+                return {"status": "success", "batch_id": bid, "started": False, "state": st}
+            raise HTTPException(status_code=400, detail="BATCH_STATUS_INVALID")
+
+        # Run in background to avoid request timeouts for large batches.
+        background_tasks.add_task(
+            _commit_import_batch_background, actor=actor, batch_id=bid, reason=body.reason
+        )
+        record_employee_action(action="reviews.import.commit", result="started")
+        return {"status": "success", "batch_id": bid, "started": True}
+    except HTTPException:
+        record_employee_action(action="reviews.import.commit", result="fail")
+        raise
+    except Exception:
+        record_employee_action(action="reviews.import.commit", result="fail")
+        raise
 
 
 class ReprocessImportBatchRequest(BaseModel):
