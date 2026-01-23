@@ -2657,10 +2657,22 @@ async def commit_import_batch(
 
     merchant_id = _as_text(batch["merchant_id"])
     source_system = _as_text(batch["source_system"])
-    report_json = _row_get(batch, "report_json")
-    replace_existing = bool(report_json.get("replace_existing")) if isinstance(report_json, dict) else False
+    report_json_raw = _row_get(batch, "report_json")
+    report_json: Dict[str, Any] = {}
+    if isinstance(report_json_raw, dict):
+        report_json = report_json_raw
+    elif isinstance(report_json_raw, str):
+        try:
+            parsed = json.loads(report_json_raw)
+            if isinstance(parsed, dict):
+                report_json = parsed
+        except Exception:
+            report_json = {}
+    replace_existing = bool(report_json.get("replace_existing"))
     if not source_system:
         raise HTTPException(status_code=400, detail="BATCH_SOURCE_SYSTEM_MISSING")
+
+    reviews_file_path = _as_text(_row_get(batch, "reviews_file_path"))
 
     # Load media zip (optional). Convention: files are referenced by filename in each row.
     media_zip_path = _as_text(_row_get(batch, "media_zip_path"))
