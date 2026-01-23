@@ -283,69 +283,90 @@ async def log_agent_usage(
     return request_id
 
 
-async def check_rate_limit(agent_id: str) -> tuple[bool, int, int]:
+async def check_rate_limit(agent_id: str, rate_limit: Optional[int] = None) -> tuple[bool, int, int]:
     """
     检查 Agent 是否超过速率限制
     返回: (是否允许, 当前分钟内请求数, 限制数)
     """
-    # 获取 Agent 配置
-    agent = await get_agent(agent_id)
-    if not agent:
-        return False, 0, 0
-    
-    rate_limit = agent.get("rate_limit", 100)
+    # 获取 Agent 配置（允许调用方传入 limit 以避免重复 DB roundtrip）
+    if rate_limit is None:
+        agent = await get_agent(agent_id)
+        if not agent:
+            return False, 0, 0
+        rate_limit = agent.get("rate_limit", 100)
+
+    try:
+        limit_value = int(rate_limit or 100)
+    except Exception:
+        limit_value = 100
     
     # 统计最近一分钟的请求数
     one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
-    query = f"""
-        SELECT COUNT(*) as count 
-        FROM agent_usage_logs 
-        WHERE agent_id = :agent_id 
-        AND timestamp > :since
+    # Avoid full-table COUNT(*) scans on hot paths by limiting to limit+1 rows.
+    limit_plus_one = max(1, limit_value + 1)
+    query = """
+        SELECT COUNT(*) as count
+        FROM (
+            SELECT 1
+            FROM agent_usage_logs
+            WHERE agent_id = :agent_id
+              AND timestamp > :since
+            LIMIT :limit
+        ) t
     """
     
     try:
         result = await database.fetch_one(
             query,
-            {"agent_id": agent_id, "since": one_minute_ago}
+            {"agent_id": agent_id, "since": one_minute_ago, "limit": limit_plus_one}
         )
         current_count = result["count"] if result else 0
-        return current_count < rate_limit, current_count, rate_limit
+        return current_count < limit_value, current_count, limit_value
     except Exception:
         # If logs table missing, allow request with default limits
-        return True, 0, rate_limit
+        return True, 0, limit_value
 
 
-async def check_daily_quota(agent_id: str) -> tuple[bool, int, int]:
+async def check_daily_quota(agent_id: str, daily_quota: Optional[int] = None) -> tuple[bool, int, int]:
     """
     检查 Agent 是否超过每日配额
     返回: (是否允许, 今日使用量, 配额)
     """
-    agent = await get_agent(agent_id)
-    if not agent:
-        return False, 0, 0
-    
-    daily_quota = agent.get("daily_quota", 10000)
+    if daily_quota is None:
+        agent = await get_agent(agent_id)
+        if not agent:
+            return False, 0, 0
+        daily_quota = agent.get("daily_quota", 10000)
+
+    try:
+        quota_value = int(daily_quota or 10000)
+    except Exception:
+        quota_value = 10000
     
     # 统计今天的请求数
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    query = f"""
-        SELECT COUNT(*) as count 
-        FROM agent_usage_logs 
-        WHERE agent_id = :agent_id 
-        AND timestamp >= :today
+    limit_plus_one = max(1, quota_value + 1)
+    query = """
+        SELECT COUNT(*) as count
+        FROM (
+            SELECT 1
+            FROM agent_usage_logs
+            WHERE agent_id = :agent_id
+              AND timestamp >= :today
+            LIMIT :limit
+        ) t
     """
     
     try:
         result = await database.fetch_one(
             query,
-            {"agent_id": agent_id, "today": today}
+            {"agent_id": agent_id, "today": today, "limit": limit_plus_one}
         )
         today_count = result["count"] if result else 0
-        return today_count < daily_quota, today_count, daily_quota
+        return today_count < quota_value, today_count, quota_value
     except Exception:
         # If logs table missing, allow within quota by default
-        return True, 0, daily_quota
+        return True, 0, quota_value
 
 
 async def get_agent_analytics(
