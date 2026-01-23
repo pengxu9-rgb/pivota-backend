@@ -451,6 +451,194 @@ class ShopifyProductAdapter:
 
 class WixProductAdapter:
     """Wix 产品适配器：Wix API → StandardProduct"""
+
+    @staticmethod
+    def _stock_to_inventory(stock_data: Optional[Dict[str, Any]]) -> int:
+        if not stock_data or not isinstance(stock_data, dict):
+            return 0
+
+        # Wix 库存语义（综合兼容）：
+        # - 老字段：trackInventory
+        # - 新字段：trackQuantity
+        # - inStock: 是否展示为“有货”
+        # - quantity: 仅在跟踪库存时有意义
+        raw_quantity = stock_data.get("quantity", 0) or 0
+        in_stock_flag = stock_data.get("inStock")
+        track_quantity = stock_data.get("trackQuantity")
+        track_inventory = stock_data.get("trackInventory")
+
+        # 不跟踪库存但标记为 inStock：视为充足库存（Wix 前台会显示有货）
+        if (track_quantity is False or track_inventory is False) and in_stock_flag is True and raw_quantity <= 0:
+            return 9999
+
+        try:
+            return int(raw_quantity)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _first_image_url(media: Any) -> Optional[str]:
+        if not media or not isinstance(media, dict):
+            return None
+        items = media.get("items") or []
+        if not isinstance(items, list) or not items:
+            return None
+        first = items[0] if isinstance(items[0], dict) else None
+        img = first.get("image") if first else None
+        url = img.get("url") if isinstance(img, dict) else None
+        return str(url).strip() if url else None
+
+    @staticmethod
+    def _normalize_variant_choices(raw: Any) -> Dict[str, str]:
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            out: Dict[str, str] = {}
+            for k, v in raw.items():
+                kk = str(k).strip()
+                vv = str(v).strip()
+                if kk and vv:
+                    out[kk] = vv
+            return out
+        if isinstance(raw, list):
+            out: Dict[str, str] = {}
+            for it in raw:
+                if not isinstance(it, dict):
+                    continue
+                k = it.get("name") or it.get("option") or it.get("key")
+                v = it.get("value")
+                kk = str(k).strip() if k else ""
+                vv = str(v).strip() if v else ""
+                if kk and vv:
+                    out[kk] = vv
+            return out
+        return {}
+
+    @staticmethod
+    def _extract_wix_variants(wp: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw = wp.get("variants")
+        if isinstance(raw, list):
+            return [v for v in raw if isinstance(v, dict)]
+        if isinstance(raw, dict):
+            inner = raw.get("variants") or raw.get("items") or raw.get("results") or []
+            if isinstance(inner, list):
+                return [v for v in inner if isinstance(v, dict)]
+        return []
+
+    @staticmethod
+    def _convert_product(wp: Dict[str, Any], merchant_id: str) -> Optional[StandardProduct]:
+        if not wp or not isinstance(wp, dict):
+            return None
+
+        price_data = wp.get("priceData") if wp else {}
+        if not price_data:
+            price_data = {}
+
+        image_url = WixProductAdapter._first_image_url(wp.get("media"))
+        inventory = WixProductAdapter._stock_to_inventory(wp.get("stock"))
+
+        name = str(wp.get("name", "Unnamed Product"))
+        product_id = str(wp.get("id", "")).strip()
+
+        # Base product price; if missing/0, fall back to min variant price.
+        try:
+            base_price = float(price_data.get("price", 0) or 0)
+        except Exception:
+            base_price = 0.0
+
+        currency = str(price_data.get("currency", "USD"))
+        sku = str(wp.get("sku", "")) or None
+
+        variants_out: List[StandardProductVariant] = []
+        for v in WixProductAdapter._extract_wix_variants(wp):
+            # Wix sometimes nests variant-specific attributes under `variant`.
+            v_body = v.get("variant") if isinstance(v.get("variant"), dict) else v
+            variant_id = str(v.get("id") or v_body.get("id") or "").strip()
+            if not variant_id:
+                continue
+
+            v_price_data = v_body.get("priceData") if isinstance(v_body.get("priceData"), dict) else {}
+            if not v_price_data and isinstance(v.get("priceData"), dict):
+                v_price_data = v.get("priceData")
+
+            try:
+                v_price = float(v_price_data.get("price", base_price) or base_price)
+            except Exception:
+                v_price = base_price
+
+            v_stock = v_body.get("stock") if isinstance(v_body.get("stock"), dict) else v.get("stock")
+            v_inventory = WixProductAdapter._stock_to_inventory(v_stock)
+
+            v_sku = str(v_body.get("sku") or v.get("sku") or "").strip() or None
+
+            v_media = v_body.get("media") if isinstance(v_body.get("media"), dict) else v.get("media")
+            v_image_url = WixProductAdapter._first_image_url(v_media) or image_url
+
+            choices = WixProductAdapter._normalize_variant_choices(v.get("choices") or v_body.get("choices"))
+            title = " / ".join([str(val) for val in choices.values()]) if choices else name
+
+            variants_out.append(
+                StandardProductVariant(
+                    id=variant_id,
+                    title=title,
+                    sku=v_sku,
+                    price=v_price,
+                    inventory_quantity=int(v_inventory),
+                    options=choices or None,
+                    image_url=v_image_url,
+                )
+            )
+
+        # If no real variants, keep legacy behavior with a synthetic default variant.
+        if not variants_out:
+            variants_out = [
+                StandardProductVariant(
+                    id=str(product_id or sku or "default"),
+                    title=name,
+                    sku=sku,
+                    price=base_price,
+                    inventory_quantity=int(inventory),
+                    image_url=image_url,
+                )
+            ]
+        else:
+            # Ensure stable product inventory and price when variants exist.
+            if base_price <= 0:
+                prices = [v.price for v in variants_out if isinstance(v.price, (int, float)) and v.price > 0]
+                if prices:
+                    base_price = float(min(prices))
+            invs = [int(v.inventory_quantity or 0) for v in variants_out]
+            inventory = 9999 if any(i >= 9999 for i in invs) else int(sum(invs))
+
+        # Check if product is orderable from a Wix perspective:
+        # visible + has a positive price.
+        is_orderable = bool(wp.get("visible", True)) and base_price > 0
+
+        product = StandardProduct(
+            id=product_id,
+            title=name,
+            description=str(wp.get("description", "")),
+            price=base_price,
+            currency=currency,
+            inventory_quantity=int(inventory),
+            sku=sku,
+            image_url=image_url,
+            platform="wix",
+            merchant_id=merchant_id,
+            status=ProductStatus.ACTIVE,
+            variants=variants_out,
+            orderable=is_orderable,
+            created_at=wp.get("dateCreated"),
+            updated_at=wp.get("lastUpdated"),
+        )
+
+        # Run orderable validation
+        from models.standard_product import validate_orderable
+
+        orderable, validation = validate_orderable(product)
+        product.orderable = orderable
+        product.orderable_validation = validation
+        return product
     
     @staticmethod
     async def fetch_products(
@@ -492,87 +680,9 @@ class WixProductAdapter:
                 standard_products = []
                 for wp in wix_products:
                     try:
-                        price_data = wp.get("priceData") if wp else {}
-                        if not price_data:
-                            price_data = {}
-                        
-                        media_items = []
-                        if wp and wp.get("media"):
-                            media_items = wp.get("media", {}).get("items", [])
-                        
-                        image_url = None
-                        if media_items and len(media_items) > 0:
-                            image_obj = media_items[0].get("image") if media_items[0] else None
-                            if image_obj:
-                                image_url = image_obj.get("url")
-                        
-                        stock_data = wp.get("stock") if wp else {}
-                        inventory = 0
-                        if stock_data:
-                            # Wix 库存语义（综合兼容）：
-                            # - 老字段：trackInventory
-                            # - 新字段：trackQuantity
-                            # - inStock: 是否展示为“有货”
-                            # - quantity: 仅在跟踪库存时有意义
-                            raw_quantity = stock_data.get("quantity", 0) or 0
-                            in_stock_flag = stock_data.get("inStock")
-                            track_quantity = stock_data.get("trackQuantity")
-                            track_inventory = stock_data.get("trackInventory")
-
-                            # 不跟踪库存但标记为 inStock：视为充足库存（Wix 前台会显示有货）
-                            if (track_quantity is False or track_inventory is False) and in_stock_flag is True and raw_quantity <= 0:
-                                inventory = 9999
-                            else:
-                                # 正常按照数量来
-                                inventory = raw_quantity
-                        
-                        name = str(wp.get("name", "Unnamed Product"))
-                        price = float(price_data.get("price", 0))
-                        sku = str(wp.get("sku", "")) or None
-
-                        # Check if product is orderable from a Wix perspective:
-                        # visible + has a positive price.
-                        is_orderable = (
-                            wp.get("visible", True) and
-                            price > 0
-                        )
-
-                        # Build a synthetic default variant so that validate_orderable
-                        # can succeed for structurally valid Wix products.
-                        variant = StandardProductVariant(
-                            id=str(wp.get("id", "") or sku or "default"),
-                            title=name,
-                            sku=sku,
-                            price=price,
-                            inventory_quantity=int(inventory),
-                            image_url=image_url,
-                        )
-                        
-                        product = StandardProduct(
-                            id=str(wp.get("id", "")),
-                            title=name,
-                            description=str(wp.get("description", "")),
-                            price=price,
-                            currency=str(price_data.get("currency", "USD")),
-                            inventory_quantity=int(inventory),
-                            sku=sku,
-                            image_url=image_url,
-                            platform="wix",
-                            merchant_id=merchant_id,
-                            status=ProductStatus.ACTIVE,
-                            variants=[variant],
-                            orderable=is_orderable,
-                            created_at=wp.get("dateCreated"),
-                            updated_at=wp.get("lastUpdated")
-                        )
-                        
-                        # Run orderable validation
-                        from models.standard_product import validate_orderable
-                        orderable, validation = validate_orderable(product)
-                        product.orderable = orderable
-                        product.orderable_validation = validation
-                        
-                        standard_products.append(product)
+                        product = WixProductAdapter._convert_product(wp, merchant_id=merchant_id)
+                        if product:
+                            standard_products.append(product)
                     except Exception as product_error:
                         logger.error(f"Error converting Wix product: {product_error}")
                         continue

@@ -1469,6 +1469,156 @@ async def agent_search_products(
         raise HTTPException(status_code=500, detail="Search failed")
 
 
+# ============================================================================
+# 产品归一 / Product Groups (multi-seller offers)
+# ============================================================================
+
+@router.get("/product-groups/resolve")
+async def agent_resolve_product_group(
+    merchant_id: str = Query(..., description="Anchor merchant ID"),
+    product_id: str = Query(..., description="Merchant-scoped platform product_id (platform_product_id)"),
+    platform: Optional[str] = Query(None, description="Optional platform filter (shopify/wix/...)"),
+    limit: int = Query(default=50, le=200),
+    context: AgentContext = Depends(get_agent_context),
+) -> Dict[str, Any]:
+    """
+    Resolve a merchant product into a curated product_group_id, and return its members.
+
+    This powers the gateway's "one product + many seller offers" flow.
+    """
+    if not context.can_access_merchant(merchant_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+    normalized_platform = str(platform or "").strip().lower() or None
+    normalized_product_id = str(product_id or "").strip()
+    if not normalized_product_id:
+        raise HTTPException(status_code=400, detail="product_id is required")
+
+    try:
+        where_platform = "AND platform = :platform" if normalized_platform else ""
+        values = {
+            "merchant_id": merchant_id,
+            "platform_product_id": normalized_product_id,
+            "platform": normalized_platform,
+        }
+        row = await database.fetch_one(
+            f"""
+            SELECT product_group_id
+            FROM product_group_members
+            WHERE merchant_id = :merchant_id
+              AND platform_product_id = :platform_product_id
+              {where_platform}
+            LIMIT 1
+            """,
+            values,
+        )
+        product_group_id = (row["product_group_id"] if row else None) or None
+
+        if not product_group_id:
+            return {"status": "success", "product_group_id": None, "members": []}
+
+        member_rows = await database.fetch_all(
+            """
+            SELECT pgm.merchant_id,
+                   mo.business_name AS merchant_name,
+                   pgm.platform,
+                   pgm.platform_product_id AS product_id,
+                   pgm.is_primary
+            FROM product_group_members pgm
+            LEFT JOIN merchant_onboarding mo ON mo.merchant_id = pgm.merchant_id
+            WHERE pgm.product_group_id = :product_group_id
+            ORDER BY pgm.is_primary DESC, pgm.merchant_id ASC
+            LIMIT :limit
+            """,
+            {"product_group_id": product_group_id, "limit": limit},
+        )
+
+        members = []
+        for r in member_rows or []:
+            mid = str(r.get("merchant_id") or "").strip()
+            if not mid or not context.can_access_merchant(mid):
+                continue
+            members.append(
+                {
+                    "merchant_id": mid,
+                    "merchant_name": r.get("merchant_name"),
+                    "product_id": str(r.get("product_id") or "").strip(),
+                    "platform": str(r.get("platform") or "").strip().lower() or None,
+                    "is_primary": bool(r.get("is_primary") or False),
+                }
+            )
+
+        return {"status": "success", "product_group_id": product_group_id, "members": members}
+    except Exception as e:
+        message = str(e)
+        if "product_group_members" in message and ("does not exist" in message or "relation" in message):
+            return {
+                "status": "success",
+                "product_group_id": None,
+                "members": [],
+                "warning": "product_group_members table not found (migration not applied)",
+            }
+        raise
+
+
+@router.get("/product-groups/{product_group_id}")
+async def agent_get_product_group(
+    product_group_id: str,
+    limit: int = Query(default=50, le=200),
+    context: AgentContext = Depends(get_agent_context),
+) -> Dict[str, Any]:
+    """
+    Fetch product-group members by product_group_id.
+    """
+    normalized_group_id = str(product_group_id or "").strip()
+    if not normalized_group_id:
+        raise HTTPException(status_code=400, detail="product_group_id is required")
+
+    try:
+        member_rows = await database.fetch_all(
+            """
+            SELECT pgm.merchant_id,
+                   mo.business_name AS merchant_name,
+                   pgm.platform,
+                   pgm.platform_product_id AS product_id,
+                   pgm.is_primary
+            FROM product_group_members pgm
+            LEFT JOIN merchant_onboarding mo ON mo.merchant_id = pgm.merchant_id
+            WHERE pgm.product_group_id = :product_group_id
+            ORDER BY pgm.is_primary DESC, pgm.merchant_id ASC
+            LIMIT :limit
+            """,
+            {"product_group_id": normalized_group_id, "limit": limit},
+        )
+
+        members = []
+        for r in member_rows or []:
+            mid = str(r.get("merchant_id") or "").strip()
+            if not mid or not context.can_access_merchant(mid):
+                continue
+            members.append(
+                {
+                    "merchant_id": mid,
+                    "merchant_name": r.get("merchant_name"),
+                    "product_id": str(r.get("product_id") or "").strip(),
+                    "platform": str(r.get("platform") or "").strip().lower() or None,
+                    "is_primary": bool(r.get("is_primary") or False),
+                }
+            )
+
+        return {"status": "success", "product_group_id": normalized_group_id, "members": members}
+    except Exception as e:
+        message = str(e)
+        if "product_group_members" in message and ("does not exist" in message or "relation" in message):
+            return {
+                "status": "success",
+                "product_group_id": normalized_group_id,
+                "members": [],
+                "warning": "product_group_members table not found (migration not applied)",
+            }
+        raise
+
+
 @router.get("/products/{merchant_id}/{product_id}")
 async def agent_get_product(
     merchant_id: str,

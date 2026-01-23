@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
+from pydantic import BaseModel, Field
 
 from db.database import database
 
@@ -32,6 +33,18 @@ async def require_admin_key(
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
     return dict(row) if row is not None else {}
+
+
+class ProductGroupMemberInput(BaseModel):
+    merchant_id: str = Field(..., description="Internal merchant id")
+    platform: str = Field(..., description="Platform identifier (shopify/wix/...)")
+    platform_product_id: str = Field(..., description="Platform product id (aka agent product_id)")
+    is_primary: bool = Field(default=False, description="Primary/anchor member in the group")
+
+
+class ProductGroupUpsertRequest(BaseModel):
+    product_group_id: str = Field(..., description="Stable product group id")
+    members: List[ProductGroupMemberInput] = Field(default_factory=list)
 
 
 @router.get("/merchant/{merchant_id}", response_model=Dict[str, Any])
@@ -165,3 +178,66 @@ async def reconcile_store_product_counts(
             updated.append({"store_id": store_id, "platform": platform, "from": current, "to": target})
 
     return {"ok": True, "merchant_id": merchant_id, "counts_by_platform": counts_by_platform, "updated": updated}
+
+
+@router.post("/product-groups/upsert", response_model=Dict[str, Any])
+async def upsert_product_group_members(
+    payload: ProductGroupUpsertRequest,
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """
+    Upsert product_group_members rows.
+
+    This is an internal operational helper to curate multi-seller group mappings.
+    """
+    product_group_id = str(payload.product_group_id or "").strip()
+    if not product_group_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_group_id is required")
+
+    members = payload.members or []
+    if not members:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="members[] is required")
+
+    upserted: List[Dict[str, Any]] = []
+    for m in members:
+        merchant_id = str(m.merchant_id or "").strip()
+        platform = str(m.platform or "").strip().lower()
+        platform_product_id = str(m.platform_product_id or "").strip()
+        if not merchant_id or not platform or not platform_product_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Each member requires merchant_id, platform, platform_product_id",
+            )
+
+        await database.execute(
+            """
+            INSERT INTO product_group_members (
+              product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at
+            ) VALUES (
+              :product_group_id, :merchant_id, :platform, :platform_product_id, :is_primary, NOW()
+            )
+            ON CONFLICT (merchant_id, platform, platform_product_id)
+            DO UPDATE SET
+              product_group_id = EXCLUDED.product_group_id,
+              is_primary = EXCLUDED.is_primary,
+              updated_at = NOW()
+            """,
+            {
+                "product_group_id": product_group_id,
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+                "is_primary": bool(m.is_primary),
+            },
+        )
+        upserted.append(
+            {
+                "product_group_id": product_group_id,
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "product_id": platform_product_id,
+                "is_primary": bool(m.is_primary),
+            }
+        )
+
+    return {"ok": True, "product_group_id": product_group_id, "upserted": upserted}
