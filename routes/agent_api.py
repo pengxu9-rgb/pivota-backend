@@ -1597,11 +1597,9 @@ async def agent_resolve_product_group(
 
     try:
         where_platform = "AND platform = :platform" if normalized_platform else ""
-        values = {
-            "merchant_id": merchant_id,
-            "platform_product_id": normalized_product_id,
-            "platform": normalized_platform,
-        }
+        values = {"merchant_id": merchant_id, "platform_product_id": normalized_product_id}
+        if normalized_platform:
+            values["platform"] = normalized_platform
         row = await database.fetch_one(
             f"""
             SELECT product_group_id
@@ -1683,6 +1681,9 @@ async def agent_resolve_product_group_by_product_id(
 
     try:
         where_platform = "AND platform = :platform" if normalized_platform else ""
+        params = {"platform_product_id": normalized_product_id, "limit": limit}
+        if normalized_platform:
+            params["platform"] = normalized_platform
         rows = await database.fetch_all(
             f"""
             SELECT product_group_id, merchant_id
@@ -1692,7 +1693,7 @@ async def agent_resolve_product_group_by_product_id(
             ORDER BY is_primary DESC, merchant_id ASC
             LIMIT :limit
             """,
-            {"platform_product_id": normalized_product_id, "platform": normalized_platform, "limit": limit},
+            params,
         )
 
         resolved_group_id: Optional[str] = None
