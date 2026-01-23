@@ -242,7 +242,7 @@ async def _get_from_cache_all_platforms(
             SELECT product_data
             FROM products_cache
             WHERE merchant_id = :merchant_id
-            AND (expires_at IS NULL OR expires_at > NOW())
+            AND expires_at > NOW()
             ORDER BY cached_at DESC
             LIMIT {limit}
         """
