@@ -17,6 +17,7 @@ import json
 import hashlib
 import re
 from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlunparse
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -517,6 +518,51 @@ def _parse_float(raw: Any) -> Optional[float]:
         return None
 
 
+_CSV_KEY_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_csv_key(raw: Any) -> str:
+    """
+    Normalize CSV header keys so we can accept multiple upload formats.
+    Examples:
+      - "Product URL" -> "product_url"
+      - "priceAmount" -> "priceamount"
+    """
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    s = _CSV_KEY_NORMALIZE_RE.sub("_", s)
+    return s.strip("_")
+
+
+def _normalize_seed_url_for_id(url: str) -> str:
+    """
+    Make external_product_id stable across common tracking params.
+    Mirrors `services.external_offers_service._normalize_url` semantics (subset).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="INVALID_URL")
+    qs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith("utm_")]
+    qs = [(k, v) for k, v in qs if k.lower() not in {"fbclid", "gclid", "yclid", "msclkid"}]
+    query = urlencode(qs, doseq=True)
+    return urlunparse(parsed._replace(fragment="", query=query))
+
+
+def _normalize_seed_availability(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    v = s.strip().lower()
+    if v in {"in stock", "in_stock", "instock"}:
+        return "in_stock"
+    if v in {"out of stock", "out_of_stock", "outofstock", "sold out", "sold_out", "unavailable"}:
+        return "out_of_stock"
+    return v.replace(" ", "_")
+
+
 @router.post("/external-seeds/import-csv", response_model=ExternalSeedsCsvImportResponse)
 async def import_external_seeds_csv(
     req: Request,
@@ -551,6 +597,13 @@ async def import_external_seeds_csv(
         raise HTTPException(status_code=400, detail="INVALID_MODE")
 
     reader = csv.DictReader(io.StringIO(text))
+    fieldnames_norm = {_normalize_csv_key(x) for x in (reader.fieldnames or [])}
+    is_catalog_export = (
+        "product_url" in fieldnames_norm
+        and "destination_url" not in fieldnames_norm
+        and "url" not in fieldnames_norm
+    )
+
     created = 0
     updated = 0
     errors: List[str] = []
@@ -559,230 +612,574 @@ async def import_external_seeds_csv(
     employee_id = current_user.get("employee_id") or current_user.get("employeeId")
     created_by = str(current_user.get("email") or employee_id or "")
 
-    for idx, row in enumerate(reader, start=2):
-        try:
-            destination_url = str(row.get("destination_url") or row.get("url") or "").strip()
-            if not destination_url:
-                raise ValueError("MISSING_DESTINATION_URL")
-            dest = _require_http_url(destination_url)
+    if is_catalog_export:
+        # Catalog-style import (one row per variant, grouped into a single seed per Product URL).
+        # Example: Tom Ford export CSV.
+        groups: Dict[str, Dict[str, Any]] = {}
+        group_meta: Dict[str, Dict[str, Any]] = {}
 
-            row_market = _normalize_market(row.get("market") or default_market)
-            row_tool = _normalize_tool(row.get("tool") or default_tool)
-
-            title = str(row.get("title") or "").strip() or None
-            description = str(row.get("description") or row.get("product_details") or "").strip() or None
-            image_url = str(row.get("image_url") or row.get("imageUrl") or "").strip() or None
-            availability = str(row.get("availability") or "").strip() or None
-            utm_template = str(row.get("utm_template") or row.get("utmTemplate") or "").strip() or None
-            partner_type = str(row.get("partner_type") or row.get("partnerType") or "").strip() or None
-            disclosure_text = str(row.get("disclosure_text") or row.get("disclosureText") or "").strip() or None
-            notes = str(row.get("notes") or "").strip() or None
-            status = str(row.get("status") or "").strip().lower() or None
-
-            attached_product_key = str(row.get("attached_product_key") or row.get("product_key") or "").strip() or None
-            attached_variant_id = str(row.get("attached_variant_id") or row.get("variant_id") or "").strip() or None
-            if attached_variant_id == "":
-                attached_variant_id = None
-            if attached_variant_id is not None and attached_variant_id != "∅":
-                attached_variant_id = attached_variant_id
-            if attached_variant_id is None and attached_product_key:
-                attached_variant_id = "∅"
-
-            price_amount = _parse_float(row.get("price_amount") or row.get("price") or row.get("priceAmount"))
-            price_currency = str(row.get("price_currency") or row.get("currency") or row.get("priceCurrency") or "").strip() or None
-
-            canonical_url = str(row.get("canonical_url") or row.get("canonicalUrl") or "").strip() or None
-            domain = None
+        for idx, row in enumerate(reader, start=2):
             try:
-                domain = (urlparse(canonical_url or dest).hostname or "").lower() or None
-            except Exception:
-                domain = None
+                nrow = { _normalize_csv_key(k): v for k, v in (row or {}).items() if k is not None }
 
-            external_product_id = str(row.get("external_product_id") or "").strip() or _stable_external_product_id(canonical_url or dest)
-            if not external_product_id:
-                raise ValueError("MISSING_EXTERNAL_PRODUCT_ID")
+                product_url_raw = str(nrow.get("product_url") or "").strip()
+                if not product_url_raw:
+                    raise ValueError("MISSING_PRODUCT_URL")
+                product_url = _normalize_seed_url_for_id(_require_http_url(product_url_raw))
 
-            existing_row = None
-            if mode_norm == "upsert":
-                existing_row = await database.fetch_one(
-                    """
-                    SELECT *
-                    FROM external_product_seeds
-                    WHERE market = :market
-                      AND tool = :tool
-                      AND external_product_id = :external_product_id
-                    ORDER BY updated_at DESC, created_at DESC
-                    LIMIT 1
-                    """,
-                    {"market": row_market, "tool": row_tool, "external_product_id": external_product_id},
+                row_market = _normalize_market(nrow.get("market") or default_market)
+                row_tool = _normalize_tool(nrow.get("tool") or default_tool)
+
+                product_title = str(nrow.get("product_title") or nrow.get("title") or "").strip() or None
+                brand = str(nrow.get("brand") or "").strip() or None
+                description = str(nrow.get("ai_merged_description") or nrow.get("description") or "").strip() or None
+
+                variant_sku = str(nrow.get("sku") or nrow.get("option_value") or "").strip() or None
+                variant_id_raw = str(nrow.get("variant_id") or "").strip() or None
+                variant_id = variant_sku or variant_id_raw or f"v_{idx}"
+
+                option_name = str(nrow.get("option_name") or "").strip() or None
+                option_value = str(nrow.get("option_value") or "").strip() or None
+
+                deep_link = str(nrow.get("deep_link") or nrow.get("variant_url") or "").strip() or None
+                if deep_link and not deep_link.startswith(("http://", "https://")):
+                    deep_link = None
+
+                price_amount = _parse_float(nrow.get("price") or nrow.get("price_amount") or nrow.get("priceamount"))
+                price_currency = str(nrow.get("currency") or nrow.get("price_currency") or nrow.get("pricecurrency") or "").strip().upper() or None
+                availability = _normalize_seed_availability(nrow.get("availability"))
+
+                variant_image_url = str(nrow.get("variant_image_url") or "").strip() or None
+                if variant_image_url and not variant_image_url.startswith(("http://", "https://")):
+                    variant_image_url = None
+
+                external_product_id = (
+                    str(nrow.get("external_product_id") or "").strip()
+                    or _stable_external_product_id(product_url)
                 )
-                if not existing_row:
-                    match_url = canonical_url or dest
+                if not external_product_id:
+                    raise ValueError("MISSING_EXTERNAL_PRODUCT_ID")
+
+                group_key = f"{row_market}|{row_tool}|{external_product_id}"
+                groups.setdefault(group_key, {"variants": [], "image_urls": []})
+                gm = group_meta.setdefault(
+                    group_key,
+                    {
+                        "market": row_market,
+                        "tool": row_tool,
+                        "external_product_id": external_product_id,
+                        "destination_url": product_url,
+                        "canonical_url": product_url,
+                        "title": product_title,
+                        "brand": brand,
+                        "description": description,
+                    },
+                )
+
+                # Merge group-level fields (first non-empty wins).
+                if not gm.get("title") and product_title:
+                    gm["title"] = product_title
+                if not gm.get("brand") and brand:
+                    gm["brand"] = brand
+                if not gm.get("description") and description:
+                    gm["description"] = description
+
+                options: Dict[str, str] = {}
+                if option_name and option_value:
+                    options[option_name] = option_value
+
+                variant_title = option_value or variant_sku or variant_id
+                variant_payload: Dict[str, Any] = {
+                    "variant_id": variant_id,
+                    "title": _normalize_variant_title(variant_title),
+                    **({"sku": variant_sku} if variant_sku else {}),
+                    **({"price_amount": price_amount} if price_amount is not None else {}),
+                    **({"price_currency": price_currency} if price_currency else {}),
+                    **({"currency": price_currency} if price_currency else {}),
+                    **({"availability": availability} if availability else {}),
+                    **({"image_url": variant_image_url} if variant_image_url else {}),
+                    **({"options": options} if options else {}),
+                    **({"destination_url": deep_link} if deep_link else {}),
+                }
+
+                groups[group_key]["variants"].append(variant_payload)
+                if variant_image_url:
+                    groups[group_key]["image_urls"].append(variant_image_url)
+            except HTTPException as exc:
+                errors.append(f"Row {idx}: {exc.detail}")
+            except Exception as exc:
+                errors.append(f"Row {idx}: {str(exc)}")
+
+        # Upsert each grouped product seed
+        for group_key, g in groups.items():
+            try:
+                gm = group_meta.get(group_key) or {}
+                row_market = gm.get("market") or default_market
+                row_tool = gm.get("tool") or default_tool
+                external_product_id = gm.get("external_product_id") or ""
+                dest = gm.get("destination_url") or ""
+                canonical_url = gm.get("canonical_url") or None
+
+                if not external_product_id or not dest:
+                    raise ValueError("INVALID_GROUP")
+
+                # Deduplicate + sort variants so primary price is stable (min price first).
+                seen_variant_ids: set[str] = set()
+                variants: List[Dict[str, Any]] = []
+                for v in g.get("variants") or []:
+                    if not isinstance(v, dict):
+                        continue
+                    vid = str(v.get("variant_id") or "").strip()
+                    if not vid or vid in seen_variant_ids:
+                        continue
+                    seen_variant_ids.add(vid)
+                    variants.append(v)
+
+                def _variant_price_key(v: Dict[str, Any]) -> float:
+                    raw = v.get("price_amount")
+                    if raw is None:
+                        raw = v.get("price") or v.get("amount") or v.get("value")
+                    try:
+                        return float(raw)
+                    except Exception:
+                        return float("inf")
+
+                variants.sort(key=_variant_price_key)
+
+                image_urls: List[str] = []
+                seen_images: set[str] = set()
+                for u in g.get("image_urls") or []:
+                    if not isinstance(u, str):
+                        continue
+                    uu = u.strip()
+                    if not uu or not uu.startswith(("http://", "https://")):
+                        continue
+                    if uu in seen_images:
+                        continue
+                    seen_images.add(uu)
+                    image_urls.append(uu)
+                    if len(image_urls) >= 20:
+                        break
+
+                title = gm.get("title") or None
+                brand = gm.get("brand") or None
+                description = gm.get("description") or None
+                image_url = image_urls[0] if image_urls else None
+
+                # Summary price: min variant price when present.
+                price_amount = None
+                price_currency = None
+                for v in variants:
+                    if v.get("price_amount") is None:
+                        continue
+                    price_amount = v.get("price_amount")
+                    price_currency = v.get("price_currency") or v.get("currency")
+                    break
+                if price_currency is not None:
+                    price_currency = str(price_currency).strip().upper() or None
+
+                # Summary availability: in_stock if any variant is in_stock.
+                availability = None
+                if variants:
+                    any_in_stock = False
+                    for v in variants:
+                        a = _normalize_seed_availability(v.get("availability"))
+                        if a == "in_stock" or a is None:
+                            any_in_stock = True
+                            break
+                    availability = "in_stock" if any_in_stock else "out_of_stock"
+
+                domain = None
+                try:
+                    domain = (urlparse(canonical_url or dest).hostname or "").lower() or None
+                except Exception:
+                    domain = None
+
+                existing_row = None
+                if mode_norm == "upsert":
                     existing_row = await database.fetch_one(
                         """
                         SELECT *
                         FROM external_product_seeds
                         WHERE market = :market
                           AND tool = :tool
-                          AND (canonical_url = :match_url OR destination_url = :match_url)
+                          AND external_product_id = :external_product_id
                         ORDER BY updated_at DESC, created_at DESC
                         LIMIT 1
                         """,
-                        {"market": row_market, "tool": row_tool, "match_url": match_url},
+                        {"market": row_market, "tool": row_tool, "external_product_id": external_product_id},
                     )
+                    if not existing_row:
+                        match_url = canonical_url or dest
+                        existing_row = await database.fetch_one(
+                            """
+                            SELECT *
+                            FROM external_product_seeds
+                            WHERE market = :market
+                              AND tool = :tool
+                              AND (canonical_url = :match_url OR destination_url = :match_url)
+                            ORDER BY updated_at DESC, created_at DESC
+                            LIMIT 1
+                            """,
+                            {"market": row_market, "tool": row_tool, "match_url": match_url},
+                        )
 
-            if existing_row:
-                existing = dict(existing_row)
-                seed_id = str(existing.get("id"))
-                seed_data = _ensure_json_obj(existing.get("seed_data"))
-                seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
-                seed_data["source"] = seed_data.get("source") or "employee_seed_csv"
+                if existing_row:
+                    existing = dict(existing_row)
+                    seed_id = str(existing.get("id"))
+                    seed_data = _ensure_json_obj(existing.get("seed_data"))
+                    seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
+                    seed_data["source"] = seed_data.get("source") or "employee_seed_csv_catalog"
+                    if title is not None:
+                        seed_data["title"] = title
+                    if brand is not None:
+                        seed_data["brand"] = brand
+                    if description is not None:
+                        seed_data["description"] = description
+                    if image_url is not None:
+                        seed_data["image_url"] = image_url
+                    if image_urls:
+                        seed_data["image_urls"] = image_urls
+                    if availability is not None:
+                        seed_data["availability"] = availability
+                    if variants:
+                        seed_data["variants"] = variants
 
-                if title is not None:
-                    seed_data["title"] = title
-                if description is not None:
-                    seed_data["description"] = description
-                if image_url is not None:
-                    seed_data["image_url"] = image_url
-                if availability is not None:
-                    seed_data["availability"] = availability
-                if utm_template is not None:
-                    seed_data["utm_template"] = utm_template
-                if partner_type is not None:
-                    seed_data["partner_type"] = partner_type
-                if disclosure_text is not None:
-                    seed_data["disclosure_text"] = disclosure_text
+                    canonical_url_update = canonical_url if canonical_url is not None else existing.get("canonical_url")
+                    domain_update = domain if domain is not None else existing.get("domain")
 
-                canonical_url_update = canonical_url if canonical_url is not None else existing.get("canonical_url")
-                domain_update = domain if domain is not None else existing.get("domain")
+                    update_values: Dict[str, Any] = {
+                        "id": seed_id,
+                        "external_product_id": external_product_id,
+                        "destination_url": dest,
+                        "canonical_url": canonical_url_update,
+                        "domain": domain_update,
+                        "seed_data": _seed_data_payload(seed_data),
+                        "created_by_employee_id": str(employee_id) if employee_id else None,
+                    }
+                    set_clauses = [
+                        "external_product_id = :external_product_id",
+                        "destination_url = :destination_url",
+                        "canonical_url = :canonical_url",
+                        "domain = :domain",
+                        "seed_data = :seed_data",
+                        "updated_at = NOW()",
+                        "created_by_employee_id = :created_by_employee_id",
+                    ]
 
-                update_values: Dict[str, Any] = {
-                    "id": seed_id,
+                    if title is not None:
+                        update_values["title"] = title
+                        set_clauses.append("title = :title")
+                    if image_url is not None:
+                        update_values["image_url"] = image_url
+                        set_clauses.append("image_url = :image_url")
+                    if price_amount is not None:
+                        update_values["price_amount"] = price_amount
+                        set_clauses.append("price_amount = :price_amount")
+                    if price_currency is not None:
+                        update_values["price_currency"] = price_currency
+                        set_clauses.append("price_currency = :price_currency")
+                    if availability is not None:
+                        update_values["availability"] = availability
+                        set_clauses.append("availability = :availability")
+
+                    await _execute_seed_data_stmt(
+                        f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
+                        update_values,
+                    )
+                    updated += 1
+                    seed_ids.append(seed_id)
+                    continue
+
+                seed_id = _seed_id()
+                seed_data: Dict[str, Any] = {
                     "external_product_id": external_product_id,
-                    "destination_url": dest,
-                    "canonical_url": canonical_url_update,
-                    "domain": domain_update,
-                    "seed_data": _seed_data_payload(seed_data),
-                    "created_by_employee_id": str(employee_id) if employee_id else None,
+                    "title": title,
+                    "brand": brand,
+                    "description": description,
+                    "image_url": image_url,
+                    "image_urls": image_urls,
+                    "availability": availability,
+                    "variants": variants,
+                    "disclosure_text": DEFAULT_DISCLOSURE_TEXT,
+                    "source": "employee_seed_csv_catalog",
                 }
-                set_clauses = [
-                    "external_product_id = :external_product_id",
-                    "destination_url = :destination_url",
-                    "canonical_url = :canonical_url",
-                    "domain = :domain",
-                    "seed_data = :seed_data",
-                    "updated_at = NOW()",
-                    "created_by_employee_id = :created_by_employee_id",
-                ]
-
-                if title is not None:
-                    update_values["title"] = title
-                    set_clauses.append("title = :title")
-                if image_url is not None:
-                    update_values["image_url"] = image_url
-                    set_clauses.append("image_url = :image_url")
-                if price_amount is not None:
-                    update_values["price_amount"] = price_amount
-                    set_clauses.append("price_amount = :price_amount")
-                if price_currency is not None:
-                    update_values["price_currency"] = price_currency
-                    set_clauses.append("price_currency = :price_currency")
-                if availability is not None:
-                    update_values["availability"] = availability
-                    set_clauses.append("availability = :availability")
-                if utm_template is not None:
-                    update_values["utm_template"] = utm_template
-                    set_clauses.append("utm_template = :utm_template")
-                if partner_type is not None:
-                    update_values["partner_type"] = partner_type
-                    set_clauses.append("partner_type = :partner_type")
-                if disclosure_text is not None:
-                    update_values["disclosure_text"] = disclosure_text
-                    set_clauses.append("disclosure_text = :disclosure_text")
-                if notes is not None:
-                    update_values["notes"] = notes
-                    set_clauses.append("notes = :notes")
-                if status is not None:
-                    if status not in ("active", "disabled"):
-                        raise ValueError("INVALID_STATUS")
-                    update_values["status"] = status
-                    set_clauses.append("status = :status")
-                if attached_product_key is not None:
-                    update_values["attached_product_key"] = attached_product_key
-                    set_clauses.append("attached_product_key = :attached_product_key")
-                    update_values["attached_variant_id"] = attached_variant_id or "∅"
-                    set_clauses.append("attached_variant_id = :attached_variant_id")
 
                 await _execute_seed_data_stmt(
-                    f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
-                    update_values,
+                    """
+                    INSERT INTO external_product_seeds (
+                      id, external_product_id, market, tool,
+                      utm_template, partner_type, disclosure_text,
+                      destination_url, canonical_url, domain,
+                      title, image_url, price_amount, price_currency, availability,
+                      seed_data, status, notes, created_by_employee_id, attached_product_key, attached_variant_id,
+                      created_at, updated_at
+                    ) VALUES (
+                      :id, :external_product_id, :market, :tool,
+                      :utm_template, :partner_type, :disclosure_text,
+                      :destination_url, :canonical_url, :domain,
+                      :title, :image_url, :price_amount, :price_currency, :availability,
+                      :seed_data, :status, :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+                      NOW(), NOW()
+                    )
+                    """,
+                    {
+                        "id": seed_id,
+                        "external_product_id": external_product_id,
+                        "market": row_market,
+                        "tool": row_tool,
+                        "utm_template": None,
+                        "partner_type": None,
+                        "disclosure_text": DEFAULT_DISCLOSURE_TEXT,
+                        "destination_url": dest,
+                        "canonical_url": canonical_url,
+                        "domain": domain,
+                        "title": title,
+                        "image_url": image_url,
+                        "price_amount": price_amount,
+                        "price_currency": price_currency,
+                        "availability": availability,
+                        "seed_data": _seed_data_payload(seed_data),
+                        "status": "active",
+                        "notes": None,
+                        "created_by_employee_id": created_by,
+                        "attached_product_key": None,
+                        "attached_variant_id": None,
+                    },
                 )
-                updated += 1
+                created += 1
                 seed_ids.append(seed_id)
-                continue
+            except HTTPException as exc:
+                errors.append(f"Group {group_key}: {exc.detail}")
+            except Exception as exc:
+                errors.append(f"Group {group_key}: {str(exc)}")
+    else:
+        for idx, row in enumerate(reader, start=2):
+            try:
+                destination_url = str(row.get("destination_url") or row.get("url") or "").strip()
+                if not destination_url:
+                    raise ValueError("MISSING_DESTINATION_URL")
+                dest = _normalize_seed_url_for_id(_require_http_url(destination_url))
 
-            # Create
-            seed_id = _seed_id()
-            seed_data: Dict[str, Any] = {
-                "external_product_id": external_product_id,
-                "title": title,
-                "description": description,
-                "image_url": image_url,
-                "availability": availability,
-                "utm_template": utm_template,
-                "partner_type": partner_type,
-                "disclosure_text": disclosure_text or DEFAULT_DISCLOSURE_TEXT,
-                "source": "employee_seed_csv",
-            }
+                row_market = _normalize_market(row.get("market") or default_market)
+                row_tool = _normalize_tool(row.get("tool") or default_tool)
 
-            await _execute_seed_data_stmt(
-                """
-                INSERT INTO external_product_seeds (
-                  id, external_product_id, market, tool,
-                  utm_template, partner_type, disclosure_text,
-                  destination_url, canonical_url, domain,
-                  title, image_url, price_amount, price_currency, availability,
-                  seed_data, status, notes, created_by_employee_id, attached_product_key, attached_variant_id,
-                  created_at, updated_at
-                ) VALUES (
-                  :id, :external_product_id, :market, :tool,
-                  :utm_template, :partner_type, :disclosure_text,
-                  :destination_url, :canonical_url, :domain,
-                  :title, :image_url, :price_amount, :price_currency, :availability,
-                  :seed_data, :status, :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
-                  NOW(), NOW()
-                )
-                """,
-                {
-                    "id": seed_id,
+                title = str(row.get("title") or "").strip() or None
+                description = str(row.get("description") or row.get("product_details") or "").strip() or None
+                image_url = str(row.get("image_url") or row.get("imageUrl") or "").strip() or None
+                availability = _normalize_seed_availability(row.get("availability"))
+                utm_template = str(row.get("utm_template") or row.get("utmTemplate") or "").strip() or None
+                partner_type = str(row.get("partner_type") or row.get("partnerType") or "").strip() or None
+                disclosure_text = str(row.get("disclosure_text") or row.get("disclosureText") or "").strip() or None
+                notes = str(row.get("notes") or "").strip() or None
+                status = str(row.get("status") or "").strip().lower() or None
+
+                attached_product_key = str(row.get("attached_product_key") or row.get("product_key") or "").strip() or None
+                attached_variant_id = str(row.get("attached_variant_id") or row.get("variant_id") or "").strip() or None
+                if attached_variant_id == "":
+                    attached_variant_id = None
+                if attached_variant_id is not None and attached_variant_id != "∅":
+                    attached_variant_id = attached_variant_id
+                if attached_variant_id is None and attached_product_key:
+                    attached_variant_id = "∅"
+
+                price_amount = _parse_float(row.get("price_amount") or row.get("price") or row.get("priceAmount"))
+                price_currency = str(row.get("price_currency") or row.get("currency") or row.get("priceCurrency") or "").strip() or None
+
+                canonical_url = str(row.get("canonical_url") or row.get("canonicalUrl") or "").strip() or None
+                if canonical_url:
+                    canonical_url = _normalize_seed_url_for_id(_require_http_url(canonical_url))
+                domain = None
+                try:
+                    domain = (urlparse(canonical_url or dest).hostname or "").lower() or None
+                except Exception:
+                    domain = None
+
+                external_product_id = str(row.get("external_product_id") or "").strip() or _stable_external_product_id(canonical_url or dest)
+                if not external_product_id:
+                    raise ValueError("MISSING_EXTERNAL_PRODUCT_ID")
+
+                existing_row = None
+                if mode_norm == "upsert":
+                    existing_row = await database.fetch_one(
+                        """
+                        SELECT *
+                        FROM external_product_seeds
+                        WHERE market = :market
+                          AND tool = :tool
+                          AND external_product_id = :external_product_id
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT 1
+                        """,
+                        {"market": row_market, "tool": row_tool, "external_product_id": external_product_id},
+                    )
+                    if not existing_row:
+                        match_url = canonical_url or dest
+                        existing_row = await database.fetch_one(
+                            """
+                            SELECT *
+                            FROM external_product_seeds
+                            WHERE market = :market
+                              AND tool = :tool
+                              AND (canonical_url = :match_url OR destination_url = :match_url)
+                            ORDER BY updated_at DESC, created_at DESC
+                            LIMIT 1
+                            """,
+                            {"market": row_market, "tool": row_tool, "match_url": match_url},
+                        )
+
+                if existing_row:
+                    existing = dict(existing_row)
+                    seed_id = str(existing.get("id"))
+                    seed_data = _ensure_json_obj(existing.get("seed_data"))
+                    seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
+                    seed_data["source"] = seed_data.get("source") or "employee_seed_csv"
+
+                    if title is not None:
+                        seed_data["title"] = title
+                    if description is not None:
+                        seed_data["description"] = description
+                    if image_url is not None:
+                        seed_data["image_url"] = image_url
+                    if availability is not None:
+                        seed_data["availability"] = availability
+                    if utm_template is not None:
+                        seed_data["utm_template"] = utm_template
+                    if partner_type is not None:
+                        seed_data["partner_type"] = partner_type
+                    if disclosure_text is not None:
+                        seed_data["disclosure_text"] = disclosure_text
+
+                    canonical_url_update = canonical_url if canonical_url is not None else existing.get("canonical_url")
+                    domain_update = domain if domain is not None else existing.get("domain")
+
+                    update_values: Dict[str, Any] = {
+                        "id": seed_id,
+                        "external_product_id": external_product_id,
+                        "destination_url": dest,
+                        "canonical_url": canonical_url_update,
+                        "domain": domain_update,
+                        "seed_data": _seed_data_payload(seed_data),
+                        "created_by_employee_id": str(employee_id) if employee_id else None,
+                    }
+                    set_clauses = [
+                        "external_product_id = :external_product_id",
+                        "destination_url = :destination_url",
+                        "canonical_url = :canonical_url",
+                        "domain = :domain",
+                        "seed_data = :seed_data",
+                        "updated_at = NOW()",
+                        "created_by_employee_id = :created_by_employee_id",
+                    ]
+
+                    if title is not None:
+                        update_values["title"] = title
+                        set_clauses.append("title = :title")
+                    if image_url is not None:
+                        update_values["image_url"] = image_url
+                        set_clauses.append("image_url = :image_url")
+                    if price_amount is not None:
+                        update_values["price_amount"] = price_amount
+                        set_clauses.append("price_amount = :price_amount")
+                    if price_currency is not None:
+                        update_values["price_currency"] = price_currency
+                        set_clauses.append("price_currency = :price_currency")
+                    if availability is not None:
+                        update_values["availability"] = availability
+                        set_clauses.append("availability = :availability")
+                    if utm_template is not None:
+                        update_values["utm_template"] = utm_template
+                        set_clauses.append("utm_template = :utm_template")
+                    if partner_type is not None:
+                        update_values["partner_type"] = partner_type
+                        set_clauses.append("partner_type = :partner_type")
+                    if disclosure_text is not None:
+                        update_values["disclosure_text"] = disclosure_text
+                        set_clauses.append("disclosure_text = :disclosure_text")
+                    if notes is not None:
+                        update_values["notes"] = notes
+                        set_clauses.append("notes = :notes")
+                    if status is not None:
+                        if status not in ("active", "disabled"):
+                            raise ValueError("INVALID_STATUS")
+                        update_values["status"] = status
+                        set_clauses.append("status = :status")
+                    if attached_product_key is not None:
+                        update_values["attached_product_key"] = attached_product_key
+                        set_clauses.append("attached_product_key = :attached_product_key")
+                        update_values["attached_variant_id"] = attached_variant_id or "∅"
+                        set_clauses.append("attached_variant_id = :attached_variant_id")
+
+                    await _execute_seed_data_stmt(
+                        f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
+                        update_values,
+                    )
+                    updated += 1
+                    seed_ids.append(seed_id)
+                    continue
+
+                # Create
+                seed_id = _seed_id()
+                seed_data: Dict[str, Any] = {
                     "external_product_id": external_product_id,
-                    "market": row_market,
-                    "tool": row_tool,
+                    "title": title,
+                    "description": description,
+                    "image_url": image_url,
+                    "availability": availability,
                     "utm_template": utm_template,
                     "partner_type": partner_type,
                     "disclosure_text": disclosure_text or DEFAULT_DISCLOSURE_TEXT,
-                    "destination_url": dest,
-                    "canonical_url": canonical_url,
-                    "domain": domain,
-                    "title": title,
-                    "image_url": image_url,
-                    "price_amount": price_amount,
-                    "price_currency": price_currency,
-                    "availability": availability,
-                    "seed_data": _seed_data_payload(seed_data),
-                    "status": status if status in ("active", "disabled") else "active",
-                    "notes": notes,
-                    "created_by_employee_id": created_by,
-                    "attached_product_key": attached_product_key,
-                    "attached_variant_id": attached_variant_id or ("∅" if attached_product_key else None),
-                },
-            )
-            created += 1
-            seed_ids.append(seed_id)
-        except HTTPException as exc:
-            errors.append(f"Row {idx}: {exc.detail}")
-        except Exception as exc:
-            errors.append(f"Row {idx}: {str(exc)}")
+                    "source": "employee_seed_csv",
+                }
+
+                await _execute_seed_data_stmt(
+                    """
+                    INSERT INTO external_product_seeds (
+                      id, external_product_id, market, tool,
+                      utm_template, partner_type, disclosure_text,
+                      destination_url, canonical_url, domain,
+                      title, image_url, price_amount, price_currency, availability,
+                      seed_data, status, notes, created_by_employee_id, attached_product_key, attached_variant_id,
+                      created_at, updated_at
+                    ) VALUES (
+                      :id, :external_product_id, :market, :tool,
+                      :utm_template, :partner_type, :disclosure_text,
+                      :destination_url, :canonical_url, :domain,
+                      :title, :image_url, :price_amount, :price_currency, :availability,
+                      :seed_data, :status, :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+                      NOW(), NOW()
+                    )
+                    """,
+                    {
+                        "id": seed_id,
+                        "external_product_id": external_product_id,
+                        "market": row_market,
+                        "tool": row_tool,
+                        "utm_template": utm_template,
+                        "partner_type": partner_type,
+                        "disclosure_text": disclosure_text or DEFAULT_DISCLOSURE_TEXT,
+                        "destination_url": dest,
+                        "canonical_url": canonical_url,
+                        "domain": domain,
+                        "title": title,
+                        "image_url": image_url,
+                        "price_amount": price_amount,
+                        "price_currency": price_currency,
+                        "availability": availability,
+                        "seed_data": _seed_data_payload(seed_data),
+                        "status": status if status in ("active", "disabled") else "active",
+                        "notes": notes,
+                        "created_by_employee_id": created_by,
+                        "attached_product_key": attached_product_key,
+                        "attached_variant_id": attached_variant_id or ("∅" if attached_product_key else None),
+                    },
+                )
+                created += 1
+                seed_ids.append(seed_id)
+            except HTTPException as exc:
+                errors.append(f"Row {idx}: {exc.detail}")
+            except Exception as exc:
+                errors.append(f"Row {idx}: {str(exc)}")
 
     return ExternalSeedsCsvImportResponse(created=created, updated=updated, errors=errors, seedIds=seed_ids)
 
