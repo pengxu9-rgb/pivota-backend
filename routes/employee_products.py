@@ -11,6 +11,7 @@ NOTE (v0):
 """
 
 from typing import Any, Dict, List, Optional
+import asyncio
 import csv
 import io
 import json
@@ -20,7 +21,7 @@ from urllib.parse import urlparse
 from urllib.parse import parse_qsl, urlencode, urlunparse
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 import uuid
 
@@ -41,6 +42,12 @@ from db.reviews_center import product_reviews
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
+
+_EXTERNAL_SEEDS_TABLE_READY = False
+_EXTERNAL_SEEDS_TABLE_LOCK = asyncio.Lock()
+
+_EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = False
+_EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
 
 def _to_iso(val: Any) -> Optional[str]:
     if val is None:
@@ -147,6 +154,12 @@ async def _ensure_external_seeds_table() -> None:
     Minimal storage for employee-managed external seeds.
     We intentionally keep this as runtime DDL for MVP to avoid blocking on migration runners.
     """
+    global _EXTERNAL_SEEDS_TABLE_READY
+    if _EXTERNAL_SEEDS_TABLE_READY:
+        return
+    async with _EXTERNAL_SEEDS_TABLE_LOCK:
+        if _EXTERNAL_SEEDS_TABLE_READY:
+            return
     await database.execute(
         """
         CREATE TABLE IF NOT EXISTS external_product_seeds (
@@ -219,6 +232,78 @@ async def _ensure_external_seeds_table() -> None:
     await database.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_product_seeds_active_unique ON external_product_seeds(market, tool, external_product_id) WHERE status = 'active' AND external_product_id IS NOT NULL;"
     )
+    _EXTERNAL_SEEDS_TABLE_READY = True
+
+
+async def _ensure_external_seed_import_tasks_table() -> None:
+    """
+    Track async CSV imports so the UI can poll status without holding an HTTP connection open.
+    Runtime DDL keeps MVP deploys unblocked.
+    """
+    global _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY
+    if _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY:
+        return
+    async with _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK:
+        if _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY:
+            return
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS employee_external_seed_import_tasks (
+              id TEXT PRIMARY KEY,
+              status TEXT NOT NULL DEFAULT 'pending',
+              market TEXT NOT NULL,
+              tool TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              created_by_employee_id TEXT NULL,
+              created_count INTEGER NOT NULL DEFAULT 0,
+              updated_count INTEGER NOT NULL DEFAULT 0,
+              errors TEXT NOT NULL DEFAULT '[]',
+              seed_ids TEXT NOT NULL DEFAULT '[]',
+              stats TEXT NOT NULL DEFAULT '{}',
+              error TEXT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              finished_at TIMESTAMPTZ NULL
+            );
+            """
+        )
+
+        # Backfill columns for older deployments (best-effort).
+        try:
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_by_employee_id TEXT;"
+            )
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_count INTEGER NOT NULL DEFAULT 0;"
+            )
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS updated_count INTEGER NOT NULL DEFAULT 0;"
+            )
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS errors TEXT NOT NULL DEFAULT '[]';"
+            )
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS seed_ids TEXT NOT NULL DEFAULT '[]';"
+            )
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS stats TEXT NOT NULL DEFAULT '{}';"
+            )
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS error TEXT;"
+            )
+            await database.execute(
+                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;"
+            )
+        except Exception:
+            pass
+
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_status ON employee_external_seed_import_tasks(status);"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_updated_at ON employee_external_seed_import_tasks(updated_at DESC);"
+        )
+        _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = True
 
 
 async def _ensure_primary_offers_table() -> None:
@@ -266,6 +351,27 @@ def _ensure_json_obj(val: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _ensure_json_list(val: Any) -> List[Any]:
+    if isinstance(val, list):
+        return val
+    if isinstance(val, tuple):
+        return list(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _external_seed_import_task_id() -> str:
+    return f"esit_{uuid.uuid4().hex}"
 
 
 _SEED_DATA_FORCE_TEXT = False
@@ -504,6 +610,7 @@ class ExternalSeedsCsvImportResponse(BaseModel):
     updated: int = 0
     errors: List[str] = Field(default_factory=list)
     seedIds: List[str] = Field(default_factory=list)
+    taskId: Optional[str] = None
 
 
 def _parse_float(raw: Any) -> Optional[float]:
@@ -563,13 +670,195 @@ def _normalize_seed_availability(raw: Any) -> Optional[str]:
     return v.replace(" ", "_")
 
 
+async def _run_external_seed_import_task(
+    *,
+    task_id: str,
+    csv_text: str,
+    current_user: dict,
+    market: str,
+    tool: str,
+    mode: str,
+) -> None:
+    started_at = datetime.now(timezone.utc)
+    try:
+        await _ensure_external_seed_import_tasks_table()
+        await database.execute(
+            """
+            UPDATE employee_external_seed_import_tasks
+            SET status = 'running',
+                updated_at = NOW()
+            WHERE id = :id
+            """,
+            {"id": task_id},
+        )
+
+        result = await _import_external_seeds_csv_text(
+            text=csv_text,
+            current_user=current_user,
+            market=market,
+            tool=tool,
+            mode=mode,
+        )
+
+        duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        stats = {
+            "duration_ms": duration_ms,
+            "created": result.created,
+            "updated": result.updated,
+            "errors_count": len(result.errors or []),
+            "seed_ids_count": len(result.seedIds or []),
+        }
+
+        await database.execute(
+            """
+            UPDATE employee_external_seed_import_tasks
+            SET status = 'success',
+                created_count = :created_count,
+                updated_count = :updated_count,
+                errors = :errors,
+                seed_ids = :seed_ids,
+                stats = :stats,
+                finished_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :id
+            """,
+            {
+                "id": task_id,
+                "created_count": int(result.created or 0),
+                "updated_count": int(result.updated or 0),
+                "errors": json.dumps(list(result.errors or [])[:500]),
+                "seed_ids": json.dumps(list(result.seedIds or [])[:5000]),
+                "stats": json.dumps(stats),
+            },
+        )
+    except Exception as exc:
+        try:
+            duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+            await database.execute(
+                """
+                UPDATE employee_external_seed_import_tasks
+                SET status = 'error',
+                    error = :error,
+                    stats = :stats,
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :id
+                """,
+                {
+                    "id": task_id,
+                    "error": str(exc)[:800],
+                    "stats": json.dumps({"duration_ms": duration_ms}),
+                },
+            )
+        except Exception:
+            pass
+
+
+@router.get("/external-seeds/import-tasks/{task_id}")
+async def get_external_seed_import_task(
+    task_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seed_import_tasks_table()
+    row = await database.fetch_one(
+        "SELECT * FROM employee_external_seed_import_tasks WHERE id = :id",
+        {"id": task_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+    data = dict(row)
+    return {
+        "status": "success",
+        "task": {
+            "id": data.get("id"),
+            "status": data.get("status"),
+            "market": data.get("market"),
+            "tool": data.get("tool"),
+            "mode": data.get("mode"),
+            "created": int(data.get("created_count") or 0),
+            "updated": int(data.get("updated_count") or 0),
+            "errors": [str(x) for x in _ensure_json_list(data.get("errors")) if str(x)],
+            "seedIds": [str(x) for x in _ensure_json_list(data.get("seed_ids")) if str(x)],
+            "error": data.get("error"),
+            "stats": _ensure_json_obj(data.get("stats")),
+            "created_at": _to_iso(data.get("created_at")),
+            "updated_at": _to_iso(data.get("updated_at")),
+            "finished_at": _to_iso(data.get("finished_at")),
+        },
+    }
+
+
 @router.post("/external-seeds/import-csv", response_model=ExternalSeedsCsvImportResponse)
 async def import_external_seeds_csv(
     req: Request,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_employee),
     market: str = Query("US"),
     tool: str = Query("*"),
     mode: str = Query("upsert"),
+    async_import: bool = Query(False, alias="async"),
+) -> ExternalSeedsCsvImportResponse:
+    raw = await req.body()
+    text = raw.decode("utf-8", errors="replace")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="EMPTY_CSV")
+
+    employee_id = current_user.get("employee_id") or current_user.get("employeeId")
+    created_by = str(current_user.get("email") or employee_id or "")
+
+    if async_import:
+        await _ensure_external_seed_import_tasks_table()
+        task_id = _external_seed_import_task_id()
+        await database.execute(
+            """
+            INSERT INTO employee_external_seed_import_tasks (
+              id, status, market, tool, mode, created_by_employee_id,
+              created_count, updated_count, errors, seed_ids, stats,
+              created_at, updated_at
+            ) VALUES (
+              :id, 'pending', :market, :tool, :mode, :created_by_employee_id,
+              0, 0, :errors, :seed_ids, :stats,
+              NOW(), NOW()
+            )
+            """,
+            {
+                "id": task_id,
+                "market": _normalize_market(market),
+                "tool": _normalize_tool(tool),
+                "mode": str(mode or "upsert").strip().lower(),
+                "created_by_employee_id": created_by,
+                "errors": "[]",
+                "seed_ids": "[]",
+                "stats": json.dumps({"input_bytes": len(raw)}),
+            },
+        )
+        background_tasks.add_task(
+            _run_external_seed_import_task,
+            task_id=task_id,
+            csv_text=text,
+            current_user=current_user,
+            market=market,
+            tool=tool,
+            mode=mode,
+        )
+        return ExternalSeedsCsvImportResponse(created=0, updated=0, errors=[], seedIds=[], taskId=task_id)
+
+    return await _import_external_seeds_csv_text(
+        text=text,
+        current_user=current_user,
+        market=market,
+        tool=tool,
+        mode=mode,
+    )
+
+
+async def _import_external_seeds_csv_text(
+    *,
+    text: str,
+    current_user: dict,
+    market: str,
+    tool: str,
+    mode: str,
 ) -> ExternalSeedsCsvImportResponse:
     """
     CSV import for external seeds / external products.
@@ -586,7 +875,6 @@ async def import_external_seeds_csv(
     """
     await _ensure_external_seeds_table()
 
-    text = (await req.body()).decode("utf-8", errors="replace")
     if not text.strip():
         raise HTTPException(status_code=400, detail="EMPTY_CSV")
 
