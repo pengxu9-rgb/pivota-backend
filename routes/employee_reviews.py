@@ -352,6 +352,7 @@ async def employee_commit_import_batch(
     batch_id: int,
     request: Request,
     background_tasks: BackgroundTasks,
+    resume: bool = Query(default=False),
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.import.commit"])),
     body: CommitImportBatchRequest = Body(default_factory=CommitImportBatchRequest),
 ) -> Dict[str, Any]:
@@ -373,9 +374,64 @@ async def employee_commit_import_batch(
             if not existing:
                 raise HTTPException(status_code=404, detail="BATCH_NOT_FOUND")
             st = str(existing["status"] or "").lower()
-            if st in {"committing", "committed"}:
+            if st == "committed":
                 record_employee_action(action="reviews.import.commit", result="noop")
                 return {"status": "success", "batch_id": bid, "started": False, "state": st}
+            if st == "committing":
+                # Allow a safe "resume" if the original background task was dropped (e.g. worker restart).
+                # This is guarded by a staleness check on import_items.updated_at so we don't accidentally
+                # start parallel commits while one is still making progress.
+                if not resume:
+                    record_employee_action(action="reviews.import.commit", result="noop")
+                    return {"status": "success", "batch_id": bid, "started": False, "state": st}
+
+                remaining = await database.fetch_val(
+                    """
+                    SELECT COUNT(*)::int
+                    FROM import_items
+                    WHERE batch_id = :bid
+                      AND status NOT IN ('imported', 'replaced', 'rejected', 'deduped')
+                    """,
+                    {"bid": bid},
+                )
+                remaining_n = int(remaining or 0)
+                if remaining_n <= 0:
+                    # Nothing left to do; best-effort mark committed so the UI unblocks.
+                    await database.execute(
+                        import_batches.update()
+                        .where(import_batches.c.id == bid)
+                        .values(status="committed", updated_at=_now())
+                    )
+                    record_employee_action(action="reviews.import.commit", result="noop")
+                    return {"status": "success", "batch_id": bid, "started": False, "state": "committed"}
+
+                # Staleness check: if import_items.updated_at has advanced recently, a commit is still running.
+                # Use a Python comparison so this works across Postgres/SQLite.
+                last_progress = await database.fetch_val(
+                    "SELECT MAX(updated_at) FROM import_items WHERE batch_id = :bid", {"bid": bid}
+                )
+                stale = True
+                try:
+                    lp = last_progress
+                    if isinstance(lp, str):
+                        lp = datetime.fromisoformat(lp.replace("Z", "+00:00"))
+                    if isinstance(lp, datetime):
+                        if lp.tzinfo is None:
+                            lp = lp.replace(tzinfo=timezone.utc)
+                        stale = (_now() - lp).total_seconds() > 5 * 60
+                except Exception:
+                    stale = True
+
+                if not stale:
+                    # Still progressing; don't start a second commit.
+                    raise HTTPException(status_code=409, detail="COMMIT_IN_PROGRESS")
+
+                # Run in background to avoid request timeouts for large batches.
+                background_tasks.add_task(
+                    _commit_import_batch_background, actor=actor, batch_id=bid, reason=body.reason
+                )
+                record_employee_action(action="reviews.import.commit", result="resumed")
+                return {"status": "success", "batch_id": bid, "started": True, "resumed": True}
             raise HTTPException(status_code=400, detail="BATCH_STATUS_INVALID")
 
         # Run in background to avoid request timeouts for large batches.
