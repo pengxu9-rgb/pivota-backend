@@ -968,26 +968,26 @@ async def agent_search_products(
 
                 rows = await database.fetch_all(
                     """
-                    SELECT pc.merchant_id,
-                           mo.business_name AS merchant_name,
-                           pc.product_data
-                    FROM (
-                      SELECT id, merchant_id, product_data
-                      FROM products_cache
-                      WHERE expires_at > NOW()
-                      {subquery_where_allowed}
-                      ORDER BY id DESC
-                      LIMIT :candidate_limit
-                      OFFSET :offset
-                    ) pc
-                    JOIN merchant_onboarding mo
-                      ON mo.merchant_id = pc.merchant_id
-                    WHERE mo.status NOT IN ('deleted', 'rejected')
-                      AND mo.psp_connected = true
-                    ORDER BY pc.id DESC
-                    """.format(subquery_where_allowed=subquery_where_allowed),
-                    params,
-                )
+	                    SELECT pc.merchant_id,
+	                           mo.business_name AS merchant_name,
+	                           pc.product_data
+	                    FROM (
+	                      SELECT id, expires_at, merchant_id, product_data
+	                      FROM products_cache
+	                      WHERE expires_at > NOW()
+	                      {subquery_where_allowed}
+	                      ORDER BY expires_at DESC, id DESC
+	                      LIMIT :candidate_limit
+	                      OFFSET :offset
+	                    ) pc
+	                    JOIN merchant_onboarding mo
+	                      ON mo.merchant_id = pc.merchant_id
+	                    WHERE mo.status NOT IN ('deleted', 'rejected')
+	                      AND mo.psp_connected = true
+	                    ORDER BY pc.expires_at DESC, pc.id DESC
+	                    """.format(subquery_where_allowed=subquery_where_allowed),
+	                    params,
+	                )
 
                 products: List[Dict[str, Any]] = []
                 for row in rows:
