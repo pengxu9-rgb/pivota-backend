@@ -267,6 +267,10 @@ class GetProductDetailPayload(BaseModel):
     product: ProductRef
 
 
+class GetReviewSummaryPayload(BaseModel):
+    sku: ReviewsSkuRef
+
+
 class ListSkuReviewsFilters(BaseModel):
     featured_only: bool = False
     has_media: bool = False
@@ -3964,6 +3968,7 @@ async def invoke_shop_operation(
     Supported operations:
     - find_products
     - get_product_detail
+    - get_review_summary
     - list_sku_reviews
     - list_group_reviews
     - list_group_merchants
@@ -4002,6 +4007,62 @@ async def invoke_shop_operation(
         error_detail = None
         try:
             return await _handle_get_product_detail(payload.product, background_tasks)
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=max(0.0, time.time() - started),
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
+
+    if operation == "get_review_summary":
+        if not _reviews_enabled():
+            raise HTTPException(status_code=404, detail="REVIEWS_DISABLED")
+        payload = GetReviewSummaryPayload(**request.payload)
+        http_request.state.operation = operation
+        http_request.state.merchant_id = payload.sku.merchant_id
+        started = time.time()
+        status_code = 200
+        error_detail = None
+        try:
+            from services.reviews_service import get_review_summary_for_sku
+
+            variant_id = payload.sku.variant_id
+            if variant_id is not None and str(variant_id).strip() == "":
+                variant_id = None
+
+            review_summary = await get_review_summary_for_sku(
+                merchant_id=payload.sku.merchant_id,
+                platform=payload.sku.platform,
+                platform_product_id=payload.sku.platform_product_id,
+                variant_id=variant_id,
+            )
+
+            dv = _reviews_default_view_override()
+            if dv and review_summary:
+                review_summary["default_view"] = dv
+            try:
+                from observability.reviews_metrics import record_pdp_default_view
+
+                if review_summary and isinstance(review_summary, dict):
+                    record_pdp_default_view(str(review_summary.get("default_view") or "merchant"))
+            except Exception:
+                pass
+
+            return {"review_summary": review_summary}
         except HTTPException as e:
             status_code = int(e.status_code)
             error_detail = str(e.detail)
