@@ -261,25 +261,34 @@ async def signin(login_data: UserLogin):
             print(f"Users lookup skipped: {e}")
             user = None
 
-        if user and user.get("password_hash") and verify_bcrypt_password(
+        user_row = None
+        if user:
+            # `database.fetch_one` returns a Record which supports `__getitem__`
+            # but not `.get()`; convert to dict for safe access.
+            try:
+                user_row = dict(user)
+            except Exception:
+                user_row = None
+
+        if user_row and user_row.get("password_hash") and verify_bcrypt_password(
             login_data.password,
-            user["password_hash"],
+            user_row["password_hash"],
         ):
-            if user.get("active") is False:
+            if user_row.get("active") is False:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Account has been deactivated",
                 )
 
-            token = create_jwt_token(user["email"], user["role"], user["email"])
+            token = create_jwt_token(user_row["email"], user_row["role"], user_row["email"])
             user_payload = {
-                "id": str(user["id"]),
-                "email": user["email"],
-                "full_name": user.get("full_name") or user["email"],
-                "role": user["role"],
+                "id": str(user_row["id"]),
+                "email": user_row["email"],
+                "full_name": user_row.get("full_name") or user_row["email"],
+                "role": user_row["role"],
             }
-            if user.get("merchant_id"):
-                user_payload["merchant_id"] = user["merchant_id"]
+            if user_row.get("merchant_id"):
+                user_payload["merchant_id"] = user_row["merchant_id"]
 
             return {
                 "status": "success",
