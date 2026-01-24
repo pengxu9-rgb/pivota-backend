@@ -50,6 +50,9 @@ _EXTERNAL_SEEDS_TABLE_LOCK = asyncio.Lock()
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = False
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
 
+EXTERNAL_SEED_MERCHANT_ID = "external_seed"
+EXTERNAL_SEED_PLATFORM = "external"
+
 def _to_iso(val: Any) -> Optional[str]:
     if val is None:
         return None
@@ -540,6 +543,291 @@ def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> 
         if amt is not None:
             return {"amount": amt, "currency": cur}
     return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
+
+
+def _is_external_seed_product_key(*, merchant_id: str, platform: str) -> bool:
+    return merchant_id == EXTERNAL_SEED_MERCHANT_ID and platform == EXTERNAL_SEED_PLATFORM
+
+
+async def _fetch_external_seed_rows_by_external_product_id(
+    *,
+    external_product_id: str,
+    limit: int = 50,
+    allow_attached_product_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    await _ensure_external_seeds_table()
+    values: Dict[str, Any] = {"external_product_id": external_product_id, "limit": limit}
+    attached_clause = ""
+    if allow_attached_product_key:
+        values["allow_attached_product_key"] = allow_attached_product_key
+        attached_clause = " AND (attached_product_key IS NULL OR attached_product_key = :allow_attached_product_key)"
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT *
+            FROM external_product_seeds
+            WHERE status = 'active'
+              AND (
+                external_product_id = :external_product_id
+                OR (seed_data->>'external_product_id') = :external_product_id
+              )
+            """
+            + attached_clause
+            + """
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT :limit
+            """,
+            values,
+        )
+    except Exception:
+        rows = await database.fetch_all(
+            """
+            SELECT *
+            FROM external_product_seeds
+            WHERE status = 'active'
+              AND external_product_id = :external_product_id
+            """
+            + attached_clause
+            + """
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT :limit
+            """,
+            values,
+        )
+    return [dict(r) for r in (rows or [])]
+
+
+def _normalize_seed_image_urls(*, seed_data: Dict[str, Any], row: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    raw_list = seed_data.get("image_urls")
+    if isinstance(raw_list, list):
+        candidates.extend([str(u) for u in raw_list if isinstance(u, str)])
+    for u in [seed_data.get("image_url"), row.get("image_url")]:
+        if isinstance(u, str):
+            candidates.append(u)
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for u in candidates:
+        uu = str(u).strip()
+        if not uu or not uu.startswith(("http://", "https://")):
+            continue
+        if uu in seen:
+            continue
+        seen.add(uu)
+        out.append(uu)
+        if len(out) >= 20:
+            break
+    return out
+
+
+def _normalize_seed_brand(seed_data: Dict[str, Any]) -> Optional[str]:
+    raw = seed_data.get("brand") or seed_data.get("product", {}).get("brand")
+    if isinstance(raw, dict):
+        raw = raw.get("name") or raw.get("brand")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _seed_variant_to_raw_row(
+    *,
+    v: Dict[str, Any],
+    idx: int,
+    external_product_id: str,
+    default_currency: str,
+    fallback_price_amount: Optional[float],
+) -> Dict[str, Any]:
+    variant_id = str(v.get("variant_id") or v.get("id") or v.get("sku") or f"{external_product_id}:{idx + 1}").strip()
+    title = v.get("title") or v.get("name") or f"Variant {idx + 1}"
+    raw_amount = v.get("price_amount")
+    if raw_amount is None:
+        raw_amount = v.get("price") or v.get("amount") or v.get("value")
+    price_amount: Optional[float] = None
+    if raw_amount is not None and raw_amount != "":
+        try:
+            price_amount = float(raw_amount)
+        except Exception:
+            price_amount = None
+    if price_amount is None:
+        price_amount = fallback_price_amount
+
+    raw_currency = v.get("price_currency") or v.get("currency") or default_currency
+    price_currency = str(raw_currency or default_currency).strip().upper() or default_currency
+
+    availability = _normalize_seed_availability(v.get("availability"))
+    available: Optional[bool] = None
+    if availability in (None, "in_stock"):
+        available = True
+    elif availability == "out_of_stock":
+        available = False
+
+    out: Dict[str, Any] = {
+        "variant_id": variant_id,
+        "title": title,
+        "price_amount": price_amount,
+        "price_currency": price_currency,
+        **({"availability": availability} if availability is not None else {}),
+        **({"available": available} if available is not None else {}),
+    }
+    return out
+
+
+def _seed_variant_to_standard_variant(
+    *,
+    raw_row: Dict[str, Any],
+    fallback_price: float,
+) -> Dict[str, Any]:
+    vid = str(raw_row.get("variant_id") or "").strip() or "∅"
+    title = str(raw_row.get("title") or "Variant").strip() or "Variant"
+    price_amount = raw_row.get("price_amount")
+    try:
+        price = float(price_amount) if price_amount is not None else float(fallback_price)
+    except Exception:
+        price = float(fallback_price)
+    return {
+        "id": vid,
+        "variant_id": vid,
+        "title": title,
+        "sku": vid,
+        "price": price,
+        "inventory_quantity": 0,
+    }
+
+
+async def _build_external_seed_product_view(
+    *,
+    external_product_id: str,
+    allow_attached_product_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    rows = await _fetch_external_seed_rows_by_external_product_id(
+        external_product_id=external_product_id,
+        allow_attached_product_key=allow_attached_product_key,
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="PRODUCT_NOT_FOUND")
+
+    primary_row = rows[0]
+    seed_data = _ensure_json_obj(primary_row.get("seed_data"))
+
+    title = (
+        seed_data.get("title")
+        or primary_row.get("title")
+        or primary_row.get("canonical_url")
+        or primary_row.get("destination_url")
+        or external_product_id
+    )
+    description = seed_data.get("description") or seed_data.get("snapshot", {}).get("description") or ""
+
+    primary_price = _seed_primary_price(primary_row, seed_data)
+    raw_amount = primary_price.get("amount")
+    try:
+        price = float(raw_amount) if raw_amount is not None else 0.0
+    except Exception:
+        price = 0.0
+    currency = str(primary_price.get("currency") or "USD").strip().upper() or "USD"
+
+    image_urls = _normalize_seed_image_urls(seed_data=seed_data, row=primary_row)
+    image_url = image_urls[0] if image_urls else None
+
+    seed_variants = _seed_variants(seed_data)
+    raw_variants: List[Dict[str, Any]] = []
+    std_variants: List[Dict[str, Any]] = []
+    for idx, v in enumerate(seed_variants):
+        if not isinstance(v, dict):
+            continue
+        raw_row = _seed_variant_to_raw_row(
+            v=v,
+            idx=idx,
+            external_product_id=external_product_id,
+            default_currency=currency,
+            fallback_price_amount=(float(raw_amount) if raw_amount is not None else None),
+        )
+        raw_variants.append(raw_row)
+        std_variants.append(_seed_variant_to_standard_variant(raw_row=raw_row, fallback_price=price))
+        if len(raw_variants) >= 50:
+            break
+
+    if not std_variants:
+        std_variants = [
+            {
+                "id": external_product_id,
+                "variant_id": external_product_id,
+                "title": "Default",
+                "sku": external_product_id,
+                "price": price,
+                "inventory_quantity": 0,
+            }
+        ]
+        raw_variants = [
+            {
+                "variant_id": "∅",
+                "title": "Default (no variants)",
+                "price_amount": (price if raw_amount is not None else None),
+                "price_currency": currency,
+            }
+        ]
+
+    vendor = _normalize_seed_brand(seed_data)
+
+    product_data: Dict[str, Any] = {
+        "id": external_product_id,
+        "product_id": external_product_id,
+        "platform": EXTERNAL_SEED_PLATFORM,
+        "merchant_id": EXTERNAL_SEED_MERCHANT_ID,
+        "title": title,
+        "description": description,
+        "vendor": vendor,
+        "product_type": "external",
+        "tags": [],
+        "price": price,
+        "currency": currency,
+        "inventory_quantity": 0,
+        "orderable": False,
+        "image_url": image_url,
+        "images": image_urls,
+        "variants": std_variants,
+        "updated_at": primary_row.get("updated_at") or primary_row.get("created_at"),
+        "platform_metadata": {
+            "source": "external_seed",
+            "external_product_id": external_product_id,
+            "domain": primary_row.get("domain"),
+            "canonical_url": primary_row.get("canonical_url"),
+            "destination_url": primary_row.get("destination_url"),
+            "seed_ids": [str(r.get("id")) for r in rows if r.get("id")],
+        },
+    }
+
+    raw: Dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "image_url": image_url,
+        "images": image_urls,
+        "variants": raw_variants,
+        "source": "external_seed",
+        "external_product_id": external_product_id,
+        "seed_primary": {
+            "id": primary_row.get("id"),
+            "market": primary_row.get("market"),
+            "tool": primary_row.get("tool"),
+            "utm_template": primary_row.get("utm_template") or seed_data.get("utm_template"),
+            "partner_type": primary_row.get("partner_type") or seed_data.get("partner_type"),
+            "disclosure_text": primary_row.get("disclosure_text")
+            or seed_data.get("disclosure_text")
+            or DEFAULT_DISCLOSURE_TEXT,
+            "destination_url": primary_row.get("destination_url"),
+            "canonical_url": primary_row.get("canonical_url"),
+            "domain": primary_row.get("domain"),
+            "price_amount": primary_row.get("price_amount"),
+            "price_currency": primary_row.get("price_currency"),
+            "availability": primary_row.get("availability"),
+            "updated_at": _to_iso(primary_row.get("updated_at") or primary_row.get("created_at")),
+        },
+        "seed_data": seed_data,
+    }
+
+    cached_at = primary_row.get("updated_at") or primary_row.get("created_at")
+    return {"product_data": product_data, "raw": raw, "cached_at": cached_at}
 
 
 def _seed_merchant_display_name(seed_data: Dict[str, Any], domain: Optional[str]) -> Optional[str]:
@@ -2490,26 +2778,75 @@ async def list_attached_external_links(
     if len(parts) != 3:
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
 
-    values: Dict[str, Any] = {"pk": product_key, "limit": limit}
-    where = "attached_product_key = :pk AND status = 'active'"
-    if variant_id:
-        values["vid"] = str(variant_id).strip()
-        where += " AND attached_variant_id = :vid"
+    merchant_id, platform, platform_product_id = parts
 
-    rows = await database.fetch_all(
-        f"""
-        SELECT id, market, tool, destination_url, canonical_url, domain, title, image_url,
-               price_amount, price_currency, availability,
-               utm_template, partner_type, disclosure_text,
-               seed_data,
-               notes, attached_variant_id, created_at
-        FROM external_product_seeds
-        WHERE {where}
-        ORDER BY created_at DESC
-        LIMIT :limit
-        """,
-        values,
-    )
+    values: Dict[str, Any]
+    where: str
+
+    if _is_external_seed_product_key(merchant_id=merchant_id, platform=platform):
+        values = {"external_product_id": platform_product_id, "pk": product_key, "limit": limit}
+        where = (
+            "status = 'active' AND (external_product_id = :external_product_id OR (seed_data->>'external_product_id') = :external_product_id)"
+        )
+        where += " AND (attached_product_key IS NULL OR attached_product_key = :pk)"
+        if variant_id:
+            values["vid"] = str(variant_id).strip()
+            where += " AND COALESCE(attached_variant_id, '∅') = :vid"
+        try:
+            rows = await database.fetch_all(
+                f"""
+                SELECT id, market, tool, destination_url, canonical_url, domain, title, image_url,
+                       price_amount, price_currency, availability,
+                       utm_template, partner_type, disclosure_text,
+                       seed_data,
+                       notes, attached_variant_id, created_at
+                FROM external_product_seeds
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """,
+                values,
+            )
+        except Exception:
+            where = "status = 'active' AND external_product_id = :external_product_id"
+            where += " AND (attached_product_key IS NULL OR attached_product_key = :pk)"
+            if variant_id:
+                where += " AND COALESCE(attached_variant_id, '∅') = :vid"
+            rows = await database.fetch_all(
+                f"""
+                SELECT id, market, tool, destination_url, canonical_url, domain, title, image_url,
+                       price_amount, price_currency, availability,
+                       utm_template, partner_type, disclosure_text,
+                       seed_data,
+                       notes, attached_variant_id, created_at
+                FROM external_product_seeds
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """,
+                values,
+            )
+    else:
+        values = {"pk": product_key, "limit": limit}
+        where = "attached_product_key = :pk AND status = 'active'"
+        if variant_id:
+            values["vid"] = str(variant_id).strip()
+            where += " AND attached_variant_id = :vid"
+
+        rows = await database.fetch_all(
+            f"""
+            SELECT id, market, tool, destination_url, canonical_url, domain, title, image_url,
+                   price_amount, price_currency, availability,
+                   utm_template, partner_type, disclosure_text,
+                   seed_data,
+                   notes, attached_variant_id, created_at
+            FROM external_product_seeds
+            WHERE {where}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """,
+            values,
+        )
 
     items = []
     for r in rows:
@@ -2688,6 +3025,68 @@ async def _build_external_seed_offers(
                 "availability": seed_data.get("availability") or r.get("availability"),
                 "variants_count": len(_seed_variants(seed_data)),
                 "attached_variant_id": r.get("attached_variant_id") or "∅",
+                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+            }
+        )
+    return offers
+
+
+async def _build_external_seed_offers_for_external_product_id(
+    *,
+    external_product_id: str,
+    product_key_for_ctx: str,
+    request: Request,
+    variant_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    rows = await _fetch_external_seed_rows_by_external_product_id(
+        external_product_id=external_product_id,
+        limit=200,
+        allow_attached_product_key=product_key_for_ctx,
+    )
+    offers: List[Dict[str, Any]] = []
+    for r in rows:
+        r = dict(r)
+        vid = str(r.get("attached_variant_id") or "∅").strip() or "∅"
+        if variant_id is not None and str(variant_id).strip() != vid:
+            continue
+
+        seed_data = _ensure_json_obj(r.get("seed_data"))
+        redirect_url = await _make_redirect_url(
+            request=request,
+            market=r.get("market"),
+            tool=r.get("tool"),
+            destination_url=r.get("canonical_url") or r.get("destination_url"),
+            utm_template=r.get("utm_template") or seed_data.get("utm_template"),
+            ctx={
+                "seedId": r.get("id"),
+                "productKey": product_key_for_ctx,
+                "variantId": vid,
+            },
+        )
+        disclosure_text = r.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
+        offers.append(
+            {
+                "id": r.get("id"),
+                "source": "external_seed",
+                "seed_id": r.get("id"),
+                "market": r.get("market"),
+                "tool": r.get("tool"),
+                "utm_template": r.get("utm_template") or seed_data.get("utm_template"),
+                "partner_type": r.get("partner_type") or seed_data.get("partner_type"),
+                "disclosure_text": disclosure_text,
+                "destination_url": r.get("destination_url"),
+                "canonical_url": r.get("canonical_url"),
+                "domain": r.get("domain"),
+                "title": seed_data.get("title") or r.get("title"),
+                "image_url": seed_data.get("image_url") or r.get("image_url"),
+                "merchant_display_name": _seed_merchant_display_name(seed_data, r.get("domain")),
+                "price": _seed_primary_price(r, seed_data),
+                "availability": seed_data.get("availability") or r.get("availability"),
+                "variants_count": len(_seed_variants(seed_data)),
+                "attached_variant_id": vid,
+                "notes": r.get("notes"),
+                "created_at": _to_iso(r.get("created_at")),
+                "updated_at": _to_iso(r.get("updated_at")),
                 "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
             }
         )
@@ -2906,6 +3305,34 @@ async def list_product_offers(
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
 
     merchant_id, platform, platform_product_id = parts
+
+    if _is_external_seed_product_key(merchant_id=merchant_id, platform=platform):
+        offers = await _build_external_seed_offers_for_external_product_id(
+            external_product_id=platform_product_id,
+            product_key_for_ctx=product_key,
+            request=request,
+            variant_id=variant_id,
+        )
+
+        primary = await _get_primary_offer(product_key)
+        if primary:
+            primary_offer = {
+                "offer_id": primary.get("offer_id"),
+                "offer_type": primary.get("offer_type"),
+                "updated_at": _to_iso(primary.get("updated_at")),
+            }
+        else:
+            primary_offer = {
+                "offer_id": offers[0].get("id") if offers else None,
+                "offer_type": "external_seed" if offers else None,
+            }
+
+        return {
+            "status": "success",
+            "product_group_id": None,
+            "items": offers,
+            "primary": primary_offer,
+        }
     row = await _fetch_latest_products_cache_row(
         merchant_id=merchant_id,
         platform=platform,
@@ -3323,6 +3750,82 @@ async def get_product_by_key(
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
 
     merchant_id, platform, platform_product_id = parts
+
+    # External-only canonical product, synthesized from external_product_seeds.
+    if _is_external_seed_product_key(merchant_id=merchant_id, platform=platform):
+        view = await _build_external_seed_product_view(
+            external_product_id=platform_product_id,
+            allow_attached_product_key=product_key,
+        )
+        product_data = _ensure_dict(view.get("product_data"))
+        cached_at = view.get("cached_at")
+        raw_payload = _ensure_dict(view.get("raw"))
+
+        try:
+            sp = StandardProduct.parse_obj(product_data)
+            normalized = sp.dict()
+        except Exception:
+            normalized = None
+
+        metrics = {
+            "sales_7d": None,
+            "sales_30d": None,
+            "gmv_7d": None,
+            "gmv_30d": None,
+            "merchants_selling": 0,
+            "debug": {"product_type": "external_seed"},
+        }
+
+        enrichment_row: Optional[Dict[str, Any]] = None
+        enrichment: Dict[str, Any] = {}
+        enrichment_meta: Dict[str, Any] = {"status": "missing"}
+        try:
+            enrichment_row = await get_enrichment(
+                merchant_id=merchant_id,
+                platform=platform,
+                platform_product_id=platform_product_id,
+                geo_code="default",
+            )
+            if enrichment_row:
+                enrichment = {
+                    "title_override": enrichment_row.get("title_override"),
+                    "summary_short": enrichment_row.get("summary_short"),
+                    "description_markdown": enrichment_row.get("description_markdown"),
+                    "bullet_points": enrichment_row.get("bullet_points"),
+                    "usage_scenarios": enrichment_row.get("usage_scenarios"),
+                    "audience_tags": enrichment_row.get("audience_tags"),
+                    "topic_tags": enrichment_row.get("topic_tags"),
+                    "regulatory_disclaimer_local": enrichment_row.get("regulatory_disclaimer_local"),
+                    "extra_images": enrichment_row.get("extra_images"),
+                    "llm_readability_score": enrichment_row.get("llm_readability_score"),
+                    "llm_safety_flags": enrichment_row.get("llm_safety_flags"),
+                }
+                enrichment_meta = {
+                    "status": "ready",
+                    "geo_code": enrichment_row.get("geo_code") or "default",
+                    "updated_at": enrichment_row.get("updated_at").isoformat() if enrichment_row.get("updated_at") else None,
+                    "updated_by_employee_id": enrichment_row.get("updated_by_employee_id"),
+                    "updated_by_email": enrichment_row.get("updated_by_email"),
+                }
+        except Exception as exc:
+            enrichment = {}
+            enrichment_meta = {"status": "degraded", "error": str(exc)[:200]}
+
+        return {
+            "status": "success",
+            "product_key": product_key,
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+            "cached_at": _to_iso(cached_at),
+            "expires_at": None,
+            "product": normalized,
+            "raw": raw_payload,
+            "metrics": metrics,
+            "enrichment": enrichment,
+            "enrichment_meta": enrichment_meta,
+        }
+
     row = await _fetch_latest_products_cache_row(
         merchant_id=merchant_id,
         platform=platform,
