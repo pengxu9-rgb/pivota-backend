@@ -40,7 +40,8 @@ async def test_shopify_api(merchant_id: str):
             raise HTTPException(status_code=404, detail="Shopify store not found")
         
         shop_domain = store["domain"]
-        access_token = extract_shopify_access_token(store.get("api_key"))
+        api_key_raw = store["api_key"]
+        access_token = extract_shopify_access_token(api_key_raw)
         if not access_token:
             raise HTTPException(status_code=400, detail="Shopify access token missing/invalid (stored api_key)")
         
@@ -85,4 +86,3 @@ async def test_shopify_api(merchant_id: str):
     except Exception as e:
         logger.error(f"❌ Shopify API test failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
