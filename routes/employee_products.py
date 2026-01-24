@@ -457,6 +457,196 @@ def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def _variant_id(v: Dict[str, Any]) -> str:
+    for k in ("variant_id", "variantId", "id", "sku_id", "skuId"):
+        raw = v.get(k)
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if not s or s.lower() in ("none", "null"):
+            continue
+        return s
+    return ""
+
+
+def _distinct_variant_ids(variants: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        vid = _variant_id(v)
+        if vid and vid not in out:
+            out.append(vid)
+    return out
+
+
+def _normalize_variant_source(val: Any) -> str:
+    s = str(val or "").strip().lower()
+    return s or "unknown"
+
+
+def _variant_source(v: Dict[str, Any]) -> str:
+    return _normalize_variant_source(v.get("_source") or v.get("source"))
+
+
+def _coerce_variants_with_source(
+    variants: List[Dict[str, Any]], *, source: str, force: bool = False
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        vv = dict(v)
+        if force or "_source" not in vv:
+            vv["_source"] = source
+        out.append(vv)
+    return out
+
+
+def _variant_options_signature(value: Any) -> str:
+    """
+    Stable signature for matching when variant_id is absent.
+
+    Supports:
+      - dict: {"Color":"Red","Size":"M"}
+      - list: [{"name":"Color","value":"Red"}, ...]
+    """
+    if isinstance(value, dict):
+        pairs = []
+        for k, v in value.items():
+            kk = str(k or "").strip().lower()
+            vv = str(v or "").strip().lower()
+            if kk and vv:
+                pairs.append((kk, vv))
+        if not pairs:
+            return ""
+        pairs.sort()
+        return "|".join([f"{k}={v}" for k, v in pairs])
+    if isinstance(value, list):
+        pairs = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            kk = str(item.get("name") or item.get("key") or "").strip().lower()
+            vv = str(item.get("value") or "").strip().lower()
+            if kk and vv:
+                pairs.append((kk, vv))
+        if not pairs:
+            return ""
+        pairs.sort()
+        return "|".join([f"{k}={v}" for k, v in pairs])
+    return ""
+
+
+def _variant_match_key(v: Dict[str, Any], product_title: Optional[str]) -> str:
+    """
+    Prefer variant_id. Fallback to options signature, then a normalized title (when title != product_title).
+    """
+    vid = _variant_id(v)
+    if vid:
+        return f"vid:{vid}"
+
+    opt_sig = _variant_options_signature(v.get("options") or v.get("option_values"))
+    if opt_sig:
+        return f"opt:{opt_sig}"
+
+    title = _normalize_variant_title(v.get("title"))
+    if title and product_title and title.lower() == str(product_title).strip().lower():
+        return ""
+    if title:
+        return f"title:{title.lower()}"
+
+    return ""
+
+
+def _merge_seed_variants(
+    *,
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+    product_title: Optional[str],
+    incoming_source: str,
+    now_iso: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Merge incoming variants into existing, preserving existing structure and curated fields.
+
+    Rules:
+      - Match by variant_id (preferred), then options signature, then normalized title (when not degenerate).
+      - Always update dynamic fields (price/currency/availability/image) from incoming when present.
+      - Only update title when existing title is missing/degenerate (e.g. equals product_title).
+      - Append new incoming variants (marked with _source=incoming_source).
+    """
+    if not incoming:
+        return existing
+    incoming_norm = _coerce_variants_with_source(incoming, source=incoming_source, force=False)
+    existing_norm = [v for v in existing if isinstance(v, dict)]
+
+    incoming_by_key: Dict[str, Dict[str, Any]] = {}
+    incoming_anon: List[Dict[str, Any]] = []
+    for v in incoming_norm:
+        key = _variant_match_key(v, product_title)
+        if key:
+            # Keep first occurrence deterministically.
+            incoming_by_key.setdefault(key, v)
+        else:
+            incoming_anon.append(v)
+
+    out: List[Dict[str, Any]] = []
+    used_keys: set[str] = set()
+
+    def _merge_variant(existing_v: Dict[str, Any], incoming_v: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(existing_v)
+        for k in ("price_amount", "price_currency", "availability", "image_url"):
+            if k in incoming_v and incoming_v.get(k) is not None:
+                merged[k] = incoming_v.get(k)
+        # Optional: allow scrape to populate additional images payload if present.
+        if "image_urls" in incoming_v and incoming_v.get("image_urls"):
+            merged.setdefault("image_urls", incoming_v.get("image_urls"))
+        # Title: only overwrite when existing title is empty/degenerate.
+        existing_title = merged.get("title")
+        if (not existing_title) or (
+            _variant_title_score(title=existing_title, product_title=product_title) == 0
+        ):
+            if incoming_v.get("title"):
+                merged["title"] = incoming_v.get("title")
+        # Preserve existing _source unless missing.
+        if "_source" not in merged and incoming_v.get("_source"):
+            merged["_source"] = incoming_v.get("_source")
+        if now_iso:
+            merged["_refreshed_at"] = now_iso
+        return merged
+
+    for ev in existing_norm:
+        key = _variant_match_key(ev, product_title)
+        if key and key in incoming_by_key:
+            iv = incoming_by_key.pop(key)
+            out.append(_merge_variant(ev, iv))
+            used_keys.add(key)
+        else:
+            out.append(ev)
+            if key:
+                used_keys.add(key)
+
+    for key, iv in incoming_by_key.items():
+        if key in used_keys:
+            continue
+        vv = dict(iv)
+        if now_iso:
+            vv["_refreshed_at"] = now_iso
+        out.append(vv)
+        used_keys.add(key)
+
+    # Anonymous incoming variants (no match key): append if they add value and aren't obvious duplicates.
+    for iv in incoming_anon:
+        title = _normalize_variant_title(iv.get("title"))
+        if title and product_title and title.lower() == str(product_title).strip().lower():
+            # Avoid re-introducing placeholder duplicates.
+            continue
+        out.append(iv)
+
+    return out
+
+
 _SIZE_LIKE_RE = re.compile(
     r"\b\d+(?:\.\d+)?\s*(?:ml|mL|l|L|oz|fl\s*oz|g|kg|lb|lbs|cm|mm|in|inch|inches)\b",
     re.IGNORECASE,
@@ -507,18 +697,40 @@ def _distinct_variant_titles(variants: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
-def _distinct_variant_ids(variants: List[Dict[str, Any]]) -> List[str]:
+def _distinct_variant_option_signatures(variants: List[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
     for v in variants:
         if not isinstance(v, dict):
             continue
-        raw = v.get("variant_id") or v.get("variantId") or v.get("id") or v.get("sku") or v.get("sku_id")
-        if raw is None:
-            continue
-        s = str(raw).strip()
-        if s and s not in out:
-            out.append(s)
+        sig = _variant_options_signature(v.get("options") or v.get("option_values"))
+        if sig and sig not in out:
+            out.append(sig)
     return out
+
+
+_PLACEHOLDER_VARIANT_TITLES = {"default title", "default", "*", "unknown", "variant"}
+
+
+def _variants_look_placeholder(variants: List[Dict[str, Any]], product_title: Optional[str]) -> bool:
+    if not variants:
+        return True
+    if _distinct_variant_ids(variants):
+        return False
+    if _distinct_variant_option_signatures(variants):
+        return False
+
+    titles = _distinct_variant_titles(variants)
+    if len(titles) >= 2:
+        return False
+    if not titles:
+        return True
+
+    t0 = titles[0].strip().lower()
+    if t0 in _PLACEHOLDER_VARIANT_TITLES:
+        return True
+    if product_title and t0 == str(product_title).strip().lower():
+        return True
+    return False
 
 
 def _should_overwrite_seed_variants(
@@ -532,23 +744,30 @@ def _should_overwrite_seed_variants(
     if not existing:
         return True
 
-    existing_score = _best_variant_title_score(existing, product_title)
-    incoming_score = _best_variant_title_score(incoming, product_title)
-    if incoming_score < existing_score:
+    # Smart overwrite policy:
+    # - Only overwrite when existing looks like a placeholder/weak representation.
+    # - Otherwise, prefer merge so we don't drop curated/manual edits.
+    if not _variants_look_placeholder(existing, product_title):
         return False
 
-    # Overwrite only when existing titles are weak or degenerate.
-    if existing_score <= 1 and incoming_score >= 2:
-        return True
+    existing_score = _best_variant_title_score(existing, product_title)
+    incoming_score = _best_variant_title_score(incoming, product_title)
 
-    existing_titles = _distinct_variant_titles(existing)
+    incoming_ids = _distinct_variant_ids(incoming)
+    incoming_opts = _distinct_variant_option_signatures(incoming)
     incoming_titles = _distinct_variant_titles(incoming)
+    existing_titles = _distinct_variant_titles(existing)
+
+    # Overwrite when incoming clearly adds structure or breadth.
+    if len(incoming_ids) >= 2:
+        return True
+    if len(incoming_opts) >= 2:
+        return True
+    if len(incoming) > len(existing):
+        return True
     if len(incoming_titles) > len(existing_titles):
         return True
-
-    existing_ids = _distinct_variant_ids(existing)
-    incoming_ids = _distinct_variant_ids(incoming)
-    if len(incoming_ids) > len(existing_ids):
+    if incoming_score > existing_score:
         return True
 
     return False
@@ -2078,6 +2297,7 @@ async def create_external_seed(
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
+    snap_refreshed_at = _to_iso(getattr(snapshot, "fetched_at", None)) if snapshot else None
     evidence = getattr(snapshot, "evidence", None) if snapshot else None
     if isinstance(evidence, dict):
         raw_desc = evidence.get("description")
@@ -2180,14 +2400,31 @@ async def create_external_seed(
         )
         if snap_description:
             seed_data["snapshot"]["description"] = snap_description
-        if body.variants is not None and body.variants:
-            seed_data["variants"] = body.variants
+        if snap_refreshed_at:
+            seed_data["snapshot"]["refreshed_at"] = snap_refreshed_at
+        if snap_variants is not None:
+            seed_data["snapshot"]["variants"] = snap_variants
+        if body.variants is not None:
+            seed_data["variants"] = _coerce_variants_with_source(body.variants or [], source="manual", force=True)
         elif snap_variants:
             existing_variants = _seed_variants(seed_data)
-            if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
-                seed_data["variants"] = snap_variants
-            elif not existing_variants:
-                seed_data["variants"] = snap_variants
+            product_title = seed_data.get("title") or snap_title
+            if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=product_title):
+                seed_data["variants"] = _merge_seed_variants(
+                    existing=[],
+                    incoming=snap_variants,
+                    product_title=product_title,
+                    incoming_source="snapshot",
+                    now_iso=snap_refreshed_at,
+                )
+            else:
+                seed_data["variants"] = _merge_seed_variants(
+                    existing=existing_variants,
+                    incoming=snap_variants,
+                    product_title=product_title,
+                    incoming_source="snapshot",
+                    now_iso=snap_refreshed_at,
+                )
 
         match_url = canonical_url or dest
 
@@ -2272,7 +2509,15 @@ async def create_external_seed(
             "description": description,
             "image_url": image_url,
             "availability": availability,
-            "variants": body.variants or (snap_variants or []),
+            "variants": _coerce_variants_with_source(body.variants or [], source="manual", force=True)
+            if body.variants is not None
+            else _merge_seed_variants(
+                existing=[],
+                incoming=(snap_variants or []),
+                product_title=title,
+                incoming_source="snapshot",
+                now_iso=snap_refreshed_at,
+            ),
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
@@ -2286,6 +2531,8 @@ async def create_external_seed(
                 "price_amount": snap_price_amount,
                 "price_currency": snap_price_currency,
                 "availability": snap_availability,
+                "variants": snap_variants or [],
+                "refreshed_at": snap_refreshed_at,
             },
         }
 
@@ -2480,7 +2727,7 @@ async def update_external_seed(
     if body.category is not None:
         seed_data["category"] = body.category
     if body.variants is not None:
-        seed_data["variants"] = body.variants
+        seed_data["variants"] = _coerce_variants_with_source(body.variants or [], source="manual", force=True)
     if body.utm_template is not None:
         seed_data["utm_template"] = (body.utm_template or "").strip() or None
     if body.partner_type is not None:
@@ -2610,6 +2857,8 @@ async def refresh_external_seed(
             "refreshed_at": _to_iso(getattr(snapshot, "fetched_at", None)) or None,
         }
     )
+    if snap_variants is not None:
+        seed_data["snapshot"]["variants"] = snap_variants
     # Only overwrite curated fields if they are missing.
     if not seed_data.get("title"):
         seed_data["title"] = snap_title
@@ -2625,10 +2874,23 @@ async def refresh_external_seed(
     if snap_variants:
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
+        now_iso = seed_data.get("snapshot", {}).get("refreshed_at")
         if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=product_title):
-            seed_data["variants"] = snap_variants
-        elif not existing_variants:
-            seed_data["variants"] = snap_variants
+            seed_data["variants"] = _merge_seed_variants(
+                existing=[],
+                incoming=snap_variants,
+                product_title=product_title,
+                incoming_source="snapshot",
+                now_iso=now_iso,
+            )
+        else:
+            seed_data["variants"] = _merge_seed_variants(
+                existing=existing_variants,
+                incoming=snap_variants,
+                product_title=product_title,
+                incoming_source="snapshot",
+                now_iso=now_iso,
+            )
 
     await _execute_seed_data_stmt(
         """
