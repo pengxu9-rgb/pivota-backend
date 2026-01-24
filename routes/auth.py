@@ -590,8 +590,8 @@ async def forgot_password(data: ForgotPasswordRequest):
         # Some deployments use `id` instead of `user_id`, but for this flow
         # we only need to know whether an email exists, so select email only
         user = await database.fetch_one(
-            "SELECT email FROM users WHERE email = :email",
-            {"email": data.email}
+            "SELECT email, role FROM users WHERE email = :email",
+            {"email": data.email},
         )
         
         if not user:
@@ -661,8 +661,18 @@ async def forgot_password(data: ForgotPasswordRequest):
             {"token": reset_token, "email": data.email, "expires_at": expires_at}
         )
         
-        # Build reset link - use configured Merchant Portal base URL
+        # Build reset link. Choose portal base URL based on user role (if known).
         base_url = getattr(settings, "merchant_portal_base_url", "https://merchant.pivota.cc").rstrip("/")
+        try:
+            role = user["role"] if user else None
+        except Exception:
+            role = None
+
+        if role in {"super_admin", "admin", "employee", "outsourced"}:
+            base_url = getattr(settings, "employee_portal_base_url", "https://employee.pivota.cc").rstrip("/")
+        elif role == "agent":
+            base_url = getattr(settings, "agent_portal_base_url", "https://developer.pivota.cc").rstrip("/")
+
         reset_link = f"{base_url}/reset-password?token={reset_token}"
         print(f"🔑 Password reset link for {data.email}: {reset_link}")
         print(f"   (Valid for 1 hour)")
