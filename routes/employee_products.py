@@ -27,6 +27,7 @@ import uuid
 
 from db.database import database
 from db.products import products_cache
+from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
@@ -3264,6 +3265,41 @@ async def get_product_by_key(
         product_data=product_data,
     )
 
+    enrichment_row: Optional[Dict[str, Any]] = None
+    enrichment: Dict[str, Any] = {}
+    enrichment_meta: Dict[str, Any] = {"status": "missing"}
+    try:
+        enrichment_row = await get_enrichment(
+            merchant_id=merchant_id,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            geo_code="default",
+        )
+        if enrichment_row:
+            enrichment = {
+                "title_override": enrichment_row.get("title_override"),
+                "summary_short": enrichment_row.get("summary_short"),
+                "description_markdown": enrichment_row.get("description_markdown"),
+                "bullet_points": enrichment_row.get("bullet_points"),
+                "usage_scenarios": enrichment_row.get("usage_scenarios"),
+                "audience_tags": enrichment_row.get("audience_tags"),
+                "topic_tags": enrichment_row.get("topic_tags"),
+                "regulatory_disclaimer_local": enrichment_row.get("regulatory_disclaimer_local"),
+                "extra_images": enrichment_row.get("extra_images"),
+                "llm_readability_score": enrichment_row.get("llm_readability_score"),
+                "llm_safety_flags": enrichment_row.get("llm_safety_flags"),
+            }
+            enrichment_meta = {
+                "status": "ready",
+                "geo_code": enrichment_row.get("geo_code") or "default",
+                "updated_at": enrichment_row.get("updated_at").isoformat() if enrichment_row.get("updated_at") else None,
+                "updated_by_employee_id": enrichment_row.get("updated_by_employee_id"),
+                "updated_by_email": enrichment_row.get("updated_by_email"),
+            }
+    except Exception as exc:
+        enrichment = {}
+        enrichment_meta = {"status": "degraded", "error": str(exc)[:200]}
+
     return {
         "status": "success",
         "product_key": product_key,
@@ -3275,6 +3311,8 @@ async def get_product_by_key(
         "product": normalized,
         "raw": product_data,
         "metrics": metrics,
+        "enrichment": enrichment,
+        "enrichment_meta": enrichment_meta,
     }
 
 @router.get("/{merchant_id}/{platform}/{platform_product_id}")
@@ -3292,6 +3330,84 @@ async def get_product_by_triplet(
     """
     product_key = f"{merchant_id}|{platform}|{platform_product_id}"
     return await get_product_by_key(product_key=product_key, current_user=current_user)
+
+
+class UpdateProductEnrichmentRequest(BaseModel):
+    summary_short: Optional[str] = None
+    description_markdown: Optional[str] = None
+
+
+@router.patch("/{product_key}/enrichment")
+async def update_product_enrichment(
+    product_key: str,
+    body: UpdateProductEnrichmentRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    parts = [p.strip() for p in (product_key or "").split("|")]
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
+
+    merchant_id, platform, platform_product_id = parts
+
+    patch: Dict[str, Any] = {}
+    if body.summary_short is not None:
+        patch["summary_short"] = (body.summary_short or "").strip() or None
+    if body.description_markdown is not None:
+        patch["description_markdown"] = (body.description_markdown or "").strip() or None
+
+    if not patch:
+        raise HTTPException(status_code=400, detail="NO_FIELDS_TO_UPDATE")
+
+    employee_id = (
+        current_user.get("employee_id")
+        or current_user.get("employeeId")
+        or current_user.get("user_id")
+        or current_user.get("sub")
+    )
+    email = current_user.get("email")
+    patch["updated_by_employee_id"] = str(employee_id) if employee_id else None
+    patch["updated_by_email"] = str(email) if email else None
+
+    await upsert_enrichment(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        geo_code="default",
+        data=patch,
+    )
+
+    row = await get_enrichment(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        geo_code="default",
+    )
+    if not row:
+        return {"status": "degraded", "enrichment": None}
+
+    return {
+        "status": "success",
+        "enrichment": {
+            "title_override": row.get("title_override"),
+            "summary_short": row.get("summary_short"),
+            "description_markdown": row.get("description_markdown"),
+            "bullet_points": row.get("bullet_points"),
+            "usage_scenarios": row.get("usage_scenarios"),
+            "audience_tags": row.get("audience_tags"),
+            "topic_tags": row.get("topic_tags"),
+            "regulatory_disclaimer_local": row.get("regulatory_disclaimer_local"),
+            "extra_images": row.get("extra_images"),
+            "llm_readability_score": row.get("llm_readability_score"),
+            "llm_safety_flags": row.get("llm_safety_flags"),
+        },
+        "enrichment_meta": {
+            "status": "ready",
+            "geo_code": row.get("geo_code") or "default",
+            "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+            "updated_by_employee_id": row.get("updated_by_employee_id"),
+            "updated_by_email": row.get("updated_by_email"),
+        },
+    }
 
 
 class CreateManualReviewRequest(BaseModel):

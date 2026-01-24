@@ -1,7 +1,12 @@
-from sqlalchemy import Table, Column, String, DateTime, JSON, Float, Index
-from sqlalchemy.sql import func
-from typing import Optional, Dict, Any
+from __future__ import annotations
+
+import asyncio
 import json
+import logging
+from typing import Any, Dict, Optional
+
+from sqlalchemy import Column, DateTime, Float, Index, JSON, String, Table, Text
+from sqlalchemy.sql import func
 
 from db.database import metadata, database
 
@@ -18,6 +23,7 @@ product_enrichment = Table(
     # Overlay fields (all optional, only present when merchant / Pivota added them)
     Column("title_override", String(500), nullable=True),
     Column("summary_short", String(1000), nullable=True),
+    Column("description_markdown", Text, nullable=True),
     Column("bullet_points", JSON, nullable=True),
     Column("usage_scenarios", JSON, nullable=True),
     Column("audience_tags", JSON, nullable=True),
@@ -27,6 +33,9 @@ product_enrichment = Table(
     # LLM-related metrics (for internal use)
     Column("llm_readability_score", Float, nullable=True),
     Column("llm_safety_flags", JSON, nullable=True),
+    # Employee edit metadata (optional)
+    Column("updated_by_employee_id", String(64), nullable=True),
+    Column("updated_by_email", String(255), nullable=True),
     # Audit
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
@@ -38,6 +47,68 @@ Index(
     product_enrichment.c.platform,
 )
 
+logger = logging.getLogger(__name__)
+
+_PRODUCT_ENRICHMENT_DDL_READY = False
+_PRODUCT_ENRICHMENT_DDL_LOCK = asyncio.Lock()
+
+
+async def ensure_product_enrichment_table() -> None:
+    """
+    Best-effort defensive DDL.
+
+    Production normally relies on metadata.create_all(engine) in startup, but this:
+    - avoids hard failures if import ordering changes
+    - adds new columns incrementally without requiring a migration for MVP
+    """
+    global _PRODUCT_ENRICHMENT_DDL_READY
+    if _PRODUCT_ENRICHMENT_DDL_READY:
+        return
+    async with _PRODUCT_ENRICHMENT_DDL_LOCK:
+        if _PRODUCT_ENRICHMENT_DDL_READY:
+            return
+        try:
+            statements = [
+                """
+                CREATE TABLE IF NOT EXISTS product_enrichment (
+                  merchant_id VARCHAR(100) NOT NULL,
+                  platform VARCHAR(50) NOT NULL,
+                  platform_product_id VARCHAR(200) NOT NULL,
+                  geo_code VARCHAR(16) NOT NULL DEFAULT 'default',
+
+                  title_override VARCHAR(500),
+                  summary_short VARCHAR(1000),
+                  description_markdown TEXT,
+                  bullet_points JSONB,
+                  usage_scenarios JSONB,
+                  audience_tags JSONB,
+                  topic_tags JSONB,
+                  regulatory_disclaimer_local VARCHAR(2000),
+                  extra_images JSONB,
+                  llm_readability_score DOUBLE PRECISION,
+                  llm_safety_flags JSONB,
+
+                  updated_by_employee_id VARCHAR(64),
+                  updated_by_email VARCHAR(255),
+
+                  created_at TIMESTAMPTZ DEFAULT NOW(),
+                  updated_at TIMESTAMPTZ DEFAULT NOW(),
+                  PRIMARY KEY (merchant_id, platform, platform_product_id, geo_code)
+                );
+                """,
+                "ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS description_markdown TEXT;",
+                "ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS updated_by_employee_id VARCHAR(64);",
+                "ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS updated_by_email VARCHAR(255);",
+                "CREATE INDEX IF NOT EXISTS idx_enrichment_merchant_platform ON product_enrichment(merchant_id, platform);",
+            ]
+            for stmt in statements:
+                await database.execute(stmt)
+        except Exception as exc:
+            # Best-effort; callers will degrade when table/columns are missing.
+            logger.warning("ensure_product_enrichment_table failed (best-effort): %s", str(exc)[:200])
+            return
+        _PRODUCT_ENRICHMENT_DDL_READY = True
+
 
 async def get_enrichment(
     merchant_id: str,
@@ -46,6 +117,7 @@ async def get_enrichment(
     geo_code: str = "default",
 ) -> Optional[Dict[str, Any]]:
     """Fetch enrichment row if it exists."""
+    await ensure_product_enrichment_table()
     query = product_enrichment.select().where(
         (product_enrichment.c.merchant_id == merchant_id)
         & (product_enrichment.c.platform == platform)
@@ -68,10 +140,12 @@ async def upsert_enrichment(
 
     Uses PostgreSQL's ON CONFLICT to avoid race conditions.
     """
+    await ensure_product_enrichment_table()
     # Keep only known keys to avoid arbitrary data
     allowed_keys = {
         "title_override",
         "summary_short",
+        "description_markdown",
         "bullet_points",
         "usage_scenarios",
         "audience_tags",
@@ -80,8 +154,13 @@ async def upsert_enrichment(
         "extra_images",
         "llm_readability_score",
         "llm_safety_flags",
+        "updated_by_employee_id",
+        "updated_by_email",
     }
     clean_data = {k: v for k, v in data.items() if k in allowed_keys}
+
+    if not clean_data:
+        return
 
     # JSON-like fields must be encoded as strings when using raw SQL with asyncpg.
     # Postgres will parse the JSON text into the JSON column type.
@@ -90,50 +169,43 @@ async def upsert_enrichment(
             return None
         return json.dumps(value)
 
-    # Basic ON CONFLICT upsert
+    json_keys = {
+        "bullet_points",
+        "usage_scenarios",
+        "audience_tags",
+        "topic_tags",
+        "extra_images",
+        "llm_safety_flags",
+    }
+
+    base_cols = ["merchant_id", "platform", "platform_product_id", "geo_code"]
+    patch_cols = sorted(clean_data.keys())
+    cols = base_cols + patch_cols
+
+    insert_cols = ", ".join(cols)
+    insert_vals = ", ".join([f":{c}" for c in cols])
+
+    update_sets = ", ".join([f"{c} = EXCLUDED.{c}" for c in patch_cols] + ["updated_at = NOW()"])
+
     query = f"""
-    INSERT INTO product_enrichment (
-        merchant_id, platform, platform_product_id, geo_code,
-        title_override, summary_short, bullet_points, usage_scenarios,
-        audience_tags, topic_tags, regulatory_disclaimer_local,
-        extra_images, llm_readability_score, llm_safety_flags
-    ) VALUES (
-        :merchant_id, :platform, :platform_product_id, :geo_code,
-        :title_override, :summary_short, :bullet_points, :usage_scenarios,
-        :audience_tags, :topic_tags, :regulatory_disclaimer_local,
-        :extra_images, :llm_readability_score, :llm_safety_flags
-    )
+    INSERT INTO product_enrichment ({insert_cols})
+    VALUES ({insert_vals})
     ON CONFLICT (merchant_id, platform, platform_product_id, geo_code)
-    DO UPDATE SET
-        title_override = EXCLUDED.title_override,
-        summary_short = EXCLUDED.summary_short,
-        bullet_points = EXCLUDED.bullet_points,
-        usage_scenarios = EXCLUDED.usage_scenarios,
-        audience_tags = EXCLUDED.audience_tags,
-        topic_tags = EXCLUDED.topic_tags,
-        regulatory_disclaimer_local = EXCLUDED.regulatory_disclaimer_local,
-        extra_images = EXCLUDED.extra_images,
-        llm_readability_score = EXCLUDED.llm_readability_score,
-        llm_safety_flags = EXCLUDED.llm_safety_flags,
-        updated_at = NOW()
+    DO UPDATE SET {update_sets}
     """
 
-    params = {
+    params: Dict[str, Any] = {
         "merchant_id": merchant_id,
         "platform": platform,
         "platform_product_id": platform_product_id,
         "geo_code": geo_code or "default",
-        # Enrichment fields (may be missing)
-        "title_override": clean_data.get("title_override"),
-        "summary_short": clean_data.get("summary_short"),
-        "bullet_points": _encode_json(clean_data.get("bullet_points")),
-        "usage_scenarios": _encode_json(clean_data.get("usage_scenarios")),
-        "audience_tags": _encode_json(clean_data.get("audience_tags")),
-        "topic_tags": _encode_json(clean_data.get("topic_tags")),
-        "regulatory_disclaimer_local": clean_data.get("regulatory_disclaimer_local"),
-        "extra_images": _encode_json(clean_data.get("extra_images")),
-        "llm_readability_score": clean_data.get("llm_readability_score"),
-        "llm_safety_flags": _encode_json(clean_data.get("llm_safety_flags")),
     }
+
+    for k in patch_cols:
+        val = clean_data.get(k)
+        if k in json_keys:
+            params[k] = _encode_json(val)
+        else:
+            params[k] = val
 
     await database.execute(query, params)
