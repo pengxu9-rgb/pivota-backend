@@ -507,6 +507,20 @@ def _distinct_variant_titles(variants: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _distinct_variant_ids(variants: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        raw = v.get("variant_id") or v.get("variantId") or v.get("id") or v.get("sku") or v.get("sku_id")
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
 def _should_overwrite_seed_variants(
     *,
     existing: List[Dict[str, Any]],
@@ -520,7 +534,7 @@ def _should_overwrite_seed_variants(
 
     existing_score = _best_variant_title_score(existing, product_title)
     incoming_score = _best_variant_title_score(incoming, product_title)
-    if incoming_score <= existing_score:
+    if incoming_score < existing_score:
         return False
 
     # Overwrite only when existing titles are weak or degenerate.
@@ -529,7 +543,12 @@ def _should_overwrite_seed_variants(
 
     existing_titles = _distinct_variant_titles(existing)
     incoming_titles = _distinct_variant_titles(incoming)
-    if len(existing_titles) <= 1 and len(incoming_titles) > 1:
+    if len(incoming_titles) > len(existing_titles):
+        return True
+
+    existing_ids = _distinct_variant_ids(existing)
+    incoming_ids = _distinct_variant_ids(incoming)
+    if len(incoming_ids) > len(existing_ids):
         return True
 
     return False
