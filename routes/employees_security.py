@@ -239,7 +239,11 @@ async def create_employee(
                 ) VALUES (
                     :email, :password_hash, :full_name, :role, :active
                 )
-                ON CONFLICT (email) DO NOTHING
+                ON CONFLICT (email) DO UPDATE SET
+                    password_hash = EXCLUDED.password_hash,
+                    full_name = EXCLUDED.full_name,
+                    role = EXCLUDED.role,
+                    active = EXCLUDED.active
             """
             await database.execute(users_insert, {
                 "email": request.email,
@@ -330,7 +334,36 @@ async def update_employee(
         """
         
         await database.execute(update_query, params)
-        
+
+        # Best-effort: keep canonical users table in sync for /api/auth/login.
+        try:
+            employee_row = await database.fetch_one(
+                "SELECT email FROM employees WHERE employee_id = :employee_id",
+                {"employee_id": employee_id},
+            )
+            if employee_row:
+                employee_email = employee_row["email"]
+                user_updates = []
+                user_params = {"email": employee_email}
+
+                if name:
+                    user_updates.append("full_name = :full_name")
+                    user_params["full_name"] = name
+                if role:
+                    user_updates.append("role = :role")
+                    user_params["role"] = role
+                if status:
+                    user_updates.append("active = :active")
+                    user_params["active"] = status == "active"
+
+                if user_updates:
+                    await database.execute(
+                        f"UPDATE users SET {', '.join(user_updates)} WHERE email = :email",
+                        user_params,
+                    )
+        except Exception as exc:
+            logger.error("[Employees] Failed to sync users table on update: %s", exc)
+
         return {
             "status": "success",
             "message": "Employee updated successfully"
@@ -358,7 +391,21 @@ async def delete_employee(
         """
         
         await database.execute(update_query, {"employee_id": employee_id})
-        
+
+        # Best-effort: deactivate corresponding users account for /api/auth/login.
+        try:
+            employee_row = await database.fetch_one(
+                "SELECT email FROM employees WHERE employee_id = :employee_id",
+                {"employee_id": employee_id},
+            )
+            if employee_row:
+                await database.execute(
+                    "UPDATE users SET active = :active WHERE email = :email",
+                    {"active": False, "email": employee_row["email"]},
+                )
+        except Exception as exc:
+            logger.error("[Employees] Failed to sync users table on delete: %s", exc)
+
         return {
             "status": "success",
             "message": "Employee deactivated successfully"
@@ -520,7 +567,6 @@ async def update_security_settings(
             "max_login_attempts": max_login_attempts
         }
     }
-
 
 
 

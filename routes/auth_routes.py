@@ -16,6 +16,7 @@ import os
 
 # Database import for employee authentication
 from db.database import database
+from utils.auth import verify_password as verify_bcrypt_password
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
@@ -180,18 +181,14 @@ async def signup(user_data: UserSignup):
 @router.post("/signin")
 async def signin(login_data: UserLogin):
     """
-    [DEPRECATED] User signin (in-memory, with built-in demo accounts).
-    
-    ⚠️ WARNING: This endpoint only supports hardcoded demo accounts.
-    For real merchant/agent accounts, use /api/auth/login instead.
-    
-    Demo accounts only:
-    - merchant@test.com
-    - employee@pivota.com  
-    - agent@test.com
-    - superadmin@pivota.com
-    
-    Real accounts should use: POST /api/auth/login
+    Legacy signin endpoint kept for backward compatibility with older frontends.
+
+    Supports:
+    - In-memory demo accounts (dev/testing)
+    - Legacy `employees` table auth (SHA256 + static salt)
+    - Canonical `users` table auth (bcrypt) as a fallback
+
+    Preferred for real accounts: `POST /api/auth/login`.
     """
     try:
         demo_accounts = {
@@ -248,6 +245,49 @@ async def signin(login_data: UserLogin):
                     }
                 }
         
+        # Canonical users table (bcrypt). For backward compatibility with older
+        # frontends that still call `/auth/signin`, allow authenticating against
+        # the modern `/api/auth/*` user store as well.
+        user = None
+        try:
+            user_query = """
+                SELECT id, email, password_hash, full_name, role, active, merchant_id
+                FROM users
+                WHERE email = :email
+                LIMIT 1
+            """
+            user = await database.fetch_one(user_query, {"email": login_data.email})
+        except Exception as e:
+            print(f"Users lookup skipped: {e}")
+            user = None
+
+        if user and user.get("password_hash") and verify_bcrypt_password(
+            login_data.password,
+            user["password_hash"],
+        ):
+            if user.get("active") is False:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account has been deactivated",
+                )
+
+            token = create_jwt_token(user["email"], user["role"], user["email"])
+            user_payload = {
+                "id": str(user["id"]),
+                "email": user["email"],
+                "full_name": user.get("full_name") or user["email"],
+                "role": user["role"],
+            }
+            if user.get("merchant_id"):
+                user_payload["merchant_id"] = user["merchant_id"]
+
+            return {
+                "status": "success",
+                "message": "Login successful",
+                "token": token,
+                "user": user_payload,
+            }
+
         # Demo accounts fallback
         acct = demo_accounts.get(login_data.email)
         if not acct or acct["password"] != login_data.password:
