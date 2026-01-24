@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import httpx
 from utils.logger import logger
 from db.database import database
+from services.shopify_transactions_service import extract_shopify_access_token
 
 router = APIRouter(prefix="/debug", tags=["debug"])
 
@@ -23,9 +24,15 @@ async def test_shopify_api(merchant_id: str):
     try:
         # 1. 获取 Shopify 商店信息
         store = await database.fetch_one(
-            """SELECT domain, api_key FROM merchant_stores 
-               WHERE merchant_id = :merchant_id AND platform = 'shopify'
-               LIMIT 1""",
+            """
+            SELECT domain, api_key, status, connected_at
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+              AND platform = 'shopify'
+              AND status IN ('active', 'connected')
+            ORDER BY connected_at DESC NULLS LAST
+            LIMIT 1
+            """,
             {"merchant_id": merchant_id}
         )
         
@@ -33,7 +40,9 @@ async def test_shopify_api(merchant_id: str):
             raise HTTPException(status_code=404, detail="Shopify store not found")
         
         shop_domain = store["domain"]
-        access_token = store["api_key"]
+        access_token = extract_shopify_access_token(store.get("api_key"))
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Shopify access token missing/invalid (stored api_key)")
         
         logger.info(f"🔍 Testing Shopify API: domain={shop_domain}, has_token={bool(access_token)}")
         
@@ -76,5 +85,4 @@ async def test_shopify_api(merchant_id: str):
     except Exception as e:
         logger.error(f"❌ Shopify API test failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
