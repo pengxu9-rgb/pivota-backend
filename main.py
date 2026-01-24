@@ -117,6 +117,7 @@ from routes.admin_debug_psp_metrics import router as admin_debug_psp_metrics_rou
 from routes.simple_test_orders import router as simple_test_orders_router
 from routes.migrate_employees_password import router as migrate_employees_password_router
 from routes.debug_product_sync import router as debug_product_sync_router
+from routes.debug_shopify_api import router as debug_shopify_api_router
 from routes.merchant_store_connections import router as merchant_store_connections_router
 from routes.ops_shopify_integration_routes import router as ops_shopify_integration_router
 from routes.ops_pcs_reducer_routes import router as ops_pcs_reducer_router
@@ -604,6 +605,7 @@ app.include_router(external_offers_router)  # External offers (fetch/cache OG/JS
 app.include_router(simple_test_orders_router)  # Simple test orders generation
 app.include_router(migrate_employees_password_router)  # Migrate employees table
 app.include_router(debug_product_sync_router)  # Debug product sync
+app.include_router(debug_shopify_api_router)  # Debug Shopify API
 app.include_router(admin_sql_router)  # Admin SQL
 app.include_router(admin_agents_debug_router)  # Admin agents debug
 app.include_router(agent_health_router)  # Agent health check
