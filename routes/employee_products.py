@@ -2394,6 +2394,89 @@ async def attach_external_seed(
     return {"status": "success"}
 
 
+@router.post("/external-seeds/{seed_id}/detach")
+async def detach_external_seed(
+    seed_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    row = await database.fetch_one("SELECT id FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+    await database.execute(
+        """
+        UPDATE external_product_seeds
+        SET attached_product_key = NULL,
+            attached_variant_id = NULL,
+            updated_at = NOW()
+        WHERE id = :id
+        """,
+        {"id": seed_id},
+    )
+    return {"status": "success"}
+
+
+@router.get("/external-seeds/{seed_id}/resolve-subject")
+async def resolve_external_seed_subject(
+    seed_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """
+    Convenience helper for the Employee Portal to resolve the canonical PDP subject for an external seed.
+
+    Returns:
+    - product_key (when attached)
+    - product_group_id (best-effort; may be null when grouping table is unavailable)
+    """
+    await _ensure_external_seeds_table()
+    row = await database.fetch_one(
+        "SELECT id, attached_product_key, attached_variant_id FROM external_product_seeds WHERE id = :id",
+        {"id": seed_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+    r = dict(row)
+    product_key = (r.get("attached_product_key") or "").strip() or None
+    attached_variant_id = (r.get("attached_variant_id") or "").strip() or None
+    if product_key:
+        attached_variant_id = attached_variant_id or "∅"
+
+    product_group_id: Optional[str] = None
+    debug_errors: List[str] = []
+    if product_key and product_key.count("|") == 2:
+        try:
+            parts = [p.strip() for p in product_key.split("|")]
+            merchant_id, platform, platform_product_id = parts
+            pg_row = await database.fetch_one(
+                """
+                SELECT product_group_id
+                FROM product_group_members
+                WHERE merchant_id = :merchant_id
+                  AND platform = :platform
+                  AND platform_product_id = :platform_product_id
+                LIMIT 1
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "platform": platform,
+                    "platform_product_id": platform_product_id,
+                },
+            )
+            if pg_row and pg_row.get("product_group_id"):
+                product_group_id = str(pg_row["product_group_id"])
+        except Exception as exc:
+            debug_errors.append(f"resolve_product_group_failed: {str(exc)[:200]}")
+
+    return {
+        "status": "degraded" if debug_errors else "success",
+        "seed_id": seed_id,
+        "product_key": product_key,
+        "attached_variant_id": attached_variant_id,
+        "product_group_id": product_group_id,
+        **({"debug_errors": debug_errors} if debug_errors else {}),
+    }
+
+
 @router.get("/{product_key}/external-links")
 async def list_attached_external_links(
     product_key: str,
