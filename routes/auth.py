@@ -77,17 +77,9 @@ def _send_reset_password_email(email: str, reset_link: str) -> None:
     """
     Best-effort email sender for password reset links.
 
-    Uses SendGrid when SENDGRID_API_KEY / settings.sendgrid_api_key is configured.
-    Failures are logged but never propagated to the caller.
+    Uses Amazon SES by default (see utils.email_sender). Failures are logged but never
+    propagated to the caller (to avoid leaking account existence).
     """
-    api_key = getattr(settings, "sendgrid_api_key", None)
-    if not api_key:
-        logger.info(
-            "[Auth] SENDGRID_API_KEY not configured; "
-            "skipping password reset email send"
-        )
-        return
-
     from_email = getattr(settings, "from_email", "noreply@pivota.ai")
 
     subject = "Reset your Pivota password"
@@ -110,38 +102,26 @@ def _send_reset_password_email(email: str, reset_link: str) -> None:
     ).strip()
 
     try:
-        import requests
+        from utils.email_sender import send_email, mask_email
 
-        response = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "personalizations": [{"to": [{"email": email}]}],
-                "from": {"email": from_email, "name": "Pivota"},
-                "subject": subject,
-                "content": [
-                    {"type": "text/plain", "value": text_content},
-                    {"type": "text/html", "value": html_content},
-                ],
-            },
-            timeout=10,
+        res = send_email(
+            to_email=email,
+            subject=subject,
+            text_body=text_content,
+            html_body=html_content,
+            from_email=from_email,
+            from_name="Pivota",
+            tags={"type": "reset_password"},
         )
-        if response.status_code >= 400:
-            logger.error(
-                "[Auth] Failed to send reset-password email via SendGrid: "
-                "status=%s body=%s",
-                response.status_code,
-                response.text,
+        if not getattr(res, "ok", False):
+            logger.warning(
+                "[Auth] Reset-password email delivery failed provider=%s error=%s to=%s",
+                getattr(res, "provider", None),
+                getattr(res, "error", None),
+                mask_email(email),
             )
-        else:
-            logger.info("[Auth] Reset-password email sent via SendGrid to %s", email)
     except Exception as exc:
-        logger.error(
-            "[Auth] Exception while sending reset-password email: %s", exc
-        )
+        logger.warning("[Auth] Reset-password email send raised error=%s", type(exc).__name__)
 
 @router.post("/register", response_model=MessageResponse)
 async def register(data: RegisterRequest):
@@ -674,10 +654,8 @@ async def forgot_password(data: ForgotPasswordRequest):
             base_url = getattr(settings, "agent_portal_base_url", "https://developer.pivota.cc").rstrip("/")
 
         reset_link = f"{base_url}/reset-password?token={reset_token}"
-        print(f"🔑 Password reset link for {data.email}: {reset_link}")
-        print(f"   (Valid for 1 hour)")
 
-        # Best-effort email delivery via SendGrid; failures are logged only
+        # Best-effort email delivery; failures are logged only
         _send_reset_password_email(data.email, reset_link)
         
         return MessageResponse(
