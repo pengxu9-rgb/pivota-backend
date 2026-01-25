@@ -325,6 +325,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             429: ErrorCode.RATE_LIMIT_EXCEEDED,
             500: ErrorCode.INTERNAL_SERVER_ERROR,
             502: ErrorCode.EXTERNAL_SERVICE_ERROR,
+            503: ErrorCode.EXTERNAL_SERVICE_ERROR,
         }
         
         return status_map.get(status_code, ErrorCode.INTERNAL_SERVER_ERROR)

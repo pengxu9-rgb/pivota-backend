@@ -691,10 +691,17 @@ async def start_login(request: Request, body: LoginStartRequest):
             getattr(delivery, "error", None),
             _mask_email(email),
         )
-        raise _error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "EMAIL_DELIVERY_FAILED",
-            "Unable to deliver login code email. Please retry shortly.",
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": {
+                    "code": "EMAIL_DELIVERY_FAILED",
+                    "message": "Unable to deliver login code email. Please retry shortly.",
+                    "provider": getattr(delivery, "provider", None),
+                    "delivery_error": getattr(delivery, "error", None),
+                    "delivery_details": getattr(delivery, "details", None),
+                }
+            },
         )
 
     # In non-production, optionally echo the OTP for easier local testing

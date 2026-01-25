@@ -26,6 +26,7 @@ class EmailSendResult:
     provider: str
     message_id: Optional[str] = None
     error: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
 
 
 def mask_email(email: str) -> str:
@@ -131,7 +132,58 @@ def _send_via_ses(
         logger.info("email.sent provider=ses to=%s", mask_email(to_email))
         return EmailSendResult(ok=True, provider="ses", message_id=msg_id)
     except Exception as exc:
-        # Do not log the exception message (may include details we don't want).
+        # Avoid logging exception messages (may include email addresses).
+        try:
+            from botocore.exceptions import (
+                ClientError,
+                EndpointConnectionError,
+                NoCredentialsError,
+                NoRegionError,
+            )
+        except Exception:
+            ClientError = None  # type: ignore[assignment]
+            EndpointConnectionError = None  # type: ignore[assignment]
+            NoCredentialsError = None  # type: ignore[assignment]
+            NoRegionError = None  # type: ignore[assignment]
+
+        if NoRegionError is not None and isinstance(exc, NoRegionError):
+            logger.warning("email.send_failed provider=ses code=NoRegionError")
+            return EmailSendResult(ok=False, provider="ses", error="SES_NO_REGION")
+
+        if NoCredentialsError is not None and isinstance(exc, NoCredentialsError):
+            logger.warning("email.send_failed provider=ses code=NoCredentialsError")
+            return EmailSendResult(ok=False, provider="ses", error="SES_NO_CREDENTIALS")
+
+        if EndpointConnectionError is not None and isinstance(exc, EndpointConnectionError):
+            logger.warning("email.send_failed provider=ses code=EndpointConnectionError")
+            return EmailSendResult(ok=False, provider="ses", error="SES_ENDPOINT_UNREACHABLE")
+
+        if ClientError is not None and isinstance(exc, ClientError):
+            resp = getattr(exc, "response", {}) or {}
+            err = resp.get("Error") or {}
+            meta = resp.get("ResponseMetadata") or {}
+            aws_code = str(err.get("Code") or "ClientError").strip()
+            aws_status = meta.get("HTTPStatusCode")
+            aws_request_id = str(meta.get("RequestId") or "").strip() or None
+            logger.warning(
+                "email.send_failed provider=ses code=%s status=%s request_id=%s region=%s",
+                aws_code,
+                aws_status,
+                aws_request_id,
+                _aws_region() or "unknown",
+            )
+            return EmailSendResult(
+                ok=False,
+                provider="ses",
+                error=f"SES_{aws_code}",
+                details={
+                    "aws_code": aws_code,
+                    "aws_status": aws_status,
+                    "aws_request_id": aws_request_id,
+                    "aws_region": _aws_region() or None,
+                },
+            )
+
         logger.warning("email.send_failed provider=ses error=%s", type(exc).__name__)
         return EmailSendResult(ok=False, provider="ses", error="SES_SEND_FAILED")
 
