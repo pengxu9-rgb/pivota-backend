@@ -320,6 +320,36 @@ buyer_review_ownership = Table(
 
 Index("idx_buyer_review_ownership_token", buyer_review_ownership.c.token_jti_hash)
 
+buyer_review_user_subject = Table(
+    "buyer_review_user_subject",
+    metadata,
+    Column("id", _ID_TYPE, primary_key=True, autoincrement=True),
+    Column("user_id", String(128), nullable=False),
+    Column("subject_type", String(32), nullable=False),
+    Column("subject_id", Text, nullable=False),
+    Column("review_id", _ID_TYPE, ForeignKey("product_reviews.id", ondelete="CASCADE"), nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    UniqueConstraint("user_id", "subject_type", "subject_id", name="ux_buyer_review_user_subject"),
+)
+
+Index("idx_buyer_review_user_subject_user", buyer_review_user_subject.c.user_id)
+Index("idx_buyer_review_user_subject_subject", buyer_review_user_subject.c.subject_type, buyer_review_user_subject.c.subject_id)
+
+ugc_questions = Table(
+    "ugc_questions",
+    metadata,
+    Column("id", _ID_TYPE, primary_key=True, autoincrement=True),
+    Column("user_id", String(128), nullable=False),
+    Column("subject_type", String(32), nullable=False),
+    Column("subject_id", Text, nullable=False),
+    Column("question", Text, nullable=False),
+    Column("status", String(16), nullable=False, server_default="active"),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+Index("idx_ugc_questions_user_created", ugc_questions.c.user_id, ugc_questions.c.created_at.desc())
+Index("idx_ugc_questions_subject_created", ugc_questions.c.subject_type, ugc_questions.c.subject_id, ugc_questions.c.created_at.desc())
+
 Index("idx_import_items_batch_status", import_items.c.batch_id, import_items.c.status)
 Index(
     "ux_import_items_merchant_source_external_review",

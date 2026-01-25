@@ -47,6 +47,12 @@ from db.accounts import (
 )
 from db.orders import orders as orders_table
 from utils.auth import create_access_token, decode_token
+from services.ugc_capabilities_service import (
+    UgcSubject,
+    has_user_reviewed_subject,
+    is_question_rate_limited,
+    user_has_purchased_subject,
+)
 
 
 router = APIRouter(prefix="/accounts", tags=["accounts-orders"])
@@ -172,6 +178,19 @@ async def get_accounts_principal(request: Request) -> AccountsPrincipal:
 
     norm = normalize_email(email)
     return AccountsPrincipal(user_id=sub, email=email, email_normalized=norm, primary_role=role)
+
+
+async def get_accounts_principal_ugc(request: Request) -> AccountsPrincipal:
+    """
+    UGC endpoints require a simple error contract:
+      - 401 NOT_AUTHENTICATED
+
+    Wrap the shared accounts session checker but normalize the code.
+    """
+    try:
+        return await get_accounts_principal(request)
+    except HTTPException:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="NOT_AUTHENTICATED")
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +828,119 @@ async def get_me(principal: AccountsPrincipal = Depends(get_accounts_principal))
         )
     session_payload = await _build_user_session(dict(user_row))
     return session_payload
+
+
+@router.get("/pdp/v2/personalization")
+async def get_pdp_v2_personalization(
+    response: Response,
+    principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
+    product_id: str = Query(..., min_length=1, alias="productId"),
+    product_group_id: Optional[str] = Query(None, alias="productGroupId"),
+):
+    """
+    User-specific PDP v2 personalization (UGC capabilities).
+
+    NOTE: This endpoint must never be cached by CDN/browser.
+    """
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    pid = str(product_id or "").strip()
+    pgid = str(product_group_id or "").strip() or None
+    subject_id = pgid or pid
+
+    subject = UgcSubject(
+        subject_type="product_group" if pgid else "product",
+        subject_id=subject_id,
+        product_id=pid,
+        product_group_id=pgid,
+    )
+
+    is_purchaser = await user_has_purchased_subject(
+        email_normalized=principal.email_normalized,
+        subject=subject,
+    )
+    already_reviewed = await has_user_reviewed_subject(
+        user_id=principal.user_id,
+        subject_type=subject.subject_type,
+        subject_id=subject.subject_id,
+    )
+
+    question_rate_limited = await is_question_rate_limited(
+        user_id=principal.user_id,
+        subject_type=subject.subject_type,
+        subject_id=subject.subject_id,
+        window_seconds=60,
+    )
+
+    can_upload = bool(is_purchaser)
+    can_review = bool(is_purchaser) and not bool(already_reviewed)
+    can_ask = not bool(question_rate_limited)
+
+    reasons: Dict[str, str] = {}
+    if not can_upload:
+        reasons["upload"] = "NOT_PURCHASER"
+    if not can_review:
+        reasons["review"] = "ALREADY_REVIEWED" if already_reviewed else "NOT_PURCHASER"
+    if not can_ask:
+        reasons["question"] = "RATE_LIMITED"
+
+    return {
+        "ugcCapabilities": {
+            "canUploadMedia": can_upload,
+            "canWriteReview": can_review,
+            "canAskQuestion": can_ask,
+            "reasons": reasons,
+        }
+    }
+
+
+@router.get("/reviews/eligibility")
+async def get_review_eligibility(
+    response: Response,
+    principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
+    product_id: str = Query(..., min_length=1, alias="productId"),
+    product_group_id: Optional[str] = Query(None, alias="productGroupId"),
+):
+    """
+    Best-effort "can I write a review?" endpoint for UX gating.
+
+    Returns:
+      { eligible: boolean, reason?: "NOT_PURCHASER"|"ALREADY_REVIEWED" }
+    """
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    pid = str(product_id or "").strip()
+    pgid = str(product_group_id or "").strip() or None
+    subject_id = pgid or pid
+
+    subject = UgcSubject(
+        subject_type="product_group" if pgid else "product",
+        subject_id=subject_id,
+        product_id=pid,
+        product_group_id=pgid,
+    )
+
+    is_purchaser = await user_has_purchased_subject(
+        email_normalized=principal.email_normalized,
+        subject=subject,
+    )
+
+    if not is_purchaser:
+        return {"eligible": False, "reason": "NOT_PURCHASER"}
+
+    already_reviewed = await has_user_reviewed_subject(
+        user_id=principal.user_id,
+        subject_type=subject.subject_type,
+        subject_id=subject.subject_id,
+    )
+    if already_reviewed:
+        return {"eligible": False, "reason": "ALREADY_REVIEWED"}
+
+    return {"eligible": True}
 
 
 @router.post("/auth/refresh")
