@@ -73,6 +73,33 @@ def test_extract_from_html_collects_images_from_data_product_skus_value() -> Non
     assert "https://example.com/b.jpg" in image_urls
 
 
+def test_extract_from_html_collects_images_from_img_tags_and_srcset() -> None:
+    html = """
+    <html>
+      <head>
+        <link rel="canonical" href="https://example.com/p/1" />
+        <link rel="preload" as="image" href="https://example.com/preload_1.webp" />
+      </head>
+      <body>
+        <img src="/assets/p1.jpg" />
+        <img data-src="//cdn.example.com/p2.png" />
+        <img
+          srcset="https://example.com/small.jpg 400w, https://example.com/large.jpg 1200w"
+        />
+        <img src="https://example.com/logo.svg" />
+      </body>
+    </html>
+    """
+
+    out = _extract_from_html("https://example.com/p/1", html)
+    image_urls = out.get("image_urls") or []
+    assert "https://example.com/preload_1.webp" in image_urls
+    assert "https://example.com/assets/p1.jpg" in image_urls
+    assert "https://cdn.example.com/p2.png" in image_urls
+    assert "https://example.com/large.jpg" in image_urls
+    assert all("logo.svg" not in u for u in image_urls)
+
+
 def test_extract_from_html_prefers_size_titles_from_data_attrs_when_jsonld_titles_are_generic() -> None:
     html = """
     <html>
@@ -105,4 +132,3 @@ def test_extract_from_html_prefers_size_titles_from_data_attrs_when_jsonld_title
     assert any(v.get("variant_id") == "T2KD01" and v.get("title") == "250 ml" for v in variants)
 
     assert "Explore desire" in (out.get("description") or "")
-

@@ -32,6 +32,8 @@ class _MetaParser(HTMLParser):
         self.jsonld: list[str] = []
         self._in_jsonld = False
         self._jsonld_buf: list[str] = []
+        self.img_attrs: list[Dict[str, str]] = []
+        self.preload_images: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         a = {k.lower(): (v or "") for k, v in attrs}
@@ -52,11 +54,36 @@ class _MetaParser(HTMLParser):
             href = (a.get("href") or "").strip()
             if rel and href:
                 self.links[rel] = href
+            # Track preload images for galleries (best-effort).
+            rel_tokens = {t for t in rel.split() if t}
+            if "preload" in rel_tokens and (a.get("as") or "").strip().lower() == "image" and href:
+                self.preload_images.append(href)
         elif tag.lower() == "script":
             t = (a.get("type") or "").strip().lower()
             if t == "application/ld+json":
                 self._in_jsonld = True
                 self._jsonld_buf = []
+        elif tag.lower() in {"img", "source"}:
+            # Capture common lazy-load / responsive attributes.
+            captured: Dict[str, str] = {}
+            for key in (
+                "src",
+                "srcset",
+                "data-src",
+                "data-srcset",
+                "data-original",
+                "data-lazy-src",
+                "data-zoom-image",
+                "data-image",
+                "data-large_image",
+                "data-large-image",
+                "href",
+            ):
+                val = (a.get(key) or "").strip()
+                if val:
+                    captured[key] = val
+            if captured:
+                self.img_attrs.append(captured)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "title":
@@ -136,6 +163,13 @@ def _parse_price(value: Optional[str]) -> Optional[float]:
 
 MAX_VARIANTS = int(os.getenv("EXTERNAL_OFFER_MAX_VARIANTS") or "50")
 MAX_IMAGES = int(os.getenv("EXTERNAL_OFFER_MAX_IMAGES") or "20")
+
+_IMG_EXT_RE = re.compile(r"\.(?:avif|webp|jpe?g|png|gif)(?:\\?|#|$)", re.IGNORECASE)
+_IMG_FORMAT_QS_RE = re.compile(r"(?:[?&](?:fm|format)=)(?:avif|webp|jpe?g|png|gif)\\b", re.IGNORECASE)
+_IMG_BLACKLIST_RE = re.compile(
+    r"(?:^|/|_|-)(?:logo|icon|sprite|favicon|badge|payment|klarna|paypal)(?:$|/|\\.|_|-)",
+    re.IGNORECASE,
+)
 
 
 _SIZE_TITLE_KEY_CANDIDATES = (
@@ -682,6 +716,118 @@ def _extract_meta_image_urls(parser: _MetaParser, base_url: str) -> list[str]:
     return urls
 
 
+def _extract_dom_image_urls(parser: _MetaParser, base_url: str) -> list[str]:
+    """
+    Best-effort gallery extraction from <img>/<source>/<link rel=preload as=image> tags.
+
+    This is intentionally heuristic to pick up common ecommerce galleries (Shopify themes, etc.)
+    when JSON-LD/OG only provides a single hero image.
+    """
+    candidates: list[str] = []
+    candidates.extend([c for c in parser.preload_images if isinstance(c, str)])
+    for attrs in parser.img_attrs:
+        if not isinstance(attrs, dict):
+            continue
+        for key in (
+            "src",
+            "data-src",
+            "data-original",
+            "data-lazy-src",
+            "data-zoom-image",
+            "data-image",
+            "data-large_image",
+            "data-large-image",
+            "href",
+        ):
+            raw = attrs.get(key)
+            if raw:
+                candidates.append(raw)
+        # Prefer the highest-resolution entry in a srcset/data-srcset.
+        for key in ("srcset", "data-srcset"):
+            raw = attrs.get(key)
+            if not raw:
+                continue
+            raw = html_lib.unescape(str(raw))
+            best_url = None
+            best_score = -1.0
+            for part in raw.split(","):
+                token = part.strip()
+                if not token:
+                    continue
+                bits = token.split()
+                url = bits[0].strip()
+                if not url:
+                    continue
+                score = 0.0
+                if len(bits) >= 2:
+                    d = bits[1].strip().lower()
+                    if d.endswith("w"):
+                        try:
+                            score = float(int(re.sub(r"[^0-9]", "", d) or "0"))
+                        except Exception:
+                            score = 0.0
+                    elif d.endswith("x"):
+                        try:
+                            score = float(re.sub(r"[^0-9.]", "", d) or "0")
+                        except Exception:
+                            score = 0.0
+                if score >= best_score:
+                    best_score = score
+                    best_url = url
+            if best_url:
+                candidates.append(best_url)
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def normalize(raw: Any) -> Optional[str]:
+        if not raw:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        s = html_lib.unescape(s)
+        if s.startswith("data:"):
+            return None
+        if s.startswith("//"):
+            try:
+                scheme = urlparse(base_url).scheme or "https"
+            except Exception:
+                scheme = "https"
+            s = f"{scheme}:{s}"
+        if not s.startswith(("http://", "https://")):
+            s = urljoin(base_url, s)
+        return s if s.startswith(("http://", "https://")) else None
+
+    def looks_like_image(url: str) -> bool:
+        u = url.lower()
+        if u.startswith("data:"):
+            return False
+        if ".svg" in u:
+            return False
+        if _IMG_BLACKLIST_RE.search(u):
+            return False
+        # Prefer extension, but allow common CDN format query strings (e.g. ?fm=webp).
+        if _IMG_EXT_RE.search(u) or _IMG_FORMAT_QS_RE.search(u):
+            return True
+        # Some CDNs omit extensions; accept those as a fallback if they live under /images or /image.
+        if "/images" in u or "/image" in u:
+            return True
+        return False
+
+    for raw in candidates:
+        resolved = normalize(raw)
+        if not resolved or resolved in seen:
+            continue
+        if not looks_like_image(resolved):
+            continue
+        seen.add(resolved)
+        urls.append(resolved)
+        if len(urls) >= MAX_IMAGES:
+            break
+    return urls
+
+
 def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
     for root in parsed_objs:
@@ -793,6 +939,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     jsonld_image_urls = _extract_jsonld_image_urls(parsed_jsonld, canonical)
     meta_image_urls = _extract_meta_image_urls(p, canonical)
     data_attr_image_urls = _extract_image_urls_from_data_attrs(html, canonical)
+    dom_image_urls = _extract_dom_image_urls(p, canonical)
     variants_jsonld = _extract_jsonld_variants(parsed_jsonld)
     fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
     variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency)
@@ -837,7 +984,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     if preferred:
         image_urls.append(preferred)
         seen_images.add(preferred)
-    for url in jsonld_image_urls + meta_image_urls + data_attr_image_urls:
+    for url in jsonld_image_urls + meta_image_urls + data_attr_image_urls + dom_image_urls:
         if not url or url in seen_images:
             continue
         seen_images.add(url)

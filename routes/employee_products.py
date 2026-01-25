@@ -920,6 +920,7 @@ class CreateExternalSeedRequest(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
@@ -938,6 +939,7 @@ class UpdateExternalSeedRequest(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
@@ -2076,10 +2078,14 @@ async def create_external_seed(
     snap_price_amount = getattr(snapshot, "price_amount", None) if snapshot else None
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
+    snap_image_urls: list[str] = []
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
     evidence = getattr(snapshot, "evidence", None) if snapshot else None
     if isinstance(evidence, dict):
+        raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
+        if isinstance(raw_images, list):
+            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
         raw_desc = evidence.get("description")
         if isinstance(raw_desc, str) and raw_desc.strip():
             snap_description = raw_desc.strip()
@@ -2106,6 +2112,12 @@ async def create_external_seed(
     title = (body.title or "").strip() or snap_title
     description = (body.description or "").strip() or snap_description
     image_url = (body.image_url or "").strip() or snap_image_url
+    if not image_url and body.image_urls:
+        cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
+        if cleaned:
+            image_url = cleaned[0]
+    if not image_url and snap_image_urls:
+        image_url = snap_image_urls[0]
     price_amount = body.price_amount if body.price_amount is not None else snap_price_amount
     price_currency = (body.price_currency or "").strip() or snap_price_currency
     availability = (body.availability or "").strip() or snap_availability
@@ -2161,6 +2173,10 @@ async def create_external_seed(
         seed_data["title"] = title
         seed_data["description"] = description
         seed_data["image_url"] = image_url
+        if body.image_urls is not None:
+            seed_data["image_urls"] = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
+        elif snap_image_urls:
+            seed_data["image_urls"] = snap_image_urls
         seed_data["availability"] = availability
         seed_data["utm_template"] = utm_template
         seed_data["partner_type"] = partner_type
@@ -2173,6 +2189,7 @@ async def create_external_seed(
                 "domain": domain,
                 "title": snap_title,
                 "image_url": snap_image_url,
+                "image_urls": snap_image_urls,
                 "price_amount": snap_price_amount,
                 "price_currency": snap_price_currency,
                 "availability": snap_availability,
@@ -2271,6 +2288,9 @@ async def create_external_seed(
             "title": title,
             "description": description,
             "image_url": image_url,
+            "image_urls": [str(u).strip() for u in (body.image_urls or []) if isinstance(u, str) and str(u).strip()]
+            if body.image_urls is not None
+            else snap_image_urls,
             "availability": availability,
             "variants": body.variants or (snap_variants or []),
             "utm_template": utm_template,
@@ -2283,6 +2303,7 @@ async def create_external_seed(
                 "title": snap_title,
                 "description": snap_description,
                 "image_url": snap_image_url,
+                "image_urls": snap_image_urls,
                 "price_amount": snap_price_amount,
                 "price_currency": snap_price_currency,
                 "availability": snap_availability,
@@ -2471,6 +2492,11 @@ async def update_external_seed(
         seed_data["description"] = body.description
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
+    if body.image_urls is not None:
+        cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
+        seed_data["image_urls"] = cleaned
+        if body.image_url is None and cleaned:
+            seed_data["image_url"] = cleaned[0]
     if body.availability is not None:
         seed_data["availability"] = body.availability
     if body.product_id is not None:
@@ -2526,6 +2552,11 @@ async def update_external_seed(
     if body.image_url is not None:
         updates["image_url"] = body.image_url
         set_clauses.append("image_url = :image_url")
+    elif body.image_urls is not None:
+        cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
+        if cleaned:
+            updates["image_url"] = cleaned[0]
+            set_clauses.append("image_url = :image_url")
     if body.price_amount is not None:
         updates["price_amount"] = body.price_amount
         set_clauses.append("price_amount = :price_amount")

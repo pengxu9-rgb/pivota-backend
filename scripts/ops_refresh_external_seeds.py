@@ -233,7 +233,7 @@ async def _refresh_seed(
         return False, f"degraded: {payload.get('error')}"
     return False, f"unexpected_status: {status}"
 
-async def _preview_seed_variants(
+async def _preview_seed(
     client: httpx.AsyncClient,
     base_url: str,
     token: str,
@@ -241,7 +241,7 @@ async def _preview_seed_variants(
     destination_url: str,
     market: Optional[str],
     timeout: float,
-) -> Tuple[bool, str, List[Dict[str, Any]]]:
+) -> Tuple[bool, str, List[Dict[str, Any]], List[str]]:
     url = f"{base_url.rstrip('/')}/employee/products/external-seeds/preview"
     body: Dict[str, Any] = {
         "destination_url": destination_url,
@@ -250,32 +250,40 @@ async def _preview_seed_variants(
     }
     resp = await client.post(url, headers=_auth_headers(token), json=body, timeout=timeout)
     if resp.status_code != 200:
-        return False, f"HTTP {resp.status_code}", []
+        return False, f"HTTP {resp.status_code}", [], []
     payload = resp.json() if resp.content else {}
     status = str(payload.get("status") or "")
     if status != "success":
         err = payload.get("error")
-        return False, f"{status}:{str(err)[:120] if err else ''}".strip(":"), []
+        return False, f"{status}:{str(err)[:120] if err else ''}".strip(":"), [], []
     preview = payload.get("preview")
     if not isinstance(preview, dict):
-        return False, "invalid_preview", []
+        return False, "invalid_preview", [], []
     variants = preview.get("variants") or []
     if not isinstance(variants, list):
-        return False, "invalid_variants", []
+        return False, "invalid_variants", [], []
     cleaned = [v for v in variants if isinstance(v, dict)]
-    return True, f"preview_variants={len(cleaned)}", cleaned
+    images = preview.get("image_urls") or preview.get("images") or []
+    if not isinstance(images, list):
+        images = []
+    cleaned_images = [str(u).strip() for u in images if isinstance(u, str) and str(u).strip()]
+    return True, f"preview_variants={len(cleaned)} preview_images={len(cleaned_images)}", cleaned, cleaned_images
 
 
-async def _patch_seed_variants(
+async def _patch_seed(
     client: httpx.AsyncClient,
     base_url: str,
     token: str,
     seed_id: str,
     variants: List[Dict[str, Any]],
+    image_urls: List[str],
     timeout: float,
 ) -> Tuple[bool, str]:
     url = f"{base_url.rstrip('/')}/employee/products/external-seeds/{seed_id}"
-    resp = await client.patch(url, headers=_auth_headers(token), json={"variants": variants}, timeout=timeout)
+    payload: Dict[str, Any] = {"variants": variants}
+    if image_urls:
+        payload["image_urls"] = image_urls
+    resp = await client.patch(url, headers=_auth_headers(token), json=payload, timeout=timeout)
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code}"
     payload = resp.json() if resp.content else {}
@@ -373,7 +381,7 @@ async def main_async(args: argparse.Namespace) -> int:
                         if not dest:
                             ok, msg = False, "missing_destination_url"
                         else:
-                            prev_ok, prev_msg, variants = await _preview_seed_variants(
+                            prev_ok, prev_msg, variants, image_urls = await _preview_seed(
                                 client,
                                 base_url,
                                 token,
@@ -383,11 +391,11 @@ async def main_async(args: argparse.Namespace) -> int:
                             )
                             if not prev_ok:
                                 ok, msg = False, f"preview_failed:{prev_msg}"
-                            elif not variants:
+                            elif not variants and not image_urls:
                                 ok, msg = False, f"preview_empty:{prev_msg}"
                             else:
-                                patch_ok, patch_msg = await _patch_seed_variants(
-                                    client, base_url, token, seed_id, variants, args.timeout
+                                patch_ok, patch_msg = await _patch_seed(
+                                    client, base_url, token, seed_id, variants, image_urls, args.timeout
                                 )
                                 ok, msg = (patch_ok, f"{patch_msg} ({prev_msg})")
 
