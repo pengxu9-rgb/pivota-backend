@@ -198,22 +198,12 @@ async def get_accounts_principal_ugc(request: Request) -> AccountsPrincipal:
 # ---------------------------------------------------------------------------
 
 
-def _send_login_otp_email(email: str, otp_code: str) -> None:
+def _send_login_otp_email(email: str, otp_code: str):
     """
-    Best-effort email sender for login OTP codes.
+    Email sender for login OTP codes.
 
-    Uses SendGrid when SENDGRID_API_KEY / settings.sendgrid_api_key is configured.
-    Failures are logged but never propagated to the caller, so login flow
-    still returns 200 even if email delivery fails.
+    Uses Amazon SES by default (see utils.email_sender). Returns an EmailSendResult.
     """
-    api_key = getattr(settings, "sendgrid_api_key", None)
-    if not api_key:
-        logger.info(
-            "[AccountsAuth] SENDGRID_API_KEY not configured; "
-            "skipping OTP email send"
-        )
-        return
-
     from_email = getattr(settings, "from_email", "noreply@pivota.ai")
 
     subject = "Your login code for Pivota"
@@ -229,41 +219,17 @@ def _send_login_otp_email(email: str, otp_code: str) -> None:
         """
     ).strip()
 
-    try:
-        import requests
+    from utils.email_sender import send_email
 
-        response = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "personalizations": [{"to": [{"email": email}]}],
-                "from": {"email": from_email, "name": "Pivota"},
-                "subject": subject,
-                "content": [
-                    {"type": "text/plain", "value": text_content},
-                    {"type": "text/html", "value": html_content},
-                ],
-            },
-            timeout=10,
-        )
-        if response.status_code >= 400:
-            logger.error(
-                "[AccountsAuth] Failed to send OTP email via SendGrid: "
-                "status=%s body=%s",
-                response.status_code,
-                response.text,
-            )
-        else:
-            logger.info(
-                "[AccountsAuth] OTP email sent via SendGrid to %s", email
-            )
-    except Exception as exc:
-        logger.error(
-            "[AccountsAuth] Exception while sending OTP email: %s", exc
-        )
+    return send_email(
+        to_email=email,
+        subject=subject,
+        text_body=text_content,
+        html_body=html_content,
+        from_email=from_email,
+        from_name="Pivota",
+        tags={"type": "accounts_login_otp"},
+    )
 
 class LoginStartRequest(BaseModel):
     channel: str = Field(..., description="email | sms")
@@ -705,11 +671,31 @@ async def start_login(request: Request, body: LoginStartRequest):
         )
     )
 
-    # Log OTP for observability (and dev environments)
-    logger.info("[AccountsAuth] OTP generated for %s", email)
+    # Log OTP for observability (avoid PII in logs)
+    logger.info("[AccountsAuth] OTP generated for %s", _mask_email(email))
 
-    # Best-effort email delivery; failures are logged but do not break the flow
-    _send_login_otp_email(email, otp_code)
+    # Email delivery is required in production; fail-closed so the UI can surface the issue.
+    try:
+        delivery = await asyncio.to_thread(_send_login_otp_email, email, otp_code)
+    except Exception as exc:
+        delivery = None
+        logger.warning(
+            "[AccountsAuth] OTP email send raised error=%s to=%s",
+            type(exc).__name__,
+            _mask_email(email),
+        )
+    if not getattr(delivery, "ok", False) and not settings.dev_mode:
+        logger.warning(
+            "[AccountsAuth] OTP email delivery failed provider=%s error=%s to=%s",
+            getattr(delivery, "provider", None),
+            getattr(delivery, "error", None),
+            _mask_email(email),
+        )
+        raise _error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "EMAIL_DELIVERY_FAILED",
+            "Unable to deliver login code email. Please retry shortly.",
+        )
 
     # In non-production, optionally echo the OTP for easier local testing
     payload: Dict[str, Any] = {"status": "sent"}

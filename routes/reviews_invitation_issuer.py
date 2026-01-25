@@ -18,6 +18,7 @@ Security:
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import html
 import os
@@ -459,76 +460,47 @@ async def _send_sendgrid_email(
     template_data: Dict[str, Any],
     reply_to_email: Optional[str] = None,
 ) -> Dict[str, Any]:
-    api_key = _sendgrid_api_key()
-    if not api_key:
-        raise HTTPException(status_code=503, detail="SENDGRID_DISABLED")
-
     to_email = (to_email or "").strip()
     if not to_email:
         raise HTTPException(status_code=400, detail="ORDER_EMAIL_MISSING")
 
     from_email = _sendgrid_from_email()
     if not from_email:
-        raise HTTPException(status_code=503, detail="SENDGRID_FROM_EMAIL_MISSING")
+        raise HTTPException(status_code=503, detail="FROM_EMAIL_MISSING")
 
-    template_id = _sendgrid_template_id()
-    use_template = bool(template_id and _use_sendgrid_template())
-    from_name = _sendgrid_from_name()
-    payload: Dict[str, Any] = {
-        "personalizations": [{"to": [{"email": to_email}]}],
-        "from": {"email": from_email},
-    }
-    if from_name:
-        payload["from"]["name"] = from_name
+    from utils.email_sender import send_email
 
+    from_name = (_sendgrid_from_name() or "Pivota").strip()
+    reply_to: Optional[str] = None
     if _reply_to_support_email_enabled():
         reply = (reply_to_email or "").strip()
         if reply:
-            payload["reply_to"] = {"email": reply}
-    click_tracking_disabled = False
-    if _disable_sendgrid_click_tracking():
-        payload["tracking_settings"] = {"click_tracking": {"enable": False, "enable_text": False}}
-        click_tracking_disabled = True
+            reply_to = reply
 
-    if use_template:
-        payload["template_id"] = template_id
-        payload["personalizations"][0]["dynamic_template_data"] = template_data
-    else:
-        payload["subject"] = subject
-        payload["content"] = [
-            {"type": "text/plain", "value": text_body},
-            {"type": "text/html", "value": html_body},
-        ]
+    res = await asyncio.to_thread(
+        send_email,
+        to_email=to_email,
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+        from_email=from_email,
+        from_name=from_name or None,
+        reply_to=reply_to,
+        tags={"type": "reviews_invitation"},
+    )
+    if not getattr(res, "ok", False):
+        raise HTTPException(status_code=503, detail="EMAIL_DELIVERY_FAILED")
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                "https://api.sendgrid.com/v3/mail/send",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-    except Exception:
-        raise HTTPException(status_code=503, detail="SENDGRID_UNAVAILABLE")
-
-    # SendGrid returns 202 Accepted on success.
-    if resp.status_code not in {200, 202}:
-        raise HTTPException(status_code=503, detail="SENDGRID_UNAVAILABLE")
-
-    # Best-effort: capture message id for debugging (non-PII).
-    msg_id = (
-        resp.headers.get("x-message-id")
-        or resp.headers.get("X-Message-Id")
-        or resp.headers.get("X-Message-ID")
-        or ""
-    ).strip()
+    msg_id = str(getattr(res, "message_id", "") or "").strip() or None
     return {
-        "sendgrid_status_code": resp.status_code,
-        "sendgrid_message_id": msg_id or None,
-        "sendgrid_template_used": bool(use_template),
-        "sendgrid_click_tracking_disabled": click_tracking_disabled,
+        # Backward-compat fields (historically SendGrid-specific).
+        "sendgrid_status_code": 200,
+        "sendgrid_message_id": msg_id,
+        "sendgrid_template_used": False,
+        "sendgrid_click_tracking_disabled": False,
+        # New generic fields.
+        "email_provider": getattr(res, "provider", None),
+        "email_message_id": msg_id,
     }
 
 

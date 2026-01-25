@@ -35,16 +35,8 @@ def hash_password(password: str) -> str:
 def _send_employee_welcome_email(email: str, name: str, temp_password: str) -> str:
     """
     Best-effort email sender for newly created employee accounts.
-    Returns: "sent", "failed", or "skipped".
+    Returns: "sent" or "failed".
     """
-    api_key = getattr(settings, "sendgrid_api_key", None)
-    if not api_key:
-        logger.info(
-            "[Employees] SENDGRID_API_KEY not configured; "
-            "skipping employee welcome email send"
-        )
-        return "skipped"
-
     from_email = getattr(settings, "from_email", "noreply@pivota.ai")
     subject = "Your Pivota employee account"
     text_content = (
@@ -67,39 +59,29 @@ def _send_employee_welcome_email(email: str, name: str, temp_password: str) -> s
     ).strip()
 
     try:
-        import requests
+        from utils.email_sender import send_email, mask_email
 
-        response = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "personalizations": [{"to": [{"email": email}]}],
-                "from": {"email": from_email, "name": "Pivota"},
-                "subject": subject,
-                "content": [
-                    {"type": "text/plain", "value": text_content},
-                    {"type": "text/html", "value": html_content},
-                ],
-            },
-            timeout=10,
+        res = send_email(
+            to_email=email,
+            subject=subject,
+            text_body=text_content,
+            html_body=html_content,
+            from_email=from_email,
+            from_name="Pivota",
+            tags={"type": "employee_welcome"},
         )
-        if response.status_code >= 400:
-            logger.error(
-                "[Employees] Failed to send welcome email via SendGrid: "
-                "status=%s body=%s",
-                response.status_code,
-                response.text,
+        if not getattr(res, "ok", False):
+            logger.warning(
+                "[Employees] Welcome email delivery failed provider=%s error=%s to=%s",
+                getattr(res, "provider", None),
+                getattr(res, "error", None),
+                mask_email(email),
             )
             return "failed"
-        logger.info("[Employees] Welcome email sent via SendGrid to %s", email)
+        logger.info("[Employees] Welcome email sent to %s", mask_email(email))
         return "sent"
     except Exception as exc:
-        logger.error(
-            "[Employees] Exception while sending welcome email: %s", exc
-        )
+        logger.warning("[Employees] Welcome email send raised error=%s", type(exc).__name__)
         return "failed"
 
 # ============== Employees Management ==============
@@ -567,6 +549,4 @@ async def update_security_settings(
             "max_login_attempts": max_login_attempts
         }
     }
-
-
 
