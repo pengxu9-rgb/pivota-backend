@@ -79,6 +79,24 @@ def _aws_endpoint_url() -> Optional[str]:
     return v or None
 
 
+def _ses_default_endpoint_url(region: str) -> str:
+    # SES uses the "email" subdomain.
+    suffix = "amazonaws.com.cn" if (region or "").startswith("cn-") else "amazonaws.com"
+    return f"https://email.{region}.{suffix}"
+
+
+def _ses_endpoint_url(region: Optional[str]) -> Optional[str]:
+    # Always pass an explicit endpoint URL to avoid SDK-level global endpoint overrides
+    # (e.g. `AWS_ENDPOINT_URL`) accidentally affecting SES.
+    override = _aws_endpoint_url()
+    if override:
+        return override
+    r = (region or "").strip()
+    if not r:
+        return None
+    return _ses_default_endpoint_url(r)
+
+
 @lru_cache(maxsize=4)
 def _sesv2_client(region: Optional[str], endpoint_url: Optional[str]) -> Any:
     import boto3
@@ -99,7 +117,7 @@ def _send_via_ses(
 ) -> EmailSendResult:
     try:
         region = _aws_region()
-        endpoint_url = _aws_endpoint_url()
+        endpoint_url = _ses_endpoint_url(region)
         client = _sesv2_client(region, endpoint_url)
     except Exception as exc:
         logger.warning("email.ses.client_unavailable error=%s", type(exc).__name__)
@@ -166,12 +184,18 @@ def _send_via_ses(
             aws_code = str(err.get("Code") or "ClientError").strip()
             aws_status = meta.get("HTTPStatusCode")
             aws_request_id = str(meta.get("RequestId") or "").strip() or None
+            endpoint = None
+            try:
+                endpoint = str(getattr(getattr(client, "meta", None), "endpoint_url", "") or "").strip() or None
+            except Exception:
+                endpoint = None
             logger.warning(
-                "email.send_failed provider=ses code=%s status=%s request_id=%s region=%s",
+                "email.send_failed provider=ses code=%s status=%s request_id=%s region=%s endpoint=%s",
                 aws_code,
                 aws_status,
                 aws_request_id,
                 _aws_region() or "unknown",
+                endpoint or "unknown",
             )
             return EmailSendResult(
                 ok=False,
