@@ -71,11 +71,12 @@ def _aws_region() -> Optional[str]:
 
 def _aws_endpoint_url() -> Optional[str]:
     # Optional override for local testing (e.g. LocalStack).
-    return (
-        (os.getenv("AWS_SES_ENDPOINT_URL") or "").strip()
-        or (os.getenv("AWS_ENDPOINT_URL") or "").strip()
-        or None
-    )
+    #
+    # Important: do NOT fall back to generic `AWS_ENDPOINT_URL` because some
+    # deployments use it for S3-compatible storage (R2/MinIO). Reusing it for SES
+    # would route email sends to the wrong service and fail with opaque 400s.
+    v = (os.getenv("AWS_SES_ENDPOINT_URL") or "").strip()
+    return v or None
 
 
 @lru_cache(maxsize=4)
