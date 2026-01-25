@@ -33,17 +33,48 @@ async def post_question(
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    no_store_headers = {
+        "Cache-Control": "private, no-store",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+    }
 
     pid = str(body.product_id or "").strip()
     pgid = str(body.product_group_id or "").strip() or None
     subject_type = "product_group" if pgid else "product"
     subject_id = pgid or pid
 
-    qid = await create_question(
-        user_id=principal.user_id,
-        subject_type=subject_type,
-        subject_id=subject_id,
-        question=str(body.question or "").strip(),
-        window_seconds=60,
-    )
+    try:
+        qid = await create_question(
+            user_id=principal.user_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            question=str(body.question or "").strip(),
+            window_seconds=60,
+        )
+    except HTTPException as e:
+        code = (
+            str(e.detail or "").strip()
+            if isinstance(e.detail, str)
+            else str((e.detail or {}).get("error", {}).get("code") or "ERROR").strip()
+            if isinstance(e.detail, dict)
+            else "ERROR"
+        )
+        message = "Unable to submit question."
+        if code == "RATE_LIMITED":
+            message = "Too many questions. Please try again in a minute."
+        elif code == "QUESTION_TOO_SHORT":
+            message = "Question is too short."
+        elif code == "QUESTION_TOO_LONG":
+            message = "Question is too long."
+        elif code == "INVALID_SUBJECT":
+            message = "Invalid product."
+        elif code == "NOT_AUTHENTICATED":
+            message = "Please log in to ask a question."
+
+        raise HTTPException(
+            status_code=int(getattr(e, "status_code", 500) or 500),
+            detail={"error": {"code": code, "message": message}},
+            headers=no_store_headers,
+        )
     return {"status": "success", "question_id": int(qid), "subject_type": subject_type, "subject_id": subject_id}

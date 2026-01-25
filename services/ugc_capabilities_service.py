@@ -137,15 +137,42 @@ async def get_product_group_member_product_ids(product_group_id: str) -> Set[str
 
 
 def _is_paid_order(row: Dict[str, Any]) -> bool:
+    """
+    Best-effort purchase/fulfillment gate used for UGC eligibility.
+
+    Business intent:
+      - allow paid / shipped(fulfilled) / delivered orders
+      - do not treat cancelled/refunded as eligible
+
+    NOTE: Different integrations may populate different fields; we accept multiple signals.
+    """
     payment_status = str(row.get("payment_status") or "").strip().lower()
     status = str(row.get("status") or "").strip().lower()
+    fulfillment_status = str(row.get("fulfillment_status") or "").strip().lower()
+
+    cancelled = row.get("cancelled_at") is not None or status in {"cancelled", "canceled"}
+    if cancelled:
+        return False
+    if payment_status in {"refunded"} or status in {"refunded"}:
+        return False
+
     if payment_status in {"paid", "succeeded"}:
         return True
     if row.get("paid_at") is not None:
         return True
-    # Some legacy deployments may encode as status only.
-    if status in {"paid", "delivered", "completed", "fulfilled"}:
+
+    # Some deployments only populate fulfillment timestamps/fields.
+    if fulfillment_status in {"fulfilled", "shipped", "delivered"}:
         return True
+    if row.get("delivered_at") is not None:
+        return True
+    if row.get("shipped_at") is not None:
+        return True
+
+    # Legacy deployments may encode purchase state in status only.
+    if status in {"paid", "shipped", "delivered", "completed", "fulfilled"}:
+        return True
+
     return False
 
 
@@ -212,7 +239,10 @@ async def user_has_purchased_subject(*, email_normalized: str, subject: UgcSubje
                 or_(
                     func.lower(orders_table.c.payment_status).in_(["paid", "succeeded"]),
                     orders_table.c.paid_at.isnot(None),
-                    func.lower(orders_table.c.status).in_(["paid", "delivered", "completed", "fulfilled"]),
+                    func.lower(orders_table.c.status).in_(["paid", "shipped", "delivered", "completed", "fulfilled"]),
+                    func.lower(orders_table.c.fulfillment_status).in_(["fulfilled", "shipped", "delivered"]),
+                    orders_table.c.shipped_at.isnot(None),
+                    orders_table.c.delivered_at.isnot(None),
                 ),
             )
         )
