@@ -37,6 +37,7 @@ from db.database import database
 from db.accounts import (
     shop_users,
     shop_user_memberships,
+    shop_user_passwords,
     shop_login_otps,
     public_order_lookup_logs,
     normalize_email,
@@ -46,7 +47,7 @@ from db.accounts import (
     count_recent_public_lookup_by_key,
 )
 from db.orders import orders as orders_table
-from utils.auth import create_access_token, decode_token
+from utils.auth import create_access_token, decode_token, hash_password, verify_password
 from services.ugc_capabilities_service import (
     UgcSubject,
     has_user_reviewed_subject,
@@ -157,6 +158,9 @@ class AccountsPrincipal(BaseModel):
     email: str
     email_normalized: str
     primary_role: str = "customer"
+    amr: Optional[str] = None
+    iat: Optional[int] = None
+    auth_time: Optional[int] = None
 
 
 async def get_accounts_principal(request: Request) -> AccountsPrincipal:
@@ -173,11 +177,38 @@ async def get_accounts_principal(request: Request) -> AccountsPrincipal:
     sub = payload.get("sub")
     email = payload.get("email")
     role = payload.get("role", "customer")
+    amr = payload.get("amr")
+    raw_iat = payload.get("iat")
+    raw_auth_time = payload.get("auth_time")
+    iat: Optional[int] = None
+    auth_time: Optional[int] = None
+    try:
+        if isinstance(raw_iat, (int, float)):
+            iat = int(raw_iat)
+        elif isinstance(raw_iat, str) and raw_iat.strip().isdigit():
+            iat = int(raw_iat.strip())
+    except Exception:
+        iat = None
+    try:
+        if isinstance(raw_auth_time, (int, float)):
+            auth_time = int(raw_auth_time)
+        elif isinstance(raw_auth_time, str) and raw_auth_time.strip().isdigit():
+            auth_time = int(raw_auth_time.strip())
+    except Exception:
+        auth_time = None
     if not sub or not email:
         raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Invalid token payload")
 
     norm = normalize_email(email)
-    return AccountsPrincipal(user_id=sub, email=email, email_normalized=norm, primary_role=role)
+    return AccountsPrincipal(
+        user_id=sub,
+        email=email,
+        email_normalized=norm,
+        primary_role=role,
+        amr=amr,
+        iat=iat,
+        auth_time=auth_time,
+    )
 
 
 async def get_accounts_principal_ugc(request: Request) -> AccountsPrincipal:
@@ -274,6 +305,15 @@ class VerifyRequest(BaseModel):
     @validator("otp")
     def trim_otp(cls, v: str) -> str:
         return v.strip()
+
+class PasswordLoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+class PasswordSetRequest(BaseModel):
+    new_password: str = Field(..., min_length=1, max_length=1024)
+    current_password: Optional[str] = Field(None, min_length=1, max_length=1024)
 
 
 class MembershipInfo(BaseModel):
@@ -397,12 +437,23 @@ async def _build_user_session(user_row: dict) -> UserSessionPayload:
         # Fail-open: just mark as False if query fails
         has_claimable_orders = False
 
+    # Password status
+    has_password = False
+    try:
+        pw_row = await database.fetch_one(
+            shop_user_passwords.select().where(shop_user_passwords.c.user_id == user_id)
+        )
+        has_password = bool(pw_row)
+    except Exception:
+        has_password = False
+
     user_payload = {
         "id": user_id,
         "email": email,
         "phone": user_row.get("phone"),
         "primary_role": primary_role,
         "is_guest": bool(user_row.get("is_guest")),
+        "has_password": has_password,
     }
 
     return UserSessionPayload(
@@ -443,6 +494,8 @@ def _set_auth_cookies(
     user_id: str,
     email: str,
     primary_role: str = "customer",
+    amr: Optional[str] = None,
+    auth_time: Optional[int] = None,
 ) -> None:
     """Set access + refresh cookies for accounts API."""
     base_payload = {
@@ -451,6 +504,10 @@ def _set_auth_cookies(
         "role": primary_role,
         "scope": "accounts",
     }
+    if amr:
+        base_payload["amr"] = amr
+    if auth_time is not None:
+        base_payload["auth_time"] = auth_time
     access_token = create_access_token(
         base_payload,
         expires_delta=timedelta(minutes=ACCESS_EXPIRE_MINUTES),
@@ -794,8 +851,155 @@ async def verify_login(body: VerifyRequest, request: Request):
         user_id=user_row["id"],
         email=user_row["email"],
         primary_role=user_row.get("primary_role", "customer"),
+        amr="otp",
+        auth_time=int(datetime.now(timezone.utc).timestamp()),
     )
     return response
+
+def _validate_password_bytes(password: str) -> None:
+    pw_bytes = password.encode("utf-8")
+    if len(pw_bytes) < 8:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "Password must be at least 8 characters.",
+        )
+    # bcrypt truncates at 72 bytes; enforce to avoid surprising behavior.
+    if len(pw_bytes) > 72:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "Password must be at most 72 bytes.",
+        )
+
+
+@router.post("/auth/password/login")
+async def password_login(body: PasswordLoginRequest, request: Request):
+    """
+    Password-based login for accounts users.
+    """
+    await _ensure_database_connected()
+    email = str(body.email)
+    norm = normalize_email(email)
+    _validate_password_bytes(body.password)
+
+    user_row = await database.fetch_one(
+        shop_users.select().where(shop_users.c.email_normalized == norm)
+    )
+    if not user_row:
+        raise _error(
+            status.HTTP_401_UNAUTHORIZED,
+            "INVALID_CREDENTIALS",
+            "Email or password is incorrect",
+        )
+
+    pw_row = await database.fetch_one(
+        shop_user_passwords.select().where(shop_user_passwords.c.user_id == user_row["id"])
+    )
+    if not pw_row:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "NO_PASSWORD",
+            "No password is set for this account. Sign in with an email code once, then set a password.",
+        )
+
+    if not verify_password(body.password, pw_row["password_hash"]):
+        raise _error(
+            status.HTTP_401_UNAUTHORIZED,
+            "INVALID_CREDENTIALS",
+            "Email or password is incorrect",
+        )
+
+    session_payload = await _build_user_session(dict(user_row))
+    response = JSONResponse(session_payload.dict())
+    _set_auth_cookies(
+        response,
+        user_id=user_row["id"],
+        email=user_row["email"],
+        primary_role=user_row.get("primary_role", "customer"),
+        amr="password",
+        auth_time=int(datetime.now(timezone.utc).timestamp()),
+    )
+    return response
+
+
+@router.post("/auth/password/set")
+async def set_password(
+    body: PasswordSetRequest,
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
+):
+    """
+    Set or change the current user's password.
+
+    - If a password is already set, `current_password` is required.
+    - Exception: if the current session was created via OTP in the last 15 minutes,
+      allow setting a new password without providing the current one (password reset UX).
+    """
+    await _ensure_database_connected()
+    _validate_password_bytes(body.new_password)
+
+    # Ensure user exists
+    user_row = await database.fetch_one(
+        shop_users.select().where(shop_users.c.id == principal.user_id)
+    )
+    if not user_row:
+        raise _error(
+            status.HTTP_401_UNAUTHORIZED,
+            "UNAUTHENTICATED",
+            "User not found",
+        )
+
+    existing = await database.fetch_one(
+        shop_user_passwords.select().where(
+            shop_user_passwords.c.user_id == principal.user_id
+        )
+    )
+
+    if existing:
+        if body.current_password:
+            if not verify_password(body.current_password, existing["password_hash"]):
+                raise _error(
+                    status.HTTP_401_UNAUTHORIZED,
+                    "INVALID_CREDENTIALS",
+                    "Current password is incorrect",
+                )
+        else:
+            allow_without_current = False
+            if principal.amr == "otp" and principal.auth_time:
+                try:
+                    token_auth_time = datetime.fromtimestamp(
+                        int(principal.auth_time), tz=timezone.utc
+                    )
+                    if datetime.now(timezone.utc) - token_auth_time <= timedelta(minutes=15):
+                        allow_without_current = True
+                except Exception:
+                    allow_without_current = False
+
+            if not allow_without_current:
+                raise _error(
+                    status.HTTP_400_BAD_REQUEST,
+                    "CURRENT_PASSWORD_REQUIRED",
+                    "Current password is required to change password",
+                )
+
+    password_hash = hash_password(body.new_password)
+    if existing:
+        await database.execute(
+            shop_user_passwords.update()
+            .where(shop_user_passwords.c.user_id == principal.user_id)
+            .values(password_hash=password_hash, updated_at=func.now())
+        )
+    else:
+        await database.execute(
+            shop_user_passwords.insert().values(
+                user_id=principal.user_id,
+                password_hash=password_hash,
+                created_at=func.now(),
+                updated_at=func.now(),
+            )
+        )
+
+    return {"status": "ok"}
 
 
 @router.get("/auth/me")
@@ -965,6 +1169,16 @@ async def refresh_token(request: Request):
     user_id = payload.get("sub")
     email = payload.get("email")
     primary_role = payload.get("role", "customer")
+    amr = payload.get("amr")
+    raw_auth_time = payload.get("auth_time")
+    auth_time: Optional[int] = None
+    try:
+        if isinstance(raw_auth_time, (int, float)):
+            auth_time = int(raw_auth_time)
+        elif isinstance(raw_auth_time, str) and raw_auth_time.strip().isdigit():
+            auth_time = int(raw_auth_time.strip())
+    except Exception:
+        auth_time = None
     if not user_id or not email:
         raise _error(
             status.HTTP_401_UNAUTHORIZED,
@@ -973,7 +1187,14 @@ async def refresh_token(request: Request):
         )
 
     response = JSONResponse({"status": "ok"})
-    _set_auth_cookies(response, user_id=user_id, email=email, primary_role=primary_role)
+    _set_auth_cookies(
+        response,
+        user_id=user_id,
+        email=email,
+        primary_role=primary_role,
+        amr=amr,
+        auth_time=auth_time,
+    )
     return response
 
 

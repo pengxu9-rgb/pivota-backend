@@ -55,6 +55,16 @@ shop_user_memberships = Table(
     UniqueConstraint("user_id", "merchant_id", name="uq_shop_user_memberships_user_merchant"),
 )
 
+shop_user_passwords = Table(
+    "shop_user_passwords",
+    metadata,
+    Column("user_id", String(50), primary_key=True),
+    # bcrypt hashes include salt and cost; keep as string.
+    Column("password_hash", String(255), nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime(timezone=True), onupdate=func.now()),
+)
+
 
 shop_login_otps = Table(
     "shop_login_otps",
@@ -179,4 +189,3 @@ async def count_recent_public_lookup_by_key(
     )
     rows = await database.fetch_all(query)
     return len(rows)
-
