@@ -963,7 +963,7 @@ async def _load_product_by_id(
     query = """
     SELECT product_data
     FROM products_cache
-    WHERE (:mid IS NULL OR merchant_id = :mid)
+    WHERE (CAST(:mid AS TEXT) IS NULL OR merchant_id = CAST(:mid AS TEXT))
       AND (expires_at IS NULL OR expires_at > NOW())
       AND (
         product_data->>'product_id' = :pid

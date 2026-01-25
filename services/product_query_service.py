@@ -79,13 +79,14 @@ async def get_merchant_realtime_config(merchant_id: str) -> Optional[RealtimeCon
         
         if not result:
             return None
-        
+
+        data = dict(result)
         return RealtimeConfig(
-            realtime_enabled=result.get("realtime_enabled", False),
-            api_endpoint=result.get("api_endpoint"),
-            api_key=result.get("api_key"),
-            ttl_seconds=result.get("query_ttl_seconds", 600),
-            platform=result.get("platform", "unknown")
+            realtime_enabled=bool(data.get("realtime_enabled") or False),
+            api_endpoint=data.get("api_endpoint"),
+            api_key=data.get("api_key"),
+            ttl_seconds=int(data.get("query_ttl_seconds") or 600),
+            platform=str(data.get("platform") or "unknown"),
         )
         
     except Exception as e:
