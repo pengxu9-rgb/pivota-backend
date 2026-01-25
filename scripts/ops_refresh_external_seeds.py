@@ -22,6 +22,14 @@ Usage (from repo root):
         --only-if-variants-le 1 \
         --concurrency 2
 
+    # Force-sync variants via preview+PATCH (works even if /refresh refuses to overwrite)
+    python3 scripts/ops_refresh_external_seeds.py \
+        --base-url https://YOUR_BACKEND \
+        --mode sync-variants \
+        --query tomfordbeauty.com \
+        --only-if-variants-le 1 \
+        --concurrency 2
+
 Environment variables:
     PIVOTA_BACKEND_BASE_URL   Base URL for the FastAPI service (default: http://localhost:8000)
     PIVOTA_EMPLOYEE_JWT       Employee/admin JWT for Authorization: Bearer
@@ -112,6 +120,15 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=60.0,
         help="HTTP timeout seconds per request (default: %(default)s)",
+    )
+    runtime.add_argument(
+        "--mode",
+        choices=["refresh", "sync-variants"],
+        default="refresh",
+        help=(
+            "refresh: POST /external-seeds/{id}/refresh (default); "
+            "sync-variants: POST /external-seeds/preview + PATCH seed variants"
+        ),
     )
     runtime.add_argument("--dry-run", action="store_true", help="List target seeds but do not refresh")
     runtime.add_argument(
@@ -216,6 +233,56 @@ async def _refresh_seed(
         return False, f"degraded: {payload.get('error')}"
     return False, f"unexpected_status: {status}"
 
+async def _preview_seed_variants(
+    client: httpx.AsyncClient,
+    base_url: str,
+    token: str,
+    *,
+    destination_url: str,
+    market: Optional[str],
+    timeout: float,
+) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    url = f"{base_url.rstrip('/')}/employee/products/external-seeds/preview"
+    body: Dict[str, Any] = {
+        "destination_url": destination_url,
+        "market": market,
+        "force_refresh": True,
+    }
+    resp = await client.post(url, headers=_auth_headers(token), json=body, timeout=timeout)
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}", []
+    payload = resp.json() if resp.content else {}
+    status = str(payload.get("status") or "")
+    if status != "success":
+        err = payload.get("error")
+        return False, f"{status}:{str(err)[:120] if err else ''}".strip(":"), []
+    preview = payload.get("preview")
+    if not isinstance(preview, dict):
+        return False, "invalid_preview", []
+    variants = preview.get("variants") or []
+    if not isinstance(variants, list):
+        return False, "invalid_variants", []
+    cleaned = [v for v in variants if isinstance(v, dict)]
+    return True, f"preview_variants={len(cleaned)}", cleaned
+
+
+async def _patch_seed_variants(
+    client: httpx.AsyncClient,
+    base_url: str,
+    token: str,
+    seed_id: str,
+    variants: List[Dict[str, Any]],
+    timeout: float,
+) -> Tuple[bool, str]:
+    url = f"{base_url.rstrip('/')}/employee/products/external-seeds/{seed_id}"
+    resp = await client.patch(url, headers=_auth_headers(token), json={"variants": variants}, timeout=timeout)
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    payload = resp.json() if resp.content else {}
+    if str(payload.get("status") or "") == "success":
+        return True, "patched"
+    return True, "patched"
+
 
 async def main_async(args: argparse.Namespace) -> int:
     base_url = str(args.base_url or "").strip()
@@ -289,11 +356,40 @@ async def main_async(args: argparse.Namespace) -> int:
             async with sem:
                 before_vc = item.get("variants_count")
                 try:
-                    if before_vc is None:
+                    seed_before = None
+                    if before_vc is None or args.mode == "sync-variants":
                         seed_before = await _get_seed(client, base_url, token, seed_id, args.timeout)
                         before_vc = seed_before.get("variants_count")
 
-                    ok, msg = await _refresh_seed(client, base_url, token, seed_id, args.timeout)
+                    ok = False
+                    msg = ""
+                    if args.mode == "refresh":
+                        ok, msg = await _refresh_seed(client, base_url, token, seed_id, args.timeout)
+                    else:
+                        if not seed_before:
+                            seed_before = await _get_seed(client, base_url, token, seed_id, args.timeout)
+                        dest = str(seed_before.get("destination_url") or "").strip()
+                        market = seed_before.get("market")
+                        if not dest:
+                            ok, msg = False, "missing_destination_url"
+                        else:
+                            prev_ok, prev_msg, variants = await _preview_seed_variants(
+                                client,
+                                base_url,
+                                token,
+                                destination_url=dest,
+                                market=str(market).strip() if market else None,
+                                timeout=args.timeout,
+                            )
+                            if not prev_ok:
+                                ok, msg = False, f"preview_failed:{prev_msg}"
+                            elif not variants:
+                                ok, msg = False, f"preview_empty:{prev_msg}"
+                            else:
+                                patch_ok, patch_msg = await _patch_seed_variants(
+                                    client, base_url, token, seed_id, variants, args.timeout
+                                )
+                                ok, msg = (patch_ok, f"{patch_msg} ({prev_msg})")
 
                     after_vc = None
                     try:
@@ -360,4 +456,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
