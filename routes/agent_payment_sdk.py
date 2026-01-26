@@ -2,13 +2,16 @@
 Unified Payment Endpoint for Agent SDK
 Provides production-ready payment processing with PSP integration
 """
+import hashlib
 import json
+import os
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from db.merchant_onboarding import get_merchant_onboarding
@@ -62,6 +65,29 @@ class PaymentResponse(BaseModel):
     next_action: Optional[NextAction] = None
     error: Optional[str] = None
     created_at: str
+
+
+class AuthorizePaymentRequest(BaseModel):
+    """Agentic payment authorization request (PSP integration is not wired yet)."""
+
+    mandate_id: str = Field(..., description="Buyer mandate id")
+    amount: float = Field(..., gt=0, description="Amount to authorize")
+    currency: str = Field(..., min_length=1, description="Currency (e.g., USD)")
+    agent_user_ref: Optional[str] = Field(None, description="Agent-scoped user reference (opaque)")
+    merchant_context: Optional[Dict[str, Any]] = Field(None, description="Merchant context for allowlist checks")
+    shipping_address_id: Optional[str] = Field(None, description="Buyer address id (optional)")
+
+
+class AuthorizePaymentResponse(BaseModel):
+    authorization_token: Optional[str] = None
+    expires_at: Optional[str] = None
+    requires_user_confirmation: Optional[bool] = None
+    confirm_url: Optional[str] = None
+
+
+def _checkout_ui_base() -> str:
+    return (os.getenv("CHECKOUT_UI_BASE_URL") or "https://agent.pivota.cc").rstrip("/")
+
 
 # ============================================================================
 # Payment Endpoint
@@ -623,6 +649,163 @@ async def create_payment(
     except Exception as e:
         logger.error(f"Payment creation error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Payment processing failed: {str(e)}")
+
+
+@router.post("/payments/authorize", response_model=AuthorizePaymentResponse)
+async def authorize_payment(
+    body: AuthorizePaymentRequest,
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Mint a constrained authorization token for future agentic payments (skeleton; no PSP charge).
+
+    Security:
+    - Agent can only authorize against mandates belonging to its own agent_id.
+    - Only stores token hash (never stores raw token).
+    """
+    from db.buyer_vault import audit_buyer_action, authorization_tokens, mandates
+
+    mandate_id = str(body.mandate_id or "").strip()
+    if not mandate_id:
+        raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "mandate_id is required"})
+
+    currency = str(body.currency or "").strip().upper()
+    if not currency:
+        raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "currency is required"})
+
+    amount = Decimal(str(body.amount))
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "amount must be > 0"})
+
+    row = await database.fetch_one(
+        mandates.select()
+        .where((mandates.c.id == mandate_id) & (mandates.c.agent_id == context.agent_id))
+        .limit(1)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail={"error": "MANDATE_NOT_FOUND", "message": "Mandate not found"})
+
+    mandate = dict(row)
+    status = str(mandate.get("status") or "").lower()
+    if status != "active":
+        raise HTTPException(status_code=403, detail={"error": "MANDATE_NOT_ACTIVE", "message": "Mandate is not active"})
+
+    expires_at = mandate.get("expires_at")
+    if expires_at and hasattr(expires_at, "timestamp") and expires_at.timestamp() < datetime.now(timezone.utc).timestamp():
+        raise HTTPException(status_code=403, detail={"error": "EXPIRED_MANDATE", "message": "Mandate expired"})
+
+    constraints = mandate.get("constraints_json") if isinstance(mandate.get("constraints_json"), dict) else {}
+
+    allowed_currency = str(constraints.get("currency") or "").strip().upper() or None
+    if allowed_currency and allowed_currency != currency:
+        raise HTTPException(status_code=403, detail={"error": "CURRENCY_NOT_ALLOWED", "message": "Currency not allowed"})
+
+    per_txn_limit = constraints.get("per_txn_limit")
+    if per_txn_limit is not None:
+        try:
+            if amount > Decimal(str(per_txn_limit)):
+                raise HTTPException(
+                    status_code=403,
+                    detail={"error": "EXCEEDED_LIMIT", "message": "Amount exceeds per_txn_limit"},
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    merchant_allowlist = constraints.get("merchant_allowlist")
+    if isinstance(merchant_allowlist, list) and merchant_allowlist:
+        merchant_id = None
+        if isinstance(body.merchant_context, dict):
+            merchant_id = body.merchant_context.get("merchant_id") or body.merchant_context.get("merchantId") or body.merchant_context.get("id")
+        if merchant_id and str(merchant_id) not in {str(x) for x in merchant_allowlist}:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "NOT_ALLOWED_MERCHANT", "message": "Merchant not allowed by mandate"},
+            )
+
+    confirmation_policy = str(constraints.get("confirmation_policy") or "").strip().lower() or "auto_under_limit"
+    address_allowlist = constraints.get("address_allowlist_ids")
+    address_allowlist_set = {str(x) for x in address_allowlist} if isinstance(address_allowlist, list) else set()
+    shipping_address_id = str(body.shipping_address_id or "").strip() or None
+
+    requires_confirmation = False
+    if confirmation_policy == "always":
+        requires_confirmation = True
+    elif confirmation_policy == "step_up_on_new_address":
+        if not shipping_address_id:
+            requires_confirmation = True
+        elif address_allowlist_set and shipping_address_id not in address_allowlist_set:
+            requires_confirmation = True
+
+    if requires_confirmation:
+        confirm_url = f"{_checkout_ui_base()}/mandates/confirm?mandate_id={mandate_id}"
+        await audit_buyer_action(
+            buyer_id=mandate.get("buyer_id"),
+            agent_id=context.agent_id,
+            action="mandate.authorization_token.step_up_required",
+            details={
+                "mandate_id": mandate_id,
+                "amount": float(amount),
+                "currency": currency,
+                "confirmation_policy": confirmation_policy,
+            },
+            ip_address=context.request.client.host if context.request.client else None,
+            user_agent=context.request.headers.get("user-agent"),
+        )
+        return AuthorizePaymentResponse(requires_user_confirmation=True, confirm_url=confirm_url)
+
+    # Mint + store hash only (never store raw token).
+    now = datetime.now(timezone.utc)
+    token_expires_at = now + timedelta(minutes=10)
+    scope_json: Dict[str, Any] = {
+        "type": "agentic_payment",
+        "agent_user_ref": (str(body.agent_user_ref)[:256] if body.agent_user_ref else None),
+        "merchant_context": body.merchant_context if isinstance(body.merchant_context, dict) else None,
+    }
+
+    for _ in range(5):
+        token_id = f"at_{secrets.token_hex(12)}"
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        try:
+            await database.execute(
+                authorization_tokens.insert().values(
+                    id=token_id,
+                    mandate_id=mandate_id,
+                    intent_id=None,
+                    token_hash=token_hash,
+                    scope_json=scope_json,
+                    amount=amount,
+                    currency=currency,
+                    expires_at=token_expires_at,
+                    created_at=now,
+                    used_at=None,
+                )
+            )
+            await audit_buyer_action(
+                buyer_id=mandate.get("buyer_id"),
+                agent_id=context.agent_id,
+                action="mandate.authorization_token.issued",
+                details={
+                    "mandate_id": mandate_id,
+                    "authorization_token_id": token_id,
+                    "amount": float(amount),
+                    "currency": currency,
+                    "expires_at": token_expires_at.isoformat(),
+                },
+                ip_address=context.request.client.host if context.request.client else None,
+                user_agent=context.request.headers.get("user-agent"),
+            )
+            return AuthorizePaymentResponse(authorization_token=raw_token, expires_at=token_expires_at.isoformat())
+        except Exception:
+            continue
+
+    raise HTTPException(
+        status_code=503,
+        detail={"error": "TEMPORARY_UNAVAILABLE", "message": "Failed to mint authorization token, please retry"},
+    )
+
 
 # ============================================================================
 # Payment Status Check
