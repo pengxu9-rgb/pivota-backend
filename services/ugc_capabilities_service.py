@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, or_, select, text
 
 from db.database import database
 from db.orders import orders as orders_table
-from db.reviews_center import buyer_review_user_subject, ugc_questions
+from db.reviews_center import buyer_review_user_subject, ugc_question_replies, ugc_questions
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,28 @@ async def ensure_ugc_tables_exist() -> None:
                   ON ugc_questions(user_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_ugc_questions_subject_created
                   ON ugc_questions(subject_type, subject_id, created_at DESC);
+                """
+            )
+        )
+
+    try:
+        await database.fetch_one(text("SELECT 1 FROM ugc_question_replies LIMIT 1"))
+    except Exception:
+        await database.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS ugc_question_replies (
+                  id BIGSERIAL PRIMARY KEY,
+                  question_id BIGINT NOT NULL REFERENCES ugc_questions(id) ON DELETE CASCADE,
+                  user_id TEXT NOT NULL,
+                  body TEXT NOT NULL,
+                  status VARCHAR(16) NOT NULL DEFAULT 'active',
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_ugc_question_replies_question_created
+                  ON ugc_question_replies(question_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ugc_question_replies_user_created
+                  ON ugc_question_replies(user_id, created_at DESC);
                 """
             )
         )
@@ -396,3 +418,372 @@ async def create_question(
         return int(question_id)
     except Exception:
         return 0
+
+
+async def list_questions(
+    *,
+    subject_type: str,
+    subject_id: str,
+    limit: int = 10,
+) -> Dict[str, Any]:
+    """
+    List recent questions for a subject.
+
+    This endpoint is safe to expose publicly (no user_id returned).
+    """
+    await ensure_ugc_tables_exist()
+    st = str(subject_type or "").strip()
+    sid = str(subject_id or "").strip()
+    try:
+        limit_n = int(limit)
+    except Exception:
+        limit_n = 10
+    limit_n = max(1, min(50, limit_n))
+
+    if not st or not sid:
+        raise HTTPException(status_code=400, detail="INVALID_SUBJECT")
+
+    base_filter = (
+        (ugc_questions.c.subject_type == st)
+        & (ugc_questions.c.subject_id == sid)
+        & (ugc_questions.c.status == "active")
+    )
+
+    try:
+        total = await database.fetch_val(
+            select(func.count()).select_from(ugc_questions).where(base_filter)
+        )
+    except Exception:
+        total = 0
+
+    rows = await database.fetch_all(
+        select(ugc_questions.c.id, ugc_questions.c.question, ugc_questions.c.created_at)
+        .where(base_filter)
+        .order_by(ugc_questions.c.created_at.desc())
+        .limit(limit_n)
+    )
+
+    question_ids: List[int] = []
+    for row in rows:
+        try:
+            qid = int(row["id"])  # type: ignore[index]
+        except Exception:
+            qid = 0
+        if qid:
+            question_ids.append(qid)
+
+    reply_counts: Dict[int, int] = {}
+    if question_ids:
+        try:
+            reply_rows = await database.fetch_all(
+                select(ugc_question_replies.c.question_id, func.count().label("cnt"))
+                .where(
+                    (ugc_question_replies.c.question_id.in_(question_ids))
+                    & (ugc_question_replies.c.status == "active")
+                )
+                .group_by(ugc_question_replies.c.question_id)
+            )
+            for r in reply_rows:
+                try:
+                    qid = int(r["question_id"])  # type: ignore[index]
+                    cnt = int(r["cnt"] or 0)  # type: ignore[index]
+                except Exception:
+                    continue
+                reply_counts[qid] = cnt
+        except Exception:
+            reply_counts = {}
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            qid = int(row["id"])  # type: ignore[index]
+        except Exception:
+            qid = 0
+        try:
+            question = str(row["question"] or "").strip()  # type: ignore[index]
+        except Exception:
+            question = ""
+        try:
+            created_at = row["created_at"]  # type: ignore[index]
+        except Exception:
+            created_at = None
+        created_at_iso: Optional[str]
+        if isinstance(created_at, datetime):
+            created_at_iso = (
+                created_at.replace(tzinfo=timezone.utc).isoformat()
+                if created_at.tzinfo is None
+                else created_at.isoformat()
+            )
+        else:
+            created_at_iso = None
+
+        if not question:
+            continue
+
+        items.append(
+            {
+                "question_id": qid,
+                "question": question,
+                "created_at": created_at_iso,
+                "replies": int(reply_counts.get(qid, 0)),
+            }
+        )
+
+    return {"count": int(total or 0), "items": items}
+
+
+async def _question_exists(question_id: int) -> bool:
+    await ensure_ugc_tables_exist()
+    try:
+        qid = int(question_id)
+    except Exception:
+        return False
+    if qid <= 0:
+        return False
+    try:
+        row = await database.fetch_one(
+            select(ugc_questions.c.id)
+            .where((ugc_questions.c.id == qid) & (ugc_questions.c.status == "active"))
+            .limit(1)
+        )
+    except Exception:
+        row = None
+    return bool(row)
+
+
+async def is_reply_rate_limited(
+    *,
+    user_id: str,
+    question_id: int,
+    window_seconds: int = 30,
+) -> bool:
+    await ensure_ugc_tables_exist()
+    uid = str(user_id or "").strip()
+    try:
+        qid = int(question_id)
+    except Exception:
+        qid = 0
+    if not uid or qid <= 0:
+        return False
+
+    try:
+        row = await database.fetch_one(
+            select(ugc_question_replies.c.created_at)
+            .where(
+                (ugc_question_replies.c.user_id == uid)
+                & (ugc_question_replies.c.question_id == qid)
+                & (ugc_question_replies.c.status == "active")
+            )
+            .order_by(ugc_question_replies.c.created_at.desc())
+            .limit(1)
+        )
+    except Exception:
+        row = None
+    if not row:
+        return False
+
+    try:
+        created_at = row["created_at"]  # type: ignore[index]
+    except Exception:
+        created_at = None
+    if not isinstance(created_at, datetime):
+        return False
+
+    now = datetime.now(timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at >= now - timedelta(seconds=int(window_seconds))
+
+
+async def create_question_reply(
+    *,
+    user_id: str,
+    question_id: int,
+    body: str,
+    window_seconds: int = 30,
+) -> int:
+    await ensure_ugc_tables_exist()
+    uid = str(user_id or "").strip()
+    try:
+        qid = int(question_id)
+    except Exception:
+        qid = 0
+    b = str(body or "").strip()
+
+    if not uid:
+        raise HTTPException(status_code=401, detail="NOT_AUTHENTICATED")
+    if qid <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_QUESTION")
+    if not await _question_exists(qid):
+        raise HTTPException(status_code=404, detail="QUESTION_NOT_FOUND")
+    if len(b) < 2:
+        raise HTTPException(status_code=400, detail="REPLY_TOO_SHORT")
+    if len(b) > 4000:
+        raise HTTPException(status_code=400, detail="REPLY_TOO_LONG")
+
+    if await is_reply_rate_limited(user_id=uid, question_id=qid, window_seconds=window_seconds):
+        raise HTTPException(status_code=429, detail="RATE_LIMITED")
+
+    try:
+        reply_id = await database.execute(
+            ugc_question_replies.insert().values(
+                question_id=qid,
+                user_id=uid,
+                body=b,
+                status="active",
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="REPLY_CREATE_FAILED")
+
+    try:
+        return int(reply_id)
+    except Exception:
+        return 0
+
+
+async def list_question_replies(
+    *,
+    question_id: int,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    await ensure_ugc_tables_exist()
+    try:
+        qid = int(question_id)
+    except Exception:
+        qid = 0
+    if qid <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_QUESTION")
+    if not await _question_exists(qid):
+        raise HTTPException(status_code=404, detail="QUESTION_NOT_FOUND")
+
+    try:
+        limit_n = int(limit)
+    except Exception:
+        limit_n = 20
+    limit_n = max(1, min(50, limit_n))
+
+    base_filter = (ugc_question_replies.c.question_id == qid) & (ugc_question_replies.c.status == "active")
+    try:
+        total = await database.fetch_val(
+            select(func.count()).select_from(ugc_question_replies).where(base_filter)
+        )
+    except Exception:
+        total = 0
+
+    rows = await database.fetch_all(
+        select(ugc_question_replies.c.id, ugc_question_replies.c.body, ugc_question_replies.c.created_at)
+        .where(base_filter)
+        .order_by(ugc_question_replies.c.created_at.desc())
+        .limit(limit_n)
+    )
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            rid = int(row["id"])  # type: ignore[index]
+        except Exception:
+            rid = 0
+        try:
+            body = str(row["body"] or "").strip()  # type: ignore[index]
+        except Exception:
+            body = ""
+        try:
+            created_at = row["created_at"]  # type: ignore[index]
+        except Exception:
+            created_at = None
+
+        if not body:
+            continue
+
+        created_at_iso: Optional[str]
+        if isinstance(created_at, datetime):
+            created_at_iso = (
+                created_at.replace(tzinfo=timezone.utc).isoformat()
+                if created_at.tzinfo is None
+                else created_at.isoformat()
+            )
+        else:
+            created_at_iso = None
+
+        items.append(
+            {
+                "reply_id": rid,
+                "body": body,
+                "created_at": created_at_iso,
+            }
+        )
+
+    return {"count": int(total or 0), "items": items}
+
+
+async def get_question(
+    *,
+    question_id: int,
+) -> Dict[str, Any]:
+    await ensure_ugc_tables_exist()
+    try:
+        qid = int(question_id)
+    except Exception:
+        qid = 0
+    if qid <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_QUESTION")
+
+    row = await database.fetch_one(
+        select(
+            ugc_questions.c.id,
+            ugc_questions.c.subject_type,
+            ugc_questions.c.subject_id,
+            ugc_questions.c.question,
+            ugc_questions.c.created_at,
+        )
+        .where((ugc_questions.c.id == qid) & (ugc_questions.c.status == "active"))
+        .limit(1)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="QUESTION_NOT_FOUND")
+
+    try:
+        question = str(row["question"] or "").strip()  # type: ignore[index]
+    except Exception:
+        question = ""
+    try:
+        subject_type = str(row["subject_type"] or "").strip()  # type: ignore[index]
+    except Exception:
+        subject_type = ""
+    try:
+        subject_id = str(row["subject_id"] or "").strip()  # type: ignore[index]
+    except Exception:
+        subject_id = ""
+    try:
+        created_at = row["created_at"]  # type: ignore[index]
+    except Exception:
+        created_at = None
+    created_at_iso: Optional[str]
+    if isinstance(created_at, datetime):
+        created_at_iso = (
+            created_at.replace(tzinfo=timezone.utc).isoformat()
+            if created_at.tzinfo is None
+            else created_at.isoformat()
+        )
+    else:
+        created_at_iso = None
+
+    try:
+        replies_count = await database.fetch_val(
+            select(func.count()).select_from(ugc_question_replies).where(
+                (ugc_question_replies.c.question_id == qid) & (ugc_question_replies.c.status == "active")
+            )
+        )
+    except Exception:
+        replies_count = 0
+
+    return {
+        "question_id": qid,
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "question": question,
+        "created_at": created_at_iso,
+        "replies": int(replies_count or 0),
+    }

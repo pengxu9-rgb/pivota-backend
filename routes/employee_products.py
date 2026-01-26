@@ -616,6 +616,115 @@ async def _fetch_external_seed_rows_by_external_product_id(
     return [dict(r) for r in (rows or [])]
 
 
+_SHOPIFY_SIZE_SUFFIX_RE = re.compile(r"_(\d{2,4})x(\d{0,4})?(?=\.(?:jpe?g|png|webp|gif|avif))", re.IGNORECASE)
+
+
+def _seed_image_dedupe_key(url: str) -> str:
+    s = str(url or "").strip()
+    if not s:
+        return ""
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return s
+    netloc = (parsed.hostname or parsed.netloc or "").lower()
+    path = parsed.path or ""
+    if "cdn.shopify.com" in netloc:
+        path = _SHOPIFY_SIZE_SUFFIX_RE.sub("", path)
+    qs = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in {"width", "w", "height", "h", "dpr", "quality", "q"}
+    ]
+    query = urlencode(sorted(qs, key=lambda kv: (kv[0].lower(), kv[1])), doseq=True)
+    if query:
+        return f"{netloc}{path}?{query}"
+    return f"{netloc}{path}"
+
+
+def _seed_image_resolution_score(url: str) -> float:
+    s = str(url or "").strip()
+    if not s:
+        return 0.0
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return 0.0
+
+    width: Optional[int] = None
+    height: Optional[int] = None
+    dpr: Optional[float] = None
+    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        kl = k.lower()
+        if width is None and kl in {"width", "w"}:
+            try:
+                width = int(re.sub(r"[^0-9]", "", v) or "0") or None
+            except Exception:
+                width = None
+        elif height is None and kl in {"height", "h"}:
+            try:
+                height = int(re.sub(r"[^0-9]", "", v) or "0") or None
+            except Exception:
+                height = None
+        elif dpr is None and kl == "dpr":
+            try:
+                dpr = float(re.sub(r"[^0-9.]", "", v) or "0") or None
+            except Exception:
+                dpr = None
+
+    score = 0.0
+    if width is not None and height is not None:
+        score = float(width * height)
+    elif width is not None:
+        score = float(width)
+    elif height is not None:
+        score = float(height)
+
+    m = _SHOPIFY_SIZE_SUFFIX_RE.search(parsed.path or "")
+    if m:
+        try:
+            w = int(m.group(1) or "0") or 0
+        except Exception:
+            w = 0
+        try:
+            h = int(m.group(2) or "0") if m.group(2) else 0
+        except Exception:
+            h = 0
+        if w and h:
+            score = max(score, float(w * h))
+        elif w:
+            score = max(score, float(w))
+
+    if score and dpr and dpr > 0:
+        score *= float(dpr * dpr)
+    return score
+
+
+def _dedupe_seed_image_urls(urls: List[str], *, limit: int = 20) -> List[str]:
+    out: List[str] = []
+    idx_by_key: Dict[str, int] = {}
+    score_by_key: Dict[str, float] = {}
+    for u in urls or []:
+        if not isinstance(u, str):
+            continue
+        uu = u.strip()
+        if not uu or not uu.startswith(("http://", "https://")):
+            continue
+        key = _seed_image_dedupe_key(uu) or uu
+        score = _seed_image_resolution_score(uu)
+        if key in idx_by_key:
+            if score > score_by_key.get(key, -1.0):
+                out[idx_by_key[key]] = uu
+                score_by_key[key] = score
+            continue
+        if len(out) >= limit:
+            continue
+        idx_by_key[key] = len(out)
+        score_by_key[key] = score
+        out.append(uu)
+    return out
+
+
 def _normalize_seed_image_urls(*, seed_data: Dict[str, Any], row: Dict[str, Any]) -> List[str]:
     candidates: List[str] = []
     raw_list = seed_data.get("image_urls")
@@ -625,19 +734,7 @@ def _normalize_seed_image_urls(*, seed_data: Dict[str, Any], row: Dict[str, Any]
         if isinstance(u, str):
             candidates.append(u)
 
-    out: List[str] = []
-    seen: set[str] = set()
-    for u in candidates:
-        uu = str(u).strip()
-        if not uu or not uu.startswith(("http://", "https://")):
-            continue
-        if uu in seen:
-            continue
-        seen.add(uu)
-        out.append(uu)
-        if len(out) >= 20:
-            break
-    return out
+    return _dedupe_seed_image_urls(candidates, limit=20)
 
 
 def _normalize_seed_brand(seed_data: Dict[str, Any]) -> Optional[str]:
@@ -920,6 +1017,7 @@ class CreateExternalSeedRequest(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
@@ -938,6 +1036,7 @@ class UpdateExternalSeedRequest(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
@@ -2076,10 +2175,15 @@ async def create_external_seed(
     snap_price_amount = getattr(snapshot, "price_amount", None) if snapshot else None
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
+    snap_image_urls: list[str] = []
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
     evidence = getattr(snapshot, "evidence", None) if snapshot else None
     if isinstance(evidence, dict):
+        raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
+        if isinstance(raw_images, list):
+            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
         raw_desc = evidence.get("description")
         if isinstance(raw_desc, str) and raw_desc.strip():
             snap_description = raw_desc.strip()
@@ -2106,6 +2210,13 @@ async def create_external_seed(
     title = (body.title or "").strip() or snap_title
     description = (body.description or "").strip() or snap_description
     image_url = (body.image_url or "").strip() or snap_image_url
+    if not image_url and body.image_urls:
+        cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
+        cleaned = _dedupe_seed_image_urls(cleaned, limit=20)
+        if cleaned:
+            image_url = cleaned[0]
+    if not image_url and snap_image_urls:
+        image_url = snap_image_urls[0]
     price_amount = body.price_amount if body.price_amount is not None else snap_price_amount
     price_currency = (body.price_currency or "").strip() or snap_price_currency
     availability = (body.availability or "").strip() or snap_availability
@@ -2161,6 +2272,11 @@ async def create_external_seed(
         seed_data["title"] = title
         seed_data["description"] = description
         seed_data["image_url"] = image_url
+        if body.image_urls is not None:
+            cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
+            seed_data["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
+        elif snap_image_urls:
+            seed_data["image_urls"] = snap_image_urls
         seed_data["availability"] = availability
         seed_data["utm_template"] = utm_template
         seed_data["partner_type"] = partner_type
@@ -2173,6 +2289,7 @@ async def create_external_seed(
                 "domain": domain,
                 "title": snap_title,
                 "image_url": snap_image_url,
+                "image_urls": snap_image_urls,
                 "price_amount": snap_price_amount,
                 "price_currency": snap_price_currency,
                 "availability": snap_availability,
@@ -2271,6 +2388,9 @@ async def create_external_seed(
             "title": title,
             "description": description,
             "image_url": image_url,
+            "image_urls": [str(u).strip() for u in (body.image_urls or []) if isinstance(u, str) and str(u).strip()]
+            if body.image_urls is not None
+            else snap_image_urls,
             "availability": availability,
             "variants": body.variants or (snap_variants or []),
             "utm_template": utm_template,
@@ -2283,6 +2403,7 @@ async def create_external_seed(
                 "title": snap_title,
                 "description": snap_description,
                 "image_url": snap_image_url,
+                "image_urls": snap_image_urls,
                 "price_amount": snap_price_amount,
                 "price_currency": snap_price_currency,
                 "availability": snap_availability,
@@ -2471,6 +2592,12 @@ async def update_external_seed(
         seed_data["description"] = body.description
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
+    if body.image_urls is not None:
+        cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
+        deduped = _dedupe_seed_image_urls(cleaned, limit=20)
+        seed_data["image_urls"] = deduped
+        if body.image_url is None and deduped:
+            seed_data["image_url"] = deduped[0]
     if body.availability is not None:
         seed_data["availability"] = body.availability
     if body.product_id is not None:
@@ -2526,6 +2653,11 @@ async def update_external_seed(
     if body.image_url is not None:
         updates["image_url"] = body.image_url
         set_clauses.append("image_url = :image_url")
+    elif body.image_urls is not None:
+        deduped = seed_data.get("image_urls")
+        if isinstance(deduped, list) and deduped:
+            updates["image_url"] = str(deduped[0]).strip()
+            set_clauses.append("image_url = :image_url")
     if body.price_amount is not None:
         updates["price_amount"] = body.price_amount
         set_clauses.append("price_amount = :price_amount")
@@ -2587,6 +2719,7 @@ async def refresh_external_seed(
         raw_images = evidence.get("image_urls") or evidence.get("images")
         if isinstance(raw_images, list):
             snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
         raw_desc = evidence.get("description")
         if isinstance(raw_desc, str) and raw_desc.strip():
             snap_description = raw_desc.strip()
