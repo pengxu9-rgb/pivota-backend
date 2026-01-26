@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from routes.accounts_orders_api import AccountsPrincipal, get_accounts_principal_ugc
-from services.ugc_capabilities_service import create_question
+from services.ugc_capabilities_service import create_question, list_questions
 
 
 router = APIRouter(tags=["Questions"])
@@ -14,6 +16,31 @@ class CreateQuestionRequest(BaseModel):
     product_id: str = Field(..., min_length=1, alias="productId")
     product_group_id: str | None = Field(None, alias="productGroupId")
     question: str = Field(..., min_length=1, max_length=2000)
+
+
+@router.get("/questions")
+async def get_questions(
+    response: Response,
+    product_id: str = Query(..., min_length=1, alias="productId"),
+    product_group_id: Optional[str] = Query(None, alias="productGroupId"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """
+    List recent product Q&A questions.
+
+    This is public (no auth required). It does not expose user identities.
+    """
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    pid = str(product_id or "").strip()
+    pgid = str(product_group_id or "").strip() or None
+    subject_type = "product_group" if pgid else "product"
+    subject_id = pgid or pid
+
+    result = await list_questions(subject_type=subject_type, subject_id=subject_id, limit=int(limit))
+    return {"status": "success", "subject_type": subject_type, "subject_id": subject_id, **result}
 
 
 @router.post("/questions")

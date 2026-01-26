@@ -396,3 +396,84 @@ async def create_question(
         return int(question_id)
     except Exception:
         return 0
+
+
+async def list_questions(
+    *,
+    subject_type: str,
+    subject_id: str,
+    limit: int = 10,
+) -> Dict[str, Any]:
+    """
+    List recent questions for a subject.
+
+    This endpoint is safe to expose publicly (no user_id returned).
+    """
+    await ensure_ugc_tables_exist()
+    st = str(subject_type or "").strip()
+    sid = str(subject_id or "").strip()
+    try:
+        limit_n = int(limit)
+    except Exception:
+        limit_n = 10
+    limit_n = max(1, min(50, limit_n))
+
+    if not st or not sid:
+        raise HTTPException(status_code=400, detail="INVALID_SUBJECT")
+
+    base_filter = (
+        (ugc_questions.c.subject_type == st)
+        & (ugc_questions.c.subject_id == sid)
+        & (ugc_questions.c.status == "active")
+    )
+
+    try:
+        total = await database.fetch_val(
+            select(func.count()).select_from(ugc_questions).where(base_filter)
+        )
+    except Exception:
+        total = 0
+
+    rows = await database.fetch_all(
+        select(ugc_questions.c.id, ugc_questions.c.question, ugc_questions.c.created_at)
+        .where(base_filter)
+        .order_by(ugc_questions.c.created_at.desc())
+        .limit(limit_n)
+    )
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            qid = int(row["id"])  # type: ignore[index]
+        except Exception:
+            qid = 0
+        try:
+            question = str(row["question"] or "").strip()  # type: ignore[index]
+        except Exception:
+            question = ""
+        try:
+            created_at = row["created_at"]  # type: ignore[index]
+        except Exception:
+            created_at = None
+        created_at_iso: Optional[str]
+        if isinstance(created_at, datetime):
+            created_at_iso = (
+                created_at.replace(tzinfo=timezone.utc).isoformat()
+                if created_at.tzinfo is None
+                else created_at.isoformat()
+            )
+        else:
+            created_at_iso = None
+
+        if not question:
+            continue
+
+        items.append(
+            {
+                "question_id": qid,
+                "question": question,
+                "created_at": created_at_iso,
+            }
+        )
+
+    return {"count": int(total or 0), "items": items}
