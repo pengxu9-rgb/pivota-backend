@@ -112,7 +112,7 @@ class CreateReviewFromUserRequest(BaseModel):
     # Canonical subject for storing the review in the reviews center
     subject: SubjectRef
 
-    rating: int = Field(..., ge=1, le=5)
+    rating: Optional[int] = Field(None, ge=1, le=5)
     title: Optional[str] = Field(None, max_length=200)
     body: Optional[str] = Field(None, max_length=5000)
 
@@ -158,7 +158,7 @@ async def buyer_create_review_from_user(
     principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
 ) -> Dict[str, Any]:
     """
-    In-app review creation for logged-in purchasers (no invitation token required).
+    In-app review creation for logged-in users (no invitation token required).
     """
     start = time.perf_counter()
     response.headers["Cache-Control"] = "private, no-store"
@@ -183,16 +183,16 @@ async def buyer_create_review_from_user(
             email_normalized=principal.email_normalized,
             subject=subject,
         )
-        if not is_purchaser:
-            raise HTTPException(status_code=403, detail="NOT_PURCHASER")
 
-        already_reviewed = await has_user_reviewed_subject(
-            user_id=principal.user_id,
-            subject_type=subject.subject_type,
-            subject_id=subject.subject_id,
-        )
-        if already_reviewed:
-            raise HTTPException(status_code=409, detail="ALREADY_REVIEWED")
+        requested_rating = int(body.rating) if body.rating is not None else None
+        title_text = (body.title or "").strip() or None
+        body_text = (body.body or "").strip() or None
+
+        if requested_rating is None and not title_text and not body_text:
+            raise HTTPException(status_code=400, detail="EMPTY_REVIEW")
+
+        if requested_rating is not None and not is_purchaser:
+            raise HTTPException(status_code=403, detail="NOT_VERIFIED_FOR_RATING")
 
         subject_ref = body.subject
         merchant_id = str(subject_ref.merchant_id or "").strip()
@@ -221,6 +221,92 @@ async def buyer_create_review_from_user(
         )
 
         now_dt = datetime.now(timezone.utc)
+
+        # Enforce per-user dedupe at the subject level.
+        # If an unverified review exists and the user has since purchased, allow a one-time upgrade.
+        existing_binding = await database.fetch_one(
+            buyer_review_user_subject.select().where(
+                (buyer_review_user_subject.c.user_id == principal.user_id)
+                & (buyer_review_user_subject.c.subject_type == subject_type)
+                & (buyer_review_user_subject.c.subject_id == subject_id)
+            )
+        )
+        if existing_binding:
+            try:
+                existing_review_id = int(existing_binding["review_id"])  # type: ignore[index]
+            except Exception:
+                existing_review_id = 0
+
+            existing_review = (
+                await database.fetch_one(product_reviews.select().where(product_reviews.c.id == existing_review_id))
+                if existing_review_id > 0
+                else None
+            )
+            existing_verification = str(existing_review["verification"] if existing_review else "").strip().lower()
+            existing_has_rating = False
+            if existing_review:
+                try:
+                    existing_has_rating = existing_review["rating"] is not None  # type: ignore[index]
+                except Exception:
+                    existing_has_rating = getattr(existing_review, "rating", None) is not None
+
+            if is_purchaser and existing_verification in {"unverified", ""}:
+                update_values: Dict[str, Any] = {
+                    "verification": "verified_purchase",
+                    "updated_at": now_dt,
+                    "status": "under_review",
+                }
+                if requested_rating is not None:
+                    update_values["rating"] = requested_rating
+                if title_text is not None:
+                    update_values["title"] = title_text
+                if body_text is not None:
+                    update_values["body"] = body_text
+
+                await database.execute(
+                    product_reviews.update()
+                    .where(product_reviews.c.id == existing_review_id)
+                    .values(**update_values)
+                )
+                record_buyer_create(result="success", reason="upgraded", duration_seconds=(time.perf_counter() - start))
+                return {
+                    "status": "success",
+                    "review_id": int(existing_review_id),
+                    "moderation_state": "under_review",
+                    "upgraded": True,
+                }
+
+            if (
+                is_purchaser
+                and existing_verification in {"verified_purchase", "verified_buyer"}
+                and (not existing_has_rating)
+                and requested_rating is not None
+            ):
+                update_values = {
+                    "updated_at": now_dt,
+                    "rating": requested_rating,
+                    "status": "under_review",
+                }
+                if title_text is not None:
+                    update_values["title"] = title_text
+                if body_text is not None:
+                    update_values["body"] = body_text
+
+                await database.execute(
+                    product_reviews.update()
+                    .where(product_reviews.c.id == existing_review_id)
+                    .values(**update_values)
+                )
+                record_buyer_create(result="success", reason="add_rating", duration_seconds=(time.perf_counter() - start))
+                return {
+                    "status": "success",
+                    "review_id": int(existing_review_id),
+                    "moderation_state": "under_review",
+                    "updated": True,
+                }
+
+            raise HTTPException(status_code=409, detail="ALREADY_REVIEWED")
+
         review_id = await database.execute(
             product_reviews.insert().values(
                 product_key=product_key,
@@ -235,10 +321,10 @@ async def buyer_create_review_from_user(
                 source_system="accounts",
                 external_review_id=None,
                 dedupe_key=f"accounts|{principal.user_id}|{subject_type}|{subject_id}",
-                verification="verified_purchase",
-                rating=int(body.rating),
-                title=(body.title or "").strip() or None,
-                body=(body.body or "").strip() or None,
+                verification="verified_purchase" if is_purchaser else "unverified",
+                rating=requested_rating if is_purchaser else None,
+                title=title_text,
+                body=body_text,
                 media_count=0,
                 risk_flags={
                     "source": "accounts",
