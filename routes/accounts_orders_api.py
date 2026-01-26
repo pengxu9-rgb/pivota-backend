@@ -910,13 +910,14 @@ async def password_login(body: PasswordLoginRequest, request: Request):
             "Email or password is incorrect",
         )
 
-    session_payload = await _build_user_session(dict(user_row))
+    user_dict = dict(user_row)
+    session_payload = await _build_user_session(user_dict)
     response = JSONResponse(session_payload.dict())
     _set_auth_cookies(
         response,
         user_id=user_row["id"],
         email=user_row["email"],
-        primary_role=user_row.get("primary_role", "customer"),
+        primary_role=str(user_dict.get("primary_role") or "customer"),
         amr="password",
         auth_time=int(datetime.now(timezone.utc).timestamp()),
     )
