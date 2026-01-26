@@ -350,6 +350,28 @@ ugc_questions = Table(
 Index("idx_ugc_questions_user_created", ugc_questions.c.user_id, ugc_questions.c.created_at.desc())
 Index("idx_ugc_questions_subject_created", ugc_questions.c.subject_type, ugc_questions.c.subject_id, ugc_questions.c.created_at.desc())
 
+ugc_question_replies = Table(
+    "ugc_question_replies",
+    metadata,
+    Column("id", _ID_TYPE, primary_key=True, autoincrement=True),
+    Column("question_id", _ID_TYPE, ForeignKey("ugc_questions.id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String(128), nullable=False),
+    Column("body", Text, nullable=False),
+    Column("status", String(16), nullable=False, server_default="active"),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+Index(
+    "idx_ugc_question_replies_question_created",
+    ugc_question_replies.c.question_id,
+    ugc_question_replies.c.created_at.desc(),
+)
+Index(
+    "idx_ugc_question_replies_user_created",
+    ugc_question_replies.c.user_id,
+    ugc_question_replies.c.created_at.desc(),
+)
+
 Index("idx_import_items_batch_status", import_items.c.batch_id, import_items.c.status)
 Index(
     "ux_import_items_merchant_source_external_review",
