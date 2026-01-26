@@ -19,6 +19,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Integer,
     Numeric,
     String,
     Table,
@@ -26,7 +27,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 
-from db.database import JSONB_TYPE, database, metadata
+from db.database import IS_SQLITE, JSONB_TYPE, database, metadata
+
+
+_autoincrement_pk_type = Integer if IS_SQLITE else BigInteger
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +59,8 @@ buyer_addresses = Table(
 buyer_agent_links = Table(
     "buyer_agent_links",
     metadata,
-    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    # SQLite requires INTEGER PRIMARY KEY for autoincrement; BigInteger breaks local dev.
+    Column("id", _autoincrement_pk_type, primary_key=True, autoincrement=True),
     Column("buyer_id", String(50), nullable=False, index=True),
     Column("agent_id", String(100), nullable=False, index=True),
     Column("agent_scoped_buyer_ref", String(128), nullable=False, unique=True, index=True),
@@ -98,7 +103,7 @@ authorization_tokens = Table(
 buyer_audit_logs = Table(
     "buyer_audit_logs",
     metadata,
-    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("id", _autoincrement_pk_type, primary_key=True, autoincrement=True),
     Column("buyer_id", String(50), nullable=True, index=True),
     Column("agent_id", String(100), nullable=True, index=True),
     Column("action", String(120), nullable=False, index=True),
