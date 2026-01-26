@@ -107,6 +107,28 @@ async def _ensure_database_connected() -> None:
         )
 
 
+async def _mark_email_verified_best_effort(user_id: str) -> None:
+    """
+    Best-effort email verification marker for Buyer Vault.
+
+    We keep this tolerant of schema drift: environments that haven't yet applied
+    the migration will auto-add the column and proceed.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return
+    try:
+        await database.execute(
+            "ALTER TABLE shop_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ"
+        )
+        await database.execute(
+            "UPDATE shop_users SET email_verified_at = NOW() WHERE id = :id AND email_verified_at IS NULL",
+            {"id": uid},
+        )
+    except Exception:
+        return
+
+
 def _get_client_ip(request: Request) -> str:
     """Best-effort client IP extraction (considering proxies)."""
     x_forwarded_for = request.headers.get("x-forwarded-for")
@@ -843,6 +865,7 @@ async def verify_login(body: VerifyRequest, request: Request):
     # Create or get shop user
     user_row = await create_or_get_shop_user(email=email, phone=body.phone)
     user_row["is_new_user"] = bool(user_row.get("created_at") and user_row["created_at"] >= now - timedelta(minutes=1))
+    await _mark_email_verified_best_effort(user_row.get("id"))
 
     session_payload = await _build_user_session(user_row)
     response = JSONResponse(session_payload.dict())
@@ -911,6 +934,7 @@ async def password_login(body: PasswordLoginRequest, request: Request):
         )
 
     user_dict = dict(user_row)
+    await _mark_email_verified_best_effort(user_dict.get("id"))
     session_payload = await _build_user_session(user_dict)
     response = JSONResponse(session_payload.dict())
     _set_auth_cookies(

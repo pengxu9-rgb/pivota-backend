@@ -251,6 +251,7 @@ from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.accounts_orders_api import router as accounts_orders_router
+from routes.buyer_api import router as buyer_router
 from routes.merchant_promotions_api import router as merchant_promotions_router
 from routes.merchant_risk_api import router as merchant_risk_router
 from routes.agent_promotions import router as agent_promotions_router
@@ -634,6 +635,7 @@ app.include_router(product_monitoring_router)  # Product sync monitoring and met
 # app.include_router(public_products_router)  # Public test endpoint
 app.include_router(order_router)  # Order processing
 app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-facing)
+app.include_router(buyer_router)  # Buyer Vault API (unified buyer account)
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
 app.include_router(after_sales_cases_router)  # After-sales Case API (refund/return_refund)

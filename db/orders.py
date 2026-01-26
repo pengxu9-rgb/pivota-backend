@@ -73,6 +73,12 @@ orders = Table(
     Column("agent_id", String(255), nullable=True, index=True),  # Agent who created this order
     Column("agent_session_id", String(255), nullable=True, index=True),
     Column("metadata", JSON, nullable=True),
+
+    # Buyer Vault linkage (internal-only; never expose global buyer_id to agents)
+    Column("buyer_id", String(50), nullable=True, index=True),
+    Column("intent_id", String(80), nullable=True, index=True),
+    Column("agent_user_ref", String(255), nullable=True, index=True),
+    Column("agent_scoped_buyer_ref", String(128), nullable=True, index=True),
     
     # 软删除（防御性设计：订单不能真删除）
     Column("is_deleted", Boolean, default=False, index=True),
@@ -165,6 +171,26 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                 await database.execute(text("""
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS metadata JSONB;
+                """))
+            if "column \"buyer_id\" of relation \"orders\" does not exist" in err or "buyer_id" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders
+                    ADD COLUMN IF NOT EXISTS buyer_id VARCHAR(50);
+                """))
+            if "column \"intent_id\" of relation \"orders\" does not exist" in err or "intent_id" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders
+                    ADD COLUMN IF NOT EXISTS intent_id VARCHAR(80);
+                """))
+            if "column \"agent_user_ref\" of relation \"orders\" does not exist" in err or "agent_user_ref" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders
+                    ADD COLUMN IF NOT EXISTS agent_user_ref VARCHAR(255);
+                """))
+            if "column \"agent_scoped_buyer_ref\" of relation \"orders\" does not exist" in err or "agent_scoped_buyer_ref" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders
+                    ADD COLUMN IF NOT EXISTS agent_scoped_buyer_ref VARCHAR(128);
                 """))
             if "column \"psp_used\" of relation \"orders\" does not exist" in err or "psp_used" in err or "Unconsumed column names: psp_used" in err:
                 await database.execute(text("""

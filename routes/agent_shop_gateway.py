@@ -335,6 +335,9 @@ class OrderItem(BaseModel):
     merchant_id: str
     product_id: str
     product_title: str
+    variant_id: Optional[str] = None
+    sku: Optional[str] = None
+    selected_options: Optional[Dict[str, Any]] = None
     quantity: int
     unit_price: float
     subtotal: float
@@ -345,6 +348,7 @@ class ShippingAddress(BaseModel):
     address_line1: str
     address_line2: Optional[str] = ""
     city: str
+    state: Optional[str] = None
     country: str
     postal_code: str
     phone: Optional[str] = None
@@ -353,6 +357,14 @@ class ShippingAddress(BaseModel):
 class OrderPayloadBody(BaseModel):
     merchant_id: str
     customer_email: str
+    currency: Optional[str] = None
+    offer_id: Optional[str] = None
+    preferred_psp: Optional[str] = None
+    quote_id: Optional[str] = None
+    discount_codes: Optional[List[str]] = None
+    selected_delivery_option: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    idempotency_key: Optional[str] = None
     items: List[OrderItem]
     shipping_address: ShippingAddress
     customer_notes: Optional[str] = None
@@ -3863,19 +3875,33 @@ async def _handle_get_product_detail(
     }
 
 
-async def _proxy_agent_api(method: str, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
-    """Forward a request to the Agent API using a server-side API key."""
-    if not AGENT_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="SHOP_GATEWAY_AGENT_API_KEY / PIVOTA_API_KEY is not configured for agent payments",
-        )
+async def _proxy_agent_api(
+    method: str,
+    path: str,
+    json_body: Dict[str, Any],
+    *,
+    checkout_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Forward a request to the Agent API.
 
+    Auth precedence:
+    - If `checkout_token` is present (Checkout UI flow), forward it so agent_id is derived from the token.
+    - Otherwise fall back to a server-side API key (legacy / demo mode).
+    """
     url = f"{AGENT_API_BASE}{path}"
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-Key": AGENT_API_KEY,
-    }
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+
+    token = (checkout_token or "").strip()
+    if token:
+        headers["X-Checkout-Token"] = token
+    else:
+        if not AGENT_API_KEY:
+            raise HTTPException(
+                status_code=500,
+                detail="SHOP_GATEWAY_AGENT_API_KEY / PIVOTA_API_KEY is not configured for agent payments",
+            )
+        headers["X-API-Key"] = AGENT_API_KEY
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -3897,16 +3923,27 @@ async def _proxy_agent_api(method: str, path: str, json_body: Dict[str, Any]) ->
         raise HTTPException(status_code=502, detail="Invalid JSON from agent API")
 
 
-async def _handle_create_order(order: OrderPayloadBody) -> Dict[str, Any]:
+async def _handle_create_order(order: OrderPayloadBody, *, checkout_token: Optional[str]) -> Dict[str, Any]:
     """Proxy create_order to Agent API (/agent/v1/orders/create)."""
     body = {
         "merchant_id": order.merchant_id,
         "customer_email": order.customer_email,
+        **({"currency": order.currency} if order.currency else {}),
+        **({"offer_id": order.offer_id} if order.offer_id else {}),
+        **({"preferred_psp": order.preferred_psp} if order.preferred_psp else {}),
+        **({"quote_id": order.quote_id} if order.quote_id else {}),
+        **({"discount_codes": order.discount_codes} if isinstance(order.discount_codes, list) else {}),
+        **({"selected_delivery_option": order.selected_delivery_option} if isinstance(order.selected_delivery_option, dict) else {}),
+        **({"metadata": order.metadata} if isinstance(order.metadata, dict) else {}),
+        **({"idempotency_key": order.idempotency_key} if order.idempotency_key else {}),
         "items": [
             {
                 "merchant_id": item.merchant_id,
                 "product_id": item.product_id,
                 "product_title": item.product_title,
+                **({"variant_id": item.variant_id} if item.variant_id else {}),
+                **({"sku": item.sku} if item.sku else {}),
+                **({"selected_options": item.selected_options} if isinstance(item.selected_options, dict) else {}),
                 "quantity": item.quantity,
                 "unit_price": item.unit_price,
                 "subtotal": item.subtotal,
@@ -3914,10 +3951,11 @@ async def _handle_create_order(order: OrderPayloadBody) -> Dict[str, Any]:
             for item in order.items
         ],
         "shipping_address": {
-            "recipient_name": order.shipping_address.name,
+            "name": order.shipping_address.name,
             "address_line1": order.shipping_address.address_line1,
             "address_line2": order.shipping_address.address_line2 or "",
             "city": order.shipping_address.city,
+            **({"state": order.shipping_address.state} if order.shipping_address.state else {}),
             "country": order.shipping_address.country,
             "postal_code": order.shipping_address.postal_code,
             "phone": order.shipping_address.phone or "",
@@ -3925,10 +3963,10 @@ async def _handle_create_order(order: OrderPayloadBody) -> Dict[str, Any]:
         "customer_notes": order.customer_notes or "",
     }
 
-    return await _proxy_agent_api("POST", "/agent/v1/orders/create", body)
+    return await _proxy_agent_api("POST", "/agent/v1/orders/create", body, checkout_token=checkout_token)
 
 
-async def _handle_submit_payment(payment: PaymentPayloadBody) -> Dict[str, Any]:
+async def _handle_submit_payment(payment: PaymentPayloadBody, *, checkout_token: Optional[str]) -> Dict[str, Any]:
     """Proxy submit_payment to Agent API (/agent/v1/payments)."""
     # 将简单的 payment_method 字符串映射为 Agent Payment API 的结构化字段
     method_type = (payment.payment_method or "").strip() or "card"
@@ -3944,7 +3982,7 @@ async def _handle_submit_payment(payment: PaymentPayloadBody) -> Dict[str, Any]:
         "currency": payment.currency,
     }
 
-    return await _proxy_agent_api("POST", "/agent/v1/payments", body)
+    return await _proxy_agent_api("POST", "/agent/v1/payments", body, checkout_token=checkout_token)
 
 
 INVOKE_SHORT_WAIT_SECONDS_RAW = os.getenv("AGENT_SHOP_INVOKE_MAX_WAIT_SECONDS")
@@ -3980,6 +4018,7 @@ async def invoke_shop_operation(
     - find_similar_products
     """
     operation = (request.operation or "").strip()
+    checkout_token = (http_request.headers.get("x-checkout-token") or "").strip() or None
 
     # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
     normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
@@ -4497,7 +4536,7 @@ async def invoke_shop_operation(
 
     if operation == "create_order":
         payload = CreateOrderPayload(**request.payload)
-        return await _handle_create_order(payload.order)
+        return await _handle_create_order(payload.order, checkout_token=checkout_token)
 
     if operation == "find_products_multi":
         payload = FindProductsMultiPayload(**request.payload)
@@ -4583,7 +4622,7 @@ async def invoke_shop_operation(
 
     if operation == "submit_payment":
         payload = SubmitPaymentPayload(**request.payload)
-        return await _handle_submit_payment(payload.payment)
+        return await _handle_submit_payment(payload.payment, checkout_token=checkout_token)
 
     # For now we only support product operations here.
     raise HTTPException(
