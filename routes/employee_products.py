@@ -778,6 +778,18 @@ def _seed_variant_to_raw_row(
     elif availability == "out_of_stock":
         available = False
 
+    image_url = v.get("image_url") or v.get("imageUrl") or v.get("imageURL") or v.get("image")
+    if image_url is None:
+        imgs = v.get("image_urls") or v.get("images")
+        if isinstance(imgs, list) and imgs:
+            image_url = imgs[0]
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url") or image_url.get("image_url") or image_url.get("src")
+    if not isinstance(image_url, str):
+        image_url = None
+    else:
+        image_url = image_url.strip() or None
+
     out: Dict[str, Any] = {
         "variant_id": variant_id,
         "title": title,
@@ -785,6 +797,7 @@ def _seed_variant_to_raw_row(
         "price_currency": price_currency,
         **({"availability": availability} if availability is not None else {}),
         **({"available": available} if available is not None else {}),
+        **({"image_url": image_url} if image_url else {}),
     }
     return out
 
@@ -801,6 +814,9 @@ def _seed_variant_to_standard_variant(
         price = float(price_amount) if price_amount is not None else float(fallback_price)
     except Exception:
         price = float(fallback_price)
+    image_url = raw_row.get("image_url")
+    if not isinstance(image_url, str) or not image_url.strip():
+        image_url = None
     return {
         "id": vid,
         "variant_id": vid,
@@ -808,6 +824,7 @@ def _seed_variant_to_standard_variant(
         "sku": vid,
         "price": price,
         "inventory_quantity": 0,
+        **({"image_url": image_url} if image_url else {}),
     }
 
 
@@ -873,6 +890,7 @@ async def _build_external_seed_product_view(
                 "sku": external_product_id,
                 "price": price,
                 "inventory_quantity": 0,
+                **({"image_url": image_url} if image_url else {}),
             }
         ]
         raw_variants = [
@@ -881,6 +899,7 @@ async def _build_external_seed_product_view(
                 "title": "Default (no variants)",
                 "price_amount": (price if raw_amount is not None else None),
                 "price_currency": currency,
+                **({"image_url": image_url} if image_url else {}),
             }
         ]
 

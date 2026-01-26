@@ -2,16 +2,24 @@ import os
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
-
-from main import app
+from utils.auth import get_current_employee
 
 
 @pytest.fixture
 def client():
+    import routes.employee_products as employee_products_module
+
+    async def override_employee():
+        return {"employee_id": "emp_test", "email": "test@example.com"}
+
+    app = FastAPI()
+    app.include_router(employee_products_module.router)
+    app.dependency_overrides[get_current_employee] = override_employee
     return TestClient(app)
 
 
@@ -37,8 +45,22 @@ def _seed_row(**overrides):
             "description": "Seed description",
             "image_urls": ["https://example.com/img_main.jpg", "https://example.com/img_2.jpg"],
             "variants": [
-                {"variant_id": "v1", "title": "50ml", "price_amount": 12.34, "price_currency": "USD", "availability": "in_stock"},
-                {"variant_id": "v2", "title": "100ml", "price_amount": 19.99, "price_currency": "USD", "availability": "in_stock"},
+                {
+                    "variant_id": "v1",
+                    "title": "50ml",
+                    "price_amount": 12.34,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "image_url": "https://example.com/v1.jpg",
+                },
+                {
+                    "variant_id": "v2",
+                    "title": "100ml",
+                    "price_amount": 19.99,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "image_url": "https://example.com/v2.jpg",
+                },
             ],
         },
         "status": "active",
@@ -81,6 +103,9 @@ def test_employee_product_detail_external_seed_synthesizes_view(monkeypatch: pyt
     assert product.get("product_id") == "ext_test_1"
     assert product.get("title") == "Example External Product"
     assert product.get("orderable") is False
+    variants = product.get("variants") or []
+    assert any(v.get("variant_id") == "v1" and v.get("image_url") == "https://example.com/v1.jpg" for v in variants)
+    assert any(v.get("variant_id") == "v2" and v.get("image_url") == "https://example.com/v2.jpg" for v in variants)
 
     raw = payload.get("raw") or {}
     assert raw.get("source") == "external_seed"
@@ -112,4 +137,3 @@ def test_employee_product_offers_external_seed_returns_external_offers(monkeypat
     assert items and items[0].get("source") == "external_seed"
     assert items[0].get("seed_id") == "eps_test_1"
     assert isinstance(items[0].get("action", {}).get("redirect_url"), str)
-

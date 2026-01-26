@@ -2,12 +2,11 @@ import os
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import AsyncMock
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
-
-from main import app
 
 
 def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) -> None:
@@ -16,10 +15,12 @@ def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) ->
     async def override_employee() -> Dict[str, Any]:
         return {"employee_id": "emp_test", "email": "test@example.com"}
 
+    import routes.employee_products as employee_products_module
+
+    app = FastAPI()
+    app.include_router(employee_products_module.router)
     app.dependency_overrides[get_current_employee] = override_employee
     try:
-        import routes.employee_products as employee_products_module
-
         store_by_id: Dict[str, Dict[str, Any]] = {}
         store_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
@@ -99,10 +100,12 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
     async def override_employee() -> Dict[str, Any]:
         return {"employee_id": "emp_test", "email": "test@example.com"}
 
+    import routes.employee_products as employee_products_module
+
+    app = FastAPI()
+    app.include_router(employee_products_module.router)
     app.dependency_overrides[get_current_employee] = override_employee
     try:
-        import routes.employee_products as employee_products_module
-
         store_by_id: Dict[str, Dict[str, Any]] = {}
         store_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
@@ -174,6 +177,8 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
         titles = [v.get("title") for v in variants]
         assert "30 ml" in titles
         assert "50 ml" in titles
+        assert any(v.get("variant_id") == "T6K601" and v.get("image_url") == "https://example.com/img1.jpg" for v in variants)
+        assert any(v.get("variant_id") == "T43001" and v.get("image_url") == "https://example.com/img2.jpg" for v in variants)
 
         res2 = client.post(
             "/employee/products/external-seeds/import-csv?market=US&tool=*&mode=upsert",
