@@ -3,9 +3,9 @@ Agent Product Browsing API
 Allows agents to view merchant products via hybrid query (cache or realtime)
 """
 
-from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from services.product_query_service import get_products_hybrid, log_query_source
 from services.agent_product_service import get_agent_product_view
+import services.merchant_store_service as merchant_store_service
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -26,7 +26,6 @@ import os
 from datetime import datetime
 
 from routes.agent_api import get_agent_context, AgentContext, log_agent_request
-from services.merchant_store_service import get_primary_store
 from routes.merchant_onboarding_routes import get_merchant_onboarding
 from fastapi import BackgroundTasks
 from db.database import database
@@ -731,7 +730,7 @@ async def get_product_details(
             raise HTTPException(status_code=404, detail="Merchant not found")
 
         # Get primary store for this merchant (may be Shopify, Wix, etc.)
-        store = await get_primary_store(merchant_id)
+        store = await merchant_store_service.get_primary_store(merchant_id)
         if not store:
             raise HTTPException(
                 status_code=404,
@@ -1020,7 +1019,7 @@ async def get_product_details_by_variant(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
-    store = await get_primary_store(merchant_id)
+    store = await merchant_store_service.get_primary_store(merchant_id)
     if not store:
         raise HTTPException(
             status_code=404,

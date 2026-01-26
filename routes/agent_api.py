@@ -22,7 +22,7 @@ from db.orders import get_order, get_orders_by_merchant, update_payment_info
 from routes.refund_api import process_refund
 from routes.order_routes import cancel_order as admin_cancel_order
 from routes.fulfillment_api import track_order_fulfillment
-from routes.order_routes import create_new_order
+import routes.order_routes as order_routes_module
 from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from utils.logger import logger
@@ -2395,7 +2395,7 @@ async def agent_create_order(
         # 调用标准订单创建 (serialize per-merchant to avoid concurrent order creation hazards)
         async with _get_order_create_lock(order_request.merchant_id):
             try:
-                order_response = await create_new_order(order_request, background_tasks)
+                order_response = await order_routes_module.create_new_order(order_request, background_tasks)
             except Exception as e:
                 # Emergency self-heal: if a pooled asyncpg connection is in a poisoned/busy state,
                 # reset the pool and retry once. Idempotency keys (when present) prevent duplicates.
@@ -2409,7 +2409,7 @@ async def agent_create_order(
                     except Exception:
                         pass
                     try:
-                        order_response = await create_new_order(order_request, background_tasks)
+                        order_response = await order_routes_module.create_new_order(order_request, background_tasks)
                     except Exception as e2:
                         if is_asyncpg_busy_error(e2):
                             raise db_busy_http_exception()

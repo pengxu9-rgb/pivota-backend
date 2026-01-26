@@ -69,20 +69,20 @@ class ResponseWrapperMiddleware(BaseHTTPMiddleware):
         
         # Call the actual endpoint
         response = await call_next(request)
+
+        # Always add request ID header for traceability
+        try:
+            response.headers[self.config.request_id_header] = request_id
+        except Exception:
+            pass
         
         # If wrapping is not enabled for this path, return as-is
         if not should_wrap:
-            # Still add request ID header
-            response.headers[self.config.request_id_header] = request_id
             return response
         
         # Check if response type should be wrapped
         content_type = response.headers.get("content-type", "")
         if self._should_exclude_content_type(content_type):
-            return response
-        
-        # Don't wrap streaming responses
-        if isinstance(response, StreamingResponse) and not isinstance(response, JSONResponse):
             return response
         
         # Don't wrap non-2xx responses that are already errors
