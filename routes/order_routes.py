@@ -1516,14 +1516,14 @@ async def create_shopify_order(order_id: str) -> bool:
 
         pivota_tag = f"pivota_order_id:{order_id}"
 
-        def _token_fingerprint(token: str | None) -> str | None:
+        def _token_fingerprint(token: Optional[str]) -> Optional[str]:
             if not token:
                 return None
             return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
         async def _find_existing_order_id_best_effort(
             *, shop_domain: str, access_token: str
-        ) -> str | None:
+        ) -> Optional[str]:
             query = """
             query($query: String!) {
               orders(first: 1, query: $query) {
@@ -1790,7 +1790,7 @@ async def create_shopify_order(order_id: str) -> bool:
         # NOTE: Shopify REST Admin API is on a legacy track; keep as-is for v0.1,
         # but plan migration to GraphQL Admin Orders API if you intend to ship as a public app.
         async with httpx.AsyncClient() as client:
-            last_error: str | None = None
+            last_error: Optional[str] = None
             for store in candidates:
                 shop_domain_raw = str((store or {}).get("domain") or "").strip()
                 shop_domain = _normalize_shopify_domain(shop_domain_raw)

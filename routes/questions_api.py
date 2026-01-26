@@ -20,7 +20,7 @@ router = APIRouter(tags=["Questions"])
 
 class CreateQuestionRequest(BaseModel):
     product_id: str = Field(..., min_length=1, alias="productId")
-    product_group_id: str | None = Field(None, alias="productGroupId")
+    product_group_id: Optional[str] = Field(None, alias="productGroupId")
     question: str = Field(..., min_length=1, max_length=2000)
 
 

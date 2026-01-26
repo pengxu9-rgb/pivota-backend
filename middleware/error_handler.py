@@ -164,6 +164,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
                 details={"validation_errors": errors},
                 request_id=request_id,
             )
+            body["detail"] = detail
             return {"status_code": 400, "body": body, "headers": out_headers}
 
         # HTTPException style errors.
@@ -186,6 +187,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             details=details,
             request_id=request_id,
         )
+        body["detail"] = detail
         return {"status_code": status_code, "body": body, "headers": out_headers}
     
     def _create_error_response(self, request: Request, error: PivotaAPIError) -> JSONResponse:
@@ -198,6 +200,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             details=error.details,
             request_id=request_id
         )
+        error_dict["detail"] = error.message
         
         return JSONResponse(
             status_code=error.error_code.http_status,
@@ -234,11 +237,23 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             details=details,
             request_id=request_id
         )
+        error_dict["detail"] = exc.detail
+
+        out_headers = {}
+        try:
+            if getattr(exc, "headers", None):
+                for k, v in dict(exc.headers).items():
+                    lk = str(k).lower()
+                    if lk in {"content-length", "content-encoding", "transfer-encoding"}:
+                        continue
+                    out_headers[k] = v
+        except Exception:
+            out_headers = {}
         
         return JSONResponse(
             status_code=exc.status_code,
             content=error_dict,
-            headers={}
+            headers=out_headers
         )
     
     def _handle_validation_error(self, request: Request, exc: RequestValidationError) -> JSONResponse:

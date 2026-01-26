@@ -3099,7 +3099,10 @@ async def _handle_find_similar_products(
     background_tasks = background_tasks or BackgroundTasks()
 
     # Try loading base product from cache first
-    base_product = await _load_product_by_id(payload.product_id, merchant_id=payload.merchant_id)
+    if payload.merchant_id:
+        base_product = await _load_product_by_id(payload.product_id, merchant_id=payload.merchant_id)
+    else:
+        base_product = await _load_product_by_id(payload.product_id)
 
     # If not found in cache but we know the merchant, fall back to the
     # hybrid path so products that only exist in the realtime slice can
