@@ -22,6 +22,7 @@ from db.buyer_vault import (
     mandates,
     mint_pairwise_buyer_ref,
 )
+from db.checkout_intents import checkout_intents
 from db.database import database
 from db.orders import orders as orders_table
 from routes.accounts_orders_api import AccountsPrincipal, get_accounts_principal
@@ -373,7 +374,8 @@ async def _get_or_create_pairwise_buyer_ref(*, buyer_id: str, agent_id: str) -> 
 
     Must be idempotent under concurrency: two concurrent checkouts should never allocate two refs.
     """
-    # Postgres UPSERT: deterministic under concurrency (requires UNIQUE(buyer_id, agent_id)).
+    # Preferred path: Postgres UPSERT with RETURNING (also easy to stub in tests).
+    # If the underlying DB doesn't support this syntax (e.g. older SQLite), fall back.
     for _ in range(5):
         candidate = mint_pairwise_buyer_ref()
         try:
@@ -383,18 +385,83 @@ async def _get_or_create_pairwise_buyer_ref(*, buyer_id: str, agent_id: str) -> 
                   buyer_id, agent_id, agent_scoped_buyer_ref, created_at, last_used_at
                 )
                 VALUES (
-                  :buyer_id, :agent_id, :ref, NOW(), NOW()
+                  :buyer_id, :agent_id, :ref, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                 )
                 ON CONFLICT (buyer_id, agent_id)
-                DO UPDATE SET last_used_at = NOW()
+                DO UPDATE SET last_used_at = CURRENT_TIMESTAMP
                 RETURNING agent_scoped_buyer_ref
                 """,
                 {"buyer_id": buyer_id, "agent_id": agent_id, "ref": candidate},
             )
-            if row and row.get("agent_scoped_buyer_ref"):
-                return str(row["agent_scoped_buyer_ref"])
+            if row:
+                row_dict = dict(row)
+                if row_dict.get("agent_scoped_buyer_ref"):
+                    return str(row_dict["agent_scoped_buyer_ref"])
         except Exception:
-            # Likely collision on UNIQUE(agent_id, agent_scoped_buyer_ref) or transient DB issue; retry.
+            break
+
+    # Fallback: cross-database select + insert (SQLite safe).
+    try:
+        existing = await database.fetch_one(
+            buyer_agent_links.select()
+            .where((buyer_agent_links.c.buyer_id == buyer_id) & (buyer_agent_links.c.agent_id == agent_id))
+            .limit(1)
+        )
+        if existing:
+            existing_dict = dict(existing)
+            if existing_dict.get("agent_scoped_buyer_ref"):
+                ref = str(existing_dict["agent_scoped_buyer_ref"])
+                try:
+                    await database.execute(
+                        buyer_agent_links.update()
+                        .where((buyer_agent_links.c.buyer_id == buyer_id) & (buyer_agent_links.c.agent_id == agent_id))
+                        .values(last_used_at=func.now())
+                    )
+                except Exception:
+                    pass
+                return ref
+    except Exception:
+        existing = None
+
+    for _ in range(5):
+        candidate = mint_pairwise_buyer_ref()
+        try:
+            await database.execute(
+                buyer_agent_links.insert().values(
+                    buyer_id=buyer_id,
+                    agent_id=agent_id,
+                    agent_scoped_buyer_ref=candidate,
+                    created_at=func.now(),
+                    last_used_at=func.now(),
+                )
+            )
+            return candidate
+        except Exception:
+            # Likely collision or concurrent insert; re-select and retry.
+            try:
+                row = await database.fetch_one(
+                    buyer_agent_links.select()
+                    .where((buyer_agent_links.c.buyer_id == buyer_id) & (buyer_agent_links.c.agent_id == agent_id))
+                    .limit(1)
+                )
+                if row:
+                    row_dict = dict(row)
+                    if row_dict.get("agent_scoped_buyer_ref"):
+                        ref = str(row_dict["agent_scoped_buyer_ref"])
+                        try:
+                            await database.execute(
+                                buyer_agent_links.update()
+                                .where(
+                                    (buyer_agent_links.c.buyer_id == buyer_id)
+                                    & (buyer_agent_links.c.agent_id == agent_id)
+                                )
+                                .values(last_used_at=func.now())
+                            )
+                        except Exception:
+                            pass
+                        return ref
+            except Exception:
+                pass
             continue
     raise _error(
         status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -419,8 +486,10 @@ async def buyer_me(
             "SELECT email_verified_at FROM shop_users WHERE id = :id LIMIT 1",
             {"id": principal.user_id},
         )
-        if row and row.get("email_verified_at"):
-            email_verified_at = row.get("email_verified_at")
+        if row:
+            row_dict = dict(row)
+            if row_dict.get("email_verified_at"):
+                email_verified_at = row_dict.get("email_verified_at")
     except Exception:
         email_verified_at = None
 
@@ -558,6 +627,7 @@ async def patch_address(
     )
     if not existing:
         raise _error(status.HTTP_404_NOT_FOUND, "NOT_FOUND", "Address not found")
+    existing = dict(existing)
 
     patch: Dict[str, Any] = {}
     for key in ("recipient_name", "line1", "line2", "city", "region", "postal_code", "phone"):
@@ -619,6 +689,7 @@ async def delete_address(
     )
     if not existing:
         raise _error(status.HTTP_404_NOT_FOUND, "NOT_FOUND", "Address not found")
+    existing = dict(existing)
 
     was_default = bool(existing.get("is_default"))
     await database.execute(
@@ -745,8 +816,14 @@ async def buyer_list_orders(
     )
 
     items: List[Dict[str, Any]] = []
-    for r in rows or []:
-        addr = r.get("shipping_address") if isinstance(r, dict) else None
+    for row in rows or []:
+        r = dict(row)
+        addr = r.get("shipping_address")
+        if isinstance(addr, str):
+            try:
+                addr = json.loads(addr)
+            except Exception:
+                addr = None
         city = None
         country = None
         if isinstance(addr, dict):
@@ -942,8 +1019,16 @@ async def save_from_checkout(
             "SELECT prefill FROM checkout_intents WHERE intent_id = :intent_id AND agent_id = :agent_id LIMIT 1",
             {"intent_id": intent_id, "agent_id": agent_id},
         )
-        if row and isinstance(row.get("prefill"), dict):
-            intent_prefill = row.get("prefill")
+        if row:
+            row_dict = dict(row)
+            prefill_value = row_dict.get("prefill")
+            if isinstance(prefill_value, str):
+                try:
+                    prefill_value = json.loads(prefill_value)
+                except Exception:
+                    prefill_value = None
+            if isinstance(prefill_value, dict):
+                intent_prefill = prefill_value
     except Exception:
         intent_prefill = None
 
@@ -954,8 +1039,16 @@ async def save_from_checkout(
                 order_row = await database.fetch_one(
                     orders_table.select().where(orders_table.c.order_id == order_id).limit(1)
                 )
-                if order_row and str(order_row.get("agent_id") or "") == agent_id:
-                    addr_to_save = _normalize_shipping_address(order_row.get("shipping_address"))
+                if order_row:
+                    order_dict = dict(order_row)
+                    if str(order_dict.get("agent_id") or "") == agent_id:
+                        shipping_raw = order_dict.get("shipping_address")
+                        if isinstance(shipping_raw, str):
+                            try:
+                                shipping_raw = json.loads(shipping_raw)
+                            except Exception:
+                                shipping_raw = None
+                        addr_to_save = _normalize_shipping_address(shipping_raw)
             except Exception:
                 addr_to_save = None
         if not addr_to_save and intent_prefill:
@@ -985,8 +1078,10 @@ async def save_from_checkout(
         except Exception:
             existing = None
 
-        if existing and existing.get("id"):
-            saved_address_id = str(existing.get("id"))
+        if existing:
+            existing_dict = dict(existing)
+            if existing_dict.get("id"):
+                saved_address_id = str(existing_dict.get("id"))
         else:
             import secrets
 
@@ -1053,12 +1148,9 @@ async def save_from_checkout(
     # Link the intent to buyer best-effort (checkout-only; internal).
     try:
         await database.execute(
-            """
-            UPDATE checkout_intents
-            SET linked_buyer_id = :buyer_id, used_at = NOW(), updated_at = NOW()
-            WHERE intent_id = :intent_id AND agent_id = :agent_id
-            """,
-            {"buyer_id": principal.user_id, "intent_id": intent_id, "agent_id": agent_id},
+            checkout_intents.update()
+            .where((checkout_intents.c.intent_id == intent_id) & (checkout_intents.c.agent_id == agent_id))
+            .values(linked_buyer_id=principal.user_id, used_at=func.now(), updated_at=func.now())
         )
     except Exception:
         pass
@@ -1173,6 +1265,7 @@ async def revoke_mandate(
     )
     if not row:
         raise _error(status.HTTP_404_NOT_FOUND, "NOT_FOUND", "Mandate not found")
+    row = dict(row)
 
     if str(row.get("status") or "").lower() != "revoked":
         await database.execute(

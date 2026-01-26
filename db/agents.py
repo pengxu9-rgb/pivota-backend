@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import secrets
 import hashlib
+import json
 
 from db.database import metadata, database
 
@@ -170,6 +171,20 @@ async def get_agent_by_key(api_key: str) -> Optional[Dict[str, Any]]:
             return None
 
         agent = dict(result)
+
+        # Normalize JSON fields for SQLite (may come back as JSON-encoded strings).
+        raw_allowed = agent.get("allowed_merchants")
+        if isinstance(raw_allowed, str):
+            try:
+                raw_allowed = json.loads(raw_allowed)
+            except Exception:
+                raw_allowed = []
+        if raw_allowed is None:
+            agent["allowed_merchants"] = None
+        elif isinstance(raw_allowed, list):
+            agent["allowed_merchants"] = [str(m).strip() for m in raw_allowed if str(m or "").strip()] or []
+        else:
+            agent["allowed_merchants"] = []
         
         # Normalize field names across schemas
         if "agent_name" not in agent and "name" in agent:
@@ -202,6 +217,18 @@ async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
         
         if result:
             agent = dict(result)
+            raw_allowed = agent.get("allowed_merchants")
+            if isinstance(raw_allowed, str):
+                try:
+                    raw_allowed = json.loads(raw_allowed)
+                except Exception:
+                    raw_allowed = []
+            if raw_allowed is None:
+                agent["allowed_merchants"] = None
+            elif isinstance(raw_allowed, list):
+                agent["allowed_merchants"] = [str(m).strip() for m in raw_allowed if str(m or "").strip()] or []
+            else:
+                agent["allowed_merchants"] = []
             # 移除敏感信息
             agent.pop("api_key", None)
             agent.pop("api_key_hash", None)
