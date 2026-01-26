@@ -85,6 +85,22 @@ def _format_set_cookie(*, name: str, value: str, max_age_seconds: int) -> str:
         parts.append("Secure")
     return "; ".join(parts)
 
+def _coerce_datetime_utc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Checkout token helpers (verify signature; do not require DB lookups)
@@ -907,8 +923,8 @@ async def save_from_checkout(
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "Invalid save_token")
 
         challenge = dict(challenge_row)
-        expires_at = challenge.get("expires_at")
-        if expires_at and hasattr(expires_at, "timestamp") and expires_at.timestamp() < time.time():
+        expires_at = _coerce_datetime_utc(challenge.get("expires_at"))
+        if expires_at and expires_at.timestamp() < time.time():
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token expired")
         if challenge.get("redeemed_at"):
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token already used")

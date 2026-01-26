@@ -740,6 +740,7 @@ async def get_review_summary_for_sku(
     scope_row = await database.fetch_one(
         f"""
         SELECT COUNT(*)::int AS total,
+               COALESCE(SUM(CASE WHEN r.rating IS NOT NULL AND r.rating > 0 THEN 1 ELSE 0 END), 0)::int AS rated_total,
                COALESCE(AVG(r.rating), 0)::float AS avg_rating
         FROM product_reviews r
         WHERE r.status = 'active' AND ({scope_where_sql})
@@ -747,6 +748,7 @@ async def get_review_summary_for_sku(
         scope_params,
     )
     review_count = int(scope_row["total"] or 0) if scope_row else 0
+    rated_review_count = int(scope_row["rated_total"] or 0) if scope_row else 0
     rating = float(scope_row["avg_rating"] or 0.0) if scope_row else 0.0
     if rating < 0:
         rating = 0.0
@@ -757,7 +759,7 @@ async def get_review_summary_for_sku(
         f"""
         SELECT r.rating::int AS rating, COUNT(*)::int AS c
         FROM product_reviews r
-        WHERE r.status = 'active' AND ({scope_where_sql})
+        WHERE r.status = 'active' AND r.rating IS NOT NULL AND r.rating > 0 AND ({scope_where_sql})
         GROUP BY r.rating
         ORDER BY r.rating DESC
         """,
@@ -773,14 +775,14 @@ async def get_review_summary_for_sku(
             continue
         by_star[stars] = int(dr["c"] or 0)
     star_distribution = []
-    if review_count > 0:
+    if rated_review_count > 0:
         for stars in range(5, 0, -1):
             c = int(by_star.get(stars, 0))
             star_distribution.append(
                 {
                     "stars": stars,
                     "count": c,
-                    "percent": (float(c) / float(review_count)) * 100.0 if review_count else 0.0,
+                    "percent": (float(c) / float(rated_review_count)) * 100.0 if rated_review_count else 0.0,
                 }
             )
 
@@ -824,6 +826,7 @@ async def get_review_summary_for_sku(
         "scale": 5,
         "rating": rating,
         "review_count": review_count,
+        "rating_count": rated_review_count,
         "star_distribution": star_distribution,
         "preview_items": preview_items,
         "product_key": product_key,

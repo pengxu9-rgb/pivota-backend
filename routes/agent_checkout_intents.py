@@ -111,6 +111,22 @@ def _require_checkout_ui_key(x_checkout_ui_key: Optional[str]) -> None:
 def _sha256_hex(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
+def _coerce_datetime_utc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
+
 def _checkout_intent_ttl_seconds() -> int:
     raw = (os.getenv("CHECKOUT_INTENT_TTL_SECONDS") or "").strip()
     try:
@@ -566,8 +582,8 @@ async def get_checkout_prefill(
 
     # Validate intent lifetime and token binding.
     try:
-        expires_at = row.get("expires_at")
-        if expires_at and hasattr(expires_at, "timestamp") and expires_at.timestamp() < time.time():
+        expires_at = _coerce_datetime_utc(row.get("expires_at"))
+        if expires_at and expires_at.timestamp() < time.time():
             raise HTTPException(
                 status_code=status.HTTP_410_GONE,
                 detail={"error": "INTENT_EXPIRED", "message": "Checkout intent expired"},

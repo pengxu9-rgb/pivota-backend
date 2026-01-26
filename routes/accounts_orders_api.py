@@ -50,7 +50,7 @@ from db.orders import orders as orders_table
 from utils.auth import create_access_token, decode_token, hash_password, verify_password
 from services.ugc_capabilities_service import (
     UgcSubject,
-    has_user_reviewed_subject,
+    get_user_review_for_subject,
     is_question_rate_limited,
     user_has_purchased_subject,
 )
@@ -1083,11 +1083,14 @@ async def get_pdp_v2_personalization(
         email_normalized=principal.email_normalized,
         subject=subject,
     )
-    already_reviewed = await has_user_reviewed_subject(
+    review_info = await get_user_review_for_subject(
         user_id=principal.user_id,
         subject_type=subject.subject_type,
         subject_id=subject.subject_id,
     )
+    review_verification = str((review_info or {}).get("verification") or "unverified").strip().lower()
+    review_is_verified = review_verification not in {"", "unverified"}
+    review_has_rating = bool((review_info or {}).get("has_rating"))
 
     question_rate_limited = await is_question_rate_limited(
         user_id=principal.user_id,
@@ -1097,23 +1100,34 @@ async def get_pdp_v2_personalization(
     )
 
     can_upload = bool(is_purchaser)
-    can_review = bool(is_purchaser) and not bool(already_reviewed)
+    # Reviews policy:
+    # - Any logged-in user can submit a text review/comment (once).
+    # - Only verified purchasers can submit a rating.
+    # - If a user already left an unverified review, allow a one-time upgrade after purchase.
+    can_upgrade_review = bool(is_purchaser) and bool(review_info) and not bool(review_is_verified)
+    can_add_rating = bool(is_purchaser) and bool(review_info) and bool(review_is_verified) and not bool(review_has_rating)
+    can_write_review = (not bool(review_info)) or can_upgrade_review or can_add_rating
+    can_rate_review = bool(is_purchaser) and ((not bool(review_info)) or can_upgrade_review or can_add_rating)
     can_ask = not bool(question_rate_limited)
 
     reasons: Dict[str, str] = {}
     if not can_upload:
         reasons["upload"] = "NOT_PURCHASER"
-    if not can_review:
-        reasons["review"] = "ALREADY_REVIEWED" if already_reviewed else "NOT_PURCHASER"
+    if not can_write_review:
+        reasons["review"] = "ALREADY_REVIEWED"
+    if not can_rate_review:
+        reasons["rating"] = "NOT_VERIFIED_FOR_RATING" if not is_purchaser else "ALREADY_REVIEWED"
     if not can_ask:
         reasons["question"] = "RATE_LIMITED"
 
     return {
         "ugcCapabilities": {
             "canUploadMedia": can_upload,
-            "canWriteReview": can_review,
+            "canWriteReview": can_write_review,
+            "canRateReview": can_rate_review,
             "canAskQuestion": can_ask,
             "reasons": reasons,
+            "review": review_info,
         }
     }
 
@@ -1150,19 +1164,36 @@ async def get_review_eligibility(
         email_normalized=principal.email_normalized,
         subject=subject,
     )
-
-    if not is_purchaser:
-        return {"eligible": False, "reason": "NOT_PURCHASER"}
-
-    already_reviewed = await has_user_reviewed_subject(
+    review_info = await get_user_review_for_subject(
         user_id=principal.user_id,
         subject_type=subject.subject_type,
         subject_id=subject.subject_id,
     )
-    if already_reviewed:
-        return {"eligible": False, "reason": "ALREADY_REVIEWED"}
+    review_verification = str((review_info or {}).get("verification") or "unverified").strip().lower()
+    review_is_verified = review_verification not in {"", "unverified"}
+    review_has_rating = bool((review_info or {}).get("has_rating"))
 
-    return {"eligible": True}
+    can_upgrade_review = bool(is_purchaser) and bool(review_info) and not bool(review_is_verified)
+    can_add_rating = bool(is_purchaser) and bool(review_info) and bool(review_is_verified) and not bool(review_has_rating)
+    eligible = (not bool(review_info)) or can_upgrade_review or can_add_rating
+    can_rate = bool(is_purchaser) and ((not bool(review_info)) or can_upgrade_review or can_add_rating)
+
+    if not eligible:
+        return {
+            "eligible": False,
+            "reason": "ALREADY_REVIEWED",
+            "canRate": False,
+        }
+
+    action = "CREATE" if not review_info else ("UPGRADE" if can_upgrade_review else "ADD_RATING" if can_add_rating else "CREATE")
+    out: Dict[str, Any] = {
+        "eligible": True,
+        "canRate": bool(can_rate),
+        "action": action,
+    }
+    if not can_rate:
+        out["ratingReason"] = "NOT_VERIFIED_FOR_RATING"
+    return out
 
 
 @router.post("/auth/refresh")

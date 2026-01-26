@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, or_, select, text
 
 from db.database import database
 from db.orders import orders as orders_table
-from db.reviews_center import buyer_review_user_subject, ugc_question_replies, ugc_questions
+from db.reviews_center import buyer_review_user_subject, product_reviews, ugc_question_replies, ugc_questions
 
 
 @dataclass(frozen=True)
@@ -312,6 +312,70 @@ async def has_user_reviewed_subject(*, user_id: str, subject_type: str, subject_
         return bool(row)
     except Exception:
         return False
+
+
+async def get_user_review_for_subject(
+    *,
+    user_id: str,
+    subject_type: str,
+    subject_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns the bound review (if any) for this user+subject, including verification + whether it has a rating.
+
+    This is user-specific and should only be used in non-cacheable personalization flows.
+    """
+    await ensure_ugc_tables_exist()
+    uid = str(user_id or "").strip()
+    st = str(subject_type or "").strip()
+    sid = str(subject_id or "").strip()
+    if not uid or not st or not sid:
+        return None
+
+    try:
+        binding = await database.fetch_one(
+            buyer_review_user_subject.select().where(
+                (buyer_review_user_subject.c.user_id == uid)
+                & (buyer_review_user_subject.c.subject_type == st)
+                & (buyer_review_user_subject.c.subject_id == sid)
+            )
+        )
+    except Exception:
+        return None
+
+    if not binding:
+        return None
+
+    try:
+        review_id = int(binding["review_id"])  # type: ignore[index]
+    except Exception:
+        review_id = 0
+
+    if review_id <= 0:
+        return None
+
+    try:
+        review = await database.fetch_one(product_reviews.select().where(product_reviews.c.id == review_id))
+    except Exception:
+        review = None
+
+    verification = ""
+    has_rating = False
+    if review:
+        try:
+            verification = str(review["verification"] or "")  # type: ignore[index]
+        except Exception:
+            verification = str(getattr(review, "verification", "") or "")
+        try:
+            has_rating = review["rating"] is not None  # type: ignore[index]
+        except Exception:
+            has_rating = getattr(review, "rating", None) is not None
+
+    return {
+        "review_id": int(review_id),
+        "verification": verification.strip() or "unverified",
+        "has_rating": bool(has_rating),
+    }
 
 
 async def bind_user_review_subject(*, user_id: str, subject_type: str, subject_id: str, review_id: int) -> None:
