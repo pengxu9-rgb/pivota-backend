@@ -40,7 +40,28 @@ class AgentContext:
         self.agent_id = agent["agent_id"]
         # Fallback: use 'name' if 'agent_name' is NULL
         self.agent_name = agent.get("agent_name") or agent.get("name") or "Unknown"
-        self.allowed_merchants = agent.get("allowed_merchants")
+        raw_allowed_merchants = agent.get("allowed_merchants")
+        allowed_merchants: Optional[list[str]] = None
+        if raw_allowed_merchants is None:
+            allowed_merchants = None
+        elif isinstance(raw_allowed_merchants, list):
+            allowed_merchants = [str(m).strip() for m in raw_allowed_merchants if str(m or "").strip()] or []
+        elif isinstance(raw_allowed_merchants, str):
+            try:
+                parsed = json.loads(raw_allowed_merchants)
+            except Exception:
+                parsed = None
+            if parsed is None:
+                allowed_merchants = None
+            elif isinstance(parsed, list):
+                allowed_merchants = [str(m).strip() for m in parsed if str(m or "").strip()] or []
+            else:
+                # Fail closed if the DB contains an unexpected type.
+                allowed_merchants = []
+        else:
+            allowed_merchants = []
+
+        self.allowed_merchants = allowed_merchants
         self.request = request
         self.start_time = time.time()
         self.request_id = None

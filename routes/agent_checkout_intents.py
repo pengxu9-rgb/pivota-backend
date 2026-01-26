@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -13,11 +14,14 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from routes.agent_auth import AgentContext, get_agent_context
-from db.database import database
+from db.checkout_intents import checkout_intents
+from db.database import IS_POSTGRES, database, engine, metadata
 import uuid
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from db.buyer_vault import buyer_addresses
 from routes.accounts_orders_api import get_accounts_principal
+
+from sqlalchemy.sql import func
 
 
 router = APIRouter(prefix="/agent/v1/checkout", tags=["agent-checkout"])
@@ -27,55 +31,25 @@ async def _ensure_checkout_intents_table() -> None:
     Best-effort self-healing for environments where migrations cannot be run manually.
     Safe to call multiple times (IF NOT EXISTS).
     """
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS checkout_intents (
-          intent_id TEXT PRIMARY KEY,
-          agent_id TEXT NOT NULL,
-          buyer_ref TEXT,
-          agent_user_ref TEXT,
-          expires_at TIMESTAMPTZ NOT NULL,
-          prefill JSONB,
-          requested_scopes JSONB,
-          checkout_token_hash TEXT,
-          prefill_read_count INTEGER NOT NULL DEFAULT 0,
-          prefill_last_read_at TIMESTAMPTZ,
-          linked_buyer_id TEXT,
-          used_at TIMESTAMPTZ,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """
-    )
-    # Environments might have an older `checkout_intents` table without newer columns.
-    # Add columns defensively so inserts/reads don't fail.
+    # Local dev/test: create via SQLAlchemy metadata so SQLite works without Postgres DDL.
+    try:
+        metadata.create_all(engine, tables=[checkout_intents])
+    except Exception:
+        pass
+
+    # Production Postgres: best-effort schema drift healing (older table missing columns).
+    if not IS_POSTGRES:
+        return
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS agent_user_ref TEXT")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS requested_scopes JSONB")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS linked_buyer_id TEXT")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS checkout_token_hash TEXT")
-    await database.execute(
-        "ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS prefill_read_count INTEGER NOT NULL DEFAULT 0"
-    )
+    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS prefill_read_count INTEGER NOT NULL DEFAULT 0")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS prefill_last_read_at TIMESTAMPTZ")
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_checkout_intents_agent_buyer
-          ON checkout_intents(agent_id, buyer_ref)
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_at
-          ON checkout_intents(expires_at)
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_used
-          ON checkout_intents(expires_at, used_at)
-        """
-    )
+    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_agent_buyer ON checkout_intents(agent_id, buyer_ref)")
+    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_at ON checkout_intents(expires_at)")
+    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_used ON checkout_intents(expires_at, used_at)")
 
 
 def _base64url_encode(data: bytes) -> str:
@@ -407,6 +381,7 @@ async def create_checkout_intent(
 
     intent_id = f"ci_{uuid.uuid4().hex}"
     expires_at_sec = int(time.time()) + _checkout_intent_ttl_seconds()
+    expires_at_dt = datetime.fromtimestamp(expires_at_sec, tz=timezone.utc)
 
     prefill: Optional[Dict[str, Any]] = None
     if req.customer_email or req.shipping_address:
@@ -439,50 +414,20 @@ async def create_checkout_intent(
     # If the table isn't migrated yet, we still return a usable checkout_url without prefill.
     try:
         await database.execute(
-            """
-            INSERT INTO checkout_intents (
-              intent_id,
-              agent_id,
-              buyer_ref,
-              agent_user_ref,
-              expires_at,
-              prefill,
-              requested_scopes,
-              checkout_token_hash,
-              prefill_read_count,
-              prefill_last_read_at,
-              linked_buyer_id,
-              used_at,
-              created_at,
-              updated_at
+            checkout_intents.insert().values(
+                intent_id=intent_id,
+                agent_id=context.agent_id,
+                buyer_ref=buyer_ref,
+                agent_user_ref=agent_user_ref,
+                expires_at=expires_at_dt,
+                prefill=prefill,
+                requested_scopes=requested_scopes,
+                checkout_token_hash=_sha256_hex(token),
+                prefill_read_count=0,
+                prefill_last_read_at=None,
+                linked_buyer_id=None,
+                used_at=None,
             )
-            VALUES (
-              :intent_id,
-              :agent_id,
-              :buyer_ref,
-              :agent_user_ref,
-              to_timestamp(:expires_at),
-              :prefill::jsonb,
-              :requested_scopes::jsonb,
-              :checkout_token_hash,
-              0,
-              NULL,
-              NULL,
-              NULL,
-              NOW(),
-              NOW()
-            )
-            """,
-            {
-                "intent_id": intent_id,
-                "agent_id": context.agent_id,
-                "buyer_ref": buyer_ref,
-                "agent_user_ref": agent_user_ref,
-                "expires_at": expires_at_sec,
-                "prefill": json.dumps(prefill, ensure_ascii=False) if prefill else None,
-                "requested_scopes": json.dumps(requested_scopes, ensure_ascii=False) if requested_scopes else None,
-                "checkout_token_hash": _sha256_hex(token),
-            },
         )
     except Exception as e:
         if is_asyncpg_busy_error(e):
@@ -490,50 +435,20 @@ async def create_checkout_intent(
         try:
             await _ensure_checkout_intents_table()
             await database.execute(
-                """
-                INSERT INTO checkout_intents (
-                  intent_id,
-                  agent_id,
-                  buyer_ref,
-                  agent_user_ref,
-                  expires_at,
-                  prefill,
-                  requested_scopes,
-                  checkout_token_hash,
-                  prefill_read_count,
-                  prefill_last_read_at,
-                  linked_buyer_id,
-                  used_at,
-                  created_at,
-                  updated_at
+                checkout_intents.insert().values(
+                    intent_id=intent_id,
+                    agent_id=context.agent_id,
+                    buyer_ref=buyer_ref,
+                    agent_user_ref=agent_user_ref,
+                    expires_at=expires_at_dt,
+                    prefill=prefill,
+                    requested_scopes=requested_scopes,
+                    checkout_token_hash=_sha256_hex(token),
+                    prefill_read_count=0,
+                    prefill_last_read_at=None,
+                    linked_buyer_id=None,
+                    used_at=None,
                 )
-                VALUES (
-                  :intent_id,
-                  :agent_id,
-                  :buyer_ref,
-                  :agent_user_ref,
-                  to_timestamp(:expires_at),
-                  :prefill::jsonb,
-                  :requested_scopes::jsonb,
-                  :checkout_token_hash,
-                  0,
-                  NULL,
-                  NULL,
-                  NULL,
-                  NOW(),
-                  NOW()
-                )
-                """,
-                {
-                    "intent_id": intent_id,
-                    "agent_id": context.agent_id,
-                    "buyer_ref": buyer_ref,
-                    "agent_user_ref": agent_user_ref,
-                    "expires_at": expires_at_sec,
-                    "prefill": json.dumps(prefill, ensure_ascii=False) if prefill else None,
-                    "requested_scopes": json.dumps(requested_scopes, ensure_ascii=False) if requested_scopes else None,
-                    "checkout_token_hash": _sha256_hex(token),
-                },
             )
         except Exception as e2:
             if is_asyncpg_busy_error(e2):
@@ -647,6 +562,7 @@ async def get_checkout_prefill(
 
     if not row:
         return {"prefill": None}
+    row = dict(row)
 
     # Validate intent lifetime and token binding.
     try:
@@ -687,19 +603,24 @@ async def get_checkout_prefill(
     # Best-effort read accounting (do not fail prefill if this update fails).
     try:
         await database.execute(
-            """
-            UPDATE checkout_intents
-            SET prefill_read_count = COALESCE(prefill_read_count, 0) + 1,
-                prefill_last_read_at = NOW(),
-                updated_at = NOW()
-            WHERE intent_id = :intent_id AND agent_id = :agent_id
-            """,
-            {"intent_id": intent_id, "agent_id": context.agent_id},
+            checkout_intents.update()
+            .where((checkout_intents.c.intent_id == intent_id) & (checkout_intents.c.agent_id == context.agent_id))
+            .values(
+                prefill_read_count=func.coalesce(checkout_intents.c.prefill_read_count, 0) + 1,
+                prefill_last_read_at=func.now(),
+                updated_at=func.now(),
+            ),
         )
     except Exception:
         pass
 
-    prefill = row.get("prefill") if isinstance(row.get("prefill"), dict) else None
+    prefill_value = row.get("prefill")
+    if isinstance(prefill_value, str):
+        try:
+            prefill_value = json.loads(prefill_value)
+        except Exception:
+            prefill_value = None
+    prefill = prefill_value if isinstance(prefill_value, dict) else None
 
     # Buyer Vault merge: if buyer is logged in, prefer vault values over intent prefill.
     buyer_prefill: Optional[Dict[str, Any]] = None
