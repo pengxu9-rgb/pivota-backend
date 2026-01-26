@@ -851,6 +851,11 @@ async def create_new_order(
             "agent_id": agent_id,  # Extract from metadata
             "agent_session_id": order_request.agent_session_id,
             "metadata": order_metadata,
+            # Buyer Vault linkage (internal-only). These are nullable and may be backfilled later.
+            "intent_id": str(order_metadata.get("intent_id") or "").strip() or None,
+            "agent_user_ref": str(order_metadata.get("agent_user_ref") or order_metadata.get("agentUserRef") or "").strip() or None,
+            "buyer_id": str(order_metadata.get("buyer_id") or "").strip() or None,
+            "agent_scoped_buyer_ref": str(order_metadata.get("agent_scoped_buyer_ref") or "").strip() or None,
             "psp_used": psp_type,  # Record which PSP provider is used (lowercase)
             # Legacy fields (optional, can be null)
             "store_id": store_id_value,

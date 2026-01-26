@@ -2350,7 +2350,7 @@ async def agent_create_order(
         if isinstance(order_request.metadata, dict):
             token_payload = getattr(context, "checkout_token_payload", None)
             if isinstance(token_payload, dict):
-                for key in ("buyer_ref", "job_id", "market", "locale"):
+                for key in ("intent_id", "buyer_ref", "job_id", "market", "locale"):
                     v = token_payload.get(key)
                     if v and not order_request.metadata.get(key):
                         order_request.metadata[key] = v
