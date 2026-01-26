@@ -150,9 +150,9 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
 
         client = TestClient(app)
         csv_text = (
-            "Brand,Product Title,Product URL,Variant ID,SKU,Option Name,Option Value,Price,Currency,Availability,Variant Image URL,AI Merged Description,AI Marketing Copy,Deep Link\n"
-            'Tom Ford Beauty,"Oud Wood Eau de Parfum",https://example.com/p/oud,111,T6K601,Size,30 ml,75.00,USD,In Stock,https://example.com/img1.jpg,"Desc",,"https://example.com/p/oud?variant=111&utm_source=pivota"\n'
-            'Tom Ford Beauty,"Oud Wood Eau de Parfum",https://example.com/p/oud,222,T43001,Size,50 ml,195.00,USD,In Stock,https://example.com/img2.jpg,"Desc",,"https://example.com/p/oud?variant=222&utm_source=pivota"\n'
+            "Brand,Product Title,Product URL,Variant ID,SKU,Option Name,Option Value,Price,Currency,Availability,Variant Image URL,Variant Label Image URL,AI Merged Description,AI Marketing Copy,Deep Link\n"
+            'Tom Ford Beauty,"Oud Wood Eau de Parfum",https://example.com/p/oud,111,T6K601,Size,30 ml,75.00,USD,In Stock,https://example.com/img1.jpg,https://example.com/swatch1.png,"Desc",,"https://example.com/p/oud?variant=111&utm_source=pivota"\n'
+            'Tom Ford Beauty,"Oud Wood Eau de Parfum",https://example.com/p/oud,222,T43001,Size,50 ml,195.00,USD,In Stock,https://example.com/img2.jpg,https://example.com/swatch2.png,"Desc",,"https://example.com/p/oud?variant=222&utm_source=pivota"\n'
         )
 
         res1 = client.post(
@@ -179,6 +179,12 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
         assert "50 ml" in titles
         assert any(v.get("variant_id") == "T6K601" and v.get("image_url") == "https://example.com/img1.jpg" for v in variants)
         assert any(v.get("variant_id") == "T43001" and v.get("image_url") == "https://example.com/img2.jpg" for v in variants)
+        assert any(
+            v.get("variant_id") == "T6K601" and v.get("label_image_url") == "https://example.com/swatch1.png" for v in variants
+        )
+        assert any(
+            v.get("variant_id") == "T43001" and v.get("label_image_url") == "https://example.com/swatch2.png" for v in variants
+        )
 
         res2 = client.post(
             "/employee/products/external-seeds/import-csv?market=US&tool=*&mode=upsert",

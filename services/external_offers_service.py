@@ -450,13 +450,36 @@ def _detect_currency_from_text(raw: Optional[str]) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str]) -> list[Dict[str, Any]]:
+def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str], base_url: str) -> list[Dict[str, Any]]:
     payload = _extract_skus_payload_from_data_attrs(html)
     if not payload:
         return []
 
     variants: list[Dict[str, Any]] = []
     seen: set[str] = set()
+
+    def normalize(url: Any) -> Optional[str]:
+        if not url:
+            return None
+        if isinstance(url, str):
+            s = url.strip()
+        elif isinstance(url, dict):
+            raw = url.get("url") or url.get("image_url") or url.get("src")
+            s = str(raw).strip() if raw else ""
+        else:
+            return None
+        if not s:
+            return None
+        if s.startswith("//"):
+            try:
+                scheme = urlparse(base_url).scheme or "https"
+            except Exception:
+                scheme = "https"
+            s = f"{scheme}:{s}"
+        if not s.startswith(("http://", "https://")):
+            s = urljoin(base_url, s)
+        return s if s.startswith(("http://", "https://")) else None
+
     for sku in payload:
         if not isinstance(sku, dict):
             continue
@@ -489,15 +512,34 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
 
         image_url = None
+        label_image_url = None
         raw_images = sku.get("images") or sku.get("image_urls") or sku.get("imageUrl") or sku.get("imageURL")
-        if isinstance(raw_images, list) and raw_images:
-            first_img = raw_images[0]
-            if isinstance(first_img, str):
-                image_url = first_img.strip() or None
-            elif isinstance(first_img, dict):
-                raw_url = first_img.get("url") or first_img.get("image_url") or first_img.get("src")
-                if isinstance(raw_url, str) and raw_url.strip():
-                    image_url = raw_url.strip()
+        candidates: list[str] = []
+        if isinstance(raw_images, list):
+            for raw in raw_images:
+                resolved = normalize(raw)
+                if resolved:
+                    candidates.append(resolved)
+        else:
+            resolved = normalize(raw_images)
+            if resolved:
+                candidates.append(resolved)
+
+        if candidates:
+            unique: list[str] = []
+            seen_urls: set[str] = set()
+            for u in candidates:
+                if u in seen_urls:
+                    continue
+                seen_urls.add(u)
+                unique.append(u)
+
+            label_candidates = [u for u in unique if _looks_like_variant_label_image(u)]
+            if label_candidates:
+                label_image_url = sorted(label_candidates, key=_image_resolution_score, reverse=True)[0]
+            hero_candidates = [u for u in unique if not _looks_like_variant_label_image(u)]
+            if hero_candidates:
+                image_url = sorted(hero_candidates, key=_image_resolution_score, reverse=True)[0]
 
         variants.append(
             {
@@ -507,6 +549,7 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
                 "price_currency": str(currency).strip().upper() if currency else None,
                 "availability": availability,
                 **({"image_url": image_url} if image_url else {}),
+                **({"label_image_url": label_image_url} if label_image_url else {}),
             }
         )
         seen.add(variant_id)
@@ -829,6 +872,7 @@ def _extract_dom_image_urls(parser: _MetaParser, base_url: str) -> list[str]:
 
 
 _SHOPIFY_SIZE_SUFFIX_RE = re.compile(r"_(\d{2,4})x(\d{0,4})?(?=\.(?:jpe?g|png|webp|gif|avif))", re.IGNORECASE)
+_SWATCH_HINT_RE = re.compile(r"\b(?:swatch|swatches|thumb|thumbnail|icon|sprite|badge)\b", re.IGNORECASE)
 
 
 def _image_dedupe_key(url: str) -> str:
@@ -854,14 +898,14 @@ def _image_dedupe_key(url: str) -> str:
     return f"{netloc}{path}"
 
 
-def _image_resolution_score(url: str) -> float:
+def _image_dimensions(url: str) -> tuple[Optional[int], Optional[int], Optional[float]]:
     s = str(url or "").strip()
     if not s:
-        return 0.0
+        return None, None, None
     try:
         parsed = urlparse(s)
     except Exception:
-        return 0.0
+        return None, None, None
 
     width: Optional[int] = None
     height: Optional[int] = None
@@ -884,14 +928,6 @@ def _image_resolution_score(url: str) -> float:
             except Exception:
                 dpr = None
 
-    score = 0.0
-    if width is not None and height is not None:
-        score = float(width * height)
-    elif width is not None:
-        score = float(width)
-    elif height is not None:
-        score = float(height)
-
     m = _SHOPIFY_SIZE_SUFFIX_RE.search(parsed.path or "")
     if m:
         try:
@@ -902,10 +938,53 @@ def _image_resolution_score(url: str) -> float:
             h = int(m.group(2) or "0") if m.group(2) else 0
         except Exception:
             h = 0
-        if w and h:
-            score = max(score, float(w * h))
-        elif w:
-            score = max(score, float(w))
+        if w and width is None:
+            width = w
+        if h and height is None:
+            height = h
+
+    return width, height, dpr
+
+
+def _looks_like_variant_label_image(url: str) -> bool:
+    u = str(url or "").strip().lower()
+    if not u:
+        return False
+    if _SWATCH_HINT_RE.search(u):
+        return True
+
+    width, height, dpr = _image_dimensions(u)
+    if width is None and height is None:
+        return False
+
+    scale = float(dpr) if dpr and dpr > 0 else 1.0
+    if width is not None and height is not None:
+        return max(width, height) * scale <= 200
+    if width is not None:
+        return width * scale <= 200
+    if height is not None:
+        return height * scale <= 200
+    return False
+
+
+def _image_resolution_score(url: str) -> float:
+    s = str(url or "").strip()
+    if not s:
+        return 0.0
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return 0.0
+
+    width, height, dpr = _image_dimensions(s)
+
+    score = 0.0
+    if width is not None and height is not None:
+        score = float(width * height)
+    elif width is not None:
+        score = float(width)
+    elif height is not None:
+        score = float(height)
 
     if score and dpr and dpr > 0:
         score *= float(dpr * dpr)
@@ -1026,7 +1105,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     dom_image_urls = _extract_dom_image_urls(p, canonical)
     variants_jsonld = _extract_jsonld_variants(parsed_jsonld)
     fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
-    variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency)
+    variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency, canonical)
 
     variants: list[Dict[str, Any]] = []
     if variants_jsonld and variants_data_attr:
@@ -1088,6 +1167,11 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     add_image((jsonld.get("image_url") or "").strip())
     for url in jsonld_image_urls + meta_image_urls + data_attr_image_urls + dom_image_urls:
         add_image(url)
+
+    # Filter tiny swatch/thumbnail assets when we have other images.
+    filtered = [u for u in image_urls if not _looks_like_variant_label_image(u)]
+    if filtered:
+        image_urls = filtered[:MAX_IMAGES]
 
     # JSON-LD is preferred when it provides structured offers.
     out = {

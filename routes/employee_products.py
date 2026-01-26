@@ -790,6 +790,14 @@ def _seed_variant_to_raw_row(
     else:
         image_url = image_url.strip() or None
 
+    label_image_url = v.get("label_image_url") or v.get("swatch_image_url") or v.get("thumbnail_url") or v.get("thumbnailUrl")
+    if isinstance(label_image_url, dict):
+        label_image_url = label_image_url.get("url") or label_image_url.get("image_url") or label_image_url.get("src")
+    if not isinstance(label_image_url, str):
+        label_image_url = None
+    else:
+        label_image_url = label_image_url.strip() or None
+
     out: Dict[str, Any] = {
         "variant_id": variant_id,
         "title": title,
@@ -798,6 +806,7 @@ def _seed_variant_to_raw_row(
         **({"availability": availability} if availability is not None else {}),
         **({"available": available} if available is not None else {}),
         **({"image_url": image_url} if image_url else {}),
+        **({"label_image_url": label_image_url} if label_image_url else {}),
     }
     return out
 
@@ -1410,6 +1419,16 @@ async def _import_external_seeds_csv_text(
                 if variant_image_url and not variant_image_url.startswith(("http://", "https://")):
                     variant_image_url = None
 
+                label_image_url = str(
+                    nrow.get("variant_label_image_url")
+                    or nrow.get("swatch_image_url")
+                    or nrow.get("label_image_url")
+                    or nrow.get("variant_swatch_image_url")
+                    or ""
+                ).strip() or None
+                if label_image_url and not label_image_url.startswith(("http://", "https://")):
+                    label_image_url = None
+
                 external_product_id = (
                     str(nrow.get("external_product_id") or "").strip()
                     or _stable_external_product_id(product_url)
@@ -1455,6 +1474,7 @@ async def _import_external_seeds_csv_text(
                     **({"currency": price_currency} if price_currency else {}),
                     **({"availability": availability} if availability else {}),
                     **({"image_url": variant_image_url} if variant_image_url else {}),
+                    **({"label_image_url": label_image_url} if label_image_url else {}),
                     **({"options": options} if options else {}),
                     **({"destination_url": deep_link} if deep_link else {}),
                 }
@@ -1503,20 +1523,7 @@ async def _import_external_seeds_csv_text(
 
                 variants.sort(key=_variant_price_key)
 
-                image_urls: List[str] = []
-                seen_images: set[str] = set()
-                for u in g.get("image_urls") or []:
-                    if not isinstance(u, str):
-                        continue
-                    uu = u.strip()
-                    if not uu or not uu.startswith(("http://", "https://")):
-                        continue
-                    if uu in seen_images:
-                        continue
-                    seen_images.add(uu)
-                    image_urls.append(uu)
-                    if len(image_urls) >= 20:
-                        break
+                image_urls = _dedupe_seed_image_urls([str(u) for u in (g.get("image_urls") or []) if isinstance(u, str)], limit=20)
 
                 title = gm.get("title") or None
                 brand = gm.get("brand") or None

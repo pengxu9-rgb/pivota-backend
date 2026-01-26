@@ -128,6 +128,43 @@ def test_extract_from_html_dedupes_shopify_size_variants() -> None:
     ]
 
 
+def test_extract_from_html_separates_variant_label_images_and_filters_gallery() -> None:
+    import html as html_lib
+    import json
+
+    payload = [
+        {
+            "id": "sku_1",
+            "price": "12.34",
+            "price_currency": "USD",
+            "inventory_status": "in_stock",
+            "images": [
+                {"src": "https://cdn.shopify.com/s/files/1/1/products/p_50x50.png?v=1"},
+                {"src": "https://cdn.shopify.com/s/files/1/1/products/p_1000x1000.png?v=1"},
+            ],
+        }
+    ]
+    attr = html_lib.escape(json.dumps(payload))
+
+    html = f"""
+    <html>
+      <head><link rel="canonical" href="https://shop.example.com/products/1" /></head>
+      <body>
+        <div data-product-skus-value="{attr}"></div>
+      </body>
+    </html>
+    """
+
+    out = _extract_from_html("https://shop.example.com/products/1", html)
+    variants = out.get("variants") or []
+    assert any(v.get("variant_id") == "sku_1" and v.get("image_url") == "https://cdn.shopify.com/s/files/1/1/products/p_1000x1000.png?v=1" for v in variants)
+    assert any(v.get("variant_id") == "sku_1" and v.get("label_image_url") == "https://cdn.shopify.com/s/files/1/1/products/p_50x50.png?v=1" for v in variants)
+
+    image_urls = out.get("image_urls") or []
+    assert "https://cdn.shopify.com/s/files/1/1/products/p_1000x1000.png?v=1" in image_urls
+    assert all("p_50x50.png" not in u for u in image_urls)
+
+
 def test_extract_from_html_prefers_size_titles_from_data_attrs_when_jsonld_titles_are_generic() -> None:
     html = """
     <html>

@@ -52,6 +52,7 @@ def _seed_row(**overrides):
                     "price_currency": "USD",
                     "availability": "in_stock",
                     "image_url": "https://example.com/v1.jpg",
+                    "label_image_url": "https://example.com/v1_swatch.png",
                 },
                 {
                     "variant_id": "v2",
@@ -60,6 +61,7 @@ def _seed_row(**overrides):
                     "price_currency": "USD",
                     "availability": "in_stock",
                     "image_url": "https://example.com/v2.jpg",
+                    "label_image_url": "https://example.com/v2_swatch.png",
                 },
             ],
         },
@@ -110,7 +112,10 @@ def test_employee_product_detail_external_seed_synthesizes_view(monkeypatch: pyt
     raw = payload.get("raw") or {}
     assert raw.get("source") == "external_seed"
     assert raw.get("external_product_id") == "ext_test_1"
-    assert len(raw.get("variants") or []) >= 1
+    raw_variants = raw.get("variants") or []
+    assert len(raw_variants) >= 1
+    assert any(v.get("variant_id") == "v1" and v.get("label_image_url") == "https://example.com/v1_swatch.png" for v in raw_variants)
+    assert any(v.get("variant_id") == "v2" and v.get("label_image_url") == "https://example.com/v2_swatch.png" for v in raw_variants)
 
 
 def test_employee_product_offers_external_seed_returns_external_offers(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
