@@ -100,6 +100,34 @@ def test_extract_from_html_collects_images_from_img_tags_and_srcset() -> None:
     assert all("logo.svg" not in u for u in image_urls)
 
 
+def test_extract_from_html_dedupes_shopify_size_variants() -> None:
+    html = """
+    <html>
+      <head>
+        <link rel="canonical" href="https://shop.example.com/products/1" />
+      </head>
+      <body>
+        <img src="https://cdn.shopify.com/s/files/1/1/products/img_360x360.jpg?v=1" />
+        <img
+          srcset="https://cdn.shopify.com/s/files/1/1/products/img_360x360.jpg?v=1 360w, https://cdn.shopify.com/s/files/1/1/products/img_2048x2048.jpg?v=1 2048w"
+        />
+        <img
+          src="https://cdn.shopify.com/s/files/1/1/products/img2.jpg?v=2&width=200"
+          srcset="https://cdn.shopify.com/s/files/1/1/products/img2.jpg?v=2&width=200 200w, https://cdn.shopify.com/s/files/1/1/products/img2.jpg?v=2&width=1200 1200w"
+        />
+      </body>
+    </html>
+    """
+
+    out = _extract_from_html("https://shop.example.com/products/1", html)
+    image_urls = out.get("image_urls") or []
+    assert out.get("image_url") == "https://cdn.shopify.com/s/files/1/1/products/img_2048x2048.jpg?v=1"
+    assert image_urls == [
+        "https://cdn.shopify.com/s/files/1/1/products/img_2048x2048.jpg?v=1",
+        "https://cdn.shopify.com/s/files/1/1/products/img2.jpg?v=2&width=1200",
+    ]
+
+
 def test_extract_from_html_prefers_size_titles_from_data_attrs_when_jsonld_titles_are_generic() -> None:
     html = """
     <html>

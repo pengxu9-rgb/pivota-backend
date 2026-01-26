@@ -828,6 +828,90 @@ def _extract_dom_image_urls(parser: _MetaParser, base_url: str) -> list[str]:
     return urls
 
 
+_SHOPIFY_SIZE_SUFFIX_RE = re.compile(r"_(\d{2,4})x(\d{0,4})?(?=\.(?:jpe?g|png|webp|gif|avif))", re.IGNORECASE)
+
+
+def _image_dedupe_key(url: str) -> str:
+    s = str(url or "").strip()
+    if not s:
+        return ""
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return s
+    netloc = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    if "cdn.shopify.com" in netloc:
+        path = _SHOPIFY_SIZE_SUFFIX_RE.sub("", path)
+    qs = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in {"width", "w", "height", "h", "dpr", "quality", "q"}
+    ]
+    query = urlencode(sorted(qs, key=lambda kv: (kv[0].lower(), kv[1])), doseq=True)
+    if query:
+        return f"{netloc}{path}?{query}"
+    return f"{netloc}{path}"
+
+
+def _image_resolution_score(url: str) -> float:
+    s = str(url or "").strip()
+    if not s:
+        return 0.0
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return 0.0
+
+    width: Optional[int] = None
+    height: Optional[int] = None
+    dpr: Optional[float] = None
+    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        kl = k.lower()
+        if width is None and kl in {"width", "w"}:
+            try:
+                width = int(re.sub(r"[^0-9]", "", v) or "0") or None
+            except Exception:
+                width = None
+        elif height is None and kl in {"height", "h"}:
+            try:
+                height = int(re.sub(r"[^0-9]", "", v) or "0") or None
+            except Exception:
+                height = None
+        elif dpr is None and kl == "dpr":
+            try:
+                dpr = float(re.sub(r"[^0-9.]", "", v) or "0") or None
+            except Exception:
+                dpr = None
+
+    score = 0.0
+    if width is not None and height is not None:
+        score = float(width * height)
+    elif width is not None:
+        score = float(width)
+    elif height is not None:
+        score = float(height)
+
+    m = _SHOPIFY_SIZE_SUFFIX_RE.search(parsed.path or "")
+    if m:
+        try:
+            w = int(m.group(1) or "0") or 0
+        except Exception:
+            w = 0
+        try:
+            h = int(m.group(2) or "0") if m.group(2) else 0
+        except Exception:
+            h = 0
+        if w and h:
+            score = max(score, float(w * h))
+        elif w:
+            score = max(score, float(w))
+
+    if score and dpr and dpr > 0:
+        score *= float(dpr * dpr)
+    return score
+
+
 def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
     for root in parsed_objs:
@@ -979,18 +1063,31 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         variants = variants_data_attr
 
     image_urls: list[str] = []
-    seen_images: set[str] = set()
-    preferred = (jsonld.get("image_url") or "").strip()
-    if preferred:
-        image_urls.append(preferred)
-        seen_images.add(preferred)
-    for url in jsonld_image_urls + meta_image_urls + data_attr_image_urls + dom_image_urls:
-        if not url or url in seen_images:
-            continue
-        seen_images.add(url)
-        image_urls.append(url)
+    idx_by_key: dict[str, int] = {}
+    score_by_key: dict[str, float] = {}
+
+    def add_image(raw: Any) -> None:
+        if not raw:
+            return
+        u = str(raw).strip()
+        if not u:
+            return
+        key = _image_dedupe_key(u) or u
+        score = _image_resolution_score(u)
+        if key in idx_by_key:
+            if score > score_by_key.get(key, -1.0):
+                image_urls[idx_by_key[key]] = u
+                score_by_key[key] = score
+            return
         if len(image_urls) >= MAX_IMAGES:
-            break
+            return
+        idx_by_key[key] = len(image_urls)
+        score_by_key[key] = score
+        image_urls.append(u)
+
+    add_image((jsonld.get("image_url") or "").strip())
+    for url in jsonld_image_urls + meta_image_urls + data_attr_image_urls + dom_image_urls:
+        add_image(url)
 
     # JSON-LD is preferred when it provides structured offers.
     out = {
@@ -998,7 +1095,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         "title": jsonld.get("title") or title,
         "description": jsonld.get("description") or description,
         "brand": jsonld.get("brand") or None,
-        "image_url": jsonld.get("image_url") or (image_urls[0] if image_urls else None) or image,
+        "image_url": (image_urls[0] if image_urls else None) or jsonld.get("image_url") or image,
         "image_urls": image_urls,
         "price_amount": _parse_price(jsonld.get("price_raw")) or _parse_price(price),
         "price_currency": (jsonld.get("currency") or currency or "").strip().upper() or None,
