@@ -81,3 +81,29 @@ curl -sS http://localhost:8000/agent/v1/checkout/prefill \
 python3 -m pytest -q
 ```
 
+---
+
+## 4) 生产/部署注意事项（避免漏跑 migration 导致 500）
+
+### 4.1 `/health` 会做 DB + schema gate
+
+Railway 的健康检查默认打到 `GET /health`。该接口会：
+
+- 以短超时检查 DB 可用性
+- 校验 Buyer Vault 依赖的关键字段是否存在（例如 `orders.agent_scoped_buyer_ref`）
+
+如果 schema 缺失，会返回 `503`，从而让部署在“上线前”就失败（避免用户进入后才触发 `column does not exist`）。
+
+### 4.2 “最小自愈”只兜底关键列
+
+生产环境通常会跳过重型 startup migration（避免 deploy healthcheck 超时回滚），但后端会在启动时做一层**最小、低风险**的自愈：
+
+- `db/schema_guard.py`：对 `orders` 做 `ADD COLUMN IF NOT EXISTS ...`（仅关键列）
+
+这不是替代正式迁移；正式迁移仍以 `db/migrations/043_buyer_vault.sql` 为准。
+
+### 4.3 新增 schema 依赖的落地规范
+
+- **先加迁移**（`db/migrations/*.sql`，可重复执行/幂等）
+- **再加 schema gate**（更新 `db/schema_guard.py:REQUIRED_SCHEMA`）
+- 最后再改业务代码引用新字段

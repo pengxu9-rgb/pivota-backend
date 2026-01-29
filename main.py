@@ -16,7 +16,7 @@ from middleware.usage_logger import UsageLoggerMiddleware
 from middleware.structured_logging import StructuredLoggingMiddleware
 from middleware.error_handler import ErrorHandlerMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # Database
 from db.database import database, metadata, engine
@@ -793,6 +793,16 @@ async def startup():
         await asyncio.wait_for(database.execute("SELECT 1"), timeout=10)
         logger.info("✅ Database connection test passed")
 
+        # Minimal schema guard (fast; safe for prod "fast mode").
+        # Prevents outages when a deploy accidentally skips SQL migrations.
+        try:
+            from db.schema_guard import ensure_required_schema_light
+
+            await ensure_required_schema_light()
+            logger.info("✅ Schema guard: critical columns ensured")
+        except Exception as schema_guard_err:
+            logger.warning(f"Schema guard warning: {schema_guard_err}")
+
         # This startup function contains a large amount of best-effort schema/DDL work.
         # In Railway, the service healthcheck must pass quickly; long-running DDL can
         # exceed the healthcheck retry window and cause deploy rollbacks.
@@ -1281,8 +1291,47 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Dedicated health check endpoint"""
-    return {"status": "ok", "timestamp": time.time()}
+    """
+    Dedicated health check endpoint used by Railway.
+
+    Must be fast and deterministic:
+      - checks DB connectivity (short timeout)
+      - checks required schema exists (read-only)
+    """
+    started_at = time.time()
+    db_ok = False
+    missing: dict[str, list[str]] = {}
+    db_error = None
+
+    try:
+        await asyncio.wait_for(database.execute("SELECT 1"), timeout=2)
+        db_ok = True
+    except Exception as e:
+        db_error = type(e).__name__
+
+    if db_ok:
+        try:
+            from db.schema_guard import check_required_schema
+
+            missing = await asyncio.wait_for(check_required_schema(), timeout=2)
+        except Exception as e:
+            db_ok = False
+            db_error = type(e).__name__
+
+    healthy = db_ok and not missing
+    status_code = 200 if healthy else 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ok" if healthy else "unhealthy",
+            "timestamp": time.time(),
+            "elapsed_ms": int((time.time() - started_at) * 1000),
+            "db_ok": db_ok,
+            "missing_columns": missing,
+            "error": db_error,
+        },
+    )
 
 @app.get("/__build")
 async def build_info():
@@ -1331,123 +1380,6 @@ async def operations_dashboard():
             return HTMLResponse(content=f.read())
     except FileNotFoundError:
         return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    from config.settings import settings
-    
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "database": "connected",
-        "config_check": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-        }
-    }
-
-@app.get("/config-check")
-async def config_check():
-    """Public endpoint to check environment variable configuration (no auth required)"""
-    from config.settings import settings
-    
-    return {
-        "status": "success",
-        "message": "Environment variable configuration check",
-        "config": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
-            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
-            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
-            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
-            "metrics_query_version": settings.metrics_query_version,
-            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
-        },
-        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
-    }
-
-# Deploy trigger: 1761041007
-
-@app.get("/health")
-async def health_check():
-    """Dedicated health check endpoint"""
-    return {"status": "ok", "timestamp": time.time()}
-
-@app.get("/operations", response_class=HTMLResponse)
-async def operations_dashboard():
-    """Serve the operations dashboard"""
-    try:
-        with open("templates/operations_dashboard.html", "r") as f:
-            return HTMLResponse(content=f.read())
-    except FileNotFoundError:
-        return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    from config.settings import settings
-    
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "database": "connected",
-        "config_check": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-        }
-    }
-
-@app.get("/config-check")
-async def config_check():
-    """Public endpoint to check environment variable configuration (no auth required)"""
-    from config.settings import settings
-    
-    return {
-        "status": "success",
-        "message": "Environment variable configuration check",
-        "config": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
-            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
-            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
-            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
-            "metrics_query_version": settings.metrics_query_version,
-            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
-        },
-        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
-    }
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    from config.settings import settings
-    
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "database": "connected",
-        "config_check": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-        }
-    }
 
 @app.get("/config-check")
 async def config_check():
