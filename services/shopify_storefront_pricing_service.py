@@ -189,6 +189,15 @@ class ShopifyStorefrontPricingService:
         self.api_version = api_version
         self.timeout_seconds = timeout_seconds
         self._rotate_cooldown_s = int(os.getenv("SHOPIFY_STOREFRONT_ROTATE_COOLDOWN_SECONDS", "3600") or "3600")
+        # Avoid repeatedly using Admin API tokens to auto-create Storefront tokens at runtime.
+        # Storefront token should be created once at connect time (or manually), then reused.
+        # Enable runtime rotate only when explicitly opted-in.
+        self._runtime_rotate_enabled = (os.getenv("SHOPIFY_STOREFRONT_RUNTIME_ROTATE") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _use_buyer_country_for_pricing(self) -> bool:
         # When enabled, we set buyerIdentity.countryCode and @inContext(country: ...)
@@ -448,7 +457,11 @@ query($ids: [ID!]!) {
                 debug_id,
             )
 
-        if not storefront_token and _rotate_allowed(merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s):
+        if (
+            not storefront_token
+            and self._runtime_rotate_enabled
+            and _rotate_allowed(merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s)
+        ):
             admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
             if admin_access_token:
                 storefront_token = (
@@ -494,7 +507,11 @@ query($ids: [ID!]!) {
                 rotated = False
 
                 # Self-heal common misconfig: Storefront scopes enabled after token issuance.
-                if admin_access_token and _rotate_allowed(merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s):
+                if (
+                    admin_access_token
+                    and self._runtime_rotate_enabled
+                    and _rotate_allowed(merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s)
+                ):
                     new_token = await _rotate_storefront_token_best_effort(
                         merchant_id=merchant_id,
                         store_id=store.get("store_id") if isinstance(store.get("store_id"), str) else None,
@@ -555,6 +572,7 @@ query($ids: [ID!]!) {
                             "variant_id": vid,
                             "admin_variant_exists": exists,
                             "storefront_token_rotated": rotated,
+                            "storefront_runtime_rotate_enabled": self._runtime_rotate_enabled,
                             "cart_create_error": getattr(err, "details", {}) or {},
                         },
                     )

@@ -11,6 +11,7 @@ import httpx
 import os
 
 from services.merchant_store_service import get_primary_store
+from services.shopify_transactions_service import extract_shopify_access_token
 from utils.logger import logger
 
 
@@ -96,7 +97,7 @@ class ShopifyPricingService:
             )
 
         shop_domain = store.get("domain")
-        access_token = store.get("api_key")
+        access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
         if not shop_domain or not access_token:
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
