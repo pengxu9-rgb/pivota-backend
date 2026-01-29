@@ -49,21 +49,22 @@ async def check_required_schema() -> Dict[str, List[str]]:
         present: Set[str] = set()
         try:
             if IS_POSTGRES:
+                # NOTE: use raw SQL string instead of SQLAlchemy TextClause + values.
+                # Railway prod uses `databases` in a mode where TextClause does not support
+                # `.values(**values)` and will raise AttributeError, which would break /health.
                 rows = await database.fetch_all(
-                    text(
-                        """
-                        SELECT column_name
-                        FROM information_schema.columns
-                        WHERE table_schema = 'public'
-                          AND table_name = :table_name
-                        """
-                    ),
-                    {"table_name": spec.table},
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = :schema_name
+                      AND table_name = :table_name
+                    """,
+                    {"schema_name": "public", "table_name": spec.table},
                 )
                 present = {str(r["column_name"]) for r in rows}  # type: ignore[index]
             elif IS_SQLITE:
                 # PRAGMA table_info returns columns: cid, name, type, notnull, dflt_value, pk
-                rows = await database.fetch_all(text(f"PRAGMA table_info({spec.table});"))
+                rows = await database.fetch_all(f"PRAGMA table_info({spec.table});")
                 present = {str(r["name"]) for r in rows}  # type: ignore[index]
             else:
                 present = set()
