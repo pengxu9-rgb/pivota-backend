@@ -3,6 +3,7 @@ Merchant Store Connections
 Allow merchants to connect their own stores (Shopify, Wix, etc.)
 """
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from services.shopify_transactions_service import extract_shopify_access_token
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
@@ -730,10 +731,11 @@ async def shopify_token_diagnostic(
         raise HTTPException(status_code=400, detail="No Shopify store connected")
 
     shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip().lower()
-    access_token = (store.get("api_key") or "").strip()
+    # merchant_stores.api_key is JSON in newer versions; always parse via helper.
+    access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
     if not access_token:
-        creds = store.get("api_credentials") or {}
-        access_token = str(creds.get("access_token") or "").strip()
+        creds = store.get("api_credentials") if isinstance(store.get("api_credentials"), dict) else {}
+        access_token = str(creds.get("access_token") or "").strip() or None
     if not shop_domain or not access_token:
         raise HTTPException(status_code=400, detail="Missing Shopify credentials")
 
