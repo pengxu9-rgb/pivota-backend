@@ -74,6 +74,8 @@ class CreateOrderRequest(BaseModel):
     customer_email: str
     customer_name: Optional[str] = None  # Customer name (optional)
     quote_id: Optional[str] = None  # Quote-first: lock pricing snapshot
+    brief_id: Optional[str] = None  # Decision/Brief join key (optional, additive)
+    brief_schema_version: Optional[str] = None
     discount_codes: Optional[List[str]] = None  # Optional; used for quote fingerprint validation
     selected_delivery_option: Optional[Dict[str, Any]] = None  # Optional; used for quote fingerprint validation
     items: List[OrderItem]

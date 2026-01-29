@@ -20,6 +20,8 @@ class QuotePreviewRequest(BaseModel):
     customer_email: Optional[str] = None
     shipping_address: Optional[Dict[str, Any]] = None
     selected_delivery_option: Optional[Dict[str, Any]] = None
+    brief_id: Optional[str] = None
+    brief_schema_version: Optional[str] = None
 
 
 class QuotePricing(BaseModel):
@@ -87,3 +89,6 @@ class QuotePreviewResponse(BaseModel):
     # Debug helpers (safe): allow clients to understand why an engine was chosen.
     debug_id: Optional[str] = None
     attempts: Optional[List[Dict[str, Any]]] = None
+    # Decision/Brief join key (optional, additive)
+    brief_id: Optional[str] = None
+    brief_schema_version: Optional[str] = None

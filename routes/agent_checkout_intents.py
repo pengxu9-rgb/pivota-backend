@@ -351,6 +351,8 @@ class CreateCheckoutIntentRequest(BaseModel):
     return_url: Optional[str] = None
     buyer_ref: Optional[str] = None
     agent_user_ref: Optional[str] = None
+    brief_id: Optional[str] = None
+    brief_schema_version: Optional[str] = None
     requested_scopes: Optional[List[str]] = None
     job_id: Optional[str] = None
     market: Optional[str] = None
@@ -387,6 +389,8 @@ async def create_checkout_intent(
 
     buyer_ref = (req.buyer_ref or "").strip() or None
     agent_user_ref = (req.agent_user_ref or "").strip() or None
+    brief_id = (req.brief_id or "").strip() or None
+    brief_schema_version = (req.brief_schema_version or "").strip() or None
     job_id = (req.job_id or "").strip() or None
     market = (req.market or "").strip().upper() or None
     locale = (req.locale or "").strip().lower() or None
@@ -421,6 +425,9 @@ async def create_checkout_intent(
     }
     if agent_user_ref:
         token_payload["agent_user_ref"] = agent_user_ref
+    if brief_id:
+        token_payload["brief_id"] = brief_id
+        token_payload["brief_schema_version"] = brief_schema_version
     if requested_scopes:
         token_payload["requested_scopes"] = requested_scopes
 
@@ -496,6 +503,8 @@ async def create_checkout_intent(
         "checkout_token": token,
         "checkout_url": checkout_url,
         "expires_at": expires_at_sec,
+        **({"brief_id": brief_id} if brief_id else {}),
+        **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
     }
 
 

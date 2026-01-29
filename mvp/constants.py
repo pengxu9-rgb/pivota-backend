@@ -27,5 +27,10 @@ EVENT_REFUND_REQUESTED: Final[str] = "refund_requested"
 EVENT_DISPUTE_OPENED: Final[str] = "dispute_opened"
 EVENT_DISPUTE_RESOLVED: Final[str] = "dispute_resolved"
 
+EVENT_BRIEF_CLARIFICATION_ASKED: Final[str] = "brief_clarification_asked"
+EVENT_BRIEF_BUILT: Final[str] = "brief_built"
+EVENT_BRIEF_COMPAT_CHECKED: Final[str] = "brief_compat_checked"
+EVENT_BRIEF_ABANDONED: Final[str] = "brief_abandoned"
+
 EVENT_AUDIT: Final[str] = "audit_event"
 EVENT_LEDGER: Final[str] = "ledger_event"
