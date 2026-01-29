@@ -54,6 +54,7 @@ def _guard_single_order_routes_py() -> None:
 # Core routers (only include what exists)
 _guard_single_order_routes_py()
 from routes.agent_routes import router as agent_router
+from routes.agent_briefs import router as agent_briefs_router
 from routes.quote_routes import router as quote_router
 from routes.offer_routes import router as offer_router
 from routes.ops_routes import router as ops_router
@@ -457,6 +458,9 @@ app.add_middleware(
         "X-API-Key",
         "X-Checkout-Token",
         "X-Request-Id",
+        "Idempotency-Key",
+        "X-Pivota-Brief-Id",
+        "X-Pivota-Brief-Schema-Version",
     ],
     expose_headers=["X-Request-Id", "X-Total-Count"],
 )
@@ -468,6 +472,7 @@ logger.info(f"🌐 CORS configured: allow_origins={allow_origins}, allow_origin_
 
 # Include available routers
 app.include_router(agent_router)
+app.include_router(agent_briefs_router)
 app.include_router(agent_checkout_intents_router)
 app.include_router(quote_router)
 app.include_router(offer_router)

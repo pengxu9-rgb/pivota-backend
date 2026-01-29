@@ -206,6 +206,16 @@ def get_default_sink() -> EventSink:
     if _DEFAULT_SINK is not None:
         return _DEFAULT_SINK
     prefer_db = os.getenv("MVP_EVENTS_SINK", "db").lower() != "file"
+    # SQLite/dev environments cannot support the Postgres DDL used by PostgresEventSink.
+    # Fail closed to FileEventSink to avoid noisy background task exceptions.
+    if prefer_db:
+        try:
+            from db.database import IS_POSTGRES
+
+            if not IS_POSTGRES:
+                prefer_db = False
+        except Exception:
+            prefer_db = False
     if prefer_db:
         try:
             _DEFAULT_SINK = PostgresEventSink()

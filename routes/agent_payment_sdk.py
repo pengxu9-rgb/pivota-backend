@@ -571,6 +571,15 @@ async def create_payment(
                 }
 
             evt = EVENT_CHECKOUT_SUCCEEDED if status == "succeeded" else EVENT_CHECKOUT_FAILED
+            brief_id = None
+            brief_schema_version = None
+            try:
+                meta = (order.get("metadata") or {}) if isinstance(order, dict) else {}
+                if isinstance(meta, dict):
+                    brief_id = meta.get("brief_id") or meta.get("briefId") or None
+                    brief_schema_version = meta.get("brief_schema_version") or meta.get("briefSchemaVersion") or None
+            except Exception:
+                pass
             emit_best_effort(
                 event_type=evt,
                 payload={
@@ -581,6 +590,8 @@ async def create_payment(
                     "payment_intent_id": payment_intent.id,
                     "psp_used": psp_used,
                     "status": status,
+                    **({"brief_id": brief_id} if brief_id else {}),
+                    **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
                 },
                 merchant_id=str(merchant_id) if merchant_id else None,
                 geo=geo,
@@ -627,6 +638,16 @@ async def create_payment(
                     "state": ship.get("state") or ship.get("province"),
                 }
 
+            brief_id = None
+            brief_schema_version = None
+            try:
+                meta = (order.get("metadata") or {}) if isinstance(order, dict) else {}
+                if isinstance(meta, dict):
+                    brief_id = meta.get("brief_id") or meta.get("briefId") or None
+                    brief_schema_version = meta.get("brief_schema_version") or meta.get("briefSchemaVersion") or None
+            except Exception:
+                pass
+
             emit_best_effort(
                 event_type=EVENT_CHECKOUT_FAILED,
                 payload={
@@ -635,6 +656,8 @@ async def create_payment(
                     "merchant_id": merchant_id if "merchant_id" in locals() else None,
                     "error_status": getattr(e, "status_code", None),
                     "error": str(getattr(e, "detail", ""))[:500],
+                    **({"brief_id": brief_id} if brief_id else {}),
+                    **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
                 },
                 merchant_id=str(merchant_id) if "merchant_id" in locals() else None,
                 geo=geo,

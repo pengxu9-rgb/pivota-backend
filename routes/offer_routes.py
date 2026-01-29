@@ -20,6 +20,8 @@ class OfferPreflightRequest(BaseModel):
     quote_id: str
     merchant_id: Optional[str] = None
     shipping_address: Optional[Dict[str, Any]] = None
+    brief_id: Optional[str] = None
+    brief_schema_version: Optional[str] = None
 
 
 @router.post("/preflight")
@@ -115,6 +117,18 @@ async def preflight_quote_offer(
             },
         )
 
+    brief_id = (req.brief_id or None)
+    brief_schema_version = (req.brief_schema_version or None)
+    try:
+        meta = (snap.get("metadata") or {}) if isinstance(snap, dict) else {}
+        brief_meta = (meta.get("brief") or {}) if isinstance(meta, dict) else {}
+        if not brief_id:
+            brief_id = brief_meta.get("brief_id") or None
+        if not brief_schema_version:
+            brief_schema_version = brief_meta.get("brief_schema_version") or None
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "quote_id": qs.quote_id,
@@ -126,4 +140,6 @@ async def preflight_quote_offer(
             {"policy_type": p.get("policy_type"), "hash_sha256": p.get("hash_sha256")} for p in (policies or [])
         ],
         "risk_tier": decision.risk_tier,
+        "brief_id": brief_id,
+        "brief_schema_version": brief_schema_version,
     }

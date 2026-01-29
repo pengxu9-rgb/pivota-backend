@@ -179,6 +179,8 @@ class QuoteService:
         customer_email: Optional[str],
         shipping_address: Optional[Dict[str, Any]],
         selected_delivery_option: Optional[Dict[str, Any]],
+        brief_id: Optional[str] = None,
+        brief_schema_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         codes = normalize_discount_codes(discount_codes)
         fingerprint = compute_request_fingerprint(
@@ -321,6 +323,20 @@ class QuoteService:
                 "request_fingerprint": fingerprint,
             }
         )
+
+        # Decision/Brief join key: store as metadata but do NOT include it in the quote hash.
+        # (We intentionally compute quote_hash_sha256 before mutating snapshot_json here.)
+        if brief_id:
+            try:
+                meta = snapshot_json.get("metadata") if isinstance(snapshot_json.get("metadata"), dict) else {}
+                meta = dict(meta or {})
+                meta["brief"] = {
+                    "brief_id": str(brief_id),
+                    "brief_schema_version": str(brief_schema_version) if brief_schema_version else None,
+                }
+                snapshot_json["metadata"] = meta
+            except Exception:
+                pass
         try:
             await insert_quote(
                 {

@@ -2110,6 +2110,18 @@ async def agent_create_order(
                 "state": getattr(addr, "state", None),
             }
 
+        brief_id = getattr(order_request, "brief_id", None) or None
+        brief_schema_version = getattr(order_request, "brief_schema_version", None) or None
+        try:
+            meta = getattr(order_request, "metadata", None)
+            if isinstance(meta, dict):
+                if not brief_id:
+                    brief_id = meta.get("brief_id") or meta.get("briefId") or None
+                if not brief_schema_version:
+                    brief_schema_version = meta.get("brief_schema_version") or meta.get("briefSchemaVersion") or None
+        except Exception:
+            pass
+
         emit_best_effort(
             event_type=EVENT_CHECKOUT_ATTEMPTED,
             payload={
@@ -2118,6 +2130,8 @@ async def agent_create_order(
                 "quote_id": getattr(order_request, "quote_id", None),
                 "items_count": len(getattr(order_request, "items", None) or []),
                 "agent_id": getattr(context, "agent_id", None),
+                **({"brief_id": brief_id} if brief_id else {}),
+                **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
             },
             merchant_id=getattr(order_request, "merchant_id", None),
             geo=geo,
@@ -2230,6 +2244,20 @@ async def agent_create_order(
 
                 snap = qs.snapshot_json or {}
                 snap_pricing = snap.get("pricing") or {}
+
+                # Decision/Brief join key (best-effort): carry forward from quote snapshot.
+                try:
+                    if not order_request.metadata:
+                        order_request.metadata = {}
+                    if isinstance(order_request.metadata, dict) and isinstance(snap, dict):
+                        smeta = snap.get("metadata") if isinstance(snap.get("metadata"), dict) else {}
+                        brief_meta = smeta.get("brief") if isinstance(smeta.get("brief"), dict) else {}
+                        if brief_meta and not order_request.metadata.get("brief_id") and brief_meta.get("brief_id"):
+                            order_request.metadata["brief_id"] = brief_meta.get("brief_id")
+                            if brief_meta.get("brief_schema_version"):
+                                order_request.metadata["brief_schema_version"] = brief_meta.get("brief_schema_version")
+                except Exception:
+                    pass
 
                 policies = await get_latest_policy_hashes(order_request.merchant_id)
                 policy_hashes_available = bool(policies)
@@ -2348,9 +2376,15 @@ async def agent_create_order(
         # This prevents footguns where callers forget to pass buyer_ref/job_id while still
         # keeping server-side identity anchored to the minted token.
         if isinstance(order_request.metadata, dict):
+            # Decision/Brief join key (preferred): allow explicit fields to flow into metadata.
+            if getattr(order_request, "brief_id", None) and not order_request.metadata.get("brief_id"):
+                order_request.metadata["brief_id"] = getattr(order_request, "brief_id")
+            if getattr(order_request, "brief_schema_version", None) and not order_request.metadata.get("brief_schema_version"):
+                order_request.metadata["brief_schema_version"] = getattr(order_request, "brief_schema_version")
+
             token_payload = getattr(context, "checkout_token_payload", None)
             if isinstance(token_payload, dict):
-                for key in ("intent_id", "buyer_ref", "job_id", "market", "locale"):
+                for key in ("intent_id", "buyer_ref", "job_id", "market", "locale", "brief_id", "brief_schema_version"):
                     v = token_payload.get(key)
                     if v and not order_request.metadata.get(key):
                         order_request.metadata[key] = v
@@ -2584,6 +2618,16 @@ async def agent_create_order(
                     "state": getattr(addr, "state", None),
                 }
 
+            brief_id = None
+            brief_schema_version = None
+            try:
+                meta = getattr(order_request, "metadata", None)
+                if isinstance(meta, dict):
+                    brief_id = meta.get("brief_id") or meta.get("briefId") or None
+                    brief_schema_version = meta.get("brief_schema_version") or meta.get("briefSchemaVersion") or None
+            except Exception:
+                pass
+
             emit_best_effort(
                 event_type=EVENT_CHECKOUT_SUCCEEDED,
                 payload={
@@ -2594,6 +2638,8 @@ async def agent_create_order(
                     "currency": order_response.currency,
                     "total": float(order_response.total),
                     "psp": getattr(order_response, "psp", None),
+                    **({"brief_id": brief_id} if brief_id else {}),
+                    **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
                 },
                 merchant_id=getattr(order_request, "merchant_id", None),
                 geo=geo,
@@ -2775,6 +2821,16 @@ async def agent_create_order(
                     "state": getattr(addr, "state", None),
                 }
 
+            brief_id = None
+            brief_schema_version = None
+            try:
+                meta = getattr(order_request, "metadata", None)
+                if isinstance(meta, dict):
+                    brief_id = meta.get("brief_id") or meta.get("briefId") or None
+                    brief_schema_version = meta.get("brief_schema_version") or meta.get("briefSchemaVersion") or None
+            except Exception:
+                pass
+
             emit_best_effort(
                 event_type=EVENT_CHECKOUT_FAILED,
                 payload={
@@ -2783,6 +2839,8 @@ async def agent_create_order(
                     "quote_id": getattr(order_request, "quote_id", None),
                     "error_status": getattr(e, "status_code", None),
                     "error": str(e.detail)[:500],
+                    **({"brief_id": brief_id} if brief_id else {}),
+                    **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
                 },
                 merchant_id=getattr(order_request, "merchant_id", None),
                 geo=geo,
@@ -2819,6 +2877,16 @@ async def agent_create_order(
                     "state": getattr(addr, "state", None),
                 }
 
+            brief_id = None
+            brief_schema_version = None
+            try:
+                meta = getattr(order_request, "metadata", None)
+                if isinstance(meta, dict):
+                    brief_id = meta.get("brief_id") or meta.get("briefId") or None
+                    brief_schema_version = meta.get("brief_schema_version") or meta.get("briefSchemaVersion") or None
+            except Exception:
+                pass
+
             emit_best_effort(
                 event_type=EVENT_CHECKOUT_FAILED,
                 payload={
@@ -2827,6 +2895,8 @@ async def agent_create_order(
                     "quote_id": getattr(order_request, "quote_id", None),
                     "error_status": 500,
                     "error": str(e)[:500],
+                    **({"brief_id": brief_id} if brief_id else {}),
+                    **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
                 },
                 merchant_id=getattr(order_request, "merchant_id", None),
                 geo=geo,

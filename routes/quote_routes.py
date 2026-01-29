@@ -32,6 +32,8 @@ async def preview_quote(
             customer_email=req.customer_email,
             shipping_address=req.shipping_address,
             selected_delivery_option=req.selected_delivery_option,
+            brief_id=req.brief_id,
+            brief_schema_version=req.brief_schema_version,
         )
     except QuoteError as e:
         raise HTTPException(
@@ -79,6 +81,8 @@ async def preview_quote(
         "delivery_options": result.get("delivery_options"),
         "debug_id": result.get("debug_id"),
         "attempts": (result.get("attempts") or None),
+        "brief_id": req.brief_id,
+        "brief_schema_version": req.brief_schema_version,
     }
 
     # MVP measurement scaffolding (best-effort): offer/quote generated.
@@ -108,6 +112,8 @@ async def preview_quote(
             "pricing": response["pricing"],
             "items_count": len(req.items or []),
             "delivery_options_count": len(response.get("delivery_options") or []),
+            **({"brief_id": req.brief_id} if req.brief_id else {}),
+            **({"brief_schema_version": req.brief_schema_version} if req.brief_schema_version else {}),
         },
         merchant_id=req.merchant_id,
         geo=geo,
