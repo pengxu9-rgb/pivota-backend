@@ -258,6 +258,474 @@ class FindSimilarProductsPayload(BaseModel):
     metadata: Optional[RequestMetadata] = None
     debug: Optional[bool] = Field(False, description="Enable debug scores in dev environments")
 
+
+class OffersResolveProductRef(BaseModel):
+    """
+    Standardized product reference for offer resolution.
+
+    - sku_id: preferred when available (variant-level resolution)
+    - product_id: fallback when sku_id is missing
+    """
+
+    product_id: Optional[str] = Field(None, description="Product id or external_product_id")
+    sku_id: Optional[str] = Field(None, description="SKU / variant id")
+
+
+class OffersResolvePayload(BaseModel):
+    product: OffersResolveProductRef
+    limit: int = Field(10, ge=1, le=30, description="Max offers to return")
+    market: Optional[str] = Field(None, description="Market for outbound allowlist and UTM")
+    tool: Optional[str] = Field(None, description="Tool identifier for outbound allowlist and UTM")
+
+
+def _safe_lower(s: Any) -> str:
+    return str(s or "").strip().lower()
+
+
+def _coerce_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+def _coerce_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _extract_price_currency_from_variant(v: Dict[str, Any], fallback_currency: str) -> tuple[Optional[float], str]:
+    price = (
+        v.get("price_amount")
+        if v.get("price_amount") is not None
+        else v.get("price")
+        if v.get("price") is not None
+        else v.get("amount")
+        if v.get("amount") is not None
+        else None
+    )
+    currency = v.get("price_currency") or v.get("currency") or v.get("currency_code") or fallback_currency
+    return (_coerce_float(price), str(currency or fallback_currency).upper())
+
+
+def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = seed_data.get("variants")
+    if isinstance(raw, list):
+        return [it for it in raw if isinstance(it, dict)]
+    return []
+
+
+def _seed_image_url(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
+    for key in ("image_url",):
+        v = row.get(key) or seed_data.get(key)
+        if isinstance(v, str) and v.startswith(("http://", "https://")):
+            return v
+    snap = seed_data.get("snapshot")
+    if isinstance(snap, dict):
+        v = snap.get("image_url")
+        if isinstance(v, str) and v.startswith(("http://", "https://")):
+            return v
+    return None
+
+
+def _seed_display_name(row: Dict[str, Any], seed_data: Dict[str, Any]) -> str:
+    for key in ("merchant_display_name", "merchant_name", "brand", "vendor", "store_name"):
+        v = row.get(key) or seed_data.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    domain = row.get("domain") or seed_data.get("domain")
+    if isinstance(domain, str) and domain.strip():
+        return domain.strip()
+    return "External"
+
+
+def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
+    raw = (
+        v.get("variant_id")
+        or v.get("variantId")
+        or v.get("sku")
+        or v.get("sku_id")
+        or v.get("id")
+        or ""
+    )
+    return str(raw).strip()
+
+
+async def _handle_offers_resolve(
+    payload: OffersResolvePayload,
+    request_metadata: Optional[Dict[str, Any]],
+    background_tasks: BackgroundTasks,
+) -> Dict[str, Any]:
+    """
+    Resolve purchasable offers for a given sku_id/product_id.
+
+    Contract goal: external outbound links are primary; internal checkout is a fallback.
+    """
+    from db.database import database
+
+    product_id = str(payload.product.product_id or "").strip() or None
+    sku_id = str(payload.product.sku_id or "").strip() or None
+    market_hint = str(payload.market or "").strip() or None
+    tool_hint = str(payload.tool or "").strip() or None
+    limit = int(payload.limit or 10)
+
+    def _conf(kind: str, confidence: float, reason: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {
+            "kind": kind,
+            "confidence": max(0.0, min(1.0, float(confidence))),
+            "reason": reason,
+            **(extra or {}),
+        }
+
+    mapping_candidates: List[Dict[str, Any]] = []
+    offers: List[Dict[str, Any]] = []
+
+    # 1) External offers from external seeds (affiliate outbound)
+    external_offers: List[Dict[str, Any]] = []
+    try:
+        seed_limit = min(max(limit * 6, 40), 240)
+        where_clauses = ["status = 'active'"]
+        params: Dict[str, Any] = {"limit": seed_limit}
+
+        if product_id:
+            params["pid"] = product_id
+            where_clauses.append(
+                "("
+                "external_product_id = :pid"
+                " OR LOWER(COALESCE(title,'')) LIKE :pid_like"
+                " OR LOWER(COALESCE(canonical_url,'')) LIKE :pid_like"
+                " OR LOWER(COALESCE(destination_url,'')) LIKE :pid_like"
+                " OR LOWER(CAST(seed_data AS TEXT)) LIKE :pid_like"
+                ")"
+            )
+            params["pid_like"] = f"%{_safe_lower(product_id)}%"
+
+        if sku_id:
+            params["sku_like"] = f"%{_safe_lower(sku_id)}%"
+            where_clauses.append("LOWER(CAST(seed_data AS TEXT)) LIKE :sku_like")
+
+        if len(where_clauses) == 1:
+            # No input: return empty (caller must provide sku_id or product_id).
+            return {
+                "status": "error",
+                "error": {
+                    "code": "MISSING_PRODUCT_REF",
+                    "message": "offers.resolve requires product.sku_id or product.product_id",
+                },
+            }
+
+        seed_rows = await database.fetch_all(
+            f"""
+            SELECT *
+            FROM external_product_seeds
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """,
+            params,
+        )
+
+        seen_offer_ids: set[str] = set()
+        for row in seed_rows:
+            row_dict = dict(row) if isinstance(row, dict) else {}
+            seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
+            variants = _seed_variants(seed_data)
+
+            matched_variants: List[Dict[str, Any]] = []
+            if sku_id:
+                for v in variants:
+                    vid = _seed_offer_variant_id(v)
+                    if vid and vid == sku_id:
+                        matched_variants.append(v)
+            else:
+                matched_variants = variants[: min(12, max(1, limit))]
+
+            if not matched_variants:
+                # If variant list missing, still allow a single fallback offer based on seed row.
+                matched_variants = [{}]
+
+            destination_url = row_dict.get("destination_url") or seed_data.get("destination_url") or ""
+            canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or destination_url
+            if not isinstance(destination_url, str) or not destination_url.startswith(("http://", "https://")):
+                continue
+
+            seed_id = str(row_dict.get("id") or "").strip() or None
+            if not seed_id:
+                continue
+
+            used_market = str(row_dict.get("market") or market_hint or "US")
+            used_tool = str(row_dict.get("tool") or tool_hint or "*")
+
+            for v in matched_variants:
+                vid = _seed_offer_variant_id(v) or (sku_id or "∅")
+                offer_id = f"of:external_seed:{seed_id}:{vid}"
+                if offer_id in seen_offer_ids:
+                    continue
+                seen_offer_ids.add(offer_id)
+
+                price_amount, currency = _extract_price_currency_from_variant(
+                    v,
+                    fallback_currency=str(row_dict.get("price_currency") or seed_data.get("price_currency") or "USD"),
+                )
+                if price_amount is None:
+                    price_amount = _coerce_float(row_dict.get("price_amount") or seed_data.get("price_amount") or 0) or 0.0
+
+                availability = (
+                    v.get("availability")
+                    or seed_data.get("availability")
+                    or row_dict.get("availability")
+                    or "unknown"
+                )
+                in_stock = True
+                if isinstance(availability, str):
+                    in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
+
+                # Generate tracked affiliate redirect URL (domain allowlist applies).
+                # We set ctx.eventType so downstream click logs can be grouped as outbound_opened.
+                redirect_url = await _make_external_redirect_url(
+                    market=used_market,
+                    tool=used_tool,
+                    destination_url=str(canonical_url or destination_url),
+                    utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
+                    ctx={
+                        "seedId": seed_id,
+                        "variantId": vid,
+                        "eventType": "outbound_opened",
+                        "source": "offers.resolve",
+                        **({"skuId": sku_id} if sku_id else {}),
+                        **({"productId": product_id} if product_id else {}),
+                    },
+                )
+                if not redirect_url:
+                    continue
+
+                title = (
+                    v.get("title")
+                    or seed_data.get("title")
+                    or row_dict.get("title")
+                    or canonical_url
+                    or destination_url
+                )
+                seller = _seed_display_name(row_dict, seed_data)
+                shipping_days = _coerce_int(v.get("shipping_days") or v.get("shippingDays"))
+                original_price = _coerce_float(v.get("original_price") or v.get("compare_at_price") or v.get("originalPrice"))
+
+                confidence = 1.0 if (sku_id and vid == sku_id) else 0.8 if product_id else 0.6
+                mapping_candidates.append(
+                    _conf(
+                        "external_seed",
+                        confidence,
+                        "matched_external_seed",
+                        {
+                            "seed_id": seed_id,
+                            "variant_id": vid,
+                            "external_product_id": row_dict.get("external_product_id") or seed_data.get("external_product_id"),
+                            "domain": row_dict.get("domain") or seed_data.get("domain"),
+                        },
+                    )
+                )
+
+                external_offers.append(
+                    {
+                        "offer_id": offer_id,
+                        "seller": seller,
+                        "price": price_amount,
+                        "currency": currency,
+                        **({"original_price": original_price} if original_price is not None else {}),
+                        **({"shipping_days": shipping_days} if shipping_days is not None else {}),
+                        "in_stock": bool(in_stock),
+                        "purchase_route": "affiliate_outbound",
+                        "affiliate_url": redirect_url,
+                        "internal_checkout_items": None,
+                        "confidence": confidence,
+                        "source": {
+                            "type": "external_seed",
+                            "seed_id": seed_id,
+                            "external_product_id": row_dict.get("external_product_id") or seed_data.get("external_product_id"),
+                            "variant_id": vid,
+                            "title": title,
+                            "image_url": _seed_image_url(row_dict, seed_data),
+                            "canonical_url": canonical_url,
+                            "destination_url": destination_url,
+                            "domain": row_dict.get("domain") or seed_data.get("domain"),
+                        },
+                    }
+                )
+                if len(external_offers) >= limit:
+                    break
+            if len(external_offers) >= limit:
+                break
+    except Exception as e:
+        logger.info("offers.resolve.external.failed", extra={"error": str(e)})
+
+    # 2) Internal checkout offers (fallback)
+    internal_offers: List[Dict[str, Any]] = []
+    if len(external_offers) == 0 or all((o.get("confidence") or 0) < 0.75 for o in external_offers):
+        try:
+            # First try direct product id match
+            rows: List[Any] = []
+            if product_id:
+                rows = await database.fetch_all(
+                    """
+                    SELECT merchant_id, product_data
+                    FROM products_cache
+                    WHERE (
+                      platform_product_id = :pid
+                      OR product_data->>'id' = :pid
+                      OR product_data->>'product_id' = :pid
+                    )
+                    ORDER BY cached_at DESC
+                    LIMIT 20
+                    """,
+                    {"pid": product_id},
+                )
+
+            # Next try SKU-like match in cached JSON (bounded).
+            if not rows and sku_id:
+                rows = await database.fetch_all(
+                    """
+                    SELECT merchant_id, product_data
+                    FROM products_cache
+                    WHERE LOWER(CAST(product_data AS TEXT)) LIKE :like
+                    ORDER BY cached_at DESC
+                    LIMIT 50
+                    """,
+                    {"like": f"%{_safe_lower(sku_id)}%"},
+                )
+
+            seen_internal_offer_ids: set[str] = set()
+            for row in rows or []:
+                merchant_id = (row.get("merchant_id") if isinstance(row, dict) else None) or None
+                product_data = row.get("product_data") if isinstance(row, dict) else None
+                if isinstance(product_data, str):
+                    try:
+                        product_data = json.loads(product_data)
+                    except Exception:
+                        continue
+                if not isinstance(product_data, dict):
+                    continue
+
+                pid = str(product_data.get("id") or product_data.get("product_id") or product_id or "").strip() or None
+                if not pid or not merchant_id:
+                    continue
+
+                variants = product_data.get("variants") if isinstance(product_data.get("variants"), list) else []
+                chosen_variant: Dict[str, Any] = {}
+                if sku_id and isinstance(variants, list):
+                    for v in variants:
+                        if not isinstance(v, dict):
+                            continue
+                        vid = str(v.get("variant_id") or v.get("id") or v.get("sku") or v.get("sku_id") or "").strip()
+                        if vid and vid == sku_id:
+                            chosen_variant = v
+                            break
+                if not chosen_variant and isinstance(variants, list) and variants:
+                    first = variants[0] if isinstance(variants[0], dict) else None
+                    chosen_variant = first or {}
+
+                variant_id = str(
+                    chosen_variant.get("variant_id")
+                    or chosen_variant.get("id")
+                    or chosen_variant.get("sku")
+                    or chosen_variant.get("sku_id")
+                    or ""
+                ).strip() or (sku_id or None)
+                offer_id = f"of:internal_checkout:{merchant_id}:{pid}:{variant_id or '∅'}"
+                if offer_id in seen_internal_offer_ids:
+                    continue
+                seen_internal_offer_ids.add(offer_id)
+
+                price = (
+                    chosen_variant.get("price")
+                    if chosen_variant.get("price") is not None
+                    else product_data.get("price")
+                )
+                currency = product_data.get("currency") or product_data.get("currency_code") or "USD"
+                price_amount = _coerce_float(price) or 0.0
+
+                original_price = _coerce_float(
+                    chosen_variant.get("compare_at_price")
+                    or product_data.get("compare_at_price")
+                )
+
+                in_stock = True
+                inv = _coerce_int(chosen_variant.get("inventory_quantity") or product_data.get("inventory_quantity"))
+                if inv is not None:
+                    in_stock = inv > 0
+                if isinstance(product_data.get("in_stock"), bool):
+                    in_stock = product_data.get("in_stock")
+
+                seller = (
+                    str(product_data.get("merchant_name") or product_data.get("store_name") or "").strip()
+                    or str(merchant_id)
+                )
+                confidence = 0.9 if product_id and pid == product_id else 0.8 if sku_id else 0.6
+                mapping_candidates.append(
+                    _conf(
+                        "internal_product",
+                        confidence,
+                        "matched_products_cache",
+                        {"merchant_id": merchant_id, "product_id": pid, "variant_id": variant_id},
+                    )
+                )
+
+                internal_offers.append(
+                    {
+                        "offer_id": offer_id,
+                        "seller": seller,
+                        "price": price_amount,
+                        "currency": str(currency).upper(),
+                        **({"original_price": original_price} if original_price is not None else {}),
+                        "in_stock": bool(in_stock),
+                        "purchase_route": "internal_checkout",
+                        "affiliate_url": None,
+                        "internal_checkout_items": [
+                            {
+                                "merchant_id": merchant_id,
+                                "product_id": pid,
+                                **({"variant_id": variant_id} if variant_id else {}),
+                                "quantity": 1,
+                            }
+                        ],
+                        "confidence": confidence,
+                        "source": {
+                            "type": "internal_product",
+                            "merchant_id": merchant_id,
+                            "product_id": pid,
+                            "variant_id": variant_id,
+                        },
+                    }
+                )
+                if len(internal_offers) >= min(3, limit):
+                    break
+        except Exception as e:
+            logger.info("offers.resolve.internal.failed", extra={"error": str(e)})
+
+    # External offers always come first.
+    offers = external_offers + internal_offers
+    offers = offers[:limit]
+
+    return {
+        "status": "success",
+        "input": {"product_id": product_id, "sku_id": sku_id},
+        "offers": offers,
+        "offers_count": len(offers),
+        "mapping": {
+            "candidates": mapping_candidates[:50],
+        },
+        "metadata": {
+            "source": "offers.resolve",
+            "has_external": bool(external_offers),
+            "has_internal": bool(internal_offers),
+        },
+    }
+
 class ProductRef(BaseModel):
     merchant_id: str
     product_id: str
@@ -4583,6 +5051,10 @@ async def invoke_shop_operation(
             # Client disconnected; best-effort cancellation.
             await agent_task_manager.cancel(task_id, reason="client_disconnect")
             raise
+
+    if operation in ("offers.resolve", "offers_resolve", "offersResolve"):
+        payload = OffersResolvePayload(**request.payload)
+        return await _handle_offers_resolve(payload, normalized_metadata, background_tasks)
 
     if operation == "find_similar_products":
         payload = FindSimilarProductsPayload(**request.payload)

@@ -29,6 +29,7 @@ class ProductClickEvent(BaseModel):
     ranking_score: Optional[float] = None
     quality_content_score: Optional[float] = None
     quality_model_readiness: Optional[float] = None
+    event_type: Optional[str] = None
 
 
 class OfferInteractionEvent(BaseModel):
@@ -66,12 +67,16 @@ async def track_product_click(
         if not context.can_access_merchant(event.merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
+        event_type = (event.event_type or "click").strip().lower()
+        if not event_type:
+            event_type = "click"
+
         await log_product_events(
             [
                 {
                     "agent_id": getattr(context, "agent_id", None),
                     "session_id": getattr(context, "session_id", None),
-                    "event_type": "click",
+                    "event_type": event_type,
                     "endpoint": "/agent/v1/events/product-click",
                     "query": event.query,
                     "merchant_id": event.merchant_id,
