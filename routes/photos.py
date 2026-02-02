@@ -92,6 +92,13 @@ def _s3_client():
         secret_access_key = _first_env("PHOTO_UPLOAD_SECRET_ACCESS_KEY", default="")
         session_token = _first_env("PHOTO_UPLOAD_SESSION_TOKEN", default="") or None
 
+        # Fallback to global AWS creds ONLY for S3-compatible endpoints. This also
+        # avoids accidentally inheriting AWS_SESSION_TOKEN, which some providers
+        # (e.g. Cloudflare R2) reject.
+        if PHOTO_UPLOAD_ENDPOINT_URL and not (access_key_id and secret_access_key):
+            access_key_id = _first_env("AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", default=access_key_id)
+            secret_access_key = _first_env("AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", default=secret_access_key)
+
         client_kwargs: Dict[str, Any] = {
             "region_name": PHOTO_UPLOAD_REGION or None,
             "endpoint_url": PHOTO_UPLOAD_ENDPOINT_URL,
