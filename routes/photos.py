@@ -84,6 +84,7 @@ def _s3_client():
         return None
     try:
         config_kwargs: Dict[str, Any] = {"signature_version": "s3v4"}
+        endpoint_lc = (PHOTO_UPLOAD_ENDPOINT_URL or "").lower()
         if PHOTO_UPLOAD_ENDPOINT_URL:
             # Most S3-compatible providers (e.g. Cloudflare R2) expect path-style.
             config_kwargs["s3"] = {"addressing_style": "path"}
@@ -92,7 +93,6 @@ def _s3_client():
         secret_access_key = _first_env("PHOTO_UPLOAD_SECRET_ACCESS_KEY", default="")
         session_token = _first_env("PHOTO_UPLOAD_SESSION_TOKEN", default="") or None
         if PHOTO_UPLOAD_ENDPOINT_URL and session_token:
-            endpoint_lc = PHOTO_UPLOAD_ENDPOINT_URL.lower()
             # Cloudflare R2 does not accept session-token based signing.
             if "cloudflarestorage.com" in endpoint_lc or ".r2." in endpoint_lc:
                 session_token = None
@@ -104,8 +104,13 @@ def _s3_client():
             access_key_id = _first_env("AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", default=access_key_id)
             secret_access_key = _first_env("AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", default=secret_access_key)
 
+        region_name = PHOTO_UPLOAD_REGION or None
+        if PHOTO_UPLOAD_ENDPOINT_URL and ("cloudflarestorage.com" in endpoint_lc or ".r2." in endpoint_lc):
+            # Cloudflare R2 requires region='auto' (or one of their region codes).
+            region_name = "auto"
+
         client_kwargs: Dict[str, Any] = {
-            "region_name": PHOTO_UPLOAD_REGION or None,
+            "region_name": region_name,
             "endpoint_url": PHOTO_UPLOAD_ENDPOINT_URL,
             "config": Config(**config_kwargs),
         }

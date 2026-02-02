@@ -66,3 +66,4 @@ Best-effort delete (marks record deleted and attempts storage delete).
 
 - QC uses Pillow (`Pillow`) to decode images and run simple heuristics (brightness / blur / color cast).
 - Users must consent before presigning; otherwise `USER_CONSENT_REQUIRED` is returned.
+- Cloudflare R2 note: region is forced to `auto` and session-token signing is disabled.
