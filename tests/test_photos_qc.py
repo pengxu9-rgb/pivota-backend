@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -53,6 +54,7 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
 
     # Configure module globals
     photos.PHOTO_UPLOAD_BUCKET = "bucket-test"
+    os.environ["ADMIN_API_KEY"] = "test-admin-key"
 
     fake_s3 = FakeS3()
     monkeypatch.setattr(photos, "_s3_client", lambda: fake_s3)
@@ -102,8 +104,31 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
             return store[upload_id]
         return None
 
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        v = values or {}
+        if "FROM photo_uploads" in q and "expires_at <=" in q:
+            now = v.get("now")
+            out = []
+            for row in store.values():
+                if row.get("deleted_at") is not None:
+                    continue
+                expires_at = row.get("expires_at")
+                if not expires_at or not now:
+                    continue
+                if isinstance(expires_at, str):
+                    try:
+                        expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except Exception:
+                        continue
+                if expires_at <= now:
+                    out.append(row)
+            return out
+        return []
+
     monkeypatch.setattr(photos.database, "execute", fake_execute)
     monkeypatch.setattr(photos.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(photos.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(photos, "_ensure_photo_uploads_table", AsyncMock(return_value=None))
 
     # QC: force deterministic status
@@ -155,3 +180,32 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     )
     assert res4.status_code == 200
     assert res4.json()["deleted"] is True
+
+    # 5) cleanup (expired rows)
+    res5 = client.post(
+        "/photos/presign",
+        headers={"X-API-Key": "test-api-key"},
+        json={"content_type": "image/jpeg", "consent": True, "byte_size": 10, "user_id": "u_2"},
+    )
+    assert res5.status_code == 200
+    upload_id_2 = res5.json()["upload_id"]
+
+    # force expiry
+    store[upload_id_2]["expires_at"] = (datetime.utcnow() - timedelta(hours=1)).replace(tzinfo=None)
+
+    # simulate upload present
+    key2 = store[upload_id_2]["object_key"]
+    fake_s3.objects[(photos.PHOTO_UPLOAD_BUCKET, key2)] = b"fake-image-bytes"
+
+    res6 = client.post(
+        "/photos/cleanup",
+        headers={"X-ADMIN-KEY": "test-admin-key"},
+        params={"limit": 10},
+    )
+    assert res6.status_code == 200
+    body6 = res6.json()
+    assert body6["status"] == "success"
+    assert body6["deleted"] >= 1
+    assert store[upload_id_2]["deleted_at"] is not None
+    assert store[upload_id_2]["status"] == "deleted"
+    assert (photos.PHOTO_UPLOAD_BUCKET, key2) not in fake_s3.objects

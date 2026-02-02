@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from db.database import database
@@ -14,6 +14,13 @@ from utils.logger import logger
 
 
 router = APIRouter(prefix="/photos", tags=["photos"])
+
+async def require_photos_admin(
+    x_admin_key: str = Header(..., alias="X-ADMIN-KEY"),
+) -> None:
+    expected = os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY")
+    if not expected or x_admin_key != expected:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="UNAUTHORIZED")
 
 def _first_env(*names: str, default: str = "") -> str:
     for name in names:
@@ -33,6 +40,13 @@ PHOTO_UPLOAD_ENDPOINT_URL = (
 PHOTO_PRESIGN_TTL_SECONDS = int(os.getenv("PHOTO_PRESIGN_TTL_SECONDS") or "900")
 PHOTO_UPLOAD_TTL_HOURS = int(os.getenv("PHOTO_UPLOAD_TTL_HOURS") or "24")
 PHOTO_UPLOAD_MAX_BYTES = int(os.getenv("PHOTO_UPLOAD_MAX_BYTES") or str(10 * 1024 * 1024))
+
+PHOTO_CLEANUP_LOOP_ENABLED = (os.getenv("PHOTO_CLEANUP_LOOP_ENABLED") or "").strip().lower() in {"1", "true", "yes", "y"}
+PHOTO_CLEANUP_INTERVAL_SECONDS = int(os.getenv("PHOTO_CLEANUP_INTERVAL_SECONDS") or str(15 * 60))
+PHOTO_CLEANUP_BATCH_SIZE = int(os.getenv("PHOTO_CLEANUP_BATCH_SIZE") or "200")
+PHOTO_CLEANUP_STARTUP_DELAY_SECONDS = int(os.getenv("PHOTO_CLEANUP_STARTUP_DELAY_SECONDS") or "30")
+
+_photo_cleanup_task: Optional[asyncio.Task] = None
 
 
 def _utcnow() -> datetime:
@@ -325,6 +339,93 @@ async def _delete_storage_object(bucket: str, key: str) -> None:
         client.delete_object(Bucket=bucket, Key=key)
     except Exception:
         return
+
+
+async def _cleanup_expired_uploads(*, limit: int, dry_run: bool) -> Dict[str, Any]:
+    await _ensure_photo_uploads_table()
+    now = _utcnow().replace(tzinfo=None)
+    safe_limit = max(1, min(int(limit), 1000))
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT upload_id, bucket, object_key, status, expires_at
+        FROM photo_uploads
+        WHERE deleted_at IS NULL
+          AND expires_at IS NOT NULL
+          AND expires_at <= :now
+        ORDER BY expires_at ASC
+        LIMIT {safe_limit}
+        """,
+        {"now": now},
+    )
+
+    candidates = [dict(r) for r in (rows or [])]
+    if dry_run:
+        return {
+            "status": "success",
+            "dry_run": True,
+            "candidates": len(candidates),
+            "would_delete_upload_ids": [r.get("upload_id") for r in candidates if r.get("upload_id")],
+        }
+
+    deleted = 0
+    storage_deletes_attempted = 0
+    for row in candidates:
+        upload_id = str(row.get("upload_id") or "")
+        if not upload_id:
+            continue
+        bucket = str(row.get("bucket") or "")
+        key = str(row.get("object_key") or "")
+        if bucket and key:
+            storage_deletes_attempted += 1
+            await _delete_storage_object(bucket, key)
+        await _update_upload(upload_id, {"deleted_at": now, "status": "deleted"})
+        deleted += 1
+
+    return {
+        "status": "success",
+        "dry_run": False,
+        "candidates": len(candidates),
+        "deleted": deleted,
+        "storage_deletes_attempted": storage_deletes_attempted,
+    }
+
+
+async def _photo_cleanup_loop() -> None:
+    await asyncio.sleep(max(0, PHOTO_CLEANUP_STARTUP_DELAY_SECONDS))
+    while True:
+        try:
+            if getattr(database, "is_connected", False):
+                result = await _cleanup_expired_uploads(limit=PHOTO_CLEANUP_BATCH_SIZE, dry_run=False)
+                if result.get("deleted"):
+                    logger.info(
+                        "photo_cleanup_deleted=%s",
+                        {
+                            "deleted": result.get("deleted"),
+                            "candidates": result.get("candidates"),
+                            "storage_deletes_attempted": result.get("storage_deletes_attempted"),
+                        },
+                    )
+        except Exception as exc:
+            logger.warning(f"photo cleanup loop failed: {str(exc)[:200]}")
+        await asyncio.sleep(max(30, PHOTO_CLEANUP_INTERVAL_SECONDS))
+
+
+def start_photo_cleanup_loop() -> None:
+    """
+    Optional background cleanup loop.
+    Enable by setting PHOTO_CLEANUP_LOOP_ENABLED=true.
+    """
+    global _photo_cleanup_task
+    if not PHOTO_CLEANUP_LOOP_ENABLED:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _photo_cleanup_task and not _photo_cleanup_task.done():
+        return
+    _photo_cleanup_task = loop.create_task(_photo_cleanup_loop())
 
 
 async def _run_qc(upload_id: str) -> None:
@@ -652,3 +753,17 @@ async def delete_photo_upload(
 
     await _update_upload(upload_id, {"deleted_at": _utcnow().replace(tzinfo=None), "status": "deleted"})
     return {"status": "success", "upload_id": upload_id, "deleted": True}
+
+
+@router.post("/cleanup")
+async def cleanup_photo_uploads(
+    limit: int = Query(default=PHOTO_CLEANUP_BATCH_SIZE, ge=1, le=1000),
+    dry_run: bool = Query(default=False),
+    _: None = Depends(require_photos_admin),
+):
+    """
+    Admin-only cleanup: delete expired photo uploads (DB row soft-delete + best-effort storage delete).
+
+    Intended for a cron job (or to backstop the optional in-process cleanup loop).
+    """
+    return await _cleanup_expired_uploads(limit=limit, dry_run=dry_run)

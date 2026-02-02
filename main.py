@@ -134,7 +134,7 @@ from routes.public_test_orders import router as public_test_orders_router
 from routes.admin_sql_quick import router as admin_sql_router
 from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
-from routes.photos import router as photos_router
+from routes.photos import router as photos_router, start_photo_cleanup_loop
 from routes.admin_usage_debug import router as admin_usage_debug_router
 from routes.agent_analytics import router as agent_analytics_router
 # Debug routers - only import if DEBUG_MODE is enabled
@@ -390,6 +390,12 @@ async def startup_event():
 
     # Ensure webhook audit/idempotency table exists (best-effort; does not raise)
     await WebhookService.ensure_webhook_events_table()
+
+    # Optional: background photo TTL cleanup (non-blocking).
+    try:
+        start_photo_cleanup_loop()
+    except Exception:
+        pass
 
 
 @app.on_event("shutdown")
@@ -794,6 +800,12 @@ async def startup():
         # Test the connection
         await asyncio.wait_for(database.execute("SELECT 1"), timeout=10)
         logger.info("✅ Database connection test passed")
+
+        # Optional: background photo TTL cleanup (non-blocking).
+        try:
+            start_photo_cleanup_loop()
+        except Exception:
+            pass
 
         # Minimal schema guard (fast; safe for prod "fast mode").
         # Prevents outages when a deploy accidentally skips SQL migrations.

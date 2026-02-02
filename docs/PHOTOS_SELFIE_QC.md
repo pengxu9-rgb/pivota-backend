@@ -46,6 +46,15 @@ Response:
 
 Best-effort delete (marks record deleted and attempts storage delete).
 
+### `POST /photos/cleanup`
+
+Admin-only cleanup for expired uploads (soft-deletes DB rows + best-effort storage delete).
+
+- Requires `X-ADMIN-KEY` (matches `ADMIN_API_KEY` or `PROMOTIONS_ADMIN_KEY`)
+- Query params:
+  - `limit` (default: `PHOTO_CLEANUP_BATCH_SIZE`, max: `1000`)
+  - `dry_run` (default: `false`) — return candidates only, do not delete
+
 ## Environment variables
 
 - `PHOTO_UPLOAD_BUCKET` (required)
@@ -61,6 +70,10 @@ Best-effort delete (marks record deleted and attempts storage delete).
 - `PHOTO_PRESIGN_TTL_SECONDS` (default: `900`)
 - `PHOTO_UPLOAD_TTL_HOURS` (default: `24`)
 - `PHOTO_UPLOAD_MAX_BYTES` (default: `10485760`)
+- `PHOTO_CLEANUP_LOOP_ENABLED` (default: `false`) — run an in-process cleanup loop
+- `PHOTO_CLEANUP_INTERVAL_SECONDS` (default: `900`)
+- `PHOTO_CLEANUP_BATCH_SIZE` (default: `200`)
+- `PHOTO_CLEANUP_STARTUP_DELAY_SECONDS` (default: `30`)
 
 ## Notes
 
