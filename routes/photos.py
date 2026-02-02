@@ -91,6 +91,11 @@ def _s3_client():
         access_key_id = _first_env("PHOTO_UPLOAD_ACCESS_KEY_ID", default="")
         secret_access_key = _first_env("PHOTO_UPLOAD_SECRET_ACCESS_KEY", default="")
         session_token = _first_env("PHOTO_UPLOAD_SESSION_TOKEN", default="") or None
+        if PHOTO_UPLOAD_ENDPOINT_URL and session_token:
+            endpoint_lc = PHOTO_UPLOAD_ENDPOINT_URL.lower()
+            # Cloudflare R2 does not accept session-token based signing.
+            if "cloudflarestorage.com" in endpoint_lc or ".r2." in endpoint_lc:
+                session_token = None
 
         # Fallback to global AWS creds ONLY for S3-compatible endpoints. This also
         # avoids accidentally inheriting AWS_SESSION_TOKEN, which some providers
