@@ -134,6 +134,7 @@ from routes.public_test_orders import router as public_test_orders_router
 from routes.admin_sql_quick import router as admin_sql_router
 from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
+from routes.photos import router as photos_router
 from routes.admin_usage_debug import router as admin_usage_debug_router
 from routes.agent_analytics import router as agent_analytics_router
 # Debug routers - only import if DEBUG_MODE is enabled
@@ -619,6 +620,7 @@ app.include_router(debug_shopify_api_router)  # Debug Shopify API
 app.include_router(admin_sql_router)  # Admin SQL
 app.include_router(admin_agents_debug_router)  # Admin agents debug
 app.include_router(agent_health_router)  # Agent health check
+app.include_router(photos_router)  # Selfie uploads + QC (presign/confirm/qc)
 app.include_router(admin_usage_debug_router)  # Admin usage logs debug
 app.include_router(agent_analytics_router)  # Agent analytics (funnel, queries)
 if DEBUG_MODE:
