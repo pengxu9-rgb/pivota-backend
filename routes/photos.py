@@ -88,11 +88,27 @@ def _s3_client():
             # Most S3-compatible providers (e.g. Cloudflare R2) expect path-style.
             config_kwargs["s3"] = {"addressing_style": "path"}
 
+        access_key_id = _first_env("PHOTO_UPLOAD_ACCESS_KEY_ID", default="")
+        secret_access_key = _first_env("PHOTO_UPLOAD_SECRET_ACCESS_KEY", default="")
+        session_token = _first_env("PHOTO_UPLOAD_SESSION_TOKEN", default="") or None
+
+        client_kwargs: Dict[str, Any] = {
+            "region_name": PHOTO_UPLOAD_REGION or None,
+            "endpoint_url": PHOTO_UPLOAD_ENDPOINT_URL,
+            "config": Config(**config_kwargs),
+        }
+        if access_key_id and secret_access_key:
+            client_kwargs.update(
+                {
+                    "aws_access_key_id": access_key_id,
+                    "aws_secret_access_key": secret_access_key,
+                    **({"aws_session_token": session_token} if session_token else {}),
+                }
+            )
+
         return boto3.client(
             "s3",
-            region_name=PHOTO_UPLOAD_REGION or None,
-            endpoint_url=PHOTO_UPLOAD_ENDPOINT_URL,
-            config=Config(**config_kwargs),
+            **client_kwargs,
         )
     except Exception:
         return None

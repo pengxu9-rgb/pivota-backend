@@ -54,6 +54,10 @@ Best-effort delete (marks record deleted and attempts storage delete).
 - `PHOTO_UPLOAD_REGION` (default: `auto`)
 - `PHOTO_UPLOAD_ENDPOINT_URL` (optional; S3-compatible endpoints like R2)
 - Fallbacks: `AWS_ENDPOINT_URL`, `S3_ENDPOINT_URL`, and region fallbacks `AWS_REGION` / `AWS_DEFAULT_REGION`
+- Optional dedicated credentials (recommended for R2 to avoid clobbering global AWS creds):
+  - `PHOTO_UPLOAD_ACCESS_KEY_ID`
+  - `PHOTO_UPLOAD_SECRET_ACCESS_KEY`
+  - `PHOTO_UPLOAD_SESSION_TOKEN` (optional)
 - `PHOTO_PRESIGN_TTL_SECONDS` (default: `900`)
 - `PHOTO_UPLOAD_TTL_HOURS` (default: `24`)
 - `PHOTO_UPLOAD_MAX_BYTES` (default: `10485760`)
