@@ -79,13 +79,20 @@ async def _ensure_photo_uploads_table() -> None:
 def _s3_client():
     try:
         import boto3
+        from botocore.client import Config
     except Exception:
         return None
     try:
+        config_kwargs: Dict[str, Any] = {"signature_version": "s3v4"}
+        if PHOTO_UPLOAD_ENDPOINT_URL:
+            # Most S3-compatible providers (e.g. Cloudflare R2) expect path-style.
+            config_kwargs["s3"] = {"addressing_style": "path"}
+
         return boto3.client(
             "s3",
             region_name=PHOTO_UPLOAD_REGION or None,
             endpoint_url=PHOTO_UPLOAD_ENDPOINT_URL,
+            config=Config(**config_kwargs),
         )
     except Exception:
         return None
