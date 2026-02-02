@@ -15,10 +15,20 @@ from utils.logger import logger
 
 router = APIRouter(prefix="/photos", tags=["photos"])
 
-PHOTO_UPLOAD_BUCKET = (os.getenv("PHOTO_UPLOAD_BUCKET") or "").strip()
-PHOTO_UPLOAD_PREFIX = (os.getenv("PHOTO_UPLOAD_PREFIX") or "selfies").strip().strip("/")
-PHOTO_UPLOAD_REGION = (os.getenv("PHOTO_UPLOAD_REGION") or "auto").strip()
-PHOTO_UPLOAD_ENDPOINT_URL = (os.getenv("PHOTO_UPLOAD_ENDPOINT_URL") or "").strip() or None
+def _first_env(*names: str, default: str = "") -> str:
+    for name in names:
+        val = (os.getenv(name) or "").strip()
+        if val:
+            return val
+    return (default or "").strip()
+
+
+PHOTO_UPLOAD_BUCKET = _first_env("PHOTO_UPLOAD_BUCKET", "S3_BUCKET", "AWS_S3_BUCKET", default="")
+PHOTO_UPLOAD_PREFIX = _first_env("PHOTO_UPLOAD_PREFIX", default="selfies").strip().strip("/")
+PHOTO_UPLOAD_REGION = _first_env("PHOTO_UPLOAD_REGION", "AWS_REGION", "AWS_DEFAULT_REGION", default="auto")
+PHOTO_UPLOAD_ENDPOINT_URL = (
+    _first_env("PHOTO_UPLOAD_ENDPOINT_URL", "AWS_ENDPOINT_URL", "S3_ENDPOINT_URL", default="") or None
+)
 
 PHOTO_PRESIGN_TTL_SECONDS = int(os.getenv("PHOTO_PRESIGN_TTL_SECONDS") or "900")
 PHOTO_UPLOAD_TTL_HOURS = int(os.getenv("PHOTO_UPLOAD_TTL_HOURS") or "24")
@@ -398,8 +408,48 @@ async def presign_photo_upload(
             ExpiresIn=PHOTO_PRESIGN_TTL_SECONDS,
         )
     except Exception as e:
-        logger.error("photos.presign.failed", extra={"error": str(e)})
-        raise HTTPException(status_code=500, detail="PRESIGN_FAILED")
+        # Make upstream storage misconfig actionable without leaking secrets.
+        err_type = type(e).__name__
+        safe_msg = (str(e) or "").strip()
+        if len(safe_msg) > 240:
+            safe_msg = safe_msg[:240]
+
+        detail: Dict[str, Any] = {
+            "error": "PRESIGN_FAILED",
+            "type": err_type,
+            "message": safe_msg or None,
+            "storage": {
+                "bucket": PHOTO_UPLOAD_BUCKET,
+                "region": PHOTO_UPLOAD_REGION or None,
+                "endpoint_url_configured": bool(PHOTO_UPLOAD_ENDPOINT_URL),
+            },
+        }
+
+        # Try to classify common botocore errors into clearer error strings.
+        try:
+            from botocore.exceptions import (  # type: ignore
+                NoCredentialsError,
+                PartialCredentialsError,
+                ParamValidationError,
+                NoRegionError,
+                UnknownEndpointError,
+            )
+
+            if isinstance(e, NoCredentialsError):
+                detail["error"] = "STORAGE_CREDENTIALS_NOT_CONFIGURED"
+            elif isinstance(e, PartialCredentialsError):
+                detail["error"] = "STORAGE_PARTIAL_CREDENTIALS"
+            elif isinstance(e, NoRegionError):
+                detail["error"] = "STORAGE_REGION_NOT_CONFIGURED"
+            elif isinstance(e, UnknownEndpointError):
+                detail["error"] = "STORAGE_UNKNOWN_ENDPOINT"
+            elif isinstance(e, ParamValidationError):
+                detail["error"] = "STORAGE_CONFIG_INVALID"
+        except Exception:
+            pass
+
+        logger.error("photos.presign.failed", extra={"error": safe_msg, "type": err_type})
+        raise HTTPException(status_code=500, detail=detail)
 
     await database.execute(
         """

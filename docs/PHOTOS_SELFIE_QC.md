@@ -49,9 +49,11 @@ Best-effort delete (marks record deleted and attempts storage delete).
 ## Environment variables
 
 - `PHOTO_UPLOAD_BUCKET` (required)
+- Fallbacks: `S3_BUCKET`, `AWS_S3_BUCKET`
 - `PHOTO_UPLOAD_PREFIX` (default: `selfies`)
 - `PHOTO_UPLOAD_REGION` (default: `auto`)
 - `PHOTO_UPLOAD_ENDPOINT_URL` (optional; S3-compatible endpoints like R2)
+- Fallbacks: `AWS_ENDPOINT_URL`, `S3_ENDPOINT_URL`, and region fallbacks `AWS_REGION` / `AWS_DEFAULT_REGION`
 - `PHOTO_PRESIGN_TTL_SECONDS` (default: `900`)
 - `PHOTO_UPLOAD_TTL_HOURS` (default: `24`)
 - `PHOTO_UPLOAD_MAX_BYTES` (default: `10485760`)
