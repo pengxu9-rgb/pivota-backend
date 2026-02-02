@@ -19,7 +19,7 @@ Request body:
 Response:
 
 - `upload_id`
-- `upload.url` + `upload.fields` (S3 POST form)
+- `upload.method` + `upload.url` + `upload.headers` (presigned `PUT` upload)
 - `expires_at` (TTL for keeping the upload record)
 - `max_bytes`
 - `tips.daylight` / `tips.indoor_white` (displayable shooting guidance)

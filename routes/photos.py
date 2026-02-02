@@ -394,17 +394,16 @@ async def presign_photo_upload(
     if not client:
         raise HTTPException(status_code=500, detail="STORAGE_CLIENT_UNAVAILABLE")
 
-    conditions = [
-        ["content-length-range", 1, PHOTO_UPLOAD_MAX_BYTES],
-        {"Content-Type": body.content_type},
-    ]
-    fields = {"Content-Type": body.content_type}
     try:
-        presigned = client.generate_presigned_post(
-            Bucket=PHOTO_UPLOAD_BUCKET,
-            Key=key,
-            Fields=fields,
-            Conditions=conditions,
+        # Cloudflare R2 does not support presigned POST (policy) uploads, so we use
+        # presigned PUT URLs which work for both AWS S3 and R2.
+        presigned_url = client.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={
+                "Bucket": PHOTO_UPLOAD_BUCKET,
+                "Key": key,
+                "ContentType": body.content_type,
+            },
             ExpiresIn=PHOTO_PRESIGN_TTL_SECONDS,
         )
     except Exception as e:
@@ -475,7 +474,12 @@ async def presign_photo_upload(
 
     return PhotoPresignResponse(
         upload_id=upload_id,
-        upload={"url": presigned.get("url"), "fields": presigned.get("fields") or {}},
+        upload={
+            "method": "PUT",
+            "url": presigned_url,
+            "headers": {"Content-Type": body.content_type},
+            "fields": {},
+        },
         expires_at=expires_at.isoformat(),
         max_bytes=PHOTO_UPLOAD_MAX_BYTES,
         tips=_lighting_tips(),

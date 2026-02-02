@@ -19,8 +19,12 @@ class FakeS3:
     def __init__(self):
         self.objects = {}
 
-    def generate_presigned_post(self, Bucket, Key, Fields, Conditions, ExpiresIn):
-        return {"url": "https://storage.example/upload", "fields": {"key": Key, **(Fields or {})}}
+    def generate_presigned_url(self, ClientMethod, Params, ExpiresIn):
+        # Minimal fake URL; tests don't execute the actual PUT, they only validate
+        # that presign returns a URL and then simulate the object existing via FakeS3.objects.
+        bucket = Params.get("Bucket")
+        key = Params.get("Key")
+        return f"https://storage.example/{bucket}/{key}?sig=fake"
 
     def head_object(self, Bucket, Key):
         if (Bucket, Key) not in self.objects:
@@ -115,7 +119,8 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     body = res.json()
     upload_id = body["upload_id"]
     assert body["upload"]["url"].startswith("https://")
-    assert "fields" in body["upload"]
+    assert body["upload"]["method"] == "PUT"
+    assert body["upload"]["headers"]["Content-Type"] == "image/jpeg"
     assert body["tips"]["daylight"]
 
     # simulate upload by placing object in fake storage
@@ -150,4 +155,3 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     )
     assert res4.status_code == 200
     assert res4.json()["deleted"] is True
-
