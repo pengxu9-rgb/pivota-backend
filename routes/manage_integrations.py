@@ -124,6 +124,12 @@ async def update_store(
                 # Treat as full admin token replacement
                 patch_dict = {"access_token": patch.strip()}
 
+            # Detect whether the caller is attempting to update Shopify Admin token.
+            updates_shopify_admin_token = False
+            if store.get("platform") == "shopify":
+                if isinstance(patch_dict, dict) and any(k in patch_dict for k in ("access_token", "token")):
+                    updates_shopify_admin_token = True
+
             merged = dict(current)
             for k, v in (patch_dict or {}).items():
                 if not isinstance(k, str) or not k:
@@ -136,6 +142,34 @@ async def update_store(
                     continue
                 else:
                     merged[k] = v
+
+            # Verify Shopify Admin token when it is being updated to prevent storing invalid credentials.
+            if store.get("platform") == "shopify" and updates_shopify_admin_token:
+                domain = str(store.get("domain") or "").strip().lower()
+                admin_token = merged.get("access_token") or merged.get("token")
+                admin_token = admin_token.strip() if isinstance(admin_token, str) else ""
+                if not domain or not admin_token:
+                    raise HTTPException(status_code=400, detail="Shopify domain/token missing")
+                try:
+                    url = f"https://{domain}/admin/api/2024-07/shop.json"
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.get(url, headers={"X-Shopify-Access-Token": admin_token})
+                    if resp.status_code != 200:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid Shopify Admin token. API returned: {resp.status_code}",
+                        )
+                    shop = (resp.json() or {}).get("shop") or {}
+                    canonical = str(shop.get("myshopify_domain") or "").strip().lower()
+                    if canonical and canonical != domain:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Shopify token does not match store domain (expected {domain}, got {canonical})",
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Failed to verify Shopify Admin token")
 
             # Optional verify: if storefront token present for Shopify, ping Storefront API.
             if (
@@ -359,7 +393,6 @@ async def cleanup_integrations(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup: {str(e)}")
-
 
 
 

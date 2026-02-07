@@ -5,6 +5,8 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from fastapi import APIRouter, HTTPException, Depends
 from datetime import datetime
 from typing import Dict, Any
+import os
+import httpx
 from config.settings import settings
 from db.merchant_onboarding import merchant_onboarding, get_merchant_onboarding
 from db.orders import orders
@@ -15,12 +17,27 @@ from utils.logger import logger
 
 router = APIRouter(prefix="/shopify-setup", tags=["Shopify Setup"])
 
+def _is_production() -> bool:
+    return (
+        os.getenv("APP_ENV", "").lower() == "production"
+        or os.getenv("ENVIRONMENT", "").lower() == "production"
+        or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+    )
+
+
+def _shopify_setup_enabled() -> bool:
+    return (os.getenv("ENABLE_SHOPIFY_SETUP_ENDPOINTS") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @router.post("/configure/{merchant_id}")
 async def configure_shopify(
     merchant_id: str,
     current_user: dict = Depends(require_admin)
 ) -> Dict[str, Any]:
     """Configure Shopify for a merchant using environment variables"""
+    if _is_production() and not _shopify_setup_enabled():
+        # Avoid accidental credential overwrites in production.
+        raise HTTPException(status_code=404, detail="Not found")
     
     # Get Shopify credentials from environment
     shopify_store = settings.shopify_store_url or "chydantest.myshopify.com"
@@ -28,12 +45,32 @@ async def configure_shopify(
     
     if not shopify_token:
         raise HTTPException(status_code=400, detail="SHOPIFY_ACCESS_TOKEN not set in environment")
+
+    # Validate env credentials before writing them to DB.
+    shop_domain = shopify_store.replace("https://", "").replace("http://", "").strip().strip("/").lower()
+    try:
+        url = f"https://{shop_domain}/admin/api/2024-07/shop.json"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers={"X-Shopify-Access-Token": shopify_token})
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Invalid Shopify env credentials (status={resp.status_code})")
+        shop = (resp.json() or {}).get("shop") or {}
+        canonical = str(shop.get("myshopify_domain") or "").strip().lower()
+        if canonical and canonical != shop_domain:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Env token does not match shop domain (expected {shop_domain}, got {canonical})",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to validate Shopify env credentials")
     
     # Update merchant with Shopify fields
     update_data = {
         "mcp_connected": True,
         "mcp_platform": "shopify",
-        "mcp_shop_domain": shopify_store.replace("https://", "").replace("http://", ""),
+        "mcp_shop_domain": shop_domain,
         "mcp_access_token": shopify_token,
         "updated_at": datetime.now()
     }

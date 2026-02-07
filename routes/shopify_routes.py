@@ -39,11 +39,19 @@ class ShopifyConnectRequest(BaseModel):
 
 
 @router.post("/connect-legacy")
-async def connect_shopify_legacy(req: ShopifyConnectRequest) -> Dict[str, Any]:
+async def connect_shopify_legacy(
+    req: ShopifyConnectRequest,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
     DEPRECATED: Use /integrations/shopify/connect from merchant_store_connections.py instead.
     This endpoint is kept for backwards compatibility but should not be used.
     """
+    # This legacy endpoint writes to merchant_onboarding.mcp_* fields and has historically been a source
+    # of accidental credential overwrites. Restrict to employee/admin usage only.
+    if current_user.get("role") not in ["employee", "admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
     # Resolve credentials
     # Accept multiple env var names for flexibility
     shop_domain = (
@@ -70,7 +78,8 @@ async def connect_shopify_legacy(req: ShopifyConnectRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
     # Validate credentials by calling /shop.json
-    url = f"https://{shop_domain}/admin/api/2024-07/shop.json"
+    canon_domain = shop_domain.replace("https://", "").replace("http://", "").strip().strip("/").lower()
+    url = f"https://{canon_domain}/admin/api/2024-07/shop.json"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(url, headers={"X-Shopify-Access-Token": access_token})
@@ -79,6 +88,13 @@ async def connect_shopify_legacy(req: ShopifyConnectRequest) -> Dict[str, Any]:
             # A common source of "token keeps becoming invalid" is accidentally overwriting the stored
             # Admin token with an invalid/expired token via legacy endpoints.
             raise HTTPException(status_code=400, detail=f"Invalid Shopify credentials (status={r.status_code})")
+        shop = (r.json() or {}).get("shop") or {}
+        canonical = str(shop.get("myshopify_domain") or "").strip().lower()
+        if canonical and canonical != canon_domain:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Shopify token does not match shop domain (expected {canon_domain}, got {canonical})",
+            )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Shopify validation error: {e}")
 
@@ -89,7 +105,7 @@ async def connect_shopify_legacy(req: ShopifyConnectRequest) -> Dict[str, Any]:
         .values(
             mcp_connected=True,
             mcp_platform="shopify",
-            mcp_shop_domain=shop_domain,  # Store shop domain
+            mcp_shop_domain=canon_domain,  # Store shop domain
             mcp_access_token=access_token  # Store access token
         )
     )
@@ -222,14 +238,39 @@ async def oauth_callback(request: Request) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"OAuth error: {e}")
 
+    access_token = str(access_token or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="OAuth token exchange returned empty access_token")
+
+    # Validate token against Shopify before persisting (prevents storing bad/partial credentials).
+    canon_domain = str(shop).replace("https://", "").replace("http://", "").strip().strip("/").lower()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            check = await client.get(
+                f"https://{canon_domain}/admin/api/2024-07/shop.json",
+                headers={"X-Shopify-Access-Token": access_token},
+            )
+        if check.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"OAuth token invalid (status={check.status_code})")
+        shop_data = (check.json() or {}).get("shop") or {}
+        canonical = str(shop_data.get("myshopify_domain") or "").strip().lower()
+        if canonical and canonical != canon_domain:
+            raise HTTPException(
+                status_code=400,
+                detail=f"OAuth token does not match shop domain (expected {canon_domain}, got {canonical})",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"OAuth validation error: {e}")
+
     # Persist to merchant
     upd = (
         merchant_onboarding.update()
         .where(merchant_onboarding.c.merchant_id == merchant_id_from_state)
-        .values(mcp_connected=True, mcp_platform="shopify", mcp_shop_domain=shop, mcp_access_token=access_token)
+        .values(mcp_connected=True, mcp_platform="shopify", mcp_shop_domain=canon_domain, mcp_access_token=access_token)
     )
     await database.execute(upd)
 
     logger.info(f"shopify_oauth_success merchant_id={merchant_id_from_state} shop={shop}")
-    return {"status": "success", "merchant_id": merchant_id_from_state, "shop": shop}
-
+    return {"status": "success", "merchant_id": merchant_id_from_state, "shop": canon_domain}

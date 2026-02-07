@@ -1333,6 +1333,23 @@ async def connect_store(
     
     if not store_url or not api_key:
         raise HTTPException(status_code=400, detail="Store URL and API key required")
+
+    # Backward compatible safety:
+    # This generic endpoint historically accepted raw tokens and stored them without validation,
+    # which can accidentally overwrite a working Shopify connection with an invalid token and
+    # cause persistent 401s downstream (primary store selection is recency-based).
+    if platform == "shopify":
+        from routes.merchant_store_connections import ConnectShopifyRequest, merchant_connect_shopify
+
+        domain = store_url.replace("https://", "").replace("http://", "").strip("/").strip()
+        req = ConnectShopifyRequest(merchant_id=merchant_id, shop_domain=domain, access_token=api_key)
+        return await merchant_connect_shopify(request=req, current_user=current_user)
+
+    if platform == "wix":
+        raise HTTPException(
+            status_code=400,
+            detail="Please connect Wix via /integrations/wix/connect (requires wix_site_id + api_key).",
+        )
     
     # Save to database
     store_id = "store_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
