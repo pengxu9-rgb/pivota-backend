@@ -189,7 +189,10 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
             """
             SELECT store_id, platform, domain, status, product_count 
             FROM merchant_stores 
-            WHERE merchant_id = :merchant_id AND platform = 'shopify'
+            WHERE merchant_id = :merchant_id
+              AND platform = 'shopify'
+              AND status IN ('active', 'connected')
+            ORDER BY connected_at DESC NULLS LAST
             LIMIT 1
             """,
             {"merchant_id": merchant_id}
@@ -204,7 +207,7 @@ async def sync_shopify_products(current_user: dict = Depends(get_current_user)):
         # Convert Row to dict
         store_check = dict(store_check_row)
         
-        if store_check["status"] != "active":
+        if (store_check.get("status") or "").lower() not in ("active", "connected"):
             raise HTTPException(
                 status_code=400,
                 detail=f"Store is {store_check['status']}. Please reconnect your store."

@@ -74,11 +74,11 @@ async def connect_shopify_legacy(req: ShopifyConnectRequest) -> Dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(url, headers={"X-Shopify-Access-Token": access_token})
-        if r.status_code not in (200, 401, 403):
-            raise HTTPException(status_code=400, detail=f"Shopify validation failed (status={r.status_code})")
-        if r.status_code in (401, 403):
-            # Treat as recognized but insufficient permission
-            pass
+        if r.status_code != 200:
+            # Never persist credentials if Shopify rejects them.
+            # A common source of "token keeps becoming invalid" is accidentally overwriting the stored
+            # Admin token with an invalid/expired token via legacy endpoints.
+            raise HTTPException(status_code=400, detail=f"Invalid Shopify credentials (status={r.status_code})")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Shopify validation error: {e}")
 
@@ -232,5 +232,4 @@ async def oauth_callback(request: Request) -> Dict[str, Any]:
 
     logger.info(f"shopify_oauth_success merchant_id={merchant_id_from_state} shop={shop}")
     return {"status": "success", "merchant_id": merchant_id_from_state, "shop": shop}
-
 
