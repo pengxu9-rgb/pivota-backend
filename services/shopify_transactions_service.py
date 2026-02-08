@@ -23,6 +23,15 @@ class ShopifyTransactionSyncRateLimitError(ShopifyTransactionSyncError):
     pass
 
 
+class ShopifyTransactionSyncHttpError(ShopifyTransactionSyncError):
+    def __init__(self, *, status_code: int, response_text: str):
+        self.status_code = int(status_code)
+        self.response_text = str(response_text or "")
+        super().__init__(
+            f"Failed to create transaction (status={self.status_code}) {self.response_text}"
+        )
+
+
 def extract_shopify_access_token(api_key_raw: Any) -> Optional[str]:
     """
     Support both legacy raw-string tokens and JSON-wrapped tokens:
@@ -80,6 +89,14 @@ def _safe_text(resp: httpx.Response, limit: int = 800) -> str:
         return (resp.text or "")[:limit]
     except Exception:
         return ""
+
+
+def _is_non_fatal_invalid_sale_error(err: Exception) -> bool:
+    if not isinstance(err, ShopifyTransactionSyncHttpError):
+        return False
+    if err.status_code != 422:
+        return False
+    return "sale is not a valid transaction" in err.response_text.lower()
 
 
 def _merge_note_attributes(
@@ -191,8 +208,9 @@ async def create_shopify_order_transaction(
     body = {"transaction": transaction}
     resp = await _shopify_request(method="POST", url=url, access_token=access_token, json_body=body)
     if resp.status_code not in (200, 201):
-        raise ShopifyTransactionSyncError(
-            f"Failed to create transaction (status={resp.status_code}) { _safe_text(resp) }"
+        raise ShopifyTransactionSyncHttpError(
+            status_code=resp.status_code,
+            response_text=_safe_text(resp),
         )
     data = resp.json() if resp.content else {}
     txn = (data or {}).get("transaction") if isinstance(data, dict) else None
@@ -240,6 +258,24 @@ async def ensure_external_payment_transaction_best_effort(
         if str(t.get("authorization") or "").strip() == payment_ref:
             return {"ok": True, "created": False, "transaction_id": t.get("id")}
 
+    # Some Shopify orders are already recorded as external/manual sales when created.
+    # If the authorization already exists on another gateway, treat it as already synced.
+    for t in txns:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("authorization") or "").strip() != payment_ref:
+            continue
+        status = str(t.get("status") or "").lower()
+        if status and status != "success":
+            continue
+        return {
+            "ok": True,
+            "created": False,
+            "transaction_id": t.get("id"),
+            "matched_existing_authorization": True,
+            "existing_gateway": t.get("gateway"),
+        }
+
     try:
         txn = await create_shopify_order_transaction(
             shop_domain=shop_domain,
@@ -258,6 +294,32 @@ async def ensure_external_payment_transaction_best_effort(
         )
         return {"ok": True, "created": True, "transaction_id": txn.get("id")}
     except Exception as e:
+        if _is_non_fatal_invalid_sale_error(e):
+            logger.info(
+                "shopify_txn.create_soft_skipped order_id=%s shopify_order_id=%s gateway=%s reason=invalid_sale_kind",
+                pivota_order_id,
+                shopify_order_id,
+                gateway,
+            )
+            annotation = await annotate_shopify_order_best_effort(
+                shop_domain=shop_domain,
+                access_token=access_token,
+                shopify_order_id=shopify_order_id,
+                api_version=api_version,
+                note_attributes={
+                    "pivota_order_id": str(pivota_order_id or ""),
+                    "pivota_psp": gateway,
+                    "pivota_psp_payment_ref": payment_ref,
+                },
+                tags=["pivota-external-psp"],
+            )
+            return {
+                "ok": True,
+                "created": False,
+                "soft_skipped": True,
+                "reason": "invalid_sale_kind",
+                "annotation": annotation,
+            }
         logger.warning(
             "shopify_txn.create_failed order_id=%s shopify_order_id=%s gateway=%s err=%s",
             pivota_order_id,
@@ -382,4 +444,3 @@ async def ensure_external_refund_transaction_best_effort(
             tags=["pivota-external-psp-refund"],
         )
         return {"ok": False, "created": False, "error": str(e), "annotation": annotation}
-
