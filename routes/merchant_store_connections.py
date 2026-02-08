@@ -760,6 +760,15 @@ async def shopify_token_diagnostic(
         shop_status = shop_resp.status_code
 
     scope_set = set(scopes)
+    required_scopes = [s.strip() for s in (settings.shopify_scopes or "").split(",") if s.strip()]
+    required_scope_set = set(required_scopes)
+    missing_required_scopes: list[str] = []
+    if required_scope_set:
+        if scopes_status == 200:
+            missing_required_scopes = sorted(required_scope_set.difference(scope_set))
+        else:
+            # If we can't read scopes (auth failed, etc.), treat as unknown and surface the requirement list.
+            missing_required_scopes = sorted(required_scope_set)
     return {
         "status": "success",
         "merchant_id": target_merchant_id,
@@ -767,11 +776,15 @@ async def shopify_token_diagnostic(
         "auth_ok": shop_status == 200,
         "shop_status_code": shop_status,
         "scopes_status_code": scopes_status,
+        "required_scopes": sorted(required_scope_set),
+        "missing_required_scopes": missing_required_scopes,
         "scope_summary": {
             "read_products": "read_products" in scope_set,
             "read_orders": "read_orders" in scope_set,
             "read_fulfillments": "read_fulfillments" in scope_set,
             "read_customers": "read_customers" in scope_set,
+            "write_orders": "write_orders" in scope_set,
+            "write_webhooks": "write_webhooks" in scope_set,
         },
         "scope_count": len(scope_set),
     }
@@ -839,7 +852,7 @@ async def merchant_connect_shopify(
 ):
     """Allow merchant to connect their Shopify store"""
     # Allow merchant, employee, or admin
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # If merchant role, verify they can only connect their own store

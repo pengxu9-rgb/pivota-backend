@@ -15,6 +15,7 @@ import hashlib
 import httpx
 import os
 import json
+from contextlib import asynccontextmanager
 from sqlalchemy import and_, or_, select
 
 from models.order import (
@@ -29,7 +30,7 @@ from db.orders import (
 from db.orders import orders as orders_table
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
-from db.database import database
+from db.database import database, IS_POSTGRES
 from utils.auth import require_admin, require_admin_or_key, get_current_user
 from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
@@ -120,6 +121,55 @@ def _normalize_shopify_domain(domain: str) -> str:
     if d.endswith(".myshopify.com"):
         return d
     return f"{d}.myshopify.com"
+
+
+def _shopify_order_create_lock_key(order_id: str) -> int:
+    """
+    Stable advisory-lock key for a given order_id.
+
+    Postgres advisory locks accept signed bigint keys; derive one from sha256 to avoid
+    collisions across different lock namespaces and order ids.
+    """
+    raw = f"pivota:shopify_order_create:{order_id}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big", signed=True)
+
+
+@asynccontextmanager
+async def _pg_advisory_lock_best_effort(*, lock_key: int):
+    """
+    Best-effort Postgres advisory lock.
+
+    - Yields `True` when the lock is acquired (or locking is unavailable).
+    - Yields `False` when the lock is available but currently held by someone else.
+    """
+    if not IS_POSTGRES or not getattr(database, "is_connected", False):
+        yield True
+        return
+
+    try:
+        async with database.connection() as conn:
+            acquired = bool(
+                await conn.fetch_val(
+                    "SELECT pg_try_advisory_lock(:lock_key)",
+                    {"lock_key": int(lock_key)},
+                )
+            )
+            if not acquired:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                try:
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock(:lock_key)",
+                        {"lock_key": int(lock_key)},
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        # If advisory locks aren't available for any reason, proceed without blocking order creation.
+        yield True
 
 
 def _build_shopify_cart_permalink_best_effort(
@@ -1361,13 +1411,12 @@ async def confirm_payment(
             async def create_shopify_order_task():
                 """创建 Shopify 订单通知商户发货"""
                 try:
-                    if True and store_info.get("platform") == "shopify":
-                        logger.info(f"Creating Shopify order for {payment_request.order_id}")
-                        success = await create_shopify_order(payment_request.order_id)
-                        if success:
-                            logger.info(f"Shopify order created successfully for {payment_request.order_id}")
-                        else:
-                            logger.error(f"Failed to create Shopify order for {payment_request.order_id}")
+                    logger.info(f"Creating Shopify order for {payment_request.order_id}")
+                    success = await create_shopify_order(payment_request.order_id)
+                    if success:
+                        logger.info(f"Shopify order created successfully for {payment_request.order_id}")
+                    else:
+                        logger.error(f"Failed to create Shopify order for {payment_request.order_id}")
                 except Exception as e:
                     logger.error(f"Error in Shopify order creation task: {e}")
             
@@ -1841,88 +1890,134 @@ async def create_shopify_order(order_id: str) -> bool:
             )
             return True
 
-        # NOTE: Shopify REST Admin API is on a legacy track; keep as-is for v0.1,
-        # but plan migration to GraphQL Admin Orders API if you intend to ship as a public app.
-        async with httpx.AsyncClient() as client:
-            last_error: Optional[str] = None
-            for store in candidates:
-                shop_domain_raw = str((store or {}).get("domain") or "").strip()
-                shop_domain = _normalize_shopify_domain(shop_domain_raw)
-                access_token = extract_shopify_access_token((store or {}).get("api_key_raw") or (store or {}).get("api_key"))
-                store_id = str((store or {}).get("store_id") or "").strip() or None
+        # Concurrency guard: confirm-payment + Stripe webhook can race and both try to create.
+        # Use a Postgres advisory lock when available, otherwise proceed best-effort.
+        lock_key = _shopify_order_create_lock_key(order_id)
+        async with _pg_advisory_lock_best_effort(lock_key=lock_key) as lock_acquired:
+            if not lock_acquired:
+                # Another worker is creating the Shopify order. Wait briefly for it to finish
+                # and return the observed outcome (avoid duplicate creation).
+                for _ in range(60):
+                    await asyncio.sleep(0.2)
+                    latest = await get_order(order_id)
+                    if latest and str(latest.get("shopify_order_id") or "").strip():
+                        return True
+                logger.info("[Shopify] Create already in progress; skipping: order_id=%s", order_id)
+                return False
 
-                if not shop_domain or not access_token:
-                    continue
-
-                token_fp = _token_fingerprint(access_token)
+            # Re-check after acquiring the lock in case another path linked the order just before us.
+            latest = await get_order(order_id)
+            latest_shopify_order_id = str((latest or {}).get("shopify_order_id") or "").strip()
+            if latest_shopify_order_id:
                 logger.info(
-                    "[Shopify] Attempt create: order_id=%s store_id=%s domain=%s token_fp=%s",
+                    "[Shopify] Order linked while waiting for lock: order_id=%s shopify_order_id=%s",
                     order_id,
-                    store_id,
-                    shop_domain,
-                    token_fp,
+                    latest_shopify_order_id,
                 )
+                return True
 
-                # Idempotency guardrail: if Shopify already has an order with our tag, reuse it.
-                existing_id = await _find_existing_order_id_best_effort(
-                    shop_domain=shop_domain, access_token=access_token
-                )
-                if existing_id:
-                    return await _finalize_success(
-                        shopify_order_id=existing_id,
-                        store_used=store,
-                        shop_domain=shop_domain,
-                        access_token=access_token,
-                        event_type="shopify_order_reused",
+            # NOTE: Shopify REST Admin API is on a legacy track; keep as-is for v0.1,
+            # but plan migration to GraphQL Admin Orders API if you intend to ship as a public app.
+            async with httpx.AsyncClient() as client:
+                last_error: Optional[str] = None
+                for store in candidates:
+                    shop_domain_raw = str((store or {}).get("domain") or "").strip()
+                    shop_domain = _normalize_shopify_domain(shop_domain_raw)
+                    access_token = extract_shopify_access_token((store or {}).get("api_key_raw") or (store or {}).get("api_key"))
+                    store_id = str((store or {}).get("store_id") or "").strip() or None
+
+                    if not shop_domain or not access_token:
+                        continue
+
+                    token_fp = _token_fingerprint(access_token)
+                    logger.info(
+                        "[Shopify] Attempt create: order_id=%s store_id=%s domain=%s token_fp=%s",
+                        order_id,
+                        store_id,
+                        shop_domain,
+                        token_fp,
                     )
 
-                url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
-                headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
-
-                # Retry once on transient upstream failures.
-                for attempt in range(2):
-                    try:
-                        response = await client.post(
-                            url,
-                            json=shopify_order_data,
-                            headers=headers,
-                            timeout=12.0,
-                        )
-                    except Exception as e:
-                        last_error = f"{type(e).__name__}: {str(e)}"
-                        if attempt == 0:
-                            continue
-                        await log_order_event(
-                            event_type="shopify_order_error",
-                            order_id=order_id,
-                            merchant_id=order["merchant_id"],
-                            metadata={
-                                "store_id": store_id,
-                                "domain": shop_domain,
-                                "api_key_fp": token_fp,
-                                "error": last_error,
-                            },
-                        )
-                        return False
-
-                    logger.info("[Shopify] API response: %s", response.status_code)
-
-                    if response.status_code == 201:
-                        shopify_order = response.json().get("order") or {}
-                        shopify_order_id = str(shopify_order.get("id") or "").strip()
-                        if not shopify_order_id:
-                            last_error = "Missing Shopify order id in response"
-                            break
+                    # Idempotency guardrail: if Shopify already has an order with our tag, reuse it.
+                    existing_id = await _find_existing_order_id_best_effort(
+                        shop_domain=shop_domain, access_token=access_token
+                    )
+                    if existing_id:
                         return await _finalize_success(
-                            shopify_order_id=shopify_order_id,
+                            shopify_order_id=existing_id,
                             store_used=store,
                             shop_domain=shop_domain,
                             access_token=access_token,
-                            event_type="shopify_order_created",
+                            event_type="shopify_order_reused",
                         )
 
-                    # Auth errors: try another store row (stale token recovery).
-                    if response.status_code in (401, 403):
+                    url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
+                    headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
+
+                    # Retry once on transient upstream failures.
+                    for attempt in range(2):
+                        try:
+                            response = await client.post(
+                                url,
+                                json=shopify_order_data,
+                                headers=headers,
+                                timeout=12.0,
+                            )
+                        except Exception as e:
+                            last_error = f"{type(e).__name__}: {str(e)}"
+                            if attempt == 0:
+                                continue
+                            await log_order_event(
+                                event_type="shopify_order_error",
+                                order_id=order_id,
+                                merchant_id=order["merchant_id"],
+                                metadata={
+                                    "store_id": store_id,
+                                    "domain": shop_domain,
+                                    "api_key_fp": token_fp,
+                                    "error": last_error,
+                                },
+                            )
+                            return False
+
+                        logger.info("[Shopify] API response: %s", response.status_code)
+
+                        if response.status_code == 201:
+                            shopify_order = response.json().get("order") or {}
+                            shopify_order_id = str(shopify_order.get("id") or "").strip()
+                            if not shopify_order_id:
+                                last_error = "Missing Shopify order id in response"
+                                break
+                            return await _finalize_success(
+                                shopify_order_id=shopify_order_id,
+                                store_used=store,
+                                shop_domain=shop_domain,
+                                access_token=access_token,
+                                event_type="shopify_order_created",
+                            )
+
+                        # Auth errors: try another store row (stale token recovery).
+                        if response.status_code in (401, 403):
+                            error_msg = (response.text or "")[:800]
+                            await log_order_event(
+                                event_type="shopify_order_failed",
+                                order_id=order_id,
+                                merchant_id=order["merchant_id"],
+                                metadata={
+                                    "status_code": response.status_code,
+                                    "store_id": store_id,
+                                    "domain": shop_domain,
+                                    "api_key_fp": token_fp,
+                                    "error": error_msg,
+                                },
+                            )
+                            last_error = f"Auth failed {response.status_code}"
+                            break
+
+                        # Retryable upstream issues.
+                        if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                            continue
+
                         error_msg = (response.text or "")[:800]
                         await log_order_event(
                             event_type="shopify_order_failed",
@@ -1936,32 +2031,12 @@ async def create_shopify_order(order_id: str) -> bool:
                                 "error": error_msg,
                             },
                         )
-                        last_error = f"Auth failed {response.status_code}"
+                        last_error = f"Shopify API error {response.status_code}"
                         break
 
-                    # Retryable upstream issues.
-                    if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                        continue
-
-                    error_msg = (response.text or "")[:800]
-                    await log_order_event(
-                        event_type="shopify_order_failed",
-                        order_id=order_id,
-                        merchant_id=order["merchant_id"],
-                        metadata={
-                            "status_code": response.status_code,
-                            "store_id": store_id,
-                            "domain": shop_domain,
-                            "api_key_fp": token_fp,
-                            "error": error_msg,
-                        },
-                    )
-                    last_error = f"Shopify API error {response.status_code}"
-                    break
-
-            if last_error:
-                logger.error("[Shopify] ❌ Failed to create order_id=%s err=%s", order_id, last_error)
-            return False
+                if last_error:
+                    logger.error("[Shopify] ❌ Failed to create order_id=%s err=%s", order_id, last_error)
+                return False
     except Exception as e:
         logger.error(f"[Shopify] ❌ Exception in create_shopify_order: {type(e).__name__}: {e}", exc_info=True)
         

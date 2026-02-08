@@ -185,7 +185,7 @@ async def get_merchant_stores(
     current_user: dict = Depends(get_current_user)
 ):
     """Get merchant's connected stores from database"""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in ["merchant", "admin", "super_admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     stores = []

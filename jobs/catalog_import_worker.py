@@ -261,6 +261,10 @@ async def _fetch_shopify_products_page(
         published_status = (os.getenv("SHOPIFY_PUBLISHED_STATUS", "any") or "").strip()
         if published_status:
             params["published_status"] = published_status
+        # Shopify does not allow status together with page_info pagination.
+        product_status = (os.getenv("SHOPIFY_PRODUCT_STATUS", "any") or "").strip()
+        if product_status:
+            params["status"] = product_status
 
     timeout_seconds = float(os.getenv("SHOPIFY_HTTP_TIMEOUT_SECONDS", "30"))
     if timeout_seconds < 5:
