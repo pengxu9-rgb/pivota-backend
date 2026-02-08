@@ -5,6 +5,7 @@ Pivota 核心价值：实时代理 + 智能缓存 + 数据标准化
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -133,7 +134,13 @@ async def get_merchant_products_realtime(
     if platform == "shopify":
         # 安全地访问 store_info，避免未定义错误
         shop_domain = store_info.get("domain") if 'store_info' in locals() and store_info else None
-        access_token = store_info.get("api_key") if 'store_info' in locals() and store_info else None
+        access_token = None
+        if shop_domain and 'store_info' in locals() and store_info:
+            access_token, _ = await resolve_shopify_admin_access_token(
+                shop_domain=shop_domain,
+                api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
+                store_id=str(store_info.get("store_id") or "").strip() or None,
+            )
         
         # 如果从 store_info 获取失败，尝试环境变量或设置
         shop_domain = shop_domain or os.getenv("SHOPIFY_SHOP_DOMAIN") or getattr(settings, "shopify_shop_domain", None)
@@ -260,7 +267,12 @@ async def get_single_product_realtime(
                 headers={"X-Error-Code": "INVALID_STORE_CONFIG"}
             )
         
-        access_token = store_info.get("api_key") or store_info.get("access_token") or os.getenv("SHOPIFY_ACCESS_TOKEN")
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key") or store_info.get("access_token"),
+            store_id=str(store_info.get("store_id") or "").strip() or None,
+        )
+        access_token = access_token or os.getenv("SHOPIFY_ACCESS_TOKEN")
         if not access_token:
             raise HTTPException(
                 status_code=400,

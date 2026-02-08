@@ -3,7 +3,10 @@ Merchant Store Connections
 Allow merchants to connect their own stores (Shopify, Wix, etc.)
 """
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from services.shopify_transactions_service import extract_shopify_access_token
+from services.shopify_access_token_service import (
+    exchange_shopify_client_credentials_token,
+    resolve_shopify_admin_access_token,
+)
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
@@ -48,7 +51,9 @@ _STOREFRONT_AUTO_CREATE_DENIED_TTL_SECONDS = 24 * 3600
 class ConnectShopifyRequest(BaseModel):
     merchant_id: str
     shop_domain: str
-    access_token: str
+    access_token: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
     # Optional: Shopify webhook HMAC secret (API secret key for the app that owns the webhooks).
     # If omitted, we fall back to the global SHOPIFY_CLIENT_SECRET (official app). For custom apps,
     # this should be provided so we can verify webhooks.
@@ -731,11 +736,15 @@ async def shopify_token_diagnostic(
         raise HTTPException(status_code=400, detail="No Shopify store connected")
 
     shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip().lower()
-    # merchant_stores.api_key is JSON in newer versions; always parse via helper.
-    access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
+    access_token, token_meta = await resolve_shopify_admin_access_token(
+        shop_domain=shop_domain,
+        api_key_raw=store.get("api_key_raw") or store.get("api_key"),
+        store_id=str(store.get("store_id") or "").strip() or None,
+    )
     if not access_token:
         creds = store.get("api_credentials") if isinstance(store.get("api_credentials"), dict) else {}
         access_token = str(creds.get("access_token") or "").strip() or None
+        token_meta = {"has_client_credentials": bool(creds.get("client_id") and creds.get("client_secret")), "refreshed": False}
     if not shop_domain or not access_token:
         raise HTTPException(status_code=400, detail="Missing Shopify credentials")
 
@@ -787,6 +796,11 @@ async def shopify_token_diagnostic(
             "write_webhooks": "write_webhooks" in scope_set,
         },
         "scope_count": len(scope_set),
+        "token_refresh": {
+            "has_client_credentials": bool((token_meta or {}).get("has_client_credentials")),
+            "refreshed": bool((token_meta or {}).get("refreshed")),
+            "refresh_error": (token_meta or {}).get("refresh_error"),
+        },
     }
 
 
@@ -861,16 +875,43 @@ async def merchant_connect_shopify(
             raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
-        # Validate shop domain and access token
+        # Validate shop domain and credentials
         if not request.shop_domain or not request.shop_domain.strip():
             raise HTTPException(status_code=400, detail="Shop domain is required")
-        
-        if not request.access_token or not request.access_token.strip():
-            raise HTTPException(status_code=400, detail="Access token is required")
-        
+
+        provided_access_token = (request.access_token or "").strip()
+        provided_client_id = (request.client_id or "").strip()
+        provided_client_secret = (request.client_secret or "").strip()
+
+        if not provided_access_token and not (provided_client_id and provided_client_secret):
+            raise HTTPException(
+                status_code=400,
+                detail="Either access_token or client_id+client_secret is required",
+            )
+        if bool(provided_client_id) != bool(provided_client_secret):
+            raise HTTPException(
+                status_code=400,
+                detail="client_id and client_secret must be provided together",
+            )
+
+        effective_access_token = provided_access_token
+        exchanged_expires_in: Optional[int] = None
+        if not effective_access_token:
+            exchanged_token, exchanged_expires_in, exchange_error = await exchange_shopify_client_credentials_token(
+                shop_domain=request.shop_domain,
+                client_id=provided_client_id,
+                client_secret=provided_client_secret,
+            )
+            if not exchanged_token:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to obtain Shopify access token via client credentials ({exchange_error})",
+                )
+            effective_access_token = exchanged_token
+
         # Test Shopify API connection
         test_url = f"https://{request.shop_domain}/admin/api/2024-07/shop.json"
-        headers = {"X-Shopify-Access-Token": request.access_token}
+        headers = {"X-Shopify-Access-Token": effective_access_token}
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             test_response = await client.get(test_url, headers=headers)
@@ -923,6 +964,22 @@ async def merchant_connect_shopify(
             except Exception:
                 existing_creds = {}
 
+        # Preserve client credentials for 24h token refresh flows.
+        effective_client_id = provided_client_id or (
+            str(existing_creds.get("client_id") or "").strip() if isinstance(existing_creds, dict) else ""
+        )
+        effective_client_secret = provided_client_secret or (
+            str(existing_creds.get("client_secret") or "").strip() if isinstance(existing_creds, dict) else ""
+        )
+        if not (effective_client_id and effective_client_secret):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Shopify now requires client_id+client_secret for automatic token refresh. "
+                    "Please reconnect with client credentials."
+                ),
+            )
+
         if not storefront_token:
             stored = (
                 (
@@ -942,7 +999,7 @@ async def merchant_connect_shopify(
         if not storefront_token:
             auto = await _create_storefront_access_token_best_effort(
                 shop_domain=canonical_myshopify_domain,
-                access_token=request.access_token,
+                access_token=effective_access_token,
             )
             if auto:
                 storefront_token = auto
@@ -975,7 +1032,7 @@ async def merchant_connect_shopify(
                     if not storefront_token_created:
                         auto2 = await _create_storefront_access_token_best_effort(
                             shop_domain=canonical_myshopify_domain,
-                            access_token=request.access_token,
+                            access_token=effective_access_token,
                         )
                         if auto2:
                             try:
@@ -1001,7 +1058,16 @@ async def merchant_connect_shopify(
             except Exception:
                 storefront_token_verified = None
 
-        token_blob: Dict[str, Any] = {"access_token": request.access_token}
+        token_blob: Dict[str, Any] = {"access_token": effective_access_token}
+        if effective_client_id and effective_client_secret:
+            token_blob["client_id"] = effective_client_id
+            token_blob["client_secret"] = effective_client_secret
+            token_blob["access_token_issued_at"] = datetime.now(timezone.utc).isoformat()
+            if exchanged_expires_in and exchanged_expires_in > 0:
+                token_blob["access_token_expires_in"] = int(exchanged_expires_in)
+                token_blob["access_token_expires_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=int(exchanged_expires_in))
+                ).isoformat()
         webhook_secret = (request.webhook_secret or "").strip()
         if webhook_secret:
             token_blob["webhook_secret"] = webhook_secret
@@ -1239,16 +1305,23 @@ async def merchant_sync_shopify_products(
             {"store_id": store["store_id"]}
         )
         api_key_raw = cred_row["api_key"] if cred_row else None
-        
-        # Parse token (support JSON format)
-        if api_key_raw and api_key_raw.strip().startswith("{"):
-            token_data = json.loads(api_key_raw)
-            access_token = token_data.get("access_token", api_key_raw)
-        else:
-            access_token = api_key_raw
+        access_token, token_meta = await resolve_shopify_admin_access_token(
+            shop_domain=store.get("domain"),
+            api_key_raw=api_key_raw,
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
         
         if not access_token:
             raise HTTPException(status_code=400, detail="Shopify access token not found")
+        if (token_meta or {}).get("refreshed"):
+            logger.info(
+                "Shopify admin token refreshed before legacy sync endpoint",
+                extra={
+                    "merchant_id": target_merchant_id,
+                    "store_id": store.get("store_id"),
+                    "shop_domain": store.get("domain"),
+                },
+            )
         
         # Fetch products from Shopify API (paginated).
         synced_count = 0

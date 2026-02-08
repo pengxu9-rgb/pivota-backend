@@ -4,6 +4,7 @@ Webhook 处理路由
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
@@ -1133,7 +1134,11 @@ async def register_shopify_webhooks(
             raise HTTPException(status_code=400, detail="No Shopify store connected")
 
         shop_domain = shopify_store.get("domain")
-        access_token = shopify_store.get("api_key")
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=shopify_store.get("api_key_raw") or shopify_store.get("api_key"),
+            store_id=str(shopify_store.get("store_id") or "").strip() or None,
+        )
         
         if not shop_domain or not access_token:
             raise HTTPException(status_code=400, detail="Missing Shopify credentials")

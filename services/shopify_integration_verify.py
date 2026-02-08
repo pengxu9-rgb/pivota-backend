@@ -8,8 +8,8 @@ import httpx
 
 from db.database import database
 from services.merchant_store_service import get_primary_store
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.shopify_graphql_client import ShopifyGraphQLError, shopify_admin_graphql
-from services.shopify_transactions_service import extract_shopify_access_token
 from services.shopify_policy_service import (
     fetch_and_store_shop_policies,
     get_latest_policy_hashes,
@@ -328,7 +328,12 @@ async def verify_shopify_integration(
         raise ValueError("Primary store is not Shopify")
 
     shop_domain = store_info.get("domain") or ""
-    access_token = extract_shopify_access_token(store_info.get("api_key")) or ""
+    access_token, _ = await resolve_shopify_admin_access_token(
+        shop_domain=shop_domain,
+        api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
+        store_id=str(store_info.get("store_id") or "").strip() or None,
+    )
+    access_token = (access_token or "").strip()
     store_id = store_info.get("store_id")
 
     if not shop_domain or not access_token:

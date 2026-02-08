@@ -21,6 +21,7 @@ import hashlib
 
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_store_service import get_primary_store
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
 
 router = APIRouter()
@@ -95,7 +96,11 @@ async def _get_shopify_credentials_for_merchant(merchant_id: str) -> Optional[di
     if not store or str(store.get("platform", "")).lower() != "shopify":
         return None
     shop_domain = _normalize_shopify_domain(store.get("domain") or "")
-    access_token = store.get("api_key") or ""
+    access_token, _ = await resolve_shopify_admin_access_token(
+        shop_domain=shop_domain,
+        api_key_raw=store.get("api_key_raw") or store.get("api_key"),
+        store_id=str(store.get("store_id") or "").strip() or None,
+    )
     if not shop_domain or not access_token:
         return None
     return {"shop_domain": shop_domain, "access_token": access_token}
@@ -467,7 +472,12 @@ async def _create_shopify_manual_refund_best_effort(
         if not store or str(store.get("platform") or "").lower() != "shopify":
             return
         shop_domain = str(store.get("domain") or "").strip()
-        access_token = str(store.get("api_key") or "").strip()
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store.get("api_key_raw") or store.get("api_key"),
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
+        access_token = str(access_token or "").strip()
         if not shop_domain or not access_token:
             return
 

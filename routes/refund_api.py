@@ -18,9 +18,9 @@ from adapters.psp_adapter import get_psp_adapter
 from config.settings import settings
 from utils.logger import logger
 from services.shopify_transactions_service import (
-    extract_shopify_access_token,
     ensure_external_refund_transaction_best_effort,
 )
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 
 
 router = APIRouter(prefix="/orders", tags=["refunds"])
@@ -351,7 +351,11 @@ async def process_refund(
                     return
 
                 shop_domain = store_info.get("domain")
-                access_token = extract_shopify_access_token(store_info.get("api_key"))
+                access_token, _ = await resolve_shopify_admin_access_token(
+                    shop_domain=shop_domain,
+                    api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
+                    store_id=str(store_info.get("store_id") or "").strip() or None,
+                )
                 if not (shop_domain and access_token):
                     return
 

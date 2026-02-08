@@ -16,8 +16,8 @@ import time
 
 from db.database import database
 from services.merchant_store_service import get_primary_store
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingResult
-from services.shopify_transactions_service import extract_shopify_access_token
 from utils.logger import logger
 
 
@@ -457,12 +457,18 @@ query($ids: [ID!]!) {
                 debug_id,
             )
 
+        admin_access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store.get("api_key_raw") or store.get("api_key"),
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
+        admin_access_token = (admin_access_token or "").strip() or None
+
         if (
             not storefront_token
             and self._runtime_rotate_enabled
             and _rotate_allowed(merchant_id=merchant_id, cooldown_s=self._rotate_cooldown_s)
         ):
-            admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
             if admin_access_token:
                 storefront_token = (
                     await _rotate_storefront_token_best_effort(
@@ -503,7 +509,6 @@ query($ids: [ID!]!) {
 
         if err is not None:
             if _is_invalid_merchandise_id(err):
-                admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
                 rotated = False
 
                 # Self-heal common misconfig: Storefront scopes enabled after token issuance.
@@ -583,7 +588,6 @@ query($ids: [ID!]!) {
         # This is critical because we create Shopify orders via Admin API (not Shopify checkout),
         # which can otherwise bypass storefront "sold out" restrictions.
         try:
-            admin_access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
             if admin_access_token:
                 await self._enforce_inventory_policy_best_effort(
                     shop_domain=shop_domain,

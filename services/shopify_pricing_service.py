@@ -11,7 +11,7 @@ import httpx
 import os
 
 from services.merchant_store_service import get_primary_store
-from services.shopify_transactions_service import extract_shopify_access_token
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from utils.logger import logger
 
 
@@ -97,7 +97,11 @@ class ShopifyPricingService:
             )
 
         shop_domain = store.get("domain")
-        access_token = extract_shopify_access_token(store.get("api_key_raw") or store.get("api_key"))
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store.get("api_key_raw") or store.get("api_key"),
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
         if not shop_domain or not access_token:
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
@@ -177,7 +181,10 @@ class ShopifyPricingService:
             checkout=checkout, discount_total=pricing["discount_total"]
         )
         line_items = await self._extract_line_items(
-            merchant_id=merchant_id, store=store, checkout=checkout
+            merchant_id=merchant_id,
+            store=store,
+            checkout=checkout,
+            access_token=access_token,
         )
 
         delivery_options = None
@@ -418,10 +425,14 @@ class ShopifyPricingService:
         return promo_lines, rounding_meta
 
     async def _extract_line_items(
-        self, *, merchant_id: str, store: Dict[str, Any], checkout: Dict[str, Any]
+        self,
+        *,
+        merchant_id: str,
+        store: Dict[str, Any],
+        checkout: Dict[str, Any],
+        access_token: str,
     ) -> List[Dict[str, Any]]:
         shop_domain = store.get("domain")
-        access_token = store.get("api_key")
         if not shop_domain or not access_token:
             return []
 

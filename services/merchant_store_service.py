@@ -29,12 +29,14 @@ def parse_api_key(api_key: str) -> str:
     if api_key.strip().startswith("{"):
         try:
             parsed = json.loads(api_key)
-            # 尝试提取 access_token
-            if isinstance(parsed, dict) and "access_token" in parsed:
-                token = parsed["access_token"]
-                # Do not log secrets (tokens).
-                logger.info("Parsed JSON format token from merchant_stores.api_key")
-                return token
+            if isinstance(parsed, dict):
+                token = parsed.get("access_token") or parsed.get("token")
+                if isinstance(token, str) and token.strip():
+                    # Do not log secrets (tokens).
+                    logger.info("Parsed JSON format token from merchant_stores.api_key")
+                    return token.strip()
+                # JSON credentials blob exists but no usable token yet.
+                return ""
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse JSON token, using as-is: {e}")
     

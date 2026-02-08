@@ -9,6 +9,7 @@ from fastapi import Depends
 from db.database import database
 import httpx
 
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from utils.auth import require_admin
 
 router = APIRouter(prefix="/admin/debug", tags=["Admin Debug"])
@@ -87,6 +88,15 @@ async def debug_shopify_token(merchant_id: str, current_user: dict = Depends(req
                     parse_method = "fallback"
                     token_analysis["json_parse_error"] = str(e)
         
+        refresh_meta = {"has_client_credentials": False, "refreshed": False}
+        resolved_token, refresh_meta = await resolve_shopify_admin_access_token(
+            shop_domain=store["domain"],
+            api_key_raw=api_key,
+            store_id=str(store["store_id"]),
+        )
+        if resolved_token:
+            parsed_token = resolved_token
+
         # Test the token with Shopify API
         test_result = None
         if parsed_token and store["domain"]:
@@ -131,6 +141,11 @@ async def debug_shopify_token(merchant_id: str, current_user: dict = Depends(req
                 "parsed_token_sha256_fp": hashlib.sha256(parsed_token.encode("utf-8")).hexdigest()[:12]
                 if parsed_token
                 else None,
+            },
+            "token_refresh": {
+                "has_client_credentials": bool((refresh_meta or {}).get("has_client_credentials")),
+                "refreshed": bool((refresh_meta or {}).get("refreshed")),
+                "refresh_error": (refresh_meta or {}).get("refresh_error"),
             },
             "api_test": test_result,
             "diagnosis": _diagnose_shopify_issue(test_result, token_analysis) if test_result else None
@@ -191,4 +206,3 @@ def _diagnose_shopify_issue(test_result: dict, token_analysis: dict) -> dict:
             "issue": test_result.get("error", "Unknown error"),
             "fix": "Check network connectivity and Shopify status"
         }
-

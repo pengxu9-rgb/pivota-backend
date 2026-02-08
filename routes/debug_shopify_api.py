@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import httpx
 from utils.logger import logger
 from db.database import database
-from services.shopify_transactions_service import extract_shopify_access_token
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 
 router = APIRouter(prefix="/debug", tags=["debug"])
 
@@ -25,7 +25,7 @@ async def test_shopify_api(merchant_id: str):
         # 1. 获取 Shopify 商店信息
         store = await database.fetch_one(
             """
-            SELECT domain, api_key, status, connected_at
+            SELECT store_id, domain, api_key, status, connected_at
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
               AND platform = 'shopify'
@@ -41,7 +41,11 @@ async def test_shopify_api(merchant_id: str):
         
         shop_domain = store["domain"]
         api_key_raw = store["api_key"]
-        access_token = extract_shopify_access_token(api_key_raw)
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=api_key_raw,
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
         if not access_token:
             raise HTTPException(status_code=400, detail="Shopify access token missing/invalid (stored api_key)")
         

@@ -6,6 +6,7 @@ Allows agents to view merchant products via hybrid query (cache or realtime)
 from services.product_query_service import get_products_hybrid, log_query_source
 from services.agent_product_service import get_agent_product_view
 import services.merchant_store_service as merchant_store_service
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -862,20 +863,11 @@ async def get_product_details(
                 headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
             )
 
-        api_key_raw = store.get("api_key") or store.get("access_token")
-
-        # Parse JSON token if needed (same logic as product_sync)
-        access_token = api_key_raw
-        if api_key_raw and api_key_raw.strip().startswith("{"):
-            try:
-                token_data = json.loads(api_key_raw)
-                access_token = (
-                    token_data.get("access_token")
-                    or token_data.get("token")
-                    or api_key_raw
-                )
-            except Exception:
-                pass
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store.get("api_key_raw") or store.get("api_key") or store.get("access_token"),
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
 
         if not access_token:
             raise HTTPException(
@@ -1041,14 +1033,11 @@ async def get_product_details_by_variant(
         return resp
 
     shop_domain = store.get("domain") or store.get("shop_domain")
-    api_key_raw = store.get("api_key") or store.get("access_token")
-    access_token = api_key_raw
-    if api_key_raw and isinstance(api_key_raw, str) and api_key_raw.strip().startswith("{"):
-        try:
-            token_data = json.loads(api_key_raw)
-            access_token = token_data.get("access_token") or token_data.get("token") or api_key_raw
-        except Exception:
-            access_token = api_key_raw
+    access_token, _ = await resolve_shopify_admin_access_token(
+        shop_domain=shop_domain,
+        api_key_raw=store.get("api_key_raw") or store.get("api_key") or store.get("access_token"),
+        store_id=str(store.get("store_id") or "").strip() or None,
+    )
 
     if not shop_domain:
         raise HTTPException(

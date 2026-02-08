@@ -51,6 +51,7 @@ from services.shopify_transactions_service import (
     extract_shopify_access_token,
     ensure_external_payment_transaction_best_effort,
 )
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
     send_invitation_email_from_order,
@@ -391,7 +392,11 @@ async def check_inventory_availability(
             return True, {"message": f"Platform {merchant.get('mcp_platform')} inventory check not implemented"}
         
         shop_domain = store_info.get("domain")
-        access_token = extract_shopify_access_token(store_info.get("api_key"))
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
+            store_id=str(store_info.get("store_id") or "").strip() or None,
+        )
         
         if not shop_domain or not access_token:
             return True, {"message": "Shop credentials missing, skipping inventory check"}
@@ -1923,8 +1928,12 @@ async def create_shopify_order(order_id: str) -> bool:
                 for store in candidates:
                     shop_domain_raw = str((store or {}).get("domain") or "").strip()
                     shop_domain = _normalize_shopify_domain(shop_domain_raw)
-                    access_token = extract_shopify_access_token((store or {}).get("api_key_raw") or (store or {}).get("api_key"))
                     store_id = str((store or {}).get("store_id") or "").strip() or None
+                    access_token, token_meta = await resolve_shopify_admin_access_token(
+                        shop_domain=shop_domain,
+                        api_key_raw=(store or {}).get("api_key_raw") or (store or {}).get("api_key"),
+                        store_id=store_id,
+                    )
 
                     if not shop_domain or not access_token:
                         continue
@@ -1975,6 +1984,8 @@ async def create_shopify_order(order_id: str) -> bool:
                                     "store_id": store_id,
                                     "domain": shop_domain,
                                     "api_key_fp": token_fp,
+                                    "token_refreshed": bool((token_meta or {}).get("refreshed")),
+                                    "token_refresh_error": (token_meta or {}).get("refresh_error"),
                                     "error": last_error,
                                 },
                             )

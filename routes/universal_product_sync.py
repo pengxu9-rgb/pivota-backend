@@ -13,6 +13,7 @@ import logging
 from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
 from db.products import delete_missing_products_from_cache
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products", tags=["product-sync-v2"])
@@ -106,6 +107,15 @@ async def universal_product_sync(
         
         platform = store_info["platform"]
         logger.info(f"Found {platform} store for merchant {request.merchant_id}")
+
+        if platform == "shopify":
+            refreshed_token, _ = await resolve_shopify_admin_access_token(
+                shop_domain=store_info.get("domain"),
+                api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
+                store_id=str(store_info.get("store_id") or "").strip() or None,
+            )
+            if refreshed_token:
+                store_info["api_key"] = refreshed_token
         
         # 3. Check credentials and prepare for sync
         credentials = prepare_platform_credentials(platform, store_info)

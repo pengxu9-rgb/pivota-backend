@@ -38,6 +38,10 @@ from db.connector_credentials import (
     mark_credential_used,
 )
 from services.crypto_service import crypto_service
+from services.shopify_access_token_service import (
+    exchange_shopify_client_credentials_token,
+    resolve_shopify_admin_access_token,
+)
 from catalog.recommendation_meta import derive_recommendation_meta
 from db.products import upsert_product_cache, touch_products_cache_ttl
 from db.platform_import_reports import get_platform_report
@@ -530,6 +534,26 @@ async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
             decrypted = crypto_service.decrypt_json_secret(credential["credentials_encrypted"])
             shop_domain = (decrypted.get("shop_domain") or "").strip()
             access_token = (decrypted.get("access_token") or "").strip()
+            if (not access_token) and shop_domain:
+                client_id = (decrypted.get("client_id") or "").strip()
+                client_secret = (decrypted.get("client_secret") or "").strip()
+                if client_id and client_secret:
+                    refreshed, _, err = await exchange_shopify_client_credentials_token(
+                        shop_domain=shop_domain,
+                        client_id=client_id,
+                        client_secret=client_secret,
+                    )
+                    if refreshed:
+                        access_token = refreshed
+                    else:
+                        logger.warning(
+                            "Connector client_credentials exchange failed; falling back",
+                            extra={
+                                "merchant_id": merchant_id,
+                                "credential_id": credential["id"],
+                                "error": err,
+                            },
+                        )
             if shop_domain and access_token:
                 await mark_credential_used(credential["id"])
                 return {"shop_domain": shop_domain, "access_token": access_token}
@@ -552,7 +576,12 @@ async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
             if (store.get("platform") or "").lower() != "shopify":
                 continue
             shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip()
-            access_token = (store.get("api_key") or store.get("access_token") or "").strip()
+            access_token, _ = await resolve_shopify_admin_access_token(
+                shop_domain=shop_domain,
+                api_key_raw=store.get("api_key_raw") or store.get("api_key"),
+                store_id=str(store.get("store_id") or "").strip() or None,
+            )
+            access_token = (access_token or "").strip()
             if shop_domain and access_token:
                 return {"shop_domain": shop_domain, "access_token": access_token}
     except Exception as e:

@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 from db.database import database
 from db.products import upsert_product_cache
 from adapters.product_adapters import fetch_merchant_products
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 
 
 class ShopifyProductsSyncError(Exception):
@@ -37,7 +38,7 @@ class ShopifyProductsSyncRateLimitError(ShopifyProductsSyncError):
 async def _get_shopify_store_credentials(merchant_id: str) -> Dict[str, str]:
     row = await database.fetch_one(
         """
-        SELECT domain, api_key, status
+        SELECT store_id, domain, api_key, status
         FROM merchant_stores
         WHERE merchant_id = :merchant_id
           AND platform = 'shopify'
@@ -57,18 +58,15 @@ async def _get_shopify_store_credentials(merchant_id: str) -> Dict[str, str]:
     if status != "active":
         raise ShopifyProductsSyncConfigError(f"Shopify store is {data.get('status')}; reconnect required")
 
-    shop_domain = data.get("domain")
+    shop_domain = str(data.get("domain") or "").strip()
     api_key_raw = data.get("api_key")
+    store_id = str(data.get("store_id") or "").strip() or None
 
-    access_token: Optional[str] = None
-    if isinstance(api_key_raw, str) and api_key_raw.strip().startswith("{"):
-        try:
-            token_data = json.loads(api_key_raw)
-            access_token = token_data.get("access_token") or token_data.get("token")
-        except Exception:
-            access_token = None
-    elif isinstance(api_key_raw, str):
-        access_token = api_key_raw
+    access_token, _ = await resolve_shopify_admin_access_token(
+        shop_domain=shop_domain,
+        api_key_raw=api_key_raw,
+        store_id=store_id,
+    )
 
     if not shop_domain or not access_token:
         raise ShopifyProductsSyncConfigError("Shopify credentials missing (domain/access_token)")

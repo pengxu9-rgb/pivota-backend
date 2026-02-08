@@ -19,7 +19,9 @@ router = APIRouter()
 class ConnectShopifyRequest(BaseModel):
     merchant_id: str
     shop_domain: str
-    access_token: str
+    access_token: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
     store_name: Optional[str] = None
 
 class ConnectWixRequest(BaseModel):
@@ -50,126 +52,22 @@ async def connect_shopify_store_employee(
     request: ConnectShopifyRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Employee-only version. Merchants should use /integrations/shopify/connect from merchant_store_connections.py"""
-    """Connect Shopify store for a merchant (Employee action)"""
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    try:
-        # Check if merchant exists and is in valid status
-        merchant_check = await database.fetch_one(
-            "SELECT merchant_id, status FROM merchant_onboarding WHERE merchant_id = :merchant_id",
-            {"merchant_id": request.merchant_id}
-        )
-        
-        if not merchant_check:
-            raise HTTPException(status_code=404, detail="Merchant not found")
-        
-        # Don't allow connecting stores for rejected/deleted merchants
-        if merchant_check["status"] in ["rejected", "deleted"]:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Cannot connect store for {merchant_check['status']} merchant. Please approve merchant first."
-            )
-        
-        # Validate shop domain format
-        if not request.shop_domain or not request.shop_domain.strip():
-            raise HTTPException(status_code=400, detail="Shop domain is required")
-        
-        # Validate access token
-        if not request.access_token or not request.access_token.strip():
-            raise HTTPException(status_code=400, detail="Access token is required")
-        
-        # Test Shopify API connection
-        import httpx
-        test_url = f"https://{request.shop_domain}/admin/api/2024-07/shop.json"
-        headers = {"X-Shopify-Access-Token": request.access_token}
-        
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                test_response = await client.get(test_url, headers=headers)
-            
-            if test_response.status_code != 200:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Invalid Shopify credentials. API returned: {test_response.status_code}"
-                )
-            
-            # Verify shop data
-            shop_data = test_response.json()
-            if not shop_data.get("shop"):
-                raise HTTPException(status_code=400, detail="Invalid Shopify response - no shop data")
-            
-            logger.info(f"✅ Shopify credentials verified for {request.shop_domain}")
-            
-        except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Cannot connect to Shopify. Please check shop domain: {str(e)}"
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Failed to verify Shopify credentials: {str(e)}"
-            )
-        
-        # Check if store already exists
-        existing = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
-               WHERE merchant_id = :merchant_id AND platform = 'shopify' 
-               AND domain = :domain""",
-            {"merchant_id": request.merchant_id, "domain": request.shop_domain}
-        )
-        
-        if existing:
-            # Update existing store
-            await database.execute(
-                """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'connected', connected_at = :connected_at
-                   WHERE store_id = :store_id""",
-                {
-                    "api_key": request.access_token,
-                    "connected_at": datetime.now(),
-                    "store_id": existing["store_id"]
-                }
-            )
-            store_id = existing["store_id"]
-        else:
-            # Create new store connection
-            store_id = f"store_shopify_{uuid.uuid4().hex[:8]}"
-            
-            await database.execute(
-                """INSERT INTO merchant_stores 
-                   (store_id, merchant_id, platform, name, domain, status, product_count, api_key, connected_at)
-                   VALUES (:store_id, :merchant_id, :platform, :name, :domain, :status, :product_count, :api_key, :connected_at)""",
-                {
-                    "store_id": store_id,
-                    "merchant_id": request.merchant_id,
-                    "platform": "shopify",
-                    "name": request.store_name or request.shop_domain,
-                    "domain": request.shop_domain,
-                    "status": "connected",
-                    "product_count": 0,
-                    "api_key": request.access_token,
-                    "connected_at": datetime.now()
-                }
-            )
-        
-        # Legacy MCP fields have been migrated to merchant_stores table
-        # No need to update merchant_onboarding anymore
-        
-        return {
-            "status": "success",
-            "message": "Shopify store connected successfully",
-            "store_id": store_id
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to connect Shopify: {str(e)}")
+
+    # Reuse the canonical merchant Shopify connect logic so employee and merchant
+    # flows have identical token validation/storage behavior.
+    from routes.merchant_store_connections import ConnectShopifyRequest as MerchantConnectShopifyRequest
+    from routes.merchant_store_connections import merchant_connect_shopify
+
+    delegated_request = MerchantConnectShopifyRequest(
+        merchant_id=request.merchant_id,
+        shop_domain=request.shop_domain,
+        access_token=request.access_token,
+        client_id=request.client_id,
+        client_secret=request.client_secret,
+    )
+    return await merchant_connect_shopify(request=delegated_request, current_user=current_user)
 
 @router.post("/integrations/wix/connect-employee")
 async def connect_wix_store_employee(
