@@ -1098,7 +1098,7 @@ async def merchant_verify_shopify_integration(
     - capability probes (Shopify Payments / Returns)
     Persists a snapshot to pcs_merchant_capabilities when available.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     if current_user["role"] == "merchant" and current_user.get("merchant_id") != request.merchant_id:
