@@ -160,3 +160,31 @@ async def test_create_shopify_order_falls_back_to_other_store_on_401(monkeypatch
 
     assert updated_store_id["order_id"] == order_id
     assert updated_store_id["update_data"]["store_id"] == "store_2"
+
+
+@pytest.mark.asyncio
+async def test_create_shopify_order_returns_true_when_lock_not_acquired(monkeypatch):
+    from routes import order_routes
+
+    called = {"get_order": 0, "released": 0}
+
+    async def fake_try_acquire(_order_id: str):
+        assert _order_id == "ORD_LOCKED"
+        return False, 123
+
+    async def fake_release(_lock_key, *, lock_acquired: bool):
+        called["released"] += 1
+        assert lock_acquired is False
+
+    async def fake_get_order(_order_id: str):
+        called["get_order"] += 1
+        return None
+
+    monkeypatch.setattr(order_routes, "_try_acquire_shopify_order_lock", fake_try_acquire)
+    monkeypatch.setattr(order_routes, "_release_shopify_order_lock", fake_release)
+    monkeypatch.setattr(order_routes, "get_order", fake_get_order)
+
+    ok = await order_routes.create_shopify_order("ORD_LOCKED")
+    assert ok is True
+    assert called["get_order"] == 0
+    assert called["released"] == 1

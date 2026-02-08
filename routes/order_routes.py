@@ -62,6 +62,45 @@ from services.reviews_invitation_send_jobs_service import (
 )
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+_PG_SHOPIFY_LOCK_SUPPORTED: Optional[bool] = None
+
+
+def _shopify_order_lock_key(order_id: str) -> int:
+    digest = hashlib.sha256(f"shopify_order:{order_id}".encode("utf-8")).hexdigest()
+    # Keep within signed int64 range for pg advisory lock.
+    return int(digest[:16], 16) & 0x7FFFFFFFFFFFFFFF
+
+
+async def _try_acquire_shopify_order_lock(order_id: str) -> Tuple[bool, Optional[int]]:
+    global _PG_SHOPIFY_LOCK_SUPPORTED
+
+    if _PG_SHOPIFY_LOCK_SUPPORTED is False:
+        return True, None
+
+    lock_key = _shopify_order_lock_key(order_id)
+    try:
+        row = await database.fetch_one(
+            "SELECT pg_try_advisory_lock(:lock_key) AS locked",
+            {"lock_key": lock_key},
+        )
+        _PG_SHOPIFY_LOCK_SUPPORTED = True
+        locked = bool((row or {}).get("locked"))
+        return locked, lock_key
+    except Exception:
+        _PG_SHOPIFY_LOCK_SUPPORTED = False
+        return True, None
+
+
+async def _release_shopify_order_lock(lock_key: Optional[int], *, lock_acquired: bool) -> None:
+    if not lock_acquired or lock_key is None or _PG_SHOPIFY_LOCK_SUPPORTED is not True:
+        return
+    try:
+        await database.execute(
+            "SELECT pg_advisory_unlock(:lock_key)",
+            {"lock_key": lock_key},
+        )
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -1475,7 +1514,17 @@ async def create_shopify_order(order_id: str) -> bool:
     - 失败不影响 Pivota 订单状态
     - 记录事件日志用于后续重试
     """
+    lock_key: Optional[int] = None
+    lock_acquired = True
     try:
+        lock_acquired, lock_key = await _try_acquire_shopify_order_lock(order_id)
+        if not lock_acquired:
+            logger.info(
+                "[Shopify] Duplicate create suppressed by advisory lock: order_id=%s",
+                order_id,
+            )
+            return True
+
         logger.info("[Shopify] Starting order creation for %s", order_id)
 
         order = await get_order(order_id)
@@ -1923,6 +1972,8 @@ async def create_shopify_order(order_id: str) -> bool:
             logger.error(f"[Shopify] Failed to log order event: {log_error}")
             
         return False
+    finally:
+        await _release_shopify_order_lock(lock_key, lock_acquired=lock_acquired)
 
 
 # ============================================================================
