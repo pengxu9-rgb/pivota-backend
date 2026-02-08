@@ -84,7 +84,12 @@ async def _try_acquire_shopify_order_lock(order_id: str) -> Tuple[bool, Optional
             {"lock_key": lock_key},
         )
         _PG_SHOPIFY_LOCK_SUPPORTED = True
-        locked = bool((row or {}).get("locked"))
+        locked = False
+        if row is not None:
+            try:
+                locked = bool(row["locked"])
+            except Exception:
+                locked = bool(getattr(row, "locked", False))
         return locked, lock_key
     except Exception:
         _PG_SHOPIFY_LOCK_SUPPORTED = False
