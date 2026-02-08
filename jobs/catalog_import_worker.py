@@ -265,9 +265,10 @@ async def _fetch_shopify_products_page(
         published_status = (os.getenv("SHOPIFY_PUBLISHED_STATUS", "any") or "").strip()
         if published_status:
             params["published_status"] = published_status
-        # Shopify does not allow status together with page_info pagination.
-        product_status = (os.getenv("SHOPIFY_PRODUCT_STATUS", "any") or "").strip()
-        if product_status:
+        # Keep status unset by default. Some shops return empty product lists when
+        # `status=any` is provided despite valid credentials and non-empty catalogs.
+        product_status = (os.getenv("SHOPIFY_PRODUCT_STATUS", "") or "").strip()
+        if product_status and product_status.lower() != "any":
             params["status"] = product_status
 
     timeout_seconds = float(os.getenv("SHOPIFY_HTTP_TIMEOUT_SECONDS", "30"))
