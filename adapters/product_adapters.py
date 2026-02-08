@@ -187,9 +187,8 @@ class ShopifyProductAdapter:
             params["page_info"] = page_info
         else:
             params["published_status"] = "any"
-            # Also include draft/archived products on the first page. Shopify does not allow
-            # status together with page_info pagination.
-            params["status"] = "any"
+            # Keep status unset. Some shops now return an empty list when `status=any`
+            # is passed, even with a valid token and non-empty catalog.
         
         headers = {"X-Shopify-Access-Token": access_token}
         
