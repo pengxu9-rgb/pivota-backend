@@ -188,3 +188,37 @@ async def test_create_shopify_order_returns_true_when_lock_not_acquired(monkeypa
     assert ok is True
     assert called["get_order"] == 0
     assert called["released"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_missing_shopify_dry_run_handles_row_without_get(monkeypatch):
+    from routes import order_routes
+
+    class RowWithoutGet:
+        def __init__(self, order_id: str):
+            self._order_id = order_id
+            self.get = None
+
+        def __getitem__(self, key):
+            if key == "order_id":
+                return self._order_id
+            raise KeyError(key)
+
+    class DummyDatabase:
+        async def fetch_all(self, _query):
+            return [RowWithoutGet("ORD_REC_1"), RowWithoutGet("ORD_REC_2")]
+
+    monkeypatch.setattr(order_routes, "database", DummyDatabase())
+
+    resp = await order_routes.reconcile_missing_shopify_orders(
+        merchant_id="merch_1",
+        limit=50,
+        min_age_seconds=120,
+        dry_run=True,
+        current_user={"role": "admin"},
+    )
+
+    assert resp["status"] == "success"
+    assert resp["dry_run"] is True
+    assert resp["count"] == 2
+    assert resp["candidates"] == ["ORD_REC_1", "ORD_REC_2"]

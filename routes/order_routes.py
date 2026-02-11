@@ -2231,14 +2231,34 @@ async def reconcile_missing_shopify_orders(
     if merchant_id:
         conditions.append(orders_table.c.merchant_id == merchant_id)
 
+    try:
+        base_query = select(orders_table.c.order_id)
+    except Exception:
+        # SQLAlchemy 1.x compatibility
+        base_query = select([orders_table.c.order_id])
+
     query = (
-        select([orders_table.c.order_id])
-        .where(and_(*conditions))
+        base_query.where(and_(*conditions))
         .order_by(orders_table.c.created_at.asc())
         .limit(int(limit))
     )
     rows = await database.fetch_all(query)
-    order_ids = [str(r["order_id"]) for r in (rows or []) if r and r.get("order_id")]
+    order_ids: List[str] = []
+    for row in (rows or []):
+        if not row:
+            continue
+        order_id_value = None
+        try:
+            # `databases` can return row wrappers that support `__getitem__` but not `.get()`.
+            order_id_value = row["order_id"]
+        except Exception:
+            if isinstance(row, dict):
+                order_id_value = row.get("order_id")
+            else:
+                order_id_value = getattr(row, "order_id", None)
+        if order_id_value in (None, ""):
+            continue
+        order_ids.append(str(order_id_value))
 
     if dry_run:
         return {
