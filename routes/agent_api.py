@@ -211,41 +211,6 @@ def _seed_image_urls(seed_data: Dict[str, Any]) -> List[str]:
     return urls
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    try:
-        if isinstance(value, str):
-            normalized = value.strip().replace(",", "")
-            if not normalized:
-                return default
-            if normalized.startswith("$"):
-                normalized = normalized[1:]
-            return float(normalized)
-        return float(value)
-    except Exception:
-        return default
-
-
-def _safe_lower_text(value: Any) -> str:
-    if value is None:
-        return ""
-    try:
-        return str(value).lower()
-    except Exception:
-        return ""
-
-
-def _safe_tag_blob(raw_tags: Any) -> str:
-    if not isinstance(raw_tags, list):
-        return ""
-    return " ".join(
-        str(tag).strip().lower()
-        for tag in raw_tags
-        if tag is not None and str(tag).strip()
-    )
-
-
 def _availability_to_in_stock(availability: Any) -> bool:
     if availability is None:
         return True
@@ -1371,7 +1336,7 @@ async def agent_search_products(
                 if in_stock_only and not product.get("in_stock", True):
                     continue
 
-                price = _safe_float(product.get("price"), default=0.0)
+                price = float(product.get("price", 0) or 0)
                 if min_price and price < min_price:
                     continue
                 if max_price and price > max_price:
@@ -1448,7 +1413,7 @@ async def agent_search_products(
             if in_stock_only and not product.get("in_stock", True):
                 continue
 
-            price = _safe_float(product.get("price"), default=0.0)
+            price = float(product.get("price", 0) or 0)
             if min_price and price < min_price:
                 continue
             if max_price and price > max_price:
@@ -1460,7 +1425,7 @@ async def agent_search_products(
                         [
                             str(product.get("category") or ""),
                             str(product.get("product_type") or ""),
-                            _safe_tag_blob(product.get("tags")),
+                            " ".join(product.get("tags") or []),
                         ]
                     )
                 ).lower()
@@ -1470,10 +1435,10 @@ async def agent_search_products(
             relevance_score = 1.0
             if normalized_query:
                 query_lower = normalized_query.lower()
-                title = _safe_lower_text(product.get("title"))
-                description = _safe_lower_text(product.get("description"))
-                tags = _safe_tag_blob(product.get("tags"))
-                product_type = _safe_lower_text(product.get("product_type"))
+                title = product.get("title", "").lower()
+                description = product.get("description", "").lower()
+                tags = " ".join(product.get("tags") or []).lower()
+                product_type = (product.get("product_type") or "").lower()
                 haystack = " ".join([title, description, tags, product_type]).strip()
 
                 if query_lower in title:
@@ -1532,7 +1497,7 @@ async def agent_search_products(
                 rel_category_match=1.0
                 if normalized_category
                 and normalized_category.lower()
-                in _safe_lower_text(product.get("product_type"))
+                in (product.get("product_type") or "").lower()
                 else 0.0,
             )
 
