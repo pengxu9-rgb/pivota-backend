@@ -301,6 +301,21 @@ def _coerce_float(v: Any) -> Optional[float]:
         return None
 
 
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    if isinstance(row, dict):
+        return row
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except Exception:
+            pass
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
 def _extract_price_currency_from_variant(v: Dict[str, Any], fallback_currency: str) -> tuple[Optional[float], str]:
     price = (
         v.get("price_amount")
@@ -604,7 +619,7 @@ async def _handle_offers_resolve(
 
         seen_offer_ids: set[str] = set()
         for row in seed_rows:
-            row_dict = dict(row) if isinstance(row, dict) else {}
+            row_dict = _row_to_dict(row)
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
             variants = _seed_variants(seed_data)
 
@@ -847,7 +862,7 @@ async def _handle_offers_resolve(
             # Canonical product-group lookup when available.
             if rows:
                 member_candidates = {
-                    str((r.get("platform_product_id") if isinstance(r, dict) else None) or "").strip()
+                    str(_row_to_dict(r).get("platform_product_id") or "").strip()
                     for r in rows
                 }
                 member_candidates.update(product_id_aliases)
@@ -868,12 +883,13 @@ async def _handle_offers_resolve(
                         timeout=2.0,
                     )
                     if group_rows:
-                        first = group_rows[0]
-                        canonical_group_id = str(first["product_group_id"])
+                        first = _row_to_dict(group_rows[0])
+                        canonical_group_id = str(first.get("product_group_id") or "").strip() or None
+                    if group_rows and canonical_group_id:
                         group_members = [
-                            dict(r)
+                            _row_to_dict(r)
                             for r in group_rows
-                            if str(r.get("product_group_id") or "") == canonical_group_id
+                            if str(_row_to_dict(r).get("product_group_id") or "") == canonical_group_id
                         ]
                         for gm in group_members:
                             if bool(gm.get("is_primary")):
@@ -930,7 +946,7 @@ async def _handle_offers_resolve(
                             merged_rows: List[Dict[str, Any]] = []
                             seen_keys: set[str] = set()
                             for it in list(rows) + list(group_cache_rows or []):
-                                rd = dict(it) if isinstance(it, dict) else {}
+                                rd = _row_to_dict(it)
                                 k = f"{rd.get('merchant_id')}::{rd.get('platform_product_id')}"
                                 if not rd or k in seen_keys:
                                     continue
@@ -940,9 +956,10 @@ async def _handle_offers_resolve(
 
             seen_internal_offer_ids: set[str] = set()
             for row in rows or []:
-                merchant_id = (row.get("merchant_id") if isinstance(row, dict) else None) or None
-                platform = (row.get("platform") if isinstance(row, dict) else None) or "unknown"
-                product_data = row.get("product_data") if isinstance(row, dict) else None
+                row_dict = _row_to_dict(row)
+                merchant_id = row_dict.get("merchant_id") or None
+                platform = row_dict.get("platform") or "unknown"
+                product_data = row_dict.get("product_data")
                 if isinstance(product_data, str):
                     try:
                         product_data = json.loads(product_data)
@@ -954,7 +971,7 @@ async def _handle_offers_resolve(
                 pid = str(
                     product_data.get("id")
                     or product_data.get("product_id")
-                    or (row.get("platform_product_id") if isinstance(row, dict) else None)
+                    or row_dict.get("platform_product_id")
                     or product_id
                     or ""
                 ).strip() or None
