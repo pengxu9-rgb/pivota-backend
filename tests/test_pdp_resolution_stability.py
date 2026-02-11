@@ -127,6 +127,52 @@ def test_products_resolve_hits_known_products(monkeypatch: pytest.MonkeyPatch, c
         assert body.get("metadata", {}).get("reason_code") == "ok"
 
 
+def test_products_resolve_reports_db_ambiguous_param_and_skips_global_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    import routes.agent_api as agent_api
+
+    class AmbiguousParameterError(Exception):
+        pass
+
+    search_calls: List[Dict[str, Any]] = []
+
+    async def fake_search(**kwargs):
+        search_calls.append({"merchant_id": kwargs.get("merchant_id")})
+        return {"status": "success", "products": []}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM products_cache" in q and "platform_product_id = ANY(:pid_aliases)" in q:
+            raise AmbiguousParameterError("could not determine data type of parameter $1")
+        if "FROM product_group_members" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+
+    res = client.get(
+        f"/agent/v1/products/resolve?merchant_id={KNOWN_MERCHANT_ID}&product_id=9886499864904&limit=10",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["candidate_count"] == 0
+    assert body.get("metadata", {}).get("reason_code") == "db_ambiguous_param"
+    assert len(search_calls) == 1
+    assert search_calls[0]["merchant_id"] == KNOWN_MERCHANT_ID
+
+    sources = body.get("metadata", {}).get("sources") or []
+    cache_source = next((s for s in sources if s.get("source") == "products_cache"), {})
+    assert cache_source.get("status") == "error"
+    assert cache_source.get("reason_code") == "db_ambiguous_param"
+    assert cache_source.get("query") == "products_cache_by_alias"
+    assert not any(s.get("source") == "agent_search_global" for s in sources)
+
+
 def test_offers_resolve_maps_to_canonical_and_internal_offers(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
     import routes.agent_shop_gateway as gateway
 
@@ -201,6 +247,44 @@ def test_offers_resolve_maps_to_canonical_and_internal_offers(monkeypatch: pytes
     assert body.get("mapping", {}).get("candidates")
     assert body.get("metadata", {}).get("reason_code") == "ok"
     assert any(s.get("source") == "products_cache" for s in (body.get("metadata", {}).get("sources") or []))
+
+
+def test_offers_resolve_reports_db_ambiguous_param(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    class AmbiguousParameterError(Exception):
+        pass
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM products_cache" in q and "platform_product_id = ANY(:pid_aliases)" in q:
+            raise AmbiguousParameterError("ambiguous parameter type")
+        if "FROM product_group_members" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "9886499864904", "merchant_id": KNOWN_MERCHANT_ID}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui", "merchant_id": KNOWN_MERCHANT_ID},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["offers_count"] == 0
+    assert body.get("metadata", {}).get("reason_code") == "db_ambiguous_param"
+    sources = body.get("metadata", {}).get("sources") or []
+    cache_source = next((s for s in sources if s.get("source") == "products_cache"), {})
+    assert cache_source.get("status") == "error"
+    assert cache_source.get("reason_code") == "db_ambiguous_param"
+    assert cache_source.get("query") == "products_cache_by_alias"
 
 
 def test_offers_resolve_stability_30_calls(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:

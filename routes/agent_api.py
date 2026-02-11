@@ -101,6 +101,13 @@ def _ensure_json_obj(val: Any) -> Dict[str, Any]:
 
 def _classify_db_reason_code(exc: Exception) -> str:
     msg = str(exc or "").lower()
+    exc_type = type(exc).__name__.lower()
+    if (
+        "ambiguousparametererror" in exc_type
+        or "ambiguous parameter" in msg
+        or "could not determine data type of parameter" in msg
+    ):
+        return "db_ambiguous_param"
     if isinstance(exc, asyncio.TimeoutError) or "timeout" in msg:
         return "db_query_timeout"
     if "does not exist" in msg or "undefined table" in msg or "undefined column" in msg or "relation" in msg:
@@ -1012,6 +1019,7 @@ async def agent_search_products(
     - 分页支持
     - 相关度评分
     """
+    started = time.perf_counter()
     try:
         overrides = infer_query_overrides(query=query, category=category)
         query = overrides["query"]
@@ -1120,6 +1128,19 @@ async def agent_search_products(
                     status_code=200,
                     merchant_id="cross_merchant_search",
                 )
+                latency_ms = int((time.perf_counter() - started) * 1000)
+                logger.info(
+                    "agent_search_products.summary",
+                    extra={
+                        "event": "agent_search_products.summary",
+                        "query": query,
+                        "merchant_scope": None,
+                        "merchant_ids": allowed if allowed else None,
+                        "reason_code": "ok" if page_items else "no_candidates",
+                        "latency_ms": latency_ms,
+                        "result_count": len(page_items),
+                    },
+                )
 
                 return {
                     "status": "success",
@@ -1145,6 +1166,11 @@ async def agent_search_products(
                         "min_price": min_price,
                         "max_price": max_price,
                         "in_stock_only": in_stock_only,
+                    },
+                    "metadata": {
+                        "source": "agent_search_products",
+                        "reason_code": "ok" if page_items else "no_candidates",
+                        "latency_ms": latency_ms,
                     },
                 }
             except Exception:
@@ -1332,6 +1358,20 @@ async def agent_search_products(
                 status_code=200,
                 merchant_id=merchant_id or "cross_merchant_search",
             )
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "agent_search_products.summary",
+                extra={
+                    "event": "agent_search_products.summary",
+                    "query": query,
+                    "merchant_scope": merchant_id,
+                    "merchant_ids": merchant_ids,
+                    "reason_code": "ok" if paginated_products else "no_candidates",
+                    "latency_ms": latency_ms,
+                    "result_count": len(paginated_products),
+                    "merchants_searched": len(merchants_to_search),
+                },
+            )
 
             return {
                 "status": "success",
@@ -1356,6 +1396,11 @@ async def agent_search_products(
                     "min_price": min_price,
                     "max_price": max_price,
                     "in_stock_only": in_stock_only,
+                },
+                "metadata": {
+                    "source": "agent_search_products",
+                    "reason_code": "ok" if paginated_products else "no_candidates",
+                    "latency_ms": latency_ms,
                 },
             }
 
@@ -1589,6 +1634,20 @@ async def agent_search_products(
             status_code=200,
             merchant_id=merchant_id or "cross_merchant_search"
         )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "agent_search_products.summary",
+            extra={
+                "event": "agent_search_products.summary",
+                "query": query,
+                "merchant_scope": merchant_id,
+                "merchant_ids": merchant_ids,
+                "reason_code": "ok" if paginated_products else "no_candidates",
+                "latency_ms": latency_ms,
+                "result_count": len(paginated_products),
+                "merchants_searched": len(merchants_to_search),
+            },
+        )
         
         return {
             "status": "success",
@@ -1613,13 +1672,31 @@ async def agent_search_products(
                 "min_price": min_price,
                 "max_price": max_price,
                 "in_stock_only": in_stock_only
-            }
+            },
+            "metadata": {
+                "source": "agent_search_products",
+                "reason_code": "ok" if paginated_products else "no_candidates",
+                "latency_ms": latency_ms,
+            },
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Agent product search error: {e}")
+        reason_code = _classify_db_reason_code(e)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        logger.error(
+            "Agent product search error",
+            extra={
+                "event": "agent_search_products.failed",
+                "query": query,
+                "merchant_scope": merchant_id,
+                "merchant_ids": merchant_ids,
+                "latency_ms": latency_ms,
+                "reason_code": reason_code,
+                "error_type": type(e).__name__,
+            },
+        )
         await log_agent_request(
             context=context,
             status_code=500,
@@ -1671,6 +1748,7 @@ async def agent_resolve_products(
         source_started: float,
         row_count: Optional[int] = None,
         error: Optional[str] = None,
+        query: Optional[str] = None,
     ) -> None:
         row: Dict[str, Any] = {
             "source": source,
@@ -1682,6 +1760,8 @@ async def agent_resolve_products(
             row["row_count"] = int(row_count)
         if error:
             row["error"] = str(error)[:500]
+        if query:
+            row["query"] = query
         sources.append(row)
 
     candidates_by_key: Dict[str, Dict[str, Any]] = {}
@@ -1724,7 +1804,7 @@ async def agent_resolve_products(
                     SELECT merchant_id, platform, platform_product_id, product_data
                     FROM products_cache
                     WHERE (expires_at IS NULL OR expires_at > NOW())
-                      AND (:merchant_id IS NULL OR merchant_id = :merchant_id)
+                      AND (CAST(:merchant_id AS TEXT) IS NULL OR merchant_id = CAST(:merchant_id AS TEXT))
                       AND (
                         platform_product_id = ANY(:pid_aliases)
                         OR product_data->>'id' = ANY(:pid_aliases)
@@ -1755,7 +1835,7 @@ async def agent_resolve_products(
                     SELECT merchant_id, platform, platform_product_id, product_data
                     FROM products_cache
                     WHERE (expires_at IS NULL OR expires_at > NOW())
-                      AND (:merchant_id IS NULL OR merchant_id = :merchant_id)
+                      AND (CAST(:merchant_id AS TEXT) IS NULL OR merchant_id = CAST(:merchant_id AS TEXT))
                       AND ({' OR '.join(where_parts)})
                     ORDER BY cached_at DESC
                     LIMIT 120
@@ -1793,6 +1873,7 @@ async def agent_resolve_products(
             reason_code="ok" if cache_rows else "no_candidates",
             source_started=cache_started,
             row_count=len(cache_rows),
+            query="products_cache_by_alias",
         )
     except Exception as e:
         _record_source(
@@ -1801,10 +1882,22 @@ async def agent_resolve_products(
             reason_code=_classify_db_reason_code(e),
             source_started=cache_started,
             error=type(e).__name__,
+            query="products_cache_by_alias",
         )
 
     # Source 2/3: scoped/global search fallback.
     search_query = query_text or (product_aliases[0] if product_aliases else sku_aliases[0] if sku_aliases else "")
+    search_timeout_s = 4.0
+    try:
+        search_timeout_s = max(1.0, min(8.0, float(os.getenv("AGENT_RESOLVE_SEARCH_TIMEOUT_S", "4.0"))))
+    except Exception:
+        search_timeout_s = 4.0
+
+    should_try_global = (
+        not merchant_id
+        or (not product_aliases and not sku_aliases and bool(query_text))
+    )
+
     if search_query and not candidates_by_key:
         async def _resolve_with_search(*, scoped_merchant: Optional[str], source_name: str) -> bool:
             search_started = time.perf_counter()
@@ -1821,11 +1914,11 @@ async def agent_resolve_products(
                         min_price=None,
                         max_price=None,
                         in_stock_only=True,
-                        limit=max(20, min(120, limit * 4)),
+                        limit=max(20, min(80, limit * 3)),
                         offset=0,
                         context=context,
                     ),
-                    timeout=6.0,
+                    timeout=search_timeout_s,
                 )
                 products = (result or {}).get("products") if isinstance(result, dict) else []
                 for p in products or []:
@@ -1845,6 +1938,7 @@ async def agent_resolve_products(
                     reason_code="ok" if products else "no_candidates",
                     source_started=search_started,
                     row_count=len(products or []),
+                    query="agent_search_products",
                 )
                 return bool(products)
             except asyncio.TimeoutError:
@@ -1854,6 +1948,7 @@ async def agent_resolve_products(
                     reason_code="upstream_timeout",
                     source_started=search_started,
                     error="TimeoutError",
+                    query="agent_search_products",
                 )
                 return False
             except Exception as e:
@@ -1864,12 +1959,13 @@ async def agent_resolve_products(
                     reason_code=reason_code,
                     source_started=search_started,
                     error=type(e).__name__,
+                    query="agent_search_products",
                 )
                 return False
 
         if merchant_id:
             _ = await _resolve_with_search(scoped_merchant=merchant_id, source_name="agent_search_scoped")
-        if not candidates_by_key:
+        if should_try_global and not candidates_by_key:
             _ = await _resolve_with_search(scoped_merchant=None, source_name="agent_search_global")
 
     candidates = sorted(
@@ -1928,6 +2024,7 @@ async def agent_resolve_products(
                 reason_code="ok" if rows else "no_candidates",
                 source_started=group_started,
                 row_count=len(rows or []),
+                query="product_group_members_by_pid",
             )
         else:
             _record_source(
@@ -1936,6 +2033,7 @@ async def agent_resolve_products(
                 reason_code="no_candidates",
                 source_started=group_started,
                 row_count=0,
+                query="product_group_members_by_pid",
             )
     except Exception as e:
         _record_source(
@@ -1944,6 +2042,7 @@ async def agent_resolve_products(
             reason_code=_classify_db_reason_code(e),
             source_started=group_started,
             error=type(e).__name__,
+            query="product_group_members_by_pid",
         )
 
     if not canonical_ref and candidates:

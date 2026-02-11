@@ -360,6 +360,13 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
 
 def _classify_db_reason_code(exc: Exception) -> str:
     msg = str(exc or "").lower()
+    exc_type = type(exc).__name__.lower()
+    if (
+        "ambiguousparametererror" in exc_type
+        or "ambiguous parameter" in msg
+        or "could not determine data type of parameter" in msg
+    ):
+        return "db_ambiguous_param"
     if isinstance(exc, asyncio.TimeoutError) or "timeout" in msg:
         return "db_query_timeout"
     if "does not exist" in msg or "undefined table" in msg or "undefined column" in msg or "relation" in msg:
@@ -742,7 +749,7 @@ async def _handle_offers_resolve(
                         SELECT merchant_id, platform, platform_product_id, product_data
                         FROM products_cache
                         WHERE (expires_at IS NULL OR expires_at > NOW())
-                          AND (:merchant_scope IS NULL OR merchant_id = :merchant_scope)
+                          AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
                           AND (
                             platform_product_id = ANY(:pid_aliases)
                             OR product_data->>'id' = ANY(:pid_aliases)
@@ -773,7 +780,7 @@ async def _handle_offers_resolve(
                         SELECT merchant_id, platform, platform_product_id, product_data
                         FROM products_cache
                         WHERE (expires_at IS NULL OR expires_at > NOW())
-                          AND (:merchant_scope IS NULL OR merchant_id = :merchant_scope)
+                          AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
                           AND ({' OR '.join(sku_clauses)})
                         ORDER BY cached_at DESC
                         LIMIT 120
