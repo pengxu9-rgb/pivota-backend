@@ -695,8 +695,20 @@ async def search_products(
             params["merchant_id"] = merchant_id
         
         if query:
-            # Search in JSON fields using PostgreSQL JSON operators
-            where_clauses.append("(LOWER(p.product_data->>'name') LIKE :query OR LOWER(p.product_data->>'description') LIKE :query)")
+            # Search in both legacy and StandardProduct fields.
+            # Shopify cache rows are StandardProduct-shaped and use `title`.
+            where_clauses.append(
+                """
+                (
+                    LOWER(COALESCE(p.product_data->>'name', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'title', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'description', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'vendor', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'product_type', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'sku', '')) LIKE :query
+                )
+                """
+            )
             params["query"] = f"%{query.lower()}%"
         
         if category:
@@ -778,20 +790,37 @@ async def search_products(
                     "platform": p_dict["platform"],
                     "cached_at": p_dict["cached_at"].isoformat() if p_dict.get("cached_at") else None
                 }
+
+                # Keep both naming conventions so callers and ranking logic can use either.
+                if not product_dict.get("title") and product_dict.get("name"):
+                    product_dict["title"] = product_dict.get("name")
+                if not product_dict.get("name") and product_dict.get("title"):
+                    product_dict["name"] = product_dict.get("title")
                 
                 # Add relevance score
                 if query:
                     score = 0
+                    title_lower = str(product_dict.get("title", "")).lower()
                     name_lower = str(product_dict.get("name", "")).lower()
                     desc_lower = str(product_dict.get("description", "")).lower()
+                    vendor_lower = str(product_dict.get("vendor", "")).lower()
+                    type_lower = str(product_dict.get("product_type", "")).lower()
                     query_lower = query.lower()
                     
+                    if query_lower in title_lower:
+                        score += 12
                     if query_lower in name_lower:
                         score += 10
+                    if title_lower.startswith(query_lower):
+                        score += 6
                     if name_lower.startswith(query_lower):
                         score += 5
                     if query_lower in desc_lower:
                         score += 3
+                    if query_lower in vendor_lower:
+                        score += 3
+                    if query_lower in type_lower:
+                        score += 2
                     
                     product_dict["relevance_score"] = score
 
