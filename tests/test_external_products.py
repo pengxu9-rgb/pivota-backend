@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,15 @@ from main import app
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+def _patch_agent_sdk_ranking(monkeypatch: pytest.MonkeyPatch, module) -> None:
+    monkeypatch.setattr(module, "hydrate_quality_and_enrichment", AsyncMock(return_value=None))
+    monkeypatch.setattr(module, "passes_agent_gating", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(module, "compute_agent_ranking_score", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(module, "serialize_features_for_log", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(module, "log_ranking_batch", AsyncMock(return_value=None))
+    monkeypatch.setattr(module, "log_product_events", AsyncMock(return_value=None))
 
 
 def test_agent_cart_validate_rejects_external_seed_merchant(client: TestClient) -> None:
@@ -110,6 +120,134 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
     external = next(p for p in products if p.get("merchant_id") == "external_seed")
     assert isinstance(external.get("external_redirect_url"), str)
     assert "/r?token=" in external.get("external_redirect_url")
+
+
+def test_agent_products_search_matches_title_field_for_shopify_rows(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    _patch_agent_sdk_ranking(monkeypatch, agent_sdk_fixed_module)
+
+    captured = {"sql": ""}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM products_cache p" in q:
+            captured["sql"] = q
+            assert values is not None
+            assert values.get("query") == "%ipsa%"
+            return [
+                {
+                    "id": 1,
+                    "merchant_id": "merch_test",
+                    "platform": "shopify",
+                    "platform_product_id": "9886500127048",
+                    "product_data": {
+                        "title": "IPSA Time Reset Aqua",
+                        "description": "Hydrating toner",
+                        "price": 45.0,
+                    },
+                    "cached_at": datetime.now(timezone.utc),
+                    "merchant_name": "Test Merchant",
+                }
+            ]
+        if "FROM external_product_seeds" in q:
+            return []
+        return []
+
+    async def fake_fetch_one(query: str, values=None):
+        q = str(query)
+        if "SELECT merchant_id FROM merchant_onboarding" in q:
+            return {"merchant_id": "merch_test"}
+        if "SELECT COUNT(*) as total" in q:
+            return {"total": 1}
+        return None
+
+    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(
+        agent_sdk_fixed_module, "_load_external_seed_products_for_search", AsyncMock(return_value=[])
+    )
+
+    res = client.get(
+        "/agent/v1/products/search?merchant_id=merch_test&query=ipsa&limit=20&offset=0&in_stock_only=false",
+        headers={"X-API-Key": "test-api-key"},
+    )
+
+    assert res.status_code == 200
+    payload = res.json()
+    products = payload.get("products") or []
+    assert products
+    assert products[0].get("platform_product_id") == "9886500127048"
+    assert products[0].get("title") == "IPSA Time Reset Aqua"
+    assert "product_data->>'title'" in captured["sql"]
+
+
+def test_agent_products_search_merchant_scope_does_not_mix_external_seed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    _patch_agent_sdk_ranking(monkeypatch, agent_sdk_fixed_module)
+
+    external_loader = AsyncMock(
+        return_value=[
+            {
+                "id": "ext_1",
+                "product_id": "ext_1",
+                "title": "External Product",
+                "merchant_id": "external_seed",
+                "platform": "external",
+            }
+        ]
+    )
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM products_cache p" in q:
+            return [
+                {
+                    "id": 2,
+                    "merchant_id": "merch_test",
+                    "platform": "shopify",
+                    "platform_product_id": "9886500127048",
+                    "product_data": {
+                        "title": "IPSA Time Reset Aqua",
+                        "description": "Hydrating toner",
+                        "price": 45.0,
+                    },
+                    "cached_at": datetime.now(timezone.utc),
+                    "merchant_name": "Test Merchant",
+                }
+            ]
+        return []
+
+    async def fake_fetch_one(query: str, values=None):
+        q = str(query)
+        if "SELECT merchant_id FROM merchant_onboarding" in q:
+            return {"merchant_id": "merch_test"}
+        if "SELECT COUNT(*) as total" in q:
+            return {"total": 1}
+        return None
+
+    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(
+        agent_sdk_fixed_module, "_load_external_seed_products_for_search", external_loader
+    )
+
+    res = client.get(
+        "/agent/v1/products/search?merchant_id=merch_test&query=ipsa&limit=20&offset=0&in_stock_only=false",
+        headers={"X-API-Key": "test-api-key"},
+    )
+
+    assert res.status_code == 200
+    payload = res.json()
+    products = payload.get("products") or []
+    assert products
+    assert all(p.get("merchant_id") != "external_seed" for p in products)
+    external_loader.assert_not_awaited()
 
 
 @pytest.mark.asyncio

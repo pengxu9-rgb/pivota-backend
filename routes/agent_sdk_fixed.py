@@ -874,7 +874,8 @@ async def search_products(
         )
         product_list = ranked_candidates
 
-        if offset == 0:
+        include_external_seed = offset == 0 and not merchant_id
+        if include_external_seed:
             try:
                 external_seed_limit = min(200, max(20, int(limit or 20) * 5))
                 external_seed_products = await _load_external_seed_products_for_search(

@@ -1226,18 +1226,23 @@ async def agent_search_products(
                     except Exception:
                         continue
 
-        # Add employee-managed external products (unattached external seeds) as first-class products.
-        try:
-            external_seed_limit = min(200, max(20, int(limit or 20) * 5))
-            external_seed_products = await _load_external_seed_products_for_search(
-                req=req,
-                query=query,
-                limit=external_seed_limit,
-            )
-            if external_seed_products:
-                all_products.extend(external_seed_products)
-        except Exception as e:
-            logger.warning(f"Failed to load external seed products: {e}")
+        # Add employee-managed external products only for explicit external/cross-merchant flows.
+        include_external_seed = (
+            (merchant_id is None and not merchant_ids)
+            or merchant_id == EXTERNAL_SEED_MERCHANT_ID
+        )
+        if include_external_seed:
+            try:
+                external_seed_limit = min(200, max(20, int(limit or 20) * 5))
+                external_seed_products = await _load_external_seed_products_for_search(
+                    req=req,
+                    query=query,
+                    limit=external_seed_limit,
+                )
+                if external_seed_products:
+                    all_products.extend(external_seed_products)
+            except Exception as e:
+                logger.warning(f"Failed to load external seed products: {e}")
 
         ranking_config = get_agent_ranking_config()
 
