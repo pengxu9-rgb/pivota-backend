@@ -502,6 +502,22 @@ async def _handle_offers_resolve(
     offers: List[Dict[str, Any]] = []
     source_status: List[Dict[str, Any]] = []
 
+    def _public_reason_code(raw_code: Optional[str]) -> str:
+        code = str(raw_code or "").strip().lower()
+        if code == "ok":
+            return "OK"
+        if code == "no_candidates":
+            return "NO_CANDIDATES"
+        if code.startswith("db_"):
+            return "DB_ERROR"
+        if code == "upstream_timeout":
+            return "UPSTREAM_TIMEOUT"
+        if code.startswith("upstream_"):
+            return "UPSTREAM_ERROR"
+        if code.startswith("skipped"):
+            return "SKIPPED"
+        return code.upper() if code else "UNKNOWN"
+
     def _record_source(
         *,
         source: str,
@@ -516,6 +532,8 @@ async def _handle_offers_resolve(
             "source": source,
             "status": status,
             "reason_code": reason_code,
+            "reason": _public_reason_code(reason_code),
+            "ok": status == "ok",
             "latency_ms": int((time.perf_counter() - source_started) * 1000),
         }
         if row_count is not None:
@@ -766,6 +784,42 @@ async def _handle_offers_resolve(
                     timeout=3.0,
                 )
 
+            # Exact SKU/variant lookup before LIKE fallback.
+            if not rows and sku_id_aliases:
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT merchant_id, platform, platform_product_id, product_data
+                        FROM products_cache
+                        WHERE (expires_at IS NULL OR expires_at > NOW())
+                          AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
+                          AND EXISTS (
+                            SELECT 1
+                            FROM jsonb_array_elements(
+                              CASE
+                                WHEN jsonb_typeof(product_data::jsonb->'variants') = 'array'
+                                THEN product_data::jsonb->'variants'
+                                ELSE '[]'::jsonb
+                              END
+                            ) AS variant
+                            WHERE COALESCE(
+                              variant->>'variant_id',
+                              variant->>'id',
+                              variant->>'sku',
+                              variant->>'sku_id'
+                            ) = ANY(:sku_aliases)
+                          )
+                        ORDER BY cached_at DESC
+                        LIMIT 120
+                        """,
+                        {
+                            "merchant_scope": merchant_scope,
+                            "sku_aliases": sku_id_aliases,
+                        },
+                    ),
+                    timeout=3.0,
+                )
+
             # Next try SKU-like match in cached JSON (bounded).
             if not rows and sku_id_aliases:
                 sku_clauses: List[str] = []
@@ -909,12 +963,12 @@ async def _handle_offers_resolve(
 
                 variants = product_data.get("variants") if isinstance(product_data.get("variants"), list) else []
                 chosen_variant: Dict[str, Any] = {}
-                if sku_id and isinstance(variants, list):
+                if sku_id_aliases and isinstance(variants, list):
                     for v in variants:
                         if not isinstance(v, dict):
                             continue
                         vid = str(v.get("variant_id") or v.get("id") or v.get("sku") or v.get("sku_id") or "").strip()
-                        if vid and vid == sku_id:
+                        if vid and vid in sku_id_aliases:
                             chosen_variant = v
                             break
                 if not chosen_variant and isinstance(variants, list) and variants:
@@ -1074,7 +1128,26 @@ async def _handle_offers_resolve(
         for s in source_status
         if str(s.get("status")) == "error"
     }
-    reason_code = "ok" if offers else (next(iter(failure_breakdown.values())) if failure_breakdown else "no_candidates")
+    cache_failed = any(
+        str(s.get("status")) == "error" and str(s.get("source")).startswith("products_cache")
+        for s in source_status
+    )
+    if offers:
+        reason_code = "OK"
+        reason = "resolved"
+    elif cache_failed:
+        reason_code = "DB_ERROR"
+        reason = "products_cache_failed"
+    elif any(str(s.get("reason_code")) == "upstream_timeout" for s in source_status):
+        reason_code = "UPSTREAM_TIMEOUT"
+        reason = "search_timeout"
+    elif failure_breakdown:
+        first_detail = next(iter(failure_breakdown.values()))
+        reason_code = _public_reason_code(first_detail)
+        reason = "offers_unavailable"
+    else:
+        reason_code = "NO_CANDIDATES"
+        reason = "no_candidates"
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     logger.info(
@@ -1086,6 +1159,7 @@ async def _handle_offers_resolve(
             "merchant_scope": merchant_scope,
             "offers_count": len(offers),
             "reason_code": reason_code,
+            "reason": reason,
             "latency_ms": latency_ms,
             "sources": source_status,
             "canonical_ref": canonical_ref,
@@ -1110,6 +1184,7 @@ async def _handle_offers_resolve(
             "has_internal": bool(internal_offers),
             "merchant_scope": merchant_scope,
             "reason_code": reason_code,
+            "reason": reason,
             "latency_ms": latency_ms,
             "sources": source_status,
             "failure_breakdown": failure_breakdown,

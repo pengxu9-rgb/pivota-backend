@@ -83,6 +83,9 @@ def test_products_search_delegates_to_optimized_handler(monkeypatch: pytest.Monk
 def test_products_resolve_hits_known_products(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
     import routes.agent_api as agent_api
 
+    async def fake_search(**kwargs):
+        raise AssertionError("exact resolve path should not call agent_search_products for direct product_id hits")
+
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
         values = values or {}
@@ -113,6 +116,7 @@ def test_products_resolve_hits_known_products(monkeypatch: pytest.MonkeyPatch, c
         return []
 
     monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
 
     for pid in KNOWN_PRODUCTS.keys():
         res = client.get(
@@ -122,9 +126,14 @@ def test_products_resolve_hits_known_products(monkeypatch: pytest.MonkeyPatch, c
         assert res.status_code == 200
         body = res.json()
         assert body["status"] == "success"
+        assert body.get("resolved") is True
+        assert body.get("reason_code") == "OK"
         assert body["candidate_count"] > 0
-        assert (body.get("canonical_ref") or "").startswith("pg:")
-        assert body.get("metadata", {}).get("reason_code") == "ok"
+        assert (body.get("canonical_ref") or "").startswith("pc:")
+        assert body.get("metadata", {}).get("reason_code") == "OK"
+        sources = body.get("metadata", {}).get("sources") or []
+        assert any(s.get("source") == "products_cache_exact" and s.get("ok") is True for s in sources)
+        assert all("latency_ms" in s for s in sources)
 
 
 def test_products_resolve_reports_db_ambiguous_param_and_skips_global_fallback(
@@ -160,16 +169,19 @@ def test_products_resolve_reports_db_ambiguous_param_and_skips_global_fallback(
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "success"
+    assert body.get("resolved") is False
     assert body["candidate_count"] == 0
-    assert body.get("metadata", {}).get("reason_code") == "db_ambiguous_param"
+    assert body.get("reason_code") == "DB_ERROR"
+    assert body.get("metadata", {}).get("reason_code") == "DB_ERROR"
     assert len(search_calls) == 1
     assert search_calls[0]["merchant_id"] == KNOWN_MERCHANT_ID
 
     sources = body.get("metadata", {}).get("sources") or []
-    cache_source = next((s for s in sources if s.get("source") == "products_cache"), {})
+    cache_source = next((s for s in sources if s.get("source") == "products_cache_exact"), {})
     assert cache_source.get("status") == "error"
     assert cache_source.get("reason_code") == "db_ambiguous_param"
-    assert cache_source.get("query") == "products_cache_by_alias"
+    assert cache_source.get("reason") == "DB_ERROR"
+    assert cache_source.get("query") == "products_cache_exact"
     assert not any(s.get("source") == "agent_search_global" for s in sources)
 
 
@@ -245,7 +257,7 @@ def test_offers_resolve_maps_to_canonical_and_internal_offers(monkeypatch: pytes
     assert body["offers_count"] > 0
     assert (body.get("canonical_product_ref") or "").startswith("pg:")
     assert body.get("mapping", {}).get("candidates")
-    assert body.get("metadata", {}).get("reason_code") == "ok"
+    assert body.get("metadata", {}).get("reason_code") == "OK"
     assert any(s.get("source") == "products_cache" for s in (body.get("metadata", {}).get("sources") or []))
 
 
@@ -279,12 +291,65 @@ def test_offers_resolve_reports_db_ambiguous_param(monkeypatch: pytest.MonkeyPat
     body = res.json()
     assert body["status"] == "success"
     assert body["offers_count"] == 0
-    assert body.get("metadata", {}).get("reason_code") == "db_ambiguous_param"
+    assert body.get("metadata", {}).get("reason_code") == "DB_ERROR"
     sources = body.get("metadata", {}).get("sources") or []
     cache_source = next((s for s in sources if s.get("source") == "products_cache"), {})
     assert cache_source.get("status") == "error"
     assert cache_source.get("reason_code") == "db_ambiguous_param"
+    assert cache_source.get("reason") == "DB_ERROR"
     assert cache_source.get("query") == "products_cache_by_alias"
+
+
+def test_offers_resolve_maps_sku_to_internal_product(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    target_pid = "9886499864904"
+    target_sku = f"{target_pid}_v1"
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        values = values or {}
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM products_cache" in q and "jsonb_array_elements" in q:
+            if target_sku in set(values.get("sku_aliases") or []):
+                return [_build_product_cache_row(target_pid, KNOWN_PRODUCTS[target_pid])]
+            return []
+        if "FROM products_cache" in q and "platform_product_id = ANY(:pid_aliases)" in q:
+            return []
+        if "FROM product_group_members" in q:
+            return [
+                {
+                    "product_group_id": f"pg_{target_pid}",
+                    "merchant_id": KNOWN_MERCHANT_ID,
+                    "platform": "shopify",
+                    "platform_product_id": target_pid,
+                    "is_primary": True,
+                }
+            ]
+        if "FROM products_cache" in q and "merchant_id = ANY(:merchant_ids)" in q:
+            return [_build_product_cache_row(target_pid, KNOWN_PRODUCTS[target_pid])]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": target_sku, "merchant_id": KNOWN_MERCHANT_ID}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui", "merchant_id": KNOWN_MERCHANT_ID},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body.get("status") == "success"
+    assert body.get("offers_count", 0) > 0
+    assert body.get("metadata", {}).get("reason_code") == "OK"
+    first_offer = (body.get("offers") or [])[0]
+    assert first_offer.get("purchase_route") == "internal_checkout"
+    items = first_offer.get("internal_checkout_items") or []
+    assert items and items[0].get("product_id") == target_pid
 
 
 def test_offers_resolve_stability_30_calls(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
@@ -332,4 +397,4 @@ def test_offers_resolve_stability_30_calls(monkeypatch: pytest.MonkeyPatch, clie
         body = res.json()
         assert body.get("status") == "success"
         assert body.get("offers_count", 0) > 0
-        assert body.get("metadata", {}).get("reason_code") == "ok"
+        assert body.get("metadata", {}).get("reason_code") == "OK"
