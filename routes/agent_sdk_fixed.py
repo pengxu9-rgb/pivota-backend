@@ -673,6 +673,154 @@ async def search_products(
     """
     from routes.agent_api import agent_search_products
 
+    async def _legacy_scoped_search_fallback() -> Dict[str, Any]:
+        # Merchant-scoped fallback to preserve historical SDK semantics and tests.
+        params: Dict[str, Any] = {
+            "merchant_id": merchant_id,
+            "limit": limit,
+            "offset": offset,
+        }
+        where_clauses: List[str] = ["p.merchant_id = :merchant_id"]
+
+        merchant_check = await database.fetch_one(
+            "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :mid AND status != 'deleted'",
+            {"mid": merchant_id},
+        )
+        if not merchant_check:
+            return {
+                "status": "success",
+                "products": [],
+                "pagination": {"total": 0, "limit": limit, "offset": offset, "has_more": False},
+                "metadata": {
+                    "reason_code": "no_candidates",
+                    "source": "agent_sdk_fixed_legacy_fallback",
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                },
+            }
+
+        if query:
+            where_clauses.append(
+                """
+                (
+                    LOWER(COALESCE(p.product_data->>'name', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'title', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'description', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'vendor', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'product_type', '')) LIKE :query
+                    OR LOWER(COALESCE(p.product_data->>'sku', '')) LIKE :query
+                )
+                """
+            )
+            params["query"] = f"%{query.lower()}%"
+
+        if category:
+            where_clauses.append(
+                """
+                (
+                    LOWER(COALESCE(p.product_data->>'category', '')) = :category
+                    OR LOWER(COALESCE(p.product_data->>'product_type', '')) = :category
+                )
+                """
+            )
+            params["category"] = category.lower()
+
+        if min_price is not None:
+            where_clauses.append(
+                "(NULLIF(p.product_data->>'price', '')::numeric >= :min_price)"
+            )
+            params["min_price"] = min_price
+
+        if max_price is not None:
+            where_clauses.append(
+                "(NULLIF(p.product_data->>'price', '')::numeric <= :max_price)"
+            )
+            params["max_price"] = max_price
+
+        if in_stock is not None:
+            where_clauses.append(
+                "(COALESCE(NULLIF(p.product_data->>'in_stock','')::boolean, true) = :in_stock)"
+            )
+            params["in_stock"] = in_stock
+
+        where_clause = " AND ".join(where_clauses)
+
+        rows = await database.fetch_all(
+            f"""
+            SELECT
+                p.id,
+                p.merchant_id,
+                p.platform,
+                p.platform_product_id,
+                p.product_data,
+                p.cached_at,
+                m.business_name as merchant_name
+            FROM products_cache p
+            JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
+            WHERE {where_clause}
+              AND m.status != 'deleted'
+              AND (p.cache_status IS NULL OR p.cache_status != 'expired')
+            ORDER BY p.cached_at DESC
+            LIMIT :limit OFFSET :offset
+            """,
+            params,
+        )
+
+        count_params = {k: v for k, v in params.items() if k not in {"limit", "offset"}}
+        total_row = await database.fetch_one(
+            f"""
+            SELECT COUNT(*) as total
+            FROM products_cache p
+            JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
+            WHERE {where_clause}
+              AND m.status != 'deleted'
+            """,
+            count_params,
+        )
+
+        products: List[Dict[str, Any]] = []
+        for row in rows or []:
+            row_dict = dict(row) if isinstance(row, dict) else {}
+            pdata = row_dict.get("product_data")
+            if isinstance(pdata, str):
+                try:
+                    pdata = json.loads(pdata)
+                except Exception:
+                    pdata = {}
+            if not isinstance(pdata, dict):
+                pdata = {}
+            merged = {
+                **pdata,
+                "platform_product_id": row_dict.get("platform_product_id"),
+                "merchant_id": row_dict.get("merchant_id"),
+                "merchant_name": row_dict.get("merchant_name"),
+                "platform": row_dict.get("platform"),
+                "cached_at": row_dict.get("cached_at").isoformat()
+                if row_dict.get("cached_at")
+                else None,
+            }
+            if not merged.get("title") and merged.get("name"):
+                merged["title"] = merged.get("name")
+            if not merged.get("name") and merged.get("title"):
+                merged["name"] = merged.get("title")
+            products.append(merged)
+
+        total = int((total_row or {}).get("total") or 0)
+        return {
+            "status": "success",
+            "products": products,
+            "pagination": {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": total > (offset + limit),
+            },
+            "metadata": {
+                "reason_code": "ok" if products else "no_candidates",
+                "source": "agent_sdk_fixed_legacy_fallback",
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+            },
+        }
+
     started = time.perf_counter()
     effective_in_stock_only = (
         in_stock_only
@@ -706,21 +854,39 @@ async def search_products(
             },
         }
 
-    result = await agent_search_products(
-        req=req,
-        background_tasks=background_tasks,
-        merchant_id=merchant_id,
-        merchant_ids=merchant_ids,
-        search_all_merchants=search_all_merchants,
-        query=query,
-        category=category,
-        min_price=min_price,
-        max_price=max_price,
-        in_stock_only=bool(effective_in_stock_only),
-        limit=limit,
-        offset=offset,
-        context=context,
-    )
+    try:
+        result = await agent_search_products(
+            req=req,
+            background_tasks=background_tasks,
+            merchant_id=merchant_id,
+            merchant_ids=merchant_ids,
+            search_all_merchants=search_all_merchants,
+            query=query,
+            category=category,
+            min_price=min_price,
+            max_price=max_price,
+            in_stock_only=bool(effective_in_stock_only),
+            limit=limit,
+            offset=offset,
+            context=context,
+        )
+    except HTTPException as e:
+        # Preserve backward compatibility for merchant-scoped SDK calls.
+        if merchant_id and int(e.status_code) in (404, 500):
+            result = await _legacy_scoped_search_fallback()
+        else:
+            raise
+    except Exception:
+        if merchant_id:
+            result = await _legacy_scoped_search_fallback()
+        else:
+            raise
+
+    if merchant_id and isinstance(result, dict):
+        current_products = result.get("products")
+        if isinstance(current_products, list) and not current_products:
+            result = await _legacy_scoped_search_fallback()
+
     if isinstance(result, dict):
         # Preserve the historical SDK behavior: when searching regular catalogs
         # we also inject external seed products for recall.
