@@ -269,6 +269,7 @@ class OffersResolveProductRef(BaseModel):
 
     product_id: Optional[str] = Field(None, description="Product id or external_product_id")
     sku_id: Optional[str] = Field(None, description="SKU / variant id")
+    merchant_id: Optional[str] = Field(None, description="Optional merchant scope for deterministic resolution")
 
 
 class OffersResolvePayload(BaseModel):
@@ -357,6 +358,105 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
     return str(raw).strip()
 
 
+def _classify_db_reason_code(exc: Exception) -> str:
+    msg = str(exc or "").lower()
+    if isinstance(exc, asyncio.TimeoutError) or "timeout" in msg:
+        return "db_query_timeout"
+    if "does not exist" in msg or "undefined table" in msg or "undefined column" in msg or "relation" in msg:
+        return "db_schema"
+    if "password authentication failed" in msg or "authentication failed" in msg or "permission denied" in msg:
+        return "db_auth"
+    if "too many connections" in msg or "connection refused" in msg or "connection reset" in msg:
+        return "db_connection"
+    return "db_error"
+
+
+def _expand_ref_aliases(raw_ref: Optional[str]) -> List[str]:
+    """
+    Expand a product/sku reference into stable aliases:
+    - raw string
+    - URL-derived id (e.g. /products/9886499864904?merchant_id=...)
+    - Shopify GID <-> numeric id variants
+    """
+    raw = str(raw_ref or "").strip()
+    if not raw:
+        return []
+
+    aliases: List[str] = []
+
+    def _add(v: Optional[str]) -> None:
+        s = str(v or "").strip()
+        if s and s not in aliases:
+            aliases.append(s)
+
+    _add(raw)
+
+    # URL form: https://.../products/<id>?...
+    if raw.startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(raw)
+            path_parts = [p for p in (parsed.path or "").split("/") if p]
+            for idx, part in enumerate(path_parts):
+                if part == "products" and idx + 1 < len(path_parts):
+                    _add(path_parts[idx + 1])
+            q = parsed.query or ""
+            if q:
+                # Lightweight query parser to avoid importing parse_qs in hot path.
+                for item in q.split("&"):
+                    if "=" not in item:
+                        continue
+                    k, v = item.split("=", 1)
+                    if k in {"product_id", "productId", "id", "variant_id", "variantId", "sku_id", "skuId"}:
+                        _add(v)
+        except Exception:
+            pass
+
+    # GID form: gid://shopify/Product/123456 or ProductVariant.
+    gid_match = re.search(r"gid://shopify/(?:Product|ProductVariant)/(\d+)", raw)
+    if gid_match:
+        _add(gid_match.group(1))
+
+    # Numeric id can map to common Shopify GID aliases.
+    if raw.isdigit():
+        _add(f"gid://shopify/Product/{raw}")
+        _add(f"gid://shopify/ProductVariant/{raw}")
+
+    # Generic suffix extraction, useful when IDs are wrapped (e.g. "shopify:988...").
+    if ":" in raw:
+        _add(raw.split(":")[-1])
+    if "/" in raw:
+        _add(raw.rstrip("/").split("/")[-1])
+
+    return aliases[:20]
+
+
+def _resolve_offers_merchant_scope(
+    *,
+    payload: OffersResolvePayload,
+    request_metadata: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    # Explicit scope in payload wins.
+    scoped = str(payload.product.merchant_id or "").strip() or None
+    if scoped:
+        return scoped
+    meta = request_metadata if isinstance(request_metadata, dict) else {}
+    for key in ("merchant_id", "merchantId"):
+        val = str(meta.get(key) or "").strip()
+        if val:
+            return val
+    merchant_scope = meta.get("merchant_scope")
+    if isinstance(merchant_scope, list):
+        for val in merchant_scope:
+            s = str(val or "").strip()
+            if s:
+                return s
+    if isinstance(merchant_scope, str):
+        s = merchant_scope.strip()
+        if s:
+            return s
+    return None
+
+
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -369,11 +469,19 @@ async def _handle_offers_resolve(
     """
     from db.database import database
 
+    started = time.perf_counter()
+
     product_id = str(payload.product.product_id or "").strip() or None
     sku_id = str(payload.product.sku_id or "").strip() or None
     market_hint = str(payload.market or "").strip() or None
     tool_hint = str(payload.tool or "").strip() or None
     limit = int(payload.limit or 10)
+    merchant_scope = _resolve_offers_merchant_scope(
+        payload=payload,
+        request_metadata=request_metadata,
+    )
+    product_id_aliases = _expand_ref_aliases(product_id)
+    sku_id_aliases = _expand_ref_aliases(sku_id)
 
     def _conf(kind: str, confidence: float, reason: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return {
@@ -385,30 +493,65 @@ async def _handle_offers_resolve(
 
     mapping_candidates: List[Dict[str, Any]] = []
     offers: List[Dict[str, Any]] = []
+    source_status: List[Dict[str, Any]] = []
+
+    def _record_source(
+        *,
+        source: str,
+        status: str,
+        reason_code: str,
+        source_started: float,
+        row_count: Optional[int] = None,
+        error: Optional[str] = None,
+        query: Optional[str] = None,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "source": source,
+            "status": status,
+            "reason_code": reason_code,
+            "latency_ms": int((time.perf_counter() - source_started) * 1000),
+        }
+        if row_count is not None:
+            entry["row_count"] = int(row_count)
+        if error:
+            entry["error"] = str(error)[:500]
+        if query:
+            entry["query"] = query
+        source_status.append(entry)
 
     # 1) External offers from external seeds (affiliate outbound)
     external_offers: List[Dict[str, Any]] = []
+    external_started = time.perf_counter()
     try:
         seed_limit = min(max(limit * 6, 40), 240)
         where_clauses = ["status = 'active'"]
         params: Dict[str, Any] = {"limit": seed_limit}
 
-        if product_id:
-            params["pid"] = product_id
-            where_clauses.append(
-                "("
-                "external_product_id = :pid"
-                " OR LOWER(COALESCE(title,'')) LIKE :pid_like"
-                " OR LOWER(COALESCE(canonical_url,'')) LIKE :pid_like"
-                " OR LOWER(COALESCE(destination_url,'')) LIKE :pid_like"
-                " OR LOWER(CAST(seed_data AS TEXT)) LIKE :pid_like"
-                ")"
-            )
-            params["pid_like"] = f"%{_safe_lower(product_id)}%"
+        if product_id_aliases:
+            pid_clause: List[str] = []
+            for idx, pid_alias in enumerate(product_id_aliases[:8]):
+                pid_key = f"pid_{idx}"
+                like_key = f"pid_like_{idx}"
+                params[pid_key] = pid_alias
+                params[like_key] = f"%{_safe_lower(pid_alias)}%"
+                pid_clause.append(
+                    "("
+                    f"external_product_id = :{pid_key}"
+                    f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
+                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
+                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
+                    f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
+                    ")"
+                )
+            where_clauses.append("(" + " OR ".join(pid_clause) + ")")
 
-        if sku_id:
-            params["sku_like"] = f"%{_safe_lower(sku_id)}%"
-            where_clauses.append("LOWER(CAST(seed_data AS TEXT)) LIKE :sku_like")
+        if sku_id_aliases:
+            sku_clause: List[str] = []
+            for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+                key = f"sku_like_{idx}"
+                params[key] = f"%{_safe_lower(sku_alias)}%"
+                sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
+            where_clauses.append("(" + " OR ".join(sku_clause) + ")")
 
         if len(where_clauses) == 1:
             # No input: return empty (caller must provide sku_id or product_id).
@@ -420,15 +563,18 @@ async def _handle_offers_resolve(
                 },
             }
 
-        seed_rows = await database.fetch_all(
-            f"""
-            SELECT *
-            FROM external_product_seeds
-            WHERE {" AND ".join(where_clauses)}
-            ORDER BY updated_at DESC, created_at DESC
-            LIMIT :limit
-            """,
-            params,
+        seed_rows = await asyncio.wait_for(
+            database.fetch_all(
+                f"""
+                SELECT *
+                FROM external_product_seeds
+                WHERE {" AND ".join(where_clauses)}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT :limit
+                """,
+                params,
+            ),
+            timeout=3.0,
         )
 
         seen_offer_ids: set[str] = set()
@@ -516,7 +662,7 @@ async def _handle_offers_resolve(
                 shipping_days = _coerce_int(v.get("shipping_days") or v.get("shippingDays"))
                 original_price = _coerce_float(v.get("original_price") or v.get("compare_at_price") or v.get("originalPrice"))
 
-                confidence = 1.0 if (sku_id and vid == sku_id) else 0.8 if product_id else 0.6
+                confidence = 1.0 if (sku_id and vid in sku_id_aliases) else 0.8 if product_id else 0.6
                 mapping_candidates.append(
                     _conf(
                         "external_seed",
@@ -561,47 +707,180 @@ async def _handle_offers_resolve(
                     break
             if len(external_offers) >= limit:
                 break
+        _record_source(
+            source="external_product_seeds",
+            status="ok",
+            reason_code="ok",
+            source_started=external_started,
+            row_count=len(seed_rows or []),
+            query="external_seed_by_ref",
+        )
     except Exception as e:
         logger.info("offers.resolve.external.failed", extra={"error": str(e)})
+        _record_source(
+            source="external_product_seeds",
+            status="error",
+            reason_code=_classify_db_reason_code(e),
+            source_started=external_started,
+            error=type(e).__name__,
+            query="external_seed_by_ref",
+        )
 
     # 2) Internal checkout offers (fallback)
     internal_offers: List[Dict[str, Any]] = []
+    canonical_group_id: Optional[str] = None
+    canonical_member: Optional[Dict[str, Any]] = None
     if len(external_offers) == 0 or all((o.get("confidence") or 0) < 0.75 for o in external_offers):
+        internal_started = time.perf_counter()
         try:
             # First try direct product id match
             rows: List[Any] = []
-            if product_id:
-                rows = await database.fetch_all(
-                    """
-                    SELECT merchant_id, product_data
-                    FROM products_cache
-                    WHERE (
-                      platform_product_id = :pid
-                      OR product_data->>'id' = :pid
-                      OR product_data->>'product_id' = :pid
-                    )
-                    ORDER BY cached_at DESC
-                    LIMIT 20
-                    """,
-                    {"pid": product_id},
+            if product_id_aliases:
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT merchant_id, platform, platform_product_id, product_data
+                        FROM products_cache
+                        WHERE (expires_at IS NULL OR expires_at > NOW())
+                          AND (:merchant_scope IS NULL OR merchant_id = :merchant_scope)
+                          AND (
+                            platform_product_id = ANY(:pid_aliases)
+                            OR product_data->>'id' = ANY(:pid_aliases)
+                            OR product_data->>'product_id' = ANY(:pid_aliases)
+                          )
+                        ORDER BY cached_at DESC
+                        LIMIT 80
+                        """,
+                        {
+                            "merchant_scope": merchant_scope,
+                            "pid_aliases": product_id_aliases,
+                        },
+                    ),
+                    timeout=3.0,
                 )
 
             # Next try SKU-like match in cached JSON (bounded).
-            if not rows and sku_id:
-                rows = await database.fetch_all(
-                    """
-                    SELECT merchant_id, product_data
-                    FROM products_cache
-                    WHERE LOWER(CAST(product_data AS TEXT)) LIKE :like
-                    ORDER BY cached_at DESC
-                    LIMIT 50
-                    """,
-                    {"like": f"%{_safe_lower(sku_id)}%"},
+            if not rows and sku_id_aliases:
+                sku_clauses: List[str] = []
+                sku_params: Dict[str, Any] = {"merchant_scope": merchant_scope}
+                for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+                    key = f"sku_like_{idx}"
+                    sku_params[key] = f"%{_safe_lower(sku_alias)}%"
+                    sku_clauses.append(f"LOWER(CAST(product_data AS TEXT)) LIKE :{key}")
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        f"""
+                        SELECT merchant_id, platform, platform_product_id, product_data
+                        FROM products_cache
+                        WHERE (expires_at IS NULL OR expires_at > NOW())
+                          AND (:merchant_scope IS NULL OR merchant_id = :merchant_scope)
+                          AND ({' OR '.join(sku_clauses)})
+                        ORDER BY cached_at DESC
+                        LIMIT 120
+                        """,
+                        sku_params,
+                    ),
+                    timeout=3.0,
                 )
+
+            # Canonical product-group lookup when available.
+            if rows:
+                member_candidates = {
+                    str((r.get("platform_product_id") if isinstance(r, dict) else None) or "").strip()
+                    for r in rows
+                }
+                member_candidates.update(product_id_aliases)
+                member_candidates = {v for v in member_candidates if v}
+
+                if member_candidates:
+                    group_rows = await asyncio.wait_for(
+                        database.fetch_all(
+                            """
+                            SELECT product_group_id, merchant_id, platform, platform_product_id, is_primary
+                            FROM product_group_members
+                            WHERE platform_product_id = ANY(:platform_product_ids)
+                            ORDER BY is_primary DESC, merchant_id ASC
+                            LIMIT 200
+                            """,
+                            {"platform_product_ids": list(member_candidates)},
+                        ),
+                        timeout=2.0,
+                    )
+                    if group_rows:
+                        first = group_rows[0]
+                        canonical_group_id = str(first["product_group_id"])
+                        group_members = [
+                            dict(r)
+                            for r in group_rows
+                            if str(r.get("product_group_id") or "") == canonical_group_id
+                        ]
+                        for gm in group_members:
+                            if bool(gm.get("is_primary")):
+                                canonical_member = gm
+                                break
+                        if canonical_member is None and group_members:
+                            canonical_member = group_members[0]
+                        mapping_candidates.append(
+                            _conf(
+                                "canonical_group",
+                                1.0,
+                                "resolved_product_group",
+                                {
+                                    "product_group_id": canonical_group_id,
+                                    "member_count": len(group_members),
+                                },
+                            )
+                        )
+
+                        member_mids = sorted(
+                            {
+                                str((gm.get("merchant_id") or "")).strip()
+                                for gm in group_members
+                                if str(gm.get("merchant_id") or "").strip()
+                            }
+                        )
+                        member_pids = sorted(
+                            {
+                                str((gm.get("platform_product_id") or "")).strip()
+                                for gm in group_members
+                                if str(gm.get("platform_product_id") or "").strip()
+                            }
+                        )
+                        if member_mids and member_pids:
+                            group_cache_rows = await asyncio.wait_for(
+                                database.fetch_all(
+                                    """
+                                    SELECT merchant_id, platform, platform_product_id, product_data
+                                    FROM products_cache
+                                    WHERE merchant_id = ANY(:merchant_ids)
+                                      AND platform_product_id = ANY(:platform_product_ids)
+                                      AND (expires_at IS NULL OR expires_at > NOW())
+                                    ORDER BY cached_at DESC
+                                    LIMIT 200
+                                    """,
+                                    {
+                                        "merchant_ids": member_mids,
+                                        "platform_product_ids": member_pids,
+                                    },
+                                ),
+                                timeout=3.0,
+                            )
+                            # Merge + dedupe by (merchant_id, platform_product_id).
+                            merged_rows: List[Dict[str, Any]] = []
+                            seen_keys: set[str] = set()
+                            for it in list(rows) + list(group_cache_rows or []):
+                                rd = dict(it) if isinstance(it, dict) else {}
+                                k = f"{rd.get('merchant_id')}::{rd.get('platform_product_id')}"
+                                if not rd or k in seen_keys:
+                                    continue
+                                seen_keys.add(k)
+                                merged_rows.append(rd)
+                            rows = merged_rows
 
             seen_internal_offer_ids: set[str] = set()
             for row in rows or []:
                 merchant_id = (row.get("merchant_id") if isinstance(row, dict) else None) or None
+                platform = (row.get("platform") if isinstance(row, dict) else None) or "unknown"
                 product_data = row.get("product_data") if isinstance(row, dict) else None
                 if isinstance(product_data, str):
                     try:
@@ -611,7 +890,13 @@ async def _handle_offers_resolve(
                 if not isinstance(product_data, dict):
                     continue
 
-                pid = str(product_data.get("id") or product_data.get("product_id") or product_id or "").strip() or None
+                pid = str(
+                    product_data.get("id")
+                    or product_data.get("product_id")
+                    or (row.get("platform_product_id") if isinstance(row, dict) else None)
+                    or product_id
+                    or ""
+                ).strip() or None
                 if not pid or not merchant_id:
                     continue
 
@@ -665,13 +950,27 @@ async def _handle_offers_resolve(
                     str(product_data.get("merchant_name") or product_data.get("store_name") or "").strip()
                     or str(merchant_id)
                 )
-                confidence = 0.9 if product_id and pid == product_id else 0.8 if sku_id else 0.6
+                exact_pid_match = bool(product_id_aliases and pid in product_id_aliases)
+                exact_sku_match = bool(sku_id_aliases and variant_id and variant_id in sku_id_aliases)
+                confidence = 0.95 if (exact_pid_match or exact_sku_match) else 0.8 if sku_id else 0.7
+                canonical_ref = (
+                    f"pg:{canonical_group_id}"
+                    if canonical_group_id
+                    else f"pc:{merchant_id}:{platform}:{pid}"
+                )
                 mapping_candidates.append(
                     _conf(
                         "internal_product",
                         confidence,
                         "matched_products_cache",
-                        {"merchant_id": merchant_id, "product_id": pid, "variant_id": variant_id},
+                        {
+                            "merchant_id": merchant_id,
+                            "platform": platform,
+                            "product_id": pid,
+                            "variant_id": variant_id,
+                            "canonical_ref": canonical_ref,
+                            "product_group_id": canonical_group_id,
+                        },
                     )
                 )
 
@@ -697,32 +996,116 @@ async def _handle_offers_resolve(
                         "source": {
                             "type": "internal_product",
                             "merchant_id": merchant_id,
+                            "platform": platform,
                             "product_id": pid,
                             "variant_id": variant_id,
+                            "canonical_ref": canonical_ref,
+                            "product_group_id": canonical_group_id,
                         },
                     }
                 )
                 if len(internal_offers) >= min(3, limit):
                     break
+            _record_source(
+                source="products_cache",
+                status="ok" if rows else "empty",
+                reason_code="ok" if rows else "no_candidates",
+                source_started=internal_started,
+                row_count=len(rows or []),
+                query="products_cache_by_alias",
+            )
         except Exception as e:
             logger.info("offers.resolve.internal.failed", extra={"error": str(e)})
+            _record_source(
+                source="products_cache",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=internal_started,
+                error=type(e).__name__,
+                query="products_cache_by_alias",
+            )
 
     # External offers always come first.
     offers = external_offers + internal_offers
     offers = offers[:limit]
+
+    canonical_ref: Optional[str] = None
+    if canonical_group_id:
+        canonical_ref = f"pg:{canonical_group_id}"
+    elif internal_offers:
+        src = (internal_offers[0].get("source") or {}) if isinstance(internal_offers[0], dict) else {}
+        if isinstance(src, dict):
+            if src.get("canonical_ref"):
+                canonical_ref = str(src.get("canonical_ref"))
+            else:
+                mid = str(src.get("merchant_id") or "").strip()
+                pid = str(src.get("product_id") or "").strip()
+                plat = str(src.get("platform") or "").strip() or "unknown"
+                if mid and pid:
+                    canonical_ref = f"pc:{mid}:{plat}:{pid}"
+
+    canonical_product: Optional[Dict[str, Any]] = None
+    if canonical_member:
+        canonical_product = {
+            "merchant_id": str(canonical_member.get("merchant_id") or "").strip() or None,
+            "platform": str(canonical_member.get("platform") or "").strip() or None,
+            "product_id": str(canonical_member.get("platform_product_id") or "").strip() or None,
+            "product_group_id": canonical_group_id,
+        }
+    elif internal_offers:
+        src = (internal_offers[0].get("source") or {}) if isinstance(internal_offers[0], dict) else {}
+        if isinstance(src, dict):
+            canonical_product = {
+                "merchant_id": src.get("merchant_id"),
+                "platform": src.get("platform"),
+                "product_id": src.get("product_id"),
+                "product_group_id": canonical_group_id,
+            }
+
+    failure_breakdown = {
+        str(s.get("source")): str(s.get("reason_code"))
+        for s in source_status
+        if str(s.get("status")) == "error"
+    }
+    reason_code = "ok" if offers else (next(iter(failure_breakdown.values())) if failure_breakdown else "no_candidates")
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    logger.info(
+        "offers.resolve.summary",
+        extra={
+            "event": "offers.resolve.summary",
+            "product_id": product_id,
+            "sku_id": sku_id,
+            "merchant_scope": merchant_scope,
+            "offers_count": len(offers),
+            "reason_code": reason_code,
+            "latency_ms": latency_ms,
+            "sources": source_status,
+            "canonical_ref": canonical_ref,
+        },
+    )
 
     return {
         "status": "success",
         "input": {"product_id": product_id, "sku_id": sku_id},
         "offers": offers,
         "offers_count": len(offers),
+        **({"canonical_product_ref": canonical_ref} if canonical_ref else {}),
         "mapping": {
+            "canonical_ref": canonical_ref,
+            "canonical_product_group_id": canonical_group_id,
+            "canonical_product": canonical_product,
             "candidates": mapping_candidates[:50],
         },
         "metadata": {
             "source": "offers.resolve",
             "has_external": bool(external_offers),
             "has_internal": bool(internal_offers),
+            "merchant_scope": merchant_scope,
+            "reason_code": reason_code,
+            "latency_ms": latency_ms,
+            "sources": source_status,
+            "failure_breakdown": failure_breakdown,
         },
     }
 

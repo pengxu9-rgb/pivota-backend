@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import time
+from urllib.parse import urlparse
 
 from models.order import CreateOrderRequest, OrderResponse
 from models.standard_product import StandardProduct
@@ -96,6 +97,59 @@ def _ensure_json_obj(val: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _classify_db_reason_code(exc: Exception) -> str:
+    msg = str(exc or "").lower()
+    if isinstance(exc, asyncio.TimeoutError) or "timeout" in msg:
+        return "db_query_timeout"
+    if "does not exist" in msg or "undefined table" in msg or "undefined column" in msg or "relation" in msg:
+        return "db_schema"
+    if "password authentication failed" in msg or "authentication failed" in msg or "permission denied" in msg:
+        return "db_auth"
+    if "too many connections" in msg or "connection refused" in msg or "connection reset" in msg:
+        return "db_connection"
+    return "db_error"
+
+
+def _expand_product_ref_aliases(raw_ref: Optional[str]) -> List[str]:
+    raw = str(raw_ref or "").strip()
+    if not raw:
+        return []
+
+    aliases: List[str] = []
+
+    def _add(v: Optional[str]) -> None:
+        s = str(v or "").strip()
+        if s and s not in aliases:
+            aliases.append(s)
+
+    _add(raw)
+    if raw.startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(raw)
+            parts = [p for p in (parsed.path or "").split("/") if p]
+            for idx, part in enumerate(parts):
+                if part == "products" and idx + 1 < len(parts):
+                    _add(parts[idx + 1])
+        except Exception:
+            pass
+
+    if raw.isdigit():
+        _add(f"gid://shopify/Product/{raw}")
+        _add(f"gid://shopify/ProductVariant/{raw}")
+
+    if "gid://shopify/" in raw:
+        maybe_numeric = raw.rstrip("/").split("/")[-1]
+        if maybe_numeric.isdigit():
+            _add(maybe_numeric)
+
+    if ":" in raw:
+        _add(raw.split(":")[-1])
+    if "/" in raw:
+        _add(raw.rstrip("/").split("/")[-1])
+
+    return aliases[:20]
 
 
 def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1573,6 +1627,378 @@ async def agent_search_products(
             error_message=str(e)
         )
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+@router.get("/products/resolve")
+async def agent_resolve_products(
+    req: Request,
+    merchant_id: Optional[str] = Query(None, description="Optional merchant scope"),
+    product_id: Optional[str] = Query(None, description="Product id / canonical ref / PDP URL"),
+    sku_id: Optional[str] = Query(None, description="SKU / variant id"),
+    query: Optional[str] = Query(None, description="Fallback free-text query"),
+    limit: int = Query(default=10, le=50),
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Resolve a stable product reference for PDP flows.
+
+    Resolution order:
+    1) products_cache exact aliases (product_id / sku_id)
+    2) scoped / global agent search fallback
+    3) canonical product_group mapping (when available)
+    """
+    started = time.perf_counter()
+
+    if merchant_id and not context.can_access_merchant(merchant_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+    product_aliases = _expand_product_ref_aliases(product_id)
+    sku_aliases = _expand_product_ref_aliases(sku_id)
+    query_text = str(query or "").strip()
+    if not product_aliases and not sku_aliases and not query_text:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of product_id, sku_id, or query is required",
+        )
+
+    sources: List[Dict[str, Any]] = []
+
+    def _record_source(
+        *,
+        source: str,
+        status: str,
+        reason_code: str,
+        source_started: float,
+        row_count: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        row: Dict[str, Any] = {
+            "source": source,
+            "status": status,
+            "reason_code": reason_code,
+            "latency_ms": int((time.perf_counter() - source_started) * 1000),
+        }
+        if row_count is not None:
+            row["row_count"] = int(row_count)
+        if error:
+            row["error"] = str(error)[:500]
+        sources.append(row)
+
+    candidates_by_key: Dict[str, Dict[str, Any]] = {}
+
+    def _add_candidate(
+        *,
+        merchant: Optional[str],
+        platform: Optional[str],
+        platform_product_id: Optional[str],
+        title: Optional[str],
+        source: str,
+        score: float,
+    ) -> None:
+        mid = str(merchant or "").strip()
+        pid = str(platform_product_id or "").strip()
+        plat = str(platform or "").strip().lower() or "unknown"
+        if not mid or not pid:
+            return
+        key = f"{mid}:{plat}:{pid}"
+        current = candidates_by_key.get(key)
+        payload = {
+            "merchant_id": mid,
+            "platform": plat,
+            "product_id": pid,
+            "title": str(title or "").strip() or None,
+            "source": source,
+            "score": float(score),
+        }
+        if not current or float(payload["score"]) > float(current.get("score", 0)):
+            candidates_by_key[key] = payload
+
+    # Source 1: exact products_cache resolution by aliases.
+    cache_started = time.perf_counter()
+    try:
+        cache_rows: List[Dict[str, Any]] = []
+        if product_aliases:
+            rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT merchant_id, platform, platform_product_id, product_data
+                    FROM products_cache
+                    WHERE (expires_at IS NULL OR expires_at > NOW())
+                      AND (:merchant_id IS NULL OR merchant_id = :merchant_id)
+                      AND (
+                        platform_product_id = ANY(:pid_aliases)
+                        OR product_data->>'id' = ANY(:pid_aliases)
+                        OR product_data->>'product_id' = ANY(:pid_aliases)
+                      )
+                    ORDER BY cached_at DESC
+                    LIMIT 120
+                    """,
+                    {
+                        "merchant_id": merchant_id,
+                        "pid_aliases": product_aliases,
+                    },
+                ),
+                timeout=3.0,
+            )
+            cache_rows.extend([dict(r) for r in (rows or [])])
+
+        if sku_aliases and not cache_rows:
+            where_parts: List[str] = []
+            params: Dict[str, Any] = {"merchant_id": merchant_id}
+            for idx, sku_alias in enumerate(sku_aliases[:8]):
+                key = f"sku_like_{idx}"
+                params[key] = f"%{str(sku_alias).lower()}%"
+                where_parts.append(f"LOWER(CAST(product_data AS TEXT)) LIKE :{key}")
+            rows = await asyncio.wait_for(
+                database.fetch_all(
+                    f"""
+                    SELECT merchant_id, platform, platform_product_id, product_data
+                    FROM products_cache
+                    WHERE (expires_at IS NULL OR expires_at > NOW())
+                      AND (:merchant_id IS NULL OR merchant_id = :merchant_id)
+                      AND ({' OR '.join(where_parts)})
+                    ORDER BY cached_at DESC
+                    LIMIT 120
+                    """,
+                    params,
+                ),
+                timeout=3.0,
+            )
+            cache_rows.extend([dict(r) for r in (rows or [])])
+
+        for row in cache_rows:
+            pdata = row.get("product_data")
+            if isinstance(pdata, str):
+                try:
+                    pdata = json.loads(pdata)
+                except Exception:
+                    pdata = None
+            if not isinstance(pdata, dict):
+                continue
+            _add_candidate(
+                merchant=row.get("merchant_id"),
+                platform=row.get("platform"),
+                platform_product_id=(
+                    pdata.get("id")
+                    or pdata.get("product_id")
+                    or row.get("platform_product_id")
+                ),
+                title=pdata.get("title") or pdata.get("name"),
+                source="products_cache",
+                score=1.0,
+            )
+        _record_source(
+            source="products_cache",
+            status="ok" if cache_rows else "empty",
+            reason_code="ok" if cache_rows else "no_candidates",
+            source_started=cache_started,
+            row_count=len(cache_rows),
+        )
+    except Exception as e:
+        _record_source(
+            source="products_cache",
+            status="error",
+            reason_code=_classify_db_reason_code(e),
+            source_started=cache_started,
+            error=type(e).__name__,
+        )
+
+    # Source 2/3: scoped/global search fallback.
+    search_query = query_text or (product_aliases[0] if product_aliases else sku_aliases[0] if sku_aliases else "")
+    if search_query and not candidates_by_key:
+        async def _resolve_with_search(*, scoped_merchant: Optional[str], source_name: str) -> bool:
+            search_started = time.perf_counter()
+            try:
+                result = await asyncio.wait_for(
+                    agent_search_products(
+                        req=req,
+                        background_tasks=BackgroundTasks(),
+                        merchant_id=scoped_merchant,
+                        merchant_ids=None,
+                        search_all_merchants=(scoped_merchant is None),
+                        query=search_query,
+                        category=None,
+                        min_price=None,
+                        max_price=None,
+                        in_stock_only=True,
+                        limit=max(20, min(120, limit * 4)),
+                        offset=0,
+                        context=context,
+                    ),
+                    timeout=6.0,
+                )
+                products = (result or {}).get("products") if isinstance(result, dict) else []
+                for p in products or []:
+                    if not isinstance(p, dict):
+                        continue
+                    _add_candidate(
+                        merchant=p.get("merchant_id") or scoped_merchant,
+                        platform=p.get("platform"),
+                        platform_product_id=(p.get("product_id") or p.get("id")),
+                        title=p.get("title") or p.get("name"),
+                        source=source_name,
+                        score=0.75,
+                    )
+                _record_source(
+                    source=source_name,
+                    status="ok" if products else "empty",
+                    reason_code="ok" if products else "no_candidates",
+                    source_started=search_started,
+                    row_count=len(products or []),
+                )
+                return bool(products)
+            except asyncio.TimeoutError:
+                _record_source(
+                    source=source_name,
+                    status="error",
+                    reason_code="upstream_timeout",
+                    source_started=search_started,
+                    error="TimeoutError",
+                )
+                return False
+            except Exception as e:
+                reason_code = "upstream_timeout" if "timeout" in str(e).lower() else "upstream_error"
+                _record_source(
+                    source=source_name,
+                    status="error",
+                    reason_code=reason_code,
+                    source_started=search_started,
+                    error=type(e).__name__,
+                )
+                return False
+
+        if merchant_id:
+            _ = await _resolve_with_search(scoped_merchant=merchant_id, source_name="agent_search_scoped")
+        if not candidates_by_key:
+            _ = await _resolve_with_search(scoped_merchant=None, source_name="agent_search_global")
+
+    candidates = sorted(
+        candidates_by_key.values(),
+        key=lambda it: float(it.get("score") or 0),
+        reverse=True,
+    )
+
+    # Canonical mapping via product groups.
+    canonical_group_id: Optional[str] = None
+    canonical_ref: Optional[str] = None
+    canonical_product: Optional[Dict[str, Any]] = None
+    group_started = time.perf_counter()
+    try:
+        candidate_product_ids = [str(c.get("product_id") or "").strip() for c in candidates if c.get("product_id")]
+        candidate_product_ids = list(dict.fromkeys([c for c in candidate_product_ids if c]))[:200]
+        if candidate_product_ids:
+            rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT product_group_id, merchant_id, platform, platform_product_id, is_primary
+                    FROM product_group_members
+                    WHERE platform_product_id = ANY(:pids)
+                    ORDER BY is_primary DESC, merchant_id ASC
+                    LIMIT 200
+                    """,
+                    {"pids": candidate_product_ids},
+                ),
+                timeout=2.0,
+            )
+            if rows:
+                first = dict(rows[0])
+                canonical_group_id = str(first.get("product_group_id") or "").strip() or None
+                if canonical_group_id:
+                    primary = None
+                    for r in rows:
+                        rd = dict(r)
+                        if str(rd.get("product_group_id") or "") != canonical_group_id:
+                            continue
+                        if bool(rd.get("is_primary")):
+                            primary = rd
+                            break
+                        if primary is None:
+                            primary = rd
+                    if primary:
+                        canonical_product = {
+                            "merchant_id": primary.get("merchant_id"),
+                            "platform": primary.get("platform"),
+                            "product_id": primary.get("platform_product_id"),
+                            "product_group_id": canonical_group_id,
+                        }
+                        canonical_ref = f"pg:{canonical_group_id}"
+            _record_source(
+                source="product_group_members",
+                status="ok" if rows else "empty",
+                reason_code="ok" if rows else "no_candidates",
+                source_started=group_started,
+                row_count=len(rows or []),
+            )
+        else:
+            _record_source(
+                source="product_group_members",
+                status="empty",
+                reason_code="no_candidates",
+                source_started=group_started,
+                row_count=0,
+            )
+    except Exception as e:
+        _record_source(
+            source="product_group_members",
+            status="error",
+            reason_code=_classify_db_reason_code(e),
+            source_started=group_started,
+            error=type(e).__name__,
+        )
+
+    if not canonical_ref and candidates:
+        top = candidates[0]
+        canonical_ref = f"pc:{top.get('merchant_id')}:{top.get('platform')}:{top.get('product_id')}"
+        canonical_product = {
+            "merchant_id": top.get("merchant_id"),
+            "platform": top.get("platform"),
+            "product_id": top.get("product_id"),
+            "product_group_id": canonical_group_id,
+        }
+
+    candidates = candidates[:limit]
+    failure_breakdown = {
+        str(s.get("source")): str(s.get("reason_code"))
+        for s in sources
+        if str(s.get("status")) == "error"
+    }
+    reason_code = "ok" if candidates else (next(iter(failure_breakdown.values())) if failure_breakdown else "no_candidates")
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    logger.info(
+        "agent_products_resolve",
+        extra={
+            "event": "agent_products_resolve",
+            "query": search_query,
+            "merchant_scope": merchant_id,
+            "latency_ms": latency_ms,
+            "reason_code": reason_code,
+            "candidate_count": len(candidates),
+            "canonical_ref": canonical_ref,
+        },
+    )
+
+    return {
+        "status": "success",
+        "input": {
+            "merchant_id": merchant_id,
+            "product_id": product_id,
+            "sku_id": sku_id,
+            "query": query_text or None,
+        },
+        "canonical_ref": canonical_ref,
+        "canonical_product_group_id": canonical_group_id,
+        "canonical_product": canonical_product,
+        "candidates": candidates,
+        "candidate_count": len(candidates),
+        "metadata": {
+            "source": "agent_products_resolve",
+            "reason_code": reason_code,
+            "latency_ms": latency_ms,
+            "sources": sources,
+            "failure_breakdown": failure_breakdown,
+        },
+    }
 
 
 # ============================================================================

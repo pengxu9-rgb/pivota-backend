@@ -2,7 +2,7 @@
 SDK-Ready Agent API Endpoints - COMPREHENSIVE FIX
 Properly handles all database schema issues and edge cases
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -12,6 +12,7 @@ from utils.logger import logger
 import secrets
 import json
 import re
+import time
 
 from services.agent_ranking_service import (
     AgentRankingFeatures,
@@ -645,360 +646,121 @@ async def list_merchants(
 @router.get("/products/search")
 async def search_products(
     req: Request,
+    background_tasks: BackgroundTasks,
     merchant_id: Optional[str] = None,
+    merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
+    search_all_merchants: bool = Query(
+        default=False,
+        description="Opt-in cross-merchant search",
+    ),
     query: Optional[str] = None,
     category: Optional[str] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock: Optional[bool] = None,
+    in_stock_only: Optional[bool] = Query(None),
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context)
 ):
-    """Search products - supports cross-merchant search with quality-aware ranking"""
-    try:
-        logger.info("agent_sdk_fixed_search_entry")
+    """
+    Delegate to optimized `/agent/v1/products/search` implementation in `agent_api`.
 
-        if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
-            external_products = await _load_external_seed_products_for_search(
-                req=req,
-                query=query,
-                limit=limit,
-                offset=offset,
-            )
-            return {
-                "status": "success",
-                "products": external_products,
-                "pagination": {
-                    "total": offset + len(external_products),
-                    "limit": limit,
-                    "offset": offset,
-                    "has_more": len(external_products) == limit,
-                },
-            }
+    Reason:
+    this router is registered earlier than `agent_api` in `main.py`, so this path
+    is the effective handler in production. Delegation keeps route compatibility
+    while using the lower-latency implementation.
+    """
+    from routes.agent_api import agent_search_products
 
-        # Build WHERE clauses
-        where_clauses = []
-        params = {"limit": limit, "offset": offset}
-        
-        if merchant_id:
-            # Verify access to merchant
-            merchant_check = await database.fetch_one(
-                "SELECT merchant_id FROM merchant_onboarding WHERE merchant_id = :mid AND status != 'deleted'",
-                {"mid": merchant_id}
-            )
-            if not merchant_check:
-                raise HTTPException(status_code=404, detail="Merchant not found")
-            
-            # Qualify to avoid ambiguity between products_cache p and merchant_onboarding m
-            where_clauses.append("p.merchant_id = :merchant_id")
-            params["merchant_id"] = merchant_id
-        
-        if query:
-            # Search in both legacy and StandardProduct fields.
-            # Shopify cache rows are StandardProduct-shaped and use `title`.
-            where_clauses.append(
-                """
-                (
-                    LOWER(COALESCE(p.product_data->>'name', '')) LIKE :query
-                    OR LOWER(COALESCE(p.product_data->>'title', '')) LIKE :query
-                    OR LOWER(COALESCE(p.product_data->>'description', '')) LIKE :query
-                    OR LOWER(COALESCE(p.product_data->>'vendor', '')) LIKE :query
-                    OR LOWER(COALESCE(p.product_data->>'product_type', '')) LIKE :query
-                    OR LOWER(COALESCE(p.product_data->>'sku', '')) LIKE :query
-                )
-                """
-            )
-            params["query"] = f"%{query.lower()}%"
-        
-        if category:
-            where_clauses.append("LOWER(p.product_data->>'category') = :category")
-            params["category"] = category.lower()
-        
-        if min_price is not None:
-            where_clauses.append("(p.product_data->>'price')::numeric >= :min_price")
-            params["min_price"] = min_price
-        
-        if max_price is not None:
-            where_clauses.append("(p.product_data->>'price')::numeric <= :max_price")
-            params["max_price"] = max_price
-        
-        if in_stock is not None:
-            where_clauses.append("(p.product_data->>'in_stock')::boolean = :in_stock")
-            params["in_stock"] = in_stock
-        
-        # Build query
-        where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
-        
-        # Get products from cache
-        query_str = f"""
-            SELECT 
-                p.id,
-                p.merchant_id,
-                p.platform,
-                p.platform_product_id,
-                p.product_data,
-                p.cached_at,
-                m.business_name as merchant_name
-            FROM products_cache p
-            JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
-            WHERE {where_clause}
-            AND m.status != 'deleted'
-            AND p.cache_status != 'expired'
-            ORDER BY p.cached_at DESC
-            LIMIT :limit OFFSET :offset
-        """
-        
-        products = await database.fetch_all(query_str, params)
-        
-        # Get total count
-        count_query = f"""
-            SELECT COUNT(*) as total
-            FROM products_cache p
-            JOIN merchant_onboarding m ON p.merchant_id = m.merchant_id
-            WHERE {where_clause}
-            AND m.status != 'deleted'
-        """
-        
-        # Remove limit and offset from params for count query
-        count_params = {k: v for k, v in params.items() if k not in ['limit', 'offset']}
-        total_result = await database.fetch_one(count_query, count_params)
-        
-        # Extract product data from JSON and calculate relevance + ranking features
-        ranking_config = get_agent_ranking_config()
-        ranked_candidates: List[Dict[str, Any]] = []
+    started = time.perf_counter()
+    effective_in_stock_only = (
+        in_stock_only
+        if in_stock_only is not None
+        else in_stock
+        if in_stock is not None
+        else True
+    )
 
-        for p in products:
-            try:
-                # Convert Row to dict safely
-                p_dict = dict(p)
-                # Extract product data from JSON column (might be string or dict)
-                product_data_raw = p_dict.get("product_data")
-                if isinstance(product_data_raw, str):
-                    product_info = json.loads(product_data_raw)
-                elif isinstance(product_data_raw, dict):
-                    product_info = product_data_raw
-                else:
-                    product_info = {}
-                
-                # Build response object - merge product_info with metadata
-                product_dict = {
-                    **product_info,  # Spread all product fields
-                    "platform_product_id": p_dict["platform_product_id"],
-                    "merchant_id": p_dict["merchant_id"],
-                    "merchant_name": p_dict.get("merchant_name"),
-                    "platform": p_dict["platform"],
-                    "cached_at": p_dict["cached_at"].isoformat() if p_dict.get("cached_at") else None
-                }
-
-                # Keep both naming conventions so callers and ranking logic can use either.
-                if not product_dict.get("title") and product_dict.get("name"):
-                    product_dict["title"] = product_dict.get("name")
-                if not product_dict.get("name") and product_dict.get("title"):
-                    product_dict["name"] = product_dict.get("title")
-                
-                # Add relevance score
-                if query:
-                    score = 0
-                    title_lower = str(product_dict.get("title", "")).lower()
-                    name_lower = str(product_dict.get("name", "")).lower()
-                    desc_lower = str(product_dict.get("description", "")).lower()
-                    vendor_lower = str(product_dict.get("vendor", "")).lower()
-                    type_lower = str(product_dict.get("product_type", "")).lower()
-                    query_lower = query.lower()
-                    
-                    if query_lower in title_lower:
-                        score += 12
-                    if query_lower in name_lower:
-                        score += 10
-                    if title_lower.startswith(query_lower):
-                        score += 6
-                    if name_lower.startswith(query_lower):
-                        score += 5
-                    if query_lower in desc_lower:
-                        score += 3
-                    if query_lower in vendor_lower:
-                        score += 3
-                    if query_lower in type_lower:
-                        score += 2
-                    
-                    product_dict["relevance_score"] = score
-
-                # Build ranking features and enrich with quality/enrichment data
-                platform_product_id = str(
-                    product_dict.get("platform_product_id")
-                    or product_dict.get("id")
-                    or product_dict.get("product_id")
-                    or ""
-                )
-                if not platform_product_id:
-                    continue
-
-                features = AgentRankingFeatures(
-                    merchant_id=product_dict.get("merchant_id"),
-                    platform=product_dict.get("platform") or "unknown",
-                    platform_product_id=platform_product_id,
-                    rel_semantic=float(product_dict.get("relevance_score") or 1.0),
-                    rel_keyword=float(product_dict.get("relevance_score") or 1.0),
-                    rel_category_match=1.0
-                    if category
-                    and isinstance(product_dict.get("category"), str)
-                    and category.lower()
-                    in product_dict.get("category", "").lower()
-                    else 0.0,
-                )
-
-                await hydrate_quality_and_enrichment(features)
-
-                if not passes_agent_gating(features, ranking_config):
-                    continue
-
-                score = compute_agent_ranking_score(features, ranking_config)
-                product_dict["ranking_score"] = score
-                product_dict["ranking_features"] = serialize_features_for_log(
-                    features, score
-                )
-
-                ranked_candidates.append(product_dict)
-            except Exception as e:
-                logger.error(f"Error processing product: {e}")
-                continue
-
-        # Sort by ranking score (fallback to relevance if needed)
-        ranked_candidates.sort(
-            key=lambda x: (
-                x.get("ranking_score") is not None,
-                x.get("ranking_score", x.get("relevance_score", 0)),
-            ),
-            reverse=True,
+    # Keep legacy behavior for explicit external seed browsing.
+    if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+        external_products = await _load_external_seed_products_for_search(
+            req=req,
+            query=query,
+            limit=limit,
+            offset=offset,
         )
-        product_list = ranked_candidates
+        return {
+            "status": "success",
+            "products": external_products,
+            "pagination": {
+                "total": offset + len(external_products),
+                "limit": limit,
+                "offset": offset,
+                "has_more": len(external_products) == limit,
+            },
+            "metadata": {
+                "reason_code": "ok",
+                "source": "agent_sdk_fixed_external_seed",
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+            },
+        }
 
-        include_external_seed = offset == 0 and not merchant_id
+    result = await agent_search_products(
+        req=req,
+        background_tasks=background_tasks,
+        merchant_id=merchant_id,
+        merchant_ids=merchant_ids,
+        search_all_merchants=search_all_merchants,
+        query=query,
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+        in_stock_only=bool(effective_in_stock_only),
+        limit=limit,
+        offset=offset,
+        context=context,
+    )
+    if isinstance(result, dict):
+        # Preserve the historical SDK behavior: when searching regular catalogs
+        # we also inject external seed products for recall.
+        injected = 0
+        include_external_seed = int(offset or 0) == 0 and not merchant_id
         if include_external_seed:
             try:
                 external_seed_limit = min(200, max(20, int(limit or 20) * 5))
-                external_seed_products = await _load_external_seed_products_for_search(
+                external_products = await _load_external_seed_products_for_search(
                     req=req,
                     query=query,
                     limit=external_seed_limit,
                     offset=0,
                 )
-                if external_seed_products:
-                    query_lower = str(query or "").strip().lower()
-                    existing_ids = {
-                        str(p.get("product_id") or p.get("id") or "") for p in ranked_candidates
-                    }
-                    for p in external_seed_products:
+                if external_products:
+                    products = result.get("products") if isinstance(result.get("products"), list) else []
+                    existing_ids = {str(p.get("product_id") or p.get("id") or "") for p in products if isinstance(p, dict)}
+                    merged: List[Dict[str, Any]] = []
+                    for p in external_products:
                         pid = str(p.get("product_id") or p.get("id") or "")
                         if not pid or pid in existing_ids:
                             continue
-                        rel = 1.0
-                        if query_lower:
-                            title = str(p.get("title") or "").lower()
-                            desc = str(p.get("description") or "").lower()
-                            domain = str(p.get("external_domain") or "").lower()
-                            ext_url = str(p.get("external_url") or "").lower()
-                            brand = str(p.get("brand") or "").lower()
-                            haystack = " ".join([title, desc, brand, domain, ext_url]).strip()
-                            if query_lower in title:
-                                rel = 1.0 if title == query_lower else 0.9
-                            elif query_lower in desc:
-                                rel = 0.7
-                            elif query_lower in haystack:
-                                rel = 0.65
-                            else:
-                                words = [w for w in query_lower.split() if w]
-                                if words:
-                                    matches = sum(1 for w in words if w in haystack)
-                                    if matches > 0:
-                                        rel = 0.5 + (matches / len(words)) * 0.3
-                                    else:
-                                        continue
-                                else:
-                                    continue
-
-                        p["relevance_score"] = rel
-                        p["ranking_score"] = float(rel) * 0.8
-                        p["ranking_features"] = {"source": "external_seed"}
-                        ranked_candidates.append(p)
+                        merged.append(p)
                         existing_ids.add(pid)
+                    if merged:
+                        injected = len(merged)
+                        result["products"] = (merged + products)[: int(limit or 20)]
+            except Exception:
+                logger.debug("agent_sdk_fixed external seed injection failed", exc_info=True)
 
-                    ranked_candidates.sort(
-                        key=lambda x: (
-                            x.get("ranking_score") is not None,
-                            x.get("ranking_score", x.get("relevance_score", 0)),
-                        ),
-                        reverse=True,
-                    )
-                    product_list = ranked_candidates[:limit]
-            except Exception as e:
-                logger.debug(f"Failed to load external seed products: {e}", exc_info=True)
-        
-        response = {
-            "status": "success",
-            "products": product_list,
-            "pagination": {
-                "total": total_result["total"] if total_result else 0,
-                "limit": limit,
-                "offset": offset,
-                "has_more": (total_result["total"] if total_result else 0) > offset + limit
-            }
-        }
-        # Persist ranking features for LTR / reranker training (best-effort).
-        try:
-            await log_ranking_batch(
-                agent_id=getattr(context, "agent_id", None),
-                endpoint="/agent/v1/products/search",
-                query=query,
-                products=product_list,
-                max_rows=50,
-            )
-        except Exception as e:
-            logger.debug(f"Failed to log agent ranking batch: {e}", exc_info=True)
-
-        # Log impression events for the returned products (top N).
-        try:
-            events = []
-            for idx, p in enumerate(product_list[:50]):
-                feat = (p.get("ranking_features") or {}) if isinstance(
-                    p.get("ranking_features"), dict
-                ) else {}
-                events.append(
-                    {
-                        "agent_id": getattr(context, "agent_id", None),
-                        "session_id": getattr(context, "session_id", None),
-                        "event_type": "impression",
-                        "endpoint": "/agent/v1/products/search",
-                        "query": query,
-                        "merchant_id": p.get("merchant_id"),
-                        "platform": p.get("platform"),
-                        "platform_product_id": str(
-                            p.get("platform_product_id")
-                            or p.get("product_id")
-                            or p.get("id")
-                            or ""
-                        )
-                            or None,
-                        "ranking_score": p.get("ranking_score"),
-                        "position": idx,
-                        "quality_content_score": feat.get("quality_content_score"),
-                        "quality_model_readiness": feat.get(
-                            "quality_model_readiness"
-                        ),
-                    }
-                )
-            await log_product_events(events)
-        except Exception as e:
-            logger.debug(f"Failed to log agent product events: {e}", exc_info=True)
-
-        return response
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to search products: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to search products: {str(e)}")
+        metadata = result.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.setdefault("reason_code", "ok")
+        metadata["source"] = "agent_sdk_fixed_delegate"
+        metadata["latency_ms"] = int((time.perf_counter() - started) * 1000)
+        if injected > 0:
+            metadata["external_seed_injected"] = injected
+        result["metadata"] = metadata
+    return result
 
 # ============================================================================
 # ORDERS

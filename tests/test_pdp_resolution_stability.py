@@ -1,0 +1,251 @@
+import os
+import time
+from typing import Any, Dict, List
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+
+from main import app
+
+
+KNOWN_MERCHANT_ID = "merch_efbc46b4619cfbdf"
+KNOWN_PRODUCTS = {
+    "9886499864904": "The Ordinary Niacinamide 10% + Zinc 1%",
+    "9886500749640": "Winona Soothing Repair Serum",
+}
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return TestClient(app)
+
+
+def _build_product_cache_row(product_id: str, title: str) -> Dict[str, Any]:
+    return {
+        "merchant_id": KNOWN_MERCHANT_ID,
+        "platform": "shopify",
+        "platform_product_id": product_id,
+        "product_data": {
+            "id": product_id,
+            "product_id": product_id,
+            "title": title,
+            "currency": "USD",
+            "price": 18.9,
+            "inventory_quantity": 18,
+            "in_stock": True,
+            "merchant_name": "Pivota Demo Store",
+            "variants": [
+                {
+                    "id": f"{product_id}_v1",
+                    "variant_id": f"{product_id}_v1",
+                    "sku": f"SKU_{product_id}",
+                    "price": 18.9,
+                    "inventory_quantity": 18,
+                }
+            ],
+        },
+    }
+
+
+def test_products_search_delegates_to_optimized_handler(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_api as agent_api
+
+    async def fake_search(**kwargs):
+        return {
+            "status": "success",
+            "products": [{"id": "p_1", "product_id": "p_1", "merchant_id": KNOWN_MERCHANT_ID}],
+            "pagination": {"total_count": 1, "limit": 20, "offset": 0, "page": 1, "total_pages": 1, "has_more": False},
+        }
+
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
+
+    latencies_ms: List[float] = []
+    for _ in range(30):
+        t0 = time.perf_counter()
+        res = client.get(
+            "/agent/v1/products/search?merchant_id=merch_efbc46b4619cfbdf&query=niacinamide&limit=20&offset=0",
+            headers={"X-API-Key": "test-api-key"},
+        )
+        latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+        assert res.status_code == 200
+        body = res.json()
+        assert body["status"] == "success"
+        assert body.get("metadata", {}).get("source") == "agent_sdk_fixed_delegate"
+        assert body.get("metadata", {}).get("reason_code") == "ok"
+
+    # Stability target: no timeout/500 for repeated calls.
+    assert len(latencies_ms) == 30
+
+
+def test_products_resolve_hits_known_products(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_api as agent_api
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        values = values or {}
+
+        if "FROM products_cache" in q and "platform_product_id = ANY(:pid_aliases)" in q:
+            pid_aliases = set(values.get("pid_aliases") or [])
+            out = []
+            for pid, title in KNOWN_PRODUCTS.items():
+                if pid in pid_aliases:
+                    out.append(_build_product_cache_row(pid, title))
+            return out
+
+        if "FROM product_group_members" in q:
+            pids = set(values.get("pids") or values.get("platform_product_ids") or [])
+            for pid in KNOWN_PRODUCTS.keys():
+                if pid in pids:
+                    return [
+                        {
+                            "product_group_id": f"pg_{pid}",
+                            "merchant_id": KNOWN_MERCHANT_ID,
+                            "platform": "shopify",
+                            "platform_product_id": pid,
+                            "is_primary": True,
+                        }
+                    ]
+            return []
+
+        return []
+
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+
+    for pid in KNOWN_PRODUCTS.keys():
+        res = client.get(
+            f"/agent/v1/products/resolve?merchant_id={KNOWN_MERCHANT_ID}&product_id={pid}&limit=10",
+            headers={"X-API-Key": "test-api-key"},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["status"] == "success"
+        assert body["candidate_count"] > 0
+        assert (body.get("canonical_ref") or "").startswith("pg:")
+        assert body.get("metadata", {}).get("reason_code") == "ok"
+
+
+def test_offers_resolve_maps_to_canonical_and_internal_offers(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        values = values or {}
+
+        if "FROM external_product_seeds" in q:
+            return []
+
+        if "FROM products_cache" in q and "platform_product_id = ANY(:pid_aliases)" in q:
+            pid_aliases = set(values.get("pid_aliases") or [])
+            out = []
+            for pid, title in KNOWN_PRODUCTS.items():
+                if pid in pid_aliases:
+                    out.append(_build_product_cache_row(pid, title))
+            return out
+
+        if "FROM product_group_members" in q:
+            candidates = set(values.get("platform_product_ids") or [])
+            for pid in KNOWN_PRODUCTS.keys():
+                if pid in candidates:
+                    return [
+                        {
+                            "product_group_id": f"pg_{pid}",
+                            "merchant_id": KNOWN_MERCHANT_ID,
+                            "platform": "shopify",
+                            "platform_product_id": pid,
+                            "is_primary": True,
+                        },
+                        {
+                            "product_group_id": f"pg_{pid}",
+                            "merchant_id": "merch_alt_seller",
+                            "platform": "shopify",
+                            "platform_product_id": pid,
+                            "is_primary": False,
+                        },
+                    ]
+            return []
+
+        if "FROM products_cache" in q and "merchant_id = ANY(:merchant_ids)" in q:
+            member_mids = values.get("merchant_ids") or []
+            member_pids = values.get("platform_product_ids") or []
+            out = []
+            for pid in member_pids:
+                if pid in KNOWN_PRODUCTS:
+                    for mid in member_mids:
+                        row = _build_product_cache_row(pid, KNOWN_PRODUCTS[pid])
+                        row["merchant_id"] = mid
+                        row["product_data"]["merchant_name"] = "Alt Seller" if mid != KNOWN_MERCHANT_ID else "Pivota Demo Store"
+                        out.append(row)
+            return out
+
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    pid = "9886499864904"
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": pid, "merchant_id": KNOWN_MERCHANT_ID}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui", "merchant_id": KNOWN_MERCHANT_ID},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["offers_count"] > 0
+    assert (body.get("canonical_product_ref") or "").startswith("pg:")
+    assert body.get("mapping", {}).get("candidates")
+    assert body.get("metadata", {}).get("reason_code") == "ok"
+    assert any(s.get("source") == "products_cache" for s in (body.get("metadata", {}).get("sources") or []))
+
+
+def test_offers_resolve_stability_30_calls(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        values = values or {}
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM products_cache" in q and "platform_product_id = ANY(:pid_aliases)" in q:
+            pid_aliases = set(values.get("pid_aliases") or [])
+            if "9886500749640" in pid_aliases:
+                return [_build_product_cache_row("9886500749640", KNOWN_PRODUCTS["9886500749640"])]
+            return []
+        if "FROM product_group_members" in q:
+            pids = values.get("platform_product_ids") or []
+            if "9886500749640" in pids:
+                return [
+                    {
+                        "product_group_id": "pg_9886500749640",
+                        "merchant_id": KNOWN_MERCHANT_ID,
+                        "platform": "shopify",
+                        "platform_product_id": "9886500749640",
+                        "is_primary": True,
+                    }
+                ]
+            return []
+        if "FROM products_cache" in q and "merchant_id = ANY(:merchant_ids)" in q:
+            return [_build_product_cache_row("9886500749640", KNOWN_PRODUCTS["9886500749640"])]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    for _ in range(30):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={
+                "operation": "offers.resolve",
+                "payload": {"product": {"product_id": "9886500749640", "merchant_id": KNOWN_MERCHANT_ID}, "limit": 10},
+                "metadata": {"source": "creator-agent-ui", "merchant_id": KNOWN_MERCHANT_ID},
+            },
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body.get("status") == "success"
+        assert body.get("offers_count", 0) > 0
+        assert body.get("metadata", {}).get("reason_code") == "ok"
