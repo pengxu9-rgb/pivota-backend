@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # Database
 from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
+import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
 import subprocess
 import os
 from pathlib import Path
@@ -252,6 +253,7 @@ from routes.simulate_payments import router as simulate_payments_router
 from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 from routes.agent_shop_gateway import router as agent_shop_gateway_router
+from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
 from routes.buyer_api import router as buyer_router
 from routes.merchant_promotions_api import router as merchant_promotions_router
@@ -651,6 +653,7 @@ app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-fa
 app.include_router(buyer_router)  # Buyer Vault API (unified buyer account)
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
+app.include_router(subject_resolve_router)  # Stable subject resolution contract (/v1/subject/resolve)
 app.include_router(after_sales_cases_router)  # After-sales Case API (refund/return_refund)
 app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
