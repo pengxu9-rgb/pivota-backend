@@ -2268,6 +2268,28 @@ async def _handle_find_products_multi(
             return []
         return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if len(t) > 2]
 
+    query_stopwords = {
+        "a",
+        "an",
+        "and",
+        "at",
+        "for",
+        "from",
+        "in",
+        "my",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+
+    def _filter_relevance_terms(terms: List[str]) -> List[str]:
+        if not terms:
+            return []
+        return [t for t in terms if t and t not in query_stopwords]
+
     def _strip_accents(text: str) -> str:
         if not text:
             return ""
@@ -2727,9 +2749,9 @@ async def _handle_find_products_multi(
     history_terms = set()
     if user_ctx and user_ctx.recent_queries:
         for q_term in user_ctx.recent_queries:
-            history_terms.update(_tokenize(q_term))
+            history_terms.update(_filter_relevance_terms(_tokenize(q_term)))
     for title in history_titles:
-        history_terms.update(_tokenize(title))
+        history_terms.update(_filter_relevance_terms(_tokenize(title)))
 
     # Optional: normalized intent safety hints from upstream (LLM or gateway).
     # Shape is intentionally flexible, but we expect fields like:
@@ -3593,22 +3615,6 @@ async def _handle_find_products_multi(
             if "labubu" in q_ascii:
                 anchor_terms = ["labubu"]
             elif q_tokens:
-                query_stopwords = {
-                    "a",
-                    "an",
-                    "and",
-                    "at",
-                    "for",
-                    "from",
-                    "in",
-                    "my",
-                    "of",
-                    "on",
-                    "or",
-                    "the",
-                    "to",
-                    "with",
-                }
                 informative_tokens = [
                     t
                     for t in q_tokens
@@ -3863,7 +3869,7 @@ async def _handle_find_products_multi(
                 relevance_score = 0.8
             else:
                 # Token-based matching with short-token guard (prevents "te e" -> ["te","e"] over-matching).
-                query_terms = _tokenize(q_ascii)
+                query_terms = _filter_relevance_terms(_tokenize(q_ascii))
 
                 if not query_terms and q_compact and len(q_compact) > 2:
                     query_terms = [q_compact]

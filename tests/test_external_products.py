@@ -494,6 +494,73 @@ async def test_shop_gateway_find_products_multi_recall_terms_drop_common_stopwor
     assert any(term in captured_like_terms for term in ("ordinary", "niacinamide", "zinc"))
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_ignores_stopword_only_query_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "m_001", "business_name": "Merchant"}]
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        product = agent_shop_gateway_module.StandardProduct(
+            id="p_001",
+            product_id="p_001",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Round Powder Brush",
+            description="Use the brush for soft focus finish",
+            price=19.0,
+            currency="USD",
+            inventory_quantity=9,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [product], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="The Ordinary Niacinamide 10% + Zinc 1%",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        ),
+        user=agent_shop_gateway_module.UserIntent(
+            recent_queries=["The Ordinary Niacinamide 10% + Zinc 1%"],
+        ),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("total") == 0
+    assert result.get("products") == []
+
+
 def test_agent_products_search_external_seed_includes_variants(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
