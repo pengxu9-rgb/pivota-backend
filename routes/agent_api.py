@@ -12,6 +12,7 @@ from datetime import datetime
 import asyncio
 import json
 import os
+import re
 import time
 from urllib.parse import urlparse
 
@@ -117,6 +118,28 @@ def _classify_db_reason_code(exc: Exception) -> str:
     if "too many connections" in msg or "connection refused" in msg or "connection reset" in msg:
         return "db_connection"
     return "db_error"
+
+
+def _safe_price_number(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        if isinstance(value, (int, float, Decimal)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return default
+        try:
+            return float(text)
+        except Exception:
+            pass
+        text = text.replace(",", ".")
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return default
+        return float(match.group(0))
+    except Exception:
+        return default
 
 
 def _expand_product_ref_aliases(raw_ref: Optional[str]) -> List[str]:
@@ -1336,7 +1359,7 @@ async def agent_search_products(
                 if in_stock_only and not product.get("in_stock", True):
                     continue
 
-                price = float(product.get("price", 0) or 0)
+                price = _safe_price_number(product.get("price", 0), 0.0)
                 if min_price and price < min_price:
                     continue
                 if max_price and price > max_price:
@@ -1413,7 +1436,7 @@ async def agent_search_products(
             if in_stock_only and not product.get("in_stock", True):
                 continue
 
-            price = float(product.get("price", 0) or 0)
+            price = _safe_price_number(product.get("price", 0), 0.0)
             if min_price and price < min_price:
                 continue
             if max_price and price > max_price:
