@@ -238,6 +238,18 @@ MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS = _env_float(
     min_value=0.2,
     max_value=10.0,
 )
+MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_SEED_QUERY_TIMEOUT_SECONDS",
+    0.8,
+    min_value=0.1,
+    max_value=5.0,
+)
+MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_RECALL_QUERY_TIMEOUT_SECONDS",
+    1.0,
+    min_value=0.1,
+    max_value=5.0,
+)
 MULTI_SEARCH_FORCE_CACHE_ONLY = _env_bool(
     "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY",
     True,
@@ -3188,15 +3200,18 @@ async def _handle_find_products_multi(
             if where_clauses:
                 seed_where += " AND (" + " OR ".join(where_clauses) + ")"
 
-        seed_rows = await database.fetch_all(
-            f"""
-            SELECT *
-            FROM external_product_seeds
-            WHERE {seed_where}
-            ORDER BY updated_at DESC, created_at DESC
-            LIMIT :limit
-            """,
-            seed_params,
+        seed_rows = await asyncio.wait_for(
+            database.fetch_all(
+                f"""
+                SELECT *
+                FROM external_product_seeds
+                WHERE {seed_where}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT :limit
+                """,
+                seed_params,
+            ),
+            timeout=MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS,
         )
 
         seen_external_ids: set[str] = set()
@@ -3604,19 +3619,22 @@ async def _handle_find_products_multi(
                     if sku_like_query:
                         where_clauses.append("LOWER(CAST(product_data AS TEXT)) LIKE :" + key)
 
-                rows = await database.fetch_all(
-                    """
-                    SELECT merchant_id, product_data
-                    FROM products_cache
-                    WHERE (expires_at IS NULL OR expires_at > NOW())
-                      AND merchant_id = ANY(:merchant_ids)
-                      AND ("""
-                    + " OR ".join(where_clauses)
-                    + """)
-                    ORDER BY cached_at DESC
-                    LIMIT :cache_limit
-                    """,
-                    params,
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT merchant_id, product_data
+                        FROM products_cache
+                        WHERE (expires_at IS NULL OR expires_at > NOW())
+                          AND merchant_id = ANY(:merchant_ids)
+                          AND ("""
+                        + " OR ".join(where_clauses)
+                        + """)
+                        ORDER BY cached_at DESC
+                        LIMIT :cache_limit
+                        """,
+                        params,
+                    ),
+                    timeout=MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS,
                 )
 
                 for row in rows:
