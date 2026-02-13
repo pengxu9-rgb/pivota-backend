@@ -322,7 +322,7 @@ MULTI_SEARCH_UPSTREAM_CACHE_MAX_ENTRIES = _env_int(
 )
 MULTI_SEARCH_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS",
-    2.2,
+    1.2,
     min_value=0.3,
     max_value=20.0,
 )
@@ -343,6 +343,10 @@ MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS = _env_float(
     90.0,
     min_value=1.0,
     max_value=1200.0,
+)
+MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT = _env_bool(
+    "AGENT_SHOP_MULTI_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT",
+    True,
 )
 
 SHOPPING_MULTI_SOURCES = {"shopping-agent", "aurora", "aurora-chatbox"}
@@ -474,7 +478,7 @@ def _multi_upstream_circuit_is_open(now_mono: Optional[float] = None) -> bool:
     return float(_MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL or 0.0) > now
 
 
-def _multi_upstream_record_outcome(success: bool) -> None:
+def _multi_upstream_record_outcome(success: bool, *, timeout: bool = False) -> None:
     global _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL
 
     now_mono = time.monotonic()
@@ -483,6 +487,15 @@ def _multi_upstream_record_outcome(success: bool) -> None:
     if success:
         _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.clear()
         _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = 0.0
+        return
+
+    if timeout and MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT:
+        open_seconds = max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS))
+        _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = max(
+            float(_MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL or 0.0),
+            now_mono + open_seconds,
+        )
+        _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS[:] = [now_mono]
         return
 
     _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.append(now_mono)
@@ -2599,11 +2612,16 @@ async def _invoke_multi_upstream_fallback(
             "metadata": merged_metadata,
         }
     except Exception as exc:
+        timeout_failure = isinstance(exc, asyncio.TimeoutError)
+        if not timeout_failure:
+            timeout_failure = isinstance(exc, httpx.TimeoutException)
+        if not timeout_failure:
+            timeout_failure = "timeout" in str(exc or "").lower()
         logger.info(
             "multi.upstream_fallback.failed",
             extra={"error": str(exc), "url": url},
         )
-        _multi_upstream_record_outcome(False)
+        _multi_upstream_record_outcome(False, timeout=timeout_failure)
         return None
 
 

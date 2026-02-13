@@ -909,6 +909,25 @@ async def test_shop_gateway_find_products_multi_delegate_circuit_open_returns_em
     agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = 0.0
 
 
+def test_shop_gateway_upstream_timeout_opens_circuit_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.clear()
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = 0.0
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS", 60.0)
+
+    agent_shop_gateway_module._multi_upstream_record_outcome(False, timeout=True)
+
+    assert agent_shop_gateway_module._multi_upstream_circuit_is_open() is True
+    assert len(agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS) == 1
+
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.clear()
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = 0.0
+
+
 @pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_creator_surface_uses_creator_cache_policy(
     monkeypatch: pytest.MonkeyPatch,
