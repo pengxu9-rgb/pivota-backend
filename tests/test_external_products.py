@@ -660,6 +660,134 @@ async def test_shop_gateway_find_products_multi_delegate_upstream_failure_return
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_delegate_upstream_success_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL", "https://resolver.example")
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_RESPONSE_CACHE_TTL_SECONDS", 120.0)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_CACHE_MAX_ENTRIES", 64)
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
+
+    upstream_response = {
+        "products": [{"id": "p_upstream_1", "title": "Upstream Product"}],
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "metadata": {"query_source": "agent_products_resolver_fallback"},
+    }
+    invoke_mock = AsyncMock(return_value=upstream_response)
+    monkeypatch.setattr(agent_shop_gateway_module, "_invoke_multi_upstream_fallback", invoke_mock)
+    get_products_mock = AsyncMock(return_value=([], "cache", None))
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", get_products_mock)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="Winona",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        )
+    )
+    first = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+    second = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert first.get("total") == 1
+    assert second.get("total") == 1
+    assert second.get("metadata", {}).get("upstream_response_cache", {}).get("hit") is True
+    assert second.get("metadata", {}).get("upstream_response_cache", {}).get("kind") == "result"
+    get_products_mock.assert_not_awaited()
+    assert invoke_mock.await_count == 1
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_delegate_upstream_error_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL", "https://resolver.example")
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_ERROR_CACHE_TTL_SECONDS", 120.0)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_CACHE_MAX_ENTRIES", 64)
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
+
+    invoke_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(agent_shop_gateway_module, "_invoke_multi_upstream_fallback", invoke_mock)
+    get_products_mock = AsyncMock(return_value=([], "cache", None))
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", get_products_mock)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="not_found_query",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        )
+    )
+    first = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+    second = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert first.get("total") == 0
+    assert second.get("total") == 0
+    assert second.get("metadata", {}).get("query_source") == "agent_products_resolver_fallback_empty"
+    assert second.get("metadata", {}).get("upstream_response_cache", {}).get("hit") is True
+    assert second.get("metadata", {}).get("upstream_response_cache", {}).get("kind") == "error"
+    get_products_mock.assert_not_awaited()
+    assert invoke_mock.await_count == 1
+    agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_creator_surface_uses_creator_cache_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

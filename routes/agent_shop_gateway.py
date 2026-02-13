@@ -14,6 +14,7 @@ Path: POST /agent/shop/v1/invoke
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -295,8 +296,141 @@ MULTI_SEARCH_UPSTREAM_FALLBACK_TIMEOUT_SECONDS = _env_float(
     min_value=0.5,
     max_value=20.0,
 )
+MULTI_SEARCH_UPSTREAM_RESPONSE_CACHE_TTL_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_UPSTREAM_RESPONSE_CACHE_TTL_SECONDS",
+    45.0,
+    min_value=0.0,
+    max_value=600.0,
+)
+MULTI_SEARCH_UPSTREAM_EMPTY_CACHE_TTL_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_UPSTREAM_EMPTY_CACHE_TTL_SECONDS",
+    30.0,
+    min_value=0.0,
+    max_value=600.0,
+)
+MULTI_SEARCH_UPSTREAM_ERROR_CACHE_TTL_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_UPSTREAM_ERROR_CACHE_TTL_SECONDS",
+    20.0,
+    min_value=0.0,
+    max_value=300.0,
+)
+MULTI_SEARCH_UPSTREAM_CACHE_MAX_ENTRIES = _env_int(
+    "AGENT_SHOP_MULTI_UPSTREAM_CACHE_MAX_ENTRIES",
+    512,
+    min_value=1,
+    max_value=10000,
+)
 
 SHOPPING_MULTI_SOURCES = {"shopping-agent", "aurora", "aurora-chatbox"}
+
+_MULTI_SEARCH_UPSTREAM_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _normalize_upstream_cache_text(value: Optional[str]) -> str:
+    text = str(value or "").strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def _build_multi_upstream_cache_key(
+    payload: "FindProductsMultiPayload",
+    request_metadata: Optional[Dict[str, Any]],
+    source_normalized: str,
+) -> str:
+    md = request_metadata or {}
+    scope = md.get("scope") if isinstance(md.get("scope"), dict) else {}
+    filters = payload.search
+    raw_query = _normalize_upstream_cache_text(getattr(filters, "query", "") or "")
+    return "|".join(
+        [
+            source_normalized or "unknown",
+            str(scope.get("catalog") or ""),
+            str(scope.get("region") or ""),
+            str(scope.get("language") or ""),
+            raw_query,
+            str(int(getattr(filters, "limit", 10) or 10)),
+            str(int(getattr(filters, "page", 1) or 1)),
+            "1" if bool(getattr(filters, "in_stock_only", False)) else "0",
+        ]
+    )
+
+
+def _multi_upstream_cache_prune(now_mono: float) -> None:
+    if not _MULTI_SEARCH_UPSTREAM_CACHE:
+        return
+
+    expired_keys: List[str] = []
+    for key, entry in _MULTI_SEARCH_UPSTREAM_CACHE.items():
+        try:
+            expires_at = float(entry.get("expires_at") or 0.0)
+        except Exception:
+            expires_at = 0.0
+        if expires_at <= now_mono:
+            expired_keys.append(key)
+    for key in expired_keys:
+        _MULTI_SEARCH_UPSTREAM_CACHE.pop(key, None)
+
+    max_entries = max(1, int(MULTI_SEARCH_UPSTREAM_CACHE_MAX_ENTRIES))
+    overflow = len(_MULTI_SEARCH_UPSTREAM_CACHE) - max_entries
+    if overflow <= 0:
+        return
+    oldest_keys = sorted(
+        _MULTI_SEARCH_UPSTREAM_CACHE.keys(),
+        key=lambda cache_key: float(_MULTI_SEARCH_UPSTREAM_CACHE[cache_key].get("stored_at") or 0.0),
+    )[:overflow]
+    for key in oldest_keys:
+        _MULTI_SEARCH_UPSTREAM_CACHE.pop(key, None)
+
+
+def _multi_upstream_cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
+    now_mono = time.monotonic()
+    _multi_upstream_cache_prune(now_mono)
+    entry = _MULTI_SEARCH_UPSTREAM_CACHE.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+
+    try:
+        expires_at = float(entry.get("expires_at") or 0.0)
+    except Exception:
+        expires_at = 0.0
+    if expires_at <= now_mono:
+        _MULTI_SEARCH_UPSTREAM_CACHE.pop(cache_key, None)
+        return None
+
+    result = entry.get("result")
+    if not isinstance(result, dict):
+        _MULTI_SEARCH_UPSTREAM_CACHE.pop(cache_key, None)
+        return None
+
+    remaining_ttl = max(0.0, expires_at - now_mono)
+    return {
+        "kind": str(entry.get("kind") or "result"),
+        "remaining_ttl_seconds": remaining_ttl,
+        "result": copy.deepcopy(result),
+    }
+
+
+def _multi_upstream_cache_put(cache_key: str, result: Dict[str, Any], kind: str) -> None:
+    if not cache_key or not isinstance(result, dict):
+        return
+
+    if kind == "error":
+        ttl_seconds = float(MULTI_SEARCH_UPSTREAM_ERROR_CACHE_TTL_SECONDS)
+    elif kind == "empty":
+        ttl_seconds = float(MULTI_SEARCH_UPSTREAM_EMPTY_CACHE_TTL_SECONDS)
+    else:
+        ttl_seconds = float(MULTI_SEARCH_UPSTREAM_RESPONSE_CACHE_TTL_SECONDS)
+
+    if ttl_seconds <= 0:
+        return
+
+    now_mono = time.monotonic()
+    _MULTI_SEARCH_UPSTREAM_CACHE[cache_key] = {
+        "kind": kind,
+        "stored_at": now_mono,
+        "expires_at": now_mono + ttl_seconds,
+        "result": copy.deepcopy(result),
+    }
+    _multi_upstream_cache_prune(now_mono)
 
 
 def _resolve_multi_force_cache_only(source: Optional[str], is_creator_surface: bool) -> bool:
@@ -2413,6 +2547,33 @@ async def _handle_find_products_multi(
         and bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL)
         and upstream_fallback_hop < 1
     )
+    upstream_cache_key: Optional[str] = None
+    if should_try_upstream and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM:
+        upstream_cache_key = _build_multi_upstream_cache_key(
+            payload,
+            request_metadata,
+            source_normalized,
+        )
+        cached = _multi_upstream_cache_get(upstream_cache_key)
+        if isinstance(cached, dict):
+            cached_result = cached.get("result")
+            if isinstance(cached_result, dict):
+                cached_meta = (
+                    cached_result.get("metadata")
+                    if isinstance(cached_result.get("metadata"), dict)
+                    else {}
+                )
+                cached_meta["upstream_response_cache"] = {
+                    "hit": True,
+                    "kind": str(cached.get("kind") or "result"),
+                    "remaining_ttl_seconds": round(
+                        float(cached.get("remaining_ttl_seconds") or 0.0),
+                        3,
+                    ),
+                }
+                cached_result["metadata"] = cached_meta
+                return cached_result
+
     if should_try_upstream and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM:
         delegated = await _invoke_multi_upstream_fallback(
             payload,
@@ -2421,12 +2582,22 @@ async def _handle_find_products_multi(
             hop=upstream_fallback_hop,
         )
         if isinstance(delegated, dict):
+            result_kind = "result"
+            try:
+                total_val = int(delegated.get("total") or 0)
+            except Exception:
+                total_val = 0
+            products_val = delegated.get("products")
+            if total_val <= 0 and isinstance(products_val, list) and len(products_val) == 0:
+                result_kind = "empty"
+            if upstream_cache_key:
+                _multi_upstream_cache_put(upstream_cache_key, delegated, result_kind)
             return delegated
         # In delegate mode we intentionally avoid running the local
         # multi-merchant path after an upstream timeout/error, because
         # combining both paths can exceed the invoke queue wait budget
         # and surface 504 UPSTREAM_TIMEOUT to the frontend.
-        return {
+        empty_result = {
             "products": [],
             "total": 0,
             "page": page,
@@ -2447,6 +2618,9 @@ async def _handle_find_products_multi(
                 "upstream_fallback_attempted": True,
             },
         }
+        if upstream_cache_key:
+            _multi_upstream_cache_put(upstream_cache_key, empty_result, "error")
+        return empty_result
 
     eval_enabled = bool(
         isinstance(request_metadata, dict) and request_metadata.get("eval") is not None
