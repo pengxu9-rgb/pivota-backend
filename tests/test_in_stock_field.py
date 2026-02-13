@@ -160,6 +160,35 @@ class TestInStockEdgeCases:
         
         assert product.in_stock is expected
 
+    def test_status_none_normalized_to_active(self):
+        """Legacy rows with null status should remain parseable as active."""
+        product = StandardProduct(
+            id="prod-status-none",
+            platform="shopify",
+            merchant_id="merchant-001",
+            title="Legacy Product",
+            price=19.99,
+            inventory_quantity=5,
+            status=None,
+        )
+
+        assert product.status.value == "active"
+
+    def test_orderable_none_remains_unspecified(self):
+        """Legacy rows with null orderable should not become explicit false."""
+        product = StandardProduct(
+            id="prod-orderable-none",
+            platform="shopify",
+            merchant_id="merchant-001",
+            title="Legacy Product",
+            price=19.99,
+            inventory_quantity=5,
+            orderable=None,
+        )
+
+        assert product.orderable is None
+        assert product.in_stock is False
+
 
 class TestProductWithVariants:
     """Test in_stock calculation with product variants"""

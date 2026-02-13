@@ -90,7 +90,7 @@ class StandardProduct(BaseModel):
     # 元数据（保留原始平台特定数据）
     platform_metadata: Optional[Dict[str, Any]] = None
     # 是否可下单及校验结果（EPIC-7 准备）
-    orderable: Optional[bool] = False
+    orderable: Optional[bool] = None
     orderable_validation: Optional[Dict[str, Any]] = None
     
     @validator('product_id', always=True)
@@ -113,8 +113,19 @@ class StandardProduct(BaseModel):
     @classmethod
     def normalize_orderable(cls, v):
         if v is None:
-            return False
+            return None
         return bool(v)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, v):
+        if v is None:
+            return ProductStatus.ACTIVE
+        if isinstance(v, str) and not v.strip():
+            return ProductStatus.ACTIVE
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
     @model_validator(mode="after")
     def calculate_in_stock(self):
