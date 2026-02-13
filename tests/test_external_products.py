@@ -1377,3 +1377,54 @@ def test_agent_products_search_tolerates_non_numeric_price(
     payload = res.json()
     assert payload.get("status") == "success"
     assert isinstance(payload.get("products"), list)
+
+
+def test_agent_products_search_handles_db_rows_with_noncallable_get(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_api as agent_api_module
+    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    class _FakeRecord:
+        def __init__(self, data):
+            self._mapping = data
+            self.get = None
+
+    class _FakeProduct:
+        def dict(self):
+            return {
+                "id": "p_row_record_1",
+                "product_id": "p_row_record_1",
+                "title": "Winona row-record sample",
+                "description": "test",
+                "platform": "shopify",
+                "price": 29.9,
+                "in_stock": True,
+            }
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [_FakeRecord({"merchant_id": "m_001", "business_name": "Merchant One"})]
+        if "FROM external_product_seeds" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "get_products_hybrid", AsyncMock(return_value=([_FakeProduct()], "cache", None)))
+    monkeypatch.setattr(agent_api_module, "hydrate_quality_and_enrichment", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "passes_agent_gating", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(agent_api_module, "compute_agent_ranking_score", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(agent_api_module, "serialize_features_for_log", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agent_api_module, "log_product_events", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_sdk_fixed_module, "_load_external_seed_products_for_search", AsyncMock(return_value=[]))
+
+    res = client.get(
+        "/agent/v1/products/search?search_all_merchants=true&query=Winona&in_stock_only=false&limit=10&offset=0",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload.get("status") == "success"
+    assert isinstance(payload.get("products"), list)

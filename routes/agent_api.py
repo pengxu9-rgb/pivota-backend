@@ -100,6 +100,23 @@ def _ensure_json_obj(val: Any) -> Dict[str, Any]:
     return {}
 
 
+def _row_as_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except Exception:
+            pass
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
 def _classify_db_reason_code(exc: Exception) -> str:
     msg = str(exc or "").lower()
     exc_type = type(exc).__name__.lower()
@@ -787,8 +804,9 @@ async def agent_merge_buyer_refs(
             """,
             {"agent_id": context.agent_id, "source_ref": target_ref},
         )
-        if row and row.get("target_ref"):
-            target_ref = str(row["target_ref"])
+        row_data = _row_as_dict(row)
+        if row_data.get("target_ref"):
+            target_ref = str(row_data["target_ref"])
     except Exception:
         pass
 
@@ -1117,9 +1135,10 @@ async def agent_search_products(
 
                 products: List[Dict[str, Any]] = []
                 for row in rows:
-                    if not isinstance(row, dict):
+                    row_data = _row_as_dict(row)
+                    if not row_data:
                         continue
-                    pdata = row.get("product_data")
+                    pdata = row_data.get("product_data")
                     if isinstance(pdata, str):
                         try:
                             pdata = json.loads(pdata)
@@ -1132,8 +1151,8 @@ async def agent_search_products(
                         continue
 
                     pdata = dict(pdata)
-                    pdata["merchant_id"] = str(row.get("merchant_id") or pdata.get("merchant_id") or "")
-                    pdata["merchant_name"] = row.get("merchant_name") or pdata.get("merchant_name") or "Unknown"
+                    pdata["merchant_id"] = str(row_data.get("merchant_id") or pdata.get("merchant_id") or "")
+                    pdata["merchant_name"] = row_data.get("merchant_name") or pdata.get("merchant_name") or "Unknown"
                     pdata.setdefault("relevance_score", 1.0)
                     pdata.setdefault("ranking_score", 1.0)
                     pdata.setdefault("ranking_features", {"mode": "browse_fastpath"})
@@ -1241,9 +1260,17 @@ async def agent_search_products(
                     LIMIT 100
                 """
                 merchant_rows = await database.fetch_all(query_merchants)
-                merchants_to_search = [row["merchant_id"] for row in merchant_rows]
+                merchant_rows_data = [_row_as_dict(row) for row in merchant_rows]
+                merchants_to_search = [
+                    str(row_data.get("merchant_id") or "").strip()
+                    for row_data in merchant_rows_data
+                    if str(row_data.get("merchant_id") or "").strip()
+                ]
                 merchant_name_by_id = {
-                    row["merchant_id"]: row.get("business_name") or "Unknown" for row in merchant_rows
+                    mid: (str(row_data.get("business_name") or "").strip() or "Unknown")
+                    for row_data in merchant_rows_data
+                    for mid in [str(row_data.get("merchant_id") or "").strip()]
+                    if mid
                 }
 
         # Collect products from all target merchants
@@ -1270,8 +1297,12 @@ async def agent_search_products(
 	                    """,
                     {"merchant_ids": merchants_to_search},
                 )
+                rows_data = [_row_as_dict(row) for row in rows]
                 merchant_name_by_id = {
-                    row["merchant_id"]: row.get("business_name") or "Unknown" for row in rows
+                    mid: (str(row_data.get("business_name") or "").strip() or "Unknown")
+                    for row_data in rows_data
+                    for mid in [str(row_data.get("merchant_id") or "").strip()]
+                    if mid
                 }
                 merchants_to_search = list(merchant_name_by_id.keys())
             except Exception:
@@ -1838,9 +1869,12 @@ async def agent_resolve_products(
         if not current or float(payload["score"]) > float(current.get("score", 0)):
             candidates_by_key[key] = payload
 
-    def _ingest_cache_rows(rows: List[Dict[str, Any]], source_name: str, score: float) -> None:
+    def _ingest_cache_rows(rows: List[Any], source_name: str, score: float) -> None:
         for row in rows:
-            pdata = row.get("product_data")
+            row_data = _row_as_dict(row)
+            if not row_data:
+                continue
+            pdata = row_data.get("product_data")
             if isinstance(pdata, str):
                 try:
                     pdata = json.loads(pdata)
@@ -1849,12 +1883,12 @@ async def agent_resolve_products(
             if not isinstance(pdata, dict):
                 continue
             _add_candidate(
-                merchant=row.get("merchant_id"),
-                platform=row.get("platform"),
+                merchant=row_data.get("merchant_id"),
+                platform=row_data.get("platform"),
                 platform_product_id=(
                     pdata.get("id")
                     or pdata.get("product_id")
-                    or row.get("platform_product_id")
+                    or row_data.get("platform_product_id")
                 ),
                 title=pdata.get("title") or pdata.get("name"),
                 source=source_name,
