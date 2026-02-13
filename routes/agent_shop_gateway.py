@@ -283,6 +283,16 @@ MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT = _env_bool(
     "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT",
     MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
 )
+MULTI_SEARCH_SKIP_HISTORY_SHOPPING = _env_bool(
+    "AGENT_SHOP_MULTI_SKIP_HISTORY_SHOPPING",
+    True,
+)
+MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING = _env_int(
+    "AGENT_SHOP_MULTI_SEED_QUERY_LIMIT_SHOPPING",
+    12,
+    min_value=0,
+    max_value=300,
+)
 MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM = _env_bool(
     "AGENT_SHOP_MULTI_DELEGATE_SHOPPING_TO_UPSTREAM",
     False,
@@ -3257,7 +3267,10 @@ async def _handle_find_products_multi(
 
         return products
 
-    history_product_ids, history_titles = await _load_user_history_signals()
+    history_product_ids: set[str] = set()
+    history_titles: List[str] = []
+    if not (is_shopping_surface and MULTI_SEARCH_SKIP_HISTORY_SHOPPING):
+        history_product_ids, history_titles = await _load_user_history_signals()
     history_terms = set()
     if user_ctx and user_ctx.recent_queries:
         for q_term in user_ctx.recent_queries:
@@ -3721,6 +3734,12 @@ async def _handle_find_products_multi(
         seed_query_compacts = [t for t in seed_query_compacts if t]
 
         seed_limit = min(max(limit * max(page, 1) * 2, 30), 200)
+        if is_shopping_surface:
+            shopping_seed_cap = max(0, int(MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING))
+            if shopping_seed_cap <= 0:
+                seed_limit = 0
+            else:
+                seed_limit = min(seed_limit, shopping_seed_cap)
         seed_params: Dict[str, Any] = {"limit": seed_limit}
         seed_where = "status = 'active'"
         if q_lower:
@@ -3741,21 +3760,25 @@ async def _handle_find_products_multi(
             if where_clauses:
                 seed_where += " AND (" + " OR ".join(where_clauses) + ")"
 
-        seed_rows = await asyncio.wait_for(
-            database.fetch_all(
-                f"""
-                SELECT *
-                FROM external_product_seeds
-                WHERE {seed_where}
-                ORDER BY updated_at DESC, created_at DESC
-                LIMIT :limit
-                """,
-                seed_params,
-            ),
-            timeout=MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS,
-        )
+        seed_rows: List[Any] = []
+        if seed_limit > 0:
+            seed_rows = await asyncio.wait_for(
+                database.fetch_all(
+                    f"""
+                    SELECT *
+                    FROM external_product_seeds
+                    WHERE {seed_where}
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT :limit
+                    """,
+                    seed_params,
+                ),
+                timeout=MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS,
+            )
 
         seen_external_ids: set[str] = set()
+        external_redirect_cache: Dict[str, Optional[str]] = {}
+        shopping_seed_target = max(1, limit * max(page, 1))
         for row in seed_rows:
             row_dict = dict(row) if isinstance(row, dict) else {}
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
@@ -3802,13 +3825,28 @@ async def _handle_find_products_multi(
                 if availability.lower() in {"out_of_stock", "outofstock", "sold_out"}:
                     continue
 
-            redirect_url = await _make_external_redirect_url(
-                market=str(row_dict.get("market") or "US"),
-                tool=str(row_dict.get("tool") or "*"),
-                destination_url=dest,
-                utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
-                ctx={"seedId": row_dict.get("id")},
+            market = str(row_dict.get("market") or "US")
+            tool = str(row_dict.get("tool") or "*")
+            utm_template = row_dict.get("utm_template") or seed_data.get("utm_template")
+            redirect_cache_key = "||".join(
+                [
+                    market,
+                    tool,
+                    str(dest),
+                    str(utm_template or ""),
+                ]
             )
+            if redirect_cache_key in external_redirect_cache:
+                redirect_url = external_redirect_cache[redirect_cache_key]
+            else:
+                redirect_url = await _make_external_redirect_url(
+                    market=market,
+                    tool=tool,
+                    destination_url=dest,
+                    utm_template=utm_template,
+                    ctx={"seedId": row_dict.get("id")},
+                )
+                external_redirect_cache[redirect_cache_key] = redirect_url
             if not redirect_url:
                 continue
 
@@ -3825,6 +3863,8 @@ async def _handle_find_products_multi(
                 }
             )
             seen_external_ids.add(external_id)
+            if is_shopping_surface and len(external_seed_wrappers) >= shopping_seed_target:
+                break
     except Exception as e:
         logger.info("multi.external_seeds.failed", extra={"error": str(e)})
 
