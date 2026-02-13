@@ -320,10 +320,36 @@ MULTI_SEARCH_UPSTREAM_CACHE_MAX_ENTRIES = _env_int(
     min_value=1,
     max_value=10000,
 )
+MULTI_SEARCH_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS",
+    2.2,
+    min_value=0.3,
+    max_value=20.0,
+)
+MULTI_SEARCH_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD = _env_int(
+    "AGENT_SHOP_MULTI_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD",
+    4,
+    min_value=1,
+    max_value=100,
+)
+MULTI_SEARCH_UPSTREAM_CIRCUIT_WINDOW_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_UPSTREAM_CIRCUIT_WINDOW_SECONDS",
+    45.0,
+    min_value=1.0,
+    max_value=600.0,
+)
+MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_UPSTREAM_CIRCUIT_OPEN_SECONDS",
+    90.0,
+    min_value=1.0,
+    max_value=1200.0,
+)
 
 SHOPPING_MULTI_SOURCES = {"shopping-agent", "aurora", "aurora-chatbox"}
 
 _MULTI_SEARCH_UPSTREAM_CACHE: Dict[str, Dict[str, Any]] = {}
+_MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS: List[float] = []
+_MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL: float = 0.0
 
 
 def _normalize_upstream_cache_text(value: Optional[str]) -> str:
@@ -431,6 +457,93 @@ def _multi_upstream_cache_put(cache_key: str, result: Dict[str, Any], kind: str)
         "result": copy.deepcopy(result),
     }
     _multi_upstream_cache_prune(now_mono)
+
+
+def _multi_upstream_circuit_prune(now_mono: float) -> None:
+    if not _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS:
+        return
+    window_seconds = max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_WINDOW_SECONDS))
+    threshold_ts = now_mono - window_seconds
+    _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS[:] = [
+        ts for ts in _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS if ts >= threshold_ts
+    ]
+
+
+def _multi_upstream_circuit_is_open(now_mono: Optional[float] = None) -> bool:
+    now = float(now_mono) if now_mono is not None else time.monotonic()
+    return float(_MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL or 0.0) > now
+
+
+def _multi_upstream_record_outcome(success: bool) -> None:
+    global _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL
+
+    now_mono = time.monotonic()
+    _multi_upstream_circuit_prune(now_mono)
+
+    if success:
+        _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.clear()
+        _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = 0.0
+        return
+
+    _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.append(now_mono)
+    _multi_upstream_circuit_prune(now_mono)
+    failure_threshold = max(1, int(MULTI_SEARCH_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD))
+    if len(_MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS) < failure_threshold:
+        return
+
+    open_seconds = max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS))
+    _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = max(
+        float(_MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL or 0.0),
+        now_mono + open_seconds,
+    )
+
+
+def _resolve_multi_upstream_timeout_seconds(is_shopping_surface: bool) -> float:
+    timeout_seconds = float(MULTI_SEARCH_UPSTREAM_FALLBACK_TIMEOUT_SECONDS)
+    if is_shopping_surface:
+        timeout_seconds = min(
+            timeout_seconds,
+            float(MULTI_SEARCH_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS),
+        )
+    return max(0.3, timeout_seconds)
+
+
+def _build_multi_delegate_empty_result(
+    *,
+    page: int,
+    force_cache_only: bool,
+    base_merchant_fanout_enabled: bool,
+    creator_id: Optional[str],
+    creator_name: Optional[str],
+    upstream_timeout_seconds: float,
+    upstream_attempted: bool,
+    upstream_circuit_open: bool,
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "query_source": "agent_products_resolver_fallback_empty",
+        "fetched_at": datetime.utcnow().isoformat(),
+        "merchants_searched": 0,
+        "merchants_scanned": 0,
+        "merchant_scan_limited": False,
+        "force_cache_only": force_cache_only,
+        "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
+        "creator_id": creator_id,
+        "creator_name": creator_name,
+        "history_boost_applied": False,
+        "upstream_fallback_configured": bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL),
+        "upstream_fallback_attempted": bool(upstream_attempted),
+        "upstream_timeout_seconds": float(upstream_timeout_seconds),
+    }
+    if upstream_circuit_open:
+        metadata["upstream_circuit_open"] = True
+    return {
+        "products": [],
+        "total": 0,
+        "page": page,
+        "page_size": 0,
+        "reply": None,
+        "metadata": metadata,
+    }
 
 
 def _resolve_multi_force_cache_only(source: Optional[str], is_creator_surface: bool) -> bool:
@@ -2434,6 +2547,7 @@ async def _invoke_multi_upstream_fallback(
         # Enforce wall-clock budget, not per-phase socket timeout only.
         resp = await asyncio.wait_for(_post_once(), timeout=timeout_seconds)
         if resp.status_code >= 400:
+            _multi_upstream_record_outcome(False)
             logger.info(
                 "multi.upstream_fallback.http_error",
                 extra={"status_code": resp.status_code, "url": url},
@@ -2442,10 +2556,12 @@ async def _invoke_multi_upstream_fallback(
 
         data = resp.json()
         if not isinstance(data, dict):
+            _multi_upstream_record_outcome(False)
             return None
 
         products_raw = data.get("products")
         if not isinstance(products_raw, list):
+            _multi_upstream_record_outcome(False)
             return None
 
         total_val = data.get("total")
@@ -2472,6 +2588,7 @@ async def _invoke_multi_upstream_fallback(
             "base_url": MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL,
             "timeout_seconds": timeout_seconds,
         }
+        _multi_upstream_record_outcome(True)
 
         return {
             "products": products_raw,
@@ -2486,6 +2603,7 @@ async def _invoke_multi_upstream_fallback(
             "multi.upstream_fallback.failed",
             extra={"error": str(exc), "url": url},
         )
+        _multi_upstream_record_outcome(False)
         return None
 
 
@@ -2547,6 +2665,7 @@ async def _handle_find_products_multi(
         and bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL)
         and upstream_fallback_hop < 1
     )
+    upstream_timeout_seconds = _resolve_multi_upstream_timeout_seconds(is_shopping_surface)
     upstream_cache_key: Optional[str] = None
     if should_try_upstream and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM:
         upstream_cache_key = _build_multi_upstream_cache_key(
@@ -2574,11 +2693,27 @@ async def _handle_find_products_multi(
                 cached_result["metadata"] = cached_meta
                 return cached_result
 
+        upstream_circuit_open = _multi_upstream_circuit_is_open()
+        if upstream_circuit_open:
+            empty_result = _build_multi_delegate_empty_result(
+                page=page,
+                force_cache_only=force_cache_only,
+                base_merchant_fanout_enabled=base_merchant_fanout_enabled,
+                creator_id=creator_id,
+                creator_name=creator_name,
+                upstream_timeout_seconds=upstream_timeout_seconds,
+                upstream_attempted=False,
+                upstream_circuit_open=True,
+            )
+            if upstream_cache_key:
+                _multi_upstream_cache_put(upstream_cache_key, empty_result, "error")
+            return empty_result
+
     if should_try_upstream and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM:
         delegated = await _invoke_multi_upstream_fallback(
             payload,
             request_metadata,
-            timeout_seconds=MULTI_SEARCH_UPSTREAM_FALLBACK_TIMEOUT_SECONDS,
+            timeout_seconds=upstream_timeout_seconds,
             hop=upstream_fallback_hop,
         )
         if isinstance(delegated, dict):
@@ -2597,27 +2732,16 @@ async def _handle_find_products_multi(
         # multi-merchant path after an upstream timeout/error, because
         # combining both paths can exceed the invoke queue wait budget
         # and surface 504 UPSTREAM_TIMEOUT to the frontend.
-        empty_result = {
-            "products": [],
-            "total": 0,
-            "page": page,
-            "page_size": 0,
-            "reply": None,
-            "metadata": {
-                "query_source": "agent_products_resolver_fallback_empty",
-                "fetched_at": datetime.utcnow().isoformat(),
-                "merchants_searched": 0,
-                "merchants_scanned": 0,
-                "merchant_scan_limited": False,
-                "force_cache_only": force_cache_only,
-                "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
-                "creator_id": creator_id,
-                "creator_name": creator_name,
-                "history_boost_applied": False,
-                "upstream_fallback_configured": bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL),
-                "upstream_fallback_attempted": True,
-            },
-        }
+        empty_result = _build_multi_delegate_empty_result(
+            page=page,
+            force_cache_only=force_cache_only,
+            base_merchant_fanout_enabled=base_merchant_fanout_enabled,
+            creator_id=creator_id,
+            creator_name=creator_name,
+            upstream_timeout_seconds=upstream_timeout_seconds,
+            upstream_attempted=True,
+            upstream_circuit_open=False,
+        )
         if upstream_cache_key:
             _multi_upstream_cache_put(upstream_cache_key, empty_result, "error")
         return empty_result
@@ -4458,7 +4582,7 @@ async def _handle_find_products_multi(
             upstream_result = await _invoke_multi_upstream_fallback(
                 payload,
                 request_metadata,
-                timeout_seconds=MULTI_SEARCH_UPSTREAM_FALLBACK_TIMEOUT_SECONDS,
+                timeout_seconds=upstream_timeout_seconds,
                 hop=upstream_fallback_hop,
             )
             if isinstance(upstream_result, dict):
