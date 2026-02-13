@@ -358,6 +358,16 @@ MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT = _env_bool(
     "AGENT_SHOP_MULTI_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT",
     True,
 )
+MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED = _env_bool(
+    "AGENT_SHOP_MULTI_PAGE_REQUEST_DEDUP_ENABLED",
+    True,
+)
+MULTI_SEARCH_PAGE_REQUEST_DEDUP_TTL_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_PAGE_REQUEST_DEDUP_TTL_SECONDS",
+    4.0,
+    min_value=0.0,
+    max_value=60.0,
+)
 
 SHOPPING_MULTI_SOURCES = {
     "shopping-agent",
@@ -389,11 +399,76 @@ def _is_shopping_multi_source(source: Optional[str]) -> bool:
 _MULTI_SEARCH_UPSTREAM_CACHE: Dict[str, Dict[str, Any]] = {}
 _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS: List[float] = []
 _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL: float = 0.0
+_MULTI_SEARCH_PAGE_REQUEST_CACHE: Dict[str, Dict[str, Any]] = {}
+_MULTI_SEARCH_PAGE_REQUEST_INFLIGHT: Dict[str, asyncio.Future] = {}
 
 
 def _normalize_upstream_cache_text(value: Optional[str]) -> str:
     text = str(value or "").strip().lower()
     return re.sub(r"\s+", " ", text)
+
+
+def _multi_page_request_cache_prune(now_mono: float) -> None:
+    if not _MULTI_SEARCH_PAGE_REQUEST_CACHE:
+        return
+    expired = []
+    for key, entry in _MULTI_SEARCH_PAGE_REQUEST_CACHE.items():
+        try:
+            expires_at = float(entry.get("expires_at") or 0.0)
+        except Exception:
+            expires_at = 0.0
+        if expires_at <= now_mono:
+            expired.append(key)
+    for key in expired:
+        _MULTI_SEARCH_PAGE_REQUEST_CACHE.pop(key, None)
+
+
+def _multi_page_request_cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
+    if not cache_key:
+        return None
+    now_mono = time.monotonic()
+    _multi_page_request_cache_prune(now_mono)
+    entry = _MULTI_SEARCH_PAGE_REQUEST_CACHE.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("value")
+    return copy.deepcopy(value) if isinstance(value, dict) else None
+
+
+def _multi_page_request_cache_put(cache_key: str, result: Dict[str, Any]) -> None:
+    if not cache_key:
+        return
+    ttl_seconds = max(0.0, float(MULTI_SEARCH_PAGE_REQUEST_DEDUP_TTL_SECONDS))
+    if ttl_seconds <= 0:
+        return
+    now_mono = time.monotonic()
+    _MULTI_SEARCH_PAGE_REQUEST_CACHE[cache_key] = {
+        "value": copy.deepcopy(result),
+        "expires_at": now_mono + ttl_seconds,
+    }
+    _multi_page_request_cache_prune(now_mono)
+
+
+def _build_multi_page_request_dedup_key(
+    payload: "FindProductsMultiPayload",
+    source_normalized: str,
+    page_request_id: Optional[str],
+) -> Optional[str]:
+    rid = str(page_request_id or "").strip()
+    if not rid:
+        return None
+    filters = payload.search
+    normalized_query = _normalize_upstream_cache_text(getattr(filters, "query", "") or "")
+    return "|".join(
+        [
+            source_normalized or "unknown",
+            rid,
+            normalized_query,
+            str(int(getattr(filters, "limit", 10) or 10)),
+            str(int(getattr(filters, "page", 1) or 1)),
+            "1" if bool(getattr(filters, "in_stock_only", False)) else "0",
+        ]
+    )
 
 
 def _build_multi_upstream_cache_key(
@@ -6376,18 +6451,58 @@ async def invoke_shop_operation(
         started = time.time()
         status_code = 200
         error_detail = None
+        request_id = getattr(http_request.state, "request_id", None)
         payload = FindProductsMultiPayload(
             **_normalize_find_products_multi_payload(request.payload)
         )
         source_normalized = _normalize_surface_source(normalized_metadata.get("source"))
         is_shopping_surface = _is_shopping_multi_source(source_normalized)
+        page_request_id = (
+            normalized_metadata.get("page_request_id")
+            or normalized_metadata.get("pageRequestId")
+        )
+        dedup_cache_hit = False
+        dedup_inflight_joined = False
+        dedup_key: Optional[str] = None
         try:
             if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and is_shopping_surface:
-                result = await _handle_find_products_multi(
-                    payload,
-                    normalized_metadata,
-                    background_tasks,
-                )
+                if MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED:
+                    dedup_key = _build_multi_page_request_dedup_key(
+                        payload=payload,
+                        source_normalized=source_normalized,
+                        page_request_id=page_request_id,
+                    )
+                if dedup_key:
+                    cached_result = _multi_page_request_cache_get(dedup_key)
+                    if isinstance(cached_result, dict):
+                        dedup_cache_hit = True
+                        result = cached_result
+                    else:
+                        inflight = _MULTI_SEARCH_PAGE_REQUEST_INFLIGHT.get(dedup_key)
+                        if inflight is not None:
+                            dedup_inflight_joined = True
+                            result = copy.deepcopy(await inflight)
+                        else:
+                            task = asyncio.create_task(
+                                _handle_find_products_multi(
+                                    payload,
+                                    normalized_metadata,
+                                    background_tasks,
+                                )
+                            )
+                            _MULTI_SEARCH_PAGE_REQUEST_INFLIGHT[dedup_key] = task
+                            try:
+                                result = await task
+                                if isinstance(result, dict):
+                                    _multi_page_request_cache_put(dedup_key, result)
+                            finally:
+                                _MULTI_SEARCH_PAGE_REQUEST_INFLIGHT.pop(dedup_key, None)
+                else:
+                    result = await _handle_find_products_multi(
+                        payload,
+                        normalized_metadata,
+                        background_tasks,
+                    )
             else:
                 session_id = _derive_session_id_for_multi(payload, normalized_metadata)
                 creator_id_for_hash = (
@@ -6431,17 +6546,20 @@ async def invoke_shop_operation(
             elapsed_ms = round(max(0.0, (time.time() - started) * 1000.0), 1)
             if isinstance(result, dict):
                 response_metadata = result.get("metadata")
-                if isinstance(response_metadata, dict):
-                    page_request_id = (
-                        normalized_metadata.get("page_request_id")
-                        or normalized_metadata.get("pageRequestId")
-                    )
-                    response_metadata.setdefault("gateway_latency_ms", elapsed_ms)
-                    response_metadata.setdefault("source_normalized", source_normalized)
-                    response_metadata.setdefault("shopping_surface_detected", is_shopping_surface)
-                    if page_request_id:
-                        response_metadata.setdefault("page_request_id", page_request_id)
-                    result["metadata"] = response_metadata
+                if not isinstance(response_metadata, dict):
+                    response_metadata = {}
+                response_metadata["gateway_latency_ms"] = elapsed_ms
+                response_metadata["source_normalized"] = source_normalized
+                response_metadata["shopping_surface_detected"] = is_shopping_surface
+                if request_id:
+                    response_metadata["request_id"] = request_id
+                if page_request_id:
+                    response_metadata["page_request_id"] = page_request_id
+                if dedup_key:
+                    response_metadata["page_request_dedup_enabled"] = True
+                    response_metadata["page_request_dedup_cache_hit"] = dedup_cache_hit
+                    response_metadata["page_request_dedup_inflight_joined"] = dedup_inflight_joined
+                result["metadata"] = response_metadata
             return result
         except asyncio.CancelledError:
             # Client disconnected; best-effort cancellation.

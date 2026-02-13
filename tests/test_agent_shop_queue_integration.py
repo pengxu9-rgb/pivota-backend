@@ -188,6 +188,63 @@ async def test_invoke_find_products_multi_payload_metadata_source_bypasses_queue
 
 
 @pytest.mark.asyncio
+async def test_invoke_find_products_multi_shopping_page_request_dedup_collapses_concurrent_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_shop_gateway.agent_task_manager = AgentTaskManager(
+        max_workers=1,
+        max_queue_size=0,
+        task_timeout_seconds=5.0,
+        max_calls_per_session=100,
+        max_duplicate_payloads=1,
+    )
+    monkeypatch.setattr(agent_shop_gateway, "INVOKE_MULTI_BYPASS_QUEUE_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway, "MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED", True)
+    monkeypatch.setattr(agent_shop_gateway, "MULTI_SEARCH_PAGE_REQUEST_DEDUP_TTL_SECONDS", 5.0)
+    monkeypatch.setattr(agent_shop_gateway, "_MULTI_SEARCH_PAGE_REQUEST_CACHE", {})
+    monkeypatch.setattr(agent_shop_gateway, "_MULTI_SEARCH_PAGE_REQUEST_INFLIGHT", {})
+
+    calls = {"count": 0}
+
+    async def fake_handler(payload: Any, metadata: Dict[str, Any], background_tasks: Any) -> Dict[str, Any]:
+        calls["count"] += 1
+        await asyncio.sleep(0.05)
+        return {
+            "products": [{"id": "p_1"}],
+            "total": 1,
+            "page": 1,
+            "page_size": 1,
+            "reply": "deduped",
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(agent_shop_gateway, "_handle_find_products_multi", fake_handler)
+
+    body = _base_multi_body()
+    body["metadata"] = {"source": "shopping_agent", "page_request_id": "pr_same_001"}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        r1, r2 = await asyncio.gather(
+            async_client.post("/agent/shop/v1/invoke", json=body),
+            async_client.post("/agent/shop/v1/invoke", json=body),
+        )
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    p1 = r1.json()
+    p2 = r2.json()
+    assert p1["reply"] == "deduped"
+    assert p2["reply"] == "deduped"
+    assert calls["count"] == 1
+    md1 = p1.get("metadata", {})
+    md2 = p2.get("metadata", {})
+    assert md1.get("page_request_dedup_enabled") is True
+    assert md2.get("page_request_dedup_enabled") is True
+    assert bool(md1.get("page_request_dedup_inflight_joined")) or bool(md2.get("page_request_dedup_inflight_joined"))
+
+
+@pytest.mark.asyncio
 async def test_queue_backpressure_returns_429(monkeypatch: pytest.MonkeyPatch) -> None:
     # Only 1 worker and no queue capacity: second concurrent request must see 429.
     agent_shop_gateway.agent_task_manager = AgentTaskManager(
