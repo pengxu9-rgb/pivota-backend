@@ -5371,6 +5371,11 @@ try:
 except ValueError:
     INVOKE_SHORT_WAIT_SECONDS = 0.0
 
+INVOKE_MULTI_BYPASS_QUEUE_SHOPPING = _env_bool(
+    "AGENT_SHOP_MULTI_BYPASS_QUEUE_SHOPPING",
+    True,
+)
+
 
 @router.post("/invoke")
 async def invoke_shop_operation(
@@ -5944,6 +5949,14 @@ async def invoke_shop_operation(
         payload = FindProductsMultiPayload(
             **_normalize_find_products_multi_payload(request.payload)
         )
+        source_normalized = str(normalized_metadata.get("source") or "").strip().lower().replace("_", "-")
+        if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and source_normalized in SHOPPING_MULTI_SOURCES:
+            return await _handle_find_products_multi(
+                payload,
+                normalized_metadata,
+                background_tasks,
+            )
+
         session_id = _derive_session_id_for_multi(payload, normalized_metadata)
         creator_id_for_hash = (
             payload.creator_id

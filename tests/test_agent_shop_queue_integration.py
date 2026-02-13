@@ -1,5 +1,6 @@
 import asyncio
 from typing import Any, Dict
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -60,6 +61,43 @@ async def test_invoke_find_products_multi_uses_queue_and_returns_payload(monkeyp
     body = resp.json()
     assert body["products"] == []
     assert body["reply"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_invoke_find_products_multi_shopping_bypasses_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_shop_gateway.agent_task_manager = AgentTaskManager(
+        max_workers=1,
+        max_queue_size=0,
+        task_timeout_seconds=5.0,
+        max_calls_per_session=100,
+        max_duplicate_payloads=1,
+    )
+    monkeypatch.setattr(agent_shop_gateway, "INVOKE_MULTI_BYPASS_QUEUE_SHOPPING", True)
+
+    async def fake_handler(payload: Any, metadata: Dict[str, Any], background_tasks: Any) -> Dict[str, Any]:
+        return {
+            "products": [{"id": "p_1"}],
+            "total": 1,
+            "page": 1,
+            "page_size": 1,
+            "reply": "bypassed",
+        }
+
+    monkeypatch.setattr(agent_shop_gateway, "_handle_find_products_multi", fake_handler)
+    enqueue_mock = AsyncMock(side_effect=AssertionError("queue should not be used for shopping source"))
+    monkeypatch.setattr(agent_shop_gateway.agent_task_manager, "enqueue", enqueue_mock)
+
+    body = _base_multi_body()
+    body["metadata"] = {"source": "shopping_agent"}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        resp = await async_client.post("/agent/shop/v1/invoke", json=body)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["reply"] == "bypassed"
+    enqueue_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
