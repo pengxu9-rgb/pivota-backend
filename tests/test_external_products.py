@@ -336,6 +336,95 @@ async def test_shop_gateway_find_products_multi_matches_external_seeds_with_stop
     assert any(p.get("source") == "external_seed" for p in products)
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_limits_merchant_fanout_and_uses_cache_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_count = max(agent_shop_gateway_module.MULTI_SEARCH_MERCHANT_SCAN_LIMIT + 5, 25)
+    merchant_rows = [
+        {"merchant_id": f"m_{idx:03d}", "business_name": f"Merchant {idx}"}
+        for idx in range(merchant_count)
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+
+    calls = []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        calls.append(
+            {
+                "merchant_id": merchant_id,
+                "limit": limit,
+                "agent_id": agent_id,
+                "force_cache_only": force_cache_only,
+            }
+        )
+        product = agent_shop_gateway_module.StandardProduct(
+            id=f"p_{merchant_id}",
+            product_id=f"p_{merchant_id}",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title=f"Winona {merchant_id}",
+            description="test",
+            price=19.0,
+            currency="USD",
+            inventory_quantity=9,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [product], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="Winona",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        )
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    expected_scanned = min(
+        merchant_count,
+        agent_shop_gateway_module.MULTI_SEARCH_MERCHANT_SCAN_LIMIT,
+    )
+    assert len(calls) == expected_scanned
+    assert all(c["force_cache_only"] is agent_shop_gateway_module.MULTI_SEARCH_FORCE_CACHE_ONLY for c in calls)
+
+    meta = result.get("metadata") or {}
+    assert meta.get("merchants_scanned") == expected_scanned
+    assert meta.get("merchants_searched") == merchant_count
+    assert meta.get("merchant_scan_limited") is True
+
+
 def test_agent_products_search_external_seed_includes_variants(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:

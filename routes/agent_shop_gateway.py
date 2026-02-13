@@ -185,6 +185,65 @@ DEV_MODE = os.getenv("APP_ENV", "dev") != "production"
 agent_task_manager = AgentTaskManager.from_env()
 
 
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+MULTI_SEARCH_MERCHANT_SCAN_LIMIT = _env_int(
+    "AGENT_SHOP_MULTI_MERCHANT_SCAN_LIMIT",
+    18,
+    min_value=1,
+    max_value=200,
+)
+MULTI_SEARCH_MERCHANT_SCAN_LIMIT_CREATOR = _env_int(
+    "AGENT_SHOP_MULTI_MERCHANT_SCAN_LIMIT_CREATOR",
+    32,
+    min_value=1,
+    max_value=300,
+)
+MULTI_SEARCH_MERCHANT_CONCURRENCY = _env_int(
+    "AGENT_SHOP_MULTI_MERCHANT_CONCURRENCY",
+    6,
+    min_value=1,
+    max_value=64,
+)
+MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_MERCHANT_FETCH_TIMEOUT_SECONDS",
+    1.2,
+    min_value=0.2,
+    max_value=10.0,
+)
+MULTI_SEARCH_FORCE_CACHE_ONLY = _env_bool(
+    "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY",
+    True,
+)
+
+
 class SearchFilters(BaseModel):
     merchant_id: str = Field(..., description="Merchant ID")
     query: str = Field("", description="Search query, empty string means 'all products'")
@@ -277,6 +336,60 @@ class OffersResolvePayload(BaseModel):
     limit: int = Field(10, ge=1, le=30, description="Max offers to return")
     market: Optional[str] = Field(None, description="Market for outbound allowlist and UTM")
     tool: Optional[str] = Field(None, description="Tool identifier for outbound allowlist and UTM")
+
+
+def _normalize_find_products_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
+    search_raw = payload.get("search")
+    if isinstance(search_raw, dict):
+        search = dict(search_raw)
+    else:
+        search = dict(payload)
+    return {"search": search}
+
+
+def _normalize_find_products_multi_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
+    search_raw = payload.get("search")
+    if isinstance(search_raw, dict):
+        search = dict(search_raw)
+    else:
+        search = {}
+        for key in (
+            "query",
+            "category",
+            "price_min",
+            "price_max",
+            "page",
+            "limit",
+            "in_stock_only",
+        ):
+            if key in payload:
+                search[key] = payload.get(key)
+    normalized: Dict[str, Any] = {"search": search}
+    for key in ("user", "metadata", "creator_id", "creatorId", "intent_safety"):
+        if key in payload:
+            normalized[key] = payload.get(key)
+    return normalized
+
+
+def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
+    product_raw = payload.get("product")
+    if isinstance(product_raw, dict):
+        product = dict(product_raw)
+    else:
+        product = {}
+
+    for key in ("product_id", "productId", "sku_id", "skuId", "merchant_id", "merchantId"):
+        if key in payload and key not in product:
+            product[key] = payload.get(key)
+
+    normalized: Dict[str, Any] = {"product": product}
+    for key in ("limit", "market", "tool"):
+        if key in payload:
+            normalized[key] = payload.get(key)
+    return normalized
 
 
 def _safe_lower(s: Any) -> str:
@@ -3405,24 +3518,51 @@ async def _handle_find_products_multi(
     # We fetch a bit more than the requested page size to have headroom for filtering.
     per_merchant_limit = min(max(limit * 2, 20), 200)
 
+    # Merchant fan-out guardrail:
+    # - `find_products_multi` is primarily cache-driven, so scanning every merchant
+    #   on each request creates long-tail latency spikes with little recall benefit.
+    # - Keep a bounded merchant slice and fetch in parallel.
+    merchant_items = list(merchant_map.items())
+    max_merchants_to_scan = (
+        MULTI_SEARCH_MERCHANT_SCAN_LIMIT_CREATOR
+        if is_creator_surface
+        else MULTI_SEARCH_MERCHANT_SCAN_LIMIT
+    )
+    if max_merchants_to_scan > 0 and len(merchant_items) > max_merchants_to_scan:
+        merchant_items = merchant_items[:max_merchants_to_scan]
+    merchants_scanned = len(merchant_items)
+
     # Collect products as (StandardProduct, merchant_name) tuples
     merchant_products: list[tuple[StandardProduct, str]] = []
-    for mid, name in merchant_map.items():
-        try:
-            products, _source, _error = await get_products_hybrid(
-                merchant_id=mid,
-                limit=per_merchant_limit,
-                agent_id="shopping_ai_multi",
-                background_tasks=background_tasks,
-            )
-            shop_currency = await _resolve_shopify_currency_for_merchant(mid)
-            for p in products:
-                if shop_currency and (p.platform or "").lower() == "shopify":
-                    p.currency = shop_currency
-                merchant_products.append((p, name))
-        except Exception:
-            # Ignore individual merchant failures to keep cross-merchant search robust
-            continue
+
+    semaphore = asyncio.Semaphore(max(1, MULTI_SEARCH_MERCHANT_CONCURRENCY))
+
+    async def _fetch_multi_candidates_for_merchant(mid: str, name: str) -> list[tuple[StandardProduct, str]]:
+        async with semaphore:
+            try:
+                products, _source, _error = await asyncio.wait_for(
+                    get_products_hybrid(
+                        merchant_id=mid,
+                        limit=per_merchant_limit,
+                        agent_id="shopping_ai_multi",
+                        background_tasks=background_tasks,
+                        force_cache_only=MULTI_SEARCH_FORCE_CACHE_ONLY,
+                    ),
+                    timeout=MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                # Ignore individual merchant failures to keep cross-merchant search robust
+                return []
+            return [(p, name) for p in products]
+
+    if merchant_items:
+        gathered = await asyncio.gather(
+            *[_fetch_multi_candidates_for_merchant(mid, name) for mid, name in merchant_items],
+            return_exceptions=True,
+        )
+        for chunk in gathered:
+            if isinstance(chunk, list):
+                merchant_products.extend(chunk)
 
     # Recall boost: when the user asks a specific query (e.g. a character name),
     # searching only a small "top-N" slice per merchant can miss relevant items.
@@ -3934,6 +4074,8 @@ async def _handle_find_products_multi(
                             "query_source": source,
                             "fetched_at": datetime.utcnow().isoformat(),
                             "merchants_searched": len(merchant_map),
+                            "merchants_scanned": merchants_scanned,
+                            "merchant_scan_limited": merchants_scanned < len(merchant_map),
                             "creator_id": creator_id,
                             "creator_name": creator_name,
                         },
@@ -3986,6 +4128,8 @@ async def _handle_find_products_multi(
                             "query_source": source,
                             "fetched_at": datetime.utcnow().isoformat(),
                             "merchants_searched": len(merchant_map),
+                            "merchants_scanned": merchants_scanned,
+                            "merchant_scan_limited": merchants_scanned < len(merchant_map),
                             "creator_id": creator_id,
                             "creator_name": creator_name,
                         },
@@ -4012,6 +4156,9 @@ async def _handle_find_products_multi(
                 "query_source": "cache_multi_intent",
                 "fetched_at": datetime.utcnow().isoformat(),
                 "merchants_searched": len(merchant_map),
+                "merchants_scanned": merchants_scanned,
+                "merchant_scan_limited": merchants_scanned < len(merchant_map),
+                "force_cache_only": MULTI_SEARCH_FORCE_CACHE_ONLY,
                 "creator_id": creator_id,
                 "creator_name": creator_name,
                 "history_boost_applied": history_used,
@@ -4549,7 +4696,9 @@ async def create_creator_task(
 
     # For now we support async tasks for the heavy operations only.
     if operation == "find_products_multi":
-        payload = FindProductsMultiPayload(**request.payload)
+        payload = FindProductsMultiPayload(
+            **_normalize_find_products_multi_payload(request.payload)
+        )
         session_id = request.session_id or _derive_session_id_for_multi(payload, normalized_metadata)
         creator_id_for_hash = (
             payload.creator_id
@@ -4987,8 +5136,32 @@ async def invoke_shop_operation(
                 break
 
     if operation == "find_products":
-        payload = FindProductsPayload(**request.payload)
-        return await _handle_find_products(payload.search, background_tasks)
+        normalized_find_products = _normalize_find_products_payload(request.payload)
+        search_payload = (
+            normalized_find_products.get("search")
+            if isinstance(normalized_find_products, dict)
+            else {}
+        )
+        if not isinstance(search_payload, dict):
+            search_payload = {}
+
+        merchant_id = str(
+            search_payload.get("merchant_id") or search_payload.get("merchantId") or ""
+        ).strip()
+        if merchant_id:
+            search_payload["merchant_id"] = merchant_id
+            payload = FindProductsPayload(search=SearchFilters(**search_payload))
+            return await _handle_find_products(payload.search, background_tasks)
+
+        # Backward-compatible fallback: treat non-merchant-scoped find_products as multi-search.
+        multi_payload = FindProductsMultiPayload(
+            **_normalize_find_products_multi_payload(request.payload)
+        )
+        return await _handle_find_products_multi(
+            multi_payload,
+            normalized_metadata,
+            background_tasks,
+        )
 
     if operation == "get_product_detail":
         payload = GetProductDetailPayload(**request.payload)
@@ -5492,7 +5665,9 @@ async def invoke_shop_operation(
         return await _handle_create_order(payload.order, checkout_token=checkout_token)
 
     if operation == "find_products_multi":
-        payload = FindProductsMultiPayload(**request.payload)
+        payload = FindProductsMultiPayload(
+            **_normalize_find_products_multi_payload(request.payload)
+        )
         session_id = _derive_session_id_for_multi(payload, normalized_metadata)
         creator_id_for_hash = (
             payload.creator_id
@@ -5535,7 +5710,9 @@ async def invoke_shop_operation(
             raise
 
     if operation in ("offers.resolve", "offers_resolve", "offersResolve"):
-        payload = OffersResolvePayload(**request.payload)
+        payload = OffersResolvePayload(
+            **_normalize_offers_resolve_payload(request.payload)
+        )
         return await _handle_offers_resolve(payload, normalized_metadata, background_tasks)
 
     if operation == "find_similar_products":
