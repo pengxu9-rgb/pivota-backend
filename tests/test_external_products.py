@@ -442,8 +442,6 @@ async def test_shop_gateway_find_products_multi_recall_terms_drop_common_stopwor
     import db.database as db_database_module
     import routes.agent_shop_gateway as agent_shop_gateway_module
 
-    captured_like_terms = []
-
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
         if "FROM merchant_onboarding" in q:
@@ -453,10 +451,40 @@ async def test_shop_gateway_find_products_multi_recall_terms_drop_common_stopwor
         if "FROM orders" in q:
             return []
         if "FROM products_cache" in q and "cache_limit" in (values or {}):
-            for key, val in (values or {}).items():
-                if str(key).startswith("like_"):
-                    captured_like_terms.append(str(val).strip("%").lower())
-            return []
+            return [
+                {
+                    "merchant_id": "m_001",
+                    "product_data": {
+                        "id": "p_the_only",
+                        "product_id": "p_the_only",
+                        "platform": "shopify",
+                        "merchant_id": "m_001",
+                        "title": "The Brush",
+                        "description": "soft finish",
+                        "price": 19.0,
+                        "currency": "USD",
+                        "inventory_quantity": 10,
+                        "orderable": True,
+                        "status": "active",
+                    },
+                },
+                {
+                    "merchant_id": "m_001",
+                    "product_data": {
+                        "id": "p_ordinary",
+                        "product_id": "p_ordinary",
+                        "platform": "shopify",
+                        "merchant_id": "m_001",
+                        "title": "Ordinary Niacinamide Serum",
+                        "description": "zinc formula",
+                        "price": 20.0,
+                        "currency": "USD",
+                        "inventory_quantity": 8,
+                        "orderable": True,
+                        "status": "active",
+                    },
+                },
+            ]
         if "FROM products_cache" in q:
             return []
         return []
@@ -483,15 +511,16 @@ async def test_shop_gateway_find_products_multi_recall_terms_drop_common_stopwor
             in_stock_only=False,
         )
     )
-    await agent_shop_gateway_module._handle_find_products_multi(
+    result = await agent_shop_gateway_module._handle_find_products_multi(
         payload,
         {"source": "shopping_agent"},
         agent_shop_gateway_module.BackgroundTasks(),
     )
 
-    assert captured_like_terms
-    assert "the" not in captured_like_terms
-    assert any(term in captured_like_terms for term in ("ordinary", "niacinamide", "zinc"))
+    products = result.get("products") or []
+    ids = {p.get("id") for p in products}
+    assert "p_ordinary" in ids
+    assert "p_the_only" not in ids
 
 
 @pytest.mark.asyncio

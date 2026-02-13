@@ -3625,30 +3625,10 @@ async def _handle_find_products_multi(
                 anchor_terms = [q_compact]
 
             if anchor_terms:
-                likes = [f"%{t.lower()}%" for t in anchor_terms if t]
-                # Clamp so we don't overfetch too much from cache.
-                cache_limit = min(max(limit * max(page, 1) * 6, 120), 900)
-
-                where_clauses: List[str] = []
-                params: Dict[str, Any] = {
-                    "merchant_ids": list(merchant_map.keys()),
-                    "cache_limit": cache_limit,
-                }
-                for idx, like in enumerate(likes):
-                    key = f"like_{idx}"
-                    params[key] = like
-                    where_clauses.append(
-                        "("
-                        "LOWER(COALESCE(product_data->>'title','')) LIKE :" + key
-                        + " OR LOWER(COALESCE(product_data->>'description','')) LIKE :" + key
-                        + " OR LOWER(COALESCE(product_data->>'product_type','')) LIKE :" + key
-                        + " OR LOWER(COALESCE(product_data->>'sku','')) LIKE :" + key
-                        + ")"
-                    )
-                    # Variant SKUs are nested; for SKU-like queries we allow a bounded JSON text scan.
-                    if sku_like_query:
-                        where_clauses.append("LOWER(CAST(product_data AS TEXT)) LIKE :" + key)
-
+                # Pull a bounded recent slice using indexed columns and do
+                # token matching in-memory. This avoids expensive JSON LIKE
+                # scans that can trigger long-tail DB latency.
+                cache_scan_limit = min(max(limit * max(page, 1) * 80, 600), 5000)
                 rows = await asyncio.wait_for(
                     database.fetch_all(
                         """
@@ -3656,16 +3636,48 @@ async def _handle_find_products_multi(
                         FROM products_cache
                         WHERE (expires_at IS NULL OR expires_at > NOW())
                           AND merchant_id = ANY(:merchant_ids)
-                          AND ("""
-                        + " OR ".join(where_clauses)
-                        + """)
                         ORDER BY cached_at DESC
                         LIMIT :cache_limit
                         """,
-                        params,
+                        {
+                            "merchant_ids": list(merchant_map.keys()),
+                            "cache_limit": cache_scan_limit,
+                        },
                     ),
                     timeout=MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS,
                 )
+
+                anchor_compacts = [
+                    re.sub(r"[^a-z0-9]+", "", str(t or "").lower())
+                    for t in anchor_terms
+                    if str(t or "").strip()
+                ]
+                anchor_compacts = [t for t in anchor_compacts if t]
+
+                def _recall_row_matches(data: Dict[str, Any]) -> bool:
+                    title = str(data.get("title") or "").lower()
+                    desc = str(data.get("description") or "").lower()
+                    ptype = str(data.get("product_type") or "").lower()
+                    sku = str(data.get("sku") or "").lower()
+                    blob = " ".join([title, desc, ptype, sku])
+                    blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
+
+                    for term in anchor_terms:
+                        tt = str(term or "").lower().strip()
+                        if tt and tt in blob:
+                            return True
+                    for compact in anchor_compacts:
+                        if compact and compact in blob_compact:
+                            return True
+
+                    if sku_like_query:
+                        json_blob = str(data).lower()
+                        for term in anchor_terms:
+                            tt = str(term or "").lower().strip()
+                            if tt and tt in json_blob:
+                                return True
+
+                    return False
 
                 for row in rows:
                     mid = row.get("merchant_id") if isinstance(row, dict) else None
@@ -3678,6 +3690,8 @@ async def _handle_find_products_multi(
                         except Exception:
                             continue
                     if not isinstance(product_data, dict):
+                        continue
+                    if not _recall_row_matches(product_data):
                         continue
                     try:
                         prod = StandardProduct(**product_data)
