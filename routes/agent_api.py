@@ -1708,8 +1708,10 @@ async def agent_search_products(
     except Exception as e:
         reason_code = _classify_db_reason_code(e)
         latency_ms = int((time.perf_counter() - started) * 1000)
-        logger.error(
-            "Agent product search error",
+        error_text = str(e or "").strip()
+        logger.exception(
+            "Agent product search error: %s",
+            (error_text[:300] if error_text else type(e).__name__),
             extra={
                 "event": "agent_search_products.failed",
                 "query": query,
