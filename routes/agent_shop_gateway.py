@@ -2293,8 +2293,12 @@ async def _invoke_multi_upstream_fallback(
 
     url = f"{MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL}/agent/shop/v1/invoke"
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            resp = await client.post(url, json=body, headers={"Content-Type": "application/json"})
+        async def _post_once() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                return await client.post(url, json=body, headers={"Content-Type": "application/json"})
+
+        # Enforce wall-clock budget, not per-phase socket timeout only.
+        resp = await asyncio.wait_for(_post_once(), timeout=timeout_seconds)
         if resp.status_code >= 400:
             logger.info(
                 "multi.upstream_fallback.http_error",
