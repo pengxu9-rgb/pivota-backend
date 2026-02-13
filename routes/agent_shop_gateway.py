@@ -2811,7 +2811,10 @@ async def _handle_find_products_multi(
             SELECT merchant_id, business_name
             FROM merchant_onboarding
             WHERE status NOT IN ('deleted', 'rejected')
-            AND psp_connected = true
+            ORDER BY
+              CASE WHEN psp_connected = true THEN 0 ELSE 1 END,
+              updated_at DESC NULLS LAST,
+              created_at DESC NULLS LAST
             LIMIT 100
             """
         )
