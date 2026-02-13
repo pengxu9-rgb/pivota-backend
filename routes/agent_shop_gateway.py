@@ -234,7 +234,7 @@ MULTI_SEARCH_MERCHANT_CONCURRENCY = _env_int(
 )
 MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_MERCHANT_FETCH_TIMEOUT_SECONDS",
-    1.2,
+    0.8,
     min_value=0.2,
     max_value=10.0,
 )
@@ -256,7 +256,7 @@ MULTI_SEARCH_FORCE_CACHE_ONLY = _env_bool(
 )
 MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT = _env_bool(
     "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT",
-    False,
+    True,
 )
 
 
@@ -3534,8 +3534,9 @@ async def _handle_find_products_multi(
         )
 
     # How many products to fetch per merchant (before global filtering/pagination)
-    # We fetch a bit more than the requested page size to have headroom for filtering.
-    per_merchant_limit = min(max(limit * 2, 20), 200)
+    # Keep per-merchant payload small to bound latency; the cross-merchant cache
+    # recall query below provides additional coverage for query-specific matches.
+    per_merchant_limit = min(max(limit + 2, 12), 60)
 
     # Merchant fan-out guardrail:
     # - `find_products_multi` is primarily cache-driven, so scanning every merchant
