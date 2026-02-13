@@ -332,13 +332,13 @@ MULTI_SEARCH_UPSTREAM_CACHE_MAX_ENTRIES = _env_int(
 )
 MULTI_SEARCH_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS",
-    1.2,
+    0.9,
     min_value=0.3,
     max_value=20.0,
 )
 MULTI_SEARCH_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD = _env_int(
     "AGENT_SHOP_MULTI_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD",
-    4,
+    1,
     min_value=1,
     max_value=100,
 )
@@ -359,7 +359,32 @@ MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT = _env_bool(
     True,
 )
 
-SHOPPING_MULTI_SOURCES = {"shopping-agent", "aurora", "aurora-chatbox"}
+SHOPPING_MULTI_SOURCES = {
+    "shopping-agent",
+    "shopping-agent-ui",
+    "shopping-agent-web",
+    "aurora",
+    "aurora-chatbox",
+}
+
+
+def _normalize_surface_source(source: Optional[str]) -> str:
+    return str(source or "").strip().lower().replace("_", "-")
+
+
+def _is_shopping_multi_source(source: Optional[str]) -> bool:
+    normalized = _normalize_surface_source(source)
+    if not normalized:
+        return False
+    if normalized in SHOPPING_MULTI_SOURCES:
+        return True
+    if normalized.startswith("shopping-") or normalized.startswith("aurora-"):
+        return True
+    if "shopping" in normalized:
+        return True
+    if "aurora" in normalized:
+        return True
+    return False
 
 _MULTI_SEARCH_UPSTREAM_CACHE: Dict[str, Dict[str, Any]] = {}
 _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS: List[float] = []
@@ -572,8 +597,7 @@ def _build_multi_delegate_empty_result(
 def _resolve_multi_force_cache_only(source: Optional[str], is_creator_surface: bool) -> bool:
     if is_creator_surface:
         return MULTI_SEARCH_FORCE_CACHE_ONLY_CREATOR
-    normalized = str(source or "").strip().lower().replace("_", "-")
-    if normalized in SHOPPING_MULTI_SOURCES:
+    if _is_shopping_multi_source(source):
         return MULTI_SEARCH_FORCE_CACHE_ONLY_SHOPPING
     return MULTI_SEARCH_FORCE_CACHE_ONLY_DEFAULT
 
@@ -581,8 +605,7 @@ def _resolve_multi_force_cache_only(source: Optional[str], is_creator_surface: b
 def _resolve_multi_base_merchant_fanout(source: Optional[str], is_creator_surface: bool) -> bool:
     if is_creator_surface:
         return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_CREATOR
-    normalized = str(source or "").strip().lower().replace("_", "-")
-    if normalized in SHOPPING_MULTI_SOURCES:
+    if _is_shopping_multi_source(source):
         return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING
     return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT
 
@@ -2664,7 +2687,7 @@ async def _handle_find_products_multi(
         creator_id = creator_meta.creator_id
         creator_name = creator_meta.creator_name
         source = creator_meta.source
-        source_normalized = str(source or "").strip().lower().replace("_", "-")
+        source_normalized = _normalize_surface_source(source)
     if isinstance(request_metadata, dict):
         try:
             upstream_fallback_hop = max(
@@ -2679,7 +2702,7 @@ async def _handle_find_products_multi(
     # permissive visibility rules (do not drop products solely because
     # orderable is false).
     is_creator_surface = source_normalized in {"creator-agent-ui", "creator-category-service"}
-    is_shopping_surface = source_normalized in SHOPPING_MULTI_SOURCES
+    is_shopping_surface = _is_shopping_multi_source(source_normalized)
     force_cache_only = _resolve_multi_force_cache_only(source_normalized, is_creator_surface)
     base_merchant_fanout_enabled = _resolve_multi_base_merchant_fanout(
         source_normalized,
@@ -6306,57 +6329,111 @@ async def invoke_shop_operation(
         return await _handle_create_order(payload.order, checkout_token=checkout_token)
 
     if operation == "find_products_multi":
+        started = time.time()
+        status_code = 200
+        error_detail = None
         payload = FindProductsMultiPayload(
             **_normalize_find_products_multi_payload(request.payload)
         )
-        source_normalized = str(normalized_metadata.get("source") or "").strip().lower().replace("_", "-")
-        if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and source_normalized in SHOPPING_MULTI_SOURCES:
-            return await _handle_find_products_multi(
-                payload,
-                normalized_metadata,
-                background_tasks,
-            )
-
-        session_id = _derive_session_id_for_multi(payload, normalized_metadata)
-        creator_id_for_hash = (
-            payload.creator_id
-            or (payload.metadata.creator_id if payload.metadata else None)
-            or normalized_metadata.get("creator_id")
-        )
-        payload_key = {
-            "query": payload.search.query,
-            "category": payload.search.category,
-            "price_min": payload.search.price_min,
-            "price_max": payload.search.price_max,
-            "in_stock_only": payload.search.in_stock_only,
-            "creator_id": creator_id_for_hash,
-        }
-        payload_hash = AgentTaskManager.compute_payload_hash(
-            "find_products_multi", payload_key
-        )
-        task_id, future = await agent_task_manager.enqueue(
-            operation="find_products_multi",
-            session_id=session_id,
-            payload_hash=payload_hash,
-            coro_factory=lambda: _handle_find_products_multi(
-                payload, normalized_metadata, background_tasks
-            ),
-        )
+        source_normalized = _normalize_surface_source(normalized_metadata.get("source"))
+        is_shopping_surface = _is_shopping_multi_source(source_normalized)
         try:
-            if INVOKE_SHORT_WAIT_SECONDS > 0:
-                try:
-                    return await asyncio.wait_for(future, timeout=INVOKE_SHORT_WAIT_SECONDS)
-                except asyncio.TimeoutError:
-                    # Short-wait budget exceeded; keep task running in the background.
-                    return {
-                        "status": "pending",
-                        "task_id": task_id,
-                    }
-            return await future
+            if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and is_shopping_surface:
+                result = await _handle_find_products_multi(
+                    payload,
+                    normalized_metadata,
+                    background_tasks,
+                )
+            else:
+                session_id = _derive_session_id_for_multi(payload, normalized_metadata)
+                creator_id_for_hash = (
+                    payload.creator_id
+                    or (payload.metadata.creator_id if payload.metadata else None)
+                    or normalized_metadata.get("creator_id")
+                )
+                payload_key = {
+                    "query": payload.search.query,
+                    "category": payload.search.category,
+                    "price_min": payload.search.price_min,
+                    "price_max": payload.search.price_max,
+                    "in_stock_only": payload.search.in_stock_only,
+                    "creator_id": creator_id_for_hash,
+                }
+                payload_hash = AgentTaskManager.compute_payload_hash(
+                    "find_products_multi", payload_key
+                )
+                task_id, future = await agent_task_manager.enqueue(
+                    operation="find_products_multi",
+                    session_id=session_id,
+                    payload_hash=payload_hash,
+                    coro_factory=lambda: _handle_find_products_multi(
+                        payload, normalized_metadata, background_tasks
+                    ),
+                )
+                if INVOKE_SHORT_WAIT_SECONDS > 0:
+                    try:
+                        result = await asyncio.wait_for(
+                            future, timeout=INVOKE_SHORT_WAIT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        # Short-wait budget exceeded; keep task running in the background.
+                        result = {
+                            "status": "pending",
+                            "task_id": task_id,
+                        }
+                else:
+                    result = await future
+
+            elapsed_ms = round(max(0.0, (time.time() - started) * 1000.0), 1)
+            if isinstance(result, dict):
+                response_metadata = result.get("metadata")
+                if isinstance(response_metadata, dict):
+                    response_metadata.setdefault("gateway_latency_ms", elapsed_ms)
+                    response_metadata.setdefault("source_normalized", source_normalized)
+                    response_metadata.setdefault("shopping_surface_detected", is_shopping_surface)
+                    result["metadata"] = response_metadata
+            return result
         except asyncio.CancelledError:
             # Client disconnected; best-effort cancellation.
-            await agent_task_manager.cancel(task_id, reason="client_disconnect")
+            status_code = 499
+            error_detail = "client_disconnect"
+            try:
+                if "task_id" in locals():
+                    await agent_task_manager.cancel(task_id, reason="client_disconnect")
+            except Exception:
+                pass
             raise
+        except HTTPException as e:
+            status_code = int(e.status_code)
+            error_detail = str(e.detail)
+            raise
+        except Exception as e:
+            status_code = 500
+            error_detail = type(e).__name__
+            raise
+        finally:
+            duration_seconds = max(0.0, time.time() - started)
+            if duration_seconds >= 2.0:
+                logger.info(
+                    "multi.invoke.slow",
+                    extra={
+                        "source": source_normalized,
+                        "is_shopping_surface": is_shopping_surface,
+                        "query": payload.search.query,
+                        "duration_ms": round(duration_seconds * 1000.0, 1),
+                    },
+                )
+            try:
+                from observability.reviews_metrics import record_invoke
+
+                record_invoke(
+                    operation=operation,
+                    status_code=status_code,
+                    duration_seconds=duration_seconds,
+                    error_detail=error_detail,
+                )
+            except Exception:
+                pass
 
     if operation in ("offers.resolve", "offers_resolve", "offersResolve"):
         payload = OffersResolvePayload(
