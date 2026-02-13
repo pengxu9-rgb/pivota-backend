@@ -425,6 +425,65 @@ async def test_shop_gateway_find_products_multi_limits_merchant_fanout_and_uses_
     assert meta.get("merchant_scan_limited") is True
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_recall_terms_drop_common_stopwords(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    captured_like_terms = []
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "m_001", "business_name": "Merchant"}]
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q and "cache_limit" in (values or {}):
+            for key, val in (values or {}).items():
+                if str(key).startswith("like_"):
+                    captured_like_terms.append(str(val).strip("%").lower())
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        return [], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="The Ordinary Niacinamide 10% + Zinc 1%",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        )
+    )
+    await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert captured_like_terms
+    assert "the" not in captured_like_terms
+    assert any(term in captured_like_terms for term in ("ordinary", "niacinamide", "zinc"))
+
+
 def test_agent_products_search_external_seed_includes_variants(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:

@@ -3588,9 +3588,28 @@ async def _handle_find_products_multi(
             if "labubu" in q_ascii:
                 anchor_terms = ["labubu"]
             elif q_tokens:
-                anchor_terms = [q_tokens[0]]
-                if len(q_tokens) > 1 and len(q_tokens[1]) >= 4:
-                    anchor_terms.append(q_tokens[1])
+                query_stopwords = {
+                    "a",
+                    "an",
+                    "and",
+                    "at",
+                    "for",
+                    "from",
+                    "in",
+                    "my",
+                    "of",
+                    "on",
+                    "or",
+                    "the",
+                    "to",
+                    "with",
+                }
+                informative_tokens = [
+                    t
+                    for t in q_tokens
+                    if len(t) >= 3 and t not in query_stopwords
+                ]
+                anchor_terms = informative_tokens[:3] if informative_tokens else q_tokens[:1]
             elif len(q_compact) >= 4:
                 anchor_terms = [q_compact]
 
