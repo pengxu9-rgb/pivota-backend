@@ -2401,6 +2401,8 @@ async def _handle_find_products_multi(
         source_normalized,
         is_creator_surface,
     )
+    page = filters.page or 1
+    limit = min(filters.limit or 20, 100)
 
     should_try_upstream = (
         is_shopping_surface
@@ -2416,9 +2418,32 @@ async def _handle_find_products_multi(
         )
         if isinstance(delegated, dict):
             return delegated
+        # In delegate mode we intentionally avoid running the local
+        # multi-merchant path after an upstream timeout/error, because
+        # combining both paths can exceed the invoke queue wait budget
+        # and surface 504 UPSTREAM_TIMEOUT to the frontend.
+        return {
+            "products": [],
+            "total": 0,
+            "page": page,
+            "page_size": 0,
+            "reply": None,
+            "metadata": {
+                "query_source": "agent_products_resolver_fallback_empty",
+                "fetched_at": datetime.utcnow().isoformat(),
+                "merchants_searched": 0,
+                "merchants_scanned": 0,
+                "merchant_scan_limited": False,
+                "force_cache_only": force_cache_only,
+                "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
+                "creator_id": creator_id,
+                "creator_name": creator_name,
+                "history_boost_applied": False,
+                "upstream_fallback_configured": bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL),
+                "upstream_fallback_attempted": True,
+            },
+        }
 
-    page = filters.page or 1
-    limit = min(filters.limit or 20, 100)
     eval_enabled = bool(
         isinstance(request_metadata, dict) and request_metadata.get("eval") is not None
     )

@@ -599,6 +599,67 @@ async def test_shop_gateway_find_products_multi_delegate_to_upstream_when_enable
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_delegate_upstream_failure_returns_empty_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM",
+        True,
+    )
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL",
+        "https://resolver.example",
+    )
+
+    invoke_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_invoke_multi_upstream_fallback",
+        invoke_mock,
+    )
+    get_products_mock = AsyncMock(return_value=([], "cache", None))
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", get_products_mock)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="not_found_query",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        )
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("total") == 0
+    assert result.get("metadata", {}).get("query_source") == "agent_products_resolver_fallback_empty"
+    get_products_mock.assert_not_awaited()
+    invoke_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_creator_surface_uses_creator_cache_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
