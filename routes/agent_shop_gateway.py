@@ -5342,6 +5342,9 @@ async def create_creator_task(
     """
     operation = (request.operation or "").strip()
     normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
+    payload_metadata = request.payload.get("metadata") if isinstance(request.payload, dict) else None
+    if not isinstance(payload_metadata, dict):
+        payload_metadata = {}
     if not normalized_metadata.get("creator_id"):
         for k in ("creatorId", "creator_id"):
             if k in request.payload:
@@ -5351,6 +5354,26 @@ async def create_creator_task(
         for k in ("creatorName", "creator_name"):
             if k in request.payload:
                 normalized_metadata["creator_name"] = request.payload.get(k)
+                break
+    if not normalized_metadata.get("source"):
+        for k in ("source",):
+            if payload_metadata.get(k):
+                normalized_metadata["source"] = payload_metadata.get(k)
+                break
+    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
+        for k in ("trace_id", "traceId"):
+            if payload_metadata.get(k):
+                normalized_metadata[k] = payload_metadata.get(k)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for k in ("page_request_id", "pageRequestId"):
+            if payload_metadata.get(k):
+                normalized_metadata[k] = payload_metadata.get(k)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for k in ("page_request_id", "pageRequestId"):
+            if k in request.payload and request.payload.get(k):
+                normalized_metadata[k] = request.payload.get(k)
                 break
 
     # For now we support async tasks for the heavy operations only.
@@ -5788,6 +5811,9 @@ async def invoke_shop_operation(
 
     # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
     normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
+    payload_metadata = request.payload.get("metadata") if isinstance(request.payload, dict) else None
+    if not isinstance(payload_metadata, dict):
+        payload_metadata = {}
     if not normalized_metadata.get("creator_id"):
         for k in ("creatorId", "creator_id"):
             if k in request.payload:
@@ -5797,6 +5823,24 @@ async def invoke_shop_operation(
         for k in ("creatorName", "creator_name"):
             if k in request.payload:
                 normalized_metadata["creator_name"] = request.payload.get(k)
+                break
+    if not normalized_metadata.get("source"):
+        if payload_metadata.get("source"):
+            normalized_metadata["source"] = payload_metadata.get("source")
+    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
+        for k in ("trace_id", "traceId"):
+            if payload_metadata.get(k):
+                normalized_metadata[k] = payload_metadata.get(k)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for k in ("page_request_id", "pageRequestId"):
+            if payload_metadata.get(k):
+                normalized_metadata[k] = payload_metadata.get(k)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for k in ("page_request_id", "pageRequestId"):
+            if k in request.payload and request.payload.get(k):
+                normalized_metadata[k] = request.payload.get(k)
                 break
 
     if operation == "find_products":
@@ -6388,9 +6432,15 @@ async def invoke_shop_operation(
             if isinstance(result, dict):
                 response_metadata = result.get("metadata")
                 if isinstance(response_metadata, dict):
+                    page_request_id = (
+                        normalized_metadata.get("page_request_id")
+                        or normalized_metadata.get("pageRequestId")
+                    )
                     response_metadata.setdefault("gateway_latency_ms", elapsed_ms)
                     response_metadata.setdefault("source_normalized", source_normalized)
                     response_metadata.setdefault("shopping_surface_detected", is_shopping_surface)
+                    if page_request_id:
+                        response_metadata.setdefault("page_request_id", page_request_id)
                     result["metadata"] = response_metadata
             return result
         except asyncio.CancelledError:
@@ -6420,6 +6470,10 @@ async def invoke_shop_operation(
                         "source": source_normalized,
                         "is_shopping_surface": is_shopping_surface,
                         "query": payload.search.query,
+                        "page_request_id": (
+                            normalized_metadata.get("page_request_id")
+                            or normalized_metadata.get("pageRequestId")
+                        ),
                         "duration_ms": round(duration_seconds * 1000.0, 1),
                     },
                 )

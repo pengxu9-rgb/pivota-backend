@@ -142,6 +142,52 @@ async def test_invoke_find_products_multi_shopping_alias_source_bypasses_queue(
 
 
 @pytest.mark.asyncio
+async def test_invoke_find_products_multi_payload_metadata_source_bypasses_queue_and_echoes_page_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_shop_gateway.agent_task_manager = AgentTaskManager(
+        max_workers=1,
+        max_queue_size=0,
+        task_timeout_seconds=5.0,
+        max_calls_per_session=100,
+        max_duplicate_payloads=1,
+    )
+    monkeypatch.setattr(agent_shop_gateway, "INVOKE_MULTI_BYPASS_QUEUE_SHOPPING", True)
+
+    async def fake_handler(payload: Any, metadata: Dict[str, Any], background_tasks: Any) -> Dict[str, Any]:
+        return {
+            "products": [{"id": "p_1"}],
+            "total": 1,
+            "page": 1,
+            "page_size": 1,
+            "reply": "bypassed",
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(agent_shop_gateway, "_handle_find_products_multi", fake_handler)
+    enqueue_mock = AsyncMock(side_effect=AssertionError("queue should not be used for payload metadata shopping source"))
+    monkeypatch.setattr(agent_shop_gateway.agent_task_manager, "enqueue", enqueue_mock)
+
+    body = _base_multi_body()
+    body["payload"]["metadata"] = {
+        "source": "shopping_agent_web",
+        "page_request_id": "pr_demo_001",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        resp = await async_client.post("/agent/shop/v1/invoke", json=body)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["reply"] == "bypassed"
+    assert payload.get("metadata", {}).get("shopping_surface_detected") is True
+    assert payload.get("metadata", {}).get("source_normalized") == "shopping-agent-web"
+    assert payload.get("metadata", {}).get("page_request_id") == "pr_demo_001"
+    enqueue_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_queue_backpressure_returns_429(monkeypatch: pytest.MonkeyPatch) -> None:
     # Only 1 worker and no queue capacity: second concurrent request must see 429.
     agent_shop_gateway.agent_task_manager = AgentTaskManager(
