@@ -312,6 +312,11 @@ async def test_shop_gateway_find_products_multi_matches_external_seeds_with_stop
 
     monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT",
+        True,
+    )
 
     async def fake_redirect_url(**_kwargs):
         return "https://example.com/r?token=test"
@@ -363,6 +368,11 @@ async def test_shop_gateway_find_products_multi_limits_merchant_fanout_and_uses_
 
     monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT",
+        True,
+    )
 
     calls = []
 

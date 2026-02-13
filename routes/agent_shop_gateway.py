@@ -254,6 +254,10 @@ MULTI_SEARCH_FORCE_CACHE_ONLY = _env_bool(
     "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY",
     True,
 )
+MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT = _env_bool(
+    "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT",
+    False,
+)
 
 
 class SearchFilters(BaseModel):
@@ -3537,7 +3541,7 @@ async def _handle_find_products_multi(
     # - `find_products_multi` is primarily cache-driven, so scanning every merchant
     #   on each request creates long-tail latency spikes with little recall benefit.
     # - Keep a bounded merchant slice and fetch in parallel.
-    merchant_items = list(merchant_map.items())
+    merchant_items = list(merchant_map.items()) if MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT else []
     max_merchants_to_scan = (
         MULTI_SEARCH_MERCHANT_SCAN_LIMIT_CREATOR
         if is_creator_surface
@@ -4113,6 +4117,7 @@ async def _handle_find_products_multi(
                             "merchants_searched": len(merchant_map),
                             "merchants_scanned": merchants_scanned,
                             "merchant_scan_limited": merchants_scanned < len(merchant_map),
+                            "base_merchant_fanout_enabled": MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
                             "creator_id": creator_id,
                             "creator_name": creator_name,
                         },
@@ -4167,6 +4172,7 @@ async def _handle_find_products_multi(
                             "merchants_searched": len(merchant_map),
                             "merchants_scanned": merchants_scanned,
                             "merchant_scan_limited": merchants_scanned < len(merchant_map),
+                            "base_merchant_fanout_enabled": MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
                             "creator_id": creator_id,
                             "creator_name": creator_name,
                         },
@@ -4196,6 +4202,7 @@ async def _handle_find_products_multi(
                 "merchants_scanned": merchants_scanned,
                 "merchant_scan_limited": merchants_scanned < len(merchant_map),
                 "force_cache_only": MULTI_SEARCH_FORCE_CACHE_ONLY,
+                "base_merchant_fanout_enabled": MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
                 "creator_id": creator_id,
                 "creator_name": creator_name,
                 "history_boost_applied": history_used,
