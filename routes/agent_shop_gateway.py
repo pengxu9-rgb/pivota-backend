@@ -250,14 +250,35 @@ MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS = _env_float(
     min_value=0.1,
     max_value=5.0,
 )
-MULTI_SEARCH_FORCE_CACHE_ONLY = _env_bool(
+MULTI_SEARCH_FORCE_CACHE_ONLY_LEGACY = _env_bool(
     "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY",
     True,
+)
+MULTI_SEARCH_FORCE_CACHE_ONLY_CREATOR = _env_bool(
+    "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY_CREATOR",
+    MULTI_SEARCH_FORCE_CACHE_ONLY_LEGACY,
+)
+MULTI_SEARCH_FORCE_CACHE_ONLY_SHOPPING = _env_bool(
+    "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY_SHOPPING",
+    False,
+)
+MULTI_SEARCH_FORCE_CACHE_ONLY_DEFAULT = _env_bool(
+    "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY_DEFAULT",
+    MULTI_SEARCH_FORCE_CACHE_ONLY_LEGACY,
 )
 MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT = _env_bool(
     "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT",
     True,
 )
+
+
+def _resolve_multi_force_cache_only(source: Optional[str], is_creator_surface: bool) -> bool:
+    if is_creator_surface:
+        return MULTI_SEARCH_FORCE_CACHE_ONLY_CREATOR
+    normalized = str(source or "").strip().lower().replace("_", "-")
+    if normalized in {"shopping-agent", "aurora", "aurora-chatbox"}:
+        return MULTI_SEARCH_FORCE_CACHE_ONLY_SHOPPING
+    return MULTI_SEARCH_FORCE_CACHE_ONLY_DEFAULT
 
 
 class SearchFilters(BaseModel):
@@ -2239,16 +2260,19 @@ async def _handle_find_products_multi(
     creator_id = None
     creator_name = None
     source: Optional[str] = None
+    source_normalized = ""
     if creator_meta:
         creator_id = creator_meta.creator_id
         creator_name = creator_meta.creator_name
         source = creator_meta.source
+        source_normalized = str(source or "").strip().lower().replace("_", "-")
 
     # Creator surfaces (creator-agent UI + creator category service) are
     # allowed to use a broader cross-merchant pool and slightly more
     # permissive visibility rules (do not drop products solely because
     # orderable is false).
-    is_creator_surface = source in ("creator-agent-ui", "creator-category-service")
+    is_creator_surface = source_normalized in {"creator-agent-ui", "creator-category-service"}
+    force_cache_only = _resolve_multi_force_cache_only(source_normalized, is_creator_surface)
 
     page = filters.page or 1
     limit = min(filters.limit or 20, 100)
@@ -3588,7 +3612,7 @@ async def _handle_find_products_multi(
                         limit=per_merchant_limit,
                         agent_id="shopping_ai_multi",
                         background_tasks=background_tasks,
-                        force_cache_only=MULTI_SEARCH_FORCE_CACHE_ONLY,
+                        force_cache_only=force_cache_only,
                     ),
                     timeout=MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS,
                 )
@@ -4222,7 +4246,7 @@ async def _handle_find_products_multi(
                 "merchants_searched": len(merchant_map),
                 "merchants_scanned": merchants_scanned,
                 "merchant_scan_limited": merchants_scanned < len(merchant_map),
-                "force_cache_only": MULTI_SEARCH_FORCE_CACHE_ONLY,
+                "force_cache_only": force_cache_only,
                 "base_merchant_fanout_enabled": MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
                 "creator_id": creator_id,
                 "creator_name": creator_name,
