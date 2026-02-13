@@ -270,15 +270,51 @@ MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT = _env_bool(
     "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT",
     True,
 )
+MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_CREATOR = _env_bool(
+    "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT_CREATOR",
+    MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
+)
+MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING = _env_bool(
+    "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING",
+    False,
+)
+MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT = _env_bool(
+    "AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT",
+    MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
+)
+MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM = _env_bool(
+    "AGENT_SHOP_MULTI_DELEGATE_SHOPPING_TO_UPSTREAM",
+    False,
+)
+MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL = (
+    os.getenv("AGENT_SHOP_MULTI_UPSTREAM_FALLBACK_BASE_URL", "").strip().rstrip("/")
+)
+MULTI_SEARCH_UPSTREAM_FALLBACK_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_UPSTREAM_FALLBACK_TIMEOUT_SECONDS",
+    4.5,
+    min_value=0.5,
+    max_value=20.0,
+)
+
+SHOPPING_MULTI_SOURCES = {"shopping-agent", "aurora", "aurora-chatbox"}
 
 
 def _resolve_multi_force_cache_only(source: Optional[str], is_creator_surface: bool) -> bool:
     if is_creator_surface:
         return MULTI_SEARCH_FORCE_CACHE_ONLY_CREATOR
     normalized = str(source or "").strip().lower().replace("_", "-")
-    if normalized in {"shopping-agent", "aurora", "aurora-chatbox"}:
+    if normalized in SHOPPING_MULTI_SOURCES:
         return MULTI_SEARCH_FORCE_CACHE_ONLY_SHOPPING
     return MULTI_SEARCH_FORCE_CACHE_ONLY_DEFAULT
+
+
+def _resolve_multi_base_merchant_fanout(source: Optional[str], is_creator_surface: bool) -> bool:
+    if is_creator_surface:
+        return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_CREATOR
+    normalized = str(source or "").strip().lower().replace("_", "-")
+    if normalized in SHOPPING_MULTI_SOURCES:
+        return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING
+    return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT
 
 
 class SearchFilters(BaseModel):
@@ -2237,6 +2273,84 @@ async def _handle_find_products(
     }
 
 
+async def _invoke_multi_upstream_fallback(
+    payload: FindProductsMultiPayload,
+    request_metadata: Optional[Dict[str, Any]],
+    *,
+    timeout_seconds: float,
+    hop: int,
+) -> Optional[Dict[str, Any]]:
+    if not MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL:
+        return None
+
+    metadata_payload: Dict[str, Any] = dict(request_metadata or {})
+    metadata_payload["upstream_fallback_hop"] = hop + 1
+    body: Dict[str, Any] = {
+        "operation": "find_products_multi",
+        "payload": payload.dict(by_alias=True, exclude_none=True),
+        "metadata": metadata_payload,
+    }
+
+    url = f"{MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL}/agent/shop/v1/invoke"
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            resp = await client.post(url, json=body, headers={"Content-Type": "application/json"})
+        if resp.status_code >= 400:
+            logger.info(
+                "multi.upstream_fallback.http_error",
+                extra={"status_code": resp.status_code, "url": url},
+            )
+            return None
+
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None
+
+        products_raw = data.get("products")
+        if not isinstance(products_raw, list):
+            return None
+
+        total_val = data.get("total")
+        if not isinstance(total_val, int):
+            total_val = len(products_raw)
+
+        page_val = data.get("page")
+        if not isinstance(page_val, int):
+            page_val = int(getattr(payload.search, "page", 1) or 1)
+
+        page_size_val = data.get("page_size")
+        if not isinstance(page_size_val, int):
+            page_size_val = len(products_raw)
+
+        reply_val = data.get("reply")
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+
+        merged_metadata = dict(metadata)
+        merged_metadata["query_source"] = (
+            str(metadata.get("query_source") or "agent_products_resolver_fallback")
+        )
+        merged_metadata["upstream_fallback"] = {
+            "applied": True,
+            "base_url": MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL,
+            "timeout_seconds": timeout_seconds,
+        }
+
+        return {
+            "products": products_raw,
+            "total": total_val,
+            "page": page_val,
+            "page_size": page_size_val,
+            "reply": reply_val,
+            "metadata": merged_metadata,
+        }
+    except Exception as exc:
+        logger.info(
+            "multi.upstream_fallback.failed",
+            extra={"error": str(exc), "url": url},
+        )
+        return None
+
+
 async def _handle_find_products_multi(
     payload: FindProductsMultiPayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -2261,18 +2375,47 @@ async def _handle_find_products_multi(
     creator_name = None
     source: Optional[str] = None
     source_normalized = ""
+    upstream_fallback_hop = 0
     if creator_meta:
         creator_id = creator_meta.creator_id
         creator_name = creator_meta.creator_name
         source = creator_meta.source
         source_normalized = str(source or "").strip().lower().replace("_", "-")
+    if isinstance(request_metadata, dict):
+        try:
+            upstream_fallback_hop = max(
+                0,
+                int(request_metadata.get("upstream_fallback_hop") or 0),
+            )
+        except Exception:
+            upstream_fallback_hop = 0
 
     # Creator surfaces (creator-agent UI + creator category service) are
     # allowed to use a broader cross-merchant pool and slightly more
     # permissive visibility rules (do not drop products solely because
     # orderable is false).
     is_creator_surface = source_normalized in {"creator-agent-ui", "creator-category-service"}
+    is_shopping_surface = source_normalized in SHOPPING_MULTI_SOURCES
     force_cache_only = _resolve_multi_force_cache_only(source_normalized, is_creator_surface)
+    base_merchant_fanout_enabled = _resolve_multi_base_merchant_fanout(
+        source_normalized,
+        is_creator_surface,
+    )
+
+    should_try_upstream = (
+        is_shopping_surface
+        and bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL)
+        and upstream_fallback_hop < 1
+    )
+    if should_try_upstream and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM:
+        delegated = await _invoke_multi_upstream_fallback(
+            payload,
+            request_metadata,
+            timeout_seconds=MULTI_SEARCH_UPSTREAM_FALLBACK_TIMEOUT_SECONDS,
+            hop=upstream_fallback_hop,
+        )
+        if isinstance(delegated, dict):
+            return delegated
 
     page = filters.page or 1
     limit = min(filters.limit or 20, 100)
@@ -3591,7 +3734,7 @@ async def _handle_find_products_multi(
     # - `find_products_multi` is primarily cache-driven, so scanning every merchant
     #   on each request creates long-tail latency spikes with little recall benefit.
     # - Keep a bounded merchant slice and fetch in parallel.
-    merchant_items = list(merchant_map.items()) if MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT else []
+    merchant_items = list(merchant_map.items()) if base_merchant_fanout_enabled else []
     max_merchants_to_scan = (
         MULTI_SEARCH_MERCHANT_SCAN_LIMIT_CREATOR
         if is_creator_surface
@@ -4108,6 +4251,20 @@ async def _handle_find_products_multi(
     # - For tee intent queries: also allow a global tee-only fallback so we don't
     #   respond with an empty list for strong tee intent (e.g. Spanish camisetas).
     if not out_products:
+        if should_try_upstream:
+            upstream_result = await _invoke_multi_upstream_fallback(
+                payload,
+                request_metadata,
+                timeout_seconds=MULTI_SEARCH_UPSTREAM_FALLBACK_TIMEOUT_SECONDS,
+                hop=upstream_fallback_hop,
+            )
+            if isinstance(upstream_result, dict):
+                return _maybe_attach_eval_debug(
+                    upstream_result,
+                    rewritten_query=q_ascii,
+                    fallback_reason="upstream_resolver_fallback",
+                )
+
         # Creator-scoped fallback (original behavior), now also respecting tee intent.
         if creator_id and not toys_intent_query:
             top_sellers = await _load_creator_top_sellers(max_candidates=limit * 2)
@@ -4165,7 +4322,7 @@ async def _handle_find_products_multi(
                             "merchants_searched": len(merchant_map),
                             "merchants_scanned": merchants_scanned,
                             "merchant_scan_limited": merchants_scanned < len(merchant_map),
-                            "base_merchant_fanout_enabled": MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
+                            "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
                             "creator_id": creator_id,
                             "creator_name": creator_name,
                         },
@@ -4220,7 +4377,7 @@ async def _handle_find_products_multi(
                             "merchants_searched": len(merchant_map),
                             "merchants_scanned": merchants_scanned,
                             "merchant_scan_limited": merchants_scanned < len(merchant_map),
-                            "base_merchant_fanout_enabled": MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
+                            "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
                             "creator_id": creator_id,
                             "creator_name": creator_name,
                         },
@@ -4250,10 +4407,12 @@ async def _handle_find_products_multi(
                 "merchants_scanned": merchants_scanned,
                 "merchant_scan_limited": merchants_scanned < len(merchant_map),
                 "force_cache_only": force_cache_only,
-                "base_merchant_fanout_enabled": MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT,
+                "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
                 "creator_id": creator_id,
                 "creator_name": creator_name,
                 "history_boost_applied": history_used,
+                "upstream_fallback_configured": bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL),
+                "upstream_fallback_attempted": bool(should_try_upstream),
             },
         },
         rewritten_query=q_ascii,
