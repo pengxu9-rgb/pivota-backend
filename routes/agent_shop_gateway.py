@@ -4212,6 +4212,7 @@ async def _handle_find_products_multi(
     # Keep per-merchant payload small to bound latency; the cross-merchant cache
     # recall query below provides additional coverage for query-specific matches.
     per_merchant_limit = min(max(limit + 2, 12), 60)
+    target_candidate_count = min(max(limit * max(page, 1) * 2, 80), 500)
 
     # Merchant fan-out guardrail:
     # - `find_products_multi` is primarily cache-driven, so scanning every merchant
@@ -4227,37 +4228,138 @@ async def _handle_find_products_multi(
         merchant_items = merchant_items[:max_merchants_to_scan]
     merchants_scanned = len(merchant_items)
 
-    # Collect products as (StandardProduct, merchant_name) tuples
+    # Collect products as (StandardProduct, merchant_name) tuples.
     merchant_products: list[tuple[StandardProduct, str]] = []
+    seen_merchant_product_keys: set[tuple[str, str]] = set()
 
-    semaphore = asyncio.Semaphore(max(1, MULTI_SEARCH_MERCHANT_CONCURRENCY))
+    def _append_merchant_candidate(
+        product: StandardProduct,
+        merchant_name: str,
+        merchant_id_hint: Optional[str] = None,
+    ) -> None:
+        pid = str(product.product_id or product.id or "").strip()
+        mid = str(product.merchant_id or merchant_id_hint or "").strip()
+        if pid and mid:
+            key = (mid, pid)
+            if key in seen_merchant_product_keys:
+                return
+            seen_merchant_product_keys.add(key)
+        merchant_products.append((product, merchant_name))
 
-    async def _fetch_multi_candidates_for_merchant(mid: str, name: str) -> list[tuple[StandardProduct, str]]:
-        async with semaphore:
-            try:
-                products, _source, _error = await asyncio.wait_for(
-                    get_products_hybrid(
-                        merchant_id=mid,
-                        limit=per_merchant_limit,
-                        agent_id="shopping_ai_multi",
-                        background_tasks=background_tasks,
-                        force_cache_only=force_cache_only,
-                    ),
-                    timeout=MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS,
+    merchant_ids_for_search = [mid for mid, _ in merchant_items]
+
+    # Fast path: perform one cache-wide SQL search across eligible merchants first.
+    # This avoids N-per-merchant round trips in the common non-empty query path.
+    if merchant_ids_for_search and q:
+        try:
+            cache_terms: List[str] = []
+            if q_tokens:
+                cache_terms.extend(q_tokens[:8])
+            if not cache_terms and q_ascii and len(q_ascii) >= 2:
+                cache_terms.append(q_ascii)
+            cache_terms = [t for t in cache_terms if t]
+
+            if cache_terms:
+                cache_limit = min(max(target_candidate_count * 3, 120), 1200)
+                where_clauses: List[str] = []
+                params: Dict[str, Any] = {
+                    "merchant_ids": merchant_ids_for_search,
+                    "cache_limit": cache_limit,
+                }
+                for idx, term in enumerate(cache_terms):
+                    key = f"like_{idx}"
+                    params[key] = f"%{term.lower()}%"
+                    where_clauses.append(
+                        "("
+                        "LOWER(COALESCE(product_data->>'title','')) LIKE :" + key
+                        + " OR LOWER(COALESCE(product_data->>'description','')) LIKE :" + key
+                        + " OR LOWER(COALESCE(product_data->>'product_type','')) LIKE :" + key
+                        + " OR LOWER(COALESCE(product_data->>'vendor','')) LIKE :" + key
+                        + " OR LOWER(COALESCE(product_data->>'sku','')) LIKE :" + key
+                        + ")"
+                    )
+                    if sku_like_query:
+                        where_clauses.append("LOWER(CAST(product_data AS TEXT)) LIKE :" + key)
+
+                rows = await database.fetch_all(
+                    """
+                    SELECT merchant_id, product_data
+                    FROM products_cache
+                    WHERE (expires_at IS NULL OR expires_at > NOW())
+                      AND merchant_id = ANY(:merchant_ids)
+                      AND ("""
+                    + " OR ".join(where_clauses)
+                    + """)
+                    ORDER BY cached_at DESC
+                    LIMIT :cache_limit
+                    """,
+                    params,
                 )
-            except Exception:
-                # Ignore individual merchant failures to keep cross-merchant search robust
-                return []
-            return [(p, name) for p in products]
 
-    if merchant_items:
+                for row in rows:
+                    mid = str(row.get("merchant_id") or "").strip()
+                    if not mid:
+                        continue
+                    product_data = row.get("product_data")
+                    if isinstance(product_data, str):
+                        try:
+                            product_data = json.loads(product_data)
+                        except Exception:
+                            continue
+                    if not isinstance(product_data, dict):
+                        continue
+                    try:
+                        prod = StandardProduct(**product_data)
+                        prod.merchant_id = prod.merchant_id or mid
+                        _append_merchant_candidate(prod, merchant_map.get(mid, ""), mid)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.info(
+                "multi.cross_merchant_cache_prefetch.failed",
+                extra={"query": q, "error": str(e)},
+            )
+
+    # Slow path fallback: if cache prefetch is not enough, pull per-merchant pools.
+    if merchant_items and len(merchant_products) < target_candidate_count:
+        semaphore = asyncio.Semaphore(max(1, MULTI_SEARCH_MERCHANT_CONCURRENCY))
+
+        async def _fetch_multi_candidates_for_merchant(
+            mid: str,
+            name: str,
+        ) -> list[tuple[StandardProduct, str, str]]:
+            async with semaphore:
+                try:
+                    products, _source, _error = await asyncio.wait_for(
+                        get_products_hybrid(
+                            merchant_id=mid,
+                            limit=per_merchant_limit,
+                            agent_id="shopping_ai_multi",
+                            background_tasks=background_tasks,
+                            force_cache_only=force_cache_only,
+                        ),
+                        timeout=MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    return []
+
+                shop_currency = _get_cached_merchant_shopify_currency(mid)
+                out: list[tuple[StandardProduct, str, str]] = []
+                for p in products:
+                    if shop_currency and (p.platform or "").lower() == "shopify":
+                        p.currency = shop_currency
+                    out.append((p, name, mid))
+                return out
+
         gathered = await asyncio.gather(
             *[_fetch_multi_candidates_for_merchant(mid, name) for mid, name in merchant_items],
             return_exceptions=True,
         )
         for chunk in gathered:
-            if isinstance(chunk, list):
-                merchant_products.extend(chunk)
+            if not isinstance(chunk, list):
+                continue
+            for prod, name, mid in chunk:
+                _append_merchant_candidate(prod, name, mid)
 
     # Recall boost: when the user asks a specific query (e.g. a character name),
     # searching only a small "top-N" slice per merchant can miss relevant items.
