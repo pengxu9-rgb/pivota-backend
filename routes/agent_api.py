@@ -1571,9 +1571,9 @@ async def agent_search_products(
                 await hydrate_quality_and_enrichment(feats)
 
         try:
-            hydrate_timeout_s = float(os.getenv("AGENT_RANKING_HYDRATE_TIMEOUT_S", "8"))
+            hydrate_timeout_s = float(os.getenv("AGENT_RANKING_HYDRATE_TIMEOUT_S", "3"))
         except Exception:
-            hydrate_timeout_s = 8.0
+            hydrate_timeout_s = 3.0
         if candidate_features:
             try:
                 await asyncio.wait_for(
@@ -2052,9 +2052,9 @@ async def agent_resolve_products(
     search_query = query_text or (product_aliases[0] if product_aliases else sku_aliases[0] if sku_aliases else "")
     search_timeout_s = 4.0
     try:
-        search_timeout_s = max(1.0, min(8.0, float(os.getenv("AGENT_RESOLVE_SEARCH_TIMEOUT_S", "4.0"))))
+        search_timeout_s = max(1.0, min(8.0, float(os.getenv("AGENT_RESOLVE_SEARCH_TIMEOUT_S", "2.0"))))
     except Exception:
-        search_timeout_s = 4.0
+        search_timeout_s = 2.0
 
     should_try_global = (
         not merchant_id
