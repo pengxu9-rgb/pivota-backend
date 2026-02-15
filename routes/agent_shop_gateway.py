@@ -368,6 +368,52 @@ MULTI_SEARCH_PAGE_REQUEST_DEDUP_TTL_SECONDS = _env_float(
     min_value=0.0,
     max_value=60.0,
 )
+OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS",
+    1.2,
+    min_value=0.2,
+    max_value=10.0,
+)
+OFFERS_RESOLVE_INTERNAL_TOTAL_BUDGET_SECONDS = _env_float(
+    "AGENT_SHOP_OFFERS_RESOLVE_INTERNAL_TOTAL_BUDGET_SECONDS",
+    2.2,
+    min_value=0.4,
+    max_value=20.0,
+)
+OFFERS_RESOLVE_INTERNAL_PID_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_OFFERS_RESOLVE_INTERNAL_PID_QUERY_TIMEOUT_SECONDS",
+    0.8,
+    min_value=0.1,
+    max_value=10.0,
+)
+OFFERS_RESOLVE_INTERNAL_SKU_EXACT_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_OFFERS_RESOLVE_INTERNAL_SKU_EXACT_QUERY_TIMEOUT_SECONDS",
+    0.9,
+    min_value=0.1,
+    max_value=10.0,
+)
+OFFERS_RESOLVE_INTERNAL_SKU_TEXT_SCAN_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_OFFERS_RESOLVE_INTERNAL_SKU_TEXT_SCAN_TIMEOUT_SECONDS",
+    0.6,
+    min_value=0.1,
+    max_value=10.0,
+)
+OFFERS_RESOLVE_INTERNAL_GROUP_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_OFFERS_RESOLVE_INTERNAL_GROUP_QUERY_TIMEOUT_SECONDS",
+    0.8,
+    min_value=0.1,
+    max_value=10.0,
+)
+OFFERS_RESOLVE_INTERNAL_GROUP_CACHE_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_OFFERS_RESOLVE_INTERNAL_GROUP_CACHE_TIMEOUT_SECONDS",
+    0.8,
+    min_value=0.1,
+    max_value=10.0,
+)
+OFFERS_RESOLVE_ENABLE_SKU_TEXT_SCAN = _env_bool(
+    "AGENT_SHOP_OFFERS_RESOLVE_ENABLE_SKU_TEXT_SCAN",
+    False,
+)
 
 SHOPPING_MULTI_SOURCES = {
     "shopping-agent",
@@ -1168,7 +1214,7 @@ async def _handle_offers_resolve(
                 """,
                 params,
             ),
-            timeout=3.0,
+            timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
         )
 
         seen_offer_ids: set[str] = set()
@@ -1327,91 +1373,112 @@ async def _handle_offers_resolve(
     if len(external_offers) == 0 or all((o.get("confidence") or 0) < 0.75 for o in external_offers):
         internal_started = time.perf_counter()
         try:
+            internal_deadline = time.perf_counter() + OFFERS_RESOLVE_INTERNAL_TOTAL_BUDGET_SECONDS
+            internal_budget_exhausted = False
+            internal_sku_scan_skipped = False
+
+            def _next_internal_timeout(default_timeout: float) -> Optional[float]:
+                nonlocal internal_budget_exhausted
+                remaining = internal_deadline - time.perf_counter()
+                if remaining <= 0:
+                    internal_budget_exhausted = True
+                    return None
+                return max(0.05, min(default_timeout, remaining))
+
             # First try direct product id match
             rows: List[Any] = []
             if product_id_aliases:
-                rows = await asyncio.wait_for(
-                    database.fetch_all(
-                        """
-                        SELECT merchant_id, platform, platform_product_id, product_data
-                        FROM products_cache
-                        WHERE (expires_at IS NULL OR expires_at > NOW())
-                          AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
-                          AND (
-                            platform_product_id = ANY(:pid_aliases)
-                            OR product_data->>'id' = ANY(:pid_aliases)
-                            OR product_data->>'product_id' = ANY(:pid_aliases)
-                          )
-                        ORDER BY cached_at DESC
-                        LIMIT 80
-                        """,
-                        {
-                            "merchant_scope": merchant_scope,
-                            "pid_aliases": product_id_aliases,
-                        },
-                    ),
-                    timeout=3.0,
-                )
+                pid_timeout_s = _next_internal_timeout(OFFERS_RESOLVE_INTERNAL_PID_QUERY_TIMEOUT_SECONDS)
+                if pid_timeout_s is not None:
+                    rows = await asyncio.wait_for(
+                        database.fetch_all(
+                            """
+                            SELECT merchant_id, platform, platform_product_id, product_data
+                            FROM products_cache
+                            WHERE (expires_at IS NULL OR expires_at > NOW())
+                              AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
+                              AND (
+                                platform_product_id = ANY(:pid_aliases)
+                                OR product_data->>'id' = ANY(:pid_aliases)
+                                OR product_data->>'product_id' = ANY(:pid_aliases)
+                              )
+                            ORDER BY cached_at DESC
+                            LIMIT 80
+                            """,
+                            {
+                                "merchant_scope": merchant_scope,
+                                "pid_aliases": product_id_aliases,
+                            },
+                        ),
+                        timeout=pid_timeout_s,
+                    )
 
             # Exact SKU/variant lookup before LIKE fallback.
             if not rows and sku_id_aliases:
-                rows = await asyncio.wait_for(
-                    database.fetch_all(
-                        """
-                        SELECT merchant_id, platform, platform_product_id, product_data
-                        FROM products_cache
-                        WHERE (expires_at IS NULL OR expires_at > NOW())
-                          AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
-                          AND EXISTS (
-                            SELECT 1
-                            FROM jsonb_array_elements(
-                              CASE
-                                WHEN jsonb_typeof(product_data::jsonb->'variants') = 'array'
-                                THEN product_data::jsonb->'variants'
-                                ELSE '[]'::jsonb
-                              END
-                            ) AS variant
-                            WHERE COALESCE(
-                              variant->>'variant_id',
-                              variant->>'id',
-                              variant->>'sku',
-                              variant->>'sku_id'
-                            ) = ANY(:sku_aliases)
-                          )
-                        ORDER BY cached_at DESC
-                        LIMIT 120
-                        """,
-                        {
-                            "merchant_scope": merchant_scope,
-                            "sku_aliases": sku_id_aliases,
-                        },
-                    ),
-                    timeout=3.0,
-                )
+                sku_exact_timeout_s = _next_internal_timeout(OFFERS_RESOLVE_INTERNAL_SKU_EXACT_QUERY_TIMEOUT_SECONDS)
+                if sku_exact_timeout_s is not None:
+                    rows = await asyncio.wait_for(
+                        database.fetch_all(
+                            """
+                            SELECT merchant_id, platform, platform_product_id, product_data
+                            FROM products_cache
+                            WHERE (expires_at IS NULL OR expires_at > NOW())
+                              AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
+                              AND EXISTS (
+                                SELECT 1
+                                FROM jsonb_array_elements(
+                                  CASE
+                                    WHEN jsonb_typeof(product_data::jsonb->'variants') = 'array'
+                                    THEN product_data::jsonb->'variants'
+                                    ELSE '[]'::jsonb
+                                  END
+                                ) AS variant
+                                WHERE COALESCE(
+                                  variant->>'variant_id',
+                                  variant->>'id',
+                                  variant->>'sku',
+                                  variant->>'sku_id'
+                                ) = ANY(:sku_aliases)
+                              )
+                            ORDER BY cached_at DESC
+                            LIMIT 120
+                            """,
+                            {
+                                "merchant_scope": merchant_scope,
+                                "sku_aliases": sku_id_aliases,
+                            },
+                        ),
+                        timeout=sku_exact_timeout_s,
+                    )
 
             # Next try SKU-like match in cached JSON (bounded).
             if not rows and sku_id_aliases:
-                sku_clauses: List[str] = []
-                sku_params: Dict[str, Any] = {"merchant_scope": merchant_scope}
-                for idx, sku_alias in enumerate(sku_id_aliases[:8]):
-                    key = f"sku_like_{idx}"
-                    sku_params[key] = f"%{_safe_lower(sku_alias)}%"
-                    sku_clauses.append(f"LOWER(CAST(product_data AS TEXT)) LIKE :{key}")
-                rows = await asyncio.wait_for(
-                    database.fetch_all(
-                        f"""
-                        SELECT merchant_id, platform, platform_product_id, product_data
-                        FROM products_cache
-                        WHERE (expires_at IS NULL OR expires_at > NOW())
-                          AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
-                          AND ({' OR '.join(sku_clauses)})
-                        ORDER BY cached_at DESC
-                        LIMIT 120
-                        """,
-                        sku_params,
-                    ),
-                    timeout=3.0,
-                )
+                if OFFERS_RESOLVE_ENABLE_SKU_TEXT_SCAN:
+                    sku_scan_timeout_s = _next_internal_timeout(OFFERS_RESOLVE_INTERNAL_SKU_TEXT_SCAN_TIMEOUT_SECONDS)
+                    if sku_scan_timeout_s is not None:
+                        sku_clauses: List[str] = []
+                        sku_params: Dict[str, Any] = {"merchant_scope": merchant_scope}
+                        for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+                            key = f"sku_like_{idx}"
+                            sku_params[key] = f"%{_safe_lower(sku_alias)}%"
+                            sku_clauses.append(f"LOWER(CAST(product_data AS TEXT)) LIKE :{key}")
+                        rows = await asyncio.wait_for(
+                            database.fetch_all(
+                                f"""
+                                SELECT merchant_id, platform, platform_product_id, product_data
+                                FROM products_cache
+                                WHERE (expires_at IS NULL OR expires_at > NOW())
+                                  AND (CAST(:merchant_scope AS TEXT) IS NULL OR merchant_id = CAST(:merchant_scope AS TEXT))
+                                  AND ({' OR '.join(sku_clauses)})
+                                ORDER BY cached_at DESC
+                                LIMIT 120
+                                """,
+                                sku_params,
+                            ),
+                            timeout=sku_scan_timeout_s,
+                        )
+                else:
+                    internal_sku_scan_skipped = True
 
             # Canonical product-group lookup when available.
             if rows:
@@ -1423,19 +1490,22 @@ async def _handle_offers_resolve(
                 member_candidates = {v for v in member_candidates if v}
 
                 if member_candidates:
-                    group_rows = await asyncio.wait_for(
-                        database.fetch_all(
-                            """
-                            SELECT product_group_id, merchant_id, platform, platform_product_id, is_primary
-                            FROM product_group_members
-                            WHERE platform_product_id = ANY(:platform_product_ids)
-                            ORDER BY is_primary DESC, merchant_id ASC
-                            LIMIT 200
-                            """,
-                            {"platform_product_ids": list(member_candidates)},
-                        ),
-                        timeout=2.0,
-                    )
+                    group_rows: List[Any] = []
+                    group_timeout_s = _next_internal_timeout(OFFERS_RESOLVE_INTERNAL_GROUP_QUERY_TIMEOUT_SECONDS)
+                    if group_timeout_s is not None:
+                        group_rows = await asyncio.wait_for(
+                            database.fetch_all(
+                                """
+                                SELECT product_group_id, merchant_id, platform, platform_product_id, is_primary
+                                FROM product_group_members
+                                WHERE platform_product_id = ANY(:platform_product_ids)
+                                ORDER BY is_primary DESC, merchant_id ASC
+                                LIMIT 200
+                                """,
+                                {"platform_product_ids": list(member_candidates)},
+                            ),
+                            timeout=group_timeout_s,
+                        )
                     if group_rows:
                         first = _row_to_dict(group_rows[0])
                         canonical_group_id = str(first.get("product_group_id") or "").strip() or None
@@ -1478,24 +1548,29 @@ async def _handle_offers_resolve(
                             }
                         )
                         if member_mids and member_pids:
-                            group_cache_rows = await asyncio.wait_for(
-                                database.fetch_all(
-                                    """
-                                    SELECT merchant_id, platform, platform_product_id, product_data
-                                    FROM products_cache
-                                    WHERE merchant_id = ANY(:merchant_ids)
-                                      AND platform_product_id = ANY(:platform_product_ids)
-                                      AND (expires_at IS NULL OR expires_at > NOW())
-                                    ORDER BY cached_at DESC
-                                    LIMIT 200
-                                    """,
-                                    {
-                                        "merchant_ids": member_mids,
-                                        "platform_product_ids": member_pids,
-                                    },
-                                ),
-                                timeout=3.0,
+                            group_cache_rows: List[Any] = []
+                            group_cache_timeout_s = _next_internal_timeout(
+                                OFFERS_RESOLVE_INTERNAL_GROUP_CACHE_TIMEOUT_SECONDS
                             )
+                            if group_cache_timeout_s is not None:
+                                group_cache_rows = await asyncio.wait_for(
+                                    database.fetch_all(
+                                        """
+                                        SELECT merchant_id, platform, platform_product_id, product_data
+                                        FROM products_cache
+                                        WHERE merchant_id = ANY(:merchant_ids)
+                                          AND platform_product_id = ANY(:platform_product_ids)
+                                          AND (expires_at IS NULL OR expires_at > NOW())
+                                        ORDER BY cached_at DESC
+                                        LIMIT 200
+                                        """,
+                                        {
+                                            "merchant_ids": member_mids,
+                                            "platform_product_ids": member_pids,
+                                        },
+                                    ),
+                                    timeout=group_cache_timeout_s,
+                                )
                             # Merge + dedupe by (merchant_id, platform_product_id).
                             merged_rows: List[Dict[str, Any]] = []
                             seen_keys: set[str] = set()
@@ -1638,10 +1713,18 @@ async def _handle_offers_resolve(
                 )
                 if len(internal_offers) >= min(3, limit):
                     break
+            internal_status = "ok" if rows else "empty"
+            internal_reason_code = "ok" if rows else "no_candidates"
+            if not rows and internal_budget_exhausted:
+                internal_status = "skipped"
+                internal_reason_code = "skipped_budget_exhausted"
+            elif not rows and internal_sku_scan_skipped:
+                internal_status = "skipped"
+                internal_reason_code = "skipped_sku_text_scan_disabled"
             _record_source(
                 source="products_cache",
-                status="ok" if rows else "empty",
-                reason_code="ok" if rows else "no_candidates",
+                status=internal_status,
+                reason_code=internal_reason_code,
                 source_started=internal_started,
                 row_count=len(rows or []),
                 query="products_cache_by_alias",

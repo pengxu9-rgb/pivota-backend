@@ -137,6 +137,26 @@ def _classify_db_reason_code(exc: Exception) -> str:
     return "db_error"
 
 
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _safe_price_number(value: Any, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -1571,14 +1591,19 @@ async def agent_search_products(
                 await hydrate_quality_and_enrichment(feats)
 
         try:
-            hydrate_timeout_s = float(os.getenv("AGENT_RANKING_HYDRATE_TIMEOUT_S", "3"))
+            hydrate_timeout_s = _env_float(
+                "AGENT_RANKING_HYDRATE_TIMEOUT_S",
+                1.0,
+                min_value=0.2,
+                max_value=10.0,
+            )
         except Exception:
-            hydrate_timeout_s = 3.0
+            hydrate_timeout_s = 1.0
         if candidate_features:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*[_hydrate_one(f) for f in candidate_features]),
-                    timeout=max(1.0, hydrate_timeout_s),
+                    timeout=max(0.2, hydrate_timeout_s),
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -1796,6 +1821,40 @@ async def agent_resolve_products(
 
     sources: List[Dict[str, Any]] = []
     has_identifier_input = bool(product_aliases or sku_aliases)
+    resolve_exact_pid_timeout_s = _env_float(
+        "AGENT_RESOLVE_EXACT_PID_TIMEOUT_S",
+        0.9,
+        min_value=0.1,
+        max_value=6.0,
+    )
+    resolve_exact_sku_timeout_s = _env_float(
+        "AGENT_RESOLVE_EXACT_SKU_TIMEOUT_S",
+        1.1,
+        min_value=0.1,
+        max_value=6.0,
+    )
+    resolve_alias_pid_timeout_s = _env_float(
+        "AGENT_RESOLVE_ALIAS_PID_TIMEOUT_S",
+        1.0,
+        min_value=0.1,
+        max_value=6.0,
+    )
+    resolve_alias_sku_scan_timeout_s = _env_float(
+        "AGENT_RESOLVE_ALIAS_SKU_SCAN_TIMEOUT_S",
+        0.7,
+        min_value=0.1,
+        max_value=6.0,
+    )
+    resolve_group_timeout_s = _env_float(
+        "AGENT_RESOLVE_GROUP_TIMEOUT_S",
+        1.0,
+        min_value=0.1,
+        max_value=6.0,
+    )
+    resolve_enable_sku_text_scan = _env_bool(
+        "AGENT_RESOLVE_ENABLE_SKU_TEXT_SCAN",
+        False,
+    )
 
     def _public_reason_code(raw_code: Optional[str]) -> str:
         code = str(raw_code or "").strip().lower()
@@ -1916,7 +1975,7 @@ async def agent_resolve_products(
                         "pid_aliases": product_aliases,
                     },
                 ),
-                timeout=1.8,
+                timeout=resolve_exact_pid_timeout_s,
             )
             exact_cache_rows.extend([dict(r) for r in (rows or [])])
 
@@ -1952,7 +2011,7 @@ async def agent_resolve_products(
                         "sku_aliases": sku_aliases,
                     },
                 ),
-                timeout=2.2,
+                timeout=resolve_exact_sku_timeout_s,
             )
             exact_cache_rows.extend([dict(r) for r in (rows or [])])
 
@@ -1980,6 +2039,7 @@ async def agent_resolve_products(
     cache_alias_started = time.perf_counter()
     try:
         cache_rows: List[Dict[str, Any]] = []
+        cache_alias_scan_skipped = False
         if has_identifier_input and not candidates_by_key and product_aliases:
             rows = await asyncio.wait_for(
                 database.fetch_all(
@@ -2001,39 +2061,44 @@ async def agent_resolve_products(
                         "pid_aliases": product_aliases,
                     },
                 ),
-                timeout=3.0,
+                timeout=resolve_alias_pid_timeout_s,
             )
             cache_rows.extend([dict(r) for r in (rows or [])])
 
         if has_identifier_input and not candidates_by_key and sku_aliases and not cache_rows:
-            where_parts: List[str] = []
-            params: Dict[str, Any] = {"merchant_id": merchant_id}
-            for idx, sku_alias in enumerate(sku_aliases[:8]):
-                key = f"sku_like_{idx}"
-                params[key] = f"%{str(sku_alias).lower()}%"
-                where_parts.append(f"LOWER(CAST(product_data AS TEXT)) LIKE :{key}")
-            rows = await asyncio.wait_for(
-                database.fetch_all(
-                    f"""
-                    SELECT merchant_id, platform, platform_product_id, product_data
-                    FROM products_cache
-                    WHERE (expires_at IS NULL OR expires_at > NOW())
-                      AND (CAST(:merchant_id AS TEXT) IS NULL OR merchant_id = CAST(:merchant_id AS TEXT))
-                      AND ({' OR '.join(where_parts)})
-                    ORDER BY cached_at DESC
-                    LIMIT 120
-                    """,
-                    params,
-                ),
-                timeout=3.0,
-            )
-            cache_rows.extend([dict(r) for r in (rows or [])])
+            if resolve_enable_sku_text_scan:
+                where_parts: List[str] = []
+                params: Dict[str, Any] = {"merchant_id": merchant_id}
+                for idx, sku_alias in enumerate(sku_aliases[:8]):
+                    key = f"sku_like_{idx}"
+                    params[key] = f"%{str(sku_alias).lower()}%"
+                    where_parts.append(f"LOWER(CAST(product_data AS TEXT)) LIKE :{key}")
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        f"""
+                        SELECT merchant_id, platform, platform_product_id, product_data
+                        FROM products_cache
+                        WHERE (expires_at IS NULL OR expires_at > NOW())
+                          AND (CAST(:merchant_id AS TEXT) IS NULL OR merchant_id = CAST(:merchant_id AS TEXT))
+                          AND ({' OR '.join(where_parts)})
+                        ORDER BY cached_at DESC
+                        LIMIT 120
+                        """,
+                        params,
+                    ),
+                    timeout=resolve_alias_sku_scan_timeout_s,
+                )
+                cache_rows.extend([dict(r) for r in (rows or [])])
+            else:
+                cache_alias_scan_skipped = True
 
         _ingest_cache_rows(cache_rows, "products_cache_alias", 0.95)
+        cache_status = "ok" if cache_rows else "skipped" if cache_alias_scan_skipped else "empty"
+        cache_reason_code = "ok" if cache_rows else "skipped_sku_text_scan_disabled" if cache_alias_scan_skipped else "no_candidates"
         _record_source(
             source="products_cache",
-            status="ok" if cache_rows else "empty",
-            reason_code="ok" if cache_rows else "no_candidates",
+            status=cache_status,
+            reason_code=cache_reason_code,
             source_started=cache_alias_started,
             row_count=len(cache_rows),
             query="products_cache_by_alias",
@@ -2052,9 +2117,14 @@ async def agent_resolve_products(
     search_query = query_text or (product_aliases[0] if product_aliases else sku_aliases[0] if sku_aliases else "")
     search_timeout_s = 4.0
     try:
-        search_timeout_s = max(1.0, min(8.0, float(os.getenv("AGENT_RESOLVE_SEARCH_TIMEOUT_S", "2.0"))))
+        search_timeout_s = _env_float(
+            "AGENT_RESOLVE_SEARCH_TIMEOUT_S",
+            1.2,
+            min_value=0.4,
+            max_value=8.0,
+        )
     except Exception:
-        search_timeout_s = 2.0
+        search_timeout_s = 1.2
 
     should_try_global = (
         not merchant_id
@@ -2167,7 +2237,7 @@ async def agent_resolve_products(
                         """,
                         {"pids": candidate_product_ids},
                     ),
-                    timeout=2.0,
+                    timeout=resolve_group_timeout_s,
                 )
                 if rows:
                     first = dict(rows[0])
