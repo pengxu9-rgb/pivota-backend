@@ -888,21 +888,7 @@ async def save_from_checkout(
     """
     raw_save_token = (str(body.save_token or "").strip() or None)
 
-    # Checkout token binds the operation to the actual checkout flow (prevents random intent guessing).
-    checkout_token = str(x_checkout_token or "").strip()
-    if not checkout_token:
-        raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Missing checkout token")
-    checkout_payload = verify_checkout_token(checkout_token)
-
-    token_intent_id = str(checkout_payload.get("intent_id") or "").strip() or None
-    if not token_intent_id:
-        raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "Checkout token missing intent_id")
-
-    agent_id = str(checkout_payload.get("agent_id") or "").strip()
-    if not agent_id:
-        raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "Checkout token missing agent_id")
-
-    # Accept either direct intent_id OR a previously issued opaque save_token.
+    # Accept either direct intent_id/order_id OR a previously issued opaque save_token.
     intent_id = (str(body.intent_id or "").strip() or None)
     order_id = (str(body.order_id or "").strip() or None)
     save_email = bool(body.save_email)
@@ -934,17 +920,78 @@ async def save_from_checkout(
         save_email = bool(challenge.get("save_email", save_email))
         save_address = bool(challenge.get("save_address", save_address))
 
-        # Ensure the token is being redeemed for the same checkout token/intention.
-        if str(intent_id or "") != token_intent_id:
-            raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token does not match checkout session")
-        stored_cth = str(challenge.get("checkout_token_hash") or "").strip() or None
-        if stored_cth and not _constant_time_equals(stored_cth, _sha256_hex(checkout_token)):
-            raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token does not match checkout session")
+    # Checkout token binds the operation to the checkout flow when available.
+    checkout_token = str(x_checkout_token or "").strip()
+    checkout_payload: Dict[str, Any] = {}
+    token_intent_id: Optional[str] = None
+    agent_id: Optional[str] = None
+
+    if checkout_token:
+        checkout_payload = verify_checkout_token(checkout_token)
+        token_intent_id = str(checkout_payload.get("intent_id") or "").strip() or None
+        if not token_intent_id:
+            raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "Checkout token missing intent_id")
+
+        agent_id = str(checkout_payload.get("agent_id") or "").strip() or None
+        if not agent_id:
+            raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "Checkout token missing agent_id")
+
+        if raw_save_token:
+            # Ensure the token is being redeemed for the same checkout token/intention.
+            if str(intent_id or "") != token_intent_id:
+                raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token does not match checkout session")
+            challenge = dict(challenge_row or {})
+            stored_cth = str(challenge.get("checkout_token_hash") or "").strip() or None
+            if stored_cth and not _constant_time_equals(stored_cth, _sha256_hex(checkout_token)):
+                raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token does not match checkout session")
+        else:
+            if not intent_id:
+                raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "intent_id is required")
+            if intent_id != token_intent_id:
+                raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "intent_id does not match checkout token")
     else:
-        if not intent_id:
-            raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "intent_id is required")
-        if intent_id != token_intent_id:
-            raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "intent_id does not match checkout token")
+        # Fallback path for legacy success pages that only carry order_id (no checkout token in URL/storage).
+        # If a save_token challenge expects checkout-token binding, token is still required.
+        if raw_save_token:
+            challenge = dict(challenge_row or {})
+            stored_cth = str(challenge.get("checkout_token_hash") or "").strip() or None
+            if stored_cth:
+                raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Missing checkout token")
+        if not order_id:
+            raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Missing checkout token")
+
+    order_row: Optional[Dict[str, Any]] = None
+    if order_id:
+        try:
+            fetched = await database.fetch_one(
+                orders_table.select().where(orders_table.c.order_id == order_id).limit(1)
+            )
+            if fetched:
+                order_row = dict(fetched)
+        except Exception:
+            order_row = None
+    if order_id and not order_row and not checkout_token:
+        raise _error(status.HTTP_404_NOT_FOUND, "NOT_FOUND", "Order not found")
+
+    if not agent_id and order_row:
+        agent_id = str(order_row.get("agent_id") or "").strip() or None
+    if not agent_id and intent_id:
+        try:
+            irow = await database.fetch_one(
+                "SELECT agent_id FROM checkout_intents WHERE intent_id = :intent_id LIMIT 1",
+                {"intent_id": intent_id},
+            )
+            if irow:
+                agent_id = str(dict(irow).get("agent_id") or "").strip() or None
+        except Exception:
+            agent_id = None
+    if not agent_id:
+        raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "Unable to determine agent_id for save flow")
+
+    if not intent_id:
+        intent_id = str((order_row or {}).get("intent_id") or "").strip() or None
+    if not intent_id and order_id:
+        intent_id = f"order:{order_id}"
 
     # Step-up: require buyer session. If missing, return a save_token + login_url for the UI to use.
     principal: Optional[AccountsPrincipal] = None
@@ -974,7 +1021,7 @@ async def save_from_checkout(
                         save_token_hash=save_token_hash,
                         intent_id=intent_id,
                         order_id=order_id,
-                        checkout_token_hash=_sha256_hex(checkout_token),
+                        checkout_token_hash=(_sha256_hex(checkout_token) if checkout_token else None),
                         client_nonce_hash=_sha256_hex(nonce),
                         save_email=bool(save_email),
                         save_address=bool(save_address),
@@ -991,7 +1038,9 @@ async def save_from_checkout(
             raise _error(status.HTTP_503_SERVICE_UNAVAILABLE, "TEMPORARY_UNAVAILABLE", "Failed to create save token")
 
         checkout_ui = _checkout_ui_base()
-        redirect_qs = f"save_token={quote(save_token)}&checkout_token={quote(checkout_token)}"
+        redirect_qs = f"save_token={quote(save_token)}"
+        if checkout_token:
+            redirect_qs += f"&checkout_token={quote(checkout_token)}"
         redirect_path = f"/order/success?{redirect_qs}"
         login_url = f"{checkout_ui}/login?redirect={quote(redirect_path)}"
         detail = {
@@ -1001,6 +1050,14 @@ async def save_from_checkout(
         }
         headers = {"Set-Cookie": set_cookie} if set_cookie else None
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail, headers=headers)
+
+    if not checkout_token:
+        if not order_id or not order_row:
+            raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "order_id is required without checkout token")
+        order_email_norm = str(order_row.get("customer_email") or "").strip().lower()
+        principal_email_norm = str(getattr(principal, "email_normalized", "") or principal.email or "").strip().lower()
+        if order_email_norm and principal_email_norm and order_email_norm != principal_email_norm:
+            raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "Order email does not match logged-in buyer")
 
     # If redeeming via save_token, require the nonce cookie and atomically mark as redeemed.
     if raw_save_token:
@@ -1054,19 +1111,22 @@ async def save_from_checkout(
     if save_address:
         if order_id:
             try:
-                order_row = await database.fetch_one(
-                    orders_table.select().where(orders_table.c.order_id == order_id).limit(1)
-                )
-                if order_row:
-                    order_dict = dict(order_row)
-                    if str(order_dict.get("agent_id") or "") == agent_id:
-                        shipping_raw = order_dict.get("shipping_address")
-                        if isinstance(shipping_raw, str):
-                            try:
-                                shipping_raw = json.loads(shipping_raw)
-                            except Exception:
-                                shipping_raw = None
-                        addr_to_save = _normalize_shipping_address(shipping_raw)
+                order_dict = order_row
+                if not order_dict:
+                    fetched = await database.fetch_one(
+                        orders_table.select().where(orders_table.c.order_id == order_id).limit(1)
+                    )
+                    order_dict = dict(fetched) if fetched else None
+                    if order_dict:
+                        order_row = order_dict
+                if order_dict and str(order_dict.get("agent_id") or "") == agent_id:
+                    shipping_raw = order_dict.get("shipping_address")
+                    if isinstance(shipping_raw, str):
+                        try:
+                            shipping_raw = json.loads(shipping_raw)
+                        except Exception:
+                            shipping_raw = None
+                    addr_to_save = _normalize_shipping_address(shipping_raw)
             except Exception:
                 addr_to_save = None
         if not addr_to_save and intent_prefill:

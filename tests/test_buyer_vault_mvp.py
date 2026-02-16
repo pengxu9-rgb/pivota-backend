@@ -119,6 +119,65 @@ def test_save_from_checkout_triggers_step_up_when_not_logged_in(client, monkeypa
     assert "shipping_address" not in detail
 
 
+def test_save_from_checkout_without_checkout_token_uses_order_id_step_up(client, monkeypatch):
+    from routes import buyer_api
+
+    async def fake_get_accounts_principal(_request):  # noqa: ANN001
+        raise HTTPException(status_code=401, detail="not logged in")
+
+    monkeypatch.setattr(buyer_api, "get_accounts_principal", fake_get_accounts_principal)
+
+    async def fake_fetch_one(_query, _values=None):  # noqa: ANN001
+        return {
+            "order_id": "ORD_TEST_NO_TOKEN",
+            "agent_id": "agent_test",
+            "intent_id": "ci_order_intent",
+            "customer_email": "buyer@example.com",
+            "shipping_address": {
+                "name": "Buyer",
+                "address_line1": "1 Main St",
+                "city": "NYC",
+                "postal_code": "10001",
+                "country": "US",
+            },
+        }
+
+    async def fake_execute(_query, _values=None):  # noqa: ANN001
+        return 1
+
+    monkeypatch.setattr(buyer_api.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(buyer_api.database, "execute", fake_execute)
+
+    res = client.post(
+        "/buyer/v1/save_from_checkout",
+        json={"order_id": "ORD_TEST_NO_TOKEN", "save_email": True, "save_address": True},
+        headers={"X-Checkout-UI-Key": "test-checkout-ui-key"},
+    )
+    assert res.status_code == 401
+    detail = res.json().get("detail") or {}
+    assert (detail.get("error") or {}).get("code") == "STEP_UP_REQUIRED"
+    assert "save_token" in detail
+    assert "login_url" in detail
+    login_url = detail.get("login_url") or ""
+    parsed = urlparse(login_url)
+    redirect_encoded = (parse_qs(parsed.query).get("redirect") or [None])[0]
+    assert redirect_encoded
+    redirect_url = unquote(str(redirect_encoded))
+    assert f"save_token={detail.get('save_token')}" in redirect_url
+    assert "checkout_token=" not in redirect_url
+
+
+def test_save_from_checkout_without_token_and_order_id_rejected(client):
+    res = client.post(
+        "/buyer/v1/save_from_checkout",
+        json={"save_email": True, "save_address": True},
+        headers={"X-Checkout-UI-Key": "test-checkout-ui-key"},
+    )
+    assert res.status_code == 401
+    detail = res.json().get("detail") or {}
+    assert (detail.get("error") or {}).get("code") == "UNAUTHENTICATED"
+
+
 @pytest.mark.asyncio
 async def test_pairwise_buyer_ref_is_per_agent_and_stable(monkeypatch):
     from routes import buyer_api
