@@ -9,6 +9,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -105,6 +106,13 @@ def test_save_from_checkout_triggers_step_up_when_not_logged_in(client, monkeypa
     assert (detail.get("error") or {}).get("code") == "STEP_UP_REQUIRED"
     assert "save_token" in detail
     assert "login_url" in detail
+    login_url = detail.get("login_url") or ""
+    parsed = urlparse(login_url)
+    redirect_encoded = (parse_qs(parsed.query).get("redirect") or [None])[0]
+    assert redirect_encoded
+    redirect_url = unquote(str(redirect_encoded))
+    assert f"save_token={detail.get('save_token')}" in redirect_url
+    assert f"checkout_token={token}" in redirect_url
     # Ensure we don't leak intent prefill fields on step-up response.
     assert "prefill" not in detail
     assert "customer_email" not in detail

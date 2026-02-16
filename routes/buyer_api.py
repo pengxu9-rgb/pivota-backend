@@ -991,7 +991,9 @@ async def save_from_checkout(
             raise _error(status.HTTP_503_SERVICE_UNAVAILABLE, "TEMPORARY_UNAVAILABLE", "Failed to create save token")
 
         checkout_ui = _checkout_ui_base()
-        login_url = f"{checkout_ui}/login?redirect={quote(f'/order/success?save_token={save_token}')}"
+        redirect_qs = f"save_token={quote(save_token)}&checkout_token={quote(checkout_token)}"
+        redirect_path = f"/order/success?{redirect_qs}"
+        login_url = f"{checkout_ui}/login?redirect={quote(redirect_path)}"
         detail = {
             "error": {"code": "STEP_UP_REQUIRED", "message": "Login required to save for next time"},
             "save_token": save_token,
