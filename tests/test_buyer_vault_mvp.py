@@ -4,7 +4,9 @@ MVP coverage for Pivota Unified Buyer Account (Buyer Vault/Profile).
 Focus: access controls + step-up + pairwise buyer_ref + agent scoping.
 """
 
+import base64
 import hashlib
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -519,6 +521,148 @@ def test_checkout_prefill_anonymous_uses_intent_prefill(app, client, monkeypatch
     assert prefill.get("customer_email") == "agent@example.com"
     assert (prefill.get("shipping_address") or {}).get("address_line1") == "1 Agent St"
     assert "phone" not in (prefill.get("shipping_address") or {})
+
+
+def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client, monkeypatch):
+    from routes.agent_checkout_intents import mint_checkout_token
+    from routes.agent_auth import get_agent_context
+    from routes import agent_checkout_intents
+
+    intent_id = "ci_test_intent"
+    agent_user_ref = "https://agent.tools.example:user_123"
+    token = mint_checkout_token(
+        {
+            "agent_id": "agent_test",
+            "intent_id": intent_id,
+            "buyer_ref": "guest:123",
+            "agent_user_ref": agent_user_ref,
+            "merchant_ids": ["merch_test"],
+            "scopes": ["checkout"],
+            "items": [],
+        },
+        ttl_seconds=3600,
+    )
+
+    class Ctx:
+        agent_id = "agent_test"
+        checkout_token_payload = {"intent_id": intent_id, "agent_user_ref": agent_user_ref}
+
+    async def fake_get_agent_context(request: Request):  # noqa: ANN001
+        return Ctx()
+
+    app.dependency_overrides[get_agent_context] = fake_get_agent_context
+
+    async def fake_get_accounts_principal(_request):  # noqa: ANN001
+        raise HTTPException(status_code=401, detail="not logged in")
+
+    monkeypatch.setattr(agent_checkout_intents, "get_accounts_principal", fake_get_accounts_principal)
+
+    async def fake_fetch_one(query, values=None):  # noqa: ANN001
+        if isinstance(query, str) and "from checkout_intents" in query.lower():
+            return {
+                "prefill": {
+                    "customer_email": "agent@example.com",
+                    "shipping_address": {"address_line1": "1 Agent St", "city": "NYC", "postal_code": "10001", "country": "US"},
+                },
+                "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
+                "used_at": None,
+                "checkout_token_hash": agent_checkout_intents._sha256_hex(token),
+                "prefill_read_count": 0,
+            }
+        if isinstance(query, str) and "from buyer_identity_links" in query.lower():
+            assert (values or {}).get("agent_id") == "agent_test"
+            assert (values or {}).get("agent_user_ref_hash") == agent_checkout_intents.hash_agent_user_ref(agent_user_ref)
+            return {"buyer_id": "buyer_1"}
+        if isinstance(query, str) and "from shop_users" in query.lower():
+            return {"email": "vault@example.com"}
+        if "buyer_addresses" in str(query):
+            return {
+                "id": "addr_1",
+                "buyer_id": "buyer_1",
+                "recipient_name": "Vault Buyer",
+                "line1": "9 Buyer Rd",
+                "line2": None,
+                "city": "SF",
+                "region": "CA",
+                "postal_code": "94105",
+                "country": "US",
+                "phone": "1234567890",
+                "is_default": True,
+            }
+        return None
+
+    async def fake_execute(_query, _values=None):  # noqa: ANN001
+        return 1
+
+    monkeypatch.setattr(agent_checkout_intents.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_checkout_intents.database, "execute", fake_execute)
+
+    res = client.get(
+        "/agent/v1/checkout/prefill",
+        headers={
+            "X-Checkout-Token": token,
+            "X-Checkout-UI-Key": "test-checkout-ui-key",
+        },
+    )
+    assert res.status_code == 200
+    prefill = (res.json() or {}).get("prefill") or {}
+    assert prefill.get("customer_email") == "vault@example.com"
+    assert (prefill.get("shipping_address") or {}).get("address_line1") == "9 Buyer Rd"
+
+
+def test_create_checkout_intent_uses_verified_agent_user_ref(app, client, monkeypatch):
+    from routes import agent_checkout_intents
+    from routes.agent_user_auth import AgentUserContext, get_agent_user_context
+
+    async def fake_get_agent_user_context():  # noqa: ANN001
+        return AgentUserContext(agent_user_ref="https://agent.tools.example:user_123")
+
+    app.dependency_overrides[get_agent_user_context] = fake_get_agent_user_context
+
+    async def fake_execute(_query, _values=None):  # noqa: ANN001
+        return 1
+
+    monkeypatch.setattr(agent_checkout_intents.database, "execute", fake_execute)
+
+    res = client.post(
+        "/agent/v1/checkout/intents",
+        headers={"X-API-Key": "test-agent-key"},
+        json={
+            "items": [
+                {"product_id": "prod_1", "variant_id": "var_1", "merchant_id": "merch_test", "quantity": 1}
+            ],
+        },
+    )
+    assert res.status_code == 200
+    payload = res.json() or {}
+    token = str(payload.get("checkout_token") or "")
+    assert token
+    parts = token.split(".")
+    payload_b64 = parts[1] if len(parts) == 3 and parts[0] == "v1" else parts[0]
+    padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+    token_payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8"))
+    assert token_payload.get("agent_user_ref") == "https://agent.tools.example:user_123"
+
+
+def test_create_checkout_intent_rejects_agent_user_ref_mismatch(app, client):
+    from routes.agent_user_auth import AgentUserContext, get_agent_user_context
+
+    async def fake_get_agent_user_context():  # noqa: ANN001
+        return AgentUserContext(agent_user_ref="https://agent.tools.example:user_123")
+
+    app.dependency_overrides[get_agent_user_context] = fake_get_agent_user_context
+
+    res = client.post(
+        "/agent/v1/checkout/intents",
+        headers={"X-API-Key": "test-agent-key"},
+        json={
+            "items": [
+                {"product_id": "prod_1", "variant_id": "var_1", "merchant_id": "merch_test", "quantity": 1}
+            ],
+            "agent_user_ref": "spoofed-user",
+        },
+    )
+    assert res.status_code == 403
 
 
 def test_save_from_checkout_redeem_saves_address_into_vault(client, monkeypatch):

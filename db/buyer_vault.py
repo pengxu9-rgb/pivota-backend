@@ -11,6 +11,9 @@ Design goals:
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import os
 import secrets
 from typing import Any, Dict, Optional
 
@@ -67,6 +70,20 @@ buyer_agent_links = Table(
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     Column("last_used_at", DateTime(timezone=True), nullable=True),
     UniqueConstraint("buyer_id", "agent_id", name="uq_buyer_agent_links_buyer_agent"),
+)
+
+
+buyer_identity_links = Table(
+    "buyer_identity_links",
+    metadata,
+    Column("id", _autoincrement_pk_type, primary_key=True, autoincrement=True),
+    Column("agent_id", String(100), nullable=False, index=True),
+    Column("agent_user_ref_hash", String(64), nullable=False, index=True),
+    Column("buyer_id", String(50), nullable=False, index=True),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime(timezone=True), server_default=func.now(), onupdate=func.now()),
+    Column("last_seen_at", DateTime(timezone=True), nullable=True),
+    UniqueConstraint("agent_id", "agent_user_ref_hash", name="uq_buyer_identity_links_agent_ref_hash"),
 )
 
 
@@ -137,6 +154,28 @@ buyer_save_challenges = Table(
 
 def _base64url_no_pad(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def hash_agent_user_ref(agent_user_ref: str) -> str:
+    """
+    Hash agent_user_ref before persistence.
+
+    If BUYER_IDENTITY_LINK_SECRET is configured, use keyed HMAC-SHA256 to reduce
+    offline dictionary risks; otherwise fall back to SHA256 for deterministic local dev.
+    """
+    raw = str(agent_user_ref or "").strip()
+    if not raw:
+        return ""
+    secret = (
+        os.getenv("BUYER_IDENTITY_LINK_SECRET")
+        or os.getenv("BUYER_ACTION_TOKEN_SECRET")
+        or os.getenv("CHECKOUT_TOKEN_SECRET")
+        or os.getenv("AGENT_CHECKOUT_TOKEN_SECRET")
+        or ""
+    ).strip()
+    if secret:
+        return hmac.new(secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def mint_pairwise_buyer_ref() -> str:

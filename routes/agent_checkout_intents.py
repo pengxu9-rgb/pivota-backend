@@ -18,8 +18,9 @@ from db.checkout_intents import checkout_intents
 from db.database import IS_POSTGRES, database, engine, metadata
 import uuid
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
-from db.buyer_vault import buyer_addresses
+from db.buyer_vault import buyer_addresses, buyer_identity_links, hash_agent_user_ref
 from routes.accounts_orders_api import get_accounts_principal
+from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 
 from sqlalchemy.sql import func
 
@@ -334,6 +335,76 @@ def _address_row_to_checkout_shipping(addr: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+async def _buyer_prefill_from_identity_link(*, agent_id: str, agent_user_ref: str) -> Optional[Dict[str, Any]]:
+    ref = str(agent_user_ref or "").strip()
+    if not ref:
+        return None
+    ref_hash = hash_agent_user_ref(ref)
+    if not ref_hash:
+        return None
+
+    try:
+        link_row = await database.fetch_one(
+            """
+            SELECT buyer_id
+            FROM buyer_identity_links
+            WHERE agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
+            LIMIT 1
+            """,
+            {"agent_id": agent_id, "agent_user_ref_hash": ref_hash},
+        )
+    except Exception:
+        link_row = None
+    if not link_row:
+        return None
+
+    buyer_id = str(dict(link_row).get("buyer_id") or "").strip() or None
+    if not buyer_id:
+        return None
+
+    try:
+        await database.execute(
+            buyer_identity_links.update()
+            .where(
+                (buyer_identity_links.c.agent_id == agent_id)
+                & (buyer_identity_links.c.agent_user_ref_hash == ref_hash)
+            )
+            .values(last_seen_at=func.now(), updated_at=func.now())
+        )
+    except Exception:
+        pass
+
+    email: Optional[str] = None
+    try:
+        user_row = await database.fetch_one(
+            "SELECT email FROM shop_users WHERE id = :id LIMIT 1",
+            {"id": buyer_id},
+        )
+        if user_row:
+            email = str(dict(user_row).get("email") or "").strip() or None
+    except Exception:
+        email = None
+
+    shipping_address: Optional[Dict[str, Any]] = None
+    try:
+        addr_row = await database.fetch_one(
+            buyer_addresses.select()
+            .where((buyer_addresses.c.buyer_id == buyer_id) & (buyer_addresses.c.is_default.is_(True)))
+            .limit(1)
+        )
+        if addr_row:
+            shipping_address = _address_row_to_checkout_shipping(dict(addr_row))
+    except Exception:
+        shipping_address = None
+
+    if not email and not shipping_address:
+        return None
+    return {
+        "customer_email": email,
+        "shipping_address": shipping_address,
+    }
+
+
 class CheckoutIntentItem(BaseModel):
     product_id: str = Field(..., description="Platform product id")
     variant_id: Optional[str] = Field(None, description="Platform variant id (preferred when available)")
@@ -366,6 +437,7 @@ class CreateCheckoutIntentRequest(BaseModel):
 async def create_checkout_intent(
     req: CreateCheckoutIntentRequest,
     context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     if not req.items:
         raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "items[] is required"})
@@ -388,7 +460,17 @@ async def create_checkout_intent(
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
     buyer_ref = (req.buyer_ref or "").strip() or None
-    agent_user_ref = (req.agent_user_ref or "").strip() or None
+    requested_agent_user_ref = (req.agent_user_ref or "").strip() or None
+    verified_agent_user_ref = str(agent_user.agent_user_ref or "").strip() if agent_user else ""
+    if requested_agent_user_ref and verified_agent_user_ref and requested_agent_user_ref != verified_agent_user_ref:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "FORBIDDEN",
+                "message": "agent_user_ref mismatch with verified identity",
+            },
+        )
+    agent_user_ref = verified_agent_user_ref or requested_agent_user_ref or None
     brief_id = (req.brief_id or "").strip() or None
     brief_schema_version = (req.brief_schema_version or "").strip() or None
     job_id = (req.job_id or "").strip() or None
@@ -666,6 +748,13 @@ async def get_checkout_prefill(
                 buyer_prefill["shipping_address"] = _address_row_to_checkout_shipping(dict(addr_row))
         except Exception:
             pass
+    else:
+        token_agent_user_ref = str(payload.get("agent_user_ref") or "").strip() or None
+        if token_agent_user_ref:
+            buyer_prefill = await _buyer_prefill_from_identity_link(
+                agent_id=context.agent_id,
+                agent_user_ref=token_agent_user_ref,
+            )
 
     merged: Optional[Dict[str, Any]] = None
     if isinstance(prefill, dict):

@@ -18,7 +18,9 @@ from db.buyer_vault import (
     audit_buyer_action,
     buyer_addresses,
     buyer_agent_links,
+    buyer_identity_links,
     buyer_save_challenges,
+    hash_agent_user_ref,
     mandates,
     mint_pairwise_buyer_ref,
 )
@@ -484,6 +486,79 @@ async def _get_or_create_pairwise_buyer_ref(*, buyer_id: str, agent_id: str) -> 
         "TEMPORARY_UNAVAILABLE",
         "Failed to allocate buyer_ref, please retry",
     )
+
+
+async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_user_ref: str) -> Optional[str]:
+    """
+    Persist agent-scoped identity mapping:
+      (agent_id, hash(agent_user_ref)) -> buyer_id
+    """
+    ref = str(agent_user_ref or "").strip()
+    if not ref:
+        return None
+    ref_hash = hash_agent_user_ref(ref)
+    if not ref_hash:
+        return None
+
+    # Preferred path: Postgres/modern SQLite upsert.
+    try:
+        await database.execute(
+            """
+            INSERT INTO buyer_identity_links (
+              agent_id, agent_user_ref_hash, buyer_id, created_at, updated_at, last_seen_at
+            )
+            VALUES (
+              :agent_id, :agent_user_ref_hash, :buyer_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (agent_id, agent_user_ref_hash)
+            DO UPDATE SET
+              buyer_id = EXCLUDED.buyer_id,
+              updated_at = CURRENT_TIMESTAMP,
+              last_seen_at = CURRENT_TIMESTAMP
+            """,
+            {
+                "agent_id": agent_id,
+                "agent_user_ref_hash": ref_hash,
+                "buyer_id": buyer_id,
+            },
+        )
+        return ref_hash
+    except Exception:
+        pass
+
+    # Fallback: update-then-insert for environments without ON CONFLICT support.
+    try:
+        updated = await database.execute(
+            buyer_identity_links.update()
+            .where(
+                (buyer_identity_links.c.agent_id == agent_id)
+                & (buyer_identity_links.c.agent_user_ref_hash == ref_hash)
+            )
+            .values(
+                buyer_id=buyer_id,
+                updated_at=func.now(),
+                last_seen_at=func.now(),
+            )
+        )
+        if int(updated or 0) > 0:
+            return ref_hash
+    except Exception:
+        pass
+
+    try:
+        await database.execute(
+            buyer_identity_links.insert().values(
+                agent_id=agent_id,
+                agent_user_ref_hash=ref_hash,
+                buyer_id=buyer_id,
+                created_at=func.now(),
+                updated_at=func.now(),
+                last_seen_at=func.now(),
+            )
+        )
+        return ref_hash
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1194,8 +1269,35 @@ async def save_from_checkout(
     # Pairwise buyer_ref for this agent.
     pairwise_ref = await _get_or_create_pairwise_buyer_ref(buyer_id=principal.user_id, agent_id=agent_id)
 
+    raw_agent_user_ref = str(checkout_payload.get("agent_user_ref") or "").strip() or None
+    legacy_buyer_ref = str(checkout_payload.get("buyer_ref") or "").strip() or None
+    if not raw_agent_user_ref and order_row:
+        raw_agent_user_ref = str(order_row.get("agent_user_ref") or "").strip() or None
+        if not raw_agent_user_ref:
+            meta = order_row.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = None
+            if isinstance(meta, dict):
+                raw_agent_user_ref = str(meta.get("agent_user_ref") or meta.get("agentUserRef") or "").strip() or None
+
+    # Keep backward compatibility: fall back to legacy buyer_ref when no explicit agent_user_ref.
+    agent_user_ref = raw_agent_user_ref or legacy_buyer_ref
+
+    # Persist agent identity link only when explicit agent_user_ref is present.
+    identity_linked = False
+    if raw_agent_user_ref:
+        identity_linked = bool(
+            await _upsert_buyer_identity_link(
+                buyer_id=principal.user_id,
+                agent_id=agent_id,
+                agent_user_ref=raw_agent_user_ref,
+            )
+        )
+
     # Update order linkage best-effort (do not fail save on DB schema drift).
-    agent_user_ref = str(checkout_payload.get("agent_user_ref") or checkout_payload.get("buyer_ref") or "").strip() or None
     try:
         if order_id:
             # Update columns + metadata in one shot (metadata remains the agent-facing compat surface).
@@ -1245,6 +1347,7 @@ async def save_from_checkout(
             "saved_address_id": saved_address_id,
             "agent_scoped_buyer_ref": pairwise_ref,
             "agent_user_ref_present": bool(agent_user_ref),
+            "agent_identity_linked": identity_linked,
             "customer_email_masked": _mask_email(principal.email),
         },
         ip_address=_client_ip(request),
