@@ -20,7 +20,7 @@ router = APIRouter(prefix="/employee/payouts", tags=["employee-payouts"])
 
 # Request/Response Models
 class ConfirmBulkRequest(BaseModel):
-    payout_ids: List[int] = Field(..., min_items=1, max_items=1000)
+    payout_ids: List[int] = Field(..., min_length=1, max_length=1000)
 
 class ConfirmResponse(BaseModel):
     status: str
@@ -59,7 +59,7 @@ async def list_all_payouts(
     page: int = Query(1, ge=1),
     size: int = Query(100, ge=1, le=1000),
     sort_by: str = Query("created_at", description="Sort by: created_at, amount, merchant_id"),
-    sort_order: str = Query("desc", regex="^(asc|desc)$"),
+    sort_order: str = Query("desc", pattern="^(asc|desc)$"),
     current_user: dict = Depends(get_current_user)
 ):
     """

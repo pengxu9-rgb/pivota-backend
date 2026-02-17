@@ -224,7 +224,7 @@ async def get_payments(
 @router.get("/analytics", response_model=AnalyticsResponse)
 async def get_analytics(
     current_user: User = Depends(get_current_user),
-    time_range: str = Query("7d", regex="^(1d|7d|30d|90d)$")
+    time_range: str = Query("7d", pattern="^(1d|7d|30d|90d)$")
 ):
     """Get analytics data for the current user"""
     try:

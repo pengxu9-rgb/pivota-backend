@@ -164,7 +164,9 @@ def validate_orderable(product: StandardProduct) -> Tuple[bool, Dict[str, Any]]:
     # Examples:
     # - Shopify/Wix adapters set product.orderable based on publish/visibility.
     # - Amazon/Temu imports do NOT set orderable and rely purely on structure.
-    explicit_fields = getattr(product, "__fields_set__", set())
+    explicit_fields = getattr(product, "model_fields_set", None)
+    if not isinstance(explicit_fields, set):
+        explicit_fields = getattr(product, "__fields_set__", set())
     has_explicit_orderable = "orderable" in explicit_fields
 
     if has_explicit_orderable:

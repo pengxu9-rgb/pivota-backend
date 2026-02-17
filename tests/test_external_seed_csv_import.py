@@ -68,7 +68,7 @@ def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) ->
 
         res1 = client.post(
             "/employee/products/external-seeds/import-csv?market=US&tool=*&mode=upsert",
-            data=csv_text,
+            content=csv_text,
             headers={"Content-Type": "text/csv"},
         )
         assert res1.status_code == 200, res1.text
@@ -79,7 +79,7 @@ def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) ->
 
         res2 = client.post(
             "/employee/products/external-seeds/import-csv?market=US&tool=*&mode=upsert",
-            data=csv_text,
+            content=csv_text,
             headers={"Content-Type": "text/csv"},
         )
         assert res2.status_code == 200, res2.text
@@ -157,7 +157,7 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
 
         res1 = client.post(
             "/employee/products/external-seeds/import-csv?market=US&tool=*&mode=upsert",
-            data=csv_text,
+            content=csv_text,
             headers={"Content-Type": "text/csv"},
         )
         assert res1.status_code == 200, res1.text
@@ -188,7 +188,7 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
 
         res2 = client.post(
             "/employee/products/external-seeds/import-csv?market=US&tool=*&mode=upsert",
-            data=csv_text,
+            content=csv_text,
             headers={"Content-Type": "text/csv"},
         )
         assert res2.status_code == 200, res2.text

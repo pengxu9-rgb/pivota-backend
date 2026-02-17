@@ -42,8 +42,8 @@ class TestProductFieldAliases:
         )
         
         # Convert to JSON
-        product_dict = product.dict()
-        product_json = json.loads(product.json())
+        product_dict = product.model_dump()
+        product_json = json.loads(product.model_dump_json())
         
         # Check dict representation
         assert product_dict["id"] == "prod-456"
@@ -154,21 +154,21 @@ class TestFieldDeprecationWarnings:
     def test_product_field_descriptions(self):
         """Test field descriptions indicate deprecation"""
         # Check model field info
-        field_info = StandardProduct.__fields__
+        field_info = StandardProduct.model_fields
         
         # The 'id' field should have deprecation notice in description
         id_field = field_info.get('id')
-        if id_field and hasattr(id_field, 'field_info'):
-            description = getattr(id_field.field_info, 'description', '')
+        if id_field:
+            description = getattr(id_field, 'description', '')
             assert 'deprecated' in description.lower()
     
     def test_variant_field_descriptions(self):
         """Test variant field descriptions indicate deprecation"""
-        field_info = StandardProductVariant.__fields__
+        field_info = StandardProductVariant.model_fields
         
         id_field = field_info.get('id')
-        if id_field and hasattr(id_field, 'field_info'):
-            description = getattr(id_field.field_info, 'description', '')
+        if id_field:
+            description = getattr(id_field, 'description', '')
             assert 'deprecated' in description.lower()
 
 
@@ -208,7 +208,7 @@ class TestBackwardCompatibility:
         )
         
         # Simulate API response
-        api_response = product.dict()
+        api_response = product.model_dump()
         
         # Both fields must be present for backward compatibility
         assert "id" in api_response

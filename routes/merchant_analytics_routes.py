@@ -304,10 +304,10 @@ def _is_refund_status(status: Optional[str]) -> bool:
 @router.get("/analytics/trends")
 @router.get("/dashboard/trends")
 async def get_trends(
-    metric: str = Query("gmv", regex="^(gmv|orders|aov|success_rate|refunds)$"),
-    range: str = Query("30d", regex="^(1d|7d|30d|90d)$"),
-    interval: str = Query("day", regex="^(day|week)$"),
-    mode: str = Query("gross", regex="^(gross|net)$"),
+    metric: str = Query("gmv", pattern="^(gmv|orders|aov|success_rate|refunds)$"),
+    range: str = Query("30d", pattern="^(1d|7d|30d|90d)$"),
+    interval: str = Query("day", pattern="^(day|week)$"),
+    mode: str = Query("gross", pattern="^(gross|net)$"),
     psp: Optional[str] = Query(None),
     currency: Optional[str] = Query(None, description="Filter by currency (deprecated - use base_currency for normalization)"),
     compare: bool = Query(True),
@@ -681,10 +681,10 @@ async def trends_cache_metrics(
 
 @router.get("/analytics/trends.csv")
 async def export_trends_csv(
-    metric: str = Query("gmv", regex="^(gmv|orders|aov|success_rate|refunds)$"),
-    range: str = Query("30d", regex="^(1d|7d|30d|90d)$"),
-    interval: str = Query("day", regex="^(day|week)$"),
-    mode: str = Query("gross", regex="^(gross|net)$"),
+    metric: str = Query("gmv", pattern="^(gmv|orders|aov|success_rate|refunds)$"),
+    range: str = Query("30d", pattern="^(1d|7d|30d|90d)$"),
+    interval: str = Query("day", pattern="^(day|week)$"),
+    mode: str = Query("gross", pattern="^(gross|net)$"),
     psp: Optional[str] = Query(None),
     currency: Optional[str] = Query(None),
     compare: bool = Query(True),

@@ -125,13 +125,13 @@ class TestInStockField:
         )
         
         # Convert to dict
-        product_dict = product.dict()
+        product_dict = product.model_dump()
         assert "in_stock" in product_dict
         assert product_dict["in_stock"] is True
         
         # Convert to JSON
         import json
-        product_json = json.loads(product.json())
+        product_json = json.loads(product.model_dump_json())
         assert "in_stock" in product_json
         assert product_json["in_stock"] is True
 

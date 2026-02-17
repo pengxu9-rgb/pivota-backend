@@ -7,6 +7,7 @@ FastAPI application with comprehensive dashboard and real-time metrics
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request, Response
@@ -359,7 +360,6 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 
-@app.on_event("startup")
 async def startup_event():
     """
     Initialize database connections and ensure core tables exist.
@@ -400,7 +400,6 @@ async def startup_event():
         pass
 
 
-@app.on_event("shutdown")
 async def shutdown_event():
     await database.disconnect()
 
@@ -764,7 +763,6 @@ async def get_version():
             "status": "healthy"
         }
 
-@app.on_event("startup")
 async def startup():
     """Initialize services on startup"""
     logger.info("🚀 Starting Pivota Infrastructure Dashboard...")
@@ -1267,7 +1265,6 @@ async def startup():
         logger.error("🟡 Continuing startup in degraded mode (some DB-backed endpoints may fail)")
         return
 
-@app.on_event("shutdown")
 async def shutdown():
     """Cleanup on shutdown"""
     try:
@@ -1276,6 +1273,20 @@ async def shutdown():
         logger.info("🛑 Application shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    await startup_event()
+    await startup()
+    try:
+        yield
+    finally:
+        await shutdown()
+        await shutdown_event()
+
+
+app.router.lifespan_context = app_lifespan
 
 # Global event publisher function for easy access
 async def publish_event_to_ws(event: dict):

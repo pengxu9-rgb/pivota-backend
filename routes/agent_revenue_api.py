@@ -4,7 +4,7 @@ Endpoints for agents to manage revenue policies and view earnings
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -34,8 +34,8 @@ class RevenuePolicyRequest(BaseModel):
     active_period_start: Optional[datetime] = None
     active_period_end: Optional[datetime] = None
     
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "merchant_id": None,
                 "split_ratio": 0.02,
@@ -43,6 +43,7 @@ class RevenuePolicyRequest(BaseModel):
                 "min_transaction_amount": 10.00
             }
         }
+    )
 
 
 class EarningsSummary(BaseModel):
@@ -443,4 +444,3 @@ async def get_revenue_expectations(
 
 # [Phase 5] Agent revenue API initialized
 print("[Phase 5.5] Agent revenue API routes initialized (with expectations)")
-

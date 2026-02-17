@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from db.database import database
 from models.reviews_refs import SkuRef as ReviewsSkuRef
@@ -768,8 +768,7 @@ class RequestMetadata(BaseModel):
     source: Optional[str] = Field(None, description="Calling surface (e.g. creator-agent-ui)")
     trace_id: Optional[str] = Field(None, alias="traceId", description="Optional trace id for observability")
 
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class FindProductsMultiPayload(BaseModel):
@@ -782,8 +781,7 @@ class FindProductsMultiPayload(BaseModel):
         description="Optional structured intent safety hints from upstream (e.g. high_level_intent, forbid/filter adult).",
     )
 
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class SimilarUserContext(BaseModel):
@@ -2502,7 +2500,9 @@ def _is_product_sellable(product: Any) -> bool:
     orderable = getattr(product, "orderable", None)
 
     # Detect whether orderable was explicitly provided on the model.
-    explicit_fields = getattr(product, "__fields_set__", None)
+    explicit_fields = getattr(product, "model_fields_set", None)
+    if explicit_fields is None:
+        explicit_fields = getattr(product, "__fields_set__", None)
     if isinstance(explicit_fields, set) and "orderable" in explicit_fields:
         if orderable is False:
             return False
@@ -2576,7 +2576,7 @@ async def _load_product_by_id(
         row = await database.fetch_one(query, {"pid": pid, "mid": mid})
         if row and "product_data" in row:
             try:
-                return StandardProduct.parse_obj(row["product_data"])
+                return StandardProduct.model_validate(row["product_data"])
             except Exception:
                 return None
     except Exception:
@@ -2607,7 +2607,7 @@ async def _load_products_by_ids(product_ids: List[str]) -> Dict[str, StandardPro
         rows = await database.fetch_all(query, params)
         for row in rows:
             try:
-                sp = StandardProduct.parse_obj(row["product_data"])
+                sp = StandardProduct.model_validate(row["product_data"])
                 pid = sp.product_id or sp.id
                 if pid:
                     result[pid] = sp
@@ -2738,7 +2738,7 @@ async def _invoke_multi_upstream_fallback(
     metadata_payload["upstream_fallback_hop"] = hop + 1
     body: Dict[str, Any] = {
         "operation": "find_products_multi",
-        "payload": payload.dict(by_alias=True, exclude_none=True),
+        "payload": payload.model_dump(by_alias=True, exclude_none=True),
         "metadata": metadata_payload,
     }
 
@@ -5817,7 +5817,7 @@ async def _handle_get_product_detail(
                             merchant_id,
                             "shopify",
                             str(product_id),
-                            fetched.dict(),
+                            fetched.model_dump(),
                             6 * 60 * 60,
                         )
                     except Exception:

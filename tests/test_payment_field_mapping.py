@@ -45,7 +45,7 @@ class TestOrderResponseFields:
         )
         
         # Convert to dict to check serialized output
-        order_dict = order_response.dict()
+        order_dict = order_response.model_dump()
         
         # Both fields should exist
         assert "total" in order_dict
@@ -85,7 +85,7 @@ class TestOrderResponseFields:
         )
         
         # Test JSON serialization
-        json_str = order_response.json()
+        json_str = order_response.model_dump_json()
         json_data = json.loads(json_str)
         
         # Check both fields exist in JSON

@@ -2,7 +2,7 @@
 Standardized Order Response Model
 统一的订单响应模型，解决 amount/total 混乱问题
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Any
 from datetime import datetime
 from decimal import Decimal
@@ -32,8 +32,8 @@ class StandardOrderResponse(BaseModel):
     psp_used: Optional[str] = Field(None, description="使用的支付服务商")
     payment_method: Optional[str] = Field(None, description="支付方式")
     
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "order_id": "ORD_123456",
                 "total_amount": 99.99,
@@ -45,6 +45,7 @@ class StandardOrderResponse(BaseModel):
                 "created_at": "2024-10-27T10:00:00Z"
             }
         }
+    )
 
 
 def format_order_for_response(order_data: dict) -> dict:

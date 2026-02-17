@@ -72,7 +72,7 @@ def app():
             orderable=True
         )
         
-        return product.dict()
+        return product.model_dump()
     
     @app.post("/api/v1/orders/enhanced")
     async def create_order_enhanced():
@@ -100,7 +100,7 @@ def app():
             updated_at=datetime.utcnow()
         )
         
-        return order.dict()
+        return order.model_dump()
     
     # Error endpoints for testing
     @app.get("/api/v1/error/old")
@@ -314,7 +314,7 @@ class TestProductSearchCompatibility:
             inventory_quantity=5
         )
         
-        variant_dict = variant.dict()
+        variant_dict = variant.model_dump()
         assert variant_dict["id"] == "var-123"
         assert variant_dict["variant_id"] == "var-123"
         assert variant_dict["id"] == variant_dict["variant_id"]

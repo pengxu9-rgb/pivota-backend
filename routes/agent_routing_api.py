@@ -4,7 +4,7 @@ Endpoints for agents to manage their own routing policies and view history
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import json
@@ -34,14 +34,15 @@ class RoutingTestRequest(BaseModel):
     currency: str = Field(default="USD", description="Currency code")
     scenarios: List[Dict[str, Any]] = Field(default=[], description="Multiple test scenarios")
     
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "merchant_id": "merchant_123",
                 "amount": 100.00,
                 "currency": "USD"
             }
         }
+    )
 
 
 class RoutingPolicyResponse(BaseModel):
@@ -317,4 +318,3 @@ async def get_agent_routing_history(
 
 # [Phase 5] Agent routing API initialized
 print("[Phase 5] Agent routing API routes initialized")
-

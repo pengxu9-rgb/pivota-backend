@@ -1355,7 +1355,7 @@ async def agent_search_products(
 
                     out: List[Dict[str, Any]] = []
                     for sp in products:
-                        prod_dict = sp.dict()
+                        prod_dict = sp.model_dump()
                         prod_dict["merchant_id"] = mid
                         prod_dict["merchant_name"] = merchant_name or prod_dict.get("merchant_name") or "Unknown"
                         prod_dict["query_source"] = query_source
@@ -3107,7 +3107,7 @@ async def agent_create_order(
                     shipping_address=(
                         order_request.shipping_address.model_dump()
                         if hasattr(order_request.shipping_address, "model_dump")
-                        else order_request.shipping_address.dict()
+                        else order_request.shipping_address
                     ),
                 )
 
@@ -3461,7 +3461,7 @@ async def agent_create_order(
         if payment_action_obj is not None:
             try:
                 # Pydantic model -> dict for JSON response
-                payment_action = payment_action_obj.dict()
+                payment_action = payment_action_obj.model_dump()
             except Exception:
                 # 防御性：即使序列化失败也不要影响下游
                 payment_action = None

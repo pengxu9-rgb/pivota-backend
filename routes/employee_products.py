@@ -137,7 +137,7 @@ def _as_product_card(row: Dict[str, Any]) -> Dict[str, Any]:
     product_data = _ensure_dict(row.get("product_data"))
 
     try:
-        sp = StandardProduct.parse_obj(product_data)
+        sp = StandardProduct.model_validate(product_data)
         title = sp.title
         image_url = sp.image_url or (sp.images[0] if sp.images else None)
         product_id = sp.product_id or sp.id or platform_product_id
@@ -169,7 +169,7 @@ def _as_product_card(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _extract_product_summary(product_data: Dict[str, Any], platform_product_id: str) -> Dict[str, Any]:
     try:
-        sp = StandardProduct.parse_obj(product_data)
+        sp = StandardProduct.model_validate(product_data)
         title = sp.title
         image_url = sp.image_url or (sp.images[0] if sp.images else None)
         product_id = sp.product_id or sp.id or platform_product_id
@@ -3940,8 +3940,8 @@ async def get_product_by_key(
         raw_payload = _ensure_dict(view.get("raw"))
 
         try:
-            sp = StandardProduct.parse_obj(product_data)
-            normalized = sp.dict()
+            sp = StandardProduct.model_validate(product_data)
+            normalized = sp.model_dump()
         except Exception:
             normalized = None
 
@@ -4017,8 +4017,8 @@ async def get_product_by_key(
 
     # Parse best-effort StandardProduct for normalized fields, but return the raw JSON as well.
     try:
-        sp = StandardProduct.parse_obj(product_data)
-        normalized = sp.dict()
+        sp = StandardProduct.model_validate(product_data)
+        normalized = sp.model_dump()
     except Exception:
         normalized = None
 

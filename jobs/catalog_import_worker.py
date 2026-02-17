@@ -155,7 +155,7 @@ def _build_shopify_cache_payload(
         merchant_id,
         currency=(currency or "USD"),
     )
-    product_data: Dict[str, Any] = json.loads(standard_product.json())
+    product_data: Dict[str, Any] = standard_product.model_dump(mode="json")
 
     platform_product_id = str(raw_shopify_product.get("id") or standard_product.id or "")
     if not platform_product_id:
@@ -1283,7 +1283,7 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                         merchant_id=merchant_id,
                         platform=platform,
                         platform_product_id=product.id,
-                        product_data=product.dict(),
+                        product_data=product.model_dump(),
                         ttl_seconds=3600,
                     )
                     succeeded += 1

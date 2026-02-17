@@ -4,7 +4,7 @@ Employee endpoints for managing merchant and agent routing policies
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import json
@@ -37,8 +37,8 @@ class RoutingPolicyRequest(BaseModel):
     failover: List[str] = Field(default=[], description="Failover PSPs")
     priority: int = Field(default=1, ge=1, le=10, description="Policy priority (auto-set to 1)")
     
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "exclude": ["paypal"],
                 "prefer": ["stripe", "adyen"],
@@ -47,6 +47,7 @@ class RoutingPolicyRequest(BaseModel):
                 "priority": 1
             }
         }
+    )
 
 
 class RoutingPolicyResponse(BaseModel):
@@ -86,8 +87,8 @@ class SimulationRequest(BaseModel):
         description="List of test scenarios with amount, currency, etc."
     )
     
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "scenarios": [
                     {"amount": 100.00, "currency": "USD"},
@@ -96,6 +97,7 @@ class SimulationRequest(BaseModel):
                 ]
             }
         }
+    )
 
 
 # ========================================================================
@@ -104,7 +106,7 @@ class SimulationRequest(BaseModel):
 
 @router.post("/policies/{owner_type}/{owner_id}", response_model=RoutingPolicyResponse)
 async def set_routing_policy(
-    owner_type: str = Path(..., regex="^(merchant|agent)$", description="Owner type: merchant or agent"),
+    owner_type: str = Path(..., pattern="^(merchant|agent)$", description="Owner type: merchant or agent"),
     owner_id: str = Path(..., description="Merchant or Agent ID"),
     request: RoutingPolicyRequest = ...,
     current_user: dict = Depends(get_current_employee)
@@ -203,7 +205,7 @@ async def set_routing_policy(
 
 @router.get("/policies/{owner_type}/{owner_id}", response_model=RoutingPolicyResponse)
 async def get_routing_policy(
-    owner_type: str = Path(..., regex="^(merchant|agent)$", description="Owner type: merchant or agent"),
+    owner_type: str = Path(..., pattern="^(merchant|agent)$", description="Owner type: merchant or agent"),
     owner_id: str = Path(..., description="Merchant or Agent ID"),
     current_user: dict = Depends(get_current_employee)
 ):
@@ -241,7 +243,7 @@ async def get_routing_policy(
 
 @router.delete("/policies/{owner_type}/{owner_id}")
 async def delete_routing_policy(
-    owner_type: str = Path(..., regex="^(merchant|agent)$", description="Owner type: merchant or agent"),
+    owner_type: str = Path(..., pattern="^(merchant|agent)$", description="Owner type: merchant or agent"),
     owner_id: str = Path(..., description="Merchant or Agent ID"),
     current_user: dict = Depends(get_current_employee)
 ):
@@ -583,4 +585,3 @@ async def set_agent_override_permission(
 
 # [Phase 4++] Routing governance routes registered
 print("[Phase 4++] Routing governance API routes initialized")
-
