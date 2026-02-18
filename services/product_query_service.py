@@ -136,6 +136,7 @@ async def get_products_hybrid(
     agent_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
     force_cache_only: bool = False,
+    allow_stale_cache: bool = STALE_CACHE_FALLBACK_ENABLED,
 ) -> Tuple[List[StandardProduct], str, Optional[str]]:
     """
     Hybrid product query - decides between cache and realtime
@@ -145,6 +146,7 @@ async def get_products_hybrid(
         limit: Max products to return
         agent_id: Agent making the request (for logging)
         background_tasks: FastAPI background tasks (for async cache refresh)
+        allow_stale_cache: Whether expired cache rows may be used as fallback
     
     Returns:
         Tuple of (products list, query source, error message)
@@ -154,7 +156,7 @@ async def get_products_hybrid(
     query_source = "cache"  # Default
 
     stale_cutoff = None
-    if STALE_CACHE_FALLBACK_ENABLED:
+    if allow_stale_cache:
         stale_cutoff = datetime.utcnow() - timedelta(hours=STALE_CACHE_MAX_AGE_HOURS)
     
     try:
@@ -170,7 +172,7 @@ async def get_products_hybrid(
             )
             if products:
                 return products, "cache_all_platforms", None
-            if STALE_CACHE_FALLBACK_ENABLED:
+            if allow_stale_cache:
                 stale_products = await _get_from_cache_all_platforms(
                     merchant_id,
                     limit,
@@ -193,7 +195,7 @@ async def get_products_hybrid(
             )
             if products:
                 return products, "cache", None
-            if STALE_CACHE_FALLBACK_ENABLED:
+            if allow_stale_cache:
                 stale_products = await _get_from_cache_all_platforms(
                     merchant_id,
                     limit,
@@ -219,7 +221,7 @@ async def get_products_hybrid(
                     logger.warning(f"Merchant API failed, falling back to cache: {error}")
                     query_source = "realtime_with_cache_fallback"
                     products = await _get_from_cache(merchant_id, config.platform, limit)
-                    if not products and STALE_CACHE_FALLBACK_ENABLED:
+                    if not products and allow_stale_cache:
                         stale_products = await _get_from_cache(
                             merchant_id,
                             config.platform,
@@ -253,7 +255,7 @@ async def get_products_hybrid(
                 logger.error(f"Realtime query failed: {e}")
                 query_source = "realtime_with_cache_fallback"
                 products = await _get_from_cache(merchant_id, config.platform, limit)
-                if not products and STALE_CACHE_FALLBACK_ENABLED:
+                if not products and allow_stale_cache:
                     stale_products = await _get_from_cache(
                         merchant_id,
                         config.platform,
@@ -292,7 +294,7 @@ async def get_products_hybrid(
         try:
             products = await _get_from_cache(merchant_id, "unknown", limit)
             source = "cache_fallback"
-            if not products and STALE_CACHE_FALLBACK_ENABLED:
+            if not products and allow_stale_cache:
                 stale_products = await _get_from_cache(
                     merchant_id,
                     "unknown",

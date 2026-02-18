@@ -1067,6 +1067,9 @@ async def agent_search_products(
     in_stock_only: bool = True,
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
+    allow_external_seed: bool = Query(default=True),
+    allow_stale_cache: bool = Query(default=True),
+    external_seed_strategy: str = Query(default="legacy"),
     context: AgentContext = Depends(get_agent_context),
 ):
     """
@@ -1082,6 +1085,16 @@ async def agent_search_products(
     """
     started = time.perf_counter()
     try:
+        normalized_seed_strategy = str(external_seed_strategy or "legacy").strip().lower()
+        if normalized_seed_strategy not in {"legacy", "supplement_internal_first"}:
+            normalized_seed_strategy = "legacy"
+
+        def _is_external_seed_product(product: Dict[str, Any]) -> bool:
+            return (
+                str(product.get("merchant_id") or "").strip() == EXTERNAL_SEED_MERCHANT_ID
+                or str(product.get("source") or "").strip() == "external_seed"
+            )
+
         overrides = infer_query_overrides(query=query, category=category)
         query = overrides["query"]
         category = overrides["category"]
@@ -1233,6 +1246,12 @@ async def agent_search_products(
                         "source": "agent_search_products",
                         "reason_code": "ok" if page_items else "no_candidates",
                         "latency_ms": latency_ms,
+                        "source_breakdown": {
+                            "internal_count": len(page_items),
+                            "external_seed_count": 0,
+                            "stale_cache_used": False,
+                            "strategy_applied": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+                        },
                     },
                 }
             except Exception:
@@ -1351,6 +1370,7 @@ async def agent_search_products(
                         agent_id=context.agent_id,
                         background_tasks=background_tasks,
                         force_cache_only=force_cache_only,
+                        allow_stale_cache=allow_stale_cache,
                     )
 
                     out: List[Dict[str, Any]] = []
@@ -1381,7 +1401,7 @@ async def agent_search_products(
                         continue
 
         # Add employee-managed external products only for explicit external/cross-merchant flows.
-        include_external_seed = (
+        include_external_seed = allow_external_seed and (
             (merchant_id is None and not merchant_ids)
             or merchant_id == EXTERNAL_SEED_MERCHANT_ID
         )
@@ -1405,7 +1425,8 @@ async def agent_search_products(
         # just to fetch a first page of products; doing N+1 enrichment queries
         # can exceed upstream timeouts.
         if is_browse_mode:
-            browse_candidates: List[Dict[str, Any]] = []
+            browse_internal: List[Dict[str, Any]] = []
+            browse_external: List[Dict[str, Any]] = []
             for product in all_products:
                 if in_stock_only and not product.get("in_stock", True):
                     continue
@@ -1421,10 +1442,32 @@ async def agent_search_products(
                     "ranking_score", float(product.get("relevance_score", 1.0) or 1.0)
                 )
                 product.setdefault("ranking_features", {"mode": "browse"})
-                browse_candidates.append(product)
+                if (
+                    normalized_seed_strategy == "supplement_internal_first"
+                    and merchant_id != EXTERNAL_SEED_MERCHANT_ID
+                    and _is_external_seed_product(product)
+                ):
+                    browse_external.append(product)
+                else:
+                    browse_internal.append(product)
+
+            if normalized_seed_strategy == "supplement_internal_first" and merchant_id != EXTERNAL_SEED_MERCHANT_ID:
+                browse_candidates = browse_internal + browse_external
+            else:
+                browse_candidates = browse_internal + browse_external
 
             total = len(browse_candidates)
             paginated_products = browse_candidates[offset : offset + limit]
+            external_count = sum(1 for p in paginated_products if _is_external_seed_product(p))
+            source_breakdown = {
+                "internal_count": len(paginated_products) - external_count,
+                "external_seed_count": external_count,
+                "stale_cache_used": any(
+                    "stale" in str((p.get("query_source") or "")).lower()
+                    for p in browse_candidates
+                ),
+                "strategy_applied": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+            }
 
             background_tasks.add_task(
                 log_agent_request,
@@ -1475,11 +1518,13 @@ async def agent_search_products(
                     "source": "agent_search_products",
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
+                    "source_breakdown": source_breakdown,
                 },
             }
 
         # Search mode: Apply filters, hydrate features, then compute ranking.
         ranked_candidates: List[Dict[str, Any]] = []
+        external_ranked_candidates: List[Dict[str, Any]] = []
         candidates: List[Dict[str, Any]] = []
         candidate_features: List[AgentRankingFeatures] = []
 
@@ -1552,7 +1597,13 @@ async def agent_search_products(
                 except Exception:
                     product["ranking_score"] = product.get("relevance_score", 0.0)
                 product["ranking_features"] = {"source": "external_seed"}
-                ranked_candidates.append(product)
+                if (
+                    normalized_seed_strategy == "supplement_internal_first"
+                    and merchant_id != EXTERNAL_SEED_MERCHANT_ID
+                ):
+                    external_ranked_candidates.append(product)
+                else:
+                    ranked_candidates.append(product)
                 continue
 
             platform = product.get("platform") or "unknown"
@@ -1633,10 +1684,29 @@ async def agent_search_products(
             key=lambda p: (p.get("ranking_score") is not None, p.get("ranking_score", p.get("relevance_score", 0))),
             reverse=True,
         )
+        if external_ranked_candidates:
+            external_ranked_candidates.sort(
+                key=lambda p: (
+                    p.get("ranking_score") is not None,
+                    p.get("ranking_score", p.get("relevance_score", 0)),
+                ),
+                reverse=True,
+            )
+            ranked_candidates = ranked_candidates + external_ranked_candidates
 
         # Pagination
         total = len(ranked_candidates)
         paginated_products = ranked_candidates[offset : offset + limit]
+        external_count = sum(1 for p in paginated_products if _is_external_seed_product(p))
+        source_breakdown = {
+            "internal_count": len(paginated_products) - external_count,
+            "external_seed_count": external_count,
+            "stale_cache_used": any(
+                "stale" in str((p.get("query_source") or "")).lower()
+                for p in ranked_candidates
+            ),
+            "strategy_applied": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+        }
 
         # Log a compact view of ranking features for top N
         try:
@@ -1756,6 +1826,7 @@ async def agent_search_products(
                 "source": "agent_search_products",
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
+                "source_breakdown": source_breakdown,
             },
         }
         

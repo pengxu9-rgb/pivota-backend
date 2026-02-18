@@ -1660,3 +1660,129 @@ def test_agent_products_search_handles_db_rows_with_noncallable_get(
     payload = res.json()
     assert payload.get("status") == "success"
     assert isinstance(payload.get("products"), list)
+
+
+def test_agent_products_search_allow_external_seed_false_disables_external_merge(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    class _FakeProduct:
+        def model_dump(self):
+            return {
+                "id": "prod_internal_1",
+                "product_id": "prod_internal_1",
+                "title": "IPSA Time Reset Aqua",
+                "description": "internal cache",
+                "platform": "shopify",
+                "price": 39,
+                "in_stock": True,
+            }
+
+    async def fake_fetch_all(query: str, values=None):
+        text = str(query)
+        if "FROM merchant_onboarding" in text:
+            return [{"merchant_id": "m_001", "business_name": "Merchant One"}]
+        return []
+
+    external_loader = AsyncMock(
+        return_value=[
+            {
+                "id": "ext_seed_1",
+                "product_id": "ext_seed_1",
+                "merchant_id": "external_seed",
+                "source": "external_seed",
+                "title": "IPSA External Seed",
+                "price": 29.0,
+                "in_stock": True,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "get_products_hybrid", AsyncMock(return_value=([_FakeProduct()], "cache", None)))
+    monkeypatch.setattr(agent_api_module, "_load_external_seed_products_for_search", external_loader)
+    monkeypatch.setattr(agent_api_module, "hydrate_quality_and_enrichment", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "passes_agent_gating", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(agent_api_module, "compute_agent_ranking_score", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(agent_api_module, "serialize_features_for_log", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agent_api_module, "log_product_events", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+
+    res = client.get(
+        "/agent/v1/products/search?search_all_merchants=true&query=ipsa&allow_external_seed=false&in_stock_only=false&limit=10&offset=0",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    products = payload.get("products") or []
+    assert products
+    assert all(p.get("merchant_id") != "external_seed" for p in products)
+    source_breakdown = ((payload.get("metadata") or {}).get("source_breakdown") or {})
+    assert source_breakdown.get("external_seed_count") == 0
+    assert source_breakdown.get("strategy_applied") == "external_seed_disabled"
+    assert external_loader.await_count == 0
+
+
+def test_agent_products_search_supplement_internal_first_keeps_internal_ahead(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    class _FakeProduct:
+        def model_dump(self):
+            return {
+                "id": "prod_internal_2",
+                "product_id": "prod_internal_2",
+                "title": "IPSA Internal Toner",
+                "description": "internal candidate",
+                "platform": "shopify",
+                "price": 35,
+                "in_stock": True,
+            }
+
+    async def fake_fetch_all(query: str, values=None):
+        text = str(query)
+        if "FROM merchant_onboarding" in text:
+            return [{"merchant_id": "m_001", "business_name": "Merchant One"}]
+        return []
+
+    external_loader = AsyncMock(
+        return_value=[
+            {
+                "id": "ext_seed_2",
+                "product_id": "ext_seed_2",
+                "merchant_id": "external_seed",
+                "source": "external_seed",
+                "title": "IPSA External Seed Candidate",
+                "description": "external supplement",
+                "price": 28.0,
+                "in_stock": True,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "get_products_hybrid", AsyncMock(return_value=([_FakeProduct()], "cache", None)))
+    monkeypatch.setattr(agent_api_module, "_load_external_seed_products_for_search", external_loader)
+    monkeypatch.setattr(agent_api_module, "hydrate_quality_and_enrichment", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "passes_agent_gating", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(agent_api_module, "compute_agent_ranking_score", lambda *_args, **_kwargs: 0.1)
+    monkeypatch.setattr(agent_api_module, "serialize_features_for_log", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agent_api_module, "log_product_events", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+
+    res = client.get(
+        "/agent/v1/products/search?search_all_merchants=true&query=ipsa&allow_external_seed=true&external_seed_strategy=supplement_internal_first&in_stock_only=false&limit=10&offset=0",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    products = payload.get("products") or []
+    assert len(products) >= 2
+    assert products[0].get("merchant_id") != "external_seed"
+    assert any(p.get("merchant_id") == "external_seed" for p in products[1:])
+    source_breakdown = ((payload.get("metadata") or {}).get("source_breakdown") or {})
+    assert source_breakdown.get("internal_count", 0) >= 1
+    assert source_breakdown.get("external_seed_count", 0) >= 1
+    assert source_breakdown.get("strategy_applied") == "supplement_internal_first"

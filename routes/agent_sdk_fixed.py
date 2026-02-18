@@ -662,6 +662,9 @@ async def search_products(
     in_stock_only: Optional[bool] = Query(None),
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
+    allow_external_seed: bool = Query(default=True),
+    allow_stale_cache: bool = Query(default=True),
+    external_seed_strategy: str = Query(default="legacy"),
     context: AgentContext = Depends(get_agent_context)
 ):
     """
@@ -938,6 +941,9 @@ async def search_products(
                 in_stock_only=bool(effective_in_stock_only),
                 limit=limit,
                 offset=offset,
+                allow_external_seed=allow_external_seed,
+                allow_stale_cache=allow_stale_cache,
+                external_seed_strategy=external_seed_strategy,
                 context=context,
             ),
             timeout=delegate_timeout_s,

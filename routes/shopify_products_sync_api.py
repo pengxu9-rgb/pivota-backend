@@ -36,12 +36,14 @@ async def require_shopify_products_admin(
 async def sync_shopify_products_endpoint(
     merchant_id: str = Path(..., description="Internal merchant ID"),
     limit: int = Query(default=500, ge=1, le=5000),
+    ttl_seconds: int = Query(default=7 * 24 * 60 * 60, ge=300, le=30 * 24 * 60 * 60),
     _: None = Depends(require_shopify_products_admin),
 ) -> Dict[str, Any]:
     try:
         summary = await sync_shopify_products_for_merchant(
             merchant_id=merchant_id,
             limit=limit,
+            ttl_seconds=ttl_seconds,
         )
         return {"ok": True, "summary": summary}
     except ShopifyProductsSyncConfigError as exc:
@@ -75,7 +77,7 @@ async def sync_shopify_products_endpoint(
 async def sync_shopify_products_get(
     merchant_id: str = Path(..., description="Internal merchant ID"),
     limit: int = Query(default=500, ge=1, le=5000),
+    ttl_seconds: int = Query(default=7 * 24 * 60 * 60, ge=300, le=30 * 24 * 60 * 60),
     _: None = Depends(require_shopify_products_admin),
 ) -> Dict[str, Any]:
-    return await sync_shopify_products_endpoint(merchant_id=merchant_id, limit=limit)  # type: ignore[arg-type]
-
+    return await sync_shopify_products_endpoint(merchant_id=merchant_id, limit=limit, ttl_seconds=ttl_seconds)  # type: ignore[arg-type]
