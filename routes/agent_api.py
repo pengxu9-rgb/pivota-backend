@@ -49,6 +49,10 @@ from services.agent_ranking_service import (
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
 from db.products import get_cached_products
+from observability.reliability_metrics import (
+    record_catalog_search,
+    record_catalog_upstream_fallback,
+)
 import httpx
 import uuid
 
@@ -1568,9 +1572,28 @@ async def agent_search_products(
     """
     started = time.perf_counter()
     try:
+        def _record_search_metric(*, mode: str, path: str, result: str) -> None:
+            try:
+                record_catalog_search(
+                    mode=mode,
+                    path=path,
+                    result=result,
+                    duration_seconds=max(0.0, time.perf_counter() - started),
+                )
+            except Exception:
+                pass
+
         normalized_seed_strategy = str(external_seed_strategy or "legacy").strip().lower()
         if normalized_seed_strategy not in {"legacy", "supplement_internal_first"}:
             normalized_seed_strategy = "legacy"
+        # Defensive normalization: this handler is also called directly by
+        # other routes (not only via FastAPI parameter parsing).
+        if isinstance(fast_mode, bool):
+            fast_mode_enabled = fast_mode
+        elif isinstance(fast_mode, str):
+            fast_mode_enabled = fast_mode.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            fast_mode_enabled = False
 
         def _is_external_seed_product(product: Dict[str, Any]) -> bool:
             return (
@@ -1699,6 +1722,11 @@ async def agent_search_products(
                         "result_count": len(page_items),
                     },
                 )
+                _record_search_metric(
+                    mode="browse_fastpath",
+                    path="cross_merchant_browse_fastpath",
+                    result="ok" if page_items else "no_candidates",
+                )
 
                 return {
                     "status": "success",
@@ -1802,7 +1830,7 @@ async def agent_search_products(
                     if mid
                 }
 
-        if fast_mode:
+        if fast_mode_enabled:
             merchant_scope_for_fast = list(dict.fromkeys([m for m in merchants_to_search if m])) if merchants_to_search else None
             fast_result = await _search_products_fast_mode(
                 merchant_scope=merchant_scope_for_fast,
@@ -1900,6 +1928,11 @@ async def agent_search_products(
                     "merchants_searched": len(merchant_scope_for_fast or []),
                     "fast_mode": True,
                 },
+            )
+            _record_search_metric(
+                mode="fast_mode",
+                path="cross_merchant_search_fast_mode",
+                result="ok" if paginated_products else "no_candidates",
             )
 
             return {
@@ -2044,6 +2077,7 @@ async def agent_search_products(
                     all_products.extend(external_seed_products)
             except Exception as e:
                 logger.warning(f"Failed to load external seed products: {e}")
+                record_catalog_upstream_fallback(reason="external_seed_load_failed")
 
         ranking_config = get_agent_ranking_config()
 
@@ -2115,6 +2149,11 @@ async def agent_search_products(
                     "result_count": len(paginated_products),
                     "merchants_searched": len(merchants_to_search),
                 },
+            )
+            _record_search_metric(
+                mode="browse_standard",
+                path="cross_merchant_browse_standard",
+                result="ok" if paginated_products else "no_candidates",
             )
 
             return {
@@ -2429,6 +2468,11 @@ async def agent_search_products(
                 "merchants_searched": len(merchants_to_search),
             },
         )
+        _record_search_metric(
+            mode="search_standard",
+            path="cross_merchant_search_standard",
+            result="ok" if paginated_products else "no_candidates",
+        )
         
         return {
             "status": "success",
@@ -2491,6 +2535,11 @@ async def agent_search_products(
             status_code=500,
             merchant_id=merchant_id,
             error_message=str(e)
+        )
+        _record_search_metric(
+            mode="search_standard",
+            path="cross_merchant_search_standard",
+            result="error",
         )
         raise HTTPException(status_code=500, detail="Search failed")
 
