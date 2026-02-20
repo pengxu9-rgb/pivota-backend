@@ -32,7 +32,9 @@ class MerchantAPIAdapter:
         self, 
         limit: int = 50,
         offset: int = 0,
-        filters: Optional[Dict[str, Any]] = None
+        filters: Optional[Dict[str, Any]] = None,
+        timeout_seconds: float = 1.0,
+        request_id: Optional[str] = None,
     ) -> Tuple[List[StandardProduct], Optional[str]]:
         """
         Query products from merchant API
@@ -47,13 +49,13 @@ class MerchantAPIAdapter:
         """
         try:
             # Construct request
-            headers = self._build_headers()
+            headers = self._build_headers(request_id=request_id)
             params = {"limit": limit, "offset": offset}
             if filters:
                 params.update(filters)
             
             # Call merchant API with 1s timeout (fail fast)
-            async with httpx.AsyncClient(timeout=1.0) as client:
+            async with httpx.AsyncClient(timeout=max(0.05, float(timeout_seconds or 1.0))) as client:
                 response = await client.get(
                     f"{self.endpoint}/products",
                     headers=headers,
@@ -91,12 +93,14 @@ class MerchantAPIAdapter:
             logger.error(error_msg)
             return [], error_msg
     
-    def _build_headers(self) -> Dict[str, str]:
+    def _build_headers(self, request_id: Optional[str] = None) -> Dict[str, str]:
         """Build request headers with authentication"""
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "Pivota-Agent/1.0"
         }
+        if request_id:
+            headers["X-Request-Id"] = str(request_id)
         
         # Add authentication
         api_key = self.credentials.get("api_key")
@@ -183,7 +187,6 @@ class MerchantAPIAdapter:
         ).hexdigest()
         
         return hmac.compare_digest(expected, signature)
-
 
 
 
