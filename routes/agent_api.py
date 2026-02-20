@@ -177,6 +177,22 @@ AGENT_PRODUCT_DETAIL_SCAN_LIMIT = int(
         max_value=10000.0,
     )
 )
+AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT = int(
+    _env_float(
+        "AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT",
+        1200.0,
+        min_value=200.0,
+        max_value=5000.0,
+    )
+)
+AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT = int(
+    _env_float(
+        "AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT",
+        300.0,
+        min_value=50.0,
+        max_value=2000.0,
+    )
+)
 
 
 def _safe_price_number(value: Any, default: float = 0.0) -> float:
@@ -451,6 +467,67 @@ async def _load_cached_product_for_agent_detail(
     return None
 
 
+async def _load_upstream_product_for_agent_detail(
+    *,
+    merchant_id: str,
+    product_ref: str,
+    context: AgentContext,
+) -> Dict[str, Any]:
+    alias_set = set(_expand_product_ref_aliases(product_ref))
+    if not alias_set:
+        return {"product": None, "query_source": None}
+
+    try:
+        products, query_source, _ = await get_products_hybrid(
+            merchant_id=merchant_id,
+            limit=AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT,
+            agent_id=getattr(context, "agent_id", "agent"),
+            background_tasks=None,
+            force_cache_only=False,
+            allow_stale_cache=False,
+        )
+    except Exception as exc:
+        logger.warning(
+            "agent_get_product upstream detail probe failed",
+            extra={
+                "event": "agent_get_product.upstream_probe_failed",
+                "merchant_id": merchant_id,
+                "product_ref": product_ref,
+                "error": str(exc),
+            },
+        )
+        return {"product": None, "query_source": None}
+
+    for item in products or []:
+        if isinstance(item, StandardProduct):
+            product_data = item.model_dump()
+        elif hasattr(item, "dict"):
+            product_data = item.dict()  # type: ignore[attr-defined]
+        elif isinstance(item, dict):
+            product_data = dict(item)
+        else:
+            continue
+        aliases = _collect_product_aliases(
+            product_data,
+            row_platform_product_id=str(product_data.get("platform_product_id") or "").strip() or None,
+        )
+        if alias_set.intersection(aliases):
+            normalized = _normalize_product_detail_payload(
+                product_data,
+                fallback_product_id=str(
+                    product_data.get("platform_product_id")
+                    or product_data.get("product_id")
+                    or product_data.get("id")
+                    or ""
+                ).strip()
+                or None,
+                merchant_id=merchant_id,
+            )
+            return {"product": normalized, "query_source": query_source}
+
+    return {"product": None, "query_source": query_source}
+
+
 def _build_route_health(
     *,
     primary_path_used: str,
@@ -466,6 +543,213 @@ def _build_route_health(
         "primary_latency_ms": max(0, int(primary_latency_ms or 0)),
         "fallback_triggered": triggered,
         "fallback_reason": reason,
+    }
+
+
+def _build_product_search_blob(product: Dict[str, Any]) -> str:
+    tags = product.get("tags")
+    if isinstance(tags, list):
+        tags_text = " ".join(str(v or "").strip() for v in tags if str(v or "").strip())
+    else:
+        tags_text = str(tags or "").strip()
+    parts = [
+        product.get("title"),
+        product.get("name"),
+        product.get("description"),
+        product.get("product_type"),
+        product.get("vendor"),
+        product.get("brand"),
+        tags_text,
+    ]
+    return " ".join(str(v or "").strip().lower() for v in parts if str(v or "").strip())
+
+
+def _score_fast_mode_relevance(
+    product: Dict[str, Any],
+    *,
+    normalized_query: str,
+    query_terms: List[str],
+) -> float:
+    if not normalized_query:
+        return 1.0
+    title = str(product.get("title") or product.get("name") or "").strip().lower()
+    blob = _build_product_search_blob(product)
+    if normalized_query and normalized_query in title:
+        return 1.0 if normalized_query == title else 0.92
+    if normalized_query and normalized_query in blob:
+        return 0.8
+
+    terms = [str(t or "").strip().lower() for t in query_terms if str(t or "").strip()]
+    if not terms:
+        terms = [tok for tok in normalized_query.split() if tok]
+    if not terms:
+        return 0.0
+    hits = sum(1 for term in terms if term in blob)
+    if hits <= 0:
+        return 0.0
+    return 0.45 + (hits / max(1, len(terms))) * 0.45
+
+
+def _passes_category_filter_fast(product: Dict[str, Any], normalized_category: str) -> bool:
+    if not normalized_category:
+        return True
+    category_blob = " ".join(
+        [
+            str(product.get("category") or ""),
+            str(product.get("product_type") or ""),
+            str(product.get("title") or ""),
+            str(product.get("name") or ""),
+            " ".join(product.get("tags") or []) if isinstance(product.get("tags"), list) else str(product.get("tags") or ""),
+        ]
+    ).lower()
+    return normalized_category in category_blob
+
+
+async def _search_products_fast_mode(
+    *,
+    merchant_scope: Optional[List[str]],
+    query: Optional[str],
+    category: Optional[str],
+    min_price: Optional[float],
+    max_price: Optional[float],
+    in_stock_only: bool,
+    limit: int,
+    offset: int,
+    normalized_seed_strategy: str,
+    allow_external_seed: bool,
+    allow_stale_cache: bool,
+) -> Dict[str, Any]:
+    normalized_query = str(query or "").strip().lower()
+    normalized_category = str(category or "").strip().lower()
+    page_limit = max(1, min(int(limit or 20), 100))
+    page_offset = max(0, int(offset or 0))
+    fetch_limit = min(
+        AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT,
+        max(page_limit * 20 + 100, 300),
+    )
+
+    where_clauses = [
+        "mo.status NOT IN ('deleted', 'rejected')",
+        "mo.psp_connected = true",
+    ]
+    params: Dict[str, Any] = {
+        "limit": fetch_limit,
+        "offset": 0,
+    }
+    if merchant_scope:
+        where_clauses.append("pc.merchant_id = ANY(:merchant_ids)")
+        params["merchant_ids"] = merchant_scope
+    if not allow_stale_cache:
+        where_clauses.append("(pc.expires_at IS NULL OR pc.expires_at > NOW())")
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT pc.merchant_id,
+               mo.business_name AS merchant_name,
+               pc.product_data,
+               pc.cached_at,
+               pc.expires_at
+        FROM products_cache pc
+        JOIN merchant_onboarding mo
+          ON mo.merchant_id = pc.merchant_id
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY pc.cached_at DESC NULLS LAST, pc.id DESC
+        LIMIT :limit
+        OFFSET :offset
+        """,
+        params,
+    )
+
+    internal_ranked: List[Dict[str, Any]] = []
+    external_ranked: List[Dict[str, Any]] = []
+    stale_cache_used = False
+    seen_keys = set()
+
+    for row in rows or []:
+        row_data = _row_as_dict(row)
+        if not row_data:
+            continue
+        pdata = row_data.get("product_data")
+        if isinstance(pdata, str):
+            try:
+                pdata = json.loads(pdata)
+            except Exception:
+                continue
+        if not isinstance(pdata, dict):
+            continue
+        product = dict(pdata)
+        product["merchant_id"] = str(row_data.get("merchant_id") or product.get("merchant_id") or "").strip()
+        product["merchant_name"] = row_data.get("merchant_name") or product.get("merchant_name") or "Unknown"
+        if not product["merchant_id"]:
+            continue
+
+        key = f"{product['merchant_id']}::{str(product.get('product_id') or product.get('id') or '').strip()}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        if in_stock_only and not _availability_to_in_stock(product.get("in_stock")):
+            continue
+
+        price = _safe_price_number(product.get("price"), 0.0)
+        if min_price is not None and price < float(min_price):
+            continue
+        if max_price is not None and price > float(max_price):
+            continue
+        if not _passes_category_filter_fast(product, normalized_category):
+            continue
+
+        score = _score_fast_mode_relevance(
+            product,
+            normalized_query=normalized_query,
+            query_terms=[tok for tok in normalized_query.split() if tok],
+        )
+        if normalized_query and score <= 0:
+            continue
+        product["relevance_score"] = score
+        product["ranking_score"] = score
+        product["ranking_features"] = {"mode": "fast_mode"}
+
+        query_source = str(product.get("query_source") or "")
+        if "stale" in query_source.lower():
+            stale_cache_used = True
+
+        is_external_seed = (
+            str(product.get("merchant_id") or "").strip() == EXTERNAL_SEED_MERCHANT_ID
+            or str(product.get("source") or "").strip() == "external_seed"
+        )
+        if is_external_seed and allow_external_seed:
+            external_ranked.append(product)
+        elif not is_external_seed:
+            internal_ranked.append(product)
+
+    internal_ranked.sort(key=lambda p: p.get("ranking_score", 0.0), reverse=True)
+    external_ranked.sort(key=lambda p: p.get("ranking_score", 0.0), reverse=True)
+
+    ranked: List[Dict[str, Any]]
+    if normalized_seed_strategy == "supplement_internal_first":
+        ranked = internal_ranked + external_ranked
+    else:
+        ranked = internal_ranked + external_ranked
+
+    total = len(ranked)
+    paginated = ranked[page_offset : page_offset + page_limit]
+    external_count = sum(
+        1
+        for product in paginated
+        if str(product.get("merchant_id") or "").strip() == EXTERNAL_SEED_MERCHANT_ID
+        or str(product.get("source") or "").strip() == "external_seed"
+    )
+    source_breakdown = {
+        "internal_count": len(paginated) - external_count,
+        "external_seed_count": external_count,
+        "stale_cache_used": stale_cache_used,
+        "strategy_applied": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+    }
+    return {
+        "products": paginated,
+        "total": total,
+        "source_breakdown": source_breakdown,
     }
 
 
@@ -1268,6 +1552,7 @@ async def agent_search_products(
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),
     external_seed_strategy: str = Query(default="legacy"),
+    fast_mode: bool = Query(default=False),
     context: AgentContext = Depends(get_agent_context),
 ):
     """
@@ -1516,6 +1801,143 @@ async def agent_search_products(
                     for mid in [str(row_data.get("merchant_id") or "").strip()]
                     if mid
                 }
+
+        if fast_mode:
+            merchant_scope_for_fast = list(dict.fromkeys([m for m in merchants_to_search if m])) if merchants_to_search else None
+            fast_result = await _search_products_fast_mode(
+                merchant_scope=merchant_scope_for_fast,
+                query=normalized_query or None,
+                category=normalized_category or None,
+                min_price=min_price,
+                max_price=max_price,
+                in_stock_only=in_stock_only,
+                limit=limit,
+                offset=offset,
+                normalized_seed_strategy=normalized_seed_strategy,
+                allow_external_seed=allow_external_seed,
+                allow_stale_cache=allow_stale_cache,
+            )
+            paginated_products = list(fast_result["products"])
+            total = int(fast_result["total"] or 0)
+            source_breakdown = dict(fast_result["source_breakdown"] or {})
+
+            if (
+                allow_external_seed
+                and normalized_seed_strategy == "supplement_internal_first"
+                and merchant_id != EXTERNAL_SEED_MERCHANT_ID
+                and (merchant_id is None and not merchant_ids)
+                and len(paginated_products) < limit
+            ):
+                try:
+                    ext_limit = min(120, max(limit * 3, 20))
+                    external_seed_products = await _load_external_seed_products_for_search(
+                        req=req,
+                        query=query,
+                        limit=ext_limit,
+                    )
+                    seen_keys = {
+                        f"{str(p.get('merchant_id') or '').strip()}::{str(p.get('product_id') or p.get('id') or '').strip()}"
+                        for p in paginated_products
+                    }
+                    to_append: List[Dict[str, Any]] = []
+                    for product in external_seed_products or []:
+                        key = f"{str(product.get('merchant_id') or '').strip()}::{str(product.get('product_id') or product.get('id') or '').strip()}"
+                        if not key or key in seen_keys:
+                            continue
+                        if in_stock_only and not _availability_to_in_stock(product.get("in_stock")):
+                            continue
+                        price = _safe_price_number(product.get("price"), 0.0)
+                        if min_price is not None and price < float(min_price):
+                            continue
+                        if max_price is not None and price > float(max_price):
+                            continue
+                        if not _passes_category_filter_fast(product, normalized_category):
+                            continue
+                        score = _score_fast_mode_relevance(
+                            product,
+                            normalized_query=normalized_query,
+                            query_terms=query_terms,
+                        )
+                        if normalized_query and score <= 0:
+                            continue
+                        product = dict(product)
+                        product["relevance_score"] = score
+                        product["ranking_score"] = score
+                        product["ranking_features"] = {"mode": "fast_mode_external_seed"}
+                        seen_keys.add(key)
+                        to_append.append(product)
+                        if len(paginated_products) + len(to_append) >= limit:
+                            break
+                    if to_append:
+                        paginated_products.extend(to_append)
+                        source_breakdown["external_seed_count"] = int(source_breakdown.get("external_seed_count", 0) or 0) + len(to_append)
+                        source_breakdown["internal_count"] = max(
+                            0,
+                            len(paginated_products) - int(source_breakdown.get("external_seed_count", 0) or 0),
+                        )
+                        total = max(total, len(paginated_products))
+                except Exception:
+                    logger.debug("agent_search_products fast mode external seed supplement failed", exc_info=True)
+
+            latency_ms = int((time.perf_counter() - started) * 1000)
+
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id or "cross_merchant_search",
+            )
+            logger.info(
+                "agent_search_products.summary",
+                extra={
+                    "event": "agent_search_products.summary",
+                    "query": query,
+                    "merchant_scope": merchant_id,
+                    "merchant_ids": merchant_ids,
+                    "reason_code": "ok" if paginated_products else "no_candidates",
+                    "latency_ms": latency_ms,
+                    "result_count": len(paginated_products),
+                    "merchants_searched": len(merchant_scope_for_fast or []),
+                    "fast_mode": True,
+                },
+            )
+
+            return {
+                "status": "success",
+                "products": paginated_products,
+                "pagination": {
+                    "total_count": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "page": (offset // limit) + 1 if limit > 0 else 1,
+                    "total_pages": (total + limit - 1) // limit if limit > 0 else 1,
+                    "has_more": offset + limit < total,
+                },
+                "search_context": {
+                    "merchant_id": merchant_id,
+                    "merchant_ids": merchant_ids,
+                    "merchants_searched": len(merchant_scope_for_fast or []),
+                    "cross_merchant_search": merchant_id is None and not merchant_ids,
+                },
+                "filters_applied": {
+                    "query": query,
+                    "category": category,
+                    "min_price": min_price,
+                    "max_price": max_price,
+                    "in_stock_only": in_stock_only,
+                },
+                "metadata": {
+                    "source": "agent_search_products_fast_mode",
+                    "reason_code": "ok" if paginated_products else "no_candidates",
+                    "latency_ms": latency_ms,
+                    "source_breakdown": source_breakdown,
+                    "route_health": _build_route_health(
+                        primary_path_used="cross_merchant_search_fast_mode",
+                        primary_latency_ms=latency_ms,
+                        source_breakdown=source_breakdown,
+                    ),
+                },
+            }
 
         # Collect products from all target merchants
         all_products: List[Dict[str, Any]] = []
@@ -2967,13 +3389,31 @@ async def agent_get_product(
                 },
             }
         
-        # 从缓存获取产品（先读新鲜缓存；可选回退到有限期 stale 缓存）
+        # Detail source order:
+        # 1) fresh_cache
+        # 2) upstream (realtime path)
+        # 3) stale_cache (bounded age)
         product = await _load_cached_product_for_agent_detail(
             merchant_id=merchant_id,
             product_ref=product_id,
             include_expired=False,
         )
+        detail_source = "fresh_cache"
         stale_fallback_used = False
+        upstream_query_source: Optional[str] = None
+
+        if product is None:
+            upstream_probe = await _load_upstream_product_for_agent_detail(
+                merchant_id=merchant_id,
+                product_ref=product_id,
+                context=context,
+            )
+            upstream_candidate = upstream_probe.get("product")
+            upstream_query_source = upstream_probe.get("query_source")
+            if upstream_candidate is not None:
+                product = upstream_candidate
+                detail_source = "upstream"
+
         if (
             product is None
             and AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED
@@ -2987,6 +3427,8 @@ async def agent_get_product(
                 stale_cutoff=stale_cutoff,
             )
             stale_fallback_used = product is not None
+            if stale_fallback_used:
+                detail_source = "stale_cache"
 
         if product is not None:
             background_tasks.add_task(
@@ -2999,9 +3441,13 @@ async def agent_get_product(
                 "status": "success",
                 "product": product,
                 "metadata": {
-                    "detail_source": "stale_cache" if stale_fallback_used else "fresh_cache",
+                    "detail_source": detail_source,
                 },
             }
+            if detail_source == "upstream":
+                resp["metadata"]["cache_source"] = "merchant_realtime_probe"
+                if upstream_query_source:
+                    resp["metadata"]["upstream_query_source"] = upstream_query_source
             if stale_fallback_used:
                 resp["metadata"]["cache_source"] = "products_cache_stale_fallback"
                 resp["metadata"]["stale_max_age_hours"] = AGENT_PRODUCT_DETAIL_STALE_MAX_AGE_HOURS

@@ -53,6 +53,11 @@ def test_agent_get_product_uses_stale_cache_fallback(
         "_load_cached_product_for_agent_detail",
         fake_load_cached_product_for_agent_detail,
     )
+    monkeypatch.setattr(
+        agent_api_module,
+        "_load_upstream_product_for_agent_detail",
+        AsyncMock(return_value={"product": None, "query_source": None}),
+    )
     monkeypatch.setattr(agent_api_module, "_context_can_access_merchant", lambda _ctx, _mid: True)
     monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
     monkeypatch.setattr(agent_api_module, "AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED", True)
@@ -97,6 +102,11 @@ def test_agent_get_product_without_stale_fallback_returns_404(
         "_load_cached_product_for_agent_detail",
         fake_load_cached_product_for_agent_detail,
     )
+    monkeypatch.setattr(
+        agent_api_module,
+        "_load_upstream_product_for_agent_detail",
+        AsyncMock(return_value={"product": None, "query_source": None}),
+    )
     monkeypatch.setattr(agent_api_module, "_context_can_access_merchant", lambda _ctx, _mid: True)
     monkeypatch.setattr(agent_api_module, "AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED", False)
 
@@ -107,6 +117,56 @@ def test_agent_get_product_without_stale_fallback_returns_404(
     assert response.status_code == 404
     assert response.json().get("detail") == "Product not found"
     assert calls == [False]
+
+
+def test_agent_get_product_prefers_upstream_before_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    async def fake_load_cached_product_for_agent_detail(
+        *,
+        merchant_id: str,
+        product_ref: str,
+        include_expired: bool = False,
+        stale_cutoff=None,
+    ):
+        return None
+
+    monkeypatch.setattr(
+        agent_api_module,
+        "_load_cached_product_for_agent_detail",
+        fake_load_cached_product_for_agent_detail,
+    )
+    monkeypatch.setattr(
+        agent_api_module,
+        "_load_upstream_product_for_agent_detail",
+        AsyncMock(
+            return_value={
+                "product": {
+                    "id": "9886500127048",
+                    "product_id": "9886500127048",
+                    "title": "IPSA Time Reset Aqua",
+                    "price": 45.0,
+                    "currency": "USD",
+                },
+                "query_source": "realtime",
+            }
+        ),
+    )
+    monkeypatch.setattr(agent_api_module, "_context_can_access_merchant", lambda _ctx, _mid: True)
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+
+    response = client.get(
+        "/agent/v1/products/merch_test/9886500127048",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["product"]["product_id"] == "9886500127048"
+    assert payload.get("metadata", {}).get("detail_source") == "upstream"
 
 
 def test_normalize_product_detail_payload_backfills_variant_price() -> None:
