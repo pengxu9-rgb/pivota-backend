@@ -176,3 +176,175 @@ async def test_get_products_hybrid_cache_path_disables_stale_when_requested(
     assert error is None
     assert source == "cache"
     assert products == []
+
+
+@pytest.mark.asyncio
+async def test_get_products_hybrid_budget_flag_off_keeps_realtime_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    import services.product_query_service as pqs
+    from core.reliability.budget import RequestBudget
+
+    config = pqs.RealtimeConfig(
+        realtime_enabled=True,
+        api_endpoint="https://merchant.example.com/api",
+        api_key="k",
+        ttl_seconds=600,
+        platform="shopify",
+    )
+
+    async def fake_config(_merchant_id: str):
+        return config
+
+    class FakeAdapter:
+        calls = []
+
+        def __init__(self, endpoint: str, credentials):
+            self.endpoint = endpoint
+            self.credentials = credentials
+
+        async def query_products(self, **kwargs):
+            FakeAdapter.calls.append(kwargs)
+            return [], None
+
+    monkeypatch.setattr(pqs, "RELIABILITY_BUDGET_ENABLED", False)
+    monkeypatch.setattr(pqs, "get_merchant_realtime_config", fake_config)
+    monkeypatch.setattr(pqs, "MerchantAPIAdapter", FakeAdapter)
+
+    expired_budget = RequestBudget(deadline_monotonic=time.monotonic() - 1.0)
+
+    products, source, error = await pqs.get_products_hybrid(
+        merchant_id="m_budget_off",
+        limit=20,
+        agent_id="agent_budget_off",
+        request_budget=expired_budget,
+    )
+
+    assert error is None
+    assert source == "realtime"
+    assert products == []
+    assert len(FakeAdapter.calls) == 1
+    assert FakeAdapter.calls[0]["timeout_seconds"] == 1.0
+    assert FakeAdapter.calls[0]["request_id"] == "pq:agent_budget_off:m_budget_off"
+
+
+@pytest.mark.asyncio
+async def test_get_products_hybrid_budget_exhausted_skips_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    import services.product_query_service as pqs
+    from core.reliability.budget import RequestBudget
+    from models.standard_product import ProductStatus, StandardProduct
+
+    config = pqs.RealtimeConfig(
+        realtime_enabled=True,
+        api_endpoint="https://merchant.example.com/api",
+        api_key="k",
+        ttl_seconds=600,
+        platform="shopify",
+    )
+
+    fallback_product = StandardProduct(
+        id="p_budget_cache_1",
+        product_id="p_budget_cache_1",
+        platform="shopify",
+        merchant_id="m_budget_on",
+        title="Budget fallback product",
+        description="cache",
+        price=9.0,
+        currency="USD",
+        inventory_quantity=2,
+        orderable=True,
+        status=ProductStatus.ACTIVE,
+    )
+
+    async def fake_config(_merchant_id: str):
+        return config
+
+    async def fake_cache(_merchant_id: str, _platform: str, _limit: int, include_expired: bool = False):
+        return [fallback_product]
+
+    class FakeAdapter:
+        calls = 0
+
+        def __init__(self, endpoint: str, credentials):
+            self.endpoint = endpoint
+            self.credentials = credentials
+
+        async def query_products(self, **kwargs):
+            FakeAdapter.calls += 1
+            return [], None
+
+    monkeypatch.setattr(pqs, "RELIABILITY_BUDGET_ENABLED", True)
+    monkeypatch.setattr(pqs, "get_merchant_realtime_config", fake_config)
+    monkeypatch.setattr(pqs, "_get_from_cache", fake_cache)
+    monkeypatch.setattr(pqs, "MerchantAPIAdapter", FakeAdapter)
+
+    expired_budget = RequestBudget(deadline_monotonic=time.monotonic() - 1.0)
+
+    products, source, error = await pqs.get_products_hybrid(
+        merchant_id="m_budget_on",
+        limit=20,
+        agent_id="agent_budget_on",
+        request_budget=expired_budget,
+    )
+
+    assert error is None
+    assert source == "realtime_budget_exhausted_cache_fallback"
+    assert len(products) == 1
+    assert products[0].id == "p_budget_cache_1"
+    assert FakeAdapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_get_products_hybrid_budget_enabled_caps_timeout_for_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.product_query_service as pqs
+    from core.reliability.budget import RequestBudget
+
+    config = pqs.RealtimeConfig(
+        realtime_enabled=True,
+        api_endpoint="https://merchant.example.com/api",
+        api_key="k",
+        ttl_seconds=600,
+        platform="shopify",
+    )
+
+    async def fake_config(_merchant_id: str):
+        return config
+
+    captured: dict = {}
+
+    class FakeAdapter:
+        def __init__(self, endpoint: str, credentials):
+            self.endpoint = endpoint
+            self.credentials = credentials
+
+        async def query_products(self, **kwargs):
+            captured.update(kwargs)
+            return [], None
+
+    monkeypatch.setattr(pqs, "RELIABILITY_BUDGET_ENABLED", True)
+    monkeypatch.setattr(pqs, "get_merchant_realtime_config", fake_config)
+    monkeypatch.setattr(pqs, "MerchantAPIAdapter", FakeAdapter)
+
+    budget = RequestBudget.from_total_ms(250)
+
+    products, source, error = await pqs.get_products_hybrid(
+        merchant_id="m_budget_cap",
+        limit=10,
+        agent_id="agent_budget_cap",
+        request_budget=budget,
+    )
+
+    assert error is None
+    assert source == "realtime"
+    assert products == []
+    assert captured.get("request_id") == "pq:agent_budget_cap:m_budget_cap"
+    timeout = float(captured.get("timeout_seconds") or 0.0)
+    assert 0.1 <= timeout <= 1.0

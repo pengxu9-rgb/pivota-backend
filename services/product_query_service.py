@@ -35,6 +35,7 @@ from db.database import database
 from db.products import get_cached_products, upsert_product_cache
 from models.standard_product import StandardProduct, ProductListResponse
 from adapters.merchant_api_adapter import MerchantAPIAdapter
+from core.reliability.budget import RequestBudget
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,16 @@ STALE_CACHE_MAX_AGE_HOURS = _env_int(
     72,
     min_value=1,
     max_value=24 * 30,
+)
+RELIABILITY_BUDGET_ENABLED = _env_bool(
+    "RELIABILITY_BUDGET_ENABLED",
+    False,
+)
+AGENT_PRODUCTS_TOTAL_BUDGET_MS = _env_int(
+    "AGENT_PRODUCTS_TOTAL_BUDGET_MS",
+    2500,
+    min_value=100,
+    max_value=30000,
 )
 
 class RealtimeConfig:
@@ -137,6 +148,7 @@ async def get_products_hybrid(
     background_tasks: Optional[BackgroundTasks] = None,
     force_cache_only: bool = False,
     allow_stale_cache: bool = STALE_CACHE_FALLBACK_ENABLED,
+    request_budget: Optional[RequestBudget] = None,
 ) -> Tuple[List[StandardProduct], str, Optional[str]]:
     """
     Hybrid product query - decides between cache and realtime
@@ -154,6 +166,9 @@ async def get_products_hybrid(
     """
     start_time = time.time()
     query_source = "cache"  # Default
+    budget_enabled = bool(RELIABILITY_BUDGET_ENABLED)
+    if budget_enabled and request_budget is None:
+        request_budget = RequestBudget.from_total_ms(AGENT_PRODUCTS_TOTAL_BUDGET_MS)
 
     stale_cutoff = None
     if allow_stale_cache:
@@ -208,13 +223,41 @@ async def get_products_hybrid(
         
         # Step 2: Decide query path
         if config.realtime_enabled and config.api_endpoint and not force_cache_only:
+            if budget_enabled and request_budget and request_budget.expired():
+                logger.warning(
+                    f"[REALTIME] Budget exhausted before upstream call for {merchant_id}, using cache fallback"
+                )
+                products = await _get_from_cache(merchant_id, config.platform, limit)
+                if not products and allow_stale_cache:
+                    stale_products = await _get_from_cache(
+                        merchant_id,
+                        config.platform,
+                        limit,
+                        include_expired=True,
+                    )
+                    if stale_products:
+                        products = stale_products
+                        query_source = "realtime_budget_exhausted_stale_cache"
+                return products, "realtime_budget_exhausted_cache_fallback", None
+
             # Realtime path
             logger.info(f"[REALTIME] Querying merchant API for {merchant_id}")
             query_source = "realtime"
             
             try:
                 adapter = MerchantAPIAdapter(config.api_endpoint, {"api_key": config.api_key})
-                products, error = await adapter.query_products(limit=limit)
+                timeout_seconds = 1.0
+                if budget_enabled and request_budget:
+                    timeout_seconds = request_budget.timeout_seconds(
+                        default_seconds=1.0,
+                        min_seconds=0.1,
+                        max_seconds=3.0,
+                    )
+                products, error = await adapter.query_products(
+                    limit=limit,
+                    timeout_seconds=timeout_seconds,
+                    request_id=f"pq:{agent_id}:{merchant_id}",
+                )
                 
                 if error:
                     # Fallback to cache on error
