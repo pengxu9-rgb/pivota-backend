@@ -51,6 +51,12 @@ from services.outbound_links_service import (
 )
 from models.standard_product import StandardProduct, ProductStatus
 from services.agent_task_manager import AgentTaskManager
+from observability.reliability_metrics import (
+    record_catalog_search,
+    record_catalog_upstream_fallback,
+    record_catalog_upstream_timeout,
+    set_catalog_upstream_circuit,
+)
 
 AGENT_API_BASE = os.getenv("AGENT_API_BASE", "https://web-production-fedb.up.railway.app").rstrip("/")
 AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API_KEY") or os.getenv("AGENT_API_KEY")
@@ -358,6 +364,48 @@ MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT = _env_bool(
     "AGENT_SHOP_MULTI_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT",
     True,
 )
+CATALOG_RELIABILITY_V2_ENABLED = _env_bool(
+    "CATALOG_RELIABILITY_V2_ENABLED",
+    False,
+)
+CATALOG_RELIABILITY_V2_LOCAL_FALLBACK_ON_DELEGATE_FAIL = _env_bool(
+    "CATALOG_RELIABILITY_V2_LOCAL_FALLBACK_ON_DELEGATE_FAIL",
+    False,
+)
+CATALOG_UPSTREAM_V2_SHOPPING_TIMEOUT_CAP_SECONDS = _env_float(
+    "CATALOG_UPSTREAM_V2_SHOPPING_TIMEOUT_CAP_SECONDS",
+    1.2,
+    min_value=0.3,
+    max_value=20.0,
+)
+CATALOG_UPSTREAM_V2_CIRCUIT_FAILURE_THRESHOLD = _env_int(
+    "CATALOG_UPSTREAM_V2_CIRCUIT_FAILURE_THRESHOLD",
+    3,
+    min_value=1,
+    max_value=100,
+)
+CATALOG_UPSTREAM_V2_CIRCUIT_WINDOW_SECONDS = _env_float(
+    "CATALOG_UPSTREAM_V2_CIRCUIT_WINDOW_SECONDS",
+    45.0,
+    min_value=1.0,
+    max_value=600.0,
+)
+CATALOG_UPSTREAM_V2_CIRCUIT_OPEN_SECONDS = _env_float(
+    "CATALOG_UPSTREAM_V2_CIRCUIT_OPEN_SECONDS",
+    60.0,
+    min_value=1.0,
+    max_value=1200.0,
+)
+CATALOG_UPSTREAM_V2_CIRCUIT_OPEN_ON_TIMEOUT = _env_bool(
+    "CATALOG_UPSTREAM_V2_CIRCUIT_OPEN_ON_TIMEOUT",
+    True,
+)
+CATALOG_UPSTREAM_V2_LOCAL_FALLBACK_MIN_BUDGET_SECONDS = _env_float(
+    "CATALOG_UPSTREAM_V2_LOCAL_FALLBACK_MIN_BUDGET_SECONDS",
+    0.4,
+    min_value=0.05,
+    max_value=10.0,
+)
 MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED = _env_bool(
     "AGENT_SHOP_MULTI_PAGE_REQUEST_DEDUP_ENABLED",
     True,
@@ -441,6 +489,40 @@ def _is_shopping_multi_source(source: Optional[str]) -> bool:
     if "aurora" in normalized:
         return True
     return False
+
+
+def _catalog_rel_v2_enabled() -> bool:
+    return bool(CATALOG_RELIABILITY_V2_ENABLED)
+
+
+def _multi_upstream_circuit_failure_threshold() -> int:
+    if _catalog_rel_v2_enabled():
+        return max(1, int(CATALOG_UPSTREAM_V2_CIRCUIT_FAILURE_THRESHOLD))
+    return max(1, int(MULTI_SEARCH_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD))
+
+
+def _multi_upstream_circuit_window_seconds() -> float:
+    if _catalog_rel_v2_enabled():
+        return max(1.0, float(CATALOG_UPSTREAM_V2_CIRCUIT_WINDOW_SECONDS))
+    return max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_WINDOW_SECONDS))
+
+
+def _multi_upstream_circuit_open_seconds() -> float:
+    if _catalog_rel_v2_enabled():
+        return max(1.0, float(CATALOG_UPSTREAM_V2_CIRCUIT_OPEN_SECONDS))
+    return max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS))
+
+
+def _multi_upstream_circuit_open_on_timeout() -> bool:
+    if _catalog_rel_v2_enabled():
+        return bool(CATALOG_UPSTREAM_V2_CIRCUIT_OPEN_ON_TIMEOUT)
+    return bool(MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT)
+
+
+def _multi_upstream_shopping_timeout_cap_seconds() -> float:
+    if _catalog_rel_v2_enabled():
+        return float(CATALOG_UPSTREAM_V2_SHOPPING_TIMEOUT_CAP_SECONDS)
+    return float(MULTI_SEARCH_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS)
 
 _MULTI_SEARCH_UPSTREAM_CACHE: Dict[str, Dict[str, Any]] = {}
 _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS: List[float] = []
@@ -622,7 +704,7 @@ def _multi_upstream_cache_put(cache_key: str, result: Dict[str, Any], kind: str)
 def _multi_upstream_circuit_prune(now_mono: float) -> None:
     if not _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS:
         return
-    window_seconds = max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_WINDOW_SECONDS))
+    window_seconds = _multi_upstream_circuit_window_seconds()
     threshold_ts = now_mono - window_seconds
     _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS[:] = [
         ts for ts in _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS if ts >= threshold_ts
@@ -643,28 +725,32 @@ def _multi_upstream_record_outcome(success: bool, *, timeout: bool = False) -> N
     if success:
         _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.clear()
         _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = 0.0
+        set_catalog_upstream_circuit(surface="shopping", state="closed")
         return
 
-    if timeout and MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_ON_TIMEOUT:
-        open_seconds = max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS))
+    if timeout and _multi_upstream_circuit_open_on_timeout():
+        open_seconds = _multi_upstream_circuit_open_seconds()
         _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = max(
             float(_MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL or 0.0),
             now_mono + open_seconds,
         )
         _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS[:] = [now_mono]
+        set_catalog_upstream_circuit(surface="shopping", state="open")
         return
 
     _MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS.append(now_mono)
     _multi_upstream_circuit_prune(now_mono)
-    failure_threshold = max(1, int(MULTI_SEARCH_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD))
+    failure_threshold = _multi_upstream_circuit_failure_threshold()
     if len(_MULTI_SEARCH_UPSTREAM_FAILURE_EVENTS) < failure_threshold:
+        set_catalog_upstream_circuit(surface="shopping", state="closed")
         return
 
-    open_seconds = max(1.0, float(MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_SECONDS))
+    open_seconds = _multi_upstream_circuit_open_seconds()
     _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL = max(
         float(_MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL or 0.0),
         now_mono + open_seconds,
     )
+    set_catalog_upstream_circuit(surface="shopping", state="open")
 
 
 def _resolve_multi_upstream_timeout_seconds(is_shopping_surface: bool) -> float:
@@ -672,7 +758,7 @@ def _resolve_multi_upstream_timeout_seconds(is_shopping_surface: bool) -> float:
     if is_shopping_surface:
         timeout_seconds = min(
             timeout_seconds,
-            float(MULTI_SEARCH_UPSTREAM_SHOPPING_TIMEOUT_CAP_SECONDS),
+            _multi_upstream_shopping_timeout_cap_seconds(),
         )
     return max(0.3, timeout_seconds)
 
@@ -713,6 +799,27 @@ def _build_multi_delegate_empty_result(
         "reply": None,
         "metadata": metadata,
     }
+
+
+def _allow_local_fallback_after_delegate_fail(request_metadata: Optional[Dict[str, Any]]) -> bool:
+    if not _catalog_rel_v2_enabled():
+        return False
+    if not CATALOG_RELIABILITY_V2_LOCAL_FALLBACK_ON_DELEGATE_FAIL:
+        return False
+
+    md = request_metadata or {}
+    remaining_seconds: Optional[float] = None
+    try:
+        if md.get("remaining_budget_seconds") is not None:
+            remaining_seconds = float(md.get("remaining_budget_seconds"))
+        elif md.get("remaining_budget_ms") is not None:
+            remaining_seconds = float(md.get("remaining_budget_ms")) / 1000.0
+    except Exception:
+        remaining_seconds = None
+
+    if remaining_seconds is None:
+        return True
+    return remaining_seconds >= float(CATALOG_UPSTREAM_V2_LOCAL_FALLBACK_MIN_BUDGET_SECONDS)
 
 
 def _resolve_multi_force_cache_only(source: Optional[str], is_creator_surface: bool) -> bool:
@@ -2752,6 +2859,7 @@ async def _invoke_multi_upstream_fallback(
         resp = await asyncio.wait_for(_post_once(), timeout=timeout_seconds)
         if resp.status_code >= 400:
             _multi_upstream_record_outcome(False)
+            record_catalog_upstream_fallback(reason=f"http_{resp.status_code}")
             logger.info(
                 "multi.upstream_fallback.http_error",
                 extra={"status_code": resp.status_code, "url": url},
@@ -2761,11 +2869,13 @@ async def _invoke_multi_upstream_fallback(
         data = resp.json()
         if not isinstance(data, dict):
             _multi_upstream_record_outcome(False)
+            record_catalog_upstream_fallback(reason="invalid_payload")
             return None
 
         products_raw = data.get("products")
         if not isinstance(products_raw, list):
             _multi_upstream_record_outcome(False)
+            record_catalog_upstream_fallback(reason="missing_products")
             return None
 
         total_val = data.get("total")
@@ -2793,6 +2903,7 @@ async def _invoke_multi_upstream_fallback(
             "timeout_seconds": timeout_seconds,
         }
         _multi_upstream_record_outcome(True)
+        record_catalog_upstream_fallback(reason="delegate_success")
 
         return {
             "products": products_raw,
@@ -2813,6 +2924,11 @@ async def _invoke_multi_upstream_fallback(
             extra={"error": str(exc), "url": url},
         )
         _multi_upstream_record_outcome(False, timeout=timeout_failure)
+        if timeout_failure:
+            record_catalog_upstream_timeout(surface="shopping")
+            record_catalog_upstream_fallback(reason="timeout")
+        else:
+            record_catalog_upstream_fallback(reason="exception")
         return None
 
 
@@ -2937,23 +3053,34 @@ async def _handle_find_products_multi(
             if upstream_cache_key:
                 _multi_upstream_cache_put(upstream_cache_key, delegated, result_kind)
             return delegated
-        # In delegate mode we intentionally avoid running the local
-        # multi-merchant path after an upstream timeout/error, because
-        # combining both paths can exceed the invoke queue wait budget
-        # and surface 504 UPSTREAM_TIMEOUT to the frontend.
-        empty_result = _build_multi_delegate_empty_result(
-            page=page,
-            force_cache_only=force_cache_only,
-            base_merchant_fanout_enabled=base_merchant_fanout_enabled,
-            creator_id=creator_id,
-            creator_name=creator_name,
-            upstream_timeout_seconds=upstream_timeout_seconds,
-            upstream_attempted=True,
-            upstream_circuit_open=False,
-        )
-        if upstream_cache_key:
-            _multi_upstream_cache_put(upstream_cache_key, empty_result, "error")
-        return empty_result
+        if _allow_local_fallback_after_delegate_fail(request_metadata):
+            logger.info(
+                "multi.upstream_fallback.local_fallback_enabled",
+                extra={
+                    "event": "multi.upstream_fallback.local_fallback_enabled",
+                    "reason": "delegate_failed",
+                    "source": source_normalized,
+                },
+            )
+            record_catalog_upstream_fallback(reason="delegate_failed_local_fallback")
+        else:
+            # In delegate mode we intentionally avoid running the local
+            # multi-merchant path after an upstream timeout/error, because
+            # combining both paths can exceed the invoke queue wait budget
+            # and surface 504 UPSTREAM_TIMEOUT to the frontend.
+            empty_result = _build_multi_delegate_empty_result(
+                page=page,
+                force_cache_only=force_cache_only,
+                base_merchant_fanout_enabled=base_merchant_fanout_enabled,
+                creator_id=creator_id,
+                creator_name=creator_name,
+                upstream_timeout_seconds=upstream_timeout_seconds,
+                upstream_attempted=True,
+                upstream_circuit_open=False,
+            )
+            if upstream_cache_key:
+                _multi_upstream_cache_put(upstream_cache_key, empty_result, "error")
+            return empty_result
 
     eval_enabled = bool(
         isinstance(request_metadata, dict) and request_metadata.get("eval") is not None
@@ -6745,6 +6872,19 @@ async def invoke_shop_operation(
                     response_metadata["page_request_dedup_cache_hit"] = dedup_cache_hit
                     response_metadata["page_request_dedup_inflight_joined"] = dedup_inflight_joined
                 result["metadata"] = response_metadata
+                try:
+                    products = result.get("products")
+                    has_products = isinstance(products, list) and len(products) > 0
+                    query_source = str(response_metadata.get("query_source") or "unknown")
+                    mode = "shopping_surface" if is_shopping_surface else "multi_search"
+                    record_catalog_search(
+                        mode=mode,
+                        path=query_source,
+                        result="ok" if has_products else "no_candidates",
+                        duration_seconds=max(0.0, time.time() - started),
+                    )
+                except Exception:
+                    pass
             return result
         except asyncio.CancelledError:
             # Client disconnected; best-effort cancellation.
