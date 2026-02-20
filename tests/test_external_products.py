@@ -1786,3 +1786,49 @@ def test_agent_products_search_supplement_internal_first_keeps_internal_ahead(
     assert source_breakdown.get("internal_count", 0) >= 1
     assert source_breakdown.get("external_seed_count", 0) >= 1
     assert source_breakdown.get("strategy_applied") == "supplement_internal_first"
+
+
+def test_agent_products_search_includes_route_health_metadata(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    class _FakeProduct:
+        def model_dump(self):
+            return {
+                "id": "prod_internal_3",
+                "product_id": "prod_internal_3",
+                "title": "IPSA Route Health Probe",
+                "description": "internal candidate",
+                "platform": "shopify",
+                "price": 31,
+                "in_stock": True,
+            }
+
+    async def fake_fetch_all(query: str, values=None):
+        text = str(query)
+        if "FROM merchant_onboarding" in text:
+            return [{"merchant_id": "m_001", "business_name": "Merchant One"}]
+        return []
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "get_products_hybrid", AsyncMock(return_value=([_FakeProduct()], "cache", None)))
+    monkeypatch.setattr(agent_api_module, "_load_external_seed_products_for_search", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent_api_module, "hydrate_quality_and_enrichment", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "passes_agent_gating", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(agent_api_module, "compute_agent_ranking_score", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(agent_api_module, "serialize_features_for_log", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agent_api_module, "log_product_events", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+
+    res = client.get(
+        "/agent/v1/products/search?search_all_merchants=true&query=ipsa&allow_external_seed=false&allow_stale_cache=false&in_stock_only=false&limit=10&offset=0",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    route_health = ((payload.get("metadata") or {}).get("route_health") or {})
+    assert route_health.get("primary_path_used") == "cross_merchant_search_standard"
+    assert isinstance(route_health.get("primary_latency_ms"), int)
+    assert route_health.get("fallback_triggered") is False
+    assert route_health.get("fallback_reason") is None

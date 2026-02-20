@@ -133,3 +133,46 @@ async def test_get_products_hybrid_no_config_disables_stale_cache_when_requested
     assert error is None
     assert source == "cache"
     assert products == []
+
+
+@pytest.mark.asyncio
+async def test_get_products_hybrid_cache_path_disables_stale_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.product_query_service as pqs
+
+    config = pqs.RealtimeConfig(
+        realtime_enabled=False,
+        api_endpoint=None,
+        api_key=None,
+        ttl_seconds=600,
+        platform="shopify",
+    )
+
+    async def fake_config(_merchant_id: str):
+        return config
+
+    async def fake_cache(
+        merchant_id: str,
+        platform: str,
+        limit: int,
+        include_expired: bool = False,
+    ):
+        if include_expired:
+            raise AssertionError("stale cache path should be skipped when allow_stale_cache=False")
+        return []
+
+    monkeypatch.setattr(pqs, "get_merchant_realtime_config", fake_config)
+    monkeypatch.setattr(pqs, "_get_from_cache", fake_cache)
+    monkeypatch.setattr(pqs, "STALE_CACHE_FALLBACK_ENABLED", True)
+
+    products, source, error = await pqs.get_products_hybrid(
+        merchant_id="m_004",
+        limit=20,
+        agent_id="test_agent",
+        allow_stale_cache=False,
+    )
+
+    assert error is None
+    assert source == "cache"
+    assert products == []

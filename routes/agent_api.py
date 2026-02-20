@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, H
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import json
 import os
@@ -157,6 +157,28 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED = _env_bool(
+    "AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED",
+    True,
+)
+AGENT_PRODUCT_DETAIL_STALE_MAX_AGE_HOURS = int(
+    _env_float(
+        "AGENT_PRODUCT_DETAIL_STALE_MAX_AGE_HOURS",
+        168.0,
+        min_value=1.0,
+        max_value=24.0 * 90.0,
+    )
+)
+AGENT_PRODUCT_DETAIL_SCAN_LIMIT = int(
+    _env_float(
+        "AGENT_PRODUCT_DETAIL_SCAN_LIMIT",
+        2500.0,
+        min_value=200.0,
+        max_value=10000.0,
+    )
+)
+
+
 def _safe_price_number(value: Any, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -269,6 +291,182 @@ def _seed_image_urls(seed_data: Dict[str, Any]) -> List[str]:
         if len(urls) >= 20:
             break
     return urls
+
+
+def _add_unique_alias(aliases: List[str], value: Any) -> None:
+    val = str(value or "").strip()
+    if val and val not in aliases:
+        aliases.append(val)
+
+
+def _collect_product_aliases(
+    product: Dict[str, Any],
+    *,
+    row_platform_product_id: Optional[str] = None,
+) -> List[str]:
+    aliases: List[str] = []
+
+    _add_unique_alias(aliases, row_platform_product_id)
+    _add_unique_alias(aliases, product.get("product_id"))
+    _add_unique_alias(aliases, product.get("id"))
+
+    platform_meta = product.get("platform_metadata")
+    if isinstance(platform_meta, dict):
+        _add_unique_alias(aliases, platform_meta.get("product_id"))
+        _add_unique_alias(aliases, platform_meta.get("shopify_product_id"))
+        _add_unique_alias(aliases, platform_meta.get("platform_product_id"))
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            _add_unique_alias(aliases, variant.get("variant_id"))
+            _add_unique_alias(aliases, variant.get("id"))
+            _add_unique_alias(aliases, variant.get("sku"))
+
+    expanded: List[str] = []
+    for alias in aliases:
+        for normalized in _expand_product_ref_aliases(alias) or [alias]:
+            _add_unique_alias(expanded, normalized)
+    return expanded
+
+
+def _coerce_price_nullable(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        normalized = float(value)
+    except Exception:
+        return None
+    if normalized != normalized:  # NaN
+        return None
+    return normalized
+
+
+def _variant_price_fallback(variant: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(variant, dict):
+        return None
+    for key in ("price", "price_amount", "amount", "value"):
+        parsed = _coerce_price_nullable(variant.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _normalize_product_detail_payload(
+    product: Dict[str, Any],
+    *,
+    fallback_product_id: Optional[str] = None,
+    merchant_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    normalized = dict(product or {})
+
+    resolved_product_id = (
+        str(normalized.get("product_id") or "").strip()
+        or str(normalized.get("id") or "").strip()
+        or str(fallback_product_id or "").strip()
+    )
+    if resolved_product_id:
+        normalized["product_id"] = resolved_product_id
+        normalized.setdefault("id", resolved_product_id)
+
+    primary_price = _coerce_price_nullable(normalized.get("price"))
+    if primary_price is None:
+        variants = normalized.get("variants")
+        if isinstance(variants, list):
+            for variant in variants:
+                primary_price = _variant_price_fallback(variant)
+                if primary_price is not None:
+                    break
+    normalized["price"] = primary_price
+
+    if merchant_id and not normalized.get("merchant_id"):
+        normalized["merchant_id"] = merchant_id
+
+    return normalized
+
+
+async def _load_cached_product_for_agent_detail(
+    *,
+    merchant_id: str,
+    product_ref: str,
+    include_expired: bool = False,
+    stale_cutoff: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    alias_candidates = _expand_product_ref_aliases(product_ref)
+    if not alias_candidates:
+        alias_candidates = [str(product_ref or "").strip()]
+    alias_set = {str(alias).strip() for alias in alias_candidates if str(alias or "").strip()}
+    if not alias_set:
+        return None
+
+    where_clauses = ["merchant_id = :merchant_id"]
+    params: Dict[str, Any] = {
+        "merchant_id": merchant_id,
+        "scan_limit": max(200, int(AGENT_PRODUCT_DETAIL_SCAN_LIMIT)),
+    }
+    if not include_expired:
+        where_clauses.append("(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)")
+    if stale_cutoff is not None:
+        where_clauses.append("(cached_at IS NULL OR cached_at >= :stale_cutoff)")
+        params["stale_cutoff"] = stale_cutoff
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT id, platform_product_id, product_data
+        FROM products_cache
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY cached_at DESC, id DESC
+        LIMIT :scan_limit
+        """,
+        params,
+    )
+
+    for row in rows or []:
+        row_data = _row_as_dict(row)
+        if not row_data:
+            continue
+        product_data = row_data.get("product_data")
+        if isinstance(product_data, str):
+            try:
+                product_data = json.loads(product_data)
+            except Exception:
+                product_data = None
+        if not isinstance(product_data, dict):
+            continue
+        product_aliases = _collect_product_aliases(
+            product_data,
+            row_platform_product_id=str(row_data.get("platform_product_id") or "").strip() or None,
+        )
+        if alias_set.intersection(product_aliases):
+            fallback_product_id = str(row_data.get("platform_product_id") or "").strip() or None
+            return _normalize_product_detail_payload(
+                product_data,
+                fallback_product_id=fallback_product_id,
+                merchant_id=merchant_id,
+            )
+    return None
+
+
+def _build_route_health(
+    *,
+    primary_path_used: str,
+    primary_latency_ms: int,
+    source_breakdown: Optional[Dict[str, Any]] = None,
+    fallback_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    stale_cache_used = bool((source_breakdown or {}).get("stale_cache_used"))
+    triggered = bool(fallback_reason) or stale_cache_used
+    reason = fallback_reason or ("stale_cache_used" if stale_cache_used else None)
+    return {
+        "primary_path_used": primary_path_used,
+        "primary_latency_ms": max(0, int(primary_latency_ms or 0)),
+        "fallback_triggered": triggered,
+        "fallback_reason": reason,
+    }
 
 
 def _availability_to_in_stock(availability: Any) -> bool:
@@ -1252,6 +1450,13 @@ async def agent_search_products(
                             "stale_cache_used": False,
                             "strategy_applied": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
                         },
+                        "route_health": _build_route_health(
+                            primary_path_used="cross_merchant_browse_fastpath",
+                            primary_latency_ms=latency_ms,
+                            source_breakdown={
+                                "stale_cache_used": False,
+                            },
+                        ),
                     },
                 }
             except Exception:
@@ -1519,6 +1724,11 @@ async def agent_search_products(
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "source_breakdown": source_breakdown,
+                    "route_health": _build_route_health(
+                        primary_path_used="cross_merchant_browse_standard",
+                        primary_latency_ms=latency_ms,
+                        source_breakdown=source_breakdown,
+                    ),
                 },
             }
 
@@ -1827,6 +2037,11 @@ async def agent_search_products(
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
                 "source_breakdown": source_breakdown,
+                "route_health": _build_route_health(
+                    primary_path_used="cross_merchant_search_standard",
+                    primary_latency_ms=latency_ms,
+                    source_breakdown=source_breakdown,
+                ),
             },
         }
         
@@ -2707,10 +2922,16 @@ async def agent_get_product(
                 status_code=200,
                 merchant_id=merchant_id,
             )
-            return {"status": "success", "product": prod}
+            return {
+                "status": "success",
+                "product": prod,
+                "metadata": {
+                    "detail_source": "upstream",
+                },
+            }
 
         # 验证商户访问权限
-        if not context.can_access_merchant(merchant_id):
+        if not _context_can_access_merchant(context, merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
         # Special handling for Platform Orders products (SKU-xxx format)
@@ -2740,25 +2961,52 @@ async def agent_get_product(
                         "sku": product_id,
                         "available": True
                     }]
-                }
+                },
+                "metadata": {
+                    "detail_source": "upstream",
+                },
             }
         
-        # 从缓存获取产品
-        products = await load_cached_product_data_for_merchant(merchant_id)
-        for product in products:
-            pid = product.get("product_id") or product.get("id")
-            if str(pid) == str(product_id):
-                background_tasks.add_task(
-                    log_agent_request,
-                    context=context,
-                    status_code=200,
-                    merchant_id=merchant_id
-                )
-                return {
-                    "status": "success",
-                    "product": product
-                }
-        
+        # 从缓存获取产品（先读新鲜缓存；可选回退到有限期 stale 缓存）
+        product = await _load_cached_product_for_agent_detail(
+            merchant_id=merchant_id,
+            product_ref=product_id,
+            include_expired=False,
+        )
+        stale_fallback_used = False
+        if (
+            product is None
+            and AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED
+            and AGENT_PRODUCT_DETAIL_STALE_MAX_AGE_HOURS > 0
+        ):
+            stale_cutoff = datetime.utcnow() - timedelta(hours=AGENT_PRODUCT_DETAIL_STALE_MAX_AGE_HOURS)
+            product = await _load_cached_product_for_agent_detail(
+                merchant_id=merchant_id,
+                product_ref=product_id,
+                include_expired=True,
+                stale_cutoff=stale_cutoff,
+            )
+            stale_fallback_used = product is not None
+
+        if product is not None:
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id
+            )
+            resp: Dict[str, Any] = {
+                "status": "success",
+                "product": product,
+                "metadata": {
+                    "detail_source": "stale_cache" if stale_fallback_used else "fresh_cache",
+                },
+            }
+            if stale_fallback_used:
+                resp["metadata"]["cache_source"] = "products_cache_stale_fallback"
+                resp["metadata"]["stale_max_age_hours"] = AGENT_PRODUCT_DETAIL_STALE_MAX_AGE_HOURS
+            return resp
+
         raise HTTPException(status_code=404, detail="Product not found")
         
     except HTTPException:

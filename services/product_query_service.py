@@ -272,7 +272,7 @@ async def get_products_hybrid(
             logger.info(f"[CACHE] Using cached products for {merchant_id}")
             products = await _get_from_cache(merchant_id, config.platform, limit)
             cache_source = "cache"
-            if not products and STALE_CACHE_FALLBACK_ENABLED:
+            if not products and allow_stale_cache:
                 stale_products = await _get_from_cache(
                     merchant_id,
                     config.platform,
