@@ -26,6 +26,12 @@ scripts/run_agent_reliability_suite.sh full
 
 Runs quick suite plus queue/task-manager integration checks.
 
+```bash
+scripts/run_reliability_v2_100_suite.sh quick
+```
+
+Runs reliability-focused regression with Payment/Catalog v2 flags enabled for no-user environments.
+
 ## Suite Composition
 
 ### Quick
