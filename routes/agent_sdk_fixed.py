@@ -665,6 +665,7 @@ async def search_products(
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),
     external_seed_strategy: str = Query(default="legacy"),
+    fast_mode: bool = Query(default=False),
     context: AgentContext = Depends(get_agent_context)
 ):
     """
@@ -944,6 +945,7 @@ async def search_products(
                 allow_external_seed=allow_external_seed,
                 allow_stale_cache=allow_stale_cache,
                 external_seed_strategy=external_seed_strategy,
+                fast_mode=fast_mode,
                 context=context,
             ),
             timeout=delegate_timeout_s,
@@ -974,7 +976,7 @@ async def search_products(
         # Preserve the historical SDK behavior: when searching regular catalogs
         # we also inject external seed products for recall.
         injected = 0
-        include_external_seed = int(offset or 0) == 0 and not merchant_id
+        include_external_seed = bool(allow_external_seed) and int(offset or 0) == 0 and not merchant_id
         if include_external_seed:
             try:
                 external_seed_limit = min(200, max(20, int(limit or 20) * 5))
