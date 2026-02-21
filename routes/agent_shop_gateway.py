@@ -45,6 +45,8 @@ from services.similarity_service import (
 from services.similarity_config import get_similarity_scoring_weights
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
+    get_active_allowed_domains_for_market,
+    is_domain_allowed_for_market_domains,
     _is_domain_allowed,
     apply_utm,
     make_redirect_token,
@@ -250,6 +252,12 @@ MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     0.8,
     min_value=0.1,
     max_value=5.0,
+)
+MULTI_SEARCH_SEED_BUILD_BUDGET_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_SEED_BUILD_BUDGET_SECONDS",
+    0.45,
+    min_value=0.05,
+    max_value=3.0,
 )
 MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_RECALL_QUERY_TIMEOUT_SECONDS",
@@ -2509,13 +2517,20 @@ async def _make_external_redirect_url(
     destination_url: str,
     utm_template: Optional[str],
     ctx: Dict[str, Any],
+    allowed_domains: Optional[List[str]] = None,
 ) -> Optional[str]:
     dest_with_utm = apply_utm(
         destination_url,
         utm_template or DEFAULT_UTM_TEMPLATE,
         {"market": market, "tool": tool},
     )
-    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+    if allowed_domains is None:
+        if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+            return None
+    elif not is_domain_allowed_for_market_domains(
+        destination_url=dest_with_utm,
+        allowed_domains=allowed_domains,
+    ):
         return None
     token = make_redirect_token(
         {
@@ -4086,8 +4101,12 @@ async def _handle_find_products_multi(
 
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
+        allowed_domains_by_market: Dict[str, List[str]] = {}
+        seed_build_deadline = time.perf_counter() + float(MULTI_SEARCH_SEED_BUILD_BUDGET_SECONDS)
         shopping_seed_target = max(1, limit * max(page, 1))
         for row in seed_rows:
+            if time.perf_counter() >= seed_build_deadline:
+                break
             row_dict = dict(row) if isinstance(row, dict) else {}
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
             dest = row_dict.get("destination_url") or seed_data.get("destination_url")
@@ -4136,6 +4155,13 @@ async def _handle_find_products_multi(
             market = str(row_dict.get("market") or "US")
             tool = str(row_dict.get("tool") or "*")
             utm_template = row_dict.get("utm_template") or seed_data.get("utm_template")
+            allowed_domains = allowed_domains_by_market.get(market)
+            if allowed_domains is None:
+                try:
+                    allowed_domains = await get_active_allowed_domains_for_market(market=market)
+                except Exception:
+                    allowed_domains = []
+                allowed_domains_by_market[market] = allowed_domains
             redirect_cache_key = "||".join(
                 [
                     market,
@@ -4153,6 +4179,7 @@ async def _handle_find_products_multi(
                     destination_url=dest,
                     utm_template=utm_template,
                     ctx={"seedId": row_dict.get("id")},
+                    allowed_domains=allowed_domains,
                 )
                 external_redirect_cache[redirect_cache_key] = redirect_url
             if not redirect_url:
