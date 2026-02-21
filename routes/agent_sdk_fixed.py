@@ -656,6 +656,10 @@ async def search_products(
     ),
     query: Optional[str] = None,
     category: Optional[str] = None,
+    catalog_surface: Optional[str] = Query(
+        default=None,
+        description="Optional search surface. Set to 'beauty' for beauty-only candidate filtering.",
+    ),
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock: Optional[bool] = None,
@@ -679,8 +683,12 @@ async def search_products(
     from routes.agent_api import (
         _classify_db_reason_code,
         _expand_product_ref_aliases,
+        _matches_catalog_surface,
+        _normalize_catalog_surface,
         agent_search_products,
     )
+
+    normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
 
     async def _legacy_scoped_search_fallback() -> Dict[str, Any]:
         # Merchant-scoped fallback to preserve historical SDK semantics and tests.
@@ -834,6 +842,8 @@ async def search_products(
                     merged["title"] = merged.get("name")
                 if not merged.get("name") and merged.get("title"):
                     merged["name"] = merged.get("title")
+                if not _matches_catalog_surface(merged, normalized_catalog_surface):
+                    continue
                 products.append(merged)
 
             has_more = len(products) > int(limit)
@@ -864,6 +874,7 @@ async def search_products(
                 "metadata": {
                     "reason_code": reason_code,
                     "source": "agent_sdk_fixed_legacy_fallback",
+                    "catalog_surface": normalized_catalog_surface,
                     "latency_ms": latency_ms,
                 },
             }
@@ -888,6 +899,7 @@ async def search_products(
                 "metadata": {
                     "reason_code": reason_code,
                     "source": "agent_sdk_fixed_legacy_fallback",
+                    "catalog_surface": normalized_catalog_surface,
                     "latency_ms": latency_ms,
                     "error": type(e).__name__,
                 },
@@ -922,6 +934,7 @@ async def search_products(
             "metadata": {
                 "reason_code": "ok",
                 "source": "agent_sdk_fixed_external_seed",
+                "catalog_surface": normalized_catalog_surface,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
             },
         }
@@ -937,6 +950,7 @@ async def search_products(
                 search_all_merchants=search_all_merchants,
                 query=query,
                 category=category,
+                catalog_surface=catalog_surface,
                 min_price=min_price,
                 max_price=max_price,
                 in_stock_only=bool(effective_in_stock_only),
@@ -1006,12 +1020,60 @@ async def search_products(
         if not isinstance(metadata, dict):
             metadata = {}
         metadata.setdefault("reason_code", "ok")
+        metadata.setdefault("catalog_surface", normalized_catalog_surface)
         metadata["source"] = "agent_sdk_fixed_delegate"
         metadata["latency_ms"] = int((time.perf_counter() - started) * 1000)
         if injected > 0:
             metadata["external_seed_injected"] = injected
         result["metadata"] = metadata
     return result
+
+
+@router.get("/beauty/products/search")
+async def search_products_beauty(
+    req: Request,
+    background_tasks: BackgroundTasks,
+    merchant_id: Optional[str] = None,
+    merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
+    search_all_merchants: bool = Query(
+        default=False,
+        description="Opt-in cross-merchant search",
+    ),
+    query: Optional[str] = None,
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    in_stock: Optional[bool] = None,
+    in_stock_only: Optional[bool] = Query(None),
+    limit: int = Query(default=20, le=100),
+    offset: int = Query(default=0, ge=0),
+    allow_external_seed: bool = Query(default=True),
+    allow_stale_cache: bool = Query(default=True),
+    external_seed_strategy: str = Query(default="legacy"),
+    fast_mode: bool = Query(default=False),
+    context: AgentContext = Depends(get_agent_context),
+):
+    return await search_products(
+        req=req,
+        background_tasks=background_tasks,
+        merchant_id=merchant_id,
+        merchant_ids=merchant_ids,
+        search_all_merchants=search_all_merchants,
+        query=query,
+        category=category,
+        catalog_surface="beauty",
+        min_price=min_price,
+        max_price=max_price,
+        in_stock=in_stock,
+        in_stock_only=in_stock_only,
+        limit=limit,
+        offset=offset,
+        allow_external_seed=allow_external_seed,
+        allow_stale_cache=allow_stale_cache,
+        external_seed_strategy=external_seed_strategy,
+        fast_mode=fast_mode,
+        context=context,
+    )
 
 # ============================================================================
 # ORDERS
