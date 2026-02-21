@@ -66,6 +66,49 @@ _ORDER_CREATE_LOCKS: Dict[str, asyncio.Lock] = {}
 
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
+CATALOG_SURFACE_BEAUTY = "beauty"
+_CATALOG_BEAUTY_KEYWORDS = (
+    "beauty",
+    "skincare",
+    "skin care",
+    "cosmetic",
+    "cosmetics",
+    "serum",
+    "essence",
+    "ampoule",
+    "cleanser",
+    "face wash",
+    "facial",
+    "moisturizer",
+    "moisturiser",
+    "cream",
+    "lotion",
+    "toner",
+    "sunscreen",
+    "sun screen",
+    "spf",
+    "retinol",
+    "retinal",
+    "niacinamide",
+    "hyaluronic",
+    "peptide",
+    "ceramide",
+    "allantoin",
+    "centella",
+    "cica",
+    "mask",
+    "eye cream",
+    "makeup",
+    "foundation",
+    "concealer",
+    "blush",
+    "mascara",
+    "eyeliner",
+    "lipstick",
+    "lip gloss",
+    "parfum",
+    "fragrance",
+)
 
 
 def _get_order_create_lock(key: str) -> asyncio.Lock:
@@ -568,6 +611,28 @@ def _build_product_search_blob(product: Dict[str, Any]) -> str:
     return " ".join(str(v or "").strip().lower() for v in parts if str(v or "").strip())
 
 
+def _normalize_catalog_surface(raw: Optional[str]) -> str:
+    token = str(raw or "").strip().lower()
+    if token in {"beauty", "skincare", "cosmetic", "cosmetics"}:
+        return CATALOG_SURFACE_BEAUTY
+    return "all"
+
+
+def _is_likely_beauty_product(product: Dict[str, Any]) -> bool:
+    if not isinstance(product, dict):
+        return False
+    blob = _build_product_search_blob(product)
+    if not blob:
+        return False
+    return any(keyword in blob for keyword in _CATALOG_BEAUTY_KEYWORDS)
+
+
+def _matches_catalog_surface(product: Dict[str, Any], catalog_surface: str) -> bool:
+    if str(catalog_surface or "all").strip().lower() != CATALOG_SURFACE_BEAUTY:
+        return True
+    return _is_likely_beauty_product(product)
+
+
 def _score_fast_mode_relevance(
     product: Dict[str, Any],
     *,
@@ -614,6 +679,7 @@ async def _search_products_fast_mode(
     merchant_scope: Optional[List[str]],
     query: Optional[str],
     category: Optional[str],
+    catalog_surface: str,
     min_price: Optional[float],
     max_price: Optional[float],
     in_stock_only: bool,
@@ -685,6 +751,8 @@ async def _search_products_fast_mode(
         product["merchant_id"] = str(row_data.get("merchant_id") or product.get("merchant_id") or "").strip()
         product["merchant_name"] = row_data.get("merchant_name") or product.get("merchant_name") or "Unknown"
         if not product["merchant_id"]:
+            continue
+        if not _matches_catalog_surface(product, catalog_surface):
             continue
 
         key = f"{product['merchant_id']}::{str(product.get('product_id') or product.get('id') or '').strip()}"
@@ -1548,6 +1616,10 @@ async def agent_search_products(
     ),
     query: Optional[str] = None,
     category: Optional[str] = None,
+    catalog_surface: Optional[str] = Query(
+        default=None,
+        description="Optional search surface. Set to 'beauty' for beauty-only candidate filtering.",
+    ),
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
@@ -1608,6 +1680,7 @@ async def agent_search_products(
 
         normalized_query = query.strip() if isinstance(query, str) else ""
         normalized_category = category.strip() if isinstance(category, str) else ""
+        normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
         is_browse_mode = (
             not normalized_query
             and not normalized_category
@@ -1690,6 +1763,8 @@ async def agent_search_products(
                         continue
 
                     pdata = dict(pdata)
+                    if not _matches_catalog_surface(pdata, normalized_catalog_surface):
+                        continue
                     pdata["merchant_id"] = str(row_data.get("merchant_id") or pdata.get("merchant_id") or "")
                     pdata["merchant_name"] = row_data.get("merchant_name") or pdata.get("merchant_name") or "Unknown"
                     pdata.setdefault("relevance_score", 1.0)
@@ -1745,16 +1820,19 @@ async def agent_search_products(
                         "merchant_ids": allowed if allowed else None,
                         "merchants_searched": None,
                         "cross_merchant_search": True,
+                        "catalog_surface": normalized_catalog_surface,
                     },
                     "filters_applied": {
                         "query": query,
                         "category": category,
+                        "catalog_surface": normalized_catalog_surface,
                         "min_price": min_price,
                         "max_price": max_price,
                         "in_stock_only": in_stock_only,
                     },
                     "metadata": {
                         "source": "agent_search_products",
+                        "catalog_surface": normalized_catalog_surface,
                         "reason_code": "ok" if page_items else "no_candidates",
                         "latency_ms": latency_ms,
                         "source_breakdown": {
@@ -1836,6 +1914,7 @@ async def agent_search_products(
                 merchant_scope=merchant_scope_for_fast,
                 query=normalized_query or None,
                 category=normalized_category or None,
+                catalog_surface=normalized_catalog_surface,
                 min_price=min_price,
                 max_price=max_price,
                 in_stock_only=in_stock_only,
@@ -1951,16 +2030,19 @@ async def agent_search_products(
                     "merchant_ids": merchant_ids,
                     "merchants_searched": len(merchant_scope_for_fast or []),
                     "cross_merchant_search": merchant_id is None and not merchant_ids,
+                    "catalog_surface": normalized_catalog_surface,
                 },
                 "filters_applied": {
                     "query": query,
                     "category": category,
+                    "catalog_surface": normalized_catalog_surface,
                     "min_price": min_price,
                     "max_price": max_price,
                     "in_stock_only": in_stock_only,
                 },
                 "metadata": {
                     "source": "agent_search_products_fast_mode",
+                    "catalog_surface": normalized_catalog_surface,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "source_breakdown": source_breakdown,
@@ -2091,6 +2173,8 @@ async def agent_search_products(
             for product in all_products:
                 if in_stock_only and not product.get("in_stock", True):
                     continue
+                if not _matches_catalog_surface(product, normalized_catalog_surface):
+                    continue
 
                 price = _safe_price_number(product.get("price", 0), 0.0)
                 if min_price and price < min_price:
@@ -2172,16 +2256,19 @@ async def agent_search_products(
                     "merchant_ids": merchant_ids,
                     "merchants_searched": len(merchants_to_search),
                     "cross_merchant_search": merchant_id is None and not merchant_ids,
+                    "catalog_surface": normalized_catalog_surface,
                 },
                 "filters_applied": {
                     "query": query,
                     "category": category,
+                    "catalog_surface": normalized_catalog_surface,
                     "min_price": min_price,
                     "max_price": max_price,
                     "in_stock_only": in_stock_only,
                 },
                 "metadata": {
                     "source": "agent_search_products",
+                    "catalog_surface": normalized_catalog_surface,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "source_breakdown": source_breakdown,
@@ -2201,6 +2288,8 @@ async def agent_search_products(
 
         for product in all_products:
             if in_stock_only and not product.get("in_stock", True):
+                continue
+            if not _matches_catalog_surface(product, normalized_catalog_surface):
                 continue
 
             price = _safe_price_number(product.get("price", 0), 0.0)
@@ -2489,17 +2578,20 @@ async def agent_search_products(
                 "merchant_id": merchant_id,
                 "merchant_ids": merchant_ids,
                 "merchants_searched": len(merchants_to_search),
-                "cross_merchant_search": merchant_id is None and not merchant_ids
+                "cross_merchant_search": merchant_id is None and not merchant_ids,
+                "catalog_surface": normalized_catalog_surface,
             },
             "filters_applied": {
                 "query": query,
                 "category": category,
+                "catalog_surface": normalized_catalog_surface,
                 "min_price": min_price,
                 "max_price": max_price,
                 "in_stock_only": in_stock_only
             },
             "metadata": {
                 "source": "agent_search_products",
+                "catalog_surface": normalized_catalog_surface,
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
                 "source_breakdown": source_breakdown,
@@ -2542,6 +2634,55 @@ async def agent_search_products(
             result="error",
         )
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+@router.get("/beauty/products/search")
+async def agent_search_products_beauty(
+    req: Request,
+    background_tasks: BackgroundTasks,
+    merchant_id: Optional[str] = None,
+    merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
+    search_all_merchants: bool = Query(
+        default=False,
+        description="Opt-in cross-merchant search (requires explicit intent to avoid irrelevant results)",
+    ),
+    query: Optional[str] = None,
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    in_stock_only: bool = True,
+    limit: int = Query(default=20, le=100),
+    offset: int = Query(default=0, ge=0),
+    allow_external_seed: bool = Query(default=True),
+    allow_stale_cache: bool = Query(default=True),
+    external_seed_strategy: str = Query(default="legacy"),
+    fast_mode: bool = Query(default=False),
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Beauty-only alias for agent product search.
+    Forces catalog_surface=beauty while preserving existing search behavior.
+    """
+    return await agent_search_products(
+        req=req,
+        background_tasks=background_tasks,
+        merchant_id=merchant_id,
+        merchant_ids=merchant_ids,
+        search_all_merchants=search_all_merchants,
+        query=query,
+        category=category,
+        catalog_surface=CATALOG_SURFACE_BEAUTY,
+        min_price=min_price,
+        max_price=max_price,
+        in_stock_only=in_stock_only,
+        limit=limit,
+        offset=offset,
+        allow_external_seed=allow_external_seed,
+        allow_stale_cache=allow_stale_cache,
+        external_seed_strategy=external_seed_strategy,
+        fast_mode=fast_mode,
+        context=context,
+    )
 
 
 @router.get("/products/resolve")
