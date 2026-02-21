@@ -57,8 +57,8 @@ AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS = _env_float(
     min_value=0.5,
     max_value=30.0,
 )
-AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SCOPED_SECONDS = _env_float(
-    "AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SCOPED_SECONDS",
+AGENT_SDK_FIXED_SCOPED_DELEGATE_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SDK_FIXED_SCOPED_DELEGATE_TIMEOUT_SECONDS",
     4.0,
     min_value=0.5,
     max_value=30.0,
@@ -110,6 +110,23 @@ _EXTERNAL_SEED_QUERY_STOPWORDS = {
     "to",
     "with",
 }
+
+def _resolve_delegate_timeout_seconds(merchant_id: Optional[str]) -> float:
+    return (
+        float(AGENT_SDK_FIXED_SCOPED_DELEGATE_TIMEOUT_SECONDS)
+        if merchant_id
+        else float(AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS)
+    )
+
+
+async def _await_with_hard_timeout(coro: Any, timeout_seconds: float) -> Any:
+    timeout_s = max(0.1, float(timeout_seconds or 0.1))
+    task = asyncio.create_task(coro)
+    done, _pending = await asyncio.wait({task}, timeout=timeout_s)
+    if task in done:
+        return await task
+    task.cancel()
+    raise asyncio.TimeoutError()
 
 
 def _stable_external_product_id(url: str) -> str:
@@ -1068,12 +1085,8 @@ async def search_products(
         }
 
     try:
-        delegate_timeout_s = (
-            AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS
-            if not merchant_id
-            else AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SCOPED_SECONDS
-        )
-        result = await asyncio.wait_for(
+        delegate_timeout_s = _resolve_delegate_timeout_seconds(merchant_id)
+        result = await _await_with_hard_timeout(
             agent_search_products(
                 req=req,
                 background_tasks=background_tasks,
@@ -1094,7 +1107,7 @@ async def search_products(
                 fast_mode=fast_mode,
                 context=context,
             ),
-            timeout=delegate_timeout_s,
+            delegate_timeout_s,
         )
     except asyncio.TimeoutError:
         if merchant_id:

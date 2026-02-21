@@ -414,6 +414,10 @@ CATALOG_UPSTREAM_V2_LOCAL_FALLBACK_MIN_BUDGET_SECONDS = _env_float(
     min_value=0.05,
     max_value=10.0,
 )
+MULTI_SEARCH_AURORA_FORCE_LOCAL_FALLBACK_ON_DELEGATE_FAIL = _env_bool(
+    "AGENT_SHOP_MULTI_AURORA_FORCE_LOCAL_FALLBACK_ON_DELEGATE_FAIL",
+    True,
+)
 MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED = _env_bool(
     "AGENT_SHOP_MULTI_PAGE_REQUEST_DEDUP_ENABLED",
     True,
@@ -810,12 +814,9 @@ def _build_multi_delegate_empty_result(
 
 
 def _allow_local_fallback_after_delegate_fail(request_metadata: Optional[Dict[str, Any]]) -> bool:
-    if not _catalog_rel_v2_enabled():
-        return False
-    if not CATALOG_RELIABILITY_V2_LOCAL_FALLBACK_ON_DELEGATE_FAIL:
-        return False
-
     md = request_metadata or {}
+    source_normalized = _normalize_surface_source(md.get("source"))
+
     remaining_seconds: Optional[float] = None
     try:
         if md.get("remaining_budget_seconds") is not None:
@@ -824,6 +825,19 @@ def _allow_local_fallback_after_delegate_fail(request_metadata: Optional[Dict[st
             remaining_seconds = float(md.get("remaining_budget_ms")) / 1000.0
     except Exception:
         remaining_seconds = None
+
+    if (
+        MULTI_SEARCH_AURORA_FORCE_LOCAL_FALLBACK_ON_DELEGATE_FAIL
+        and "aurora" in source_normalized
+    ):
+        if remaining_seconds is None:
+            return True
+        return remaining_seconds >= 0.2
+
+    if not _catalog_rel_v2_enabled():
+        return False
+    if not CATALOG_RELIABILITY_V2_LOCAL_FALLBACK_ON_DELEGATE_FAIL:
+        return False
 
     if remaining_seconds is None:
         return True

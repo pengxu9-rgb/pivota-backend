@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from datetime import datetime, timezone
@@ -738,6 +739,78 @@ async def test_shop_gateway_find_products_multi_delegate_upstream_failure_return
     assert result.get("metadata", {}).get("query_source") == "agent_products_resolver_fallback_empty"
     get_products_mock.assert_not_awaited()
     invoke_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_delegate_upstream_failure_aurora_forces_local_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as db_database_module
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+    from models.standard_product import StandardProduct
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "m_001", "business_name": "Merchant One"}]
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL", "https://resolver.example")
+    monkeypatch.setattr(agent_shop_gateway_module, "CATALOG_RELIABILITY_V2_ENABLED", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "CATALOG_RELIABILITY_V2_LOCAL_FALLBACK_ON_DELEGATE_FAIL", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_AURORA_FORCE_LOCAL_FALLBACK_ON_DELEGATE_FAIL", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_FORCE_CACHE_ONLY_SHOPPING", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", True)
+
+    invoke_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(agent_shop_gateway_module, "_invoke_multi_upstream_fallback", invoke_mock)
+    get_products_mock = AsyncMock(
+        return_value=(
+            [
+                StandardProduct(
+                    id="p_local_1",
+                    platform="shopify",
+                    merchant_id="m_001",
+                    title="Copper Peptides Serum",
+                    description="test",
+                    price=29.0,
+                    in_stock=True,
+                    inventory_quantity=10,
+                    orderable=True,
+                )
+            ],
+            "cache",
+            None,
+        )
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", get_products_mock)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="copper peptides serum",
+            page=1,
+            limit=10,
+            in_stock_only=False,
+        )
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "aurora-bff"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert (result.get("metadata") or {}).get("query_source") != "agent_products_resolver_fallback_empty"
+    invoke_mock.assert_awaited_once()
+    get_products_mock.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -1740,6 +1813,32 @@ def test_agent_products_search_handles_db_rows_with_noncallable_get(
     payload = res.json()
     assert payload.get("status") == "success"
     assert isinstance(payload.get("products"), list)
+
+
+def test_agent_products_search_delegate_hard_timeout_returns_504(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_api as agent_api_module
+    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    async def fake_slow_agent_search_products(**_kwargs):
+        await asyncio.sleep(0.3)
+        return {
+            "status": "success",
+            "products": [],
+            "pagination": {"total": 0, "limit": 20, "offset": 0, "has_more": False},
+        }
+
+    monkeypatch.setattr(agent_api_module, "agent_search_products", fake_slow_agent_search_products)
+    monkeypatch.setattr(agent_sdk_fixed_module, "AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS", 0.05)
+
+    res = client.get(
+        "/agent/v1/products/search?search_all_merchants=true&query=slow&in_stock_only=false&limit=10&offset=0",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 504
+    body = res.json()
+    assert "Search timeout" in str(body.get("detail"))
 
 
 def test_agent_products_search_allow_external_seed_false_disables_external_merge(
