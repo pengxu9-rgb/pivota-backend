@@ -233,16 +233,34 @@ def _domain_matches(dest_domain: str, allowed_domain: str) -> bool:
     return d == a or d.endswith(f".{a}")
 
 
-async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
+def _normalize_allowed_domains(rows: Any) -> list[str]:
+    allowed = [str(dict(r).get("domain") or "").strip().lower() for r in (rows or [])]
+    return [d for d in allowed if d]
+
+
+def is_domain_allowed_for_market_domains(*, destination_url: str, allowed_domains: Optional[list[str]]) -> bool:
     """
-    Backward compatible:
-    - If allowlist is empty for this market, allow everything.
-    - If allowlist has at least 1 active entry, enforce it.
+    Evaluate destination domain against a preloaded allowlist.
+
+    Backward-compatible behavior:
+    - Empty/None allowlist => allow all valid domains.
     """
     dest_domain = url_domain(destination_url).strip().lower()
     if not dest_domain:
         return False
+    normalized = [str(d or "").strip().lower() for d in (allowed_domains or []) if str(d or "").strip()]
+    if not normalized:
+        return True
+    return any(_domain_matches(dest_domain, a) for a in normalized)
 
+
+async def get_active_allowed_domains_for_market(*, market: str) -> list[str]:
+    """
+    Return active allowlist domains for a market.
+
+    Backward-compatible behavior:
+    - Missing allowlist table => return [] (interpreted as allow-all by callers).
+    """
     try:
         rows = await database.fetch_all(
             select(outbound_link_allowed_domains.c.domain)
@@ -255,17 +273,28 @@ async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
             .order_by(outbound_link_allowed_domains.c.domain.asc())
         )
     except Exception as exc:
-        # Degrade gracefully if allowlist table is missing in a given environment.
         msg = str(exc)
         if "outbound_link_allowed_domains" in msg and ("does not exist" in msg or "UndefinedTable" in msg):
-            return True
+            return []
         raise
-    allowed = [str(dict(r).get("domain") or "").strip().lower() for r in rows]
-    allowed = [d for d in allowed if d]
-    if not allowed:
-        return True
+    return _normalize_allowed_domains(rows)
 
-    return any(_domain_matches(dest_domain, a) for a in allowed)
+
+async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
+    """
+    Backward compatible:
+    - If allowlist is empty for this market, allow everything.
+    - If allowlist has at least 1 active entry, enforce it.
+    """
+    dest_domain = url_domain(destination_url).strip().lower()
+    if not dest_domain:
+        return False
+
+    allowed = await get_active_allowed_domains_for_market(market=market)
+    return is_domain_allowed_for_market_domains(
+        destination_url=destination_url,
+        allowed_domains=allowed,
+    )
 
 
 async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) -> ResolvedLink:

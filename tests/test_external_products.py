@@ -27,6 +27,86 @@ def _patch_agent_sdk_ranking(monkeypatch: pytest.MonkeyPatch, module) -> None:
     monkeypatch.setattr(module, "log_product_events", AsyncMock(return_value=None))
 
 
+@pytest.mark.asyncio
+async def test_agent_api_load_external_seed_products_prefetches_allowlist_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    seed_rows = [
+        {
+            "id": "seed_1",
+            "external_product_id": "ext_1",
+            "destination_url": "https://example.com/p/1",
+            "canonical_url": "https://example.com/p/1",
+            "seed_data": {},
+        },
+        {
+            "id": "seed_2",
+            "external_product_id": "ext_2",
+            "destination_url": "https://example.com/p/2",
+            "canonical_url": "https://example.com/p/2",
+            "seed_data": {},
+        },
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return seed_rows
+        return []
+
+    build_seen_allowed = []
+
+    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None):
+        build_seen_allowed.append(list(allowed_domains or []))
+        return {
+            "id": seed_row.get("external_product_id"),
+            "product_id": seed_row.get("external_product_id"),
+            "merchant_id": "external_seed",
+            "source": "external_seed",
+        }
+
+    allowlist_loader = AsyncMock(return_value=["example.com"])
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "get_active_allowed_domains_for_market", allowlist_loader)
+    monkeypatch.setattr(agent_api_module, "_build_external_seed_product", fake_build_external_seed_product)
+
+    products = await agent_api_module._load_external_seed_products_for_search(
+        req=None,  # req is unused by this test double.
+        query="example",
+        limit=10,
+        build_budget_ms=1000,
+    )
+
+    assert len(products) == 2
+    assert all(item == ["example.com"] for item in build_seen_allowed)
+    allowlist_loader.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_make_external_redirect_url_uses_preloaded_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    domain_check = AsyncMock(return_value=False)
+    monkeypatch.setattr(agent_shop_gateway_module, "_is_domain_allowed", domain_check)
+
+    redirect = await agent_shop_gateway_module._make_external_redirect_url(
+        market="US",
+        tool="*",
+        destination_url="https://example.com/p/1",
+        utm_template=None,
+        ctx={"seedId": "seed_1"},
+        allowed_domains=["example.com"],
+    )
+
+    assert isinstance(redirect, str)
+    assert "/r?token=" in redirect
+    domain_check.assert_not_awaited()
+
+
 def test_agent_cart_validate_rejects_external_seed_merchant(client: TestClient) -> None:
     res = client.post(
         "/agent/v1/cart/validate?merchant_id=external_seed&shipping_country=US",

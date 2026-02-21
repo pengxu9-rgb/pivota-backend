@@ -12,9 +12,9 @@ from utils.logger import logger
 import secrets
 import json
 import re
+import os
 import time
 import asyncio
-import os
 
 from services.agent_ranking_service import (
     AgentRankingFeatures,
@@ -27,6 +27,8 @@ from services.agent_ranking_service import (
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
+    get_active_allowed_domains_for_market,
+    is_domain_allowed_for_market_domains,
     _is_domain_allowed,
     apply_utm,
     make_redirect_token,
@@ -38,6 +40,51 @@ router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS",
+    7.0,
+    min_value=0.5,
+    max_value=30.0,
+)
+AGENT_SDK_FIXED_SCOPED_DELEGATE_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SDK_FIXED_SCOPED_DELEGATE_TIMEOUT_SECONDS",
+    4.0,
+    min_value=0.5,
+    max_value=30.0,
+)
+AGENT_SDK_FIXED_EXTERNAL_SEED_BUILD_CONCURRENCY = int(
+    _env_float(
+        "AGENT_SDK_FIXED_EXTERNAL_SEED_BUILD_CONCURRENCY",
+        8.0,
+        min_value=1.0,
+        max_value=64.0,
+    )
+)
+AGENT_SDK_FIXED_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SDK_FIXED_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS",
+    0.35,
+    min_value=0.05,
+    max_value=5.0,
+)
+AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS = int(
+    _env_float(
+        "AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS",
+        800.0,
+        min_value=100.0,
+        max_value=5000.0,
+    )
+)
 
 _EXTERNAL_SEED_QUERY_STOPWORDS = {
     "a",
@@ -63,30 +110,6 @@ _EXTERNAL_SEED_QUERY_STOPWORDS = {
     "to",
     "with",
 }
-
-
-def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
-    raw = (os.getenv(name) or "").strip()
-    try:
-        value = float(raw) if raw else default
-    except Exception:
-        value = default
-    return max(min_value, min(max_value, value))
-
-
-AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS = _env_float(
-    "AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS",
-    7.0,
-    min_value=0.5,
-    max_value=30.0,
-)
-AGENT_SDK_FIXED_SCOPED_DELEGATE_TIMEOUT_SECONDS = _env_float(
-    "AGENT_SDK_FIXED_SCOPED_DELEGATE_TIMEOUT_SECONDS",
-    4.0,
-    min_value=0.5,
-    max_value=30.0,
-)
-
 
 def _resolve_delegate_timeout_seconds(merchant_id: Optional[str]) -> float:
     return (
@@ -222,6 +245,7 @@ async def _build_external_seed_product(
     *,
     req: Request,
     seed_row: Dict[str, Any],
+    allowed_domains: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     seed_id = str(seed_row.get("id") or "").strip()
     if not seed_id:
@@ -255,7 +279,13 @@ async def _build_external_seed_product(
     utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
 
     dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
-    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+    if allowed_domains is None:
+        if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+            return None
+    elif not is_domain_allowed_for_market_domains(
+        destination_url=dest_with_utm,
+        allowed_domains=allowed_domains,
+    ):
         return None
 
     external_domain = str(seed_row.get("domain") or "").strip() or None
@@ -380,6 +410,9 @@ async def _load_external_seed_products_for_search(
     query: Optional[str],
     limit: int,
     offset: int,
+    build_budget_ms: Optional[int] = None,
+    build_concurrency: Optional[int] = None,
+    build_timeout_s: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     q = str(query or "").strip()
     where = ["status = :status", "attached_product_key IS NULL", "market = :market"]
@@ -455,8 +488,8 @@ async def _load_external_seed_products_for_search(
             return []
         raise
 
-    products: List[Dict[str, Any]] = []
     seen: set[str] = set()
+    candidate_rows: List[Dict[str, Any]] = []
     for row in rows or []:
         seed_row = dict(row)
         seed_data = _ensure_json_obj(seed_row.get("seed_data"))
@@ -468,13 +501,82 @@ async def _load_external_seed_products_for_search(
         if not external_product_id or external_product_id in seen:
             continue
         seen.add(external_product_id)
-        try:
-            prod = await _build_external_seed_product(req=req, seed_row=seed_row)
+        candidate_rows.append(seed_row)
+        if len(candidate_rows) >= limit:
+            break
+    if not candidate_rows:
+        return []
+
+    try:
+        allowed_domains = await get_active_allowed_domains_for_market(
+            market=DEFAULT_EXTERNAL_SEED_MARKET,
+        )
+    except Exception:
+        allowed_domains = []
+
+    concurrency = max(
+        1,
+        int(build_concurrency or AGENT_SDK_FIXED_EXTERNAL_SEED_BUILD_CONCURRENCY),
+    )
+    per_item_timeout_s = float(
+        build_timeout_s
+        if build_timeout_s is not None
+        else AGENT_SDK_FIXED_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS
+    )
+    deadline = None
+    budget_ms = int(build_budget_ms) if build_budget_ms is not None else AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS
+    if budget_ms > 0:
+        deadline = time.perf_counter() + (budget_ms / 1000.0)
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _build_guarded(seed_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async with semaphore:
+            if deadline is not None and time.perf_counter() >= deadline:
+                return None
+            try:
+                if per_item_timeout_s > 0:
+                    return await asyncio.wait_for(
+                        _build_external_seed_product(
+                            req=req,
+                            seed_row=seed_row,
+                            allowed_domains=allowed_domains,
+                        ),
+                        timeout=per_item_timeout_s,
+                    )
+                return await _build_external_seed_product(
+                    req=req,
+                    seed_row=seed_row,
+                    allowed_domains=allowed_domains,
+                )
+            except Exception:
+                return None
+
+    tasks = [asyncio.create_task(_build_guarded(seed_row)) for seed_row in candidate_rows]
+    products: List[Dict[str, Any]] = []
+    try:
+        for task in asyncio.as_completed(tasks):
+            if deadline is not None:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    prod = await asyncio.wait_for(task, timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+            else:
+                prod = await task
             if prod:
                 products.append(prod)
-        except Exception:
-            continue
-    return products
+                if len(products) >= limit:
+                    break
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    return products[:limit]
 
 # ============================================================================
 # HEALTH CHECK
@@ -963,6 +1065,7 @@ async def search_products(
             query=query,
             limit=limit,
             offset=offset,
+            build_budget_ms=AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS,
         )
         return {
             "status": "success",
@@ -1041,6 +1144,7 @@ async def search_products(
                     query=query,
                     limit=external_seed_limit,
                     offset=0,
+                    build_budget_ms=AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS,
                 )
                 if external_products:
                     products = result.get("products") if isinstance(result.get("products"), list) else []

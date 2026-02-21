@@ -34,6 +34,8 @@ from services.quote_service import QuoteError
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
+    get_active_allowed_domains_for_market,
+    is_domain_allowed_for_market_domains,
     _is_domain_allowed,
     apply_utm,
     make_redirect_token,
@@ -229,6 +231,36 @@ AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT = int(
         "AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT",
         1200.0,
         min_value=200.0,
+        max_value=5000.0,
+    )
+)
+AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY = int(
+    _env_float(
+        "AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY",
+        10.0,
+        min_value=1.0,
+        max_value=64.0,
+    )
+)
+AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS = _env_float(
+    "AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS",
+    0.35,
+    min_value=0.05,
+    max_value=5.0,
+)
+AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
+    _env_float(
+        "AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS",
+        420.0,
+        min_value=50.0,
+        max_value=3000.0,
+    )
+)
+AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS = int(
+    _env_float(
+        "AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS",
+        900.0,
+        min_value=100.0,
         max_value=5000.0,
     )
 )
@@ -844,6 +876,7 @@ async def _build_external_seed_product(
     *,
     req: Request,
     seed_row: Dict[str, Any],
+    allowed_domains: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     seed_id = str(seed_row.get("id") or "").strip()
     if not seed_id:
@@ -877,7 +910,13 @@ async def _build_external_seed_product(
     utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
 
     dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
-    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+    if allowed_domains is None:
+        if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+            return None
+    elif not is_domain_allowed_for_market_domains(
+        destination_url=dest_with_utm,
+        allowed_domains=allowed_domains,
+    ):
         return None
 
     token = make_redirect_token(
@@ -983,7 +1022,15 @@ async def _build_external_seed_product(
     }
 
 
-async def _load_external_seed_products_for_search(*, req: Request, query: Optional[str], limit: int) -> List[Dict[str, Any]]:
+async def _load_external_seed_products_for_search(
+    *,
+    req: Request,
+    query: Optional[str],
+    limit: int,
+    build_budget_ms: Optional[int] = None,
+    build_concurrency: Optional[int] = None,
+    build_timeout_s: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     """
     Load employee-managed external products (unattached external seeds) and surface as first-class products.
     """
@@ -1020,8 +1067,8 @@ async def _load_external_seed_products_for_search(*, req: Request, query: Option
             return []
         raise
 
-    products: List[Dict[str, Any]] = []
     seen: set[str] = set()
+    candidate_rows: List[Dict[str, Any]] = []
     for row in rows:
         seed_row = dict(row)
         seed_data = _ensure_json_obj(seed_row.get("seed_data"))
@@ -1033,13 +1080,82 @@ async def _load_external_seed_products_for_search(*, req: Request, query: Option
         if not external_product_id or external_product_id in seen:
             continue
         seen.add(external_product_id)
-        try:
-            prod = await _build_external_seed_product(req=req, seed_row=seed_row)
+        candidate_rows.append(seed_row)
+        if len(candidate_rows) >= limit:
+            break
+    if not candidate_rows:
+        return []
+
+    try:
+        allowed_domains = await get_active_allowed_domains_for_market(
+            market=DEFAULT_EXTERNAL_SEED_MARKET,
+        )
+    except Exception:
+        allowed_domains = []
+
+    concurrency = max(
+        1,
+        int(build_concurrency or AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY),
+    )
+    per_item_timeout_s = float(
+        build_timeout_s
+        if build_timeout_s is not None
+        else AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS
+    )
+    deadline = None
+    budget_ms = int(build_budget_ms) if build_budget_ms is not None else AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS
+    if budget_ms > 0:
+        deadline = time.perf_counter() + (budget_ms / 1000.0)
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _build_guarded(seed_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async with semaphore:
+            if deadline is not None and time.perf_counter() >= deadline:
+                return None
+            try:
+                if per_item_timeout_s > 0:
+                    return await asyncio.wait_for(
+                        _build_external_seed_product(
+                            req=req,
+                            seed_row=seed_row,
+                            allowed_domains=allowed_domains,
+                        ),
+                        timeout=per_item_timeout_s,
+                    )
+                return await _build_external_seed_product(
+                    req=req,
+                    seed_row=seed_row,
+                    allowed_domains=allowed_domains,
+                )
+            except Exception:
+                return None
+
+    tasks = [asyncio.create_task(_build_guarded(seed_row)) for seed_row in candidate_rows]
+    products: List[Dict[str, Any]] = []
+    try:
+        for task in asyncio.as_completed(tasks):
+            if deadline is not None:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    prod = await asyncio.wait_for(task, timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+            else:
+                prod = await task
             if prod:
                 products.append(prod)
-        except Exception:
-            continue
-    return products
+                if len(products) >= limit:
+                    break
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    return products[:limit]
 
 
 async def _load_external_seed_product_by_product_id(*, req: Request, product_id: str) -> Optional[Dict[str, Any]]:
@@ -1941,6 +2057,7 @@ async def agent_search_products(
                         req=req,
                         query=query,
                         limit=ext_limit,
+                        build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
                     )
                     seen_keys = {
                         f"{str(p.get('merchant_id') or '').strip()}::{str(p.get('product_id') or p.get('id') or '').strip()}"
@@ -2154,6 +2271,7 @@ async def agent_search_products(
                     req=req,
                     query=query,
                     limit=external_seed_limit,
+                    build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,
                 )
                 if external_seed_products:
                     all_products.extend(external_seed_products)
