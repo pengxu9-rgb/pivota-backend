@@ -50,6 +50,10 @@
 - One-command test run:
   - `scripts/run_reliability_v2_100_suite.sh quick`
   - `scripts/run_reliability_v2_100_suite.sh full`
+- Endpoint smoke (non-pytest):
+  - `scripts/smoke_reliability_v2_100_endpoints.sh`
+- Config template:
+  - `docs/reliability/reliability-v2-100.env.example`
 
 ## 3) Instant Rollback (config-only)
 
@@ -64,6 +68,12 @@ CATALOG_UPSTREAM_V2_SHOPPING_TIMEOUT_CAP_SECONDS=1.2
 ```
 
 If using allowlist rollout, clear allowlists and redeploy config only.
+
+Config template:
+- `docs/reliability/reliability-v2-rollback.env.example`
+
+Rollback drill command:
+- `scripts/drill_reliability_v2_rollback.sh`
 
 ## 4) Metrics to Watch
 

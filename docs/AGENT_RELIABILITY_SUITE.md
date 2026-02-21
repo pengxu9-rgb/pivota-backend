@@ -32,6 +32,21 @@ scripts/run_reliability_v2_100_suite.sh quick
 
 Runs reliability-focused regression with Payment/Catalog v2 flags enabled for no-user environments.
 
+```bash
+scripts/smoke_reliability_v2_100_endpoints.sh
+```
+
+Runs non-pytest endpoint smoke for:
+- `/agent/v1/products/search`
+- `/agent/shop/v1/invoke`
+- `/agent/v1/payments`
+
+```bash
+scripts/drill_reliability_v2_rollback.sh
+```
+
+Runs rollback drill: v2 ON quick suite, then v2 OFF quick suite.
+
 ## Suite Composition
 
 ### Quick
