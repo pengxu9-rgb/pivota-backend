@@ -234,6 +234,18 @@ AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT = int(
         max_value=5000.0,
     )
 )
+AGENT_SEARCH_FAST_MODE_QUERY_CANDIDATE_LIMIT = int(
+    _env_float(
+        "AGENT_SEARCH_FAST_MODE_QUERY_CANDIDATE_LIMIT",
+        520.0,
+        min_value=120.0,
+        max_value=3000.0,
+    )
+)
+AGENT_SEARCH_FAST_MODE_SKIP_MERCHANT_JOIN = _env_bool(
+    "AGENT_SEARCH_FAST_MODE_SKIP_MERCHANT_JOIN",
+    True,
+)
 AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY",
@@ -725,15 +737,25 @@ async def _search_products_fast_mode(
     normalized_category = str(category or "").strip().lower()
     page_limit = max(1, min(int(limit or 20), 100))
     page_offset = max(0, int(offset or 0))
-    fetch_limit = min(
-        AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT,
-        max(page_limit * 20 + 100, 300),
-    )
+    if normalized_query:
+        fetch_limit = min(
+            AGENT_SEARCH_FAST_MODE_QUERY_CANDIDATE_LIMIT,
+            max(page_limit * 12 + 60, 180),
+        )
+    else:
+        fetch_limit = min(
+            AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT,
+            max(page_limit * 20 + 100, 300),
+        )
 
-    where_clauses = [
-        "mo.status NOT IN ('deleted', 'rejected')",
-        "mo.psp_connected = true",
-    ]
+    where_clauses: List[str] = []
+    if not AGENT_SEARCH_FAST_MODE_SKIP_MERCHANT_JOIN:
+        where_clauses.extend(
+            [
+                "mo.status NOT IN ('deleted', 'rejected')",
+                "mo.psp_connected = true",
+            ]
+        )
     params: Dict[str, Any] = {
         "limit": fetch_limit,
         "offset": 0,
@@ -744,23 +766,40 @@ async def _search_products_fast_mode(
     if not allow_stale_cache:
         where_clauses.append("(pc.expires_at IS NULL OR pc.expires_at > NOW())")
 
-    rows = await database.fetch_all(
-        f"""
-        SELECT pc.merchant_id,
-               mo.business_name AS merchant_name,
-               pc.product_data,
-               pc.cached_at,
-               pc.expires_at
-        FROM products_cache pc
-        JOIN merchant_onboarding mo
-          ON mo.merchant_id = pc.merchant_id
-        WHERE {' AND '.join(where_clauses)}
-        ORDER BY pc.cached_at DESC NULLS LAST, pc.id DESC
-        LIMIT :limit
-        OFFSET :offset
-        """,
-        params,
-    )
+    if AGENT_SEARCH_FAST_MODE_SKIP_MERCHANT_JOIN:
+        rows = await database.fetch_all(
+            f"""
+            SELECT pc.merchant_id,
+                   NULL::TEXT AS merchant_name,
+                   pc.product_data,
+                   pc.cached_at,
+                   pc.expires_at
+            FROM products_cache pc
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY pc.cached_at DESC NULLS LAST, pc.id DESC
+            LIMIT :limit
+            OFFSET :offset
+            """,
+            params,
+        )
+    else:
+        rows = await database.fetch_all(
+            f"""
+            SELECT pc.merchant_id,
+                   mo.business_name AS merchant_name,
+                   pc.product_data,
+                   pc.cached_at,
+                   pc.expires_at
+            FROM products_cache pc
+            JOIN merchant_onboarding mo
+              ON mo.merchant_id = pc.merchant_id
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY pc.cached_at DESC NULLS LAST, pc.id DESC
+            LIMIT :limit
+            OFFSET :offset
+            """,
+            params,
+        )
 
     internal_ranked: List[Dict[str, Any]] = []
     external_ranked: List[Dict[str, Any]] = []
