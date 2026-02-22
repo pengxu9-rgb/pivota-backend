@@ -176,6 +176,7 @@ from routes.admin_debug_shopify_token import router as admin_debug_shopify_token
 from routes.employee_agent_mgmt import router as employee_agent_mgmt_router
 from routes.employee_products import router as employee_products_router
 from routes.employee_content import router as employee_content_router
+from routes.employee_kb_monitoring import router as employee_kb_monitoring_router
 from routes.employee_agents_management import router as employee_agents_management_router
 from routes.employee_agents_simple import router as employee_agents_simple_router
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
@@ -592,6 +593,7 @@ app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
 app.include_router(employee_finance_router)  # Employee finance endpoints
 app.include_router(employee_products_router)  # Employee products endpoints (MVP)
+app.include_router(employee_kb_monitoring_router)  # Aurora KB v0 monitoring summary
 app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
 app.include_router(employee_reviews_router)  # Employee Reviews Center (imports/governance)
