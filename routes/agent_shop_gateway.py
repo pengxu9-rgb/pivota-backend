@@ -265,6 +265,30 @@ MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS = _env_float(
     min_value=0.1,
     max_value=5.0,
 )
+MULTI_SEARCH_SHOPPING_FAST_MERCHANT_SEED_LIMIT = _env_int(
+    "AGENT_SHOP_MULTI_SHOPPING_FAST_MERCHANT_SEED_LIMIT",
+    60,
+    min_value=1,
+    max_value=200,
+)
+MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST = _env_bool(
+    "AGENT_SHOP_MULTI_SHOPPING_ENABLE_RECALL_BOOST",
+    False,
+)
+MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN = _env_bool(
+    "AGENT_SHOP_MULTI_SHOPPING_ENABLE_SKU_JSON_SCAN",
+    False,
+)
+MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN = _env_bool(
+    "AGENT_SHOP_MULTI_SHOPPING_ENABLE_SEED_TEXT_SCAN",
+    False,
+)
+MULTI_SEARCH_SHOPPING_RECALL_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_MULTI_SHOPPING_RECALL_QUERY_TIMEOUT_SECONDS",
+    0.45,
+    min_value=0.1,
+    max_value=5.0,
+)
 MULTI_SEARCH_FORCE_CACHE_ONLY_LEGACY = _env_bool(
     "AGENT_SHOP_MULTI_FORCE_CACHE_ONLY",
     True,
@@ -4085,15 +4109,17 @@ async def _handle_find_products_multi(
             for idx, term in enumerate(terms[:8]):
                 key = f"like_{idx}"
                 seed_params[key] = f"%{term.lower()}%"
-                where_clauses.append(
+                clause = (
                     "("
                     "LOWER(COALESCE(title,'')) LIKE :" + key
                     + " OR LOWER(COALESCE(domain,'')) LIKE :" + key
                     + " OR LOWER(COALESCE(canonical_url,'')) LIKE :" + key
                     + " OR LOWER(COALESCE(destination_url,'')) LIKE :" + key
-                    + " OR LOWER(CAST(seed_data AS TEXT)) LIKE :" + key
-                    + ")"
                 )
+                if (not is_shopping_surface) or MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN:
+                    clause += " OR LOWER(CAST(seed_data AS TEXT)) LIKE :" + key
+                clause += ")"
+                where_clauses.append(clause)
             if where_clauses:
                 seed_where += " AND (" + " OR ".join(where_clauses) + ")"
 
@@ -4498,6 +4524,15 @@ async def _handle_find_products_multi(
         merchant_products.append((product, merchant_name))
 
     merchant_ids_for_search = [mid for mid, _ in merchant_items]
+    if (
+        not merchant_ids_for_search
+        and is_shopping_surface
+        and q
+        and merchant_map
+    ):
+        merchant_ids_for_search = list(merchant_map.keys())[
+            : max(1, int(MULTI_SEARCH_SHOPPING_FAST_MERCHANT_SEED_LIMIT))
+        ]
 
     # Fast path: perform one cache-wide SQL search across eligible merchants first.
     # This avoids N-per-merchant round trips in the common non-empty query path.
@@ -4529,7 +4564,9 @@ async def _handle_find_products_multi(
                         + " OR LOWER(COALESCE(product_data->>'sku','')) LIKE :" + key
                         + ")"
                     )
-                    if sku_like_query:
+                    if sku_like_query and (
+                        (not is_shopping_surface) or MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN
+                    ):
                         where_clauses.append("LOWER(CAST(product_data AS TEXT)) LIKE :" + key)
 
                 rows = await database.fetch_all(
@@ -4615,7 +4652,7 @@ async def _handle_find_products_multi(
     # Recall boost: when the user asks a specific query (e.g. a character name),
     # searching only a small "top-N" slice per merchant can miss relevant items.
     # Pull additional candidates directly from products_cache using cheap text matching.
-    if merchant_map:
+    if merchant_map and (not is_shopping_surface or MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST):
         try:
             anchor_terms: List[str] = []
             if "labubu" in q_ascii:
@@ -4634,7 +4671,12 @@ async def _handle_find_products_multi(
                 # Pull a bounded recent slice using indexed columns and do
                 # token matching in-memory. This avoids expensive JSON LIKE
                 # scans that can trigger long-tail DB latency.
-                cache_scan_limit = min(max(limit * max(page, 1) * 80, 600), 5000)
+                if is_shopping_surface:
+                    cache_scan_limit = min(max(limit * max(page, 1) * 30, 240), 1500)
+                    recall_timeout_seconds = float(MULTI_SEARCH_SHOPPING_RECALL_QUERY_TIMEOUT_SECONDS)
+                else:
+                    cache_scan_limit = min(max(limit * max(page, 1) * 80, 600), 5000)
+                    recall_timeout_seconds = float(MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS)
                 rows = await asyncio.wait_for(
                     database.fetch_all(
                         """
@@ -4650,7 +4692,7 @@ async def _handle_find_products_multi(
                             "cache_limit": cache_scan_limit,
                         },
                     ),
-                    timeout=MULTI_SEARCH_RECALL_QUERY_TIMEOUT_SECONDS,
+                    timeout=recall_timeout_seconds,
                 )
 
                 anchor_compacts = [
@@ -5249,6 +5291,13 @@ async def _handle_find_products_multi(
                 "history_boost_applied": history_used,
                 "upstream_fallback_configured": bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL),
                 "upstream_fallback_attempted": bool(should_try_upstream),
+                "shopping_fast_prefetch_used": bool(is_shopping_surface and q and merchant_ids_for_search),
+                "shopping_recall_boost_enabled": bool(
+                    is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST
+                ),
+                "shopping_sku_json_scan_enabled": bool(
+                    is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN
+                ),
             },
         },
         rewritten_query=q_ascii,
