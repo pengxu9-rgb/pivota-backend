@@ -34,10 +34,9 @@ from services.quote_service import QuoteError
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
-    get_active_allowed_domains_for_market,
-    is_domain_allowed_for_market_domains,
-    _is_domain_allowed,
     apply_utm,
+    get_allowed_domains_for_market,
+    is_destination_domain_allowed,
     make_redirect_token,
 )
 from services.agent_ranking_service import (
@@ -68,6 +67,20 @@ _ORDER_CREATE_LOCKS: Dict[str, asyncio.Lock] = {}
 
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
+FIND_PRODUCTS_MULTI_SEED_BUDGET_MS = max(
+    0,
+    min(
+        5000,
+        int(os.getenv("FIND_PRODUCTS_MULTI_SEED_BUDGET_MS", "400") or 400),
+    ),
+)
+FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY = max(
+    1,
+    min(
+        32,
+        int(os.getenv("FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY", "8") or 8),
+    ),
+)
 CATALOG_SURFACE_BEAUTY = "beauty"
 _CATALOG_BEAUTY_KEYWORDS = (
     "beauty",
@@ -249,7 +262,7 @@ AGENT_SEARCH_FAST_MODE_SKIP_MERCHANT_JOIN = _env_bool(
 AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY",
-        10.0,
+        float(FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY or 8),
         min_value=1.0,
         max_value=64.0,
     )
@@ -263,7 +276,7 @@ AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS = _env_float(
 AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS",
-        420.0,
+        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 400),
         min_value=50.0,
         max_value=3000.0,
     )
@@ -271,7 +284,7 @@ AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
 AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS",
-        900.0,
+        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 400),
         min_value=100.0,
         max_value=5000.0,
     )
@@ -950,9 +963,8 @@ async def _build_external_seed_product(
 
     dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
     if allowed_domains is None:
-        if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
-            return None
-    elif not is_domain_allowed_for_market_domains(
+        allowed_domains = await get_allowed_domains_for_market(market=market)
+    if not is_destination_domain_allowed(
         destination_url=dest_with_utm,
         allowed_domains=allowed_domains,
     ):
@@ -1068,7 +1080,7 @@ async def _load_external_seed_products_for_search(
     limit: int,
     build_budget_ms: Optional[int] = None,
     build_concurrency: Optional[int] = None,
-    build_timeout_s: Optional[float] = None,
+    include_seed_data_text_match: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Load employee-managed external products (unattached external seeds) and surface as first-class products.
@@ -1078,9 +1090,13 @@ async def _load_external_seed_products_for_search(
     values: Dict[str, Any] = {"status": "active", "market": DEFAULT_EXTERNAL_SEED_MARKET, "limit": limit}
     if q:
         values["q_like"] = f"%{q}%"
-        where.append(
-            "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
+        where_clause = (
+            "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like"
         )
+        if include_seed_data_text_match:
+            where_clause += " OR CAST(seed_data AS TEXT) ILIKE :q_like"
+        where_clause += ")"
+        where.append(where_clause)
 
     try:
         rows = await database.fetch_all(
@@ -1125,24 +1141,19 @@ async def _load_external_seed_products_for_search(
     if not candidate_rows:
         return []
 
-    try:
-        allowed_domains = await get_active_allowed_domains_for_market(
-            market=DEFAULT_EXTERNAL_SEED_MARKET,
-        )
-    except Exception:
-        allowed_domains = []
+    allowlist_by_market: Dict[str, List[str]] = {}
+    for seed_row in candidate_rows:
+        seed_market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
+        if seed_market in allowlist_by_market:
+            continue
+        allowlist_by_market[seed_market] = await get_allowed_domains_for_market(market=seed_market)
 
     concurrency = max(
         1,
         int(build_concurrency or AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY),
     )
-    per_item_timeout_s = float(
-        build_timeout_s
-        if build_timeout_s is not None
-        else AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS
-    )
     deadline = None
-    budget_ms = int(build_budget_ms) if build_budget_ms is not None else AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS
+    budget_ms = int(build_budget_ms) if build_budget_ms is not None else int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS)
     if budget_ms > 0:
         deadline = time.perf_counter() + (budget_ms / 1000.0)
 
@@ -1153,15 +1164,8 @@ async def _load_external_seed_products_for_search(
             if deadline is not None and time.perf_counter() >= deadline:
                 return None
             try:
-                if per_item_timeout_s > 0:
-                    return await asyncio.wait_for(
-                        _build_external_seed_product(
-                            req=req,
-                            seed_row=seed_row,
-                            allowed_domains=allowed_domains,
-                        ),
-                        timeout=per_item_timeout_s,
-                    )
+                seed_market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
+                allowed_domains = allowlist_by_market.get(seed_market, [])
                 return await _build_external_seed_product(
                     req=req,
                     seed_row=seed_row,
@@ -2097,6 +2101,7 @@ async def agent_search_products(
                         query=query,
                         limit=ext_limit,
                         build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
+                        build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
                     )
                     seen_keys = {
                         f"{str(p.get('merchant_id') or '').strip()}::{str(p.get('product_id') or p.get('id') or '').strip()}"
@@ -2311,6 +2316,8 @@ async def agent_search_products(
                     query=query,
                     limit=external_seed_limit,
                     build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,
+                    build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
+                    include_seed_data_text_match=(normalized_seed_strategy == "legacy"),
                 )
                 if external_seed_products:
                     all_products.extend(external_seed_products)

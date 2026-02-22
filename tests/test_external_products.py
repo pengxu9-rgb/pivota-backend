@@ -69,7 +69,7 @@ async def test_agent_api_load_external_seed_products_prefetches_allowlist_once(
 
     allowlist_loader = AsyncMock(return_value=["example.com"])
     monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_api_module, "get_active_allowed_domains_for_market", allowlist_loader)
+    monkeypatch.setattr(agent_api_module, "get_allowed_domains_for_market", allowlist_loader)
     monkeypatch.setattr(agent_api_module, "_build_external_seed_product", fake_build_external_seed_product)
 
     products = await agent_api_module._load_external_seed_products_for_search(
@@ -90,8 +90,8 @@ async def test_shop_gateway_make_external_redirect_url_uses_preloaded_allowlist(
 ) -> None:
     import routes.agent_shop_gateway as agent_shop_gateway_module
 
-    domain_check = AsyncMock(return_value=False)
-    monkeypatch.setattr(agent_shop_gateway_module, "_is_domain_allowed", domain_check)
+    domain_check = AsyncMock(return_value=["example.com"])
+    monkeypatch.setattr(agent_shop_gateway_module, "get_allowed_domains_for_market", domain_check)
 
     redirect = await agent_shop_gateway_module._make_external_redirect_url(
         market="US",

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -7,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 from sqlalchemy import and_, desc, func, or_, select
@@ -21,6 +22,15 @@ DEFAULT_DISCLOSURE_TEXT = "Prices may change. We may earn a commission from qual
 
 
 SCOPE_ORDER = ["sku", "brand", "category", "role", "default"]
+ALLOWED_DOMAIN_CACHE_TTL_MS = max(
+    1000,
+    min(
+        24 * 60 * 60 * 1000,
+        int(os.getenv("FIND_PRODUCTS_MULTI_SEED_ALLOWLIST_CACHE_TTL_MS", "300000") or 300000),
+    ),
+)
+_ALLOWED_DOMAIN_CACHE: Dict[str, Tuple[int, List[str]]] = {}
+_ALLOWED_DOMAIN_INFLIGHT: Dict[str, asyncio.Task[List[str]]] = {}
 
 
 def _now_ts() -> int:
@@ -238,7 +248,7 @@ def _normalize_allowed_domains(rows: Any) -> list[str]:
     return [d for d in allowed if d]
 
 
-def is_domain_allowed_for_market_domains(*, destination_url: str, allowed_domains: Optional[list[str]]) -> bool:
+def is_destination_domain_allowed(*, destination_url: str, allowed_domains: Optional[List[str]]) -> bool:
     """
     Evaluate destination domain against a preloaded allowlist.
 
@@ -254,7 +264,19 @@ def is_domain_allowed_for_market_domains(*, destination_url: str, allowed_domain
     return any(_domain_matches(dest_domain, a) for a in normalized)
 
 
-async def get_active_allowed_domains_for_market(*, market: str) -> list[str]:
+def is_domain_allowed_for_market_domains(*, destination_url: str, allowed_domains: Optional[list[str]]) -> bool:
+    # Backward-compatible wrapper.
+    return is_destination_domain_allowed(
+        destination_url=destination_url,
+        allowed_domains=[str(d) for d in (allowed_domains or [])],
+    )
+
+
+def _normalize_market_key(market: str) -> str:
+    return str(market or "").strip().upper() or "US"
+
+
+async def _fetch_allowed_domains_for_market(cache_market: str) -> List[str]:
     """
     Return active allowlist domains for a market.
 
@@ -266,7 +288,7 @@ async def get_active_allowed_domains_for_market(*, market: str) -> list[str]:
             select(outbound_link_allowed_domains.c.domain)
             .where(
                 and_(
-                    outbound_link_allowed_domains.c.market == market,
+                    outbound_link_allowed_domains.c.market == cache_market,
                     outbound_link_allowed_domains.c.status == "active",
                 )
             )
@@ -280,6 +302,39 @@ async def get_active_allowed_domains_for_market(*, market: str) -> list[str]:
     return _normalize_allowed_domains(rows)
 
 
+async def get_allowed_domains_for_market(*, market: str) -> List[str]:
+    now_ms = int(time.time() * 1000)
+    cache_market = _normalize_market_key(market)
+    cached = _ALLOWED_DOMAIN_CACHE.get(cache_market)
+    if cached and cached[0] > now_ms:
+        return list(cached[1])
+
+    inflight = _ALLOWED_DOMAIN_INFLIGHT.get(cache_market)
+    if inflight is not None:
+        return list(await inflight)
+
+    async def _load() -> List[str]:
+        domains = await _fetch_allowed_domains_for_market(cache_market)
+        _ALLOWED_DOMAIN_CACHE[cache_market] = (
+            int(time.time() * 1000) + ALLOWED_DOMAIN_CACHE_TTL_MS,
+            list(domains),
+        )
+        return list(domains)
+
+    task = asyncio.create_task(_load())
+    _ALLOWED_DOMAIN_INFLIGHT[cache_market] = task
+    try:
+        return list(await task)
+    finally:
+        if _ALLOWED_DOMAIN_INFLIGHT.get(cache_market) is task:
+            _ALLOWED_DOMAIN_INFLIGHT.pop(cache_market, None)
+
+
+async def get_active_allowed_domains_for_market(*, market: str) -> list[str]:
+    # Backward-compatible wrapper.
+    return list(await get_allowed_domains_for_market(market=market))
+
+
 async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
     """
     Backward compatible:
@@ -290,8 +345,8 @@ async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
     if not dest_domain:
         return False
 
-    allowed = await get_active_allowed_domains_for_market(market=market)
-    return is_domain_allowed_for_market_domains(
+    allowed = await get_allowed_domains_for_market(market=market)
+    return is_destination_domain_allowed(
         destination_url=destination_url,
         allowed_domains=allowed,
     )

@@ -45,10 +45,9 @@ from services.similarity_service import (
 from services.similarity_config import get_similarity_scoring_weights
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
-    get_active_allowed_domains_for_market,
-    is_domain_allowed_for_market_domains,
-    _is_domain_allowed,
     apply_utm,
+    get_allowed_domains_for_market,
+    is_destination_domain_allowed,
     make_redirect_token,
 )
 from models.standard_product import StandardProduct, ProductStatus
@@ -67,6 +66,20 @@ logger = logging.getLogger(__name__)
 
 _MERCHANT_SHOPIFY_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
 _MERCHANT_SHOPIFY_CURRENCY_TTL_SECONDS = 6 * 60 * 60
+FIND_PRODUCTS_MULTI_SEED_BUDGET_MS = max(
+    0,
+    min(
+        5000,
+        int(os.getenv("FIND_PRODUCTS_MULTI_SEED_BUDGET_MS", "400") or 400),
+    ),
+)
+FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY = max(
+    1,
+    min(
+        32,
+        int(os.getenv("FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY", "8") or 8),
+    ),
+)
 
 _REVIEW_MEDIA_IP_LIMIT_STORE: Dict[str, tuple[int, int]] = {}
 
@@ -2563,9 +2576,8 @@ async def _make_external_redirect_url(
         {"market": market, "tool": tool},
     )
     if allowed_domains is None:
-        if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
-            return None
-    elif not is_domain_allowed_for_market_domains(
+        allowed_domains = await get_allowed_domains_for_market(market=market)
+    if not is_destination_domain_allowed(
         destination_url=dest_with_utm,
         allowed_domains=allowed_domains,
     ):
@@ -4157,10 +4169,15 @@ async def _handle_find_products_multi(
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
         allowed_domains_by_market: Dict[str, List[str]] = {}
-        seed_build_deadline = time.perf_counter() + float(MULTI_SEARCH_SEED_BUILD_BUDGET_SECONDS)
+        seed_budget_ms = int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 0)
+        seed_build_deadline = (
+            time.perf_counter() + (seed_budget_ms / 1000.0)
+            if seed_budget_ms > 0
+            else None
+        )
         shopping_seed_target = max(1, limit * max(page, 1))
         for row in seed_rows:
-            if time.perf_counter() >= seed_build_deadline:
+            if seed_build_deadline is not None and time.perf_counter() >= seed_build_deadline:
                 break
             row_dict = dict(row) if isinstance(row, dict) else {}
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
@@ -4213,7 +4230,7 @@ async def _handle_find_products_multi(
             allowed_domains = allowed_domains_by_market.get(market)
             if allowed_domains is None:
                 try:
-                    allowed_domains = await get_active_allowed_domains_for_market(market=market)
+                    allowed_domains = await get_allowed_domains_for_market(market=market)
                 except Exception:
                     allowed_domains = []
                 allowed_domains_by_market[market] = allowed_domains
