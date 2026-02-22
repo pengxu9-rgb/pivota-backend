@@ -34,8 +34,8 @@ agents = Table(
     
     # 权限和限制
     Column("allowed_merchants", JSON),  # 允许访问的商户列表，null = 全部
-    Column("rate_limit", Integer, default=100),  # 每分钟请求数
-    Column("daily_quota", Integer, default=10000),  # 每日配额
+    Column("rate_limit", Integer, default=300),  # 每分钟请求数
+    Column("daily_quota", Integer, default=500000),  # 每日配额
     
     # 统计
     Column("total_requests", Integer, default=0),
@@ -95,8 +95,8 @@ async def create_agent(
     agent_type: str,
     owner_email: Optional[str] = None,
     description: Optional[str] = None,
-    rate_limit: int = 100,
-    daily_quota: int = 10000,
+    rate_limit: int = 300,
+    daily_quota: int = 500000,
     allowed_merchants: Optional[List[str]] = None,
     webhook_url: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None
@@ -320,10 +320,10 @@ async def check_rate_limit(agent_id: str, rate_limit: Optional[int] = None) -> t
         agent = await get_agent(agent_id)
         if not agent:
             return False, 0, 0
-        rate_limit = agent.get("rate_limit", 100)
+        rate_limit = agent.get("rate_limit", 300)
 
     try:
-        limit_value = int(rate_limit or 100)
+        limit_value = int(rate_limit or 300)
     except Exception:
         limit_value = 100
     
@@ -363,10 +363,10 @@ async def check_daily_quota(agent_id: str, daily_quota: Optional[int] = None) ->
         agent = await get_agent(agent_id)
         if not agent:
             return False, 0, 0
-        daily_quota = agent.get("daily_quota", 10000)
+        daily_quota = agent.get("daily_quota", 500000)
 
     try:
-        quota_value = int(daily_quota or 10000)
+        quota_value = int(daily_quota or 500000)
     except Exception:
         quota_value = 10000
     

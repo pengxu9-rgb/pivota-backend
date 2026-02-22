@@ -32,8 +32,8 @@ class CreateAgentRequest(BaseModel):
     agent_type: str  # chatbot, voice_assistant, custom
     description: Optional[str] = None
     owner_email: Optional[EmailStr] = None
-    rate_limit: int = 100  # 每分钟请求数
-    daily_quota: int = 10000  # 每日配额
+    rate_limit: int = 300  # 每分钟请求数
+    daily_quota: int = 500000  # 每日配额
     allowed_merchants: Optional[List[str]] = None  # null = 所有商户
     webhook_url: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -801,4 +801,3 @@ async def get_agent_merchant_authorizations(
     except Exception as e:
         logger.error(f"Failed to get merchant authorizations: {e}")
         raise HTTPException(status_code=500, detail="Failed to get merchant authorizations")
-
