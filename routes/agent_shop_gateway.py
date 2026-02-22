@@ -3045,6 +3045,7 @@ async def _handle_find_products_multi(
     )
     upstream_timeout_seconds = _resolve_multi_upstream_timeout_seconds(is_shopping_surface)
     upstream_cache_key: Optional[str] = None
+    skip_delegate_due_circuit_local_fallback = False
     if should_try_upstream and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM:
         upstream_cache_key = _build_multi_upstream_cache_key(
             payload,
@@ -3073,21 +3074,35 @@ async def _handle_find_products_multi(
 
         upstream_circuit_open = _multi_upstream_circuit_is_open()
         if upstream_circuit_open:
-            empty_result = _build_multi_delegate_empty_result(
-                page=page,
-                force_cache_only=force_cache_only,
-                base_merchant_fanout_enabled=base_merchant_fanout_enabled,
-                creator_id=creator_id,
-                creator_name=creator_name,
-                upstream_timeout_seconds=upstream_timeout_seconds,
-                upstream_attempted=False,
-                upstream_circuit_open=True,
-            )
-            if upstream_cache_key:
-                _multi_upstream_cache_put(upstream_cache_key, empty_result, "error")
-            return empty_result
+            if _allow_local_fallback_after_delegate_fail(request_metadata):
+                skip_delegate_due_circuit_local_fallback = True
+                logger.info(
+                    "multi.upstream_fallback.local_fallback_on_circuit_open",
+                    extra={
+                        "event": "multi.upstream_fallback.local_fallback_on_circuit_open",
+                        "source": source_normalized,
+                    },
+                )
+            else:
+                empty_result = _build_multi_delegate_empty_result(
+                    page=page,
+                    force_cache_only=force_cache_only,
+                    base_merchant_fanout_enabled=base_merchant_fanout_enabled,
+                    creator_id=creator_id,
+                    creator_name=creator_name,
+                    upstream_timeout_seconds=upstream_timeout_seconds,
+                    upstream_attempted=False,
+                    upstream_circuit_open=True,
+                )
+                if upstream_cache_key:
+                    _multi_upstream_cache_put(upstream_cache_key, empty_result, "error")
+                return empty_result
 
-    if should_try_upstream and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM:
+    if (
+        should_try_upstream
+        and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM
+        and not skip_delegate_due_circuit_local_fallback
+    ):
         delegated = await _invoke_multi_upstream_fallback(
             payload,
             request_metadata,
