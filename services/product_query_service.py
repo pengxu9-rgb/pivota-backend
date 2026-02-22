@@ -23,6 +23,7 @@ TODO (Future enhancements):
 - Circuit breaker for failing merchant APIs
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -83,6 +84,8 @@ AGENT_PRODUCTS_TOTAL_BUDGET_MS = _env_int(
     min_value=100,
     max_value=30000,
 )
+CACHE_ALL_PLATFORMS_CONN_RETRY_ATTEMPTS = 1
+CACHE_ALL_PLATFORMS_CONN_RETRY_BACKOFF_SECONDS = 0.05
 
 class RealtimeConfig:
     """Merchant realtime query configuration"""
@@ -99,6 +102,46 @@ class RealtimeConfig:
         self.api_key = api_key
         self.ttl_seconds = ttl_seconds
         self.platform = platform
+
+
+def _is_connection_already_acquired_error(exc: Exception) -> bool:
+    return "connection is already acquired" in str(exc).strip().lower()
+
+
+async def _fetch_all_cache_rows_with_retry(query: str, params: Dict[str, Any]) -> List[Any]:
+    """
+    Handle transient connection-acquire races seen under high concurrency.
+    Keep retries narrow and deterministic to avoid masking real DB errors.
+    """
+    total_attempts = max(1, CACHE_ALL_PLATFORMS_CONN_RETRY_ATTEMPTS + 1)
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(total_attempts):
+        try:
+            if attempt == 0:
+                return await database.fetch_all(query, params)
+
+            # Retry via an explicit connection object so we do not depend on
+            # the previous task-scoped acquisition state.
+            conn = database.connection()
+            return await conn.fetch_all(query, params)
+        except Exception as exc:
+            last_exc = exc
+            is_transient = _is_connection_already_acquired_error(exc)
+            if not is_transient or attempt >= total_attempts - 1:
+                raise
+
+            logger.warning(
+                "Transient cache DB acquire conflict; retrying (%s/%s): %s",
+                attempt + 1,
+                total_attempts - 1,
+                exc,
+            )
+            await asyncio.sleep(CACHE_ALL_PLATFORMS_CONN_RETRY_BACKOFF_SECONDS * (attempt + 1))
+
+    if last_exc is not None:
+        raise last_exc
+    return []
 
 
 async def get_merchant_realtime_config(merchant_id: str) -> Optional[RealtimeConfig]:
@@ -416,7 +459,7 @@ async def _get_from_cache_all_platforms(
             LIMIT :cache_limit
         """
 
-        rows = await database.fetch_all(query, params)
+        rows = await _fetch_all_cache_rows_with_retry(query, params)
         
         products = []
         for row in rows:

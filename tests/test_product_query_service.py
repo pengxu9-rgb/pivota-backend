@@ -348,3 +348,90 @@ async def test_get_products_hybrid_budget_enabled_caps_timeout_for_upstream(
     assert captured.get("request_id") == "pq:agent_budget_cap:m_budget_cap"
     timeout = float(captured.get("timeout_seconds") or 0.0)
     assert 0.1 <= timeout <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_get_from_cache_all_platforms_retries_connection_acquire_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.product_query_service as pqs
+
+    attempts = {"primary": 0, "retry": 0, "sleep": 0}
+
+    async def fake_fetch_all(_query, _params):
+        attempts["primary"] += 1
+        raise RuntimeError("Connection is already acquired")
+
+    class FakeConnection:
+        async def fetch_all(self, _query, _params):
+            attempts["retry"] += 1
+            return [
+                {
+                    "product_data": {
+                        "id": "p_retry_1",
+                        "product_id": "p_retry_1",
+                        "platform": "shopify",
+                        "merchant_id": "m_retry",
+                        "title": "Retry Product",
+                        "price": 12.5,
+                        "currency": "USD",
+                        "inventory_quantity": 3,
+                        "orderable": True,
+                        "status": "active",
+                    }
+                }
+            ]
+
+    def fake_connection():
+        return FakeConnection()
+
+    async def fake_sleep(_seconds: float):
+        attempts["sleep"] += 1
+
+    monkeypatch.setattr(pqs.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(pqs.database, "connection", fake_connection)
+    monkeypatch.setattr(pqs.asyncio, "sleep", fake_sleep)
+
+    products = await pqs._get_from_cache_all_platforms(
+        merchant_id="m_retry",
+        limit=10,
+        include_expired=False,
+    )
+
+    assert attempts["primary"] == 1
+    assert attempts["retry"] == 1
+    assert attempts["sleep"] == 1
+    assert len(products) == 1
+    assert products[0].id == "p_retry_1"
+
+
+@pytest.mark.asyncio
+async def test_get_from_cache_all_platforms_non_transient_error_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.product_query_service as pqs
+
+    attempts = {"connection_factory": 0}
+
+    async def fake_fetch_all(_query, _params):
+        raise RuntimeError("database unavailable")
+
+    class FakeConnection:
+        async def fetch_all(self, _query, _params):
+            raise AssertionError("retry path should not be used for non-transient errors")
+
+    def fake_connection():
+        attempts["connection_factory"] += 1
+        return FakeConnection()
+
+    monkeypatch.setattr(pqs.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(pqs.database, "connection", fake_connection)
+
+    products = await pqs._get_from_cache_all_platforms(
+        merchant_id="m_no_retry",
+        limit=10,
+        include_expired=False,
+    )
+
+    assert products == []
+    assert attempts["connection_factory"] == 0
