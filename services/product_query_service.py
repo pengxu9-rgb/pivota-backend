@@ -104,8 +104,13 @@ class RealtimeConfig:
         self.platform = platform
 
 
-def _is_connection_already_acquired_error(exc: Exception) -> bool:
-    return "connection is already acquired" in str(exc).strip().lower()
+def _is_transient_cache_db_error(exc: Exception) -> bool:
+    msg = str(exc).strip().lower()
+    return (
+        "connection is already acquired" in msg
+        or "another operation is in progress" in msg
+        or "connection has been released back to the pool" in msg
+    )
 
 
 async def _fetch_all_cache_rows_with_retry(query: str, params: Dict[str, Any]) -> List[Any]:
@@ -121,13 +126,13 @@ async def _fetch_all_cache_rows_with_retry(query: str, params: Dict[str, Any]) -
             if attempt == 0:
                 return await database.fetch_all(query, params)
 
-            # Retry via an explicit connection object so we do not depend on
-            # the previous task-scoped acquisition state.
-            conn = database.connection()
-            return await conn.fetch_all(query, params)
+            # Retry via an explicitly-scoped connection to avoid leaking
+            # task-scoped acquire/release state across retries.
+            async with database.connection() as conn:
+                return await conn.fetch_all(query, params)
         except Exception as exc:
             last_exc = exc
-            is_transient = _is_connection_already_acquired_error(exc)
+            is_transient = _is_transient_cache_db_error(exc)
             if not is_transient or attempt >= total_attempts - 1:
                 raise
 
