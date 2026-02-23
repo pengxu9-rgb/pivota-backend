@@ -88,6 +88,31 @@ All knobs are per-process (per uvicorn/gunicorn worker).
     - Use this to introduce async, non-blocking behavior for agents without
       changing the existing `/invoke` contract when the flag is left at `0`.
 
+- `UVICORN_TIMEOUT_KEEP_ALIVE`
+  - **Recommended:** `75`
+  - **Meaning:** Keep-alive timeout used by the `uvicorn main:app ...` process.
+  - **Guidance:**
+    - Railway's uvicorn command supports `UVICORN_*` env mapping.
+    - Increasing this reduces reconnect churn between bursts and can lower
+      transport overhead when clients reuse connections.
+
+- `AGENT_SHOP_UPSTREAM_CLIENT_KEEPALIVE_EXPIRY_SECONDS`
+  - **Recommended:** `300`
+  - **Meaning:** Keep-alive TTL for the shared upstream `httpx.AsyncClient`
+    used by shop gateway internal proxy/fallback calls.
+
+- `AGENT_SHOP_UPSTREAM_CLIENT_MAX_KEEPALIVE_CONNECTIONS`
+  - **Recommended:** `128`
+  - **Meaning:** Max idle pooled connections retained for upstream reuse.
+
+- `AGENT_SHOP_UPSTREAM_CLIENT_WARMUP_ENABLED`
+  - **Recommended:** `true`
+  - **Meaning:** Enables startup prewarm probes to internal upstream targets.
+
+- `AGENT_SHOP_UPSTREAM_CLIENT_WARMUP_TIMEOUT_SECONDS`
+  - **Recommended:** `1.2`
+  - **Meaning:** Per-probe timeout budget for the startup prewarm.
+
 ---
 
 ## Behavioral Guarantees
