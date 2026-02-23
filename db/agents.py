@@ -7,11 +7,215 @@ from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Boo
 from sqlalchemy.sql import func
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+from collections import OrderedDict
 import secrets
 import hashlib
 import json
+import os
+import time
 
-from db.database import metadata, database
+from db.database import metadata, database, IS_POSTGRES
+
+_AGENT_AUTH_CACHE_MAX_ENTRIES = max(
+    100,
+    min(100000, int(os.getenv("AGENT_AUTH_CACHE_MAX_ENTRIES", "20000") or 20000)),
+)
+_AGENT_AUTH_POSITIVE_TTL_SECONDS = max(
+    1,
+    min(3600, int(os.getenv("AGENT_AUTH_CACHE_POSITIVE_TTL_SECONDS", "60") or 60)),
+)
+_AGENT_AUTH_NEGATIVE_TTL_SECONDS = max(
+    1,
+    min(600, int(os.getenv("AGENT_AUTH_CACHE_NEGATIVE_TTL_SECONDS", "15") or 15)),
+)
+_AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK = (
+    str(os.getenv("AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK", "false")).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_AGENT_AUTH_KEY_TABLE_MODE = str(
+    os.getenv("AGENT_AUTH_KEY_TABLE", "auto")
+).strip().lower() or "auto"
+if _AGENT_AUTH_KEY_TABLE_MODE not in {"auto", "api_keys", "agent_api_keys", "legacy_only"}:
+    _AGENT_AUTH_KEY_TABLE_MODE = "auto"
+_AGENT_AUTH_KEY_TABLE_CACHE_TTL_SECONDS = max(
+    5,
+    min(3600, int(os.getenv("AGENT_AUTH_KEY_TABLE_CACHE_TTL_SECONDS", "300") or 300)),
+)
+_AGENT_AUTH_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_AGENT_AUTH_KEY_TABLE_CACHE: Dict[str, Any] = {"table": None, "expires_at": 0.0}
+
+
+def _agent_auth_cache_key(api_key: str) -> str:
+    return hashlib.sha256(str(api_key or "").encode("utf-8")).hexdigest()
+
+
+def _normalize_agent_row(result: Any) -> Dict[str, Any]:
+    agent = dict(result)
+    raw_allowed = agent.get("allowed_merchants")
+    if isinstance(raw_allowed, str):
+        try:
+            raw_allowed = json.loads(raw_allowed)
+        except Exception:
+            raw_allowed = []
+    if raw_allowed is None:
+        agent["allowed_merchants"] = None
+    elif isinstance(raw_allowed, list):
+        agent["allowed_merchants"] = [str(m).strip() for m in raw_allowed if str(m or "").strip()] or []
+    else:
+        agent["allowed_merchants"] = []
+
+    if "agent_name" not in agent and "name" in agent:
+        agent["agent_name"] = agent["name"]
+
+    if "is_active" not in agent:
+        status = agent.get("status")
+        agent["is_active"] = (str(status).lower() == "active") if status is not None else True
+
+    if "allowed_merchants" not in agent:
+        agent["allowed_merchants"] = None
+    return agent
+
+
+def _get_cached_agent_auth(cache_key: str) -> tuple[bool, Optional[Dict[str, Any]]]:
+    now = time.monotonic()
+    entry = _AGENT_AUTH_CACHE.get(cache_key)
+    if not isinstance(entry, dict):
+        return False, None
+    expires_at = float(entry.get("expires_at") or 0)
+    if expires_at <= now:
+        _AGENT_AUTH_CACHE.pop(cache_key, None)
+        return False, None
+    _AGENT_AUTH_CACHE.move_to_end(cache_key)
+    if entry.get("found") is False:
+        return True, None
+    cached_agent = entry.get("agent")
+    if not isinstance(cached_agent, dict):
+        return True, None
+    return True, dict(cached_agent)
+
+
+def _put_cached_agent_auth(cache_key: str, agent: Optional[Dict[str, Any]]) -> None:
+    ttl = _AGENT_AUTH_POSITIVE_TTL_SECONDS if agent else _AGENT_AUTH_NEGATIVE_TTL_SECONDS
+    _AGENT_AUTH_CACHE[cache_key] = {
+        "expires_at": time.monotonic() + max(1, int(ttl or 1)),
+        "found": bool(agent),
+        "agent": dict(agent) if isinstance(agent, dict) else None,
+    }
+    _AGENT_AUTH_CACHE.move_to_end(cache_key)
+    while len(_AGENT_AUTH_CACHE) > _AGENT_AUTH_CACHE_MAX_ENTRIES:
+        _AGENT_AUTH_CACHE.popitem(last=False)
+
+
+def _clear_auth_key_table_cache() -> None:
+    _AGENT_AUTH_KEY_TABLE_CACHE["table"] = None
+    _AGENT_AUTH_KEY_TABLE_CACHE["expires_at"] = 0.0
+
+
+def _is_missing_table_error(exc: Exception, table_name: str) -> bool:
+    msg = str(exc or "").lower()
+    table = str(table_name or "").strip().lower()
+    if not table:
+        return False
+    return table in msg and (
+        "does not exist" in msg
+        or "undefined table" in msg
+        or "relation" in msg
+        or "no such table" in msg
+    )
+
+
+async def _resolve_auth_key_table() -> Optional[str]:
+    mode = _AGENT_AUTH_KEY_TABLE_MODE
+    if mode in {"api_keys", "agent_api_keys"}:
+        return mode
+    if mode == "legacy_only":
+        return None
+    if not IS_POSTGRES:
+        return None
+
+    now = time.monotonic()
+    expires_at = float(_AGENT_AUTH_KEY_TABLE_CACHE.get("expires_at") or 0)
+    if expires_at > now:
+        cached = _AGENT_AUTH_KEY_TABLE_CACHE.get("table")
+        return str(cached) if isinstance(cached, str) and cached else None
+
+    table_name: Optional[str] = None
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT
+              to_regclass('public.api_keys') AS api_keys_table,
+              to_regclass('public.agent_api_keys') AS agent_api_keys_table
+            """
+        )
+        row_dict = dict(row or {})
+        has_api_keys = bool(row_dict.get("api_keys_table"))
+        has_agent_api_keys = bool(row_dict.get("agent_api_keys_table"))
+        if has_api_keys:
+            table_name = "api_keys"
+        elif has_agent_api_keys:
+            table_name = "agent_api_keys"
+    except Exception:
+        table_name = None
+
+    _AGENT_AUTH_KEY_TABLE_CACHE["table"] = table_name
+    _AGENT_AUTH_KEY_TABLE_CACHE["expires_at"] = now + float(_AGENT_AUTH_KEY_TABLE_CACHE_TTL_SECONDS)
+    return table_name
+
+
+async def _lookup_agent_from_key_table(
+    *,
+    api_key: str,
+    key_hash_sha256: str,
+) -> tuple[Optional[Dict[str, Any]], str, Optional[str]]:
+    key_table = await _resolve_auth_key_table()
+    if key_table == "api_keys":
+        row = await database.fetch_one(
+            """
+            SELECT a.*
+            FROM agents a
+            JOIN api_keys k ON k.agent_id = a.agent_id
+            WHERE k.key_hash = :key_hash AND k.status = 'active'
+            LIMIT 1
+            """,
+            {"key_hash": key_hash_sha256},
+        )
+        return (dict(row) if row else None, "api_keys", key_table)
+
+    if key_table == "agent_api_keys":
+        key_hash_md5 = hashlib.md5(str(api_key or "").encode("utf-8")).hexdigest()
+        row = await database.fetch_one(
+            """
+            SELECT
+              a.*,
+              CASE
+                WHEN k.key_hash = :key_hash_sha256 THEN 'sha256'
+                WHEN k.key_hash = :key_hash_md5 THEN 'md5'
+                ELSE 'unknown'
+              END AS _auth_hash_alg
+            FROM agents a
+            JOIN agent_api_keys k ON k.agent_id = a.agent_id
+            WHERE (k.key_hash = :key_hash_sha256 OR k.key_hash = :key_hash_md5)
+              AND COALESCE(k.is_active, TRUE) = TRUE
+            ORDER BY
+              CASE WHEN k.key_hash = :key_hash_sha256 THEN 0 ELSE 1 END,
+              k.id DESC
+            LIMIT 1
+            """,
+            {
+                "key_hash_sha256": key_hash_sha256,
+                "key_hash_md5": key_hash_md5,
+            },
+        )
+        if not row:
+            return (None, "agent_api_keys", key_table)
+        row_dict = dict(row)
+        hash_alg = str(row_dict.pop("_auth_hash_alg", "")).strip().lower()
+        if hash_alg in {"sha256", "md5"}:
+            return (row_dict, f"agent_api_keys_{hash_alg}", key_table)
+        return (row_dict, "agent_api_keys", key_table)
+
+    return (None, "none", key_table)
 
 
 # ============================================================================
@@ -134,75 +338,96 @@ async def create_agent(
     }
 
 
-async def get_agent_by_key(api_key: str) -> Optional[Dict[str, Any]]:
+async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """通过 API Key 获取 Agent（用于认证）
 
     支持两种来源：
-    1) agents.api_key （旧/兼容）
-    2) api_keys.key_hash（新，多密钥），仅匹配 status='active' 的密钥
+    1) api_keys.key_hash（默认主路径）
+    2) agents.api_key（legacy 兜底，可通过 AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK 开关）
     """
+    started = time.perf_counter()
+    metrics = metrics_out if isinstance(metrics_out, dict) else None
+    if metrics is not None:
+        metrics.setdefault("auth_lookup_ms", 0)
+        metrics.setdefault("auth_cache_hit", False)
+        metrics.setdefault("auth_source", "none")
+
+    key_hash = _agent_auth_cache_key(api_key)
+    cache_hit, cached_agent = _get_cached_agent_auth(key_hash)
+    if cache_hit:
+        if metrics is not None:
+            metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
+            metrics["auth_cache_hit"] = True
+            metrics["auth_source"] = "cache_hit" if cached_agent else "cache_miss_cached"
+        return cached_agent
+
     try:
-        # 1) Try direct match on legacy agents.api_key
-        result = await database.fetch_one(
-            "SELECT * FROM agents WHERE api_key = :api_key LIMIT 1",
-            {"api_key": api_key}
+        result, source, key_table = await _lookup_agent_from_key_table(
+            api_key=api_key,
+            key_hash_sha256=key_hash,
         )
-        
-        # 2) If not found, try hashed match in api_keys table
-        if not result:
-            try:
-                import hashlib
-                key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-                result = await database.fetch_one(
-                    """
-                    SELECT a.*
-                    FROM agents a
-                    JOIN api_keys k ON k.agent_id = a.agent_id
-                    WHERE k.key_hash = :key_hash AND k.status = 'active'
-                    LIMIT 1
-                    """,
-                    {"key_hash": key_hash}
-                )
-            except Exception as _e:
-                # api_keys table may not exist in some environments
-                result = None
+
+        # Optional/auto legacy fallback.
+        should_try_legacy = bool(_AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK)
+        if key_table is None:
+            # Compatibility: when no hash-key table is available, fall back to agents.api_key
+            # to avoid per-request exceptions and auth regressions during schema drift.
+            should_try_legacy = True
+        if not result and should_try_legacy:
+            legacy = await database.fetch_one(
+                "SELECT * FROM agents WHERE api_key = :api_key LIMIT 1",
+                {"api_key": api_key},
+            )
+            if legacy:
+                result = dict(legacy)
+                source = "legacy_fallback" if _AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK else "legacy_auto"
 
         if not result:
+            _put_cached_agent_auth(key_hash, None)
+            if metrics is not None:
+                metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
+                metrics["auth_cache_hit"] = False
+                metrics["auth_source"] = "not_found"
             return None
 
-        agent = dict(result)
-
-        # Normalize JSON fields for SQLite (may come back as JSON-encoded strings).
-        raw_allowed = agent.get("allowed_merchants")
-        if isinstance(raw_allowed, str):
-            try:
-                raw_allowed = json.loads(raw_allowed)
-            except Exception:
-                raw_allowed = []
-        if raw_allowed is None:
-            agent["allowed_merchants"] = None
-        elif isinstance(raw_allowed, list):
-            agent["allowed_merchants"] = [str(m).strip() for m in raw_allowed if str(m or "").strip()] or []
-        else:
-            agent["allowed_merchants"] = []
-        
-        # Normalize field names across schemas
-        if "agent_name" not in agent and "name" in agent:
-            agent["agent_name"] = agent["name"]
-        
-        # Derive is_active from status if not present
-        if "is_active" not in agent:
-            status = agent.get("status")
-            agent["is_active"] = (str(status).lower() == "active") if status is not None else True
-        
-        # Ensure allowed_merchants exists (can be None)
-        if "allowed_merchants" not in agent:
-            agent["allowed_merchants"] = None
-        
+        agent = _normalize_agent_row(result)
+        _put_cached_agent_auth(key_hash, agent)
+        if metrics is not None:
+            metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
+            metrics["auth_cache_hit"] = False
+            metrics["auth_source"] = source
         return agent
     except Exception as e:
-        # Log and return None if any DB/schema issue
+        if _is_missing_table_error(e, "api_keys") or _is_missing_table_error(e, "agent_api_keys"):
+            _clear_auth_key_table_cache()
+        should_try_legacy = _AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK or _is_missing_table_error(e, "api_keys") or _is_missing_table_error(e, "agent_api_keys")
+        # Compatibility rollback: if hash key table is missing or fallback explicitly enabled,
+        # use legacy agents.api_key path.
+        if should_try_legacy:
+            try:
+                legacy = await database.fetch_one(
+                    "SELECT * FROM agents WHERE api_key = :api_key LIMIT 1",
+                    {"api_key": api_key},
+                )
+                if legacy:
+                    normalized = _normalize_agent_row(legacy)
+                    _put_cached_agent_auth(key_hash, normalized)
+                    if metrics is not None:
+                        metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
+                        metrics["auth_cache_hit"] = False
+                        metrics["auth_source"] = (
+                            "legacy_fallback"
+                            if _AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK
+                            else "legacy_auto"
+                        )
+                    return normalized
+            except Exception:
+                pass
         print(f"Error in get_agent_by_key: {e}")
+        if metrics is not None:
+            metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
+            metrics["auth_cache_hit"] = False
+            metrics["auth_source"] = "error"
         return None
 
 

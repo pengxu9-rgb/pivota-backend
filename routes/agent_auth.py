@@ -164,7 +164,16 @@ async def get_agent_context(
         )
     
     # 3. 查找 Agent
-    agent = await get_agent_by_key(api_key)
+    auth_metrics: Dict[str, Any] = {}
+    agent = await get_agent_by_key(api_key, metrics_out=auth_metrics)
+    try:
+        request.state.agent_auth_lookup_ms = max(0, int(auth_metrics.get("auth_lookup_ms") or 0))
+        request.state.agent_auth_cache_hit = bool(auth_metrics.get("auth_cache_hit") or False)
+        request.state.agent_auth_source = str(auth_metrics.get("auth_source") or "")
+        if not hasattr(request.state, "db_pool_wait_ms"):
+            request.state.db_pool_wait_ms = 0
+    except Exception:
+        pass
     if not agent:
         logger.warning(f"Invalid API key attempted: {api_key[:10]}...")
         raise HTTPException(

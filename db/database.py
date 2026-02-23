@@ -29,6 +29,24 @@ def _normalize_database_url(raw: str) -> str:
     return url_str
 
 
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
 # Prefer explicit settings, else env var, else a local SQLite db for dev/tests.
 DATABASE_URL = _normalize_database_url(settings.database_url or os.getenv("DATABASE_URL", ""))
 if not DATABASE_URL:
@@ -76,7 +94,18 @@ else:
         pass
 
 # Initialize DB connection (databases library handles pooling)
-database = Database(DATABASE_URL)
+database_kwargs = {}
+if IS_POSTGRES:
+    database_kwargs = {
+        "min_size": _env_int("DB_POOL_MIN_SIZE", 5, min_value=1, max_value=50),
+        "max_size": _env_int("DB_POOL_MAX_SIZE", 20, min_value=1, max_value=100),
+        # `databases` passes this into asyncpg connect kwargs (connection timeout).
+        "timeout": _env_float("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", 5.0, min_value=0.1, max_value=60.0),
+    }
+    if database_kwargs["max_size"] < database_kwargs["min_size"]:
+        database_kwargs["max_size"] = database_kwargs["min_size"]
+
+database = Database(DATABASE_URL, **database_kwargs)
 # Lazy asyncpg pool for legacy helpers (Postgres only)
 _asyncpg_pool: Any = None
 
