@@ -59,10 +59,51 @@ from observability.reliability_metrics import (
     set_catalog_upstream_circuit,
 )
 
-AGENT_API_BASE = os.getenv("AGENT_API_BASE", "https://web-production-fedb.up.railway.app").rstrip("/")
+def _resolve_default_agent_api_base() -> str:
+    configured = str(os.getenv("AGENT_API_BASE", "") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    # Service-local loopback avoids public TLS handshakes for internal proxy calls.
+    port = str(os.getenv("PORT", "8080") or "8080").strip() or "8080"
+    return f"http://127.0.0.1:{port}"
+
+
+AGENT_API_BASE = _resolve_default_agent_api_base()
 AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API_KEY") or os.getenv("AGENT_API_KEY")
 
 logger = logging.getLogger(__name__)
+
+_SHARED_UPSTREAM_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+_SHARED_UPSTREAM_HTTP_CLIENT_LOCK = asyncio.Lock()
+_SHARED_UPSTREAM_HTTP_LIMITS = httpx.Limits(
+    max_connections=256,
+    max_keepalive_connections=64,
+    keepalive_expiry=45.0,
+)
+
+
+def _build_request_timeout(timeout_seconds: float) -> httpx.Timeout:
+    total = max(0.1, float(timeout_seconds or 0.1))
+    connect_timeout = min(5.0, total)
+    pool_timeout = min(2.0, total)
+    return httpx.Timeout(connect=connect_timeout, read=total, write=total, pool=pool_timeout)
+
+
+async def _get_shared_upstream_http_client() -> httpx.AsyncClient:
+    global _SHARED_UPSTREAM_HTTP_CLIENT
+    client = _SHARED_UPSTREAM_HTTP_CLIENT
+    if client is not None:
+        return client
+    async with _SHARED_UPSTREAM_HTTP_CLIENT_LOCK:
+        client = _SHARED_UPSTREAM_HTTP_CLIENT
+        if client is None:
+            client = httpx.AsyncClient(
+                http2=True,
+                limits=_SHARED_UPSTREAM_HTTP_LIMITS,
+                timeout=_build_request_timeout(15.0),
+            )
+            _SHARED_UPSTREAM_HTTP_CLIENT = client
+    return client
 
 _MERCHANT_SHOPIFY_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
 _MERCHANT_SHOPIFY_CURRENCY_TTL_SECONDS = 6 * 60 * 60
@@ -202,6 +243,19 @@ async def _resolve_shopify_currency_for_merchant(merchant_id: str) -> Optional[s
 
 router = APIRouter(prefix="/agent/shop/v1", tags=["Shopping Gateway"])
 DEV_MODE = os.getenv("APP_ENV", "dev") != "production"
+
+
+@router.on_event("shutdown")
+async def _close_shared_upstream_http_client() -> None:
+    global _SHARED_UPSTREAM_HTTP_CLIENT
+    client = _SHARED_UPSTREAM_HTTP_CLIENT
+    if client is None:
+        return
+    _SHARED_UPSTREAM_HTTP_CLIENT = None
+    try:
+        await client.aclose()
+    except Exception:
+        logger.debug("failed to close shared upstream http client", exc_info=True)
 
 # Bounded queue + worker pool for heavy agent work.
 agent_task_manager = AgentTaskManager.from_env()
@@ -2916,12 +2970,17 @@ async def _invoke_multi_upstream_fallback(
 
     url = f"{MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL}/agent/shop/v1/invoke"
     try:
-        async def _post_once() -> httpx.Response:
-            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-                return await client.post(url, json=body, headers={"Content-Type": "application/json"})
-
+        client = await _get_shared_upstream_http_client()
         # Enforce wall-clock budget, not per-phase socket timeout only.
-        resp = await asyncio.wait_for(_post_once(), timeout=timeout_seconds)
+        resp = await asyncio.wait_for(
+            client.post(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=_build_request_timeout(timeout_seconds),
+            ),
+            timeout=timeout_seconds,
+        )
         if resp.status_code >= 400:
             _multi_upstream_record_outcome(False)
             record_catalog_upstream_fallback(reason=f"http_{resp.status_code}")
@@ -6197,8 +6256,14 @@ async def _proxy_agent_api(
         headers["X-API-Key"] = AGENT_API_KEY
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.request(method, url, json=json_body, headers=headers)
+        client = await _get_shared_upstream_http_client()
+        resp = await client.request(
+            method,
+            url,
+            json=json_body,
+            headers=headers,
+            timeout=_build_request_timeout(15.0),
+        )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Upstream agent API error: {exc}") from exc
 
