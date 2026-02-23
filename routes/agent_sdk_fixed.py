@@ -32,6 +32,10 @@ from services.outbound_links_service import (
     is_destination_domain_allowed,
     make_redirect_token,
 )
+from services.external_seed_search import (
+    dedupe_external_seed_rows,
+    fetch_external_seed_rows,
+)
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 
@@ -92,31 +96,12 @@ AGENT_SDK_FIXED_EXTERNAL_SEED_BUILD_CONCURRENCY = int(
         max_value=64.0,
     )
 )
-
-_EXTERNAL_SEED_QUERY_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "buy",
-    "cart",
-    "checkout",
-    "find",
-    "for",
-    "item",
-    "items",
-    "me",
-    "of",
-    "or",
-    "please",
-    "product",
-    "products",
-    "recommend",
-    "recommendation",
-    "show",
-    "the",
-    "to",
-    "with",
-}
+AGENT_SDK_FIXED_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SDK_FIXED_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS",
+    0.35,
+    min_value=0.05,
+    max_value=5.0,
+)
 
 def _resolve_delegate_timeout_seconds(merchant_id: Optional[str]) -> float:
     return (
@@ -178,27 +163,6 @@ def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> 
             except Exception:
                 return {"amount": amt, "currency": str(cur or "") or None}
     return {"amount": seed_row.get("price_amount"), "currency": seed_row.get("price_currency")}
-
-
-def _seed_search_terms(raw_query: str) -> List[str]:
-    q = str(raw_query or "").strip()
-    if not q:
-        return []
-    terms = re.findall(r"[a-z0-9]+", q.lower())
-    if not terms:
-        terms = [t for t in q.lower().split() if t]
-
-    filtered: List[str] = []
-    for t in terms:
-        if t in _EXTERNAL_SEED_QUERY_STOPWORDS:
-            continue
-        if len(t) <= 1:
-            continue
-        if t not in filtered:
-            filtered.append(t)
-        if len(filtered) >= 8:
-            break
-    return filtered or terms[:4]
 
 
 def _seed_image_urls(seed_data: Dict[str, Any]) -> List[str]:
@@ -419,104 +383,48 @@ async def _load_external_seed_products_for_search(
     build_budget_ms: Optional[int] = None,
     build_concurrency: Optional[int] = None,
     include_seed_data_text_match: bool = False,
+    metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    q = str(query or "").strip()
-    where = ["status = :status", "attached_product_key IS NULL", "market = :market"]
-    values: Dict[str, Any] = {
-        "status": "active",
-        "market": DEFAULT_EXTERNAL_SEED_MARKET,
-        "limit": limit,
-        "offset": offset,
-    }
-    if q:
-        values["q_like"] = f"%{q}%"
-        clause = (
-            "("
-            "destination_url ILIKE :q_like "
-            "OR canonical_url ILIKE :q_like "
-            "OR domain ILIKE :q_like "
-            "OR title ILIKE :q_like"
-        )
-        if include_seed_data_text_match:
-            clause += " OR CAST(seed_data AS TEXT) ILIKE :q_like"
-        clauses = [clause + ")"]
-        q_compact = "".join(q.split())
-        if q_compact and q_compact != q:
-            values["q_compact_like"] = f"%{q_compact}%"
-            compact_clause = (
-                "("
-                "destination_url ILIKE :q_compact_like "
-                "OR canonical_url ILIKE :q_compact_like "
-                "OR domain ILIKE :q_compact_like "
-                "OR title ILIKE :q_compact_like"
-            )
-            if include_seed_data_text_match:
-                compact_clause += " OR CAST(seed_data AS TEXT) ILIKE :q_compact_like"
-            clauses.append(compact_clause + ")")
+    metrics = metrics_out if isinstance(metrics_out, dict) else None
+    if metrics is not None:
+        metrics.setdefault("query_ms", 0)
+        metrics.setdefault("build_ms", 0)
+        metrics.setdefault("query_timeout", False)
+        metrics.setdefault("rows_fetched", 0)
+        metrics.setdefault("rows_built", 0)
+        metrics.setdefault("budget_exhausted", False)
 
-        terms = _seed_search_terms(q)
-        for idx, term in enumerate(terms):
-            if not term:
-                continue
-            key = f"q_term_{idx}"
-            values[key] = f"%{term}%"
-            term_clause = (
-                "("
-                f"destination_url ILIKE :{key} "
-                f"OR canonical_url ILIKE :{key} "
-                f"OR domain ILIKE :{key} "
-                f"OR title ILIKE :{key}"
-            )
-            if include_seed_data_text_match:
-                term_clause += f" OR CAST(seed_data AS TEXT) ILIKE :{key}"
-            clauses.append(term_clause + ")")
-        where.append("(" + " OR ".join(clauses) + ")")
+    fetch_result = await fetch_external_seed_rows(
+        database=database,
+        market=DEFAULT_EXTERNAL_SEED_MARKET,
+        query=query,
+        limit=limit,
+        offset=offset,
+        include_seed_data_text_match=include_seed_data_text_match,
+        query_timeout_seconds=float(AGENT_SDK_FIXED_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
+    )
+    rows = fetch_result.get("rows") or []
+    if metrics is not None:
+        metrics["query_timeout"] = bool(fetch_result.get("query_timeout") or False)
+        metrics["query_ms"] = max(0, int(fetch_result.get("query_ms") or 0))
+        metrics["rows_fetched"] = len(rows)
+        if fetch_result.get("table_missing"):
+            metrics["rows_built"] = 0
+            metrics["build_ms"] = 0
+            metrics["budget_exhausted"] = False
+    if fetch_result.get("table_missing"):
+        return []
 
-    rows = []
-    try:
-        rows = await database.fetch_all(
-            f"""
-            SELECT
-              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-              destination_url, canonical_url, domain, title, image_url,
-              price_amount, price_currency, availability,
-              seed_data,
-              status, notes, created_by_employee_id,
-              attached_product_key, attached_variant_id,
-              created_at, updated_at
-            FROM external_product_seeds
-            WHERE {" AND ".join(where)}
-            ORDER BY updated_at DESC, created_at DESC
-            LIMIT :limit OFFSET :offset
-            """,
-            values,
-        )
-    except Exception as exc:
-        msg = str(exc)
-        if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
-            return []
-        raise
-
-    seen: set[str] = set()
-    candidate_rows: List[Dict[str, Any]] = []
-    for row in rows or []:
-        seed_row = dict(row)
-        seed_data = _ensure_json_obj(seed_row.get("seed_data"))
-        external_product_id = (
-            str(seed_row.get("external_product_id") or "").strip()
-            or str(seed_data.get("external_product_id") or "").strip()
-            or _stable_external_product_id(seed_row.get("canonical_url") or seed_row.get("destination_url") or "")
-        )
-        if not external_product_id or external_product_id in seen:
-            continue
-        seen.add(external_product_id)
-        candidate_rows.append(seed_row)
-        if len(candidate_rows) >= limit:
-            break
+    candidate_rows = dedupe_external_seed_rows(rows, limit=limit)
     if not candidate_rows:
+        if metrics is not None:
+            metrics["rows_built"] = 0
+            metrics["build_ms"] = 0
+            metrics["budget_exhausted"] = False
         return []
 
     allowlist_by_market: Dict[str, List[str]] = {}
+    build_started = time.perf_counter()
     for seed_row in candidate_rows:
         seed_market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
         if seed_market in allowlist_by_market:
@@ -531,6 +439,7 @@ async def _load_external_seed_products_for_search(
     budget_ms = int(build_budget_ms) if build_budget_ms is not None else AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS
     if budget_ms > 0:
         deadline = time.perf_counter() + (budget_ms / 1000.0)
+    budget_exhausted = False
 
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -556,10 +465,12 @@ async def _load_external_seed_products_for_search(
             if deadline is not None:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
+                    budget_exhausted = True
                     break
                 try:
                     prod = await asyncio.wait_for(task, timeout=remaining)
                 except asyncio.TimeoutError:
+                    budget_exhausted = True
                     break
             else:
                 prod = await task
@@ -573,6 +484,10 @@ async def _load_external_seed_products_for_search(
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+    if metrics is not None:
+        metrics["rows_built"] = len(products[:limit])
+        metrics["build_ms"] = int((time.perf_counter() - build_started) * 1000)
+        metrics["budget_exhausted"] = budget_exhausted
     return products[:limit]
 
 # ============================================================================
@@ -1130,37 +1045,6 @@ async def search_products(
             result = await _legacy_scoped_search_fallback()
 
     if isinstance(result, dict):
-        # Preserve the historical SDK behavior: when searching regular catalogs
-        # we also inject external seed products for recall.
-        injected = 0
-        include_external_seed = bool(allow_external_seed) and int(offset or 0) == 0 and not merchant_id
-        if include_external_seed:
-            try:
-                external_seed_limit = min(200, max(20, int(limit or 20) * 5))
-                external_products = await _load_external_seed_products_for_search(
-                    req=req,
-                    query=query,
-                    limit=external_seed_limit,
-                    offset=0,
-                    build_budget_ms=AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS,
-                    build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
-                )
-                if external_products:
-                    products = result.get("products") if isinstance(result.get("products"), list) else []
-                    existing_ids = {str(p.get("product_id") or p.get("id") or "") for p in products if isinstance(p, dict)}
-                    merged: List[Dict[str, Any]] = []
-                    for p in external_products:
-                        pid = str(p.get("product_id") or p.get("id") or "")
-                        if not pid or pid in existing_ids:
-                            continue
-                        merged.append(p)
-                        existing_ids.add(pid)
-                    if merged:
-                        injected = len(merged)
-                        result["products"] = (merged + products)[: int(limit or 20)]
-            except Exception:
-                logger.debug("agent_sdk_fixed external seed injection failed", exc_info=True)
-
         metadata = result.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
@@ -1168,8 +1052,6 @@ async def search_products(
         metadata.setdefault("catalog_surface", normalized_catalog_surface)
         metadata["source"] = "agent_sdk_fixed_delegate"
         metadata["latency_ms"] = int((time.perf_counter() - started) * 1000)
-        if injected > 0:
-            metadata["external_seed_injected"] = injected
         result["metadata"] = metadata
     return result
 

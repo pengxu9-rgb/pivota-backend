@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
+from collections import OrderedDict
 import asyncio
 import json
 import os
@@ -38,6 +39,10 @@ from services.outbound_links_service import (
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     make_redirect_token,
+)
+from services.external_seed_search import (
+    dedupe_external_seed_rows,
+    fetch_external_seed_rows,
 )
 from services.agent_ranking_service import (
     AgentRankingFeatures,
@@ -124,8 +129,6 @@ _CATALOG_BEAUTY_KEYWORDS = (
     "parfum",
     "fragrance",
 )
-
-
 def _get_order_create_lock(key: str) -> asyncio.Lock:
     lock = _ORDER_CREATE_LOCKS.get(key)
     if lock is None:
@@ -273,6 +276,12 @@ AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS = _env_float(
     min_value=0.05,
     max_value=5.0,
 )
+AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS",
+    0.35,
+    min_value=0.05,
+    max_value=5.0,
+)
 AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS",
@@ -289,6 +298,38 @@ AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS = int(
         max_value=5000.0,
     )
 )
+AGENT_EXTERNAL_SEED_CACHE_ENABLED = _env_bool(
+    "AGENT_EXTERNAL_SEED_CACHE_ENABLED",
+    True,
+)
+AGENT_EXTERNAL_SEED_CACHE_FIRST_SCREEN_ONLY = _env_bool(
+    "AGENT_EXTERNAL_SEED_CACHE_FIRST_SCREEN_ONLY",
+    True,
+)
+AGENT_EXTERNAL_SEED_CACHE_HIT_TTL_SECONDS = int(
+    _env_float(
+        "AGENT_EXTERNAL_SEED_CACHE_HIT_TTL_SECONDS",
+        120.0,
+        min_value=5.0,
+        max_value=3600.0,
+    )
+)
+AGENT_EXTERNAL_SEED_CACHE_EMPTY_TTL_SECONDS = int(
+    _env_float(
+        "AGENT_EXTERNAL_SEED_CACHE_EMPTY_TTL_SECONDS",
+        30.0,
+        min_value=5.0,
+        max_value=600.0,
+    )
+)
+AGENT_EXTERNAL_SEED_CACHE_MAX_ENTRIES = int(
+    _env_float(
+        "AGENT_EXTERNAL_SEED_CACHE_MAX_ENTRIES",
+        500.0,
+        min_value=50.0,
+        max_value=5000.0,
+    )
+)
 AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT = int(
     _env_float(
         "AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT",
@@ -297,6 +338,9 @@ AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT = int(
         max_value=2000.0,
     )
 )
+
+_EXTERNAL_SEED_SEARCH_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT: Dict[str, asyncio.Task] = {}
 
 
 def _safe_price_number(value: Any, default: float = 0.0) -> float:
@@ -638,16 +682,237 @@ def _build_route_health(
     primary_latency_ms: int,
     source_breakdown: Optional[Dict[str, Any]] = None,
     fallback_reason: Optional[str] = None,
+    external_seed_health: Optional[Dict[str, Any]] = None,
+    auth_lookup_ms: Optional[int] = None,
+    db_pool_wait_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     stale_cache_used = bool((source_breakdown or {}).get("stale_cache_used"))
     triggered = bool(fallback_reason) or stale_cache_used
     reason = fallback_reason or ("stale_cache_used" if stale_cache_used else None)
+    seed_health = external_seed_health or {}
     return {
         "primary_path_used": primary_path_used,
         "primary_latency_ms": max(0, int(primary_latency_ms or 0)),
         "fallback_triggered": triggered,
         "fallback_reason": reason,
+        "external_seed_query_ms": max(0, int(seed_health.get("external_seed_query_ms") or 0)),
+        "external_seed_build_ms": max(0, int(seed_health.get("external_seed_build_ms") or 0)),
+        "external_seed_cache_hit": bool(seed_health.get("external_seed_cache_hit") or False),
+        "external_seed_query_timeout": bool(seed_health.get("external_seed_query_timeout") or False),
+        "external_seed_rows_fetched": max(0, int(seed_health.get("external_seed_rows_fetched") or 0)),
+        "external_seed_rows_built": max(0, int(seed_health.get("external_seed_rows_built") or 0)),
+        "external_seed_budget_exhausted": bool(seed_health.get("external_seed_budget_exhausted") or False),
+        "auth_lookup_ms": max(0, int(auth_lookup_ms or 0)),
+        "db_pool_wait_ms": max(0, int(db_pool_wait_ms or 0)),
     }
+
+
+def _new_external_seed_health() -> Dict[str, Any]:
+    return {
+        "external_seed_query_ms": 0,
+        "external_seed_build_ms": 0,
+        "external_seed_cache_hit": False,
+        "external_seed_query_timeout": False,
+        "external_seed_rows_fetched": 0,
+        "external_seed_rows_built": 0,
+        "external_seed_budget_exhausted": False,
+    }
+
+
+def _apply_external_seed_metrics(
+    *,
+    external_seed_health: Dict[str, Any],
+    metrics: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(metrics, dict):
+        return
+    external_seed_health["external_seed_query_ms"] = max(
+        0, int(metrics.get("query_ms") or external_seed_health.get("external_seed_query_ms") or 0)
+    )
+    external_seed_health["external_seed_build_ms"] = max(
+        0, int(metrics.get("build_ms") or external_seed_health.get("external_seed_build_ms") or 0)
+    )
+    external_seed_health["external_seed_cache_hit"] = bool(
+        metrics.get("cache_hit", external_seed_health.get("external_seed_cache_hit") or False)
+    )
+    external_seed_health["external_seed_query_timeout"] = bool(
+        metrics.get("query_timeout", external_seed_health.get("external_seed_query_timeout") or False)
+    )
+    external_seed_health["external_seed_rows_fetched"] = max(
+        0, int(metrics.get("rows_fetched") or external_seed_health.get("external_seed_rows_fetched") or 0)
+    )
+    external_seed_health["external_seed_rows_built"] = max(
+        0, int(metrics.get("rows_built") or external_seed_health.get("external_seed_rows_built") or 0)
+    )
+    external_seed_health["external_seed_budget_exhausted"] = bool(
+        metrics.get("budget_exhausted", external_seed_health.get("external_seed_budget_exhausted") or False)
+    )
+
+
+def _normalize_external_seed_cache_query(query: Optional[str]) -> str:
+    return " ".join(str(query or "").strip().lower().split())
+
+
+def _external_seed_limit_bucket(limit: int) -> int:
+    raw = max(1, int(limit or 1))
+    bucket = ((raw + 9) // 10) * 10
+    return max(10, min(100, bucket))
+
+
+def _build_external_seed_cache_key(
+    *,
+    query: Optional[str],
+    market: str,
+    strategy: str,
+    surface: str,
+    limit: int,
+) -> str:
+    normalized_query = _normalize_external_seed_cache_query(query)
+    normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
+    normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
+    normalized_surface = str(surface or "all").strip().lower() or "all"
+    limit_bucket = _external_seed_limit_bucket(limit)
+    return f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_surface}|{limit_bucket}"
+
+
+def _get_cached_external_seed_products(cache_key: str) -> Optional[List[Dict[str, Any]]]:
+    now = time.perf_counter()
+    entry = _EXTERNAL_SEED_SEARCH_CACHE.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    expires_at = float(entry.get("expires_at") or 0)
+    if expires_at <= now:
+        _EXTERNAL_SEED_SEARCH_CACHE.pop(cache_key, None)
+        return None
+    _EXTERNAL_SEED_SEARCH_CACHE.move_to_end(cache_key)
+    items = entry.get("products")
+    if not isinstance(items, list):
+        return []
+    return [dict(item) if isinstance(item, dict) else item for item in items]
+
+
+def _put_cached_external_seed_products(cache_key: str, products: List[Dict[str, Any]]) -> None:
+    ttl_seconds = AGENT_EXTERNAL_SEED_CACHE_HIT_TTL_SECONDS if products else AGENT_EXTERNAL_SEED_CACHE_EMPTY_TTL_SECONDS
+    _EXTERNAL_SEED_SEARCH_CACHE[cache_key] = {
+        "products": [dict(item) if isinstance(item, dict) else item for item in (products or [])],
+        "expires_at": time.perf_counter() + max(1, int(ttl_seconds or 1)),
+        "created_at": int(time.time()),
+    }
+    _EXTERNAL_SEED_SEARCH_CACHE.move_to_end(cache_key)
+    max_entries = max(1, int(AGENT_EXTERNAL_SEED_CACHE_MAX_ENTRIES or 1))
+    while len(_EXTERNAL_SEED_SEARCH_CACHE) > max_entries:
+        _EXTERNAL_SEED_SEARCH_CACHE.popitem(last=False)
+
+
+def _schedule_external_seed_cache_refresh(
+    *,
+    cache_key: str,
+    req: Request,
+    query: Optional[str],
+    limit: int,
+    build_budget_ms: Optional[int],
+    build_concurrency: Optional[int],
+    include_seed_data_text_match: bool,
+) -> bool:
+    existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
+    if existing is not None and not existing.done():
+        return False
+
+    async def _runner() -> None:
+        try:
+            refreshed = await _load_external_seed_products_for_search(
+                req=req,
+                query=query,
+                limit=limit,
+                build_budget_ms=build_budget_ms,
+                build_concurrency=build_concurrency,
+                include_seed_data_text_match=include_seed_data_text_match,
+                metrics_out={},
+            )
+            _put_cached_external_seed_products(cache_key, refreshed or [])
+        except Exception:
+            logger.debug("external seed async cache refresh failed", exc_info=True)
+        finally:
+            _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.pop(cache_key, None)
+
+    _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT[cache_key] = asyncio.create_task(_runner())
+    return True
+
+
+async def _load_external_seed_products_with_cache(
+    *,
+    req: Request,
+    query: Optional[str],
+    limit: int,
+    build_budget_ms: Optional[int],
+    build_concurrency: Optional[int],
+    include_seed_data_text_match: bool,
+    normalized_seed_strategy: str,
+    normalized_catalog_surface: str,
+    page_offset: int,
+    metrics_out: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    metrics = metrics_out if isinstance(metrics_out, dict) else {}
+    metrics.setdefault("cache_hit", False)
+    metrics.setdefault("query_ms", 0)
+    metrics.setdefault("build_ms", 0)
+    metrics.setdefault("query_timeout", False)
+    metrics.setdefault("rows_fetched", 0)
+    metrics.setdefault("rows_built", 0)
+    metrics.setdefault("budget_exhausted", False)
+
+    if not AGENT_EXTERNAL_SEED_CACHE_ENABLED:
+        return await _load_external_seed_products_for_search(
+            req=req,
+            query=query,
+            limit=limit,
+            build_budget_ms=build_budget_ms,
+            build_concurrency=build_concurrency,
+            include_seed_data_text_match=include_seed_data_text_match,
+            metrics_out=metrics,
+        )
+
+    is_first_screen = int(page_offset or 0) == 0
+    if AGENT_EXTERNAL_SEED_CACHE_FIRST_SCREEN_ONLY and not is_first_screen:
+        return await _load_external_seed_products_for_search(
+            req=req,
+            query=query,
+            limit=limit,
+            build_budget_ms=build_budget_ms,
+            build_concurrency=build_concurrency,
+            include_seed_data_text_match=include_seed_data_text_match,
+            metrics_out=metrics,
+        )
+
+    cache_key = _build_external_seed_cache_key(
+        query=query,
+        market=DEFAULT_EXTERNAL_SEED_MARKET,
+        strategy=normalized_seed_strategy,
+        surface=normalized_catalog_surface,
+        limit=limit,
+    )
+    cached_products = _get_cached_external_seed_products(cache_key)
+    if cached_products is not None:
+        metrics["cache_hit"] = True
+        metrics["rows_fetched"] = len(cached_products)
+        metrics["rows_built"] = len(cached_products)
+        metrics["query_ms"] = 0
+        metrics["build_ms"] = 0
+        metrics["query_timeout"] = False
+        metrics["budget_exhausted"] = False
+        return cached_products[:limit]
+
+    metrics["cache_hit"] = False
+    _schedule_external_seed_cache_refresh(
+        cache_key=cache_key,
+        req=req,
+        query=query,
+        limit=limit,
+        build_budget_ms=build_budget_ms,
+        build_concurrency=build_concurrency,
+        include_seed_data_text_match=include_seed_data_text_match,
+    )
+    return []
 
 
 def _build_product_search_blob(product: Dict[str, Any]) -> str:
@@ -1081,67 +1346,51 @@ async def _load_external_seed_products_for_search(
     build_budget_ms: Optional[int] = None,
     build_concurrency: Optional[int] = None,
     include_seed_data_text_match: bool = False,
+    metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load employee-managed external products (unattached external seeds) and surface as first-class products.
     """
-    q = str(query or "").strip()
-    where = ["status = :status", "attached_product_key IS NULL", "market = :market"]
-    values: Dict[str, Any] = {"status": "active", "market": DEFAULT_EXTERNAL_SEED_MARKET, "limit": limit}
-    if q:
-        values["q_like"] = f"%{q}%"
-        where_clause = (
-            "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like"
-        )
-        if include_seed_data_text_match:
-            where_clause += " OR CAST(seed_data AS TEXT) ILIKE :q_like"
-        where_clause += ")"
-        where.append(where_clause)
+    metrics = metrics_out if isinstance(metrics_out, dict) else None
+    if metrics is not None:
+        metrics.setdefault("query_ms", 0)
+        metrics.setdefault("build_ms", 0)
+        metrics.setdefault("query_timeout", False)
+        metrics.setdefault("rows_fetched", 0)
+        metrics.setdefault("rows_built", 0)
+        metrics.setdefault("budget_exhausted", False)
 
-    try:
-        rows = await database.fetch_all(
-            f"""
-            SELECT
-              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-              destination_url, canonical_url, domain, title, image_url,
-              price_amount, price_currency, availability,
-              seed_data,
-              status, notes, created_by_employee_id,
-              attached_product_key, attached_variant_id,
-              created_at, updated_at
-            FROM external_product_seeds
-            WHERE {" AND ".join(where)}
-            ORDER BY updated_at DESC, created_at DESC
-            LIMIT :limit
-            """,
-            values,
-        )
-    except Exception as exc:
-        msg = str(exc)
-        if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
-            return []
-        raise
+    fetch_result = await fetch_external_seed_rows(
+        database=database,
+        market=DEFAULT_EXTERNAL_SEED_MARKET,
+        query=query,
+        limit=limit,
+        offset=0,
+        include_seed_data_text_match=include_seed_data_text_match,
+        query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
+    )
+    rows = fetch_result.get("rows") or []
+    if metrics is not None:
+        metrics["query_timeout"] = bool(fetch_result.get("query_timeout") or False)
+        metrics["query_ms"] = max(0, int(fetch_result.get("query_ms") or 0))
+        metrics["rows_fetched"] = len(rows)
+        if fetch_result.get("table_missing"):
+            metrics["rows_built"] = 0
+            metrics["build_ms"] = 0
+            metrics["budget_exhausted"] = False
+    if fetch_result.get("table_missing"):
+        return []
 
-    seen: set[str] = set()
-    candidate_rows: List[Dict[str, Any]] = []
-    for row in rows:
-        seed_row = dict(row)
-        seed_data = _ensure_json_obj(seed_row.get("seed_data"))
-        external_product_id = (
-            str(seed_row.get("external_product_id") or "").strip()
-            or str(seed_data.get("external_product_id") or "").strip()
-            or _stable_external_product_id(seed_row.get("canonical_url") or seed_row.get("destination_url") or "")
-        )
-        if not external_product_id or external_product_id in seen:
-            continue
-        seen.add(external_product_id)
-        candidate_rows.append(seed_row)
-        if len(candidate_rows) >= limit:
-            break
+    candidate_rows = dedupe_external_seed_rows(rows, limit=limit)
     if not candidate_rows:
+        if metrics is not None:
+            metrics["rows_built"] = 0
+            metrics["build_ms"] = 0
+            metrics["budget_exhausted"] = False
         return []
 
     allowlist_by_market: Dict[str, List[str]] = {}
+    build_started = time.perf_counter()
     for seed_row in candidate_rows:
         seed_market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
         if seed_market in allowlist_by_market:
@@ -1156,6 +1405,7 @@ async def _load_external_seed_products_for_search(
     budget_ms = int(build_budget_ms) if build_budget_ms is not None else int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS)
     if budget_ms > 0:
         deadline = time.perf_counter() + (budget_ms / 1000.0)
+    budget_exhausted = False
 
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -1181,10 +1431,12 @@ async def _load_external_seed_products_for_search(
             if deadline is not None:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
+                    budget_exhausted = True
                     break
                 try:
                     prod = await asyncio.wait_for(task, timeout=remaining)
                 except asyncio.TimeoutError:
+                    budget_exhausted = True
                     break
             else:
                 prod = await task
@@ -1198,6 +1450,10 @@ async def _load_external_seed_products_for_search(
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+    if metrics is not None:
+        metrics["rows_built"] = len(products[:limit])
+        metrics["build_ms"] = int((time.perf_counter() - build_started) * 1000)
+        metrics["budget_exhausted"] = budget_exhausted
     return products[:limit]
 
 
@@ -1802,6 +2058,8 @@ async def agent_search_products(
     - 相关度评分
     """
     started = time.perf_counter()
+    auth_lookup_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_lookup_ms", 0) or 0))
+    db_pool_wait_ms = max(0, int(getattr(getattr(req, "state", None), "db_pool_wait_ms", 0) or 0))
     try:
         def _record_search_metric(*, mode: str, path: str, result: str) -> None:
             try:
@@ -1840,6 +2098,7 @@ async def agent_search_products(
         normalized_query = query.strip() if isinstance(query, str) else ""
         normalized_category = category.strip() if isinstance(category, str) else ""
         normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
+        external_seed_health = _new_external_seed_health()
         is_browse_mode = (
             not normalized_query
             and not normalized_category
@@ -2006,7 +2265,11 @@ async def agent_search_products(
                             source_breakdown={
                                 "stale_cache_used": False,
                             },
+                            external_seed_health=external_seed_health,
+                            auth_lookup_ms=auth_lookup_ms,
+                            db_pool_wait_ms=db_pool_wait_ms,
                         ),
+                        "external_seed_returned_count": 0,
                     },
                 }
             except Exception:
@@ -2095,13 +2358,23 @@ async def agent_search_products(
                 and len(paginated_products) < limit
             ):
                 try:
-                    ext_limit = min(120, max(limit * 3, 20))
-                    external_seed_products = await _load_external_seed_products_for_search(
+                    ext_limit = min(40, max(20, int(limit or 20) * 2))
+                    seed_metrics: Dict[str, Any] = {}
+                    external_seed_products = await _load_external_seed_products_with_cache(
                         req=req,
                         query=query,
                         limit=ext_limit,
                         build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
                         build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
+                        include_seed_data_text_match=(normalized_seed_strategy == "legacy"),
+                        normalized_seed_strategy=normalized_seed_strategy,
+                        normalized_catalog_surface=normalized_catalog_surface,
+                        page_offset=offset,
+                        metrics_out=seed_metrics,
+                    )
+                    _apply_external_seed_metrics(
+                        external_seed_health=external_seed_health,
+                        metrics=seed_metrics,
                     )
                     seen_keys = {
                         f"{str(p.get('merchant_id') or '').strip()}::{str(p.get('product_id') or p.get('id') or '').strip()}"
@@ -2207,10 +2480,16 @@ async def agent_search_products(
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "source_breakdown": source_breakdown,
+                    "external_seed_returned_count": int(
+                        source_breakdown.get("external_seed_count", 0) or 0
+                    ),
                     "route_health": _build_route_health(
                         primary_path_used="cross_merchant_search_fast_mode",
                         primary_latency_ms=latency_ms,
                         source_breakdown=source_breakdown,
+                        external_seed_health=external_seed_health,
+                        auth_lookup_ms=auth_lookup_ms,
+                        db_pool_wait_ms=db_pool_wait_ms,
                     ),
                 },
             }
@@ -2310,14 +2589,23 @@ async def agent_search_products(
         )
         if include_external_seed:
             try:
-                external_seed_limit = min(200, max(20, int(limit or 20) * 5))
-                external_seed_products = await _load_external_seed_products_for_search(
+                external_seed_limit = min(40, max(20, int(limit or 20) * 2))
+                seed_metrics: Dict[str, Any] = {}
+                external_seed_products = await _load_external_seed_products_with_cache(
                     req=req,
                     query=query,
                     limit=external_seed_limit,
                     build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,
                     build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
                     include_seed_data_text_match=(normalized_seed_strategy == "legacy"),
+                    normalized_seed_strategy=normalized_seed_strategy,
+                    normalized_catalog_surface=normalized_catalog_surface,
+                    page_offset=offset,
+                    metrics_out=seed_metrics,
+                )
+                _apply_external_seed_metrics(
+                    external_seed_health=external_seed_health,
+                    metrics=seed_metrics,
                 )
                 if external_seed_products:
                     all_products.extend(external_seed_products)
@@ -2440,7 +2728,11 @@ async def agent_search_products(
                         primary_path_used="cross_merchant_browse_standard",
                         primary_latency_ms=latency_ms,
                         source_breakdown=source_breakdown,
+                        external_seed_health=external_seed_health,
+                        auth_lookup_ms=auth_lookup_ms,
+                        db_pool_wait_ms=db_pool_wait_ms,
                     ),
+                    "external_seed_returned_count": external_count,
                 },
             }
 
@@ -2475,14 +2767,32 @@ async def agent_search_products(
                 if normalized_category.lower() not in product_category:
                     continue
 
+            is_external_seed = (
+                product.get("source") == "external_seed"
+                or product.get("merchant_id") == EXTERNAL_SEED_MERCHANT_ID
+            )
             relevance_score = 1.0
             if normalized_query:
                 query_lower = normalized_query.lower()
-                title = product.get("title", "").lower()
-                description = product.get("description", "").lower()
+                title = str(product.get("title") or "").lower()
+                description = str(product.get("description") or "").lower()
                 tags = " ".join(product.get("tags") or []).lower()
-                product_type = (product.get("product_type") or "").lower()
-                haystack = " ".join([title, description, tags, product_type]).strip()
+                product_type = str(product.get("product_type") or "").lower()
+                if is_external_seed:
+                    haystack = " ".join(
+                        [
+                            title,
+                            description,
+                            tags,
+                            product_type,
+                            str(product.get("external_domain") or "").lower(),
+                            str(product.get("external_url") or "").lower(),
+                            str(product.get("canonical_url") or "").lower(),
+                            str(product.get("destination_url") or "").lower(),
+                        ]
+                    ).strip()
+                else:
+                    haystack = " ".join([title, description, tags, product_type]).strip()
 
                 if query_lower in title:
                     relevance_score = 1.0 if query_lower == title else 0.9
@@ -2498,16 +2808,15 @@ async def agent_search_products(
                     if matches > 0:
                         relevance_score = 0.5 + (matches / len(query_words)) * 0.3
                     else:
-                        continue
+                        if is_external_seed:
+                            relevance_score = 0.35
+                        else:
+                            continue
 
                 product["relevance_score"] = relevance_score
             else:
                 product["relevance_score"] = 1.0
 
-            is_external_seed = (
-                product.get("source") == "external_seed"
-                or product.get("merchant_id") == EXTERNAL_SEED_MERCHANT_ID
-            )
             if is_external_seed:
                 platform_product_id = str(
                     product.get("product_id") or product.get("id") or ""
@@ -2763,7 +3072,11 @@ async def agent_search_products(
                     primary_path_used="cross_merchant_search_standard",
                     primary_latency_ms=latency_ms,
                     source_breakdown=source_breakdown,
+                    external_seed_health=external_seed_health,
+                    auth_lookup_ms=auth_lookup_ms,
+                    db_pool_wait_ms=db_pool_wait_ms,
                 ),
+                "external_seed_returned_count": external_count,
             },
         }
         

@@ -189,7 +189,7 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
         return []
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_sdk_fixed_module, "_is_domain_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
 
     res = client.get(
         "/agent/v1/products/search?merchant_id=external_seed&query=&limit=20&offset=0&in_stock_only=false",
@@ -1469,7 +1469,7 @@ def test_agent_products_search_external_seed_includes_variants(
         return []
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_sdk_fixed_module, "_is_domain_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
 
     res = client.get(
         "/agent/v1/products/search?merchant_id=external_seed&query=&limit=20&offset=0&in_stock_only=false",
@@ -1539,7 +1539,7 @@ def test_agent_product_detail_external_seed_includes_variants(
         return None
 
     monkeypatch.setattr(agent_api_module.database, "fetch_one", fake_fetch_one)
-    monkeypatch.setattr(agent_api_module, "_is_domain_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_api_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
 
     res = client.get(
         "/agent/v1/products/external_seed/ext_test_1",
@@ -1556,7 +1556,10 @@ def test_agent_product_detail_external_seed_includes_variants(
 def test_agent_products_search_cross_merchant_injects_external_seeds_by_domain(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
+    import routes.agent_api as agent_api_module
     import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    monkeypatch.setattr(agent_api_module, "AGENT_EXTERNAL_SEED_CACHE_ENABLED", False)
 
     async def fake_fetch_all(query: str, values=None):
         if "FROM external_product_seeds" in str(query):
@@ -1596,7 +1599,7 @@ def test_agent_products_search_cross_merchant_injects_external_seeds_by_domain(
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
-    monkeypatch.setattr(agent_sdk_fixed_module, "_is_domain_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
 
     res = client.get(
         "/agent/v1/products/search?query=example.com&limit=20&offset=0&in_stock_only=false",
@@ -1611,7 +1614,10 @@ def test_agent_products_search_cross_merchant_injects_external_seeds_by_domain(
 def test_agent_products_search_external_seed_compacts_spaced_query(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
+    import routes.agent_api as agent_api_module
     import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    monkeypatch.setattr(agent_api_module, "AGENT_EXTERNAL_SEED_CACHE_ENABLED", False)
 
     async def fake_fetch_all(query: str, values=None):
         if "FROM external_product_seeds" in str(query):
@@ -1653,7 +1659,7 @@ def test_agent_products_search_external_seed_compacts_spaced_query(
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
-    monkeypatch.setattr(agent_sdk_fixed_module, "_is_domain_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
 
     res = client.get(
         "/agent/v1/products/search?query=tom%20ford&limit=20&offset=0&in_stock_only=false",
@@ -1706,7 +1712,7 @@ def test_agent_products_search_external_seed_ignores_stopword_product(
         return []
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_sdk_fixed_module, "_is_domain_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
 
     res = client.get(
         "/agent/v1/products/search?merchant_id=external_seed&query=fenty%20beauty%20product&limit=20&offset=0",
@@ -1841,6 +1847,56 @@ def test_agent_products_search_delegate_hard_timeout_returns_504(
     assert "Search timeout" in str(body.get("detail"))
 
 
+def test_agent_sdk_fixed_delegate_path_does_not_double_inject_external_seed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_api as agent_api_module
+    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    async def fake_agent_search_products(**_kwargs):
+        return {
+            "status": "success",
+            "products": [
+                {
+                    "id": "prod_internal_1",
+                    "product_id": "prod_internal_1",
+                    "title": "Internal Product",
+                    "merchant_id": "m_001",
+                    "platform": "shopify",
+                }
+            ],
+            "pagination": {"total_count": 1, "limit": 10, "offset": 0, "has_more": False},
+            "metadata": {"source": "agent_search_products", "reason_code": "ok"},
+        }
+
+    external_loader = AsyncMock(
+        return_value=[
+            {
+                "id": "ext_seed_ignored",
+                "product_id": "ext_seed_ignored",
+                "merchant_id": "external_seed",
+                "source": "external_seed",
+                "title": "Should not be injected by sdk_fixed delegate path",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(agent_api_module, "agent_search_products", fake_agent_search_products)
+    monkeypatch.setattr(agent_sdk_fixed_module, "_load_external_seed_products_for_search", external_loader)
+
+    res = client.get(
+        "/agent/v1/products/search?search_all_merchants=true&query=ipsa&allow_external_seed=true&in_stock_only=false&limit=10&offset=0",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    payload = res.json()
+    products = payload.get("products") or []
+    assert len(products) == 1
+    assert all(str(p.get("merchant_id") or "") != "external_seed" for p in products)
+    assert ((payload.get("metadata") or {}).get("source") or "") == "agent_sdk_fixed_delegate"
+    external_loader.assert_not_awaited()
+
+
 def test_agent_products_search_allow_external_seed_false_disables_external_merge(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
@@ -1907,6 +1963,8 @@ def test_agent_products_search_supplement_internal_first_keeps_internal_ahead(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     import routes.agent_api as agent_api_module
+
+    monkeypatch.setattr(agent_api_module, "AGENT_EXTERNAL_SEED_CACHE_ENABLED", False)
 
     class _FakeProduct:
         def model_dump(self):
