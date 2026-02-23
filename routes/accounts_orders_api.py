@@ -11,10 +11,13 @@ Paths implemented here follow the contract in:
 
 from __future__ import annotations
 
+import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
+import httpx
 import logging
 from textwrap import dedent
 
@@ -66,6 +69,14 @@ logger = logging.getLogger("accounts_orders")
 
 ACCESS_COOKIE_NAME = "acc_access_token"
 REFRESH_COOKIE_NAME = "acc_refresh_token"
+DEFAULT_AURORA_BFF_BASE = "https://pivota-agent-production.up.railway.app"
+AURORA_BFF_BASE = str(os.getenv("AURORA_BFF_BASE", DEFAULT_AURORA_BFF_BASE) or DEFAULT_AURORA_BFF_BASE).strip().rstrip("/")
+try:
+    _aurora_timeout_ms = int(float(str(os.getenv("AURORA_BFF_TIMEOUT_MS", "5000"))))
+except Exception:
+    _aurora_timeout_ms = 5000
+AURORA_BFF_TIMEOUT_MS = max(1000, min(15000, _aurora_timeout_ms))
+AURORA_BFF_AUTH_ME_PATH = "/v1/auth/me"
 
 # Access token lifetime for accounts UI sessions.
 # Previously this was 30 minutes, which caused shoppers to be logged out
@@ -255,7 +266,10 @@ def _send_login_otp_email(email: str, otp_code: str):
     """
     Email sender for login OTP codes.
 
-    Uses Amazon SES by default (see utils.email_sender). Returns an EmailSendResult.
+    Provider is selected by utils.email_sender:
+    - EMAIL_PROVIDER override (`ses` | `sendgrid`)
+    - Otherwise SendGrid when `SENDGRID_API_KEY` exists, else SES.
+    Returns an EmailSendResult.
     """
     from_email = getattr(settings, "from_email", "noreply@pivota.ai")
 
@@ -336,6 +350,17 @@ class PasswordLoginRequest(BaseModel):
 class PasswordSetRequest(BaseModel):
     new_password: str = Field(..., min_length=1, max_length=1024)
     current_password: Optional[str] = Field(None, min_length=1, max_length=1024)
+
+class AuroraExchangeRequest(BaseModel):
+    aurora_token: Optional[str] = Field(None, max_length=4096)
+    aurora_uid: Optional[str] = Field(None, max_length=256)
+
+    @validator("aurora_token", "aurora_uid")
+    def trim_optional_str(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        trimmed = v.strip()
+        return trimmed or None
 
 
 class MembershipInfo(BaseModel):
@@ -582,6 +607,92 @@ def _clear_auth_cookies(response: JSONResponse) -> None:
             samesite=samesite,
             path="/",
         )
+
+
+def _resolve_aurora_email_from_auth_me_payload(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+
+    cards = payload.get("cards")
+    if isinstance(cards, list):
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            if str(card.get("type") or "").strip() != "auth_me":
+                continue
+            card_payload = card.get("payload")
+            if not isinstance(card_payload, dict):
+                continue
+            user = card_payload.get("user")
+            if not isinstance(user, dict):
+                continue
+            email = str(user.get("email") or "").strip().lower()
+            if email:
+                return email
+
+    fallback_user = payload.get("user")
+    if isinstance(fallback_user, dict):
+        email = str(fallback_user.get("email") or "").strip().lower()
+        if email:
+            return email
+    email = str(payload.get("email") or "").strip().lower()
+    if email:
+        return email
+    return None
+
+
+async def _fetch_aurora_auth_me(*, aurora_token: str, aurora_uid: str) -> Dict[str, Any]:
+    trace_id = f"accounts_aurora_exchange_{uuid.uuid4().hex[:16]}"
+    headers = {
+        "Authorization": f"Bearer {aurora_token}",
+        "X-Aurora-UID": aurora_uid,
+        "X-Lang": "EN",
+        "X-Trace-ID": trace_id,
+        "Accept": "application/json",
+    }
+    url = f"{AURORA_BFF_BASE}{AURORA_BFF_AUTH_ME_PATH}"
+    timeout_s = max(1.0, AURORA_BFF_TIMEOUT_MS / 1000.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=False) as client:
+            res = await client.get(url, headers=headers)
+    except Exception as exc:
+        logger.warning("[AccountsAuroraExchange] upstream request failed err=%s", type(exc).__name__)
+        raise _error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "TEMPORARY_UNAVAILABLE",
+            "Aurora auth upstream is temporarily unavailable",
+        ) from exc
+
+    payload = None
+    try:
+        payload = res.json()
+    except Exception:
+        payload = None
+
+    if res.status_code == status.HTTP_401_UNAUTHORIZED:
+        raise _error(
+            status.HTTP_401_UNAUTHORIZED,
+            "INVALID_AURORA_SESSION",
+            "Aurora session is invalid or expired",
+        )
+
+    if res.status_code < 200 or res.status_code >= 300:
+        logger.warning("[AccountsAuroraExchange] upstream non-2xx status=%s", res.status_code)
+        raise _error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "TEMPORARY_UNAVAILABLE",
+            "Aurora auth upstream is temporarily unavailable",
+        )
+
+    if not isinstance(payload, dict):
+        raise _error(
+            status.HTTP_502_BAD_GATEWAY,
+            "BAD_UPSTREAM_PAYLOAD",
+            "Aurora auth upstream returned an invalid payload",
+        )
+
+    return payload
 
 
 def _map_payment_status(raw_status: Optional[str]) -> str:
@@ -943,6 +1054,52 @@ async def password_login(body: PasswordLoginRequest, request: Request):
         email=user_row["email"],
         primary_role=str(user_dict.get("primary_role") or "customer"),
         amr="password",
+        auth_time=int(datetime.now(timezone.utc).timestamp()),
+    )
+    return response
+
+
+@router.post("/auth/aurora/exchange")
+async def aurora_exchange_login(body: AuroraExchangeRequest):
+    """
+    Exchange an Aurora auth session for Accounts cookies (orders/account surfaces).
+    """
+    await _ensure_database_connected()
+    aurora_token = str(body.aurora_token or "").strip()
+    aurora_uid = str(body.aurora_uid or "").strip()
+    if not aurora_token or not aurora_uid:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "aurora_token and aurora_uid are required",
+        )
+
+    aurora_payload = await _fetch_aurora_auth_me(
+        aurora_token=aurora_token,
+        aurora_uid=aurora_uid,
+    )
+    aurora_email = _resolve_aurora_email_from_auth_me_payload(aurora_payload)
+    if not aurora_email:
+        raise _error(
+            status.HTTP_502_BAD_GATEWAY,
+            "BAD_UPSTREAM_PAYLOAD",
+            "Aurora auth upstream payload is missing user email",
+        )
+
+    user_row = await create_or_get_shop_user(email=aurora_email, phone=None)
+    user_dict = dict(user_row)
+    await _mark_email_verified_best_effort(user_dict.get("id"))
+
+    session_payload = await _build_user_session(user_dict)
+    response_payload = session_payload.dict()
+    response_payload["linked_via"] = "aurora_embed"
+    response = JSONResponse(response_payload)
+    _set_auth_cookies(
+        response,
+        user_id=user_row["id"],
+        email=user_row["email"],
+        primary_role=str(user_dict.get("primary_role") or "customer"),
+        amr="aurora_embed",
         auth_time=int(datetime.now(timezone.utc).timestamp()),
     )
     return response
