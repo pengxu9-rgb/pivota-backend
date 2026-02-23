@@ -51,6 +51,8 @@ async def test_external_seed_cache_hit_serves_first_screen_without_live_query(
 
     assert len(products) == 1
     assert products[0]["product_id"] == "ext_cache_1"
+    assert metrics.get("executed") is False
+    assert metrics.get("skip_reason") == "cache_hit"
     assert metrics.get("cache_hit") is True
     assert int(metrics.get("rows_built") or 0) == 1
     live_loader.assert_not_awaited()
@@ -93,6 +95,8 @@ async def test_external_seed_cache_miss_is_non_blocking_and_triggers_async_refre
     )
 
     assert products == []
+    assert metrics.get("executed") is False
+    assert metrics.get("skip_reason") == "cache_miss_async_refresh"
     assert metrics.get("cache_hit") is False
     assert len(agent_api_module._EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT) == 1
 

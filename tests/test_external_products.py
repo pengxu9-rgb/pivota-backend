@@ -202,6 +202,12 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
     external = next(p for p in products if p.get("merchant_id") == "external_seed")
     assert isinstance(external.get("external_redirect_url"), str)
     assert "/r?token=" in external.get("external_redirect_url")
+    metadata = payload.get("metadata") or {}
+    route_health = metadata.get("route_health") or {}
+    assert route_health.get("primary_path_used") == "agent_sdk_fixed_external_seed"
+    assert route_health.get("external_seed_executed") is True
+    assert route_health.get("external_seed_query_timeout") is False
+    assert "external_seed_returned_count" in metadata
 
 
 def test_agent_products_search_matches_title_field_for_shopify_rows(

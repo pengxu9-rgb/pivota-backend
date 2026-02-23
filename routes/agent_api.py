@@ -718,6 +718,8 @@ def _build_route_health(
         "primary_latency_ms": max(0, int(primary_latency_ms or 0)),
         "fallback_triggered": triggered,
         "fallback_reason": reason,
+        "external_seed_executed": bool(seed_health.get("external_seed_executed") or False),
+        "external_seed_skip_reason": str(seed_health.get("external_seed_skip_reason") or "").strip() or None,
         "external_seed_query_ms": max(0, int(seed_health.get("external_seed_query_ms") or 0)),
         "external_seed_build_ms": max(0, int(seed_health.get("external_seed_build_ms") or 0)),
         "external_seed_cache_hit": bool(seed_health.get("external_seed_cache_hit") or False),
@@ -744,6 +746,8 @@ def _build_route_health(
 
 def _new_external_seed_health() -> Dict[str, Any]:
     return {
+        "external_seed_executed": False,
+        "external_seed_skip_reason": "not_attempted",
         "external_seed_query_ms": 0,
         "external_seed_build_ms": 0,
         "external_seed_cache_hit": False,
@@ -761,6 +765,15 @@ def _apply_external_seed_metrics(
 ) -> None:
     if not isinstance(metrics, dict):
         return
+    if "executed" in metrics:
+        external_seed_health["external_seed_executed"] = bool(
+            metrics.get("executed") or external_seed_health.get("external_seed_executed") or False
+        )
+    if "skip_reason" in metrics:
+        normalized_skip_reason = str(metrics.get("skip_reason") or "").strip()
+        external_seed_health["external_seed_skip_reason"] = normalized_skip_reason or None
+    elif external_seed_health.get("external_seed_executed"):
+        external_seed_health["external_seed_skip_reason"] = None
     external_seed_health["external_seed_query_ms"] = max(
         0, int(metrics.get("query_ms") or external_seed_health.get("external_seed_query_ms") or 0)
     )
@@ -782,6 +795,23 @@ def _apply_external_seed_metrics(
     external_seed_health["external_seed_budget_exhausted"] = bool(
         metrics.get("budget_exhausted", external_seed_health.get("external_seed_budget_exhausted") or False)
     )
+
+
+def _set_external_seed_skip_reason(
+    *,
+    external_seed_health: Dict[str, Any],
+    reason: str,
+) -> None:
+    if not isinstance(external_seed_health, dict):
+        return
+    if bool(external_seed_health.get("external_seed_executed") or False):
+        return
+    normalized_reason = str(reason or "").strip()
+    if not normalized_reason:
+        return
+    current_reason = str(external_seed_health.get("external_seed_skip_reason") or "").strip()
+    if not current_reason or current_reason == "not_attempted":
+        external_seed_health["external_seed_skip_reason"] = normalized_reason
 
 
 def _normalize_external_seed_cache_query(query: Optional[str]) -> str:
@@ -888,6 +918,8 @@ async def _load_external_seed_products_with_cache(
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
+    metrics.setdefault("executed", False)
+    metrics.setdefault("skip_reason", "not_attempted")
     metrics.setdefault("cache_hit", False)
     metrics.setdefault("query_ms", 0)
     metrics.setdefault("build_ms", 0)
@@ -897,6 +929,8 @@ async def _load_external_seed_products_with_cache(
     metrics.setdefault("budget_exhausted", False)
 
     if not AGENT_EXTERNAL_SEED_CACHE_ENABLED:
+        metrics["executed"] = True
+        metrics["skip_reason"] = None
         return await _load_external_seed_products_for_search(
             req=req,
             query=query,
@@ -909,6 +943,8 @@ async def _load_external_seed_products_with_cache(
 
     is_first_screen = int(page_offset or 0) == 0
     if AGENT_EXTERNAL_SEED_CACHE_FIRST_SCREEN_ONLY and not is_first_screen:
+        metrics["executed"] = True
+        metrics["skip_reason"] = None
         return await _load_external_seed_products_for_search(
             req=req,
             query=query,
@@ -928,6 +964,8 @@ async def _load_external_seed_products_with_cache(
     )
     cached_products = _get_cached_external_seed_products(cache_key)
     if cached_products is not None:
+        metrics["executed"] = False
+        metrics["skip_reason"] = "cache_hit"
         metrics["cache_hit"] = True
         metrics["rows_fetched"] = len(cached_products)
         metrics["rows_built"] = len(cached_products)
@@ -938,6 +976,8 @@ async def _load_external_seed_products_with_cache(
         return cached_products[:limit]
 
     metrics["cache_hit"] = False
+    metrics["executed"] = False
+    metrics["skip_reason"] = "cache_miss_async_refresh"
     _schedule_external_seed_cache_refresh(
         cache_key=cache_key,
         req=req,
@@ -1388,6 +1428,8 @@ async def _load_external_seed_products_for_search(
     """
     metrics = metrics_out if isinstance(metrics_out, dict) else None
     if metrics is not None:
+        metrics.setdefault("executed", True)
+        metrics.setdefault("skip_reason", None)
         metrics.setdefault("query_ms", 0)
         metrics.setdefault("build_ms", 0)
         metrics.setdefault("query_timeout", False)
@@ -1409,10 +1451,13 @@ async def _load_external_seed_products_for_search(
         metrics["query_timeout"] = bool(fetch_result.get("query_timeout") or False)
         metrics["query_ms"] = max(0, int(fetch_result.get("query_ms") or 0))
         metrics["rows_fetched"] = len(rows)
+        if metrics["query_timeout"]:
+            metrics["skip_reason"] = "query_timeout"
         if fetch_result.get("table_missing"):
             metrics["rows_built"] = 0
             metrics["build_ms"] = 0
             metrics["budget_exhausted"] = False
+            metrics["skip_reason"] = "seed_table_missing"
     if fetch_result.get("table_missing"):
         return []
 
@@ -1422,6 +1467,8 @@ async def _load_external_seed_products_for_search(
             metrics["rows_built"] = 0
             metrics["build_ms"] = 0
             metrics["budget_exhausted"] = False
+            if not str(metrics.get("skip_reason") or "").strip():
+                metrics["skip_reason"] = "no_seed_candidates"
         return []
 
     allowlist_by_market: Dict[str, List[str]] = {}
@@ -1489,6 +1536,8 @@ async def _load_external_seed_products_for_search(
         metrics["rows_built"] = len(products[:limit])
         metrics["build_ms"] = int((time.perf_counter() - build_started) * 1000)
         metrics["budget_exhausted"] = budget_exhausted
+        if budget_exhausted and not products:
+            metrics["skip_reason"] = "build_budget_exhausted"
     return products[:limit]
 
 
@@ -2405,13 +2454,15 @@ async def agent_search_products(
             total = int(fast_result["total"] or 0)
             source_breakdown = dict(fast_result["source_breakdown"] or {})
 
-            if (
+            fast_seed_stage_started = time.perf_counter()
+            should_supplement_external_seed = (
                 allow_external_seed
                 and normalized_seed_strategy == "supplement_internal_first"
                 and merchant_id != EXTERNAL_SEED_MERCHANT_ID
                 and (merchant_id is None and not merchant_ids)
                 and len(paginated_products) < limit
-            ):
+            )
+            if should_supplement_external_seed:
                 try:
                     ext_limit = min(40, max(20, int(limit or 20) * 2))
                     seed_metrics: Dict[str, Any] = {}
@@ -2473,7 +2524,31 @@ async def agent_search_products(
                         )
                         total = max(total, len(paginated_products))
                 except Exception:
+                    _set_external_seed_skip_reason(
+                        external_seed_health=external_seed_health,
+                        reason="seed_loader_error",
+                    )
                     logger.debug("agent_search_products fast mode external seed supplement failed", exc_info=True)
+            else:
+                if not allow_external_seed:
+                    reason = "external_seed_disabled"
+                elif normalized_seed_strategy != "supplement_internal_first":
+                    reason = "strategy_not_supplement_internal_first"
+                elif merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+                    reason = "merchant_scope_external_seed_only"
+                elif not (merchant_id is None and not merchant_ids):
+                    reason = "non_cross_merchant_scope"
+                elif len(paginated_products) >= limit:
+                    reason = "page_already_full"
+                else:
+                    reason = "not_applicable"
+                _set_external_seed_skip_reason(
+                    external_seed_health=external_seed_health,
+                    reason=reason,
+                )
+            search_stage_timings["external_seed_ms"] = max(
+                0, int((time.perf_counter() - fast_seed_stage_started) * 1000)
+            )
 
             latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -2675,8 +2750,21 @@ async def agent_search_products(
                 if external_seed_products:
                     all_products.extend(external_seed_products)
             except Exception as e:
+                _set_external_seed_skip_reason(
+                    external_seed_health=external_seed_health,
+                    reason="seed_loader_error",
+                )
                 logger.warning(f"Failed to load external seed products: {e}")
                 record_catalog_upstream_fallback(reason="external_seed_load_failed")
+        else:
+            if not allow_external_seed:
+                reason = "external_seed_disabled"
+            else:
+                reason = "non_cross_merchant_scope"
+            _set_external_seed_skip_reason(
+                external_seed_health=external_seed_health,
+                reason=reason,
+            )
         search_stage_timings["external_seed_ms"] = max(
             0, int((time.perf_counter() - external_seed_stage_started) * 1000)
         )

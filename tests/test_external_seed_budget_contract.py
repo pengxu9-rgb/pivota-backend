@@ -35,6 +35,8 @@ def test_external_seed_query_timeout_is_visible_in_route_health(
     payload = res.json()
     route_health = ((payload.get("metadata") or {}).get("route_health") or {})
     assert route_health.get("external_seed_query_timeout") is True
+    assert route_health.get("external_seed_executed") is True
+    assert route_health.get("external_seed_skip_reason") == "query_timeout"
 
 
 @pytest.mark.asyncio
@@ -62,6 +64,8 @@ async def test_external_seed_loader_marks_query_timeout_and_returns_empty(
 
     assert products == []
     assert metrics.get("query_timeout") is True
+    assert metrics.get("executed") is True
+    assert metrics.get("skip_reason") == "query_timeout"
     assert int(metrics.get("rows_fetched") or 0) == 0
     assert int(metrics.get("rows_built") or 0) == 0
 
