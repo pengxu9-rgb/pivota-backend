@@ -27,6 +27,19 @@ except Exception:  # pragma: no cover
 
 router = APIRouter(tags=["subject-resolve"])
 
+
+@router.on_event("startup")
+async def _subject_resolve_startup() -> None:
+    if not _SUBJECT_RESOLVE_UPSTREAM_WARMUP_ENABLED:
+        return
+    # Keep startup non-blocking for deploy health checks.
+    asyncio.create_task(_warm_subject_resolve_upstream_http_client())
+
+
+@router.on_event("shutdown")
+async def _subject_resolve_shutdown() -> None:
+    await _close_subject_resolve_upstream_http_client()
+
 _REASON_MAPPED_HIT = "mapped_hit"
 _REASON_NO_CANDIDATES = "no_candidates"
 _REASON_DB_TIMEOUT = "db_timeout"
@@ -60,6 +73,77 @@ _resolve_reason_counter = (
     )
     if Counter
     else None
+)
+
+
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = str(os.getenv(name, "") or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+_SUBJECT_RESOLVE_UPSTREAM_HTTP_MAX_CONNECTIONS = _env_int(
+    "SUBJECT_RESOLVE_UPSTREAM_HTTP_MAX_CONNECTIONS",
+    64,
+    min_value=4,
+    max_value=512,
+)
+_SUBJECT_RESOLVE_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int(
+    "SUBJECT_RESOLVE_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS",
+    32,
+    min_value=4,
+    max_value=512,
+)
+_SUBJECT_RESOLVE_UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS = _env_float(
+    "SUBJECT_RESOLVE_UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS",
+    300.0,
+    min_value=5.0,
+    max_value=3600.0,
+)
+_SUBJECT_RESOLVE_UPSTREAM_HTTP2 = _env_bool(
+    "SUBJECT_RESOLVE_UPSTREAM_HTTP2",
+    True,
+)
+_SUBJECT_RESOLVE_UPSTREAM_WARMUP_ENABLED = _env_bool(
+    "SUBJECT_RESOLVE_UPSTREAM_WARMUP_ENABLED",
+    True,
+)
+_SUBJECT_RESOLVE_UPSTREAM_WARMUP_TIMEOUT_SECONDS = _env_float(
+    "SUBJECT_RESOLVE_UPSTREAM_WARMUP_TIMEOUT_SECONDS",
+    1.2,
+    min_value=0.2,
+    max_value=10.0,
+)
+
+_SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+_SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT_LOCK = asyncio.Lock()
+_SUBJECT_RESOLVE_UPSTREAM_HTTP_LIMITS = httpx.Limits(
+    max_connections=_SUBJECT_RESOLVE_UPSTREAM_HTTP_MAX_CONNECTIONS,
+    max_keepalive_connections=_SUBJECT_RESOLVE_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+    keepalive_expiry=_SUBJECT_RESOLVE_UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS,
 )
 
 
@@ -122,6 +206,59 @@ def _upstream_timeout_seconds() -> float:
     except Exception:
         value = 2.0
     return max(0.05, min(value, 15.0))
+
+
+def _build_upstream_http_timeout(total_seconds: float) -> httpx.Timeout:
+    total = max(0.1, float(total_seconds or 0.1))
+    connect_timeout = min(5.0, total)
+    pool_timeout = min(2.0, total)
+    return httpx.Timeout(connect=connect_timeout, read=total, write=total, pool=pool_timeout)
+
+
+async def _get_subject_resolve_upstream_http_client() -> httpx.AsyncClient:
+    global _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT
+    client = _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT
+    if client is not None:
+        return client
+    async with _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT_LOCK:
+        client = _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT
+        if client is None:
+            client = httpx.AsyncClient(
+                http2=_SUBJECT_RESOLVE_UPSTREAM_HTTP2,
+                limits=_SUBJECT_RESOLVE_UPSTREAM_HTTP_LIMITS,
+                timeout=_build_upstream_http_timeout(15.0),
+            )
+            _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT = client
+    return client
+
+
+async def _close_subject_resolve_upstream_http_client() -> None:
+    global _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT
+    client = _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT
+    if client is None:
+        return
+    _SUBJECT_RESOLVE_UPSTREAM_HTTP_CLIENT = None
+    try:
+        await client.aclose()
+    except Exception:
+        logger.debug("subject_resolve upstream client close failed", exc_info=True)
+
+
+async def _warm_subject_resolve_upstream_http_client() -> None:
+    if not _SUBJECT_RESOLVE_UPSTREAM_WARMUP_ENABLED:
+        return
+    url = str(os.getenv("SUBJECT_RESOLVE_UPSTREAM_URL", "") or "").strip()
+    if not url:
+        return
+    try:
+        client = await _get_subject_resolve_upstream_http_client()
+        await client.get(
+            url,
+            timeout=_build_upstream_http_timeout(_SUBJECT_RESOLVE_UPSTREAM_WARMUP_TIMEOUT_SECONDS),
+            headers={"Cache-Control": "no-cache"},
+        )
+    except Exception:
+        logger.debug("subject_resolve upstream warmup probe failed", exc_info=True)
 
 
 def _bridge_enabled() -> bool:
@@ -567,8 +704,15 @@ async def _resolve_via_upstream(
         else payload.dict(exclude_none=True)
     )
     try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.post(url, json=req_payload)
+        client = await _get_subject_resolve_upstream_http_client()
+        resp = await asyncio.wait_for(
+            client.post(
+                url,
+                json=req_payload,
+                timeout=_build_upstream_http_timeout(timeout_s),
+            ),
+            timeout=timeout_s,
+        )
         if resp.status_code >= 400:
             return None, _source_row(
                 source="subject_resolve_upstream",
