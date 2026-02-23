@@ -73,12 +73,75 @@ AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API
 
 logger = logging.getLogger(__name__)
 
+
+def _bootstrap_env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _bootstrap_env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _bootstrap_env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+_UPSTREAM_HTTP_MAX_CONNECTIONS = _bootstrap_env_int(
+    "AGENT_SHOP_UPSTREAM_CLIENT_MAX_CONNECTIONS",
+    256,
+    min_value=8,
+    max_value=2048,
+)
+_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS = _bootstrap_env_int(
+    "AGENT_SHOP_UPSTREAM_CLIENT_MAX_KEEPALIVE_CONNECTIONS",
+    128,
+    min_value=8,
+    max_value=2048,
+)
+_UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS = _bootstrap_env_float(
+    "AGENT_SHOP_UPSTREAM_CLIENT_KEEPALIVE_EXPIRY_SECONDS",
+    300.0,
+    min_value=5.0,
+    max_value=3600.0,
+)
+_UPSTREAM_HTTP_ENABLE_HTTP2 = _bootstrap_env_bool(
+    "AGENT_SHOP_UPSTREAM_CLIENT_HTTP2",
+    True,
+)
+_UPSTREAM_HTTP_WARMUP_ENABLED = _bootstrap_env_bool(
+    "AGENT_SHOP_UPSTREAM_CLIENT_WARMUP_ENABLED",
+    True,
+)
+_UPSTREAM_HTTP_WARMUP_TIMEOUT_SECONDS = _bootstrap_env_float(
+    "AGENT_SHOP_UPSTREAM_CLIENT_WARMUP_TIMEOUT_SECONDS",
+    1.2,
+    min_value=0.2,
+    max_value=10.0,
+)
+
 _SHARED_UPSTREAM_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 _SHARED_UPSTREAM_HTTP_CLIENT_LOCK = asyncio.Lock()
 _SHARED_UPSTREAM_HTTP_LIMITS = httpx.Limits(
-    max_connections=256,
-    max_keepalive_connections=64,
-    keepalive_expiry=45.0,
+    max_connections=_UPSTREAM_HTTP_MAX_CONNECTIONS,
+    max_keepalive_connections=_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+    keepalive_expiry=_UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS,
 )
 
 
@@ -98,12 +161,52 @@ async def _get_shared_upstream_http_client() -> httpx.AsyncClient:
         client = _SHARED_UPSTREAM_HTTP_CLIENT
         if client is None:
             client = httpx.AsyncClient(
-                http2=True,
+                http2=_UPSTREAM_HTTP_ENABLE_HTTP2,
                 limits=_SHARED_UPSTREAM_HTTP_LIMITS,
                 timeout=_build_request_timeout(15.0),
             )
             _SHARED_UPSTREAM_HTTP_CLIENT = client
     return client
+
+
+def _collect_upstream_warmup_urls() -> List[str]:
+    urls: List[str] = []
+    for base in (
+        AGENT_API_BASE,
+        MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL,
+    ):
+        base_url = str(base or "").strip().rstrip("/")
+        if not base_url:
+            continue
+        candidate = f"{base_url}/health"
+        if candidate not in urls:
+            urls.append(candidate)
+    return urls
+
+
+async def _warm_shared_upstream_http_client() -> None:
+    if not _UPSTREAM_HTTP_WARMUP_ENABLED:
+        return
+    warmup_urls = _collect_upstream_warmup_urls()
+    if not warmup_urls:
+        return
+    client = await _get_shared_upstream_http_client()
+    timeout = _build_request_timeout(_UPSTREAM_HTTP_WARMUP_TIMEOUT_SECONDS)
+
+    async def _probe(url: str) -> None:
+        try:
+            await client.get(
+                url,
+                timeout=timeout,
+                headers={"Cache-Control": "no-cache"},
+            )
+        except Exception as exc:
+            logger.debug(
+                "upstream client warmup probe failed",
+                extra={"url": url, "error": str(exc)},
+            )
+
+    await asyncio.gather(*[_probe(url) for url in warmup_urls], return_exceptions=True)
 
 _MERCHANT_SHOPIFY_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
 _MERCHANT_SHOPIFY_CURRENCY_TTL_SECONDS = 6 * 60 * 60
@@ -256,6 +359,14 @@ async def _close_shared_upstream_http_client() -> None:
         await client.aclose()
     except Exception:
         logger.debug("failed to close shared upstream http client", exc_info=True)
+
+
+@router.on_event("startup")
+async def _warm_shared_upstream_http_client_on_startup() -> None:
+    if not _UPSTREAM_HTTP_WARMUP_ENABLED:
+        return
+    # Fire-and-forget warmup so deploy healthchecks are not blocked.
+    asyncio.create_task(_warm_shared_upstream_http_client())
 
 # Bounded queue + worker pool for heavy agent work.
 agent_task_manager = AgentTaskManager.from_env()
