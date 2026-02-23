@@ -75,7 +75,20 @@ def test_agent_search_fast_mode_returns_route_health(
     assert len(payload["products"]) == 1
     assert payload["products"][0]["title"] == "IPSA Time Reset Aqua"
     assert payload["metadata"].get("reason_code") in {"ok", "no_candidates"}
-    assert payload["metadata"]["route_health"]["primary_path_used"] == "cross_merchant_search_fast_mode"
+    route_health = payload["metadata"]["route_health"]
+    assert route_health["primary_path_used"] == "cross_merchant_search_fast_mode"
+    for key in (
+        "segment_fetch_ms",
+        "segment_external_seed_ms",
+        "segment_filter_ms",
+        "segment_hydrate_ms",
+        "segment_rank_sort_ms",
+        "segment_log_ms",
+        "segment_known_total_ms",
+        "segment_unattributed_ms",
+    ):
+        assert isinstance(route_health.get(key), int)
+        assert route_health.get(key) >= 0
     assert payload["metadata"]["source_breakdown"]["internal_count"] == 1
 
 

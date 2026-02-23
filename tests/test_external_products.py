@@ -2069,3 +2069,15 @@ def test_agent_products_search_includes_route_health_metadata(
     assert isinstance(route_health.get("primary_latency_ms"), int)
     assert route_health.get("fallback_triggered") is False
     assert route_health.get("fallback_reason") is None
+    for key in (
+        "segment_fetch_ms",
+        "segment_external_seed_ms",
+        "segment_filter_ms",
+        "segment_hydrate_ms",
+        "segment_rank_sort_ms",
+        "segment_log_ms",
+        "segment_known_total_ms",
+        "segment_unattributed_ms",
+    ):
+        assert isinstance(route_health.get(key), int)
+        assert route_health.get(key) >= 0

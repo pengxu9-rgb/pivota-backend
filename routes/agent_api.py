@@ -689,11 +689,30 @@ def _build_route_health(
     daily_quota_check_ms: Optional[int] = None,
     auth_dependency_total_ms: Optional[int] = None,
     db_pool_wait_ms: Optional[int] = None,
+    stage_timings_ms: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     stale_cache_used = bool((source_breakdown or {}).get("stale_cache_used"))
     triggered = bool(fallback_reason) or stale_cache_used
     reason = fallback_reason or ("stale_cache_used" if stale_cache_used else None)
     seed_health = external_seed_health or {}
+    stage_timings = stage_timings_ms or {}
+    segment_fetch_ms = max(0, int(stage_timings.get("fetch_ms") or 0))
+    segment_external_seed_ms = max(0, int(stage_timings.get("external_seed_ms") or 0))
+    segment_filter_ms = max(0, int(stage_timings.get("filter_ms") or 0))
+    segment_hydrate_ms = max(0, int(stage_timings.get("hydrate_ms") or 0))
+    segment_rank_sort_ms = max(0, int(stage_timings.get("rank_sort_ms") or 0))
+    segment_log_ms = max(0, int(stage_timings.get("log_ms") or 0))
+    segment_known_total_ms = (
+        segment_fetch_ms
+        + segment_external_seed_ms
+        + segment_filter_ms
+        + segment_hydrate_ms
+        + segment_rank_sort_ms
+        + segment_log_ms
+    )
+    segment_unattributed_ms = max(
+        0, max(0, int(primary_latency_ms or 0)) - segment_known_total_ms
+    )
     return {
         "primary_path_used": primary_path_used,
         "primary_latency_ms": max(0, int(primary_latency_ms or 0)),
@@ -712,6 +731,14 @@ def _build_route_health(
         "daily_quota_check_ms": max(0, int(daily_quota_check_ms or 0)),
         "auth_dependency_total_ms": max(0, int(auth_dependency_total_ms or 0)),
         "db_pool_wait_ms": max(0, int(db_pool_wait_ms or 0)),
+        "segment_fetch_ms": segment_fetch_ms,
+        "segment_external_seed_ms": segment_external_seed_ms,
+        "segment_filter_ms": segment_filter_ms,
+        "segment_hydrate_ms": segment_hydrate_ms,
+        "segment_rank_sort_ms": segment_rank_sort_ms,
+        "segment_log_ms": segment_log_ms,
+        "segment_known_total_ms": segment_known_total_ms,
+        "segment_unattributed_ms": segment_unattributed_ms,
     }
 
 
@@ -2114,6 +2141,14 @@ async def agent_search_products(
         normalized_category = category.strip() if isinstance(category, str) else ""
         normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
         external_seed_health = _new_external_seed_health()
+        search_stage_timings: Dict[str, int] = {
+            "fetch_ms": 0,
+            "external_seed_ms": 0,
+            "filter_ms": 0,
+            "hydrate_ms": 0,
+            "rank_sort_ms": 0,
+            "log_ms": 0,
+        }
         is_browse_mode = (
             not normalized_query
             and not normalized_category
@@ -2287,6 +2322,7 @@ async def agent_search_products(
                             daily_quota_check_ms=daily_quota_check_ms,
                             auth_dependency_total_ms=auth_dependency_total_ms,
                             db_pool_wait_ms=db_pool_wait_ms,
+                            stage_timings_ms=search_stage_timings,
                         ),
                         "external_seed_returned_count": 0,
                     },
@@ -2513,11 +2549,13 @@ async def agent_search_products(
                         daily_quota_check_ms=daily_quota_check_ms,
                         auth_dependency_total_ms=auth_dependency_total_ms,
                         db_pool_wait_ms=db_pool_wait_ms,
+                        stage_timings_ms=search_stage_timings,
                     ),
-                },
-            }
+                    },
+                }
 
         # Collect products from all target merchants
+        fetch_stage_started = time.perf_counter()
         all_products: List[Dict[str, Any]] = []
 
         # Multi-merchant fetch can be slow when done sequentially (N+1 DB queries,
@@ -2604,8 +2642,12 @@ async def agent_search_products(
                         all_products.extend(await _fetch_products_for_merchant(mid))
                     except Exception:
                         continue
+        search_stage_timings["fetch_ms"] = max(
+            0, int((time.perf_counter() - fetch_stage_started) * 1000)
+        )
 
         # Add employee-managed external products only for explicit external/cross-merchant flows.
+        external_seed_stage_started = time.perf_counter()
         include_external_seed = allow_external_seed and (
             (merchant_id is None and not merchant_ids)
             or merchant_id == EXTERNAL_SEED_MERCHANT_ID
@@ -2635,6 +2677,9 @@ async def agent_search_products(
             except Exception as e:
                 logger.warning(f"Failed to load external seed products: {e}")
                 record_catalog_upstream_fallback(reason="external_seed_load_failed")
+        search_stage_timings["external_seed_ms"] = max(
+            0, int((time.perf_counter() - external_seed_stage_started) * 1000)
+        )
 
         ranking_config = get_agent_ranking_config()
 
@@ -2758,10 +2803,11 @@ async def agent_search_products(
                         daily_quota_check_ms=daily_quota_check_ms,
                         auth_dependency_total_ms=auth_dependency_total_ms,
                         db_pool_wait_ms=db_pool_wait_ms,
+                        stage_timings_ms=search_stage_timings,
                     ),
-                    "external_seed_returned_count": external_count,
-                },
-            }
+                        "external_seed_returned_count": external_count,
+                    },
+                }
 
         # Search mode: Apply filters, hydrate features, then compute ranking.
         ranked_candidates: List[Dict[str, Any]] = []
@@ -2769,6 +2815,7 @@ async def agent_search_products(
         candidates: List[Dict[str, Any]] = []
         candidate_features: List[AgentRankingFeatures] = []
 
+        filter_stage_started = time.perf_counter()
         for product in all_products:
             if in_stock_only and not product.get("in_stock", True):
                 continue
@@ -2888,8 +2935,12 @@ async def agent_search_products(
 
             candidates.append(product)
             candidate_features.append(features)
+        search_stage_timings["filter_ms"] = max(
+            0, int((time.perf_counter() - filter_stage_started) * 1000)
+        )
 
         # Hydrate quality/enrichment features concurrently (bounded).
+        hydrate_stage_started = time.perf_counter()
         try:
             hydrate_concurrency = int(os.getenv("AGENT_RANKING_HYDRATE_CONCURRENCY", "8"))
         except Exception:
@@ -2930,7 +2981,11 @@ async def agent_search_products(
                     "agent_search_products hydration failed (non-fatal)",
                     exc_info=True,
                 )
+        search_stage_timings["hydrate_ms"] = max(
+            0, int((time.perf_counter() - hydrate_stage_started) * 1000)
+        )
 
+        rank_sort_stage_started = time.perf_counter()
         for product, features in zip(candidates, candidate_features):
             if not passes_agent_gating(features, ranking_config):
                 continue
@@ -2953,6 +3008,9 @@ async def agent_search_products(
                 reverse=True,
             )
             ranked_candidates = ranked_candidates + external_ranked_candidates
+        search_stage_timings["rank_sort_ms"] = max(
+            0, int((time.perf_counter() - rank_sort_stage_started) * 1000)
+        )
 
         # Pagination
         total = len(ranked_candidates)
@@ -2969,6 +3027,7 @@ async def agent_search_products(
         }
 
         # Log a compact view of ranking features for top N
+        log_stage_started = time.perf_counter()
         try:
             top_sample = [
                 {
@@ -3035,6 +3094,9 @@ async def agent_search_products(
                 "Failed to log agent product events from agent_search_products",
                 exc_info=True,
             )
+        search_stage_timings["log_ms"] = max(
+            0, int((time.perf_counter() - log_stage_started) * 1000)
+        )
         
         # Record request
         background_tasks.add_task(
@@ -3106,6 +3168,7 @@ async def agent_search_products(
                     daily_quota_check_ms=daily_quota_check_ms,
                     auth_dependency_total_ms=auth_dependency_total_ms,
                     db_pool_wait_ms=db_pool_wait_ms,
+                    stage_timings_ms=search_stage_timings,
                 ),
                 "external_seed_returned_count": external_count,
             },
