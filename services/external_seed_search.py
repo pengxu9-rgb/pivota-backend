@@ -138,6 +138,25 @@ def _is_missing_external_seed_table(exc: Exception) -> bool:
     )
 
 
+def _is_external_seed_query_timeout(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "timeout" in msg
+        or "querycancellederror" in msg
+        or "query canceled" in msg
+        or "statement timeout" in msg
+        or "canceling statement due to statement timeout" in msg
+    )
+
+
+def _database_supports_statement_timeout(database: Any) -> bool:
+    db_url = getattr(database, "url", None)
+    if db_url is None:
+        return False
+    raw_url = str(db_url).strip().lower()
+    return raw_url.startswith("postgres://") or raw_url.startswith("postgresql://")
+
+
 async def fetch_external_seed_rows(
     *,
     database: Any,
@@ -164,11 +183,7 @@ async def fetch_external_seed_rows(
         where.append(text_clause)
         values.update(text_values)
 
-    started = time.perf_counter()
-    try:
-        rows = await asyncio.wait_for(
-            database.fetch_all(
-                f"""
+    query_sql = f"""
                 SELECT
                   id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
                   destination_url, canonical_url, domain, title, image_url,
@@ -181,11 +196,46 @@ async def fetch_external_seed_rows(
                 WHERE {" AND ".join(where)}
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :limit OFFSET :offset
-                """,
-                values,
-            ),
-            timeout=max(0.05, float(query_timeout_seconds or 0.35)),
-        )
+                """
+    timeout_seconds = max(0.05, float(query_timeout_seconds or 0.35))
+    timeout_ms = max(50, int(timeout_seconds * 1000))
+
+    started = time.perf_counter()
+    try:
+        rows = None
+        if (
+            _database_supports_statement_timeout(database)
+            and hasattr(database, "transaction")
+            and hasattr(database, "execute")
+        ):
+            try:
+                async with database.transaction():
+                    await database.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+                    rows = await database.fetch_all(query_sql, values)
+            except Exception as exc:
+                if _is_missing_external_seed_table(exc):
+                    return {
+                        "rows": [],
+                        "query_ms": int((time.perf_counter() - started) * 1000),
+                        "query_timeout": False,
+                        "table_missing": True,
+                    }
+                if _is_external_seed_query_timeout(exc):
+                    return {
+                        "rows": [],
+                        "query_ms": int((time.perf_counter() - started) * 1000),
+                        "query_timeout": True,
+                        "table_missing": False,
+                    }
+                rows = await asyncio.wait_for(
+                    database.fetch_all(query_sql, values),
+                    timeout=timeout_seconds,
+                )
+        else:
+            rows = await asyncio.wait_for(
+                database.fetch_all(query_sql, values),
+                timeout=timeout_seconds,
+            )
         return {
             "rows": [dict(row) for row in (rows or [])],
             "query_ms": int((time.perf_counter() - started) * 1000),
@@ -206,6 +256,13 @@ async def fetch_external_seed_rows(
                 "query_ms": int((time.perf_counter() - started) * 1000),
                 "query_timeout": False,
                 "table_missing": True,
+            }
+        if _is_external_seed_query_timeout(exc):
+            return {
+                "rows": [],
+                "query_ms": int((time.perf_counter() - started) * 1000),
+                "query_timeout": True,
+                "table_missing": False,
             }
         raise
 
