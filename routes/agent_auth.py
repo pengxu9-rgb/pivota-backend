@@ -90,15 +90,22 @@ async def get_agent_context(
     这是主要的认证函数，所有 Agent API 都应该使用这个依赖
     """
     
+    dep_started = time.perf_counter()
+
     # 0. Checkout token auth (preferred for embedded checkout / shared UI)
     if checkout_token:
         context = await _get_agent_context_from_checkout_token(request, checkout_token)
 
         # Apply the same rate/quota guards at the agent_id level.
+        rate_started = time.perf_counter()
         rate_ok, current, limit = await check_rate_limit(
             context.agent_id,
             rate_limit=(context.agent.get("rate_limit") if isinstance(context.agent, dict) else None),
         )
+        try:
+            request.state.agent_rate_limit_check_ms = max(0, int((time.perf_counter() - rate_started) * 1000))
+        except Exception:
+            pass
         if not rate_ok:
             raise HTTPException(
                 status_code=429,
@@ -110,10 +117,15 @@ async def get_agent_context(
                 },
             )
 
+        quota_started = time.perf_counter()
         quota_ok, used, quota = await check_daily_quota(
             context.agent_id,
             daily_quota=(context.agent.get("daily_quota") if isinstance(context.agent, dict) else None),
         )
+        try:
+            request.state.agent_daily_quota_check_ms = max(0, int((time.perf_counter() - quota_started) * 1000))
+        except Exception:
+            pass
         if not quota_ok:
             raise HTTPException(
                 status_code=429,
@@ -128,6 +140,11 @@ async def get_agent_context(
         # Best-effort stats update; do not block the request on a hot row lock.
         try:
             asyncio.create_task(update_agent_stats(context.agent_id, increment_requests=1))
+        except Exception:
+            pass
+        try:
+            request.state.agent_id = context.agent_id
+            request.state.agent_dependency_total_ms = max(0, int((time.perf_counter() - dep_started) * 1000))
         except Exception:
             pass
         logger.info(f"Agent {context.agent_name} authenticated via checkout token for {request.url.path}")
@@ -152,7 +169,13 @@ async def get_agent_context(
             "allowed_merchants": None,
             "is_active": True,
         }
-        return AgentContext(agent, request)
+        context = AgentContext(agent, request)
+        try:
+            request.state.agent_id = context.agent_id
+            request.state.agent_dependency_total_ms = max(0, int((time.perf_counter() - dep_started) * 1000))
+        except Exception:
+            pass
+        return context
     
     # 2. 验证 API Key 格式（支持 ak_live_ 前缀）
     # 严格校验：ak_<64hex> 或 ak_live_<64hex>
@@ -164,12 +187,14 @@ async def get_agent_context(
         )
     
     # 3. 查找 Agent
+    auth_started = time.perf_counter()
     auth_metrics: Dict[str, Any] = {}
     agent = await get_agent_by_key(api_key, metrics_out=auth_metrics)
     try:
         request.state.agent_auth_lookup_ms = max(0, int(auth_metrics.get("auth_lookup_ms") or 0))
         request.state.agent_auth_cache_hit = bool(auth_metrics.get("auth_cache_hit") or False)
         request.state.agent_auth_source = str(auth_metrics.get("auth_source") or "")
+        request.state.agent_auth_total_ms = max(0, int((time.perf_counter() - auth_started) * 1000))
         if not hasattr(request.state, "db_pool_wait_ms"):
             request.state.db_pool_wait_ms = 0
     except Exception:
@@ -195,10 +220,15 @@ async def get_agent_context(
         )
     
     # 5. 检查速率限制
+    rate_started = time.perf_counter()
     rate_ok, current, limit = await check_rate_limit(
         agent["agent_id"],
         rate_limit=agent.get("rate_limit"),
     )
+    try:
+        request.state.agent_rate_limit_check_ms = max(0, int((time.perf_counter() - rate_started) * 1000))
+    except Exception:
+        pass
     if not rate_ok:
         raise HTTPException(
             status_code=429,
@@ -211,10 +241,15 @@ async def get_agent_context(
         )
     
     # 6. 检查每日配额
+    quota_started = time.perf_counter()
     quota_ok, used, quota = await check_daily_quota(
         agent["agent_id"],
         daily_quota=agent.get("daily_quota"),
     )
+    try:
+        request.state.agent_daily_quota_check_ms = max(0, int((time.perf_counter() - quota_started) * 1000))
+    except Exception:
+        pass
     if not quota_ok:
         raise HTTPException(
             status_code=429,
@@ -228,6 +263,11 @@ async def get_agent_context(
     
     # 7. 创建上下文
     context = AgentContext(agent, request)
+    try:
+        request.state.agent_id = context.agent_id
+        request.state.agent_dependency_total_ms = max(0, int((time.perf_counter() - dep_started) * 1000))
+    except Exception:
+        pass
     
     # 8. 更新使用统计（异步，不阻塞）
     try:

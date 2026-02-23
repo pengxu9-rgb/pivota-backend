@@ -684,6 +684,10 @@ def _build_route_health(
     fallback_reason: Optional[str] = None,
     external_seed_health: Optional[Dict[str, Any]] = None,
     auth_lookup_ms: Optional[int] = None,
+    auth_total_ms: Optional[int] = None,
+    rate_limit_check_ms: Optional[int] = None,
+    daily_quota_check_ms: Optional[int] = None,
+    auth_dependency_total_ms: Optional[int] = None,
     db_pool_wait_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     stale_cache_used = bool((source_breakdown or {}).get("stale_cache_used"))
@@ -703,6 +707,10 @@ def _build_route_health(
         "external_seed_rows_built": max(0, int(seed_health.get("external_seed_rows_built") or 0)),
         "external_seed_budget_exhausted": bool(seed_health.get("external_seed_budget_exhausted") or False),
         "auth_lookup_ms": max(0, int(auth_lookup_ms or 0)),
+        "auth_total_ms": max(0, int(auth_total_ms or 0)),
+        "rate_limit_check_ms": max(0, int(rate_limit_check_ms or 0)),
+        "daily_quota_check_ms": max(0, int(daily_quota_check_ms or 0)),
+        "auth_dependency_total_ms": max(0, int(auth_dependency_total_ms or 0)),
         "db_pool_wait_ms": max(0, int(db_pool_wait_ms or 0)),
     }
 
@@ -2059,6 +2067,13 @@ async def agent_search_products(
     """
     started = time.perf_counter()
     auth_lookup_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_lookup_ms", 0) or 0))
+    auth_total_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_total_ms", 0) or 0))
+    rate_limit_check_ms = max(0, int(getattr(getattr(req, "state", None), "agent_rate_limit_check_ms", 0) or 0))
+    daily_quota_check_ms = max(0, int(getattr(getattr(req, "state", None), "agent_daily_quota_check_ms", 0) or 0))
+    auth_dependency_total_ms = max(
+        0,
+        int(getattr(getattr(req, "state", None), "agent_dependency_total_ms", 0) or 0),
+    )
     db_pool_wait_ms = max(0, int(getattr(getattr(req, "state", None), "db_pool_wait_ms", 0) or 0))
     try:
         def _record_search_metric(*, mode: str, path: str, result: str) -> None:
@@ -2267,6 +2282,10 @@ async def agent_search_products(
                             },
                             external_seed_health=external_seed_health,
                             auth_lookup_ms=auth_lookup_ms,
+                            auth_total_ms=auth_total_ms,
+                            rate_limit_check_ms=rate_limit_check_ms,
+                            daily_quota_check_ms=daily_quota_check_ms,
+                            auth_dependency_total_ms=auth_dependency_total_ms,
                             db_pool_wait_ms=db_pool_wait_ms,
                         ),
                         "external_seed_returned_count": 0,
@@ -2489,6 +2508,10 @@ async def agent_search_products(
                         source_breakdown=source_breakdown,
                         external_seed_health=external_seed_health,
                         auth_lookup_ms=auth_lookup_ms,
+                        auth_total_ms=auth_total_ms,
+                        rate_limit_check_ms=rate_limit_check_ms,
+                        daily_quota_check_ms=daily_quota_check_ms,
+                        auth_dependency_total_ms=auth_dependency_total_ms,
                         db_pool_wait_ms=db_pool_wait_ms,
                     ),
                 },
@@ -2730,6 +2753,10 @@ async def agent_search_products(
                         source_breakdown=source_breakdown,
                         external_seed_health=external_seed_health,
                         auth_lookup_ms=auth_lookup_ms,
+                        auth_total_ms=auth_total_ms,
+                        rate_limit_check_ms=rate_limit_check_ms,
+                        daily_quota_check_ms=daily_quota_check_ms,
+                        auth_dependency_total_ms=auth_dependency_total_ms,
                         db_pool_wait_ms=db_pool_wait_ms,
                     ),
                     "external_seed_returned_count": external_count,
@@ -3074,6 +3101,10 @@ async def agent_search_products(
                     source_breakdown=source_breakdown,
                     external_seed_health=external_seed_health,
                     auth_lookup_ms=auth_lookup_ms,
+                    auth_total_ms=auth_total_ms,
+                    rate_limit_check_ms=rate_limit_check_ms,
+                    daily_quota_check_ms=daily_quota_check_ms,
+                    auth_dependency_total_ms=auth_dependency_total_ms,
                     db_pool_wait_ms=db_pool_wait_ms,
                 ),
                 "external_seed_returned_count": external_count,
