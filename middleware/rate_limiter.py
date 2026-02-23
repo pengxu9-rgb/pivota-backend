@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple
 from datetime import datetime, timedelta
 import time
 import asyncio
+import os
 from collections import defaultdict
 from utils.redis_client import get_redis_client
 from config.settings import settings
@@ -35,6 +36,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.lock = asyncio.Lock()
         # Optional Redis client for shared rate limiting
         self.redis = get_redis_client()
+        self.trust_internal_keys = str(
+            os.getenv("RATE_LIMIT_TRUST_INTERNAL_KEYS", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        explicit_trusted = [
+            item.strip()
+            for item in str(os.getenv("RATE_LIMIT_TRUSTED_API_KEYS", "") or "").split(",")
+            if item.strip()
+        ]
+        implicit_trusted = [
+            str(os.getenv("AGENT_API_KEY") or "").strip(),
+            str(os.getenv("PIVOTA_API_KEY") or "").strip(),
+            str(os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or "").strip(),
+        ]
+        trusted = explicit_trusted + (implicit_trusted if self.trust_internal_keys else [])
+        self.trusted_api_keys = {key for key in trusted if key}
     
     async def dispatch(self, request: Request, call_next):
         # Only apply to agent API endpoints
@@ -55,6 +71,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         
         # No API key = no rate limiting (will fail auth later)
         if not api_key:
+            return await call_next(request)
+        if api_key in self.trusted_api_keys:
             return await call_next(request)
         
         now = time.time()
@@ -191,4 +209,3 @@ class AdvancedRateLimiter:
         }
         
         return allowed, metadata
-
