@@ -2578,23 +2578,89 @@ def _new_media_public_id() -> str:
     return uuid4().hex
 
 
+def _first_env(*names: str, default: str = "") -> str:
+    for name in names:
+        val = (os.getenv(name) or "").strip()
+        if val:
+            return val
+    return (default or "").strip()
+
+
 def _reviews_media_s3_bucket() -> str:
-    return (os.getenv("REVIEWS_MEDIA_S3_BUCKET") or "").strip()
+    return _first_env("REVIEWS_MEDIA_S3_BUCKET", "PHOTO_UPLOAD_BUCKET", "S3_BUCKET", "AWS_S3_BUCKET", default="")
 
 
 def _reviews_media_s3_prefix() -> str:
-    return (os.getenv("REVIEWS_MEDIA_S3_PREFIX") or "reviews-media").strip().strip("/")
+    return _first_env("REVIEWS_MEDIA_S3_PREFIX", default="reviews-media").strip().strip("/")
 
 
 def _reviews_media_s3_endpoint_url() -> Optional[str]:
     # Supports AWS S3 and S3-compatible providers (e.g. Cloudflare R2 / MinIO).
-    v = (os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip()
+    v = _first_env("REVIEWS_MEDIA_S3_ENDPOINT_URL", "PHOTO_UPLOAD_ENDPOINT_URL", "AWS_ENDPOINT_URL", "S3_ENDPOINT_URL", default="")
     return v or None
 
 
 def _reviews_media_s3_region() -> Optional[str]:
-    v = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "").strip()
+    v = _first_env("REVIEWS_MEDIA_S3_REGION", "PHOTO_UPLOAD_REGION", "AWS_REGION", "AWS_DEFAULT_REGION", default="")
     return v or None
+
+
+def _reviews_media_s3_client():
+    try:
+        import boto3
+        from botocore.client import Config
+    except Exception:
+        logger.warning("reviews.media.s3.boto3_missing")
+        return None
+
+    endpoint_url = _reviews_media_s3_endpoint_url()
+    endpoint_lc = (endpoint_url or "").lower()
+    is_r2 = bool(endpoint_url and ("cloudflarestorage.com" in endpoint_lc or ".r2." in endpoint_lc))
+
+    try:
+        config_kwargs: Dict[str, Any] = {"signature_version": "s3v4"}
+        if endpoint_url:
+            # Most S3-compatible providers (e.g. Cloudflare R2) expect path-style addressing.
+            config_kwargs["s3"] = {"addressing_style": "path"}
+
+        access_key_id = _first_env("REVIEWS_MEDIA_S3_ACCESS_KEY_ID", "PHOTO_UPLOAD_ACCESS_KEY_ID", default="")
+        secret_access_key = _first_env("REVIEWS_MEDIA_S3_SECRET_ACCESS_KEY", "PHOTO_UPLOAD_SECRET_ACCESS_KEY", default="")
+        session_token = _first_env("REVIEWS_MEDIA_S3_SESSION_TOKEN", "PHOTO_UPLOAD_SESSION_TOKEN", default="") or None
+
+        if endpoint_url and not (access_key_id and secret_access_key):
+            access_key_id = _first_env("AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", default=access_key_id)
+            secret_access_key = _first_env("AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", default=secret_access_key)
+            if not is_r2 and not session_token:
+                session_token = _first_env("AWS_SESSION_TOKEN", default="") or None
+
+        if is_r2:
+            # Cloudflare R2 rejects session token based signing.
+            session_token = None
+
+        region_name = _reviews_media_s3_region()
+        if is_r2:
+            # Cloudflare R2 expects region "auto".
+            region_name = "auto"
+
+        client_kwargs: Dict[str, Any] = {
+            "region_name": region_name,
+            "endpoint_url": endpoint_url,
+            "config": Config(**config_kwargs),
+        }
+        if access_key_id and secret_access_key:
+            client_kwargs.update(
+                {
+                    "aws_access_key_id": access_key_id,
+                    "aws_secret_access_key": secret_access_key,
+                    **({"aws_session_token": session_token} if session_token else {}),
+                }
+            )
+
+        return boto3.client("s3", **client_kwargs)
+    except Exception as e:
+        logger.warning("reviews.media.s3.client_failed %s", type(e).__name__)
+        logger.debug("reviews.media.s3.client_failed_detail %s", str(e))
+        return None
 
 
 def _reviews_media_s3_put(public_id: str, *, filename: str, blob: bytes, content_type: str) -> Optional[str]:
@@ -2611,22 +2677,16 @@ def _reviews_media_s3_put(public_id: str, *, filename: str, blob: bytes, content
         ext = "." + ext
     key = f"{_reviews_media_s3_prefix()}/{public_id}{ext}"
 
-    try:
-        import boto3
-    except Exception:
-        logger.warning("reviews.media.s3.boto3_missing")
+    client = _reviews_media_s3_client()
+    if client is None:
         return None
 
     try:
-        client = boto3.client(
-            "s3",
-            region_name=_reviews_media_s3_region(),
-            endpoint_url=_reviews_media_s3_endpoint_url(),
-        )
         client.put_object(Bucket=bucket, Key=key, Body=blob, ContentType=content_type)
         return f"s3://{bucket}/{key}"
     except Exception as e:
         logger.warning("reviews.media.s3.put_failed %s", type(e).__name__)
+        logger.debug("reviews.media.s3.put_failed_detail %s", str(e))
         return None
 
 

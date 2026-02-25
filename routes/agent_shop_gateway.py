@@ -7323,7 +7323,11 @@ async def get_review_media(public_id: str, request: Request) -> Response:
             sig_fail_reason = "bad_exp"
             raise HTTPException(status_code=403, detail="BAD_SIGNATURE")
 
-        from services.reviews_service import verify_review_media_signature_with_reason, _allow_legacy_review_media_id
+        from services.reviews_service import (
+            verify_review_media_signature_with_reason,
+            _allow_legacy_review_media_id,
+            _reviews_media_s3_client,
+        )
 
         ok, reason = verify_review_media_signature_with_reason(public_id=public_id, exp=exp, sig=sig)
         if not ok:
@@ -7368,8 +7372,6 @@ async def get_review_media(public_id: str, request: Request) -> Response:
                 import asyncio
                 from starlette.concurrency import iterate_in_threadpool
                 from starlette.responses import StreamingResponse
-
-                import boto3
             except Exception:
                 status_code = 500
                 raise HTTPException(status_code=500, detail="MEDIA_STORAGE_UNAVAILABLE")
@@ -7382,9 +7384,10 @@ async def get_review_media(public_id: str, request: Request) -> Response:
                 status_code = 404
                 raise HTTPException(status_code=404, detail="MEDIA_NOT_FOUND")
 
-            endpoint_url = (os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip() or None
-            region = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "").strip() or None
-            client = boto3.client("s3", region_name=region, endpoint_url=endpoint_url)
+            client = _reviews_media_s3_client()
+            if client is None:
+                status_code = 500
+                raise HTTPException(status_code=500, detail="MEDIA_STORAGE_UNAVAILABLE")
 
             try:
                 obj = await asyncio.to_thread(client.get_object, Bucket=bucket, Key=key)
