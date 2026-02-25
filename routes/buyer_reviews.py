@@ -15,6 +15,7 @@ from services.buyer_reviews_service import (
     buyer_submit_enabled,
     buyer_submit_merchant_allowed,
     attach_buyer_review_media,
+    attach_buyer_review_media_from_user,
     create_buyer_review,
     exchange_proof_for_submission_token,
     get_buyer_review_status,
@@ -403,6 +404,35 @@ async def buyer_attach_review_media(
         result = await attach_buyer_review_media(
             request=request,
             token=token,
+            review_id=int(review_id),
+            filename=(file.filename or ""),
+            content_type=(file.content_type or ""),
+            blob=blob,
+        )
+        record_buyer_media_upload(result="success", reason="ok", duration_seconds=(time.perf_counter() - start))
+        return result
+    except HTTPException as e:
+        reason = str(e.detail or "error")
+        record_buyer_media_upload(result="error", reason=reason[:64], duration_seconds=(time.perf_counter() - start))
+        raise
+    except Exception:
+        record_buyer_media_upload(result="error", reason="exception", duration_seconds=(time.perf_counter() - start))
+        raise
+
+
+@router.post("/reviews/{review_id}/media/from_user")
+async def buyer_attach_review_media_from_user(
+    review_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
+) -> Dict[str, Any]:
+    start = time.perf_counter()
+    try:
+        blob = await file.read()
+        result = await attach_buyer_review_media_from_user(
+            request=request,
+            user_id=principal.user_id,
             review_id=int(review_id),
             filename=(file.filename or ""),
             content_type=(file.content_type or ""),

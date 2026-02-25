@@ -18,7 +18,14 @@ from fastapi import HTTPException, Request
 from db.database import database
 from db.orders import get_order
 from db.products import products_cache
-from db.reviews_center import buyer_review_idempotency_keys, buyer_review_ownership, buyer_review_submission_jtis, media_assets, product_reviews
+from db.reviews_center import (
+    buyer_review_idempotency_keys,
+    buyer_review_ownership,
+    buyer_review_submission_jtis,
+    buyer_review_user_subject,
+    media_assets,
+    product_reviews,
+)
 from services.merchant_store_service import get_primary_store
 from services.reviews_service import VARIANT_ID_SENTINEL, _reviews_media_s3_put, build_product_key, build_sku_key
 
@@ -361,6 +368,13 @@ def buyer_submit_enabled() -> bool:
     raw = (os.getenv("REVIEWS_BUYER_SUBMIT_ENABLED") or "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
+def pdp_ugc_upload_enabled() -> bool:
+    raw = (os.getenv("PDP_UGC_UPLOAD_ENABLED") or "").strip().lower()
+    if not raw:
+        # Keep existing behavior by default; explicit toggle can disable upload rollout.
+        return True
+    return raw in {"1", "true", "yes", "on"}
+
 def buyer_submit_internal_issuer_enabled() -> bool:
     # Internal-only token issuer for staging/dev smoke tests.
     # Real buyer flows should use proof exchange instead.
@@ -426,6 +440,94 @@ async def attach_buyer_review_media(
     row = await database.fetch_one(product_reviews.select().where(product_reviews.c.id == rid))
     if not row:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    status = str(_row_get(row, "status") or "")
+    if status not in {"under_review", "active"}:
+        raise HTTPException(status_code=400, detail="REVIEW_STATUS_INVALID")
+
+    name = (filename or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="MISSING_FILENAME")
+
+    ct = (content_type or "").strip() or (mimetypes.guess_type(name)[0] or "").strip() or "application/octet-stream"
+    if not _is_allowed_content_type(ct):
+        raise HTTPException(status_code=400, detail="UNSUPPORTED_MEDIA_TYPE")
+
+    max_bytes = int(os.getenv("REVIEWS_BUYER_MEDIA_MAX_BYTES") or "10485760")  # 10MB
+    if max_bytes > 0 and len(blob) > max_bytes:
+        raise HTTPException(status_code=413, detail="MEDIA_TOO_LARGE")
+
+    public_id = _new_media_public_id()
+    media_type = _guess_media_type(name, ct)
+    url = f"/agent/shop/v1/review-media/{public_id}"
+    file_hash = _sha256_hex(blob)
+
+    s3_uri = _reviews_media_s3_put(public_id, filename=name, blob=blob, content_type=ct)
+    if not s3_uri:
+        raise HTTPException(status_code=503, detail="MEDIA_STORAGE_UNAVAILABLE")
+
+    now_dt = datetime.now(timezone.utc)
+    media_id = await database.execute(
+        media_assets.insert().values(
+            review_id=rid,
+            type=media_type,
+            public_id=public_id,
+            url=url,
+            file_path=s3_uri,
+            file_hash=file_hash,
+            status="active",
+            created_at=now_dt,
+        )
+    )
+
+    await database.execute(
+        product_reviews.update()
+        .where(product_reviews.c.id == rid)
+        .values(media_count=(product_reviews.c.media_count + 1), updated_at=now_dt)
+    )
+
+    return {
+        "status": "success",
+        "review_id": rid,
+        "media": {"id": int(media_id), "public_id": public_id, "type": media_type},
+    }
+
+
+async def attach_buyer_review_media_from_user(
+    *,
+    request: Request,
+    user_id: str,
+    review_id: int,
+    filename: str,
+    content_type: str,
+    blob: bytes,
+) -> Dict[str, Any]:
+    if not buyer_submit_enabled():
+        raise HTTPException(status_code=404, detail="BUYER_SUBMIT_DISABLED")
+    if not pdp_ugc_upload_enabled():
+        raise HTTPException(status_code=404, detail="PDP_UGC_UPLOAD_DISABLED")
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="NOT_AUTHENTICATED")
+
+    rid = int(review_id)
+    owner = await database.fetch_one(
+        buyer_review_user_subject.select().where(
+            (buyer_review_user_subject.c.user_id == uid)
+            & (buyer_review_user_subject.c.review_id == rid)
+        )
+    )
+    if not owner:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    row = await database.fetch_one(product_reviews.select().where(product_reviews.c.id == rid))
+    if not row:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    merchant_id = str(_row_get(row, "merchant_id") or "").strip()
+    if merchant_id and not buyer_submit_merchant_allowed(merchant_id):
+        raise HTTPException(status_code=403, detail="NOT_ALLOWED")
 
     status = str(_row_get(row, "status") or "")
     if status not in {"under_review", "active"}:
