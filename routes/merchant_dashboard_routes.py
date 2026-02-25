@@ -560,13 +560,21 @@ async def get_merchant_analytics(
         """
         growth = await database.fetch_one(growth_query, {"merchant_id": merchant_id})
         
-        order_growth = 0
-        revenue_growth = 0
-        gmv_growth = 0
+        def _to_int(value: Any) -> int:
+            try:
+                if value is None:
+                    return 0
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        order_growth = 0.0
+        revenue_growth = 0.0
+        gmv_growth = 0.0
         
         if growth and analytics:
-            orders_prev_30 = growth["orders_prev_30"] or 0
-            orders_last_30 = analytics["orders_last_30_days"] or 0
+            orders_prev_30 = _to_int(growth["orders_prev_30"])
+            orders_last_30 = _to_int(analytics["orders_last_30_days"])
             confirmed_revenue_prev_30 = float(growth["confirmed_revenue_prev_30"] or 0)
             confirmed_revenue_last_30 = float(analytics["confirmed_revenue_last_30_days"] or 0)
             gmv_prev_30 = float(growth["gmv_prev_30"] or 0)
@@ -580,13 +588,14 @@ async def get_merchant_analytics(
                 gmv_growth = ((gmv_last_30 - gmv_prev_30) / gmv_prev_30) * 100
         
         # Calculate Analytics rates
-        total_orders_all_time = analytics["total_orders_all_time"] if analytics else 0
-        paid_orders_all_time = analytics["paid_orders_all_time"] if analytics else 0
+        total_orders_all_time = _to_int(analytics["total_orders_all_time"]) if analytics else 0
+        paid_orders_all_time = _to_int(analytics["paid_orders_all_time"]) if analytics else 0
         gmv_all_time = float(analytics["gmv_all_time"] or 0) if analytics else 0.0
         confirmed_revenue_all_time = float(analytics["confirmed_revenue_all_time"] or 0) if analytics else 0.0
 
-        total_orders = analytics["orders_last_30_days"] if analytics else 0
-        paid_orders = analytics["paid_orders_last_30_days"] if analytics else 0
+        total_orders = _to_int(analytics["orders_last_30_days"]) if analytics else 0
+        paid_orders = _to_int(analytics["paid_orders_last_30_days"]) if analytics else 0
+        total_customers = _to_int(analytics["total_customers"]) if analytics else 0
         gmv = float(analytics["gmv_last_30_days"] or 0) if analytics else 0.0
         confirmed_revenue = float(analytics["confirmed_revenue_last_30_days"] or 0) if analytics else 0.0
         
@@ -606,7 +615,7 @@ async def get_merchant_analytics(
         data = {
             "total_orders": total_orders,
             "total_revenue": confirmed_revenue,
-            "total_customers": analytics["total_customers"] if analytics else 0,
+            "total_customers": total_customers,
             "average_order_value": average_order_value,
             "order_growth": round(order_growth, 1),
             "revenue_growth": round(revenue_growth, 1),
