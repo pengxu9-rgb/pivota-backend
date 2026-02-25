@@ -16,6 +16,8 @@ from sqlalchemy import (
     String,
     Boolean,
     DateTime,
+    Float,
+    Text,
     JSON,
     UniqueConstraint,
 )
@@ -90,6 +92,22 @@ public_order_lookup_logs = Table(
     Column("ip_address", String(45), nullable=True, index=True),
     Column("email_normalized", String(255), nullable=True, index=True),
     Column("order_id", String(50), nullable=True, index=True),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+shop_browse_history_events = Table(
+    "shop_browse_history_events",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", String(50), nullable=False, index=True),
+    Column("product_id", String(255), nullable=False, index=True),
+    Column("merchant_id", String(255), nullable=True, index=True),
+    Column("title", Text, nullable=True),
+    Column("price", Float, nullable=True),
+    Column("currency", String(16), nullable=True),
+    Column("image_url", Text, nullable=True),
+    Column("description", Text, nullable=True),
+    Column("viewed_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )
 
