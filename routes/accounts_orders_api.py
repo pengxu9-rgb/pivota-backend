@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,6 +44,7 @@ from db.accounts import (
     shop_user_passwords,
     shop_login_otps,
     public_order_lookup_logs,
+    shop_browse_history_events,
     normalize_email,
     create_or_get_shop_user,
     record_public_lookup,
@@ -446,6 +448,82 @@ class CancelOrderResponse(BaseModel):
     updated_at: str
 
 
+class RefundOrderItemRequest(BaseModel):
+    item_id: Optional[str] = Field(default=None, max_length=255)
+    quantity: Optional[int] = Field(default=None, ge=1)
+    amount_minor: Optional[int] = Field(default=None, ge=1)
+
+
+class RefundOrderRequest(BaseModel):
+    amount_minor: Optional[int] = Field(default=None, ge=1)
+    amount: Optional[float] = Field(default=None, gt=0)
+    currency: Optional[str] = Field(default=None, min_length=3, max_length=8)
+    reason: Optional[str] = Field(default=None, max_length=500)
+    items: Optional[List[RefundOrderItemRequest]] = None
+
+    @validator("currency")
+    def normalize_currency(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        trimmed = v.strip().upper()
+        return trimmed or None
+
+    @validator("reason")
+    def normalize_reason(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        trimmed = v.strip()
+        return trimmed or None
+
+
+class RefundOrderResponse(BaseModel):
+    order_id: str
+    refund_status: str
+    case_id: Optional[str] = None
+    updated_at: str
+    total_refunded_minor: int
+    currency: str
+
+
+class BrowseHistoryEventRequest(BaseModel):
+    product_id: str = Field(..., min_length=1, max_length=255)
+    merchant_id: Optional[str] = Field(default=None, max_length=255)
+    title: Optional[str] = Field(default=None, max_length=1000)
+    price: Optional[float] = Field(default=None, ge=0)
+    currency: Optional[str] = Field(default=None, min_length=1, max_length=16)
+    image_url: Optional[str] = Field(default=None, max_length=4096)
+    description: Optional[str] = Field(default=None, max_length=4000)
+    viewed_at: Optional[str] = Field(default=None, max_length=64)
+
+    @validator("product_id")
+    def normalize_product_id(cls, v: str) -> str:
+        return v.strip()
+
+    @validator("merchant_id", "title", "currency", "image_url", "description", "viewed_at")
+    def normalize_optional_fields(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        trimmed = v.strip()
+        return trimmed or None
+
+
+class BrowseHistoryItem(BaseModel):
+    product_id: str
+    merchant_id: Optional[str] = None
+    title: str
+    price: float
+    currency: str
+    image_url: str
+    description: Optional[str] = None
+    timestamp: int
+    viewed_at: str
+
+
+class BrowseHistoryListResponse(BaseModel):
+    items: List[BrowseHistoryItem]
+    total: int
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -775,6 +853,229 @@ def _build_items_summary(items: List[Dict[str, Any]]) -> str:
     if len(items) == 1:
         return f"{title} x{qty}"
     return f"{title} x{qty} (+{len(items) - 1} more)"
+
+
+def _ensure_customer_order_access(order_data: Dict[str, Any], principal: AccountsPrincipal) -> None:
+    if principal.primary_role == "customer":
+        if normalize_email(order_data.get("customer_email", "")) != principal.email_normalized:
+            raise _error(
+                status.HTTP_404_NOT_FOUND,
+                "NOT_FOUND",
+                "Order not found",
+            )
+        return
+
+    raise _error(
+        status.HTTP_403_FORBIDDEN,
+        "FORBIDDEN",
+        "Only customer accounts can access orders via this API for now",
+    )
+
+
+def _coerce_json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _to_iso_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        parsed = _parse_iso_datetime(trimmed)
+        return parsed.isoformat() if parsed else trimmed
+    return str(value)
+
+
+def _extract_tracking_events_from_metadata(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    for key in ("tracking_events", "shipping_events", "events", "tracking_timeline", "timeline"):
+        raw_events = metadata.get(key)
+        if not isinstance(raw_events, list):
+            continue
+        events: List[Dict[str, Any]] = []
+        for raw_event in raw_events:
+            event = _coerce_json_object(raw_event)
+            if not event:
+                continue
+            events.append(
+                {
+                    "status": (
+                        str(event.get("status") or event.get("state") or "update")
+                    ).strip(),
+                    "description": (
+                        str(event.get("description") or event.get("message") or event.get("detail") or "")
+                    ).strip()
+                    or None,
+                    "location": (
+                        str(event.get("location") or event.get("city") or "")
+                    ).strip()
+                    or None,
+                    "timestamp": _to_iso_string(
+                        event.get("timestamp")
+                        or event.get("occurred_at")
+                        or event.get("created_at")
+                    ),
+                }
+            )
+        if events:
+            return events
+    return []
+
+
+def _build_tracking_events(order_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metadata = _coerce_json_object(order_data.get("metadata"))
+    metadata_events = _extract_tracking_events_from_metadata(metadata)
+    if metadata_events:
+        return metadata_events
+
+    created_at = order_data.get("created_at") or datetime.now(timezone.utc)
+    payment_status = _map_payment_status(order_data.get("payment_status"))
+    fulfillment_status = _map_fulfillment_status(order_data.get("fulfillment_status"))
+    delivery_status = _derive_delivery_status(
+        order_data.get("fulfillment_status"),
+        order_data.get("tracking_number"),
+    )
+    order_status = str(order_data.get("status") or "").strip().lower()
+
+    timeline: List[Dict[str, Any]] = [
+        {
+            "status": "ordered",
+            "description": "Order received",
+            "location": None,
+            "timestamp": _to_iso_string(created_at),
+        }
+    ]
+
+    if payment_status == "paid":
+        timeline.append(
+            {
+                "status": "paid",
+                "description": "Payment confirmed",
+                "location": None,
+                "timestamp": _to_iso_string(order_data.get("paid_at") or created_at),
+            }
+        )
+
+    if fulfillment_status in {"partially_fulfilled", "fulfilled"} or order_data.get("tracking_number"):
+        timeline.append(
+            {
+                "status": "shipped",
+                "description": "Shipment in transit",
+                "location": None,
+                "timestamp": _to_iso_string(order_data.get("shipped_at") or created_at),
+            }
+        )
+
+    if delivery_status == "delivered":
+        timeline.append(
+            {
+                "status": "delivered",
+                "description": "Delivered",
+                "location": None,
+                "timestamp": _to_iso_string(
+                    order_data.get("delivered_at") or order_data.get("shipped_at") or created_at
+                ),
+            }
+        )
+
+    if order_status in {"cancelled", "canceled"}:
+        timeline.append(
+            {
+                "status": "cancelled",
+                "description": "Order cancelled",
+                "location": None,
+                "timestamp": _to_iso_string(order_data.get("cancelled_at") or order_data.get("updated_at") or created_at),
+            }
+        )
+    elif order_status == "refunded":
+        timeline.append(
+            {
+                "status": "refunded",
+                "description": "Refund completed",
+                "location": None,
+                "timestamp": _to_iso_string(order_data.get("updated_at") or created_at),
+            }
+        )
+
+    return timeline
+
+
+def _extract_tracking_url(order_data: Dict[str, Any]) -> Optional[str]:
+    shipping = _coerce_json_object(order_data.get("shipping_address"))
+    metadata = _coerce_json_object(order_data.get("metadata"))
+    metadata_tracking = _coerce_json_object(metadata.get("tracking"))
+    metadata_shipment = _coerce_json_object(metadata.get("shipment"))
+    candidates = [
+        order_data.get("tracking_url"),
+        shipping.get("tracking_url"),
+        shipping.get("trackingUrl"),
+        metadata.get("tracking_url"),
+        metadata.get("trackingUrl"),
+        metadata_tracking.get("tracking_url"),
+        metadata_tracking.get("trackingUrl"),
+        metadata_tracking.get("url"),
+        metadata_shipment.get("tracking_url"),
+        metadata_shipment.get("trackingUrl"),
+        metadata_shipment.get("url"),
+    ]
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        url = raw.strip()
+        if not url:
+            continue
+        return url
+    return None
+
+
+def _normalize_history_merchant_id(value: Optional[str]) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _history_item_key(product_id: str, merchant_id: Optional[str]) -> str:
+    return f"{product_id}::{merchant_id or ''}"
+
+
+def _history_row_to_item(row: Dict[str, Any]) -> BrowseHistoryItem:
+    raw_viewed_at = row.get("viewed_at") or row.get("created_at") or datetime.now(timezone.utc)
+    parsed = None
+    if isinstance(raw_viewed_at, datetime):
+        parsed = raw_viewed_at
+    elif isinstance(raw_viewed_at, str):
+        parsed = _parse_iso_datetime(raw_viewed_at)
+    if not parsed:
+        parsed = datetime.now(timezone.utc)
+
+    price_value = row.get("price")
+    try:
+        normalized_price = float(price_value) if price_value is not None else 0.0
+    except Exception:
+        normalized_price = 0.0
+
+    return BrowseHistoryItem(
+        product_id=str(row.get("product_id") or "").strip(),
+        merchant_id=_normalize_history_merchant_id(row.get("merchant_id")),
+        title=str(row.get("title") or "Untitled product").strip() or "Untitled product",
+        price=max(0.0, normalized_price),
+        currency=str(row.get("currency") or "USD").strip() or "USD",
+        image_url=str(row.get("image_url") or "/placeholder.svg").strip() or "/placeholder.svg",
+        description=(str(row.get("description") or "").strip() or None),
+        timestamp=int(parsed.timestamp() * 1000),
+        viewed_at=parsed.isoformat(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1419,6 +1720,165 @@ async def logout():
 
 
 # ---------------------------------------------------------------------------
+# Protected Browse History endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/browse-history/events")
+async def create_browse_history_event(
+    body: BrowseHistoryEventRequest,
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
+):
+    await _ensure_database_connected()
+
+    product_id = str(body.product_id or "").strip()
+    if not product_id:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "product_id is required",
+        )
+
+    merchant_id = _normalize_history_merchant_id(body.merchant_id)
+    viewed_at = _parse_iso_datetime(body.viewed_at) or datetime.now(timezone.utc)
+
+    base_filters = [
+        shop_browse_history_events.c.user_id == principal.user_id,
+        shop_browse_history_events.c.product_id == product_id,
+    ]
+    if merchant_id is None:
+        base_filters.append(shop_browse_history_events.c.merchant_id.is_(None))
+    else:
+        base_filters.append(shop_browse_history_events.c.merchant_id == merchant_id)
+
+    existing = await database.fetch_one(
+        shop_browse_history_events.select()
+        .where(and_(*base_filters))
+        .order_by(
+            shop_browse_history_events.c.viewed_at.desc(),
+            shop_browse_history_events.c.id.desc(),
+        )
+        .limit(1)
+    )
+
+    write_values: Dict[str, Any] = {
+        "user_id": principal.user_id,
+        "product_id": product_id,
+        "merchant_id": merchant_id,
+        "title": body.title,
+        "price": float(body.price) if body.price is not None else None,
+        "currency": body.currency or "USD",
+        "image_url": body.image_url or "/placeholder.svg",
+        "description": body.description,
+        "viewed_at": viewed_at,
+    }
+
+    if existing:
+        await database.execute(
+            shop_browse_history_events.update()
+            .where(shop_browse_history_events.c.id == existing["id"])
+            .values(**write_values)
+        )
+        stored = await database.fetch_one(
+            shop_browse_history_events.select().where(
+                shop_browse_history_events.c.id == existing["id"]
+            )
+        )
+    else:
+        inserted_id = await database.execute(
+            shop_browse_history_events.insert().values(**write_values)
+        )
+        stored = None
+        try:
+            if inserted_id is not None:
+                stored = await database.fetch_one(
+                    shop_browse_history_events.select().where(
+                        shop_browse_history_events.c.id == inserted_id
+                    )
+                )
+        except Exception:
+            stored = None
+        if not stored:
+            stored = await database.fetch_one(
+                shop_browse_history_events.select()
+                .where(and_(*base_filters))
+                .order_by(
+                    shop_browse_history_events.c.viewed_at.desc(),
+                    shop_browse_history_events.c.id.desc(),
+                )
+                .limit(1)
+            )
+
+    if not stored:
+        raise _error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "SERVER_ERROR",
+            "Failed to store browse history event",
+        )
+
+    return {
+        "status": "ok",
+        "item": _history_row_to_item(dict(stored)).dict(),
+    }
+
+
+@router.get("/browse-history", response_model=BrowseHistoryListResponse)
+async def list_browse_history(
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
+    limit: int = Query(30, ge=1, le=100),
+):
+    await _ensure_database_connected()
+
+    scan_limit = min(max(limit * 5, limit), 500)
+    rows = await database.fetch_all(
+        shop_browse_history_events.select()
+        .where(shop_browse_history_events.c.user_id == principal.user_id)
+        .order_by(
+            shop_browse_history_events.c.viewed_at.desc(),
+            shop_browse_history_events.c.id.desc(),
+        )
+        .limit(scan_limit)
+    )
+
+    items: List[BrowseHistoryItem] = []
+    seen: set = set()
+    for row in rows:
+        data = dict(row)
+        key = _history_item_key(
+            str(data.get("product_id") or "").strip(),
+            _normalize_history_merchant_id(data.get("merchant_id")),
+        )
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append(_history_row_to_item(data))
+        if len(items) >= limit:
+            break
+
+    return BrowseHistoryListResponse(items=items, total=len(items))
+
+
+@router.delete("/browse-history")
+async def clear_browse_history(
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
+):
+    await _ensure_database_connected()
+    deleted = (
+        await database.fetch_val(
+            select(func.count())
+            .select_from(shop_browse_history_events)
+            .where(shop_browse_history_events.c.user_id == principal.user_id)
+        )
+        or 0
+    )
+    await database.execute(
+        shop_browse_history_events.delete().where(
+            shop_browse_history_events.c.user_id == principal.user_id
+        )
+    )
+    return {"status": "ok", "deleted": int(deleted)}
+
+
+# ---------------------------------------------------------------------------
 # Protected Orders endpoints
 # ---------------------------------------------------------------------------
 
@@ -1620,22 +2080,7 @@ async def get_order_detail(
         )
 
     order_data = dict(order)
-
-    # Access control: customers can only see their own orders
-    if principal.primary_role == "customer":
-        if normalize_email(order_data.get("customer_email", "")) != principal.email_normalized:
-            # Hide existence
-            raise _error(
-                status.HTTP_404_NOT_FOUND,
-                "NOT_FOUND",
-                "Order not found",
-            )
-    else:
-        raise _error(
-            status.HTTP_403_FORBIDDEN,
-            "FORBIDDEN",
-            "Only customer accounts can access orders via this API for now",
-        )
+    _ensure_customer_order_access(order_data, principal)
 
     payment_status_mapped = _map_payment_status(order_data.get("payment_status"))
     fulfillment_status_mapped = _map_fulfillment_status(
@@ -1651,9 +2096,9 @@ async def get_order_detail(
         refunded=(order_data.get("status") == "refunded"),
     )
 
-    shipping = order_data.get("shipping_address") or {}
+    shipping = _coerce_json_object(order_data.get("shipping_address"))
     items = order_data.get("items") or []
-    metadata = order_data.get("metadata") or {}
+    metadata = _coerce_json_object(order_data.get("metadata"))
     creator_id = None
     creator_name = None
     creator_slug = None
@@ -1672,7 +2117,7 @@ async def get_order_detail(
     try:
         payment_rows = await database.fetch_all(
             """
-            SELECT payment_id, payment_intent_id, amount, currency, psp_type, status
+            SELECT payment_id, payment_intent_id, amount, currency, psp_type, status, metadata
             FROM payments
             WHERE order_id = :order_id
             ORDER BY created_at ASC
@@ -1681,6 +2126,7 @@ async def get_order_detail(
         )
         for pr in payment_rows:
             pr_status = pr["status"]
+            pr_metadata = _coerce_json_object(pr.get("metadata"))
             # Best-effort: if the order is already marked paid but the raw payment
             # record is still "processing", surface it as succeeded in the
             # customer-facing API to avoid confusing UI states.
@@ -1700,12 +2146,30 @@ async def get_order_detail(
                     "currency": pr["currency"],
                     "status": pr_status,
                     "payment_intent_id": pr["payment_intent_id"],
+                    "method": (
+                        pr_metadata.get("method")
+                        or pr_metadata.get("payment_method")
+                        or pr_metadata.get("type")
+                        or order_data.get("payment_method")
+                    ),
+                    "brand": (
+                        pr_metadata.get("brand")
+                        or pr_metadata.get("card_brand")
+                        or pr_metadata.get("network")
+                    ),
+                    "last4": (
+                        pr_metadata.get("last4")
+                        or pr_metadata.get("card_last4")
+                        or pr_metadata.get("card_last_4")
+                    ),
                 }
             )
     except Exception:
         payment_records = []
 
     # Fulfillment / shipments (best-effort, derived from tracking fields)
+    tracking_events = _build_tracking_events(order_data)
+    tracking_url = _extract_tracking_url(order_data)
     shipments: List[Dict[str, Any]] = []
     if order_data.get("tracking_number"):
         shipments.append(
@@ -1714,7 +2178,8 @@ async def get_order_detail(
                 "carrier": order_data.get("carrier"),
                 "status": delivery_status,
                 "estimated_delivery": None,
-                "events": [],
+                "tracking_url": tracking_url,
+                "events": tracking_events,
             }
         )
 
@@ -1723,6 +2188,47 @@ async def get_order_detail(
         "phone": (shipping.get("phone") or ""),
         "name": shipping.get("name"),
     }
+
+    total_refunded_minor = _amount_to_minor(order_data.get("total_refunded"))
+    refund_status = (
+        str(metadata.get("refund_status") or "").strip().lower()
+        or ("refunded" if status_summary == "refunded" else "none")
+    )
+    refund_payload = {
+        "status": refund_status,
+        "case_id": metadata.get("refund_case_id"),
+        "updated_at": metadata.get("refund_updated_at"),
+        "total_refunded_minor": total_refunded_minor,
+        "currency": order_data.get("currency", "USD"),
+        "requests": metadata.get("refund_requests") if isinstance(metadata.get("refund_requests"), list) else [],
+    }
+
+    shipping_name = shipping.get("name") or shipping.get("full_name") or shipping.get("recipient_name")
+    shipping_phone = shipping.get("phone") or shipping.get("phone_number")
+    shipping_address_line1 = (
+        shipping.get("address_line1")
+        or shipping.get("address1")
+        or shipping.get("line1")
+        or shipping.get("street")
+    )
+    shipping_address_line2 = (
+        shipping.get("address_line2")
+        or shipping.get("address2")
+        or shipping.get("line2")
+        or shipping.get("unit")
+    )
+    shipping_city = shipping.get("city")
+    shipping_province = (
+        shipping.get("province")
+        or shipping.get("state")
+        or shipping.get("region")
+    )
+    shipping_country = shipping.get("country")
+    shipping_postal_code = (
+        shipping.get("postal_code")
+        or shipping.get("zip")
+        or shipping.get("zip_code")
+    )
 
     response_payload = {
         "order": {
@@ -1740,10 +2246,14 @@ async def get_order_detail(
             "creator_name": creator_name,
             "creator_slug": creator_slug,
             "shipping_address": {
-                "name": shipping.get("name"),
-                "city": shipping.get("city"),
-                "country": shipping.get("country"),
-                "postal_code": shipping.get("postal_code"),
+                "name": shipping_name,
+                "address_line1": shipping_address_line1,
+                "address_line2": shipping_address_line2,
+                "city": shipping_city,
+                "province": shipping_province,
+                "country": shipping_country,
+                "postal_code": shipping_postal_code,
+                "phone": shipping_phone,
             },
         },
         "items": [
@@ -1760,6 +2270,14 @@ async def get_order_detail(
         ],
         "payment": {"records": payment_records},
         "fulfillment": {"shipments": shipments},
+        "tracking": {
+            "status": delivery_status,
+            "carrier": order_data.get("carrier"),
+            "tracking_number": order_data.get("tracking_number"),
+            "tracking_url": tracking_url,
+            "events": tracking_events,
+        },
+        "refund": refund_payload,
         "customer": customer_info,
         "permissions": _compute_permissions(order_data, principal),
     }
@@ -1895,6 +2413,181 @@ async def cancel_order(
             "SERVER_ERROR",
             "cancel_order failed",
         )
+
+
+@router.get("/orders/{order_id}/tracking")
+async def get_order_tracking(
+    order_id: str,
+    response: Response,
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
+):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    order = await database.fetch_one(
+        orders_table.select().where(orders_table.c.order_id == order_id)
+    )
+    if not order:
+        raise _error(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            "Order not found",
+        )
+
+    order_data = dict(order)
+    _ensure_customer_order_access(order_data, principal)
+
+    delivery_status = _derive_delivery_status(
+        order_data.get("fulfillment_status"),
+        order_data.get("tracking_number"),
+    )
+
+    return {
+        "order_id": order_id,
+        "status": delivery_status,
+        "carrier": order_data.get("carrier"),
+        "tracking_number": order_data.get("tracking_number"),
+        "tracking_url": _extract_tracking_url(order_data),
+        "events": _build_tracking_events(order_data),
+    }
+
+
+@router.post("/orders/{order_id}/refund", response_model=RefundOrderResponse)
+async def request_order_refund(
+    order_id: str,
+    payload: RefundOrderRequest = Body(default=None),
+    principal: AccountsPrincipal = Depends(get_accounts_principal),
+):
+    order = await database.fetch_one(
+        orders_table.select().where(orders_table.c.order_id == order_id)
+    )
+    if not order:
+        raise _error(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            "Order not found",
+        )
+
+    order_data = dict(order)
+    _ensure_customer_order_access(order_data, principal)
+
+    order_status = str(order_data.get("status") or "").strip().lower()
+    if order_status in {"cancelled", "canceled"}:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_STATE",
+            "Cancelled orders cannot request refunds",
+        )
+
+    payment_status_mapped = _map_payment_status(order_data.get("payment_status"))
+    if payment_status_mapped not in {"paid", "partial"}:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_STATE",
+            "Order is not eligible for refund in its current payment state",
+        )
+
+    currency = str(order_data.get("currency") or "USD").strip().upper() or "USD"
+    if payload and payload.currency and payload.currency != currency:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "Refund currency must match order currency",
+        )
+
+    total_minor = _amount_to_minor(order_data.get("total"))
+    already_refunded_minor = _amount_to_minor(order_data.get("total_refunded"))
+    remaining_minor = max(0, total_minor - already_refunded_minor)
+    if remaining_minor <= 0:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_STATE",
+            "Order has already been fully refunded",
+        )
+
+    request_amount_minor: int
+    if payload and payload.amount_minor is not None:
+        request_amount_minor = int(round(payload.amount_minor))
+    elif payload and payload.amount is not None:
+        request_amount_minor = _amount_to_minor(payload.amount)
+    else:
+        request_amount_minor = remaining_minor
+
+    if request_amount_minor <= 0:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "Refund amount must be greater than zero",
+        )
+    if request_amount_minor > remaining_minor:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "Refund amount exceeds remaining refundable balance",
+        )
+
+    now = datetime.now(timezone.utc)
+    case_id = f"rfd_{uuid.uuid4().hex[:12]}"
+    metadata = _coerce_json_object(order_data.get("metadata"))
+    refund_requests = metadata.get("refund_requests")
+    if not isinstance(refund_requests, list):
+        refund_requests = []
+
+    refund_item_payload: List[Dict[str, Any]] = []
+    if payload and payload.items:
+        for item in payload.items:
+            try:
+                refund_item_payload.append(item.dict(exclude_none=True))
+            except Exception:
+                continue
+
+    refund_requests.append(
+        {
+            "case_id": case_id,
+            "status": "requested",
+            "amount_minor": request_amount_minor,
+            "currency": currency,
+            "reason": payload.reason if payload else None,
+            "items": refund_item_payload,
+            "created_at": now.isoformat(),
+        }
+    )
+
+    new_total_refunded_minor = already_refunded_minor + request_amount_minor
+    metadata["refund_status"] = "requested"
+    metadata["refund_case_id"] = case_id
+    metadata["refund_updated_at"] = now.isoformat()
+    metadata["refund_requests"] = refund_requests
+
+    update_values: Dict[str, Any] = {
+        "total_refunded": new_total_refunded_minor / 100.0,
+        "updated_at": now,
+        "metadata": metadata,
+    }
+    if new_total_refunded_minor >= total_minor:
+        update_values["status"] = "refunded"
+        update_values["payment_status"] = "refunded"
+
+    await database.execute(
+        orders_table.update()
+        .where(
+            and_(
+                orders_table.c.order_id == order_id,
+                orders_table.c.is_deleted == False,  # noqa: E712
+            )
+        )
+        .values(**update_values)
+    )
+
+    return RefundOrderResponse(
+        order_id=order_id,
+        refund_status="requested",
+        case_id=case_id,
+        updated_at=now.isoformat(),
+        total_refunded_minor=new_total_refunded_minor,
+        currency=currency,
+    )
 
 
 # ---------------------------------------------------------------------------
