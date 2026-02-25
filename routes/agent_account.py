@@ -15,6 +15,93 @@ from utils.auth import hash_password, verify_password, create_access_token, get_
 
 router = APIRouter(prefix="/agent/account", tags=["agent-account"])
 
+
+async def _resolve_agent_key_table() -> Optional[str]:
+    """
+    Resolve which key table is used by auth lookup priority.
+    Priority follows db.agents._resolve_auth_key_table: api_keys > agent_api_keys > legacy.
+    """
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT
+              to_regclass('public.api_keys') AS api_keys_table,
+              to_regclass('public.agent_api_keys') AS agent_api_keys_table
+            """
+        )
+        row_dict = dict(row or {})
+        if row_dict.get("api_keys_table"):
+            return "api_keys"
+        if row_dict.get("agent_api_keys_table"):
+            return "agent_api_keys"
+    except Exception:
+        # Non-postgres or no visibility to regclass: keep legacy-only behavior.
+        return None
+    return None
+
+
+async def _sync_new_agent_api_key(
+    *,
+    agent_id: str,
+    api_key: str,
+    api_key_hash: str,
+) -> str:
+    """
+    Ensure newly registered agent key is available on the active auth path.
+    Returns one of: api_keys / agent_api_keys / legacy.
+    """
+    key_table = await _resolve_agent_key_table()
+
+    if key_table == "api_keys":
+        await database.execute(
+            """
+            INSERT INTO api_keys (agent_id, name, key_hash, key_prefix)
+            VALUES (:agent_id, :name, :key_hash, :key_prefix)
+            """,
+            {
+                "agent_id": agent_id,
+                "name": "Primary Key",
+                "key_hash": api_key_hash,
+                "key_prefix": api_key[:10],
+            },
+        )
+        return "api_keys"
+
+    if key_table == "agent_api_keys":
+        await database.execute(
+            """
+            INSERT INTO agent_api_keys (
+                key_id,
+                agent_id,
+                key_name,
+                key_hash,
+                key_prefix,
+                is_active,
+                created_at
+            )
+            VALUES (
+                :key_id,
+                :agent_id,
+                :key_name,
+                :key_hash,
+                :key_prefix,
+                TRUE,
+                NOW()
+            )
+            """,
+            {
+                "key_id": f"key_{secrets.token_hex(8)}",
+                "agent_id": agent_id,
+                "key_name": "Primary Key",
+                "key_hash": api_key_hash,
+                "key_prefix": api_key[:12] + "...",
+            },
+        )
+        return "agent_api_keys"
+
+    return "legacy"
+
+
 # ============================================================================
 # Models
 # ============================================================================
@@ -63,6 +150,8 @@ async def register_agent(data: AgentRegisterRequest):
     Register a new AI Agent
     Simplified to work with actual database schema
     """
+    agent_id: Optional[str] = None
+
     try:
         # 1. Check if user already exists
         existing_user = await database.fetch_one(
@@ -131,8 +220,15 @@ async def register_agent(data: AgentRegisterRequest):
                 "api_key_hash": api_key_hash,
             }
         )
-        
-        print(f"✅ Agent created: {agent_id} for {data.email}")
+
+        # 5. Persist key in the auth lookup table when hash-key auth is enabled.
+        key_sync_source = await _sync_new_agent_api_key(
+            agent_id=agent_id,
+            api_key=api_key,
+            api_key_hash=api_key_hash,
+        )
+
+        print(f"✅ Agent created: {agent_id} for {data.email} (key sync: {key_sync_source})")
         
         return {
             "success": True,
@@ -146,7 +242,17 @@ async def register_agent(data: AgentRegisterRequest):
     except HTTPException:
         raise
     except Exception as e:
-        # If agent creation failed, clean up user account
+        # If any step failed after partial writes, clean up created rows.
+        if agent_id:
+            try:
+                await database.execute(
+                    "DELETE FROM agents WHERE agent_id = :agent_id",
+                    {"agent_id": agent_id},
+                )
+                print(f"🧹 Cleaned up agent record after failure: {agent_id}")
+            except Exception:
+                pass
+
         try:
             await database.execute(
                 "DELETE FROM users WHERE email = :email AND role = 'agent'",
