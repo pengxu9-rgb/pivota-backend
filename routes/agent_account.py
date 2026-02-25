@@ -73,28 +73,28 @@ async def _sync_new_agent_api_key(
             INSERT INTO agent_api_keys (
                 key_id,
                 agent_id,
-                key_name,
                 key_hash,
                 key_prefix,
                 is_active,
+                created_by,
                 created_at
             )
             VALUES (
                 :key_id,
                 :agent_id,
-                :key_name,
                 :key_hash,
                 :key_prefix,
                 TRUE,
+                :created_by,
                 NOW()
             )
             """,
             {
                 "key_id": f"key_{secrets.token_hex(8)}",
                 "agent_id": agent_id,
-                "key_name": "Primary Key",
                 "key_hash": api_key_hash,
                 "key_prefix": api_key[:12] + "...",
+                "created_by": "agent_signup",
             },
         )
         return "agent_api_keys"

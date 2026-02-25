@@ -61,7 +61,10 @@ async def test_sync_new_agent_api_key_uses_agent_api_keys_when_needed(
     )
 
     assert source == "agent_api_keys"
-    assert any("INSERT INTO agent_api_keys" in q for q, _ in executed)
+    agent_insert_queries = [q for q, _ in executed if "INSERT INTO agent_api_keys" in q]
+    assert len(agent_insert_queries) == 1
+    assert "key_name" not in agent_insert_queries[0]
+    assert "created_by" in agent_insert_queries[0]
     assert all("INSERT INTO api_keys" not in q for q, _ in executed)
 
 
