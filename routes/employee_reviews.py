@@ -13,7 +13,15 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from db.database import database
-from db.reviews_center import import_batches, import_items, media_assets, review_featured, review_group, review_group_membership
+from db.reviews_center import (
+    buyer_review_user_subject,
+    import_batches,
+    import_items,
+    media_assets,
+    review_featured,
+    review_group,
+    review_group_membership,
+)
 from observability.reviews_metrics import (
     record_employee_action,
     record_import_commit,
@@ -863,6 +871,7 @@ async def employee_list_reviews_for_moderation(
     status: Optional[str] = None,
     source_type: Optional[str] = None,
     source_system: Optional[str] = None,
+    order_id: Optional[str] = None,
     limit: int = 50,
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
 ) -> Dict[str, Any]:
@@ -881,16 +890,40 @@ async def employee_list_reviews_for_moderation(
     if source_system:
         where.append("source_system = :ssys")
         params["ssys"] = str(source_system)
+    order_id_norm = str(order_id or "").strip()
+    if order_id_norm:
+        where.append("COALESCE(NULLIF(product_reviews.risk_flags ->> 'order_id', ''), bind.order_id) = :oid")
+        params["oid"] = order_id_norm
     rows = await database.fetch_all(
         f"""
-        SELECT id, merchant_id, platform, platform_product_id, variant_id, group_id,
-               source_type, source_system, external_review_id,
-               verification, rating, title,
-               COALESCE(NULLIF(body_redacted, ''), body) AS body_effective,
-               media_count, status, created_at, updated_at
+        SELECT
+               product_reviews.id,
+               product_reviews.merchant_id,
+               product_reviews.platform,
+               product_reviews.platform_product_id,
+               product_reviews.variant_id,
+               product_reviews.group_id,
+               product_reviews.source_type,
+               product_reviews.source_system,
+               product_reviews.external_review_id,
+               product_reviews.verification,
+               product_reviews.rating,
+               product_reviews.title,
+               COALESCE(NULLIF(product_reviews.body_redacted, ''), product_reviews.body) AS body_effective,
+               product_reviews.media_count,
+               product_reviews.status,
+               product_reviews.created_at,
+               product_reviews.updated_at,
+               COALESCE(NULLIF(product_reviews.risk_flags ->> 'order_id', ''), bind.order_id) AS order_id
         FROM product_reviews
+        LEFT JOIN (
+            SELECT review_id, MAX(order_id) AS order_id
+            FROM {buyer_review_user_subject.name}
+            WHERE order_id IS NOT NULL AND order_id <> ''
+            GROUP BY review_id
+        ) AS bind ON bind.review_id = product_reviews.id
         WHERE {' AND '.join(where)}
-        ORDER BY created_at DESC, id DESC
+        ORDER BY product_reviews.created_at DESC, product_reviews.id DESC
         LIMIT {limit}
         """,
         params,
