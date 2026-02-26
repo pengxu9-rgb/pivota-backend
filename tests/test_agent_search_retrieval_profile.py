@@ -11,6 +11,25 @@ def test_resolve_retrieval_profile_for_fragrance_query():
     assert profile["confidence"] in {"high", "medium"}
 
 
+def test_resolve_retrieval_profile_for_brand_query_without_category():
+    profile = agent_api._resolve_retrieval_profile(
+        query_text="tom ford",
+        category_text=None,
+        profile_hint=None,
+    )
+    assert profile["id"] == "brand_broad"
+    assert profile["reason"] in {"brand_keyword_match", "explicit_profile_hint"}
+
+
+def test_resolve_retrieval_profile_for_brand_query_with_category():
+    profile = agent_api._resolve_retrieval_profile(
+        query_text="dior perfume",
+        category_text=None,
+        profile_hint=None,
+    )
+    assert profile["id"] == "fragrance_strict"
+
+
 def test_resolve_retrieval_profile_respects_hint():
     profile = agent_api._resolve_retrieval_profile(
         query_text="anything",

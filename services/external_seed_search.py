@@ -197,12 +197,21 @@ async def fetch_external_seed_rows(
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :limit OFFSET :offset
                 """
+    count_sql = f"""
+                SELECT COUNT(*) AS total_count
+                FROM external_product_seeds
+                WHERE {" AND ".join(where)}
+                """
+    count_values: Dict[str, Any] = {
+        k: v for k, v in values.items() if k not in {"limit", "offset"}
+    }
     timeout_seconds = max(0.05, float(query_timeout_seconds or 0.35))
     timeout_ms = max(50, int(timeout_seconds * 1000))
 
     started = time.perf_counter()
     try:
         rows = None
+        total_count = 0
         if (
             _database_supports_statement_timeout(database)
             and hasattr(database, "transaction")
@@ -212,10 +221,19 @@ async def fetch_external_seed_rows(
                 async with database.transaction():
                     await database.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
                     rows = await database.fetch_all(query_sql, values)
+                    try:
+                        count_row = await database.fetch_one(count_sql, count_values)
+                        total_count = int(
+                            (count_row.get("total_count") if isinstance(count_row, dict) else dict(count_row).get("total_count"))
+                            or 0
+                        )
+                    except Exception:
+                        total_count = len(rows or [])
             except Exception as exc:
                 if _is_missing_external_seed_table(exc):
                     return {
                         "rows": [],
+                        "total_count": 0,
                         "query_ms": int((time.perf_counter() - started) * 1000),
                         "query_timeout": False,
                         "table_missing": True,
@@ -223,6 +241,7 @@ async def fetch_external_seed_rows(
                 if _is_external_seed_query_timeout(exc):
                     return {
                         "rows": [],
+                        "total_count": 0,
                         "query_ms": int((time.perf_counter() - started) * 1000),
                         "query_timeout": True,
                         "table_missing": False,
@@ -231,13 +250,46 @@ async def fetch_external_seed_rows(
                     database.fetch_all(query_sql, values),
                     timeout=timeout_seconds,
                 )
+                try:
+                    count_row = await asyncio.wait_for(
+                        database.fetch_one(count_sql, count_values),
+                        timeout=timeout_seconds,
+                    )
+                    total_count = int(
+                        (
+                            count_row.get("total_count")
+                            if isinstance(count_row, dict)
+                            else dict(count_row).get("total_count")
+                        )
+                        or 0
+                    )
+                except Exception:
+                    total_count = len(rows or [])
         else:
             rows = await asyncio.wait_for(
                 database.fetch_all(query_sql, values),
                 timeout=timeout_seconds,
             )
+            try:
+                count_row = await asyncio.wait_for(
+                    database.fetch_one(count_sql, count_values),
+                    timeout=timeout_seconds,
+                )
+                total_count = int(
+                    (
+                        count_row.get("total_count")
+                        if isinstance(count_row, dict)
+                        else dict(count_row).get("total_count")
+                    )
+                    or 0
+                )
+            except Exception:
+                total_count = len(rows or [])
+        if total_count <= 0:
+            total_count = len(rows or [])
         return {
             "rows": [dict(row) for row in (rows or [])],
+            "total_count": total_count,
             "query_ms": int((time.perf_counter() - started) * 1000),
             "query_timeout": False,
             "table_missing": False,
@@ -245,6 +297,7 @@ async def fetch_external_seed_rows(
     except asyncio.TimeoutError:
         return {
             "rows": [],
+            "total_count": 0,
             "query_ms": int((time.perf_counter() - started) * 1000),
             "query_timeout": True,
             "table_missing": False,
@@ -253,6 +306,7 @@ async def fetch_external_seed_rows(
         if _is_missing_external_seed_table(exc):
             return {
                 "rows": [],
+                "total_count": 0,
                 "query_ms": int((time.perf_counter() - started) * 1000),
                 "query_timeout": False,
                 "table_missing": True,
@@ -260,6 +314,7 @@ async def fetch_external_seed_rows(
         if _is_external_seed_query_timeout(exc):
             return {
                 "rows": [],
+                "total_count": 0,
                 "query_ms": int((time.perf_counter() - started) * 1000),
                 "query_timeout": True,
                 "table_missing": False,
