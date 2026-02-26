@@ -129,6 +129,21 @@ _CATALOG_BEAUTY_KEYWORDS = (
     "parfum",
     "fragrance",
 )
+_LINGERIE_QUERY_KEYWORDS = (
+    "lingerie",
+    "underwear",
+    "under wear",
+    "bra",
+    "bras",
+    "panties",
+    "panty",
+    "brief",
+    "briefs",
+    "thong",
+    "bralette",
+    "intimates",
+    "sleepwear",
+)
 def _get_order_create_lock(key: str) -> asyncio.Lock:
     lock = _ORDER_CREATE_LOCKS.get(key)
     if lock is None:
@@ -220,6 +235,11 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _is_lingerie_query(query_text: Optional[str], category_text: Optional[str]) -> bool:
+    haystack = f"{str(query_text or '').lower()} {str(category_text or '').lower()}"
+    return any(keyword in haystack for keyword in _LINGERIE_QUERY_KEYWORDS)
 
 
 AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED = _env_bool(
@@ -335,6 +355,46 @@ AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT = int(
         "AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT",
         300.0,
         min_value=50.0,
+        max_value=2000.0,
+    )
+)
+AGENT_SEARCH_PER_MERCHANT_LIMIT_BASE = int(
+    _env_float(
+        "AGENT_SEARCH_PER_MERCHANT_LIMIT_BASE",
+        96.0,
+        min_value=24.0,
+        max_value=2000.0,
+    )
+)
+AGENT_SEARCH_PER_MERCHANT_LIMIT_LINGERIE = int(
+    _env_float(
+        "AGENT_SEARCH_PER_MERCHANT_LIMIT_LINGERIE",
+        240.0,
+        min_value=24.0,
+        max_value=5000.0,
+    )
+)
+AGENT_SEARCH_PER_MERCHANT_LIMIT_MAX = int(
+    _env_float(
+        "AGENT_SEARCH_PER_MERCHANT_LIMIT_MAX",
+        500.0,
+        min_value=50.0,
+        max_value=5000.0,
+    )
+)
+AGENT_SEARCH_PER_MERCHANT_LIMIT_LARGE_SCOPE_THRESHOLD = int(
+    _env_float(
+        "AGENT_SEARCH_PER_MERCHANT_LIMIT_LARGE_SCOPE_THRESHOLD",
+        40.0,
+        min_value=10.0,
+        max_value=500.0,
+    )
+)
+AGENT_SEARCH_PER_MERCHANT_LIMIT_LARGE_SCOPE_CAP = int(
+    _env_float(
+        "AGENT_SEARCH_PER_MERCHANT_LIMIT_LARGE_SCOPE_CAP",
+        160.0,
+        min_value=24.0,
         max_value=2000.0,
     )
 )
@@ -2672,7 +2732,31 @@ async def agent_search_products(
         fetch_concurrency = max(1, min(32, fetch_concurrency))
         fetch_sem = asyncio.Semaphore(fetch_concurrency)
 
-        per_merchant_limit = min(50, max(10, int(limit or 20)))
+        requested_limit = max(1, int(limit or 20))
+        lingerie_query = _is_lingerie_query(normalized_query, normalized_category)
+        per_merchant_limit_max = max(
+            AGENT_SEARCH_PER_MERCHANT_LIMIT_MAX,
+            AGENT_SEARCH_PER_MERCHANT_LIMIT_BASE,
+            AGENT_SEARCH_PER_MERCHANT_LIMIT_LINGERIE,
+        )
+        per_merchant_limit_target = max(
+            requested_limit * 4,
+            AGENT_SEARCH_PER_MERCHANT_LIMIT_BASE,
+        )
+        if lingerie_query:
+            per_merchant_limit_target = max(
+                per_merchant_limit_target,
+                AGENT_SEARCH_PER_MERCHANT_LIMIT_LINGERIE,
+            )
+        if len(merchants_to_search) > AGENT_SEARCH_PER_MERCHANT_LIMIT_LARGE_SCOPE_THRESHOLD:
+            per_merchant_limit_target = min(
+                per_merchant_limit_target,
+                AGENT_SEARCH_PER_MERCHANT_LIMIT_LARGE_SCOPE_CAP,
+            )
+        per_merchant_limit = min(
+            per_merchant_limit_max,
+            max(10, int(per_merchant_limit_target)),
+        )
 
         async def _fetch_products_for_merchant(mid: str) -> List[Dict[str, Any]]:
             async with fetch_sem:
@@ -2880,6 +2964,11 @@ async def agent_search_products(
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "source_breakdown": source_breakdown,
+                    "search_window": {
+                        "per_merchant_limit": per_merchant_limit,
+                        "merchants_searched": len(merchants_to_search),
+                        "candidate_pool_size": len(browse_candidates),
+                    },
                     "route_health": _build_route_health(
                         primary_path_used="cross_merchant_browse_standard",
                         primary_latency_ms=latency_ms,
@@ -3245,6 +3334,11 @@ async def agent_search_products(
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
                 "source_breakdown": source_breakdown,
+                "search_window": {
+                    "per_merchant_limit": per_merchant_limit,
+                    "merchants_searched": len(merchants_to_search),
+                    "candidate_pool_size": len(ranked_candidates),
+                },
                 "route_health": _build_route_health(
                     primary_path_used="cross_merchant_search_standard",
                     primary_latency_ms=latency_ms,
