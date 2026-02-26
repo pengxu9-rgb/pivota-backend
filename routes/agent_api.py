@@ -2224,7 +2224,7 @@ async def agent_search_products(
                 pass
 
         normalized_seed_strategy = str(external_seed_strategy or "legacy").strip().lower()
-        if normalized_seed_strategy not in {"legacy", "supplement_internal_first"}:
+        if normalized_seed_strategy not in {"legacy", "supplement_internal_first", "unified_relevance"}:
             normalized_seed_strategy = "legacy"
         # Defensive normalization: this handler is also called directly by
         # other routes (not only via FastAPI parameter parsing).
@@ -2412,6 +2412,9 @@ async def agent_search_products(
                         "catalog_surface": normalized_catalog_surface,
                         "reason_code": "ok" if page_items else "no_candidates",
                         "latency_ms": latency_ms,
+                        "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+                        "external_seed_inclusion_reason": None,
+                        "external_seed_skip_reason": "browse_fastpath_no_external_seed",
                         "source_breakdown": {
                             "internal_count": len(page_items),
                             "external_seed_count": 0,
@@ -2513,16 +2516,36 @@ async def agent_search_products(
             paginated_products = list(fast_result["products"])
             total = int(fast_result["total"] or 0)
             source_breakdown = dict(fast_result["source_breakdown"] or {})
+            external_seed_inclusion_reason: Optional[str] = None
+            external_seed_skip_reason: Optional[str] = None
 
             fast_seed_stage_started = time.perf_counter()
+            strategy_requires_supplement = normalized_seed_strategy in {
+                "supplement_internal_first",
+                "unified_relevance",
+            }
             should_supplement_external_seed = (
                 allow_external_seed
-                and normalized_seed_strategy == "supplement_internal_first"
+                and strategy_requires_supplement
                 and merchant_id != EXTERNAL_SEED_MERCHANT_ID
                 and (merchant_id is None and not merchant_ids)
-                and len(paginated_products) < limit
+                and (
+                    (
+                        normalized_seed_strategy == "supplement_internal_first"
+                        and len(paginated_products) < limit
+                    )
+                    or (
+                        normalized_seed_strategy == "unified_relevance"
+                        and bool(normalized_query)
+                    )
+                )
             )
             if should_supplement_external_seed:
+                external_seed_inclusion_reason = (
+                    "unified_relevance_query_non_empty"
+                    if normalized_seed_strategy == "unified_relevance"
+                    else "underfill_supplement"
+                )
                 try:
                     ext_limit = min(40, max(20, int(limit or 20) * 2))
                     seed_metrics: Dict[str, Any] = {}
@@ -2576,36 +2599,55 @@ async def agent_search_products(
                         if len(paginated_products) + len(to_append) >= limit:
                             break
                     if to_append:
-                        paginated_products.extend(to_append)
+                        if normalized_seed_strategy == "unified_relevance":
+                            merged_products = paginated_products + to_append
+                            merged_products.sort(
+                                key=lambda p: float(
+                                    p.get("ranking_score", p.get("relevance_score", 0.0)) or 0.0
+                                ),
+                                reverse=True,
+                            )
+                            paginated_products = merged_products[:limit]
+                        else:
+                            paginated_products.extend(to_append)
                         source_breakdown["external_seed_count"] = int(source_breakdown.get("external_seed_count", 0) or 0) + len(to_append)
                         source_breakdown["internal_count"] = max(
                             0,
                             len(paginated_products) - int(source_breakdown.get("external_seed_count", 0) or 0),
                         )
-                        total = max(total, len(paginated_products))
+                        total = max(total, int(offset or 0) + len(paginated_products))
+                    else:
+                        external_seed_skip_reason = "no_external_candidates"
                 except Exception:
                     _set_external_seed_skip_reason(
                         external_seed_health=external_seed_health,
                         reason="seed_loader_error",
                     )
+                    external_seed_skip_reason = "seed_loader_error"
                     logger.debug("agent_search_products fast mode external seed supplement failed", exc_info=True)
             else:
                 if not allow_external_seed:
                     reason = "external_seed_disabled"
-                elif normalized_seed_strategy != "supplement_internal_first":
-                    reason = "strategy_not_supplement_internal_first"
+                elif not strategy_requires_supplement:
+                    reason = "strategy_not_supported"
                 elif merchant_id == EXTERNAL_SEED_MERCHANT_ID:
                     reason = "merchant_scope_external_seed_only"
                 elif not (merchant_id is None and not merchant_ids):
                     reason = "non_cross_merchant_scope"
-                elif len(paginated_products) >= limit:
+                elif normalized_seed_strategy == "supplement_internal_first" and len(paginated_products) >= limit:
                     reason = "page_already_full"
+                elif normalized_seed_strategy == "unified_relevance" and not normalized_query:
+                    reason = "query_empty_for_unified"
                 else:
                     reason = "not_applicable"
+                external_seed_skip_reason = reason
                 _set_external_seed_skip_reason(
                     external_seed_health=external_seed_health,
                     reason=reason,
                 )
+            if not external_seed_skip_reason:
+                health_reason = str(external_seed_health.get("external_seed_skip_reason") or "").strip()
+                external_seed_skip_reason = health_reason or None
             search_stage_timings["external_seed_ms"] = max(
                 0, int((time.perf_counter() - fast_seed_stage_started) * 1000)
             )
@@ -2669,6 +2711,9 @@ async def agent_search_products(
                     "catalog_surface": normalized_catalog_surface,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
+                    "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+                    "external_seed_inclusion_reason": external_seed_inclusion_reason,
+                    "external_seed_skip_reason": external_seed_skip_reason,
                     "source_breakdown": source_breakdown,
                     "external_seed_returned_count": int(
                         source_breakdown.get("external_seed_count", 0) or 0
@@ -2963,6 +3008,9 @@ async def agent_search_products(
                     "catalog_surface": normalized_catalog_surface,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
+                    "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+                    "external_seed_inclusion_reason": None,
+                    "external_seed_skip_reason": str(external_seed_health.get("external_seed_skip_reason") or "").strip() or None,
                     "source_breakdown": source_breakdown,
                     "search_window": {
                         "per_merchant_limit": per_merchant_limit,
@@ -3075,9 +3123,8 @@ async def agent_search_products(
                 if not platform_product_id:
                     continue
                 try:
-                    product["ranking_score"] = (
-                        float(product.get("relevance_score", 0.0)) * 0.8
-                    )
+                    external_score_factor = 1.0 if normalized_seed_strategy == "unified_relevance" else 0.8
+                    product["ranking_score"] = float(product.get("relevance_score", 0.0)) * external_score_factor
                 except Exception:
                     product["ranking_score"] = product.get("relevance_score", 0.0)
                 product["ranking_features"] = {"source": "external_seed"}
@@ -3333,6 +3380,13 @@ async def agent_search_products(
                 "catalog_surface": normalized_catalog_surface,
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
+                "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
+                "external_seed_inclusion_reason": (
+                    "cross_merchant_unified_relevance"
+                    if allow_external_seed and normalized_seed_strategy == "unified_relevance" and normalized_query
+                    else None
+                ),
+                "external_seed_skip_reason": str(external_seed_health.get("external_seed_skip_reason") or "").strip() or None,
                 "source_breakdown": source_breakdown,
                 "search_window": {
                     "per_merchant_limit": per_merchant_limit,
