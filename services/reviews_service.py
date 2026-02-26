@@ -790,24 +790,59 @@ async def get_review_summary_for_sku(
         f"""
         SELECT r.id, r.merchant_id, r.rating,
                COALESCE(NULLIF(r.body_redacted, ''), r.body) AS body_effective,
-               r.created_at
+               r.created_at,
+               r.media_count
         FROM product_reviews r
         WHERE r.status = 'active' AND ({scope_where_sql})
         ORDER BY r.created_at DESC, r.id DESC
-        LIMIT 3
+        LIMIT 6
         """,
         scope_params,
     )
+    preview_review_ids = [int(_row_get(pr, "id") or 0) for pr in preview_rows if int(_row_get(pr, "id") or 0) > 0]
+    preview_media_by_review: Dict[int, Dict[str, Any]] = {}
+    if preview_review_ids:
+        preview_media_rows = await database.fetch_all(
+            media_assets.select()
+            .where(
+                (media_assets.c.review_id.in_(preview_review_ids))
+                & (media_assets.c.status == "active")
+            )
+            .order_by(media_assets.c.review_id.asc(), media_assets.c.id.asc())
+        )
+        for mr in preview_media_rows:
+            rid = int(_row_get(mr, "review_id") or 0)
+            if rid <= 0 or rid in preview_media_by_review:
+                continue
+            mid = int(_row_get(mr, "id") or 0)
+            if mid <= 0:
+                continue
+            pid = _as_text(_row_get(mr, "public_id"))
+            signed_url = _signed_media_url(public_id=pid or None, media_id=mid)
+            if not signed_url:
+                continue
+            preview_media_by_review[rid] = {
+                "type": _as_text(_row_get(mr, "type")) or "image",
+                "url": signed_url,
+            }
     preview_items: List[Dict[str, Any]] = []
     for pr in preview_rows:
+        rid = int(pr["id"])
+        media_cnt = int(_row_get(pr, "media_count") or 0)
+        item = {
+            "review_id": rid,
+            "merchant_id": str(pr["merchant_id"]),
+            "rating": int(pr["rating"] or 0),
+            "text_snippet": _safe_snippet(pr["body_effective"]),
+            "created_at": _as_iso_datetime(_row_get(pr, "created_at")),
+            "has_media": media_cnt > 0,
+            "media_count": media_cnt,
+        }
+        preview_media = preview_media_by_review.get(rid)
+        if preview_media:
+            item["media"] = [preview_media]
         preview_items.append(
-            {
-                "review_id": int(pr["id"]),
-                "merchant_id": str(pr["merchant_id"]),
-                "rating": int(pr["rating"] or 0),
-                "text_snippet": _safe_snippet(pr["body_effective"]),
-                "created_at": _as_iso_datetime(_row_get(pr, "created_at")),
-            }
+            item
         )
 
     return {
