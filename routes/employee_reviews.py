@@ -896,8 +896,9 @@ async def employee_list_reviews_for_moderation(
     status: Optional[str] = None,
     source_type: Optional[str] = None,
     source_system: Optional[str] = None,
+    review_id: Optional[int] = None,
     order_id: Optional[str] = None,
-    has_pending_media: Optional[bool] = Query(default=None),
+    has_pending_media: Optional[bool] = None,
     limit: int = 50,
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
 ) -> Dict[str, Any]:
@@ -916,6 +917,9 @@ async def employee_list_reviews_for_moderation(
     if source_system:
         where.append("source_system = :ssys")
         params["ssys"] = str(source_system)
+    if review_id is not None:
+        where.append("product_reviews.id = :rid")
+        params["rid"] = int(review_id)
     order_id_norm = str(order_id or "").strip()
     if order_id_norm:
         where.append("COALESCE(NULLIF(product_reviews.risk_flags ->> 'order_id', ''), bind.order_id) = :oid")

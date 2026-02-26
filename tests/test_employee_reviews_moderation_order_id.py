@@ -116,3 +116,82 @@ async def test_moderation_list_supports_has_pending_media_filter(monkeypatch: py
     assert payload == {"items": [], "limit": 50}
     query = str(captured["query"])
     assert "COALESCE(media_stats.pending_media_count, 0) > 0" in query
+
+
+@pytest.mark.asyncio
+async def test_moderation_list_supports_review_id_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_fetch_all(query: str, values=None):
+        captured["query"] = str(query)
+        captured["values"] = dict(values or {})
+        return [
+            {
+                "id": 9306,
+                "merchant_id": "merch_efbc46b4619cfbdf",
+                "platform": "shopify",
+                "platform_product_id": "9859803873608",
+                "variant_id": None,
+                "group_id": None,
+                "source_type": "native",
+                "source_system": "accounts",
+                "external_review_id": None,
+                "verification": "verified_purchase",
+                "rating": 5,
+                "title": "Review title",
+                "body_effective": "Review body",
+                "media_count": 0,
+                "pending_media_count": 1,
+                "active_media_count": 0,
+                "total_media_count": 1,
+                "status": "active",
+                "created_at": None,
+                "updated_at": None,
+                "order_id": "ORD_5FC726A48A2565BF",
+            }
+        ]
+
+    monkeypatch.setattr(employee_reviews_routes.database, "fetch_all", fake_fetch_all)
+
+    payload = await employee_reviews_routes.employee_list_reviews_for_moderation(
+        review_id=9306,
+        actor={"employee_id": "emp_test"},
+    )
+
+    assert payload["limit"] == 50
+    assert len(payload["items"]) == 1
+    assert payload["items"][0]["id"] == 9306
+
+    values = captured["values"]
+    assert isinstance(values, dict)
+    assert values.get("rid") == 9306
+
+    query = str(captured["query"])
+    assert "product_reviews.id = :rid" in query
+
+
+@pytest.mark.asyncio
+async def test_moderation_list_supports_review_id_with_pending_media_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_fetch_all(query: str, values=None):
+        captured["query"] = str(query)
+        captured["values"] = dict(values or {})
+        return []
+
+    monkeypatch.setattr(employee_reviews_routes.database, "fetch_all", fake_fetch_all)
+
+    payload = await employee_reviews_routes.employee_list_reviews_for_moderation(
+        review_id=9306,
+        has_pending_media=True,
+        actor={"employee_id": "emp_test"},
+    )
+
+    assert payload == {"items": [], "limit": 50}
+    values = captured["values"]
+    assert isinstance(values, dict)
+    assert values.get("rid") == 9306
+
+    query = str(captured["query"])
+    assert "product_reviews.id = :rid" in query
+    assert "COALESCE(media_stats.pending_media_count, 0) > 0" in query
