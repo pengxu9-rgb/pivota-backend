@@ -6,6 +6,7 @@ from fastapi import HTTPException
 
 
 _ASYNC_PG_BUSY_SUBSTR = "another operation is in progress"
+_ASYNC_PG_POOL_CLOSING_SUBSTR = "pool is closing"
 
 
 def is_asyncpg_busy_error(err: BaseException) -> bool:
@@ -18,7 +19,10 @@ def is_asyncpg_busy_error(err: BaseException) -> bool:
     cur: Optional[BaseException] = err
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-        if _ASYNC_PG_BUSY_SUBSTR in str(cur):
+        cur_text = str(cur).lower()
+        if _ASYNC_PG_BUSY_SUBSTR in cur_text:
+            return True
+        if _ASYNC_PG_POOL_CLOSING_SUBSTR in cur_text:
             return True
         cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
     return False
@@ -33,4 +37,3 @@ def db_busy_http_exception(*, retry_after_seconds: int = 1) -> HTTPException:
             "message": "Temporary database busy. Please retry shortly.",
         },
     )
-

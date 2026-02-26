@@ -53,6 +53,7 @@ from db.accounts import (
 )
 from db.orders import orders as orders_table
 from utils.auth import create_access_token, decode_token, hash_password, verify_password
+from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from services.ugc_capabilities_service import (
     UgcSubject,
     get_review_slot_summary,
@@ -1097,6 +1098,8 @@ async def start_login(request: Request, body: LoginStartRequest):
             "SMS login channel is not supported yet",
         )
 
+    await _ensure_database_connected()
+
     email = str(body.email)
     norm = normalize_email(email)
     ip = _get_client_ip(request)
@@ -1148,19 +1151,38 @@ async def start_login(request: Request, body: LoginStartRequest):
 
     expires_at = now + timedelta(minutes=10)
 
-    await database.execute(
-        shop_login_otps.insert().values(
-            channel="email",
-            email_normalized=norm,
-            phone=None,
-            otp_code=otp_code,
-            ip_address=ip,
-            created_at=now,
-            expires_at=expires_at,
-            attempt_count=0,
-            max_attempts=5,
-        )
+    otp_insert_values = shop_login_otps.insert().values(
+        channel="email",
+        email_normalized=norm,
+        phone=None,
+        otp_code=otp_code,
+        ip_address=ip,
+        created_at=now,
+        expires_at=expires_at,
+        attempt_count=0,
+        max_attempts=5,
     )
+    try:
+        await database.execute(otp_insert_values)
+    except Exception as exc:
+        if is_asyncpg_busy_error(exc):
+            logger.warning(
+                "[AccountsAuth] transient DB state during OTP insert; retrying once for %s",
+                _mask_email(email),
+            )
+            await _ensure_database_connected()
+            try:
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+            try:
+                await database.execute(otp_insert_values)
+            except Exception as exc2:
+                if is_asyncpg_busy_error(exc2):
+                    raise db_busy_http_exception()
+                raise
+        else:
+            raise
 
     # Log OTP for observability (avoid PII in logs)
     logger.info("[AccountsAuth] OTP generated for %s", _mask_email(email))
