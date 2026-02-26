@@ -9,6 +9,7 @@ from datetime import datetime
 import httpx
 import logging
 import time
+import re
 from urllib.parse import urlparse, parse_qs
 
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
@@ -17,6 +18,42 @@ logger = logging.getLogger(__name__)
 
 _SHOP_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
 _SHOP_CURRENCY_TTL_SECONDS = 6 * 60 * 60
+SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE = "__SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE__"
+
+
+def extract_shopify_next_page_token(link_header: str) -> Tuple[Optional[str], bool, Optional[str]]:
+    """
+    Parse Shopify Link header and extract `page_info` from rel=next URL.
+
+    Returns:
+      (next_page_token, has_next, parse_error)
+    """
+    header = str(link_header or "").strip()
+    if not header:
+        return None, False, None
+
+    parts = [part.strip() for part in header.split(",") if part.strip()]
+    has_next = False
+    parse_error: Optional[str] = None
+    for part in parts:
+        if re.search(r'rel\s*=\s*"next"|rel\s*=\s*next', part, flags=re.IGNORECASE):
+            has_next = True
+            match = re.search(r"<([^>]+)>", part)
+            if not match:
+                parse_error = "next_link_missing_url_brackets"
+                continue
+            url_part = (match.group(1) or "").strip()
+            if not url_part:
+                parse_error = "next_link_empty_url"
+                continue
+            parsed = urlparse(url_part)
+            query = parse_qs(parsed.query)
+            token = (query.get("page_info", [None])[0] or "").strip()
+            if token:
+                return token, True, None
+            parse_error = "next_link_missing_page_info"
+
+    return None, has_next, parse_error
 
 
 def _get_cached_shop_currency(shop_domain: str) -> Optional[str]:
@@ -226,31 +263,20 @@ class ShopifyProductAdapter:
                 for sp in shopify_products
             ]
             
-            # 提取分页信息（Shopify 使用 Link header）
             next_page_token = None
-            link_header = response.headers.get("Link", "")
-            if "rel=\"next\"" in link_header:
-                try:
-                    # Link header example:
-                    # <https://shop.myshopify.com/admin/api/2024-07/products.json?page_info=abc&limit=250>; rel="next"
-                    parts = [p.strip() for p in link_header.split(",")]
-                    for part in parts:
-                        if 'rel="next"' in part:
-                            start = part.find("<")
-                            end = part.find(">")
-                            if start != -1 and end != -1:
-                                url_part = part[start + 1 : end]
-                                parsed = urlparse(url_part)
-                                qs = parse_qs(parsed.query)
-                                token = qs.get("page_info", [None])[0]
-                                if token:
-                                    next_page_token = token
-                                    break
-                    # Fallback: if parsing fails but rel=next exists, keep a simple flag
-                    if not next_page_token:
-                        next_page_token = "has_next"
-                except Exception:
-                    next_page_token = "has_next"
+            next_token, has_next, parse_error = extract_shopify_next_page_token(
+                response.headers.get("Link", ""),
+            )
+            if next_token:
+                next_page_token = next_token
+            elif has_next:
+                next_page_token = SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE
+                logger.warning(
+                    "Shopify Link header contains rel=next but page_info is unavailable: merchant_id=%s parse_error=%s link=%s",
+                    merchant_id,
+                    parse_error,
+                    response.headers.get("Link", ""),
+                )
             
             logger.info(f"✅ Fetched {len(standard_products)} products from Shopify for merchant {merchant_id}")
             return standard_products, next_page_token, None

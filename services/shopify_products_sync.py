@@ -15,7 +15,10 @@ from typing import Any, Dict, Optional
 
 from db.database import database
 from db.products import upsert_product_cache
-from adapters.product_adapters import fetch_merchant_products
+from adapters.product_adapters import (
+    SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE,
+    fetch_merchant_products,
+)
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 
 
@@ -103,7 +106,10 @@ async def sync_shopify_products_for_merchant(
     upserted = 0
     pages = 0
     page_token: Optional[str] = None
+    next_page_token: Optional[str] = None
     last_error: Optional[str] = None
+    truncated = False
+    truncated_reason: Optional[str] = None
 
     # Fetch in pages to avoid huge payloads and to stay within timeouts.
     while fetched < limit and pages < max_pages:
@@ -126,8 +132,15 @@ async def sync_shopify_products_for_merchant(
                 raise ShopifyProductsSyncAuthError(error)
             raise ShopifyProductsSyncError(error)
 
+        if next_token == SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE:
+            truncated = True
+            truncated_reason = "next_page_token_unparseable"
+            next_page_token = None
+            next_token = None
+
         if not products:
             page_token = next_token
+            next_page_token = next_token
             if not next_token:
                 break
             continue
@@ -157,8 +170,16 @@ async def sync_shopify_products_for_merchant(
 
         fetched += len(products)
         page_token = next_token
+        next_page_token = next_token
         if not page_token:
             break
+
+    if not truncated and fetched >= limit and page_token:
+        truncated = True
+        truncated_reason = "limit_reached_with_next_page"
+    if not truncated and pages >= max_pages and page_token:
+        truncated = True
+        truncated_reason = "max_pages_reached_with_next_page"
 
     return {
         "merchantId": merchant_id,
@@ -166,7 +187,10 @@ async def sync_shopify_products_for_merchant(
         "productsFetched": fetched,
         "productsUpserted": upserted,
         "pagesFetched": pages,
-        "nextPageToken": page_token,
+        "nextPageToken": next_page_token,
+        "nextPageTokenPresent": bool(next_page_token),
+        "truncated": truncated,
+        "truncatedReason": truncated_reason,
         "ttlSeconds": ttl_seconds,
         "limit": limit,
         "perPage": per_page,
