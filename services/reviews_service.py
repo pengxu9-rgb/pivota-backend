@@ -2632,8 +2632,6 @@ def _reviews_media_s3_client():
         if endpoint_url and not (access_key_id and secret_access_key):
             access_key_id = _first_env("AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", default=access_key_id)
             secret_access_key = _first_env("AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", default=secret_access_key)
-            if not is_r2 and not session_token:
-                session_token = _first_env("AWS_SESSION_TOKEN", default="") or None
 
         if is_r2:
             # Cloudflare R2 rejects session token based signing.
