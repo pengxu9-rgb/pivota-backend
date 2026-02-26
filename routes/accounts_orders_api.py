@@ -55,9 +55,9 @@ from db.orders import orders as orders_table
 from utils.auth import create_access_token, decode_token, hash_password, verify_password
 from services.ugc_capabilities_service import (
     UgcSubject,
+    get_review_slot_summary,
     get_user_review_for_subject,
     is_question_rate_limited,
-    user_has_purchased_subject,
 )
 
 
@@ -1537,10 +1537,14 @@ async def get_pdp_v2_personalization(
         product_group_id=pgid,
     )
 
-    is_purchaser = await user_has_purchased_subject(
+    slot_summary = await get_review_slot_summary(
         email_normalized=principal.email_normalized,
+        user_id=principal.user_id,
         subject=subject,
     )
+    total_paid_orders = int(slot_summary.get("total_paid_orders") or 0)
+    available_slots = int(slot_summary.get("available_slots") or 0)
+    is_purchaser = total_paid_orders > 0
     review_info = await get_user_review_for_subject(
         user_id=principal.user_id,
         subject_type=subject.subject_type,
@@ -1564,15 +1568,18 @@ async def get_pdp_v2_personalization(
     # - If a user already left an unverified review, allow a one-time upgrade after purchase.
     can_upgrade_review = bool(is_purchaser) and bool(review_info) and not bool(review_is_verified)
     can_add_rating = bool(is_purchaser) and bool(review_info) and bool(review_is_verified) and not bool(review_has_rating)
-    can_write_review = (not bool(review_info)) or can_upgrade_review or can_add_rating
-    can_rate_review = bool(is_purchaser) and ((not bool(review_info)) or can_upgrade_review or can_add_rating)
+    can_create_new_for_unreviewed_order = available_slots > 0
+    can_write_review = can_create_new_for_unreviewed_order or can_upgrade_review or can_add_rating
+    can_rate_review = bool(is_purchaser) and (
+        can_create_new_for_unreviewed_order or can_upgrade_review or can_add_rating
+    )
     can_ask = not bool(question_rate_limited)
 
     reasons: Dict[str, str] = {}
     if not can_upload:
         reasons["upload"] = "NOT_PURCHASER"
     if not can_write_review:
-        reasons["review"] = "ALREADY_REVIEWED"
+        reasons["review"] = "NOT_PURCHASER" if not is_purchaser else "ALREADY_REVIEWED"
     if not can_rate_review:
         reasons["rating"] = "NOT_VERIFIED_FOR_RATING" if not is_purchaser else "ALREADY_REVIEWED"
     if not can_ask:
@@ -1586,6 +1593,12 @@ async def get_pdp_v2_personalization(
             "canAskQuestion": can_ask,
             "reasons": reasons,
             "review": review_info,
+            "reviewSlots": {
+                "totalPaidOrders": total_paid_orders,
+                "usedOrders": int(slot_summary.get("used_slots") or 0),
+                "availableOrders": available_slots,
+                "legacyBindings": int(slot_summary.get("legacy_binding_count") or 0),
+            },
         }
     }
 
@@ -1618,10 +1631,14 @@ async def get_review_eligibility(
         product_group_id=pgid,
     )
 
-    is_purchaser = await user_has_purchased_subject(
+    slot_summary = await get_review_slot_summary(
         email_normalized=principal.email_normalized,
+        user_id=principal.user_id,
         subject=subject,
     )
+    total_paid_orders = int(slot_summary.get("total_paid_orders") or 0)
+    available_slots = int(slot_summary.get("available_slots") or 0)
+    is_purchaser = total_paid_orders > 0
     review_info = await get_user_review_for_subject(
         user_id=principal.user_id,
         subject_type=subject.subject_type,
@@ -1633,21 +1650,39 @@ async def get_review_eligibility(
 
     can_upgrade_review = bool(is_purchaser) and bool(review_info) and not bool(review_is_verified)
     can_add_rating = bool(is_purchaser) and bool(review_info) and bool(review_is_verified) and not bool(review_has_rating)
-    eligible = (not bool(review_info)) or can_upgrade_review or can_add_rating
-    can_rate = bool(is_purchaser) and ((not bool(review_info)) or can_upgrade_review or can_add_rating)
+    can_create_new_for_unreviewed_order = available_slots > 0
+    eligible = can_create_new_for_unreviewed_order or can_upgrade_review or can_add_rating
+    can_rate = bool(is_purchaser) and (can_create_new_for_unreviewed_order or can_upgrade_review or can_add_rating)
 
     if not eligible:
+        reason = "NOT_PURCHASER" if not is_purchaser else "ALREADY_REVIEWED"
         return {
             "eligible": False,
-            "reason": "ALREADY_REVIEWED",
+            "reason": reason,
             "canRate": False,
+            "reviewSlots": {
+                "totalPaidOrders": total_paid_orders,
+                "usedOrders": int(slot_summary.get("used_slots") or 0),
+                "availableOrders": available_slots,
+                "legacyBindings": int(slot_summary.get("legacy_binding_count") or 0),
+            },
         }
 
-    action = "CREATE" if not review_info else ("UPGRADE" if can_upgrade_review else "ADD_RATING" if can_add_rating else "CREATE")
+    action = (
+        "CREATE"
+        if can_create_new_for_unreviewed_order
+        else ("UPGRADE" if can_upgrade_review else "ADD_RATING" if can_add_rating else "CREATE")
+    )
     out: Dict[str, Any] = {
         "eligible": True,
         "canRate": bool(can_rate),
         "action": action,
+        "reviewSlots": {
+            "totalPaidOrders": total_paid_orders,
+            "usedOrders": int(slot_summary.get("used_slots") or 0),
+            "availableOrders": available_slots,
+            "legacyBindings": int(slot_summary.get("legacy_binding_count") or 0),
+        },
     }
     if not can_rate:
         out["ratingReason"] = "NOT_VERIFIED_FOR_RATING"

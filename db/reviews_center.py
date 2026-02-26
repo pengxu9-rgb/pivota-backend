@@ -327,13 +327,23 @@ buyer_review_user_subject = Table(
     Column("user_id", String(128), nullable=False),
     Column("subject_type", String(32), nullable=False),
     Column("subject_id", Text, nullable=False),
+    Column("order_id", String(128), nullable=True),
     Column("review_id", _ID_TYPE, ForeignKey("product_reviews.id", ondelete="CASCADE"), nullable=False),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
-    UniqueConstraint("user_id", "subject_type", "subject_id", name="ux_buyer_review_user_subject"),
+    UniqueConstraint("user_id", "subject_type", "subject_id", "order_id", name="ux_buyer_review_user_subject_order"),
 )
 
 Index("idx_buyer_review_user_subject_user", buyer_review_user_subject.c.user_id)
 Index("idx_buyer_review_user_subject_subject", buyer_review_user_subject.c.subject_type, buyer_review_user_subject.c.subject_id)
+Index("idx_buyer_review_user_subject_order_id", buyer_review_user_subject.c.order_id)
+Index(
+    "ux_buyer_review_user_subject_legacy_null_order",
+    buyer_review_user_subject.c.user_id,
+    buyer_review_user_subject.c.subject_type,
+    buyer_review_user_subject.c.subject_id,
+    unique=True,
+    postgresql_where=buyer_review_user_subject.c.order_id.is_(None),
+)
 
 ugc_questions = Table(
     "ugc_questions",

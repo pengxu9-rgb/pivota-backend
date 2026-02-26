@@ -22,7 +22,7 @@ from services.buyer_reviews_service import (
     issue_submission_token,
 )
 from services.reviews_service import VARIANT_ID_SENTINEL, build_product_key, build_sku_key
-from services.ugc_capabilities_service import UgcSubject, bind_user_review_subject, has_user_reviewed_subject, user_has_purchased_subject
+from services.ugc_capabilities_service import UgcSubject, bind_user_review_subject, get_review_slot_summary
 
 
 router = APIRouter(prefix="/buyer/reviews/v1", tags=["Buyer Reviews"])
@@ -180,10 +180,15 @@ async def buyer_create_review_from_user(
             product_group_id=subject_group_id,
         )
 
-        is_purchaser = await user_has_purchased_subject(
+        slot_summary = await get_review_slot_summary(
             email_normalized=principal.email_normalized,
+            user_id=principal.user_id,
             subject=subject,
         )
+        paid_order_ids = list(slot_summary.get("paid_order_ids") or [])
+        is_purchaser = bool(paid_order_ids)
+        available_order_ids = list(slot_summary.get("available_order_ids") or [])
+        existing_bindings = list(slot_summary.get("bindings") or [])
 
         requested_rating = int(body.rating) if body.rating is not None else None
         title_text = (body.title or "").strip() or None
@@ -194,6 +199,8 @@ async def buyer_create_review_from_user(
 
         if requested_rating is not None and not is_purchaser:
             raise HTTPException(status_code=403, detail="NOT_VERIFIED_FOR_RATING")
+        if not is_purchaser:
+            raise HTTPException(status_code=403, detail="NOT_PURCHASER")
 
         subject_ref = body.subject
         merchant_id = str(subject_ref.merchant_id or "").strip()
@@ -223,25 +230,18 @@ async def buyer_create_review_from_user(
 
         now_dt = datetime.now(timezone.utc)
 
-        # Enforce per-user dedupe at the subject level.
-        # If an unverified review exists and the user has since purchased, allow a one-time upgrade.
-        existing_binding = await database.fetch_one(
-            buyer_review_user_subject.select().where(
-                (buyer_review_user_subject.c.user_id == principal.user_id)
-                & (buyer_review_user_subject.c.subject_type == subject_type)
-                & (buyer_review_user_subject.c.subject_id == subject_id)
-            )
-        )
-        if existing_binding:
+        # Backward compatibility: if a historical binding exists without order_id,
+        # preserve upgrade/add-rating behavior before allocating a new order slot.
+        for existing_binding in existing_bindings:
             try:
-                existing_review_id = int(existing_binding["review_id"])  # type: ignore[index]
+                existing_review_id = int((existing_binding or {}).get("review_id") or 0)
             except Exception:
                 existing_review_id = 0
+            if existing_review_id <= 0:
+                continue
 
-            existing_review = (
-                await database.fetch_one(product_reviews.select().where(product_reviews.c.id == existing_review_id))
-                if existing_review_id > 0
-                else None
+            existing_review = await database.fetch_one(
+                product_reviews.select().where(product_reviews.c.id == existing_review_id)
             )
             existing_verification = str(existing_review["verification"] if existing_review else "").strip().lower()
             existing_has_rating = False
@@ -251,7 +251,7 @@ async def buyer_create_review_from_user(
                 except Exception:
                     existing_has_rating = getattr(existing_review, "rating", None) is not None
 
-            if is_purchaser and existing_verification in {"unverified", ""}:
+            if existing_verification in {"unverified", ""}:
                 update_values: Dict[str, Any] = {
                     "verification": "verified_purchase",
                     "updated_at": now_dt,
@@ -278,8 +278,7 @@ async def buyer_create_review_from_user(
                 }
 
             if (
-                is_purchaser
-                and existing_verification in {"verified_purchase", "verified_buyer"}
+                existing_verification in {"verified_purchase", "verified_buyer"}
                 and (not existing_has_rating)
                 and requested_rating is not None
             ):
@@ -306,7 +305,9 @@ async def buyer_create_review_from_user(
                     "updated": True,
                 }
 
+        if not available_order_ids:
             raise HTTPException(status_code=409, detail="ALREADY_REVIEWED")
+        target_order_id = str(available_order_ids[0]).strip()
 
         review_id = await database.execute(
             product_reviews.insert().values(
@@ -321,7 +322,7 @@ async def buyer_create_review_from_user(
                 source_type="native",
                 source_system="accounts",
                 external_review_id=None,
-                dedupe_key=f"accounts|{principal.user_id}|{subject_type}|{subject_id}",
+                dedupe_key=f"accounts|{principal.user_id}|{subject_type}|{subject_id}|{target_order_id}",
                 verification="verified_purchase" if is_purchaser else "unverified",
                 rating=requested_rating if is_purchaser else None,
                 title=title_text,
@@ -332,6 +333,7 @@ async def buyer_create_review_from_user(
                     "accounts_user_id": principal.user_id,
                     "subject_type": subject_type,
                     "subject_id": subject_id,
+                    "order_id": target_order_id,
                 },
                 status="under_review",
                 created_at=now_dt,
@@ -345,6 +347,7 @@ async def buyer_create_review_from_user(
                 subject_type=subject_type,
                 subject_id=subject_id,
                 review_id=int(review_id),
+                order_id=target_order_id,
             )
         except HTTPException as e:
             if e.status_code == 409:
@@ -354,6 +357,7 @@ async def buyer_create_review_from_user(
                         (buyer_review_user_subject.c.user_id == principal.user_id)
                         & (buyer_review_user_subject.c.subject_type == subject_type)
                         & (buyer_review_user_subject.c.subject_id == subject_id)
+                        & (buyer_review_user_subject.c.order_id == target_order_id)
                     )
                 )
                 if existing:

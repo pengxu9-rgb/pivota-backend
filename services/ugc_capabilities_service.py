@@ -62,17 +62,50 @@ async def ensure_ugc_tables_exist() -> None:
                   user_id TEXT NOT NULL,
                   subject_type VARCHAR(32) NOT NULL,
                   subject_id TEXT NOT NULL,
+                  order_id TEXT NULL,
                   review_id BIGINT NOT NULL REFERENCES product_reviews(id) ON DELETE CASCADE,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                  CONSTRAINT ux_buyer_review_user_subject UNIQUE(user_id, subject_type, subject_id)
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_user
                   ON buyer_review_user_subject(user_id);
                 CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_subject
                   ON buyer_review_user_subject(subject_type, subject_id);
+                CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id
+                  ON buyer_review_user_subject(order_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order
+                  ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order
+                  ON buyer_review_user_subject(user_id, subject_type, subject_id)
+                  WHERE order_id IS NULL;
                 """
             )
         )
+    # Backward-compatible in-place hardening for environments with old schema.
+    try:
+        await database.execute(text("ALTER TABLE buyer_review_user_subject ADD COLUMN IF NOT EXISTS order_id TEXT"))
+        await database.execute(text("ALTER TABLE buyer_review_user_subject DROP CONSTRAINT IF EXISTS ux_buyer_review_user_subject"))
+        await database.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id "
+                "ON buyer_review_user_subject(order_id)"
+            )
+        )
+        await database.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order "
+                "ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id)"
+            )
+        )
+        await database.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order "
+                "ON buyer_review_user_subject(user_id, subject_type, subject_id) "
+                "WHERE order_id IS NULL"
+            )
+        )
+    except Exception:
+        # Best-effort only; callers can still proceed with degraded behavior.
+        pass
 
     try:
         await database.fetch_one(text("SELECT 1 FROM ugc_questions LIMIT 1"))
@@ -225,32 +258,60 @@ def _iter_candidate_group_ids(item: Dict[str, Any]) -> Iterable[str]:
             yield s
 
 
-async def user_has_purchased_subject(*, email_normalized: str, subject: UgcSubject) -> bool:
+def _normalize_order_id(value: Any) -> Optional[str]:
+    oid = str(value or "").strip()
+    return oid or None
+
+
+def _subject_group_id(subject: UgcSubject) -> str:
+    return str(subject.product_group_id or "").strip() or (
+        subject.subject_id if subject.subject_type == "product_group" else ""
+    )
+
+
+async def _subject_candidate_product_ids(subject: UgcSubject) -> Tuple[Set[str], str]:
+    product_ids: Set[str] = set()
+    if subject.product_id:
+        pid = str(subject.product_id).strip()
+        if pid:
+            product_ids.add(pid)
+
+    group_id = _subject_group_id(subject)
+    if group_id:
+        member_ids = await get_product_group_member_product_ids(group_id)
+        product_ids.update(member_ids)
+
+    sid = str(subject.subject_id).strip()
+    if sid:
+        # Fallback for deployments where order item only carries subject_id.
+        product_ids.add(sid)
+
+    return product_ids, group_id
+
+
+def _order_matches_subject(*, row: Dict[str, Any], product_ids: Set[str], group_id: str) -> bool:
+    items = _coerce_items(row.get("items"))
+    for it in items:
+        if group_id and any(gid == group_id for gid in _iter_candidate_group_ids(it)):
+            return True
+        if product_ids:
+            for pid in _iter_candidate_item_ids(it):
+                if pid in product_ids:
+                    return True
+    return False
+
+
+async def get_paid_order_ids_for_subject(*, email_normalized: str, subject: UgcSubject) -> List[str]:
     """
-    Returns whether the accounts user (by email) has at least one paid/completed order
-    containing a matching item for this subject.
+    Returns matched paid order ids for this subject, sorted by latest order first.
     """
     await _ensure_database_connected()
 
     email_norm = str(email_normalized or "").strip().lower()
     if not email_norm:
-        return False
+        return []
 
-    # Candidate product ids that can satisfy purchase. Start with explicit product_id (if any),
-    # and optionally include group members.
-    product_ids: Set[str] = set()
-    if subject.product_id:
-        product_ids.add(str(subject.product_id).strip())
-
-    group_id = str(subject.product_group_id or "").strip() or (
-        subject.subject_id if subject.subject_type == "product_group" else ""
-    )
-    if group_id:
-        member_ids = await get_product_group_member_product_ids(group_id)
-        product_ids.update(member_ids)
-
-    # Always include subject_id as a fallback match.
-    product_ids.add(str(subject.subject_id).strip())
+    product_ids, group_id = await _subject_candidate_product_ids(subject)
 
     query = (
         select(orders_table)
@@ -275,43 +336,145 @@ async def user_has_purchased_subject(*, email_normalized: str, subject: UgcSubje
     try:
         rows = await database.fetch_all(query)
     except Exception:
-        return False
+        return []
 
+    out: List[str] = []
+    seen: Set[str] = set()
     for r in rows:
         row = dict(r)
         if not _is_paid_order(row):
             continue
-        items = _coerce_items(row.get("items"))
-        for it in items:
-            if group_id:
-                if any(gid == group_id for gid in _iter_candidate_group_ids(it)):
-                    return True
-            if product_ids:
-                for pid in _iter_candidate_item_ids(it):
-                    if pid in product_ids:
-                        return True
+        oid = _normalize_order_id(row.get("order_id"))
+        if not oid or oid in seen:
+            continue
+        if _order_matches_subject(row=row, product_ids=product_ids, group_id=group_id):
+            out.append(oid)
+            seen.add(oid)
 
-    return False
+    return out
 
 
-async def has_user_reviewed_subject(*, user_id: str, subject_type: str, subject_id: str) -> bool:
+async def user_has_purchased_subject(*, email_normalized: str, subject: UgcSubject) -> bool:
+    """
+    Returns whether the accounts user (by email) has at least one paid/completed order
+    containing a matching item for this subject.
+    """
+    return bool(await get_paid_order_ids_for_subject(email_normalized=email_normalized, subject=subject))
+
+
+async def list_user_review_bindings(*, user_id: str, subject_type: str, subject_id: str) -> List[Dict[str, Any]]:
     await ensure_ugc_tables_exist()
     uid = str(user_id or "").strip()
     st = str(subject_type or "").strip()
     sid = str(subject_id or "").strip()
     if not uid or not st or not sid:
-        return False
+        return []
     try:
-        row = await database.fetch_one(
-            buyer_review_user_subject.select().where(
+        rows = await database.fetch_all(
+            buyer_review_user_subject.select()
+            .where(
                 (buyer_review_user_subject.c.user_id == uid)
                 & (buyer_review_user_subject.c.subject_type == st)
                 & (buyer_review_user_subject.c.subject_id == sid)
             )
+            .order_by(buyer_review_user_subject.c.created_at.desc())
         )
-        return bool(row)
     except Exception:
-        return False
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            rid = int(row["review_id"])  # type: ignore[index]
+        except Exception:
+            rid = 0
+        if rid <= 0:
+            continue
+        try:
+            created_at = row["created_at"]  # type: ignore[index]
+        except Exception:
+            created_at = None
+        try:
+            order_id_raw = row["order_id"]  # type: ignore[index]
+        except Exception:
+            order_id_raw = None
+        out.append(
+            {
+                "review_id": rid,
+                "order_id": _normalize_order_id(order_id_raw),
+                "created_at": created_at,
+            }
+        )
+    return out
+
+
+def compute_review_slot_usage(*, paid_order_ids: List[str], bindings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    paid_newest: List[str] = []
+    seen_paid: Set[str] = set()
+    for raw in paid_order_ids:
+        oid = _normalize_order_id(raw)
+        if not oid or oid in seen_paid:
+            continue
+        paid_newest.append(oid)
+        seen_paid.add(oid)
+
+    used_set: Set[str] = set()
+    legacy_binding_count = 0
+    for b in bindings:
+        oid = _normalize_order_id((b or {}).get("order_id"))
+        if oid:
+            if oid in seen_paid:
+                used_set.add(oid)
+            continue
+        legacy_binding_count += 1
+
+    paid_oldest = list(reversed(paid_newest))
+    legacy_consumed: List[str] = []
+    for oid in paid_oldest:
+        if oid in used_set:
+            continue
+        if len(legacy_consumed) >= legacy_binding_count:
+            break
+        legacy_consumed.append(oid)
+        used_set.add(oid)
+
+    used_order_ids = [oid for oid in paid_newest if oid in used_set]
+    available_order_ids = [oid for oid in paid_newest if oid not in used_set]
+    return {
+        "paid_order_ids": paid_newest,
+        "used_order_ids": used_order_ids,
+        "available_order_ids": available_order_ids,
+        "legacy_binding_count": int(legacy_binding_count),
+        "legacy_consumed_order_ids": legacy_consumed,
+        "total_paid_orders": len(paid_newest),
+        "used_slots": len(used_order_ids),
+        "available_slots": len(available_order_ids),
+    }
+
+
+async def get_review_slot_summary(
+    *,
+    email_normalized: str,
+    user_id: str,
+    subject: UgcSubject,
+) -> Dict[str, Any]:
+    paid_order_ids = await get_paid_order_ids_for_subject(
+        email_normalized=email_normalized,
+        subject=subject,
+    )
+    bindings = await list_user_review_bindings(
+        user_id=user_id,
+        subject_type=subject.subject_type,
+        subject_id=subject.subject_id,
+    )
+    usage = compute_review_slot_usage(paid_order_ids=paid_order_ids, bindings=bindings)
+    usage["bindings"] = bindings
+    return usage
+
+
+async def has_user_reviewed_subject(*, user_id: str, subject_type: str, subject_id: str) -> bool:
+    bindings = await list_user_review_bindings(user_id=user_id, subject_type=subject_type, subject_id=subject_id)
+    return bool(bindings)
 
 
 async def get_user_review_for_subject(
@@ -332,24 +495,11 @@ async def get_user_review_for_subject(
     if not uid or not st or not sid:
         return None
 
-    try:
-        binding = await database.fetch_one(
-            buyer_review_user_subject.select().where(
-                (buyer_review_user_subject.c.user_id == uid)
-                & (buyer_review_user_subject.c.subject_type == st)
-                & (buyer_review_user_subject.c.subject_id == sid)
-            )
-        )
-    except Exception:
+    bindings = await list_user_review_bindings(user_id=uid, subject_type=st, subject_id=sid)
+    if not bindings:
         return None
-
-    if not binding:
-        return None
-
-    try:
-        review_id = int(binding["review_id"])  # type: ignore[index]
-    except Exception:
-        review_id = 0
+    top_binding = bindings[0]
+    review_id = int(top_binding.get("review_id") or 0)
 
     if review_id <= 0:
         return None
@@ -375,10 +525,18 @@ async def get_user_review_for_subject(
         "review_id": int(review_id),
         "verification": verification.strip() or "unverified",
         "has_rating": bool(has_rating),
+        "order_id": _normalize_order_id(top_binding.get("order_id")),
     }
 
 
-async def bind_user_review_subject(*, user_id: str, subject_type: str, subject_id: str, review_id: int) -> None:
+async def bind_user_review_subject(
+    *,
+    user_id: str,
+    subject_type: str,
+    subject_id: str,
+    review_id: int,
+    order_id: Optional[str] = None,
+) -> None:
     await ensure_ugc_tables_exist()
     uid = str(user_id or "").strip()
     st = str(subject_type or "").strip()
@@ -391,6 +549,7 @@ async def bind_user_review_subject(*, user_id: str, subject_type: str, subject_i
                 user_id=uid,
                 subject_type=st,
                 subject_id=sid,
+                order_id=_normalize_order_id(order_id),
                 review_id=int(review_id),
                 created_at=datetime.now(timezone.utc),
             )
