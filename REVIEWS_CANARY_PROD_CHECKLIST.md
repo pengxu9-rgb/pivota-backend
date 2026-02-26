@@ -19,6 +19,10 @@ Security note:
   - Proof issuer only: `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`
   - Proof issuer only (optional, for invitation tokens): `REVIEWS_BUYER_INVITATION_SIGNING_SECRET`
   - Reviews backend: `REVIEWS_MEDIA_SIGNING_SECRET`, `JWT_SECRET_KEY`
+  - Reviews backend prefixing:
+    - optional `REVIEWS_MEDIA_S3_PREFIX` for dedicated review-media object path
+    - if `REVIEWS_MEDIA_S3_PREFIX` is unset, backend reuses `PHOTO_UPLOAD_PREFIX`
+    - if both are unset, backend defaults to `reviews-media`
 - If you want the reviews backend to accept `invitation_token` at `/buyer/reviews/v1/verification/exchange`:
   - Reviews backend: `REVIEWS_PROOF_ISSUER_BASE_URL`, `REVIEWS_PROOF_ISSUER_INTERNAL_KEY` (or reuse `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`)
 - Confirm canary gating is configured on reviews backend:

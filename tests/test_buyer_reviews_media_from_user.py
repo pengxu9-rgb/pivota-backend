@@ -205,6 +205,39 @@ async def test_attach_media_from_user_rejects_invalid_review_status(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_attach_media_from_user_returns_503_when_storage_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_upload_flags(monkeypatch)
+
+    async def fake_fetch_one(query: Any) -> Dict[str, Any] | None:
+        q = str(query)
+        if "buyer_review_user_subject" in q:
+            return {"user_id": "u_1", "review_id": 88}
+        if "product_reviews" in q:
+            return {"id": 88, "merchant_id": "m_1", "status": "under_review"}
+        return None
+
+    async def fake_execute(query: Any) -> int:
+        raise AssertionError("execute should not be called when storage upload is unavailable")
+
+    monkeypatch.setattr(buyer_reviews_service.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(buyer_reviews_service.database, "execute", fake_execute)
+    monkeypatch.setattr(buyer_reviews_service, "_reviews_media_s3_put", lambda *args, **kwargs: None)
+
+    with pytest.raises(HTTPException) as exc:
+        await buyer_reviews_service.attach_buyer_review_media_from_user(
+            request=object(),  # type: ignore[arg-type]
+            user_id="u_1",
+            review_id=88,
+            filename="proof.png",
+            content_type="image/png",
+            blob=b"abc",
+        )
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "MEDIA_STORAGE_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
 async def test_attach_media_from_user_rejects_when_upload_rollout_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

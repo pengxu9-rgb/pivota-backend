@@ -2591,7 +2591,9 @@ def _reviews_media_s3_bucket() -> str:
 
 
 def _reviews_media_s3_prefix() -> str:
-    return _first_env("REVIEWS_MEDIA_S3_PREFIX", default="reviews-media").strip().strip("/")
+    # Reuse PHOTO_UPLOAD_PREFIX when review-specific prefix is unset so existing
+    # bucket IAM policies scoped to the photo prefix continue to work.
+    return _first_env("REVIEWS_MEDIA_S3_PREFIX", "PHOTO_UPLOAD_PREFIX", default="reviews-media").strip().strip("/")
 
 
 def _reviews_media_s3_endpoint_url() -> Optional[str]:
@@ -2675,7 +2677,8 @@ def _reviews_media_s3_put(public_id: str, *, filename: str, blob: bytes, content
     ext = (os.path.splitext(filename)[1] or "").lower()
     if ext and not ext.startswith("."):
         ext = "." + ext
-    key = f"{_reviews_media_s3_prefix()}/{public_id}{ext}"
+    prefix = _reviews_media_s3_prefix()
+    key = f"{prefix}/{public_id}{ext}"
 
     client = _reviews_media_s3_client()
     if client is None:
@@ -2685,7 +2688,15 @@ def _reviews_media_s3_put(public_id: str, *, filename: str, blob: bytes, content
         client.put_object(Bucket=bucket, Key=key, Body=blob, ContentType=content_type)
         return f"s3://{bucket}/{key}"
     except Exception as e:
+        endpoint_url = _reviews_media_s3_endpoint_url()
         logger.warning("reviews.media.s3.put_failed %s", type(e).__name__)
+        logger.warning(
+            "reviews.media.s3.put_context bucket=%s prefix=%s endpoint_configured=%s error_type=%s",
+            bucket,
+            prefix,
+            bool(endpoint_url),
+            type(e).__name__,
+        )
         logger.debug("reviews.media.s3.put_failed_detail %s", str(e))
         return None
 

@@ -30,6 +30,9 @@ Security note:
 - (optional, to accept `invitation_token` at `/buyer/reviews/v1/verification/exchange`): `REVIEWS_PROOF_ISSUER_BASE_URL`, `REVIEWS_PROOF_ISSUER_INTERNAL_KEY` (or reuse `REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`)
 - `REVIEWS_BUYER_SUBMIT_MERCHANT_ALLOWLIST`: comma-separated merchant ids for canary (empty = allow all)
 - `REVIEWS_MEDIA_SIGNING_SECRET`: signs `/review-media` URLs
+- `REVIEWS_MEDIA_S3_PREFIX`: optional dedicated prefix for review media objects
+  - if unset, backend reuses `PHOTO_UPLOAD_PREFIX`
+  - if neither is set, backend defaults to `reviews-media`
 - `JWT_SECRET_KEY`: employee JWT signing secret (used by smoke scripts)
 - (recommended): `REVIEWS_RISK_HASH_SECRET` (HMAC salt for risk signals like `ip_hash`; avoids reversible hashing)
 
