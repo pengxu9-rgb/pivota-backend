@@ -59,7 +59,7 @@ async def test_external_seed_cache_hit_serves_first_screen_without_live_query(
 
 
 @pytest.mark.asyncio
-async def test_external_seed_cache_miss_is_non_blocking_and_triggers_async_refresh(
+async def test_external_seed_cache_miss_sync_fills_before_async_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_api as agent_api_module
@@ -94,13 +94,12 @@ async def test_external_seed_cache_miss_is_non_blocking_and_triggers_async_refre
         metrics_out=metrics,
     )
 
-    assert products == []
-    assert metrics.get("executed") is False
-    assert metrics.get("skip_reason") == "cache_miss_async_refresh"
+    assert len(products) == 1
+    assert products[0]["product_id"] == "ext_refresh_1"
+    assert metrics.get("executed") is True
+    assert metrics.get("skip_reason") == "cache_miss_sync_filled"
     assert metrics.get("cache_hit") is False
-    assert len(agent_api_module._EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT) == 1
-
-    await asyncio.gather(*list(agent_api_module._EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.values()))
+    assert len(agent_api_module._EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT) == 0
 
     cache_key = agent_api_module._build_external_seed_cache_key(
         query="fenty gloss",
