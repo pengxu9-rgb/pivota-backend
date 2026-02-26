@@ -144,6 +144,62 @@ _LINGERIE_QUERY_KEYWORDS = (
     "intimates",
     "sleepwear",
 )
+_FRAGRANCE_QUERY_KEYWORDS = (
+    "perfume",
+    "fragrance",
+    "parfum",
+    "cologne",
+    "body mist",
+    "eau de parfum",
+    "eau de toilette",
+    "tom ford",
+    "jo malone",
+    "diptyque",
+    "byredo",
+    "le labo",
+    "chanel",
+    "dior",
+    "ysl",
+    "yves saint laurent",
+    "armani",
+    "hermes",
+    "gucci",
+    "creed",
+    "kilian",
+    "amouage",
+)
+_BEAUTY_TOOL_KEYWORDS = (
+    "brush",
+    "brush set",
+    "makeup brush",
+    "applicator",
+    "sponge",
+    "puff",
+    "beauty blender",
+    "tool",
+    "tools",
+    "tweezer",
+    "eyelash curler",
+)
+_PET_QUERY_KEYWORDS = (
+    "pet",
+    "dog",
+    "cat",
+    "puppy",
+    "kitten",
+    "harness",
+    "leash",
+    "pet food",
+    "litter",
+)
+
+_RETRIEVAL_PROFILE_IDS = {
+    "FRAGRANCE_STRICT": "fragrance_strict",
+    "LINGERIE_STRICT": "lingerie_strict",
+    "PET_SUPPLIES": "pet_supplies",
+    "BEAUTY_GENERAL": "beauty_general",
+    "GENERAL": "general",
+}
 def _get_order_create_lock(key: str) -> asyncio.Lock:
     lock = _ORDER_CREATE_LOCKS.get(key)
     if lock is None:
@@ -242,6 +298,129 @@ def _is_lingerie_query(query_text: Optional[str], category_text: Optional[str]) 
     return any(keyword in haystack for keyword in _LINGERIE_QUERY_KEYWORDS)
 
 
+def _is_fragrance_query(query_text: Optional[str], category_text: Optional[str]) -> bool:
+    haystack = f"{str(query_text or '').lower()} {str(category_text or '').lower()}"
+    return any(keyword in haystack for keyword in _FRAGRANCE_QUERY_KEYWORDS)
+
+
+def _normalize_profile_hint(value: Optional[str]) -> Optional[str]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    alias_map = {
+        "fragrance": _RETRIEVAL_PROFILE_IDS["FRAGRANCE_STRICT"],
+        "perfume": _RETRIEVAL_PROFILE_IDS["FRAGRANCE_STRICT"],
+        "lingerie": _RETRIEVAL_PROFILE_IDS["LINGERIE_STRICT"],
+        "underwear": _RETRIEVAL_PROFILE_IDS["LINGERIE_STRICT"],
+        "pet": _RETRIEVAL_PROFILE_IDS["PET_SUPPLIES"],
+        "beauty": _RETRIEVAL_PROFILE_IDS["BEAUTY_GENERAL"],
+        "skincare": _RETRIEVAL_PROFILE_IDS["BEAUTY_GENERAL"],
+        "general": _RETRIEVAL_PROFILE_IDS["GENERAL"],
+    }
+    if raw in alias_map:
+        return alias_map[raw]
+    if raw in _RETRIEVAL_PROFILE_IDS.values():
+        return raw
+    return None
+
+
+def _resolve_retrieval_profile(
+    *,
+    query_text: Optional[str],
+    category_text: Optional[str],
+    profile_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    hinted = _normalize_profile_hint(profile_hint)
+    if hinted:
+        return {
+            "id": hinted,
+            "confidence": "hint",
+            "reason": "explicit_profile_hint",
+            "rules_applied": [f"profile:{hinted}", "resolver:explicit_profile_hint"],
+        }
+    if _is_fragrance_query(query_text, category_text):
+        profile_id = _RETRIEVAL_PROFILE_IDS["FRAGRANCE_STRICT"]
+        return {
+            "id": profile_id,
+            "confidence": "high",
+            "reason": "fragrance_keyword_match",
+            "rules_applied": [f"profile:{profile_id}", "ambiguity:search_first", "filter:strict_fragrance"],
+        }
+    if _is_lingerie_query(query_text, category_text):
+        profile_id = _RETRIEVAL_PROFILE_IDS["LINGERIE_STRICT"]
+        return {
+            "id": profile_id,
+            "confidence": "high",
+            "reason": "lingerie_keyword_match",
+            "rules_applied": [f"profile:{profile_id}", "ambiguity:search_first", "filter:strict_lingerie"],
+        }
+    haystack = f"{str(query_text or '').lower()} {str(category_text or '').lower()}"
+    if any(keyword in haystack for keyword in _PET_QUERY_KEYWORDS):
+        profile_id = _RETRIEVAL_PROFILE_IDS["PET_SUPPLIES"]
+        return {
+            "id": profile_id,
+            "confidence": "medium",
+            "reason": "pet_keyword_match",
+            "rules_applied": [f"profile:{profile_id}", "ambiguity:clarify_first", "filter:pet_focus"],
+        }
+    if _is_likely_beauty_product({"title": haystack, "category": category_text or ""}):
+        profile_id = _RETRIEVAL_PROFILE_IDS["BEAUTY_GENERAL"]
+        return {
+            "id": profile_id,
+            "confidence": "low",
+            "reason": "beauty_keyword_match",
+            "rules_applied": [f"profile:{profile_id}", "ambiguity:clarify_first", "filter:beauty_balanced"],
+        }
+    profile_id = _RETRIEVAL_PROFILE_IDS["GENERAL"]
+    return {
+        "id": profile_id,
+        "confidence": "low",
+        "reason": "fallback_general",
+        "rules_applied": [f"profile:{profile_id}", "resolver:fallback_general"],
+    }
+
+
+def _is_beauty_tool_like_product(product: Dict[str, Any]) -> bool:
+    blob = _build_product_search_blob(product)
+    if not blob:
+        return False
+    return any(keyword in blob for keyword in _BEAUTY_TOOL_KEYWORDS)
+
+
+def _is_lingerie_like_product(product: Dict[str, Any]) -> bool:
+    blob = _build_product_search_blob(product)
+    if not blob:
+        return False
+    return any(keyword in blob for keyword in _LINGERIE_QUERY_KEYWORDS)
+
+
+def _is_fragrance_like_product(product: Dict[str, Any]) -> bool:
+    blob = _build_product_search_blob(product)
+    if not blob:
+        return False
+    return any(keyword in blob for keyword in _FRAGRANCE_QUERY_KEYWORDS)
+
+
+def _is_pet_like_product(product: Dict[str, Any]) -> bool:
+    blob = _build_product_search_blob(product)
+    if not blob:
+        return False
+    return any(keyword in blob for keyword in _PET_QUERY_KEYWORDS)
+
+
+def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -> bool:
+    pid = str(profile_id or _RETRIEVAL_PROFILE_IDS["GENERAL"]).strip().lower()
+    if pid == _RETRIEVAL_PROFILE_IDS["FRAGRANCE_STRICT"]:
+        return _is_fragrance_like_product(product) and not _is_beauty_tool_like_product(product)
+    if pid == _RETRIEVAL_PROFILE_IDS["LINGERIE_STRICT"]:
+        return _is_lingerie_like_product(product) and not _is_beauty_tool_like_product(product)
+    if pid == _RETRIEVAL_PROFILE_IDS["PET_SUPPLIES"]:
+        return _is_pet_like_product(product)
+    if pid == _RETRIEVAL_PROFILE_IDS["BEAUTY_GENERAL"]:
+        return _is_likely_beauty_product(product) and not _is_lingerie_like_product(product)
+    return True
+
+
 AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED = _env_bool(
     "AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED",
     True,
@@ -300,6 +479,12 @@ AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS",
     0.35,
     min_value=0.05,
+    max_value=5.0,
+)
+AGENT_EXTERNAL_SEED_FRAGRANCE_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_EXTERNAL_SEED_FRAGRANCE_QUERY_TIMEOUT_SECONDS",
+    0.8,
+    min_value=0.1,
     max_value=5.0,
 )
 AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
@@ -891,13 +1076,15 @@ def _build_external_seed_cache_key(
     strategy: str,
     surface: str,
     limit: int,
+    include_seed_data_text_match: bool = False,
 ) -> str:
     normalized_query = _normalize_external_seed_cache_query(query)
     normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
     normalized_surface = str(surface or "all").strip().lower() or "all"
     limit_bucket = _external_seed_limit_bucket(limit)
-    return f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_surface}|{limit_bucket}"
+    seed_data_mode = "seed_text_on" if include_seed_data_text_match else "seed_text_off"
+    return f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_surface}|{limit_bucket}|{seed_data_mode}"
 
 
 def _get_cached_external_seed_products(cache_key: str) -> Optional[List[Dict[str, Any]]]:
@@ -938,6 +1125,7 @@ def _schedule_external_seed_cache_refresh(
     build_budget_ms: Optional[int],
     build_concurrency: Optional[int],
     include_seed_data_text_match: bool,
+    query_timeout_seconds: Optional[float] = None,
 ) -> bool:
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
     if existing is not None and not existing.done():
@@ -952,6 +1140,7 @@ def _schedule_external_seed_cache_refresh(
                 build_budget_ms=build_budget_ms,
                 build_concurrency=build_concurrency,
                 include_seed_data_text_match=include_seed_data_text_match,
+                query_timeout_seconds=query_timeout_seconds,
                 metrics_out={},
             )
             _put_cached_external_seed_products(cache_key, refreshed or [])
@@ -975,6 +1164,7 @@ async def _load_external_seed_products_with_cache(
     normalized_seed_strategy: str,
     normalized_catalog_surface: str,
     page_offset: int,
+    query_timeout_seconds: Optional[float] = None,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
@@ -998,6 +1188,7 @@ async def _load_external_seed_products_with_cache(
             build_budget_ms=build_budget_ms,
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
+            query_timeout_seconds=query_timeout_seconds,
             metrics_out=metrics,
         )
 
@@ -1012,6 +1203,7 @@ async def _load_external_seed_products_with_cache(
             build_budget_ms=build_budget_ms,
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
+            query_timeout_seconds=query_timeout_seconds,
             metrics_out=metrics,
         )
 
@@ -1021,6 +1213,7 @@ async def _load_external_seed_products_with_cache(
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         limit=limit,
+        include_seed_data_text_match=include_seed_data_text_match,
     )
     cached_products = _get_cached_external_seed_products(cache_key)
     if cached_products is not None:
@@ -1046,6 +1239,7 @@ async def _load_external_seed_products_with_cache(
         build_budget_ms=build_budget_ms,
         build_concurrency=build_concurrency,
         include_seed_data_text_match=include_seed_data_text_match,
+        query_timeout_seconds=query_timeout_seconds,
     )
     return []
 
@@ -1136,6 +1330,7 @@ async def _search_products_fast_mode(
     merchant_scope: Optional[List[str]],
     query: Optional[str],
     category: Optional[str],
+    retrieval_profile: Optional[Dict[str, Any]],
     catalog_surface: str,
     min_price: Optional[float],
     max_price: Optional[float],
@@ -1148,6 +1343,7 @@ async def _search_products_fast_mode(
 ) -> Dict[str, Any]:
     normalized_query = str(query or "").strip().lower()
     normalized_category = str(category or "").strip().lower()
+    fragrance_query = _is_fragrance_query(normalized_query, normalized_category)
     page_limit = max(1, min(int(limit or 20), 100))
     page_offset = max(0, int(offset or 0))
     if normalized_query:
@@ -1218,6 +1414,8 @@ async def _search_products_fast_mode(
     external_ranked: List[Dict[str, Any]] = []
     stale_cache_used = False
     seen_keys = set()
+    profile_filtered_out = 0
+    profile_id = str((retrieval_profile or {}).get("id") or _RETRIEVAL_PROFILE_IDS["GENERAL"])
 
     for row in rows or []:
         row_data = _row_as_dict(row)
@@ -1254,6 +1452,9 @@ async def _search_products_fast_mode(
             continue
         if not _passes_category_filter_fast(product, normalized_category):
             continue
+        if not _passes_retrieval_profile_filter(product, profile_id):
+            profile_filtered_out += 1
+            continue
 
         score = _score_fast_mode_relevance(
             product,
@@ -1285,6 +1486,12 @@ async def _search_products_fast_mode(
     ranked: List[Dict[str, Any]]
     if normalized_seed_strategy == "supplement_internal_first":
         ranked = internal_ranked + external_ranked
+    elif normalized_seed_strategy == "unified_relevance":
+        ranked = internal_ranked + external_ranked
+        ranked.sort(
+            key=lambda p: float(p.get("ranking_score", p.get("relevance_score", 0.0)) or 0.0),
+            reverse=True,
+        )
     else:
         ranked = internal_ranked + external_ranked
 
@@ -1306,6 +1513,8 @@ async def _search_products_fast_mode(
         "products": paginated,
         "total": total,
         "source_breakdown": source_breakdown,
+        "profile_filtered_out": profile_filtered_out,
+        "profile_id": profile_id,
     }
 
 
@@ -1481,6 +1690,7 @@ async def _load_external_seed_products_for_search(
     build_budget_ms: Optional[int] = None,
     build_concurrency: Optional[int] = None,
     include_seed_data_text_match: bool = False,
+    query_timeout_seconds: Optional[float] = None,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -1504,7 +1714,12 @@ async def _load_external_seed_products_for_search(
         limit=limit,
         offset=0,
         include_seed_data_text_match=include_seed_data_text_match,
-        query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
+        query_timeout_seconds=float(
+            query_timeout_seconds
+            if query_timeout_seconds is not None
+            else AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS
+            or 0.35
+        ),
     )
     rows = fetch_result.get("rows") or []
     if metrics is not None:
@@ -2187,6 +2402,7 @@ async def agent_search_products(
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),
     external_seed_strategy: str = Query(default="legacy"),
+    profile_hint: Optional[str] = Query(default=None),
     fast_mode: bool = Query(default=False),
     context: AgentContext = Depends(get_agent_context),
 ):
@@ -2248,6 +2464,26 @@ async def agent_search_products(
 
         normalized_query = query.strip() if isinstance(query, str) else ""
         normalized_category = category.strip() if isinstance(category, str) else ""
+        retrieval_profile = _resolve_retrieval_profile(
+            query_text=normalized_query,
+            category_text=normalized_category,
+            profile_hint=profile_hint,
+        )
+        retrieval_profile_id = str(retrieval_profile.get("id") or _RETRIEVAL_PROFILE_IDS["GENERAL"])
+        if (
+            allow_external_seed
+            and normalized_seed_strategy != "unified_relevance"
+            and retrieval_profile_id != _RETRIEVAL_PROFILE_IDS["GENERAL"]
+        ):
+            normalized_seed_strategy = "unified_relevance"
+            retrieval_profile["rules_applied"] = list(
+                dict.fromkeys(
+                    [
+                        *(retrieval_profile.get("rules_applied") or []),
+                        "seed_strategy:forced_unified_relevance",
+                    ]
+                )
+            )
         normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
         external_seed_health = _new_external_seed_health()
         search_stage_timings: Dict[str, int] = {
@@ -2412,6 +2648,9 @@ async def agent_search_products(
                         "catalog_surface": normalized_catalog_surface,
                         "reason_code": "ok" if page_items else "no_candidates",
                         "latency_ms": latency_ms,
+                        "retrieval_profile": retrieval_profile_id,
+                        "profile_confidence": retrieval_profile.get("confidence"),
+                        "rules_applied": retrieval_profile.get("rules_applied") or [],
                         "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
                         "external_seed_inclusion_reason": None,
                         "external_seed_skip_reason": "browse_fastpath_no_external_seed",
@@ -2437,6 +2676,7 @@ async def agent_search_products(
                             stage_timings_ms=search_stage_timings,
                         ),
                         "external_seed_returned_count": 0,
+                        "profile_filtered_out": 0,
                     },
                 }
             except Exception:
@@ -2503,6 +2743,7 @@ async def agent_search_products(
                 merchant_scope=merchant_scope_for_fast,
                 query=normalized_query or None,
                 category=normalized_category or None,
+                retrieval_profile=retrieval_profile,
                 catalog_surface=normalized_catalog_surface,
                 min_price=min_price,
                 max_price=max_price,
@@ -2516,6 +2757,7 @@ async def agent_search_products(
             paginated_products = list(fast_result["products"])
             total = int(fast_result["total"] or 0)
             source_breakdown = dict(fast_result["source_breakdown"] or {})
+            profile_filtered_out = int(fast_result.get("profile_filtered_out") or 0)
             external_seed_inclusion_reason: Optional[str] = None
             external_seed_skip_reason: Optional[str] = None
 
@@ -2555,7 +2797,14 @@ async def agent_search_products(
                         limit=ext_limit,
                         build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
                         build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
-                        include_seed_data_text_match=(normalized_seed_strategy == "legacy"),
+                        include_seed_data_text_match=(
+                            normalized_seed_strategy == "legacy" or fragrance_query
+                        ),
+                        query_timeout_seconds=(
+                            AGENT_EXTERNAL_SEED_FRAGRANCE_QUERY_TIMEOUT_SECONDS
+                            if fragrance_query
+                            else AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS
+                        ),
                         normalized_seed_strategy=normalized_seed_strategy,
                         normalized_catalog_surface=normalized_catalog_surface,
                         page_offset=offset,
@@ -2711,6 +2960,9 @@ async def agent_search_products(
                     "catalog_surface": normalized_catalog_surface,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
+                    "retrieval_profile": retrieval_profile_id,
+                    "profile_confidence": retrieval_profile.get("confidence"),
+                    "rules_applied": retrieval_profile.get("rules_applied") or [],
                     "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
                     "external_seed_inclusion_reason": external_seed_inclusion_reason,
                     "external_seed_skip_reason": external_seed_skip_reason,
@@ -2718,6 +2970,7 @@ async def agent_search_products(
                     "external_seed_returned_count": int(
                         source_breakdown.get("external_seed_count", 0) or 0
                     ),
+                    "profile_filtered_out": profile_filtered_out,
                     "route_health": _build_route_health(
                         primary_path_used="cross_merchant_search_fast_mode",
                         primary_latency_ms=latency_ms,
@@ -2858,6 +3111,7 @@ async def agent_search_products(
         )
         if include_external_seed:
             try:
+                fragrance_query = _is_fragrance_query(normalized_query, normalized_category)
                 external_seed_limit = min(40, max(20, int(limit or 20) * 2))
                 seed_metrics: Dict[str, Any] = {}
                 external_seed_products = await _load_external_seed_products_with_cache(
@@ -2866,7 +3120,14 @@ async def agent_search_products(
                     limit=external_seed_limit,
                     build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,
                     build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
-                    include_seed_data_text_match=(normalized_seed_strategy == "legacy"),
+                    include_seed_data_text_match=(
+                        normalized_seed_strategy == "legacy" or fragrance_query
+                    ),
+                    query_timeout_seconds=(
+                        AGENT_EXTERNAL_SEED_FRAGRANCE_QUERY_TIMEOUT_SECONDS
+                        if fragrance_query
+                        else AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS
+                    ),
                     normalized_seed_strategy=normalized_seed_strategy,
                     normalized_catalog_surface=normalized_catalog_surface,
                     page_offset=offset,
@@ -2907,10 +3168,14 @@ async def agent_search_products(
         if is_browse_mode:
             browse_internal: List[Dict[str, Any]] = []
             browse_external: List[Dict[str, Any]] = []
+            profile_filtered_out = 0
             for product in all_products:
                 if in_stock_only and not product.get("in_stock", True):
                     continue
                 if not _matches_catalog_surface(product, normalized_catalog_surface):
+                    continue
+                if not _passes_retrieval_profile_filter(product, retrieval_profile_id):
+                    profile_filtered_out += 1
                     continue
 
                 price = _safe_price_number(product.get("price", 0), 0.0)
@@ -3008,6 +3273,9 @@ async def agent_search_products(
                     "catalog_surface": normalized_catalog_surface,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
+                    "retrieval_profile": retrieval_profile_id,
+                    "profile_confidence": retrieval_profile.get("confidence"),
+                    "rules_applied": retrieval_profile.get("rules_applied") or [],
                     "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
                     "external_seed_inclusion_reason": None,
                     "external_seed_skip_reason": str(external_seed_health.get("external_seed_skip_reason") or "").strip() or None,
@@ -3030,8 +3298,9 @@ async def agent_search_products(
                         db_pool_wait_ms=db_pool_wait_ms,
                         stage_timings_ms=search_stage_timings,
                     ),
-                        "external_seed_returned_count": external_count,
-                    },
+                    "external_seed_returned_count": external_count,
+                    "profile_filtered_out": profile_filtered_out,
+                },
                 }
 
         # Search mode: Apply filters, hydrate features, then compute ranking.
@@ -3039,12 +3308,16 @@ async def agent_search_products(
         external_ranked_candidates: List[Dict[str, Any]] = []
         candidates: List[Dict[str, Any]] = []
         candidate_features: List[AgentRankingFeatures] = []
+        profile_filtered_out = 0
 
         filter_stage_started = time.perf_counter()
         for product in all_products:
             if in_stock_only and not product.get("in_stock", True):
                 continue
             if not _matches_catalog_surface(product, normalized_catalog_surface):
+                continue
+            if not _passes_retrieval_profile_filter(product, retrieval_profile_id):
+                profile_filtered_out += 1
                 continue
 
             price = _safe_price_number(product.get("price", 0), 0.0)
@@ -3231,7 +3504,17 @@ async def agent_search_products(
                 ),
                 reverse=True,
             )
-            ranked_candidates = ranked_candidates + external_ranked_candidates
+            if normalized_seed_strategy == "unified_relevance":
+                ranked_candidates = ranked_candidates + external_ranked_candidates
+                ranked_candidates.sort(
+                    key=lambda p: (
+                        p.get("ranking_score") is not None,
+                        p.get("ranking_score", p.get("relevance_score", 0)),
+                    ),
+                    reverse=True,
+                )
+            else:
+                ranked_candidates = ranked_candidates + external_ranked_candidates
         search_stage_timings["rank_sort_ms"] = max(
             0, int((time.perf_counter() - rank_sort_stage_started) * 1000)
         )
@@ -3380,6 +3663,9 @@ async def agent_search_products(
                 "catalog_surface": normalized_catalog_surface,
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
+                "retrieval_profile": retrieval_profile_id,
+                "profile_confidence": retrieval_profile.get("confidence"),
+                "rules_applied": retrieval_profile.get("rules_applied") or [],
                 "retrieval_mix_strategy": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
                 "external_seed_inclusion_reason": (
                     "cross_merchant_unified_relevance"
@@ -3407,6 +3693,7 @@ async def agent_search_products(
                     stage_timings_ms=search_stage_timings,
                 ),
                 "external_seed_returned_count": external_count,
+                "profile_filtered_out": profile_filtered_out,
             },
         }
         
