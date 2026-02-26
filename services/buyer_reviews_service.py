@@ -27,6 +27,7 @@ from db.reviews_center import (
     product_reviews,
 )
 from services.merchant_store_service import get_primary_store
+from services.review_moderation_policy import assess_review_text_risk, merge_moderation_risk_flags
 from services.reviews_service import VARIANT_ID_SENTINEL, _reviews_media_s3_put, build_product_key, build_sku_key
 
 
@@ -475,7 +476,7 @@ async def attach_buyer_review_media(
             url=url,
             file_path=s3_uri,
             file_hash=file_hash,
-            status="active",
+            status="under_review",
             created_at=now_dt,
         )
     )
@@ -483,13 +484,14 @@ async def attach_buyer_review_media(
     await database.execute(
         product_reviews.update()
         .where(product_reviews.c.id == rid)
-        .values(media_count=(product_reviews.c.media_count + 1), updated_at=now_dt)
+        .values(updated_at=now_dt)
     )
 
     return {
         "status": "success",
         "review_id": rid,
         "media": {"id": int(media_id), "public_id": public_id, "type": media_type},
+        "media_moderation_state": "under_review",
     }
 
 
@@ -563,7 +565,7 @@ async def attach_buyer_review_media_from_user(
             url=url,
             file_path=s3_uri,
             file_hash=file_hash,
-            status="active",
+            status="under_review",
             created_at=now_dt,
         )
     )
@@ -571,13 +573,14 @@ async def attach_buyer_review_media_from_user(
     await database.execute(
         product_reviews.update()
         .where(product_reviews.c.id == rid)
-        .values(media_count=(product_reviews.c.media_count + 1), updated_at=now_dt)
+        .values(updated_at=now_dt)
     )
 
     return {
         "status": "success",
         "review_id": rid,
         "media": {"id": int(media_id), "public_id": public_id, "type": media_type},
+        "media_moderation_state": "under_review",
     }
 
 
@@ -1018,6 +1021,8 @@ async def create_buyer_review(
     p = (platform or "").strip().lower()
     pp = (platform_product_id or "").strip()
     vid = (str(variant_id).strip() if variant_id is not None else "").strip()
+    title_text = (title or "").strip() or None
+    body_text = (body or "").strip() or None
     if not p or not pp:
         raise HTTPException(status_code=400, detail="MISSING_SUBJECT")
 
@@ -1042,8 +1047,8 @@ async def create_buyer_review(
             "platform_product_id": pp,
             "variant_id": vid,
             "rating": rating_int,
-            "title": (title or "").strip(),
-            "body": (body or "").strip(),
+            "title": title_text or "",
+            "body": body_text or "",
         }
     )
     existing_review_id, is_conflict = await _claim_idempotency_key(
@@ -1066,8 +1071,14 @@ async def create_buyer_review(
 
     product_key = build_product_key(merchant_id=merchant_id, platform=p, platform_product_id=pp)
     sku_key = build_sku_key(merchant_id=merchant_id, platform=p, platform_product_id=pp, variant_id=vid or None)
+    moderation = assess_review_text_risk(title=title_text, body=body_text)
+    moderation_state = str(moderation.get("moderation_state") or "under_review")
+    risk_flags = merge_moderation_risk_flags(
+        {"source": "buyer", "ip_hash": _client_ip_hash(request)},
+        moderation=moderation,
+    )
 
-    # Persist review as under_review (not visible to PDP read path until employee sets active).
+    # Persist review according to text moderation policy.
     now_dt = datetime.now(timezone.utc)
     review_id = await database.execute(
         product_reviews.insert().values(
@@ -1085,11 +1096,11 @@ async def create_buyer_review(
             dedupe_key=_sha256_hex(f"{merchant_id}|{sku_key}|{verified.jti_hash}".encode("utf-8")),
             verification=(verified.verification or "unverified"),
             rating=rating_int,
-            title=(title or "").strip() or None,
-            body=(body or "").strip() or None,
+            title=title_text,
+            body=body_text,
             media_count=0,
-            risk_flags={"source": "buyer", "ip_hash": _client_ip_hash(request)},
-            status="under_review",
+            risk_flags=risk_flags,
+            status=moderation_state,
             created_at=now_dt,
             updated_at=now_dt,
         )
@@ -1105,7 +1116,7 @@ async def create_buyer_review(
 
     await _bind_idempotency_to_review(merchant_id=merchant_id, idempotency_key=idempotency_key, review_id=int(review_id))
 
-    return {"status": "success", "review_id": int(review_id), "moderation_state": "under_review"}
+    return {"status": "success", "review_id": int(review_id), "moderation_state": moderation_state}
 
 
 async def get_buyer_review_status(*, token: str, review_id: int) -> Dict[str, Any]:

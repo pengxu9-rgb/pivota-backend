@@ -115,6 +115,7 @@ def test_from_user_single_paid_order_allows_once_then_returns_409(
 
     assert first.status_code == 200
     assert first.json().get("review_id") == 7101
+    assert first.json().get("moderation_state") == "active"
     assert second.status_code == 409
     assert second.json().get("detail") == "ALREADY_REVIEWED"
     assert [c.get("order_id") for c in bind_calls] == ["ord_1"]
@@ -200,8 +201,70 @@ def test_from_user_two_paid_orders_allows_two_reviews_third_is_409(
 
     assert first.status_code == 200
     assert first.json().get("review_id") == 7201
+    assert first.json().get("moderation_state") == "active"
     assert second.status_code == 200
     assert second.json().get("review_id") == 7202
+    assert second.json().get("moderation_state") == "active"
     assert third.status_code == 409
     assert third.json().get("detail") == "ALREADY_REVIEWED"
     assert [c.get("order_id") for c in bind_calls] == ["ord_2", "ord_1"]
+
+
+def test_from_user_high_risk_text_stays_under_review(
+    app: FastAPI,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.buyer_reviews as buyer_reviews_routes
+
+    slot_summaries = [
+        {
+            "paid_order_ids": ["ord_9"],
+            "available_order_ids": ["ord_9"],
+            "bindings": [],
+            "total_paid_orders": 1,
+            "used_slots": 0,
+            "available_slots": 1,
+            "legacy_binding_count": 0,
+        },
+    ]
+    created_review_ids = iter([7301])
+
+    async def override_principal() -> AccountsPrincipal:
+        return _principal()
+
+    async def fake_get_review_slot_summary(**_: Any) -> Dict[str, Any]:
+        if not slot_summaries:
+            raise AssertionError("Unexpected extra get_review_slot_summary call")
+        return slot_summaries.pop(0)
+
+    async def fake_execute(query: Any) -> int:
+        if "insert into product_reviews" not in str(query).lower():
+            raise AssertionError(f"Unexpected execute query: {query}")
+        return next(created_review_ids)
+
+    async def fake_bind_user_review_subject(**kwargs: Any) -> None:
+        _ = kwargs
+
+    app.dependency_overrides[get_accounts_principal_ugc] = override_principal
+    monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_enabled", lambda: True)
+    monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_merchant_allowed", lambda _: True)
+    monkeypatch.setattr(buyer_reviews_routes, "get_review_slot_summary", fake_get_review_slot_summary)
+    monkeypatch.setattr(buyer_reviews_routes, "bind_user_review_subject", fake_bind_user_review_subject)
+    monkeypatch.setattr(buyer_reviews_routes.database, "execute", fake_execute)
+
+    try:
+        response = client.post(
+            "/buyer/reviews/v1/reviews/from_user",
+            json={
+                **_payload(),
+                "title": "xxx",
+                "body": "porn content",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_accounts_principal_ugc, None)
+
+    assert response.status_code == 200
+    assert response.json().get("review_id") == 7301
+    assert response.json().get("moderation_state") == "under_review"

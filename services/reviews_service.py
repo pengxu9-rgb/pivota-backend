@@ -789,6 +789,7 @@ async def get_review_summary_for_sku(
     preview_rows = await database.fetch_all(
         f"""
         SELECT r.id, r.merchant_id, r.rating,
+               r.title,
                COALESCE(NULLIF(r.body_redacted, ''), r.body) AS body_effective,
                r.created_at,
                r.media_count
@@ -829,15 +830,20 @@ async def get_review_summary_for_sku(
     for pr in preview_rows:
         rid = int(pr["id"])
         media_cnt = int(_row_get(pr, "media_count") or 0)
+        title_text = _as_text(_row_get(pr, "title"))
+        body_snippet = _safe_snippet(_row_get(pr, "body_effective"))
+        snippet = body_snippet or _safe_snippet(title_text)
         item = {
             "review_id": rid,
             "merchant_id": str(pr["merchant_id"]),
             "rating": int(pr["rating"] or 0),
-            "text_snippet": _safe_snippet(pr["body_effective"]),
+            "text_snippet": snippet,
             "created_at": _as_iso_datetime(_row_get(pr, "created_at")),
             "has_media": media_cnt > 0,
             "media_count": media_cnt,
         }
+        if title_text:
+            item["title"] = title_text
         preview_media = preview_media_by_review.get(rid)
         if preview_media:
             item["media"] = [preview_media]
@@ -1313,8 +1319,28 @@ async def remove_review_media(
     media_id: int,
     reason: Optional[str],
 ) -> Dict[str, Any]:
+    return await set_review_media_status(
+        actor=actor,
+        review_id=review_id,
+        media_id=media_id,
+        status="removed",
+        reason=reason,
+    )
+
+
+async def set_review_media_status(
+    *,
+    actor: Dict[str, Any],
+    review_id: int,
+    media_id: int,
+    status: str,
+    reason: Optional[str],
+) -> Dict[str, Any]:
     rid = int(review_id)
     mid = int(media_id)
+    next_status = _as_text(status).lower()
+    if next_status not in {"active", "under_review", "removed"}:
+        raise HTTPException(status_code=400, detail="INVALID_MEDIA_STATUS")
     before_media = await database.fetch_one(
         media_assets.select().where((media_assets.c.id == mid) & (media_assets.c.review_id == rid))
     )
@@ -1324,7 +1350,7 @@ async def remove_review_media(
     await database.execute(
         media_assets.update()
         .where(media_assets.c.id == mid)
-        .values(status="removed")
+        .values(status=next_status)
     )
 
     # Recompute denormalized media_count for the review.
@@ -1349,7 +1375,13 @@ async def remove_review_media(
         before=dict(before_media),
         after=dict(after_media) if after_media else None,
     )
-    return {"status": "success", "review_id": rid, "media_id": mid, "review_media_count": cnt}
+    return {
+        "status": "success",
+        "review_id": rid,
+        "media_id": mid,
+        "new_status": next_status,
+        "review_media_count": cnt,
+    }
 
 
 async def _get_or_create_group(
@@ -2732,6 +2764,43 @@ def _reviews_media_s3_put(public_id: str, *, filename: str, blob: bytes, content
         )
         logger.debug("reviews.media.s3.put_failed_detail %s", str(e))
         return None
+
+
+def build_employee_review_media_preview_url(
+    *,
+    file_path: Optional[str],
+    public_id: Optional[str],
+    media_id: Optional[int],
+    ttl_seconds: int = 900,
+) -> Optional[str]:
+    """
+    Build an employee-only preview URL for review media.
+
+    For S3-backed files, return a short-lived presigned URL so under_review media
+    can be previewed without exposing them on public read paths.
+    """
+    path = _as_text(file_path)
+    if path.startswith("s3://"):
+        try:
+            rest = path[len("s3://") :]
+            bucket, key = rest.split("/", 1)
+        except Exception:
+            return None
+        client = _reviews_media_s3_client()
+        if client is None:
+            return None
+        try:
+            ttl = max(60, min(int(ttl_seconds), 1800))
+            return client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=ttl,
+            )
+        except Exception:
+            return None
+
+    # Fallback for local/dev media path: use existing signed public route.
+    return _signed_media_url(public_id=public_id, media_id=media_id)
 
 
 async def commit_import_batch(

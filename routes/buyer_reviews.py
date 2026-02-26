@@ -22,6 +22,7 @@ from services.buyer_reviews_service import (
     issue_submission_token,
 )
 from services.reviews_service import VARIANT_ID_SENTINEL, build_product_key, build_sku_key
+from services.review_moderation_policy import assess_review_text_risk, merge_moderation_risk_flags
 from services.ugc_capabilities_service import UgcSubject, bind_user_review_subject, get_review_slot_summary
 
 
@@ -35,6 +36,26 @@ def _bearer_token(authorization: Optional[str]) -> str:
     if not h.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="UNAUTHORIZED")
     return h[7:].strip()
+
+
+def _moderation_reason_from_state(state: Optional[str], *, fallback: str = "ok") -> str:
+    norm = str(state or "").strip().lower()
+    if norm == "active":
+        return "auto_approved"
+    if norm == "under_review":
+        return "high_risk_under_review"
+    return fallback
+
+
+def _row_get(row: Any, key: str) -> Any:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get(key)
+    try:
+        return row[key]
+    except Exception:
+        return getattr(row, key, None)
 
 
 class SubjectRef(BaseModel):
@@ -140,7 +161,11 @@ async def buyer_create_review(
             title=body.title,
             body=body.body,
         )
-        record_buyer_create(result="success", reason="ok", duration_seconds=(time.perf_counter() - start))
+        record_buyer_create(
+            result="success",
+            reason=_moderation_reason_from_state(result.get("moderation_state"), fallback="ok"),
+            duration_seconds=(time.perf_counter() - start),
+        )
         return result
     except HTTPException as e:
         reason = str(e.detail or "error")
@@ -193,6 +218,8 @@ async def buyer_create_review_from_user(
         requested_rating = int(body.rating) if body.rating is not None else None
         title_text = (body.title or "").strip() or None
         body_text = (body.body or "").strip() or None
+        moderation = assess_review_text_risk(title=title_text, body=body_text)
+        moderation_state = str(moderation.get("moderation_state") or "under_review")
 
         if requested_rating is None and not title_text and not body_text:
             raise HTTPException(status_code=400, detail="EMPTY_REVIEW")
@@ -229,6 +256,12 @@ async def buyer_create_review_from_user(
         )
 
         now_dt = datetime.now(timezone.utc)
+        base_risk_fields = {
+            "source": "accounts",
+            "accounts_user_id": principal.user_id,
+            "subject_type": subject_type,
+            "subject_id": subject_id,
+        }
 
         # Backward compatibility: if a historical binding exists without order_id,
         # preserve upgrade/add-rating behavior before allocating a new order slot.
@@ -243,19 +276,28 @@ async def buyer_create_review_from_user(
             existing_review = await database.fetch_one(
                 product_reviews.select().where(product_reviews.c.id == existing_review_id)
             )
-            existing_verification = str(existing_review["verification"] if existing_review else "").strip().lower()
+            existing_verification = str(_row_get(existing_review, "verification") or "").strip().lower()
             existing_has_rating = False
             if existing_review:
                 try:
                     existing_has_rating = existing_review["rating"] is not None  # type: ignore[index]
                 except Exception:
                     existing_has_rating = getattr(existing_review, "rating", None) is not None
+            existing_order_id = str((existing_binding or {}).get("order_id") or "").strip() or None
+            update_risk_fields = dict(base_risk_fields)
+            if existing_order_id:
+                update_risk_fields["order_id"] = existing_order_id
 
             if existing_verification in {"unverified", ""}:
                 update_values: Dict[str, Any] = {
                     "verification": "verified_purchase",
                     "updated_at": now_dt,
-                    "status": "under_review",
+                    "status": moderation_state,
+                    "risk_flags": merge_moderation_risk_flags(
+                        _row_get(existing_review, "risk_flags"),
+                        moderation=moderation,
+                        extra=update_risk_fields,
+                    ),
                 }
                 if requested_rating is not None:
                     update_values["rating"] = requested_rating
@@ -269,11 +311,15 @@ async def buyer_create_review_from_user(
                     .where(product_reviews.c.id == existing_review_id)
                     .values(**update_values)
                 )
-                record_buyer_create(result="success", reason="upgraded", duration_seconds=(time.perf_counter() - start))
+                record_buyer_create(
+                    result="success",
+                    reason=_moderation_reason_from_state(moderation_state, fallback="upgraded"),
+                    duration_seconds=(time.perf_counter() - start),
+                )
                 return {
                     "status": "success",
                     "review_id": int(existing_review_id),
-                    "moderation_state": "under_review",
+                    "moderation_state": moderation_state,
                     "upgraded": True,
                 }
 
@@ -285,7 +331,12 @@ async def buyer_create_review_from_user(
                 update_values = {
                     "updated_at": now_dt,
                     "rating": requested_rating,
-                    "status": "under_review",
+                    "status": moderation_state,
+                    "risk_flags": merge_moderation_risk_flags(
+                        _row_get(existing_review, "risk_flags"),
+                        moderation=moderation,
+                        extra=update_risk_fields,
+                    ),
                 }
                 if title_text is not None:
                     update_values["title"] = title_text
@@ -297,11 +348,15 @@ async def buyer_create_review_from_user(
                     .where(product_reviews.c.id == existing_review_id)
                     .values(**update_values)
                 )
-                record_buyer_create(result="success", reason="add_rating", duration_seconds=(time.perf_counter() - start))
+                record_buyer_create(
+                    result="success",
+                    reason=_moderation_reason_from_state(moderation_state, fallback="add_rating"),
+                    duration_seconds=(time.perf_counter() - start),
+                )
                 return {
                     "status": "success",
                     "review_id": int(existing_review_id),
-                    "moderation_state": "under_review",
+                    "moderation_state": moderation_state,
                     "updated": True,
                 }
 
@@ -328,14 +383,12 @@ async def buyer_create_review_from_user(
                 title=title_text,
                 body=body_text,
                 media_count=0,
-                risk_flags={
-                    "source": "accounts",
-                    "accounts_user_id": principal.user_id,
-                    "subject_type": subject_type,
-                    "subject_id": subject_id,
-                    "order_id": target_order_id,
-                },
-                status="under_review",
+                risk_flags=merge_moderation_risk_flags(
+                    None,
+                    moderation=moderation,
+                    extra={**base_risk_fields, "order_id": target_order_id},
+                ),
+                status=moderation_state,
                 created_at=now_dt,
                 updated_at=now_dt,
             )
@@ -366,16 +419,23 @@ async def buyer_create_review_from_user(
                     except Exception:
                         existing_review_id = None
                     if existing_review_id:
+                        existing_review_row = await database.fetch_one(
+                            product_reviews.select().where(product_reviews.c.id == int(existing_review_id))
+                        )
                         return {
                             "status": "success",
                             "review_id": int(existing_review_id),
-                            "moderation_state": "under_review",
+                            "moderation_state": str(_row_get(existing_review_row, "status") or moderation_state),
                             "idempotent_replay": True,
                         }
             raise
 
-        record_buyer_create(result="success", reason="ok", duration_seconds=(time.perf_counter() - start))
-        return {"status": "success", "review_id": int(review_id), "moderation_state": "under_review"}
+        record_buyer_create(
+            result="success",
+            reason=_moderation_reason_from_state(moderation_state, fallback="ok"),
+            duration_seconds=(time.perf_counter() - start),
+        )
+        return {"status": "success", "review_id": int(review_id), "moderation_state": moderation_state}
     except HTTPException as e:
         reason = str(e.detail or "error")
         record_buyer_create(result="error", reason=reason[:64], duration_seconds=(time.perf_counter() - start))

@@ -33,6 +33,9 @@ async def test_moderation_list_supports_order_id_filter(monkeypatch: pytest.Monk
                 "title": "Great quality",
                 "body_effective": "Looks good.",
                 "media_count": 1,
+                "pending_media_count": 1,
+                "active_media_count": 0,
+                "total_media_count": 1,
                 "status": "under_review",
                 "created_at": None,
                 "updated_at": None,
@@ -63,6 +66,10 @@ async def test_moderation_list_supports_order_id_filter(monkeypatch: pytest.Monk
     query = str(captured["query"])
     assert "LEFT JOIN (" in query
     assert "FROM buyer_review_user_subject" in query
+    assert "FROM media_assets" in query
+    assert "pending_media_count" in query
+    assert "active_media_count" in query
+    assert "total_media_count" in query
     assert "risk_flags ->> 'order_id'" in query
     assert "AS order_id" in query
     assert "= :oid" in query
@@ -88,3 +95,24 @@ async def test_moderation_list_ignores_blank_order_id_filter(monkeypatch: pytest
     values = captured["values"]
     assert isinstance(values, dict)
     assert "oid" not in values
+
+
+@pytest.mark.asyncio
+async def test_moderation_list_supports_has_pending_media_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_fetch_all(query: str, values=None):
+        captured["query"] = str(query)
+        captured["values"] = dict(values or {})
+        return []
+
+    monkeypatch.setattr(employee_reviews_routes.database, "fetch_all", fake_fetch_all)
+
+    payload = await employee_reviews_routes.employee_list_reviews_for_moderation(
+        has_pending_media=True,
+        actor={"employee_id": "emp_test"},
+    )
+
+    assert payload == {"items": [], "limit": 50}
+    query = str(captured["query"])
+    assert "COALESCE(media_stats.pending_media_count, 0) > 0" in query

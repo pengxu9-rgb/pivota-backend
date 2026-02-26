@@ -37,10 +37,12 @@ from services.reviews_service import (
     generate_featured_reviews_for_group,
     get_group_counts_by_merchant,
     list_employee_audit_logs,
+    build_employee_review_media_preview_url,
     _signed_media_url,
     remove_group_member,
     redact_review,
     remove_review_media,
+    set_review_media_status,
     reprocess_import_batch,
     set_featured_pin,
     set_group_featured_frozen,
@@ -664,6 +666,29 @@ async def employee_remove_review_media(
     )
 
 
+class SetReviewMediaStatusRequest(BaseModel):
+    status: str = Field(..., min_length=1)
+    reason: Optional[str] = None
+
+
+@router.post(
+    "/reviews/{review_id}/media/{media_id}/status",
+)
+async def employee_set_review_media_status(
+    review_id: int,
+    media_id: int,
+    body: SetReviewMediaStatusRequest,
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.moderate.media"])),
+) -> Dict[str, Any]:
+    return await set_review_media_status(
+        actor=actor,
+        review_id=int(review_id),
+        media_id=int(media_id),
+        status=body.status,
+        reason=body.reason,
+    )
+
+
 class CreateGroupRequest(BaseModel):
     group_key: Optional[str] = None
     reason: Optional[str] = None
@@ -872,6 +897,7 @@ async def employee_list_reviews_for_moderation(
     source_type: Optional[str] = None,
     source_system: Optional[str] = None,
     order_id: Optional[str] = None,
+    has_pending_media: Optional[bool] = Query(default=None),
     limit: int = 50,
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
 ) -> Dict[str, Any]:
@@ -894,6 +920,11 @@ async def employee_list_reviews_for_moderation(
     if order_id_norm:
         where.append("COALESCE(NULLIF(product_reviews.risk_flags ->> 'order_id', ''), bind.order_id) = :oid")
         params["oid"] = order_id_norm
+    if has_pending_media is not None:
+        if has_pending_media:
+            where.append("COALESCE(media_stats.pending_media_count, 0) > 0")
+        else:
+            where.append("COALESCE(media_stats.pending_media_count, 0) = 0")
     rows = await database.fetch_all(
         f"""
         SELECT
@@ -911,6 +942,9 @@ async def employee_list_reviews_for_moderation(
                product_reviews.title,
                COALESCE(NULLIF(product_reviews.body_redacted, ''), product_reviews.body) AS body_effective,
                product_reviews.media_count,
+               COALESCE(media_stats.pending_media_count, 0)::int AS pending_media_count,
+               COALESCE(media_stats.active_media_count, 0)::int AS active_media_count,
+               COALESCE(media_stats.total_media_count, 0)::int AS total_media_count,
                product_reviews.status,
                product_reviews.created_at,
                product_reviews.updated_at,
@@ -922,6 +956,15 @@ async def employee_list_reviews_for_moderation(
             WHERE order_id IS NOT NULL AND order_id <> ''
             GROUP BY review_id
         ) AS bind ON bind.review_id = product_reviews.id
+        LEFT JOIN (
+            SELECT
+              review_id,
+              COUNT(*)::int AS total_media_count,
+              COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_media_count,
+              COALESCE(SUM(CASE WHEN status = 'under_review' THEN 1 ELSE 0 END), 0)::int AS pending_media_count
+            FROM {media_assets.name}
+            GROUP BY review_id
+        ) AS media_stats ON media_stats.review_id = product_reviews.id
         WHERE {' AND '.join(where)}
         ORDER BY product_reviews.created_at DESC, product_reviews.id DESC
         LIMIT {limit}
@@ -937,19 +980,41 @@ async def employee_list_reviews_for_moderation(
 async def employee_list_review_media(
     review_id: int,
     request: Request,
+    status: Optional[str] = Query(default=None),
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
 ) -> Dict[str, Any]:
+    status_norm = str(status or "").strip().lower()
+    where = media_assets.c.review_id == int(review_id)
+    if status_norm:
+        if status_norm not in {"active", "under_review", "removed"}:
+            raise HTTPException(status_code=400, detail="INVALID_MEDIA_STATUS")
+        where = where & (media_assets.c.status == status_norm)
+    else:
+        where = where & (media_assets.c.status.in_(("active", "under_review")))
+
     rows = await database.fetch_all(
         media_assets.select()
-        .where((media_assets.c.review_id == int(review_id)) & (media_assets.c.status == "active"))
+        .where(where)
         .order_by(media_assets.c.id.asc())
     )
     base = str(request.base_url).rstrip("/")
     items: List[Dict[str, Any]] = []
     for r in rows:
         item = dict(r)
-        signed = _signed_media_url(public_id=item.get("public_id"), media_id=item.get("id"))
-        if signed:
-            item["url"] = f"{base}{signed}" if signed.startswith("/") else signed
+        status_value = str(item.get("status") or "").strip().lower()
+        preview_url: Optional[str] = None
+        if status_value == "under_review":
+            preview_url = build_employee_review_media_preview_url(
+                file_path=item.get("file_path"),
+                public_id=item.get("public_id"),
+                media_id=item.get("id"),
+                ttl_seconds=900,
+            )
+        if not preview_url:
+            signed = _signed_media_url(public_id=item.get("public_id"), media_id=item.get("id"))
+            if signed:
+                preview_url = f"{base}{signed}" if signed.startswith("/") else signed
+        if preview_url:
+            item["url"] = preview_url
         items.append(item)
     return {"items": items}

@@ -64,6 +64,7 @@ async def test_get_review_summary_preview_items_include_media_when_available(
             "id": 9311,
             "merchant_id": "m_demo",
             "rating": 5,
+            "title": "Amazing set",
             "body_effective": "Looks great.",
             "created_at": now,
             "media_count": 2,
@@ -72,6 +73,7 @@ async def test_get_review_summary_preview_items_include_media_when_available(
             "id": 9310,
             "merchant_id": "m_demo",
             "rating": 4,
+            "title": "Solid quality",
             "body_effective": "Nice quality.",
             "created_at": now,
             "media_count": 0,
@@ -116,12 +118,14 @@ async def test_get_review_summary_preview_items_include_media_when_available(
 
     first = preview_items[0]
     assert first["review_id"] == 9311
+    assert first["title"] == "Amazing set"
     assert first["has_media"] is True
     assert first["media_count"] == 2
     assert first["media"] == [{"type": "image", "url": "/signed/pub_9311"}]
 
     second = preview_items[1]
     assert second["review_id"] == 9310
+    assert second["title"] == "Solid quality"
     assert second["has_media"] is False
     assert second["media_count"] == 0
     assert "media" not in second
@@ -137,6 +141,7 @@ async def test_get_review_summary_preview_items_keep_backward_compatible_shape_w
             "id": 9400,
             "merchant_id": "m_demo",
             "rating": 5,
+            "title": "No photo review title",
             "body_effective": "No photo review.",
             "created_at": now,
             "media_count": 0,
@@ -159,7 +164,43 @@ async def test_get_review_summary_preview_items_keep_backward_compatible_shape_w
     item = summary["preview_items"][0]
     assert item["review_id"] == 9400
     assert item["rating"] == 5
+    assert item["title"] == "No photo review title"
     assert "text_snippet" in item
     assert item["has_media"] is False
     assert item["media_count"] == 0
     assert "media" not in item
+
+
+@pytest.mark.asyncio
+async def test_get_review_summary_preview_items_text_snippet_falls_back_to_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    preview_rows = [
+        {
+            "id": 9500,
+            "merchant_id": "m_demo",
+            "rating": 5,
+            "title": "Title fallback only",
+            "body_effective": None,
+            "created_at": now,
+            "media_count": 0,
+        }
+    ]
+
+    _install_summary_stubs(
+        monkeypatch,
+        preview_rows=preview_rows,
+        preview_media_rows=[],
+    )
+
+    summary = await reviews_service.get_review_summary_for_sku(
+        merchant_id="m_demo",
+        platform="shopify",
+        platform_product_id="p_demo",
+        variant_id=None,
+    )
+
+    item = summary["preview_items"][0]
+    assert item["title"] == "Title fallback only"
+    assert item["text_snippet"] == "Title fallback only"

@@ -21,7 +21,7 @@ def _enable_upload_flags(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 async def test_attach_media_from_user_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _enable_upload_flags(monkeypatch)
-    executed = []
+    executed: list[Any] = []
     s3_calls = []
 
     async def fake_fetch_one(query: Any) -> Dict[str, Any] | None:
@@ -33,7 +33,7 @@ async def test_attach_media_from_user_success(monkeypatch: pytest.MonkeyPatch) -
         return None
 
     async def fake_execute(query: Any) -> int | None:
-        executed.append(str(query))
+        executed.append(query)
         if len(executed) == 1:
             return 501
         return None
@@ -67,10 +67,15 @@ async def test_attach_media_from_user_success(monkeypatch: pytest.MonkeyPatch) -
         "status": "success",
         "review_id": 88,
         "media": {"id": 501, "public_id": "media_public_1", "type": "image"},
+        "media_moderation_state": "under_review",
     }
     assert len(executed) == 2
     assert len(s3_calls) == 1
     assert s3_calls[0]["content_type"] == "image/png"
+    insert_params = executed[0].compile().params
+    update_params = executed[1].compile().params
+    assert insert_params.get("status") == "under_review"
+    assert "media_count" not in update_params
 
 
 @pytest.mark.asyncio
