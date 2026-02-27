@@ -415,10 +415,6 @@ AGENT_EXTERNAL_SEED_CACHE_MAX_ENTRIES = int(
         max_value=5000.0,
     )
 )
-AGENT_EXTERNAL_SEED_SCOPE_BYPASS_ENABLED = _env_bool(
-    "AGENT_EXTERNAL_SEED_SCOPE_BYPASS_ENABLED",
-    True,
-)
 AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT = int(
     _env_float(
         "AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT",
@@ -2644,8 +2640,7 @@ async def agent_search_products(
             if isinstance(getattr(context, "allowed_merchants", None), list):
                 allowed = [str(m).strip() for m in context.allowed_merchants if str(m).strip()]
                 bypass_external_seed_only_scope = (
-                    AGENT_EXTERNAL_SEED_SCOPE_BYPASS_ENABLED
-                    and search_all_merchants is True
+                    search_all_merchants is True
                     and not external_seed_only
                     and not merchant_id
                     and not merchant_ids
