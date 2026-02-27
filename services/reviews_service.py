@@ -2051,6 +2051,25 @@ def sign_review_media_ref(*, public_id: str, exp: int) -> str:
     return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
 
 
+def _review_media_public_base_url() -> str:
+    raw = str(os.getenv("REVIEW_MEDIA_PUBLIC_BASE_URL") or "")
+    # Be defensive against accidental newline/escaped newline in env values.
+    normalized = (
+        raw.replace("\r", "")
+        .replace("\n", "")
+        .replace("\\r", "")
+        .replace("\\n", "")
+        .strip()
+    )
+    if not normalized:
+        return ""
+    if (normalized.startswith('"') and normalized.endswith('"')) or (
+        normalized.startswith("'") and normalized.endswith("'")
+    ):
+        normalized = normalized[1:-1].strip()
+    return normalized.rstrip("/")
+
+
 def build_signed_review_media_url(*, public_id: str, ttl_seconds: int = 300) -> str:
     ttl_env = _as_text(os.getenv("REVIEWS_MEDIA_URL_TTL_SECONDS"))
     if ttl_env:
@@ -2064,7 +2083,11 @@ def build_signed_review_media_url(*, public_id: str, ttl_seconds: int = 300) -> 
 
     exp = int(_now().timestamp()) + int(ttl_seconds)
     sig = sign_review_media_ref(public_id=public_id, exp=exp)
-    return f"/agent/shop/v1/review-media/{public_id}?exp={exp}&sig={sig}"
+    path = f"/agent/shop/v1/review-media/{public_id}?exp={exp}&sig={sig}"
+    base = _review_media_public_base_url()
+    if base:
+        return f"{base}{path}"
+    return path
 
 
 def verify_review_media_signature(*, public_id: str, exp: int, sig: str) -> bool:
