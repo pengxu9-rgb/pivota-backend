@@ -1104,14 +1104,33 @@ def _build_product_search_blob(product: Dict[str, Any]) -> str:
         tags_text = " ".join(str(v or "").strip() for v in tags if str(v or "").strip())
     else:
         tags_text = str(tags or "").strip()
+    seed_data = _ensure_json_obj(product.get("seed_data"))
+    seed_tags = seed_data.get("tags")
+    if isinstance(seed_tags, list):
+        seed_tags_text = " ".join(str(v or "").strip() for v in seed_tags if str(v or "").strip())
+    else:
+        seed_tags_text = str(seed_tags or "").strip()
     parts = [
         product.get("title"),
         product.get("name"),
         product.get("description"),
         product.get("product_type"),
+        product.get("category"),
         product.get("vendor"),
         product.get("brand"),
         tags_text,
+        product.get("external_domain"),
+        product.get("external_url"),
+        product.get("canonical_url"),
+        product.get("destination_url"),
+        seed_data.get("title"),
+        seed_data.get("description"),
+        seed_data.get("brand"),
+        seed_data.get("vendor"),
+        seed_data.get("manufacturer"),
+        seed_data.get("product_type"),
+        seed_data.get("category"),
+        seed_tags_text,
     ]
     return " ".join(str(v or "").strip().lower() for v in parts if str(v or "").strip())
 
@@ -1123,7 +1142,28 @@ def _is_brand_relevant_product(product: Dict[str, Any], brand_terms: List[str]) 
     blob = _build_product_search_blob(product)
     if not blob:
         return False
-    return any(term in blob for term in terms)
+    compact_blob = blob.replace(" ", "")
+    for term in terms:
+        normalized_term = _normalize_brand_query_text(term)
+        if not normalized_term:
+            continue
+        if normalized_term in blob:
+            return True
+        compact_term = normalized_term.replace(" ", "")
+        if compact_term and compact_term in compact_blob:
+            return True
+        tokens = [token for token in re.findall(r"[a-z0-9]+", normalized_term) if token]
+        core_tokens = [token for token in tokens if token not in _BRAND_HINT_SUFFIXES]
+        candidate_tokens = core_tokens or tokens
+        if not candidate_tokens:
+            continue
+        if len(candidate_tokens) == 1:
+            if candidate_tokens[0] in blob:
+                return True
+            continue
+        if all(token in blob for token in candidate_tokens):
+            return True
+    return False
 
 
 def _normalize_catalog_surface(raw: Optional[str]) -> str:
@@ -1408,6 +1448,48 @@ async def _build_external_seed_product(
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
     canonical_url = str(seed_row.get("canonical_url") or "").strip() or None
     title = seed_data.get("title") or seed_row.get("title") or None
+    brand = (
+        str(
+            seed_data.get("brand")
+            or seed_data.get("vendor")
+            or seed_data.get("manufacturer")
+            or ""
+        ).strip()
+        or None
+    )
+    vendor = (
+        str(
+            seed_data.get("vendor")
+            or seed_data.get("brand")
+            or seed_data.get("manufacturer")
+            or seed_row.get("domain")
+            or ""
+        ).strip()
+        or None
+    )
+    product_type = (
+        str(
+            seed_data.get("product_type")
+            or seed_data.get("category")
+            or seed_data.get("type")
+            or "external"
+        ).strip()
+        or "external"
+    )
+    category = (
+        str(
+            seed_data.get("category")
+            or seed_data.get("product_type")
+            or seed_data.get("type")
+            or ""
+        ).strip()
+        or None
+    )
+    seed_tags = seed_data.get("tags")
+    if isinstance(seed_tags, list):
+        tags = [str(item or "").strip() for item in seed_tags if str(item or "").strip()]
+    else:
+        tags = []
     image_urls = _seed_image_urls(seed_data)
     image_url = seed_data.get("image_url") or seed_row.get("image_url") or (image_urls[0] if image_urls else None)
 
@@ -1523,17 +1605,26 @@ async def _build_external_seed_product(
         "platform_product_id": external_product_id,
         "title": title or destination_url,
         "description": str(seed_data.get("description") or "") or "",
+        **({"brand": brand} if brand else {}),
+        **({"vendor": vendor} if vendor else {}),
         "price": price,
         "currency": price_currency,
         "image_url": image_url,
         "image_urls": image_urls,
         "in_stock": True,
         "inventory_quantity": 999,
-        "product_type": "external",
+        "product_type": product_type,
+        **({"category": category} if category else {}),
+        **({"tags": tags} if tags else {}),
         "source": "external_seed",
+        **({"external_domain": str(seed_row.get("domain") or "").strip()} if str(seed_row.get("domain") or "").strip() else {}),
+        **({"canonical_url": canonical_url} if canonical_url else {}),
+        "destination_url": destination_url,
+        "external_url": destination_url,
         "external_seed_id": seed_id,
         "external_redirect_url": external_redirect_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
+        "seed_data": seed_data,
         "variants": variants,
     }
 
@@ -2594,6 +2685,8 @@ async def agent_search_products(
             total = int(fast_result["total"] or 0)
             source_breakdown = dict(fast_result["source_breakdown"] or {})
             unified_merge_pool_size = len(fast_ranked_candidates) if fast_ranked_candidates else total
+            external_seed_inclusion_reason: Optional[str] = None
+            external_seed_skip_reason: Optional[str] = None
 
             fast_seed_stage_started = time.perf_counter()
             is_cross_merchant_scope = merchant_id is None and not merchant_ids
@@ -2685,13 +2778,18 @@ async def agent_search_products(
                             total = unified_merge_pool_size
                             paginated_products = merged[offset : offset + limit]
                             fast_ranked_candidates = merged
+                            external_seed_inclusion_reason = "unified_pool_merge"
                         else:
                             paginated_products.extend(to_append)
                             total = max(total, int(offset or 0) + len(paginated_products))
+                            external_seed_inclusion_reason = "supplement_underfill"
                         external_count_now = sum(1 for p in paginated_products if _is_external_seed_product(p))
                         source_breakdown["external_seed_count"] = external_count_now
                         source_breakdown["internal_count"] = max(0, len(paginated_products) - external_count_now)
+                    else:
+                        external_seed_skip_reason = "no_relevant_external_seed_candidates"
                 except Exception:
+                    external_seed_skip_reason = "seed_loader_error"
                     _set_external_seed_skip_reason(
                         external_seed_health=external_seed_health,
                         reason="seed_loader_error",
@@ -2710,6 +2808,7 @@ async def agent_search_products(
                     reason = "page_already_full"
                 else:
                     reason = "not_applicable"
+                external_seed_skip_reason = reason
                 _set_external_seed_skip_reason(
                     external_seed_health=external_seed_health,
                     reason=reason,
@@ -2717,6 +2816,14 @@ async def agent_search_products(
             search_stage_timings["external_seed_ms"] = max(
                 0, int((time.perf_counter() - fast_seed_stage_started) * 1000)
             )
+            if source_breakdown.get("external_seed_count", 0) and not external_seed_inclusion_reason:
+                external_seed_inclusion_reason = "fast_pool_contains_external"
+            if not external_seed_skip_reason:
+                external_seed_skip_reason = str(
+                    external_seed_health.get("skip_reason")
+                    or external_seed_health.get("external_seed_skip_reason")
+                    or ""
+                ).strip() or None
 
             latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -2783,6 +2890,8 @@ async def agent_search_products(
                     "brand_entities": brand_query_terms,
                     "brand_scope": brand_scope,
                     "brand_detection_mode": brand_detection_mode,
+                    "external_seed_inclusion_reason": external_seed_inclusion_reason,
+                    "external_seed_skip_reason": external_seed_skip_reason,
                     "external_seed_cache_status": str(
                         external_seed_health.get("skip_reason")
                         or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
@@ -2920,6 +3029,8 @@ async def agent_search_products(
 
         # Add employee-managed external products only for explicit external/cross-merchant flows.
         external_seed_stage_started = time.perf_counter()
+        external_seed_inclusion_reason: Optional[str] = None
+        external_seed_skip_reason: Optional[str] = None
         include_external_seed = allow_external_seed and (
             (merchant_id is None and not merchant_ids)
             or merchant_id == EXTERNAL_SEED_MERCHANT_ID
@@ -2954,7 +3065,11 @@ async def agent_search_products(
                 )
                 if external_seed_products:
                     all_products.extend(external_seed_products)
+                    external_seed_inclusion_reason = "cross_merchant_joined"
+                else:
+                    external_seed_skip_reason = "no_external_seed_candidates"
             except Exception as e:
+                external_seed_skip_reason = "seed_loader_error"
                 _set_external_seed_skip_reason(
                     external_seed_health=external_seed_health,
                     reason="seed_loader_error",
@@ -2966,6 +3081,7 @@ async def agent_search_products(
                 reason = "external_seed_disabled"
             else:
                 reason = "non_cross_merchant_scope"
+            external_seed_skip_reason = reason
             _set_external_seed_skip_reason(
                 external_seed_health=external_seed_health,
                 reason=reason,
@@ -3336,6 +3452,14 @@ async def agent_search_products(
         total = len(ranked_candidates)
         paginated_products = ranked_candidates[offset : offset + limit]
         external_count = sum(1 for p in paginated_products if _is_external_seed_product(p))
+        if external_count > 0 and not external_seed_inclusion_reason:
+            external_seed_inclusion_reason = "ranked_pool_contains_external"
+        if not external_seed_skip_reason:
+            external_seed_skip_reason = str(
+                external_seed_health.get("skip_reason")
+                or external_seed_health.get("external_seed_skip_reason")
+                or ""
+            ).strip() or None
         source_breakdown = {
             "internal_count": len(paginated_products) - external_count,
             "external_seed_count": external_count,
@@ -3487,6 +3611,8 @@ async def agent_search_products(
                     "merchants_searched": len(merchants_to_search),
                     "candidate_pool_size": len(all_products),
                 },
+                "external_seed_inclusion_reason": external_seed_inclusion_reason,
+                "external_seed_skip_reason": external_seed_skip_reason,
                 "external_seed_cache_status": str(
                     external_seed_health.get("skip_reason")
                     or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
