@@ -113,3 +113,92 @@ async def test_external_seed_cache_miss_sync_fills_before_async_refresh(
     assert len(cached) == 1
     assert cached[0]["product_id"] == "ext_refresh_1"
     assert live_loader.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_brand_broad_fallback_triggers_when_strict_rows_have_no_brand_relevance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    strict_rows = [
+        {
+            "id": "seed_strict_1",
+            "external_product_id": "seed_strict_1",
+            "market": "US",
+            "title": "Generic beauty serum",
+            "destination_url": "https://example.com/serum",
+            "seed_data": {"brand": "Generic"},
+        }
+    ]
+    broad_rows = [
+        {
+            "id": "seed_broad_1",
+            "external_product_id": "seed_broad_1",
+            "market": "CA",
+            "title": "Fenty Beauty Eau de Parfum",
+            "destination_url": "https://example.com/fenty",
+            "seed_data": {"brand": "Fenty Beauty"},
+        }
+    ]
+
+    calls = []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            return {
+                "rows": strict_rows,
+                "total_count": len(strict_rows),
+                "query_ms": 5,
+                "query_timeout": False,
+                "table_missing": False,
+            }
+        return {
+            "rows": broad_rows,
+            "total_count": len(broad_rows),
+            "query_ms": 6,
+            "query_timeout": False,
+            "table_missing": False,
+        }
+
+    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains):
+        return {
+            "id": str(seed_row.get("external_product_id")),
+            "product_id": str(seed_row.get("external_product_id")),
+            "merchant_id": "external_seed",
+            "source": "external_seed",
+            "title": str(seed_row.get("title") or ""),
+            "seed_data": seed_row.get("seed_data") or {},
+        }
+
+    monkeypatch.setattr(agent_api_module, "fetch_external_seed_rows", fake_fetch_external_seed_rows)
+    monkeypatch.setattr(agent_api_module, "dedupe_external_seed_rows", lambda rows, limit: list(rows)[:limit])
+    monkeypatch.setattr(agent_api_module, "get_allowed_domains_for_market", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent_api_module, "_build_external_seed_product", fake_build_external_seed_product)
+
+    metrics = {}
+    products = await agent_api_module._load_external_seed_products_for_search(
+        req=None,
+        query="fenty beauty",
+        limit=20,
+        page_offset=0,
+        build_budget_ms=200,
+        build_concurrency=2,
+        include_seed_data_text_match=True,
+        enable_broad_fallback=True,
+        brand_terms=["fenty beauty"],
+        brand_query_detected=True,
+        required_terms=["fenty"],
+        prefer_terms=["fenty beauty"],
+        scope="brand_strict",
+        metrics_out=metrics,
+    )
+
+    assert len(products) == 1
+    assert products[0]["product_id"] == "seed_broad_1"
+    assert metrics.get("brand_strict_rows") == 1
+    assert metrics.get("brand_relevant_rows") == 0
+    assert metrics.get("broad_scope_fallback_used") is True
+    assert metrics.get("broad_scope_rows_fetched") == 1
+    assert any(call.get("market") is None for call in calls)

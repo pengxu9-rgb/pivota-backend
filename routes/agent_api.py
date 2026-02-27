@@ -11,6 +11,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 from collections import OrderedDict
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -812,6 +813,18 @@ def _build_route_health(
         "external_seed_rows_fetched": max(0, int(seed_health.get("external_seed_rows_fetched") or 0)),
         "external_seed_rows_built": max(0, int(seed_health.get("external_seed_rows_built") or 0)),
         "external_seed_budget_exhausted": bool(seed_health.get("external_seed_budget_exhausted") or False),
+        "external_seed_brand_strict_rows": max(
+            0, int(seed_health.get("external_seed_brand_strict_rows") or 0)
+        ),
+        "external_seed_brand_relevant_rows": max(
+            0, int(seed_health.get("external_seed_brand_relevant_rows") or 0)
+        ),
+        "external_seed_broad_fallback_used": bool(
+            seed_health.get("external_seed_broad_fallback_used") or False
+        ),
+        "external_seed_broad_scope_rows": max(
+            0, int(seed_health.get("external_seed_broad_scope_rows") or 0)
+        ),
         "auth_lookup_ms": max(0, int(auth_lookup_ms or 0)),
         "auth_total_ms": max(0, int(auth_total_ms or 0)),
         "rate_limit_check_ms": max(0, int(rate_limit_check_ms or 0)),
@@ -840,6 +853,10 @@ def _new_external_seed_health() -> Dict[str, Any]:
         "external_seed_rows_fetched": 0,
         "external_seed_rows_built": 0,
         "external_seed_budget_exhausted": False,
+        "external_seed_brand_strict_rows": 0,
+        "external_seed_brand_relevant_rows": 0,
+        "external_seed_broad_fallback_used": False,
+        "external_seed_broad_scope_rows": 0,
     }
 
 
@@ -880,6 +897,33 @@ def _apply_external_seed_metrics(
     external_seed_health["external_seed_budget_exhausted"] = bool(
         metrics.get("budget_exhausted", external_seed_health.get("external_seed_budget_exhausted") or False)
     )
+    external_seed_health["external_seed_brand_strict_rows"] = max(
+        0,
+        int(
+            metrics["brand_strict_rows"]
+            if "brand_strict_rows" in metrics
+            else external_seed_health.get("external_seed_brand_strict_rows") or 0
+        ),
+    )
+    external_seed_health["external_seed_brand_relevant_rows"] = max(
+        0,
+        int(
+            metrics["brand_relevant_rows"]
+            if "brand_relevant_rows" in metrics
+            else external_seed_health.get("external_seed_brand_relevant_rows") or 0
+        ),
+    )
+    external_seed_health["external_seed_broad_fallback_used"] = bool(
+        metrics.get("broad_scope_fallback_used", external_seed_health.get("external_seed_broad_fallback_used") or False)
+    )
+    external_seed_health["external_seed_broad_scope_rows"] = max(
+        0,
+        int(
+            metrics["broad_scope_rows_fetched"]
+            if "broad_scope_rows_fetched" in metrics
+            else external_seed_health.get("external_seed_broad_scope_rows") or 0
+        ),
+    )
 
 
 def _set_external_seed_skip_reason(
@@ -909,6 +953,31 @@ def _external_seed_limit_bucket(limit: int) -> int:
     return max(10, min(100, bucket))
 
 
+def _normalize_external_seed_terms(terms: Optional[List[str]], *, max_terms: int = 8) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in terms or []:
+        token = str(item or "").strip().lower()
+        if not token:
+            continue
+        normalized = " ".join(re.findall(r"[a-z0-9]+", token))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _hash_external_seed_terms(terms: Optional[List[str]]) -> str:
+    normalized = _normalize_external_seed_terms(terms)
+    if not normalized:
+        return "none"
+    digest = hashlib.sha1("|".join(normalized).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
 def _build_external_seed_cache_key(
     *,
     query: Optional[str],
@@ -916,6 +985,7 @@ def _build_external_seed_cache_key(
     strategy: str,
     surface: str,
     scope: str = "default",
+    required_terms: Optional[List[str]] = None,
     limit: int,
     page_offset: int = 0,
 ) -> str:
@@ -924,10 +994,11 @@ def _build_external_seed_cache_key(
     normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
     normalized_surface = str(surface or "all").strip().lower() or "all"
     normalized_scope = str(scope or "default").strip().lower() or "default"
+    required_terms_hash = _hash_external_seed_terms(required_terms)
     limit_bucket = _external_seed_limit_bucket(limit)
     offset_bucket = max(0, int(page_offset or 0))
     return (
-        f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_scope}|"
+        f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_scope}|{required_terms_hash}|"
         f"{normalized_surface}|{limit_bucket}|{offset_bucket}"
     )
 
@@ -972,6 +1043,11 @@ def _schedule_external_seed_cache_refresh(
     build_concurrency: Optional[int],
     include_seed_data_text_match: bool,
     enable_broad_fallback: bool,
+    brand_terms: Optional[List[str]] = None,
+    brand_query_detected: bool = False,
+    required_terms: Optional[List[str]] = None,
+    prefer_terms: Optional[List[str]] = None,
+    scope: str = "default",
 ) -> bool:
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
     if existing is not None and not existing.done():
@@ -988,6 +1064,11 @@ def _schedule_external_seed_cache_refresh(
                 build_concurrency=build_concurrency,
                 include_seed_data_text_match=include_seed_data_text_match,
                 enable_broad_fallback=enable_broad_fallback,
+                brand_terms=brand_terms,
+                brand_query_detected=brand_query_detected,
+                required_terms=required_terms,
+                prefer_terms=prefer_terms,
+                scope=scope,
                 metrics_out={},
             )
             _put_cached_external_seed_products(cache_key, refreshed or [])
@@ -1012,6 +1093,11 @@ async def _load_external_seed_products_with_cache(
     normalized_catalog_surface: str,
     page_offset: int,
     enable_broad_fallback: bool = False,
+    brand_terms: Optional[List[str]] = None,
+    brand_query_detected: bool = False,
+    required_terms: Optional[List[str]] = None,
+    prefer_terms: Optional[List[str]] = None,
+    scope: str = "default",
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
@@ -1024,6 +1110,10 @@ async def _load_external_seed_products_with_cache(
     metrics.setdefault("rows_fetched", 0)
     metrics.setdefault("rows_built", 0)
     metrics.setdefault("budget_exhausted", False)
+    metrics.setdefault("brand_strict_rows", 0)
+    metrics.setdefault("brand_relevant_rows", 0)
+    metrics.setdefault("broad_scope_fallback_used", False)
+    metrics.setdefault("broad_scope_rows_fetched", 0)
 
     if not AGENT_EXTERNAL_SEED_CACHE_ENABLED:
         metrics["executed"] = True
@@ -1037,6 +1127,11 @@ async def _load_external_seed_products_with_cache(
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
+            brand_terms=brand_terms,
+            brand_query_detected=brand_query_detected,
+            required_terms=required_terms,
+            prefer_terms=prefer_terms,
+            scope=scope,
             metrics_out=metrics,
         )
 
@@ -1053,6 +1148,11 @@ async def _load_external_seed_products_with_cache(
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
+            brand_terms=brand_terms,
+            brand_query_detected=brand_query_detected,
+            required_terms=required_terms,
+            prefer_terms=prefer_terms,
+            scope=scope,
             metrics_out=metrics,
         )
 
@@ -1061,7 +1161,8 @@ async def _load_external_seed_products_with_cache(
         market=DEFAULT_EXTERNAL_SEED_MARKET,
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
-        scope="brand_broad" if enable_broad_fallback else "default",
+        scope=scope,
+        required_terms=required_terms,
         limit=limit,
         page_offset=page_offset,
     )
@@ -1088,6 +1189,11 @@ async def _load_external_seed_products_with_cache(
         build_concurrency=build_concurrency,
         include_seed_data_text_match=include_seed_data_text_match,
         enable_broad_fallback=enable_broad_fallback,
+        brand_terms=brand_terms,
+        brand_query_detected=brand_query_detected,
+        required_terms=required_terms,
+        prefer_terms=prefer_terms,
+        scope=scope,
         metrics_out=metrics,
     )
     metrics["executed"] = True
@@ -1104,6 +1210,11 @@ async def _load_external_seed_products_with_cache(
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
+            brand_terms=brand_terms,
+            brand_query_detected=brand_query_detected,
+            required_terms=required_terms,
+            prefer_terms=prefer_terms,
+            scope=scope,
         )
     return sync_rows[:limit]
 
@@ -1649,6 +1760,11 @@ async def _load_external_seed_products_for_search(
     build_concurrency: Optional[int] = None,
     include_seed_data_text_match: bool = False,
     enable_broad_fallback: bool = False,
+    brand_terms: Optional[List[str]] = None,
+    brand_query_detected: bool = False,
+    required_terms: Optional[List[str]] = None,
+    prefer_terms: Optional[List[str]] = None,
+    scope: str = "default",
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -1666,6 +1782,8 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("budget_exhausted", False)
         metrics.setdefault("broad_scope_fallback_used", False)
         metrics.setdefault("broad_scope_rows_fetched", 0)
+        metrics.setdefault("brand_strict_rows", 0)
+        metrics.setdefault("brand_relevant_rows", 0)
 
     fetch_result = await fetch_external_seed_rows(
         database=database,
@@ -1676,13 +1794,28 @@ async def _load_external_seed_products_for_search(
         include_seed_data_text_match=include_seed_data_text_match,
         only_unattached=True,
         query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
+        required_terms=required_terms,
+        prefer_terms=prefer_terms,
+        scope=scope,
     )
     rows = fetch_result.get("rows") or []
+    strict_rows_count = len(rows)
+    normalized_brand_terms = _normalize_external_seed_terms(brand_terms, max_terms=8)
+    strict_brand_relevant_rows = 0
+    if brand_query_detected and normalized_brand_terms:
+        strict_brand_relevant_rows = sum(
+            1 for row in rows if _is_brand_relevant_product(dict(row), normalized_brand_terms)
+        )
+    strict_rows_empty = not rows
+    strict_brand_pool_empty = (
+        bool(brand_query_detected and normalized_brand_terms)
+        and int(strict_brand_relevant_rows or 0) <= 0
+    )
     if (
         enable_broad_fallback
         and str(query or "").strip()
         and int(page_offset or 0) == 0
-        and not rows
+        and (strict_rows_empty or strict_brand_pool_empty)
     ):
         broad_limit = min(1000, max(int(limit or 20) * 4, 120))
         broad_fetch_result = await fetch_external_seed_rows(
@@ -1694,6 +1827,9 @@ async def _load_external_seed_products_for_search(
             include_seed_data_text_match=True,
             only_unattached=False,
             query_timeout_seconds=max(float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35), 0.8),
+            required_terms=required_terms,
+            prefer_terms=prefer_terms,
+            scope="brand_broad" if brand_query_detected else scope,
         )
         broad_rows = broad_fetch_result.get("rows") or []
         if broad_rows:
@@ -1703,6 +1839,8 @@ async def _load_external_seed_products_for_search(
                 metrics["broad_scope_fallback_used"] = True
                 metrics["broad_scope_rows_fetched"] = len(broad_rows)
     if metrics is not None:
+        metrics["brand_strict_rows"] = int(strict_rows_count)
+        metrics["brand_relevant_rows"] = int(strict_brand_relevant_rows)
         metrics["query_timeout"] = bool(fetch_result.get("query_timeout") or False)
         metrics["query_ms"] = max(0, int(fetch_result.get("query_ms") or 0))
         metrics["rows_fetched"] = len(rows)
@@ -2377,7 +2515,7 @@ async def agent_search_products(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
-    limit: int = Query(default=20, le=100),
+    limit: int = Query(default=20, le=200),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     external_seed_only: bool = Query(default=False),
@@ -2488,6 +2626,17 @@ async def agent_search_products(
         brand_query = _detect_brand_query(normalized_query)
         brand_query_detected = bool(brand_query.get("brand_like"))
         brand_query_terms: List[str] = list(brand_query.get("brand_terms") or [])
+        normalized_brand_query_terms = _normalize_external_seed_terms(brand_query_terms, max_terms=8)
+        brand_required_terms: List[str] = []
+        for term in normalized_brand_query_terms:
+            tokens = [token for token in re.findall(r"[a-z0-9]+", term) if token]
+            core_tokens = [token for token in tokens if token not in _BRAND_HINT_SUFFIXES]
+            chosen_tokens = core_tokens or tokens
+            for token in chosen_tokens:
+                if token not in brand_required_terms:
+                    brand_required_terms.append(token)
+        brand_prefer_terms = normalized_brand_query_terms
+        external_seed_scope = "brand_strict" if brand_query_detected else "default"
         brand_scope = str(brand_query.get("scope") or "") or None
         brand_detection_mode = str(brand_query.get("mode") or "") or None
         _push_gate_trace(
@@ -2826,6 +2975,8 @@ async def agent_search_products(
                 and merchant_id != EXTERNAL_SEED_MERCHANT_ID
                 and is_cross_merchant_scope
                 and (
+                    (brand_query_detected and bool(normalized_query))
+                    or
                     (is_unified_relevance and bool(normalized_query))
                     or len(paginated_products) < limit
                 )
@@ -2853,6 +3004,11 @@ async def agent_search_products(
                         normalized_catalog_surface=normalized_catalog_surface,
                         page_offset=offset,
                         enable_broad_fallback=brand_query_detected,
+                        brand_terms=brand_query_terms,
+                        brand_query_detected=brand_query_detected,
+                        required_terms=brand_required_terms if brand_query_detected else None,
+                        prefer_terms=brand_prefer_terms if brand_query_detected else None,
+                        scope=external_seed_scope,
                         metrics_out=seed_metrics,
                     )
                     _apply_external_seed_metrics(
@@ -2888,7 +3044,7 @@ async def agent_search_products(
                             query_terms=query_terms,
                         )
                         if brand_query_detected and not brand_relevant:
-                            score = max(0.0, float(score or 0.0) * 0.65)
+                            continue
                         if normalized_query and score <= 0:
                             continue
                         product = dict(product)
@@ -2898,13 +3054,22 @@ async def agent_search_products(
                         product["ranking_features"] = {"mode": "fast_mode_external_seed"}
                         seen_keys.add(key)
                         to_append.append(product)
-                        if not is_unified_relevance and len(paginated_products) + len(to_append) >= limit:
+                        if (
+                            not is_unified_relevance
+                            and not brand_query_detected
+                            and len(paginated_products) + len(to_append) >= limit
+                        ):
                             break
                     if to_append:
                         if is_unified_relevance:
-                            merged = (fast_ranked_candidates or paginated_products) + to_append
+                            base_pool = list(fast_ranked_candidates or paginated_products)
+                            if brand_query_detected:
+                                merged = to_append + base_pool
+                            else:
+                                merged = base_pool + to_append
                             merged.sort(
                                 key=lambda p: (
+                                    bool(brand_query_detected and _is_external_seed_product(p) and p.get("_brand_relevant")),
                                     p.get("ranking_score") is not None,
                                     p.get("ranking_score", p.get("relevance_score", 0.0)),
                                 ),
@@ -2914,11 +3079,22 @@ async def agent_search_products(
                             total = unified_merge_pool_size
                             paginated_products = merged[offset : offset + limit]
                             fast_ranked_candidates = merged
-                            external_seed_inclusion_reason = "unified_pool_merge"
+                            external_seed_inclusion_reason = (
+                                "brand_external_priority_unified_merge"
+                                if brand_query_detected
+                                else "unified_pool_merge"
+                            )
                         else:
-                            paginated_products.extend(to_append)
-                            total = max(total, int(offset or 0) + len(paginated_products))
-                            external_seed_inclusion_reason = "supplement_underfill"
+                            if brand_query_detected:
+                                merged = to_append + list(paginated_products)
+                                fast_ranked_candidates = merged
+                                total = len(merged)
+                                paginated_products = merged[offset : offset + limit]
+                                external_seed_inclusion_reason = "brand_external_priority_supplement"
+                            else:
+                                paginated_products.extend(to_append)
+                                total = max(total, int(offset or 0) + len(paginated_products))
+                                external_seed_inclusion_reason = "supplement_underfill"
                         external_count_now = sum(1 for p in paginated_products if _is_external_seed_product(p))
                         source_breakdown["external_seed_count"] = external_count_now
                         source_breakdown["internal_count"] = max(0, len(paginated_products) - external_count_now)
@@ -2940,7 +3116,11 @@ async def agent_search_products(
                     reason = "merchant_scope_external_seed_only"
                 elif not (merchant_id is None and not merchant_ids):
                     reason = "non_cross_merchant_scope"
-                elif normalized_seed_strategy == "supplement_internal_first" and len(paginated_products) >= limit:
+                elif (
+                    normalized_seed_strategy == "supplement_internal_first"
+                    and len(paginated_products) >= limit
+                    and not brand_query_detected
+                ):
                     reason = "page_already_full"
                 else:
                     reason = "not_applicable"
@@ -3080,6 +3260,18 @@ async def agent_search_products(
                     "external_seed_only_requested": requested_external_seed_only,
                     "external_seed_inclusion_reason": external_seed_inclusion_reason,
                     "external_seed_skip_reason": external_seed_skip_reason,
+                    "external_seed_brand_strict_rows": int(
+                        external_seed_health.get("external_seed_brand_strict_rows") or 0
+                    ),
+                    "external_seed_brand_relevant_rows": int(
+                        external_seed_health.get("external_seed_brand_relevant_rows") or 0
+                    ),
+                    "external_seed_broad_fallback_used": bool(
+                        external_seed_health.get("external_seed_broad_fallback_used") or False
+                    ),
+                    "external_seed_broad_scope_rows": int(
+                        external_seed_health.get("external_seed_broad_scope_rows") or 0
+                    ),
                     "low_confidence": low_confidence,
                     "low_confidence_reasons": low_confidence_reasons,
                     "external_seed_cache_status": str(
@@ -3250,6 +3442,11 @@ async def agent_search_products(
                     normalized_catalog_surface=normalized_catalog_surface,
                     page_offset=offset,
                     enable_broad_fallback=brand_query_detected,
+                    brand_terms=brand_query_terms,
+                    brand_query_detected=brand_query_detected,
+                    required_terms=brand_required_terms if brand_query_detected else None,
+                    prefer_terms=brand_prefer_terms if brand_query_detected else None,
+                    scope=external_seed_scope,
                     metrics_out=seed_metrics,
                 )
                 _apply_external_seed_metrics(
@@ -3413,6 +3610,18 @@ async def agent_search_products(
                     "brand_entities": brand_query_terms,
                     "brand_scope": brand_scope,
                     "brand_detection_mode": brand_detection_mode,
+                    "external_seed_brand_strict_rows": int(
+                        external_seed_health.get("external_seed_brand_strict_rows") or 0
+                    ),
+                    "external_seed_brand_relevant_rows": int(
+                        external_seed_health.get("external_seed_brand_relevant_rows") or 0
+                    ),
+                    "external_seed_broad_fallback_used": bool(
+                        external_seed_health.get("external_seed_broad_fallback_used") or False
+                    ),
+                    "external_seed_broad_scope_rows": int(
+                        external_seed_health.get("external_seed_broad_scope_rows") or 0
+                    ),
                     "search_window": {
                         "per_merchant_limit": per_merchant_limit,
                         "merchants_searched": len(merchants_to_search),
@@ -3870,6 +4079,18 @@ async def agent_search_products(
                 },
                 "external_seed_inclusion_reason": external_seed_inclusion_reason,
                 "external_seed_skip_reason": external_seed_skip_reason,
+                "external_seed_brand_strict_rows": int(
+                    external_seed_health.get("external_seed_brand_strict_rows") or 0
+                ),
+                "external_seed_brand_relevant_rows": int(
+                    external_seed_health.get("external_seed_brand_relevant_rows") or 0
+                ),
+                "external_seed_broad_fallback_used": bool(
+                    external_seed_health.get("external_seed_broad_fallback_used") or False
+                ),
+                "external_seed_broad_scope_rows": int(
+                    external_seed_health.get("external_seed_broad_scope_rows") or 0
+                ),
                 "low_confidence": low_confidence,
                 "low_confidence_reasons": low_confidence_reasons,
                 "external_seed_cache_status": str(
@@ -3944,7 +4165,7 @@ async def agent_search_products_beauty(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
-    limit: int = Query(default=20, le=100),
+    limit: int = Query(default=20, le=200),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),

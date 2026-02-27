@@ -89,6 +89,29 @@ def _build_text_match_clause(*, param_key: str, include_seed_data_text_match: bo
     return "(" + " OR ".join(parts) + ")"
 
 
+def _normalize_text_terms(raw_terms: Optional[List[str]], *, max_terms: int = 8) -> List[str]:
+    terms: List[str] = []
+    seen = set()
+    for item in raw_terms or []:
+        token = str(item or "").strip().lower()
+        if not token:
+            continue
+        normalized = " ".join(re.findall(r"[a-z0-9]+", token))
+        if not normalized:
+            continue
+        if normalized in _EXTERNAL_SEED_QUERY_STOPWORDS:
+            continue
+        if len(normalized) <= 1:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        terms.append(normalized)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
 def build_external_seed_text_clause(
     *,
     raw_query: Optional[str],
@@ -167,6 +190,9 @@ async def fetch_external_seed_rows(
     include_seed_data_text_match: bool = False,
     only_unattached: bool = True,
     query_timeout_seconds: float = 0.35,
+    required_terms: Optional[List[str]] = None,
+    prefer_terms: Optional[List[str]] = None,
+    scope: str = "default",
 ) -> Dict[str, Any]:
     where = ["status = :status"]
     values: Dict[str, Any] = {
@@ -189,6 +215,27 @@ async def fetch_external_seed_rows(
         where.append(text_clause)
         values.update(text_values)
 
+    required_term_list = _normalize_text_terms(required_terms, max_terms=6)
+    for idx, term in enumerate(required_term_list):
+        term_key = f"required_term_{idx}"
+        values[term_key] = f"%{term}%"
+        where.append(
+            _build_text_match_clause(
+                param_key=term_key,
+                include_seed_data_text_match=include_seed_data_text_match,
+            )
+        )
+
+    prefer_term_list = _normalize_text_terms(prefer_terms, max_terms=8)
+    prefer_term_clauses: List[str] = []
+    for idx, term in enumerate(prefer_term_list):
+        term_key = f"prefer_term_{idx}"
+        values[term_key] = f"%{term}%"
+        prefer_term_clauses.append(
+            f"CASE WHEN {_build_text_match_clause(param_key=term_key, include_seed_data_text_match=include_seed_data_text_match)} THEN 1 ELSE 0 END"
+        )
+    brand_term_hit_expr = " + ".join(prefer_term_clauses) if prefer_term_clauses else "0"
+
     query_sql = f"""
                 SELECT
                   id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
@@ -197,10 +244,11 @@ async def fetch_external_seed_rows(
                   seed_data,
                   status, notes, created_by_employee_id,
                   attached_product_key, attached_variant_id,
-                  created_at, updated_at
+                  created_at, updated_at,
+                  ({brand_term_hit_expr}) AS brand_term_hit
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
-                ORDER BY updated_at DESC, created_at DESC
+                ORDER BY brand_term_hit DESC, updated_at DESC, created_at DESC
                 LIMIT :limit OFFSET :offset
                 """
     count_sql = f"""
@@ -299,6 +347,7 @@ async def fetch_external_seed_rows(
             "query_ms": int((time.perf_counter() - started) * 1000),
             "query_timeout": False,
             "table_missing": False,
+            "scope": str(scope or "default"),
         }
     except asyncio.TimeoutError:
         return {
