@@ -2432,22 +2432,30 @@ async def agent_search_products(
             and min_price is None
             and max_price is None
         )
+        requested_search_all_merchants = search_all_merchants is True
+        requested_external_seed_only = bool(external_seed_only)
         merchant_scope_override_reason: Optional[str] = None
+        if (
+            requested_search_all_merchants
+            and not merchant_ids
+            and (not merchant_id or merchant_id == EXTERNAL_SEED_MERCHANT_ID)
+        ):
+            if external_seed_only:
+                external_seed_only = False
+                merchant_scope_override_reason = (
+                    merchant_scope_override_reason
+                    or "search_all_merchants_overrode_external_seed_only"
+                )
+            if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
+                merchant_id = None
+                merchant_scope_override_reason = (
+                    merchant_scope_override_reason
+                    or "search_all_merchants_overrode_external_seed_scope"
+                )
         if external_seed_only and not merchant_id:
             merchant_id = EXTERNAL_SEED_MERCHANT_ID
         if external_seed_only and fast_mode_enabled:
             fast_mode_enabled = False
-        if (
-            search_all_merchants is True
-            and not external_seed_only
-            and merchant_id == EXTERNAL_SEED_MERCHANT_ID
-            and not merchant_ids
-        ):
-            merchant_id = None
-            merchant_scope_override_reason = (
-                merchant_scope_override_reason
-                or "search_all_merchants_overrode_external_seed_scope"
-            )
 
         # Fast path: cross-merchant browse (empty query/filters).
         #
@@ -2619,8 +2627,8 @@ async def agent_search_products(
                         ),
                         "external_seed_returned_count": 0,
                         "merchant_scope_override_reason": merchant_scope_override_reason,
-                        "search_all_merchants_requested": search_all_merchants is True,
-                        "external_seed_only_requested": bool(external_seed_only),
+                        "search_all_merchants_requested": requested_search_all_merchants,
+                        "external_seed_only_requested": requested_external_seed_only,
                     },
                 }
             except Exception:
@@ -2918,8 +2926,8 @@ async def agent_search_products(
                     "brand_scope": brand_scope,
                     "brand_detection_mode": brand_detection_mode,
                     "merchant_scope_override_reason": merchant_scope_override_reason,
-                    "search_all_merchants_requested": search_all_merchants is True,
-                    "external_seed_only_requested": bool(external_seed_only),
+                    "search_all_merchants_requested": requested_search_all_merchants,
+                    "external_seed_only_requested": requested_external_seed_only,
                     "external_seed_inclusion_reason": external_seed_inclusion_reason,
                     "external_seed_skip_reason": external_seed_skip_reason,
                     "external_seed_cache_status": str(
@@ -3637,8 +3645,8 @@ async def agent_search_products(
                 "brand_scope": brand_scope,
                 "brand_detection_mode": brand_detection_mode,
                 "merchant_scope_override_reason": merchant_scope_override_reason,
-                "search_all_merchants_requested": search_all_merchants is True,
-                "external_seed_only_requested": bool(external_seed_only),
+                "search_all_merchants_requested": requested_search_all_merchants,
+                "external_seed_only_requested": requested_external_seed_only,
                 "search_window": {
                     "per_merchant_limit": per_merchant_limit,
                     "merchants_searched": len(merchants_to_search),
