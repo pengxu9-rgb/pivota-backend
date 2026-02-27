@@ -2437,6 +2437,17 @@ async def agent_search_products(
             merchant_id = EXTERNAL_SEED_MERCHANT_ID
         if external_seed_only and fast_mode_enabled:
             fast_mode_enabled = False
+        if (
+            search_all_merchants is True
+            and not external_seed_only
+            and merchant_id == EXTERNAL_SEED_MERCHANT_ID
+            and not merchant_ids
+        ):
+            merchant_id = None
+            merchant_scope_override_reason = (
+                merchant_scope_override_reason
+                or "search_all_merchants_overrode_external_seed_scope"
+            )
 
         # Fast path: cross-merchant browse (empty query/filters).
         #
@@ -2608,6 +2619,8 @@ async def agent_search_products(
                         ),
                         "external_seed_returned_count": 0,
                         "merchant_scope_override_reason": merchant_scope_override_reason,
+                        "search_all_merchants_requested": search_all_merchants is True,
+                        "external_seed_only_requested": bool(external_seed_only),
                     },
                 }
             except Exception:
@@ -2905,6 +2918,8 @@ async def agent_search_products(
                     "brand_scope": brand_scope,
                     "brand_detection_mode": brand_detection_mode,
                     "merchant_scope_override_reason": merchant_scope_override_reason,
+                    "search_all_merchants_requested": search_all_merchants is True,
+                    "external_seed_only_requested": bool(external_seed_only),
                     "external_seed_inclusion_reason": external_seed_inclusion_reason,
                     "external_seed_skip_reason": external_seed_skip_reason,
                     "external_seed_cache_status": str(
@@ -3622,6 +3637,8 @@ async def agent_search_products(
                 "brand_scope": brand_scope,
                 "brand_detection_mode": brand_detection_mode,
                 "merchant_scope_override_reason": merchant_scope_override_reason,
+                "search_all_merchants_requested": search_all_merchants is True,
+                "external_seed_only_requested": bool(external_seed_only),
                 "search_window": {
                     "per_merchant_limit": per_merchant_limit,
                     "merchants_searched": len(merchants_to_search),
