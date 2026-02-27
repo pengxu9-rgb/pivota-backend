@@ -915,6 +915,7 @@ def _build_external_seed_cache_key(
     market: str,
     strategy: str,
     surface: str,
+    scope: str = "default",
     limit: int,
     page_offset: int = 0,
 ) -> str:
@@ -922,10 +923,11 @@ def _build_external_seed_cache_key(
     normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
     normalized_surface = str(surface or "all").strip().lower() or "all"
+    normalized_scope = str(scope or "default").strip().lower() or "default"
     limit_bucket = _external_seed_limit_bucket(limit)
     offset_bucket = max(0, int(page_offset or 0))
     return (
-        f"{normalized_query}|{normalized_market}|{normalized_strategy}|"
+        f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_scope}|"
         f"{normalized_surface}|{limit_bucket}|{offset_bucket}"
     )
 
@@ -969,6 +971,7 @@ def _schedule_external_seed_cache_refresh(
     build_budget_ms: Optional[int],
     build_concurrency: Optional[int],
     include_seed_data_text_match: bool,
+    enable_broad_fallback: bool,
 ) -> bool:
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
     if existing is not None and not existing.done():
@@ -984,6 +987,7 @@ def _schedule_external_seed_cache_refresh(
                 build_budget_ms=build_budget_ms,
                 build_concurrency=build_concurrency,
                 include_seed_data_text_match=include_seed_data_text_match,
+                enable_broad_fallback=enable_broad_fallback,
                 metrics_out={},
             )
             _put_cached_external_seed_products(cache_key, refreshed or [])
@@ -1007,6 +1011,7 @@ async def _load_external_seed_products_with_cache(
     normalized_seed_strategy: str,
     normalized_catalog_surface: str,
     page_offset: int,
+    enable_broad_fallback: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
@@ -1031,6 +1036,7 @@ async def _load_external_seed_products_with_cache(
             build_budget_ms=build_budget_ms,
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
+            enable_broad_fallback=enable_broad_fallback,
             metrics_out=metrics,
         )
 
@@ -1046,6 +1052,7 @@ async def _load_external_seed_products_with_cache(
             build_budget_ms=build_budget_ms,
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
+            enable_broad_fallback=enable_broad_fallback,
             metrics_out=metrics,
         )
 
@@ -1054,6 +1061,7 @@ async def _load_external_seed_products_with_cache(
         market=DEFAULT_EXTERNAL_SEED_MARKET,
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
+        scope="brand_broad" if enable_broad_fallback else "default",
         limit=limit,
         page_offset=page_offset,
     )
@@ -1079,6 +1087,7 @@ async def _load_external_seed_products_with_cache(
         build_budget_ms=build_budget_ms,
         build_concurrency=build_concurrency,
         include_seed_data_text_match=include_seed_data_text_match,
+        enable_broad_fallback=enable_broad_fallback,
         metrics_out=metrics,
     )
     metrics["executed"] = True
@@ -1094,6 +1103,7 @@ async def _load_external_seed_products_with_cache(
             build_budget_ms=build_budget_ms,
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
+            enable_broad_fallback=enable_broad_fallback,
         )
     return sync_rows[:limit]
 
@@ -1638,6 +1648,7 @@ async def _load_external_seed_products_for_search(
     build_budget_ms: Optional[int] = None,
     build_concurrency: Optional[int] = None,
     include_seed_data_text_match: bool = False,
+    enable_broad_fallback: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -1653,6 +1664,8 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("rows_fetched", 0)
         metrics.setdefault("rows_built", 0)
         metrics.setdefault("budget_exhausted", False)
+        metrics.setdefault("broad_scope_fallback_used", False)
+        metrics.setdefault("broad_scope_rows_fetched", 0)
 
     fetch_result = await fetch_external_seed_rows(
         database=database,
@@ -1661,9 +1674,34 @@ async def _load_external_seed_products_for_search(
         limit=limit,
         offset=max(0, int(page_offset or 0)),
         include_seed_data_text_match=include_seed_data_text_match,
+        only_unattached=True,
         query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
     )
     rows = fetch_result.get("rows") or []
+    if (
+        enable_broad_fallback
+        and str(query or "").strip()
+        and int(page_offset or 0) == 0
+        and not rows
+    ):
+        broad_limit = min(1000, max(int(limit or 20) * 4, 120))
+        broad_fetch_result = await fetch_external_seed_rows(
+            database=database,
+            market=None,
+            query=query,
+            limit=broad_limit,
+            offset=0,
+            include_seed_data_text_match=True,
+            only_unattached=False,
+            query_timeout_seconds=max(float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35), 0.8),
+        )
+        broad_rows = broad_fetch_result.get("rows") or []
+        if broad_rows:
+            rows = broad_rows
+            fetch_result = broad_fetch_result
+            if metrics is not None:
+                metrics["broad_scope_fallback_used"] = True
+                metrics["broad_scope_rows_fetched"] = len(broad_rows)
     if metrics is not None:
         metrics["query_timeout"] = bool(fetch_result.get("query_timeout") or False)
         metrics["query_ms"] = max(0, int(fetch_result.get("query_ms") or 0))
@@ -2814,6 +2852,7 @@ async def agent_search_products(
                         normalized_seed_strategy=normalized_seed_strategy,
                         normalized_catalog_surface=normalized_catalog_surface,
                         page_offset=offset,
+                        enable_broad_fallback=brand_query_detected,
                         metrics_out=seed_metrics,
                     )
                     _apply_external_seed_metrics(
@@ -2954,6 +2993,10 @@ async def agent_search_products(
                     )
                     low_confidence = True
                     low_confidence_reasons.append("brand_strict_no_match_fallback_broad")
+                    if not paginated_products and merged_pool_for_brand:
+                        total = len(merged_pool_for_brand)
+                        unified_merge_pool_size = total
+                        paginated_products = merged_pool_for_brand[offset : offset + limit]
             external_count_after_brand = sum(
                 1 for item in paginated_products if _is_external_seed_product(item)
             )
@@ -3206,6 +3249,7 @@ async def agent_search_products(
                     normalized_seed_strategy=normalized_seed_strategy,
                     normalized_catalog_surface=normalized_catalog_surface,
                     page_offset=offset,
+                    enable_broad_fallback=brand_query_detected,
                     metrics_out=seed_metrics,
                 )
                 _apply_external_seed_metrics(

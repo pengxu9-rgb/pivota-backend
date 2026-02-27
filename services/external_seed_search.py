@@ -160,20 +160,26 @@ def _database_supports_statement_timeout(database: Any) -> bool:
 async def fetch_external_seed_rows(
     *,
     database: Any,
-    market: str,
+    market: Optional[str],
     query: Optional[str],
     limit: int,
     offset: int = 0,
     include_seed_data_text_match: bool = False,
+    only_unattached: bool = True,
     query_timeout_seconds: float = 0.35,
 ) -> Dict[str, Any]:
-    where = ["status = :status", "attached_product_key IS NULL", "market = :market"]
+    where = ["status = :status"]
     values: Dict[str, Any] = {
         "status": "active",
-        "market": str(market or "US").strip().upper() or "US",
         "limit": max(1, int(limit or 1)),
         "offset": max(0, int(offset or 0)),
     }
+    if only_unattached:
+        where.append("attached_product_key IS NULL")
+    normalized_market = str(market or "").strip().upper()
+    if normalized_market:
+        where.append("market = :market")
+        values["market"] = normalized_market
     text_clause, text_values = build_external_seed_text_clause(
         raw_query=query,
         include_seed_data_text_match=include_seed_data_text_match,
