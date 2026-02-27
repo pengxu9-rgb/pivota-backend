@@ -444,52 +444,6 @@ async def get_agent_usage(
         raise HTTPException(status_code=500, detail="Failed to get usage logs")
 
 
-@router.post("/{agent_id}/reset-api-key")
-async def reset_agent_api_key(
-    agent_id: str,
-    admin_user: dict = Depends(get_current_employee)
-):
-    """
-    重置 Agent API Key
-    
-    生成新的 API Key，旧的将失效
-    """
-    try:
-        import secrets
-        import hashlib
-        
-        # 检查 Agent 是否存在
-        agent = await get_agent(agent_id)
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        # 生成新的 API Key (ak_live_ format)
-        new_api_key = f"ak_live_{secrets.token_hex(32)}"
-        new_api_key_hash = hashlib.sha256(new_api_key.encode()).hexdigest()
-        
-        # 更新数据库
-        query = agents.update().where(agents.c.agent_id == agent_id).values(
-            api_key=new_api_key,
-            api_key_hash=new_api_key_hash,
-            updated_at=datetime.utcnow()
-        )
-        await database.execute(query)
-        
-        logger.info(f"API Key reset for agent {agent_id} by admin {admin_user['user_id']}")
-        
-        return {
-            "status": "success",
-            "agent_id": agent_id,
-            "new_api_key": new_api_key,
-            "warning": "Please save the new API key securely. The old key is now invalid."
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to reset API key: {e}")
-        raise HTTPException(status_code=500, detail="Failed to reset API key")
-
 @router.get("/{agent_id}/funnel")
 async def get_agent_conversion_funnel(
     agent_id: str,
@@ -801,4 +755,3 @@ async def get_agent_merchant_authorizations(
     except Exception as e:
         logger.error(f"Failed to get merchant authorizations: {e}")
         raise HTTPException(status_code=500, detail="Failed to get merchant authorizations")
-

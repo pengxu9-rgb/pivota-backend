@@ -244,25 +244,121 @@ async def reset_agent_api_key(
         user_agent_id = current_user.get("agent_id") or current_user.get("email")
         if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
             raise HTTPException(status_code=403, detail="Not authorized to reset this API key")
-        
-        # Generate new API key
-        new_api_key = f"pk_live_{secrets.token_urlsafe(32)[:32]}"
-        
-        # Update in database
-        await database.execute(
-            """
-            UPDATE agents 
-            SET api_key = :api_key
-            WHERE agent_id = :agent_id
-            """,
-            {"api_key": new_api_key, "agent_id": agent_id}
-        )
-        
+
+        # Generate a standards-compliant external key:
+        #   ak_live_ + 64 lowercase hex chars.
+        new_api_key = f"ak_live_{secrets.token_hex(32)}"
+        new_key_hash = hashlib.sha256(new_api_key.encode("utf-8")).hexdigest()
+
+        # Keep legacy agents table in sync.
+        try:
+            await database.execute(
+                """
+                UPDATE agents
+                SET api_key = :api_key, api_key_hash = :api_key_hash
+                WHERE agent_id = :agent_id
+                """,
+                {"api_key": new_api_key, "api_key_hash": new_key_hash, "agent_id": agent_id},
+            )
+        except Exception:
+            # Backward compatibility for schemas without api_key_hash.
+            await database.execute(
+                """
+                UPDATE agents
+                SET api_key = :api_key
+                WHERE agent_id = :agent_id
+                """,
+                {"api_key": new_api_key, "agent_id": agent_id},
+            )
+
+        # Sync with hash-key auth tables so get_agent_by_key keeps working.
+        key_sync_source = "legacy"
+        try:
+            table_info = await database.fetch_one(
+                """
+                SELECT
+                  to_regclass('public.api_keys') AS api_keys_table,
+                  to_regclass('public.agent_api_keys') AS agent_api_keys_table
+                """
+            )
+            table_dict = dict(table_info or {})
+            has_api_keys = bool(table_dict.get("api_keys_table"))
+            has_agent_api_keys = bool(table_dict.get("agent_api_keys_table"))
+        except Exception:
+            has_api_keys = False
+            has_agent_api_keys = False
+
+        if has_api_keys:
+            await database.execute(
+                """
+                UPDATE api_keys
+                SET status = 'revoked'
+                WHERE agent_id = :agent_id AND status = 'active'
+                """,
+                {"agent_id": agent_id},
+            )
+            await database.execute(
+                """
+                INSERT INTO api_keys (agent_id, name, key_hash, key_prefix, status)
+                VALUES (:agent_id, :name, :key_hash, :key_prefix, 'active')
+                """,
+                {
+                    "agent_id": agent_id,
+                    "name": "Primary Key (Rotated)",
+                    "key_hash": new_key_hash,
+                    "key_prefix": new_api_key[:10],
+                },
+            )
+            key_sync_source = "api_keys"
+        elif has_agent_api_keys:
+            await database.execute(
+                """
+                UPDATE agent_api_keys
+                SET is_active = FALSE, last_rotated_at = NOW()
+                WHERE agent_id = :agent_id AND COALESCE(is_active, TRUE) = TRUE
+                """,
+                {"agent_id": agent_id},
+            )
+            await database.execute(
+                """
+                INSERT INTO agent_api_keys (
+                    key_id,
+                    agent_id,
+                    key_hash,
+                    key_prefix,
+                    is_active,
+                    created_by,
+                    created_at
+                )
+                VALUES (
+                    :key_id,
+                    :agent_id,
+                    :key_hash,
+                    :key_prefix,
+                    TRUE,
+                    :created_by,
+                    NOW()
+                )
+                """,
+                {
+                    "key_id": f"key_{secrets.token_hex(8)}",
+                    "agent_id": agent_id,
+                    "key_hash": new_key_hash,
+                    "key_prefix": new_api_key[:12] + "...",
+                    "created_by": "self_reset",
+                },
+            )
+            key_sync_source = "agent_api_keys"
+
         return {
             "status": "success",
-            "api_key": new_api_key
+            "api_key": new_api_key,
+            "new_api_key": new_api_key,
+            "key_sync_source": key_sync_source,
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error resetting API key: {e}")
         raise HTTPException(status_code=500, detail="Failed to reset API key")
