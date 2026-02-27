@@ -1343,6 +1343,12 @@ async def _search_products_fast_mode(
     ranked: List[Dict[str, Any]]
     if normalized_seed_strategy == "supplement_internal_first":
         ranked = internal_ranked + external_ranked
+    elif normalized_seed_strategy == "unified_relevance":
+        ranked = internal_ranked + external_ranked
+        ranked.sort(
+            key=lambda p: float(p.get("ranking_score", p.get("relevance_score", 0.0)) or 0.0),
+            reverse=True,
+        )
     else:
         ranked = internal_ranked + external_ranked
 
@@ -1364,6 +1370,7 @@ async def _search_products_fast_mode(
         "products": paginated,
         "total": total,
         "source_breakdown": source_breakdown,
+        "ranked_candidates": ranked,
     }
 
 
@@ -2583,8 +2590,10 @@ async def agent_search_products(
                 allow_stale_cache=allow_stale_cache,
             )
             paginated_products = list(fast_result["products"])
+            fast_ranked_candidates = list(fast_result.get("ranked_candidates") or [])
             total = int(fast_result["total"] or 0)
             source_breakdown = dict(fast_result["source_breakdown"] or {})
+            unified_merge_pool_size = len(fast_ranked_candidates) if fast_ranked_candidates else total
 
             fast_seed_stage_started = time.perf_counter()
             is_cross_merchant_scope = merchant_id is None and not merchant_ids
@@ -2629,7 +2638,7 @@ async def agent_search_products(
                     )
                     seen_keys = {
                         f"{str(p.get('merchant_id') or '').strip()}::{str(p.get('product_id') or p.get('id') or '').strip()}"
-                        for p in paginated_products
+                        for p in (fast_ranked_candidates or paginated_products)
                     }
                     to_append: List[Dict[str, Any]] = []
                     for product in external_seed_products or []:
@@ -2663,8 +2672,8 @@ async def agent_search_products(
                         if not is_unified_relevance and len(paginated_products) + len(to_append) >= limit:
                             break
                     if to_append:
-                        if is_unified_relevance and int(offset or 0) == 0:
-                            merged = paginated_products + to_append
+                        if is_unified_relevance:
+                            merged = (fast_ranked_candidates or paginated_products) + to_append
                             merged.sort(
                                 key=lambda p: (
                                     p.get("ranking_score") is not None,
@@ -2672,11 +2681,13 @@ async def agent_search_products(
                                 ),
                                 reverse=True,
                             )
-                            paginated_products = merged[:limit]
-                            total = max(total, len(merged))
+                            unified_merge_pool_size = len(merged)
+                            total = unified_merge_pool_size
+                            paginated_products = merged[offset : offset + limit]
+                            fast_ranked_candidates = merged
                         else:
                             paginated_products.extend(to_append)
-                            total = max(total, len(paginated_products))
+                            total = max(total, int(offset or 0) + len(paginated_products))
                         external_count_now = sum(1 for p in paginated_products if _is_external_seed_product(p))
                         source_breakdown["external_seed_count"] = external_count_now
                         source_breakdown["internal_count"] = max(0, len(paginated_products) - external_count_now)
@@ -2767,6 +2778,7 @@ async def agent_search_products(
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "retrieval_mix_strategy": normalized_seed_strategy,
+                    "unified_merge_pool_size": int(unified_merge_pool_size or len(paginated_products)),
                     "brand_query_detected": brand_query_detected,
                     "brand_entities": brand_query_terms,
                     "brand_scope": brand_scope,
@@ -3073,6 +3085,7 @@ async def agent_search_products(
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "retrieval_mix_strategy": normalized_seed_strategy,
+                    "unified_merge_pool_size": int(len(all_products)),
                     "brand_query_detected": brand_query_detected,
                     "brand_entities": brand_query_terms,
                     "brand_scope": brand_scope,
@@ -3464,6 +3477,7 @@ async def agent_search_products(
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
                 "retrieval_mix_strategy": normalized_seed_strategy,
+                "unified_merge_pool_size": int(len(ranked_candidates)),
                 "brand_query_detected": brand_query_detected,
                 "brand_entities": brand_query_terms,
                 "brand_scope": brand_scope,
