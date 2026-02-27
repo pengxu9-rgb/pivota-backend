@@ -2369,6 +2369,40 @@ async def agent_search_products(
         int(getattr(getattr(req, "state", None), "agent_dependency_total_ms", 0) or 0),
     )
     db_pool_wait_ms = max(0, int(getattr(getattr(req, "state", None), "db_pool_wait_ms", 0) or 0))
+    gate_trace: List[Dict[str, Any]] = []
+
+    def _push_gate_trace(
+        gate_id: str,
+        applied: bool,
+        decision: str,
+        reason: Optional[str] = None,
+        cost_ms_estimate: int = 0,
+        query_class: Optional[str] = None,
+    ) -> None:
+        gate_trace.append(
+            {
+                "gate_id": str(gate_id or "unknown"),
+                "applied": bool(applied),
+                "decision": str(decision or "pass"),
+                "reason": str(reason) if reason else None,
+                "cost_ms_estimate": max(0, int(cost_ms_estimate or 0)),
+                "query_class": str(query_class) if query_class else None,
+            }
+        )
+
+    def _gate_summary() -> Dict[str, Any]:
+        return {
+            "applied_count": sum(1 for item in gate_trace if item.get("applied")),
+            "blocked_count": sum(
+                1
+                for item in gate_trace
+                if str(item.get("decision") or "")
+                in {"strict_empty", "clarify_only_early", "skipped"}
+            ),
+            "total_cost_ms_estimate": sum(
+                max(0, int(item.get("cost_ms_estimate") or 0)) for item in gate_trace
+            ),
+        }
     try:
         def _record_search_metric(*, mode: str, path: str, result: str) -> None:
             try:
@@ -2384,6 +2418,13 @@ async def agent_search_products(
         normalized_seed_strategy = str(external_seed_strategy or "legacy").strip().lower()
         if normalized_seed_strategy not in {"legacy", "supplement_internal_first", "unified_relevance"}:
             normalized_seed_strategy = "legacy"
+        _push_gate_trace(
+            gate_id="seed_strategy",
+            applied=True,
+            decision="configured",
+            reason=normalized_seed_strategy,
+            cost_ms_estimate=5,
+        )
         # Defensive normalization: this handler is also called directly by
         # other routes (not only via FastAPI parameter parsing).
         if isinstance(fast_mode, bool):
@@ -2411,6 +2452,14 @@ async def agent_search_products(
         brand_query_terms: List[str] = list(brand_query.get("brand_terms") or [])
         brand_scope = str(brand_query.get("scope") or "") or None
         brand_detection_mode = str(brand_query.get("mode") or "") or None
+        _push_gate_trace(
+            gate_id="brand_detection",
+            applied=brand_query_detected,
+            decision="detected" if brand_query_detected else "pass",
+            reason=brand_detection_mode if brand_query_detected else None,
+            cost_ms_estimate=8,
+            query_class="brand_query" if brand_query_detected else None,
+        )
         include_seed_data_text_match = bool(
             brand_query_detected
             or normalized_seed_strategy == "legacy"
@@ -2700,6 +2749,13 @@ async def agent_search_products(
                 }
 
         if fast_mode_enabled:
+            _push_gate_trace(
+                gate_id="fast_mode",
+                applied=True,
+                decision="applied",
+                reason="cross_merchant_search_fast_mode",
+                cost_ms_estimate=35,
+            )
             merchant_scope_for_fast = list(dict.fromkeys([m for m in merchants_to_search if m])) if merchants_to_search else None
             fast_result = await _search_products_fast_mode(
                 merchant_scope=merchant_scope_for_fast,
@@ -2782,16 +2838,22 @@ async def agent_search_products(
                             continue
                         if not _passes_category_filter_fast(product, normalized_category):
                             continue
-                        if brand_query_detected and not _is_brand_relevant_product(product, brand_query_terms):
-                            continue
+                        brand_relevant = (
+                            _is_brand_relevant_product(product, brand_query_terms)
+                            if brand_query_detected
+                            else True
+                        )
                         score = _score_fast_mode_relevance(
                             product,
                             normalized_query=normalized_query,
                             query_terms=query_terms,
                         )
+                        if brand_query_detected and not brand_relevant:
+                            score = max(0.0, float(score or 0.0) * 0.65)
                         if normalized_query and score <= 0:
                             continue
                         product = dict(product)
+                        product["_brand_relevant"] = bool(brand_relevant)
                         product["relevance_score"] = score
                         product["ranking_score"] = score
                         product["ranking_features"] = {"mode": "fast_mode_external_seed"}
@@ -2859,6 +2921,51 @@ async def agent_search_products(
                     or external_seed_health.get("external_seed_skip_reason")
                     or ""
                 ).strip() or None
+            low_confidence = False
+            low_confidence_reasons: List[str] = []
+            if brand_query_detected:
+                merged_pool_for_brand = list(fast_ranked_candidates or paginated_products)
+                brand_matched_pool = [
+                    item
+                    for item in merged_pool_for_brand
+                    if bool(item.get("_brand_relevant"))
+                    or _is_brand_relevant_product(item, brand_query_terms)
+                ]
+                if brand_matched_pool:
+                    _push_gate_trace(
+                        gate_id="brand_relevance_gate",
+                        applied=True,
+                        decision="applied",
+                        reason="strict_brand_pool",
+                        cost_ms_estimate=20,
+                        query_class="brand_query",
+                    )
+                    total = len(brand_matched_pool)
+                    unified_merge_pool_size = total
+                    paginated_products = brand_matched_pool[offset : offset + limit]
+                else:
+                    _push_gate_trace(
+                        gate_id="brand_relevance_gate",
+                        applied=True,
+                        decision="pass",
+                        reason="brand_strict_no_match_fallback_broad",
+                        cost_ms_estimate=20,
+                        query_class="brand_query",
+                    )
+                    low_confidence = True
+                    low_confidence_reasons.append("brand_strict_no_match_fallback_broad")
+            external_count_after_brand = sum(
+                1 for item in paginated_products if _is_external_seed_product(item)
+            )
+            source_breakdown["external_seed_count"] = external_count_after_brand
+            source_breakdown["internal_count"] = max(0, len(paginated_products) - external_count_after_brand)
+            _push_gate_trace(
+                gate_id="external_seed_join",
+                applied=allow_external_seed,
+                decision="applied" if source_breakdown.get("external_seed_count", 0) > 0 else "pass",
+                reason=external_seed_inclusion_reason or external_seed_skip_reason,
+                cost_ms_estimate=90,
+            )
 
             latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -2930,10 +3037,14 @@ async def agent_search_products(
                     "external_seed_only_requested": requested_external_seed_only,
                     "external_seed_inclusion_reason": external_seed_inclusion_reason,
                     "external_seed_skip_reason": external_seed_skip_reason,
+                    "low_confidence": low_confidence,
+                    "low_confidence_reasons": low_confidence_reasons,
                     "external_seed_cache_status": str(
                         external_seed_health.get("skip_reason")
                         or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
                     ),
+                    "gate_trace": gate_trace,
+                    "gate_summary": _gate_summary(),
                     "source_breakdown": source_breakdown,
                     "external_seed_returned_count": int(
                         source_breakdown.get("external_seed_count", 0) or 0
@@ -3180,6 +3291,20 @@ async def agent_search_products(
                 ),
                 "strategy_applied": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
             }
+            _push_gate_trace(
+                gate_id="browse_mode",
+                applied=True,
+                decision="applied",
+                reason="cross_merchant_browse_standard",
+                cost_ms_estimate=40,
+            )
+            _push_gate_trace(
+                gate_id="external_seed_join",
+                applied=allow_external_seed,
+                decision="applied" if external_count > 0 else "pass",
+                reason=external_seed_inclusion_reason or external_seed_skip_reason,
+                cost_ms_estimate=80,
+            )
 
             background_tasks.add_task(
                 log_agent_request,
@@ -3249,10 +3374,14 @@ async def agent_search_products(
                         "merchants_searched": len(merchants_to_search),
                         "candidate_pool_size": len(all_products),
                     },
+                    "low_confidence": False,
+                    "low_confidence_reasons": [],
                     "external_seed_cache_status": str(
                         external_seed_health.get("skip_reason")
                         or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
                     ),
+                    "gate_trace": gate_trace,
+                    "gate_summary": _gate_summary(),
                     "source_breakdown": source_breakdown,
                     "route_health": _build_route_health(
                         primary_path_used="cross_merchant_browse_standard",
@@ -3302,8 +3431,12 @@ async def agent_search_products(
                 ).lower()
                 if normalized_category.lower() not in product_category:
                     continue
-            if brand_query_detected and not _is_brand_relevant_product(product, brand_query_terms):
-                continue
+            brand_relevant = (
+                _is_brand_relevant_product(product, brand_query_terms)
+                if brand_query_detected
+                else True
+            )
+            product["_brand_relevant"] = bool(brand_relevant)
 
             is_external_seed = (
                 product.get("source") == "external_seed"
@@ -3350,6 +3483,8 @@ async def agent_search_products(
                             relevance_score = 0.35
                         else:
                             continue
+                if brand_query_detected and not brand_relevant:
+                    relevance_score = max(0.0, float(relevance_score or 0.0) * 0.65)
 
                 product["relevance_score"] = relevance_score
             else:
@@ -3485,6 +3620,36 @@ async def agent_search_products(
         search_stage_timings["rank_sort_ms"] = max(
             0, int((time.perf_counter() - rank_sort_stage_started) * 1000)
         )
+        low_confidence = False
+        low_confidence_reasons: List[str] = []
+        if brand_query_detected:
+            strict_brand_ranked = [
+                item
+                for item in ranked_candidates
+                if bool(item.get("_brand_relevant"))
+                or _is_brand_relevant_product(item, brand_query_terms)
+            ]
+            if strict_brand_ranked:
+                ranked_candidates = strict_brand_ranked
+                _push_gate_trace(
+                    gate_id="brand_relevance_gate",
+                    applied=True,
+                    decision="applied",
+                    reason="strict_brand_pool",
+                    cost_ms_estimate=25,
+                    query_class="brand_query",
+                )
+            else:
+                low_confidence = True
+                low_confidence_reasons.append("brand_strict_no_match_fallback_broad")
+                _push_gate_trace(
+                    gate_id="brand_relevance_gate",
+                    applied=True,
+                    decision="pass",
+                    reason="brand_strict_no_match_fallback_broad",
+                    cost_ms_estimate=25,
+                    query_class="brand_query",
+                )
 
         # Pagination
         total = len(ranked_candidates)
@@ -3507,6 +3672,13 @@ async def agent_search_products(
             ),
             "strategy_applied": normalized_seed_strategy if allow_external_seed else "external_seed_disabled",
         }
+        _push_gate_trace(
+            gate_id="external_seed_join",
+            applied=allow_external_seed,
+            decision="applied" if external_count > 0 else "pass",
+            reason=external_seed_inclusion_reason or external_seed_skip_reason,
+            cost_ms_estimate=90,
+        )
 
         # Log a compact view of ranking features for top N
         log_stage_started = time.perf_counter()
@@ -3654,10 +3826,14 @@ async def agent_search_products(
                 },
                 "external_seed_inclusion_reason": external_seed_inclusion_reason,
                 "external_seed_skip_reason": external_seed_skip_reason,
+                "low_confidence": low_confidence,
+                "low_confidence_reasons": low_confidence_reasons,
                 "external_seed_cache_status": str(
                     external_seed_health.get("skip_reason")
                     or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
                 ),
+                "gate_trace": gate_trace,
+                "gate_summary": _gate_summary(),
                 "source_breakdown": source_breakdown,
                 "route_health": _build_route_health(
                     primary_path_used="cross_merchant_search_standard",
