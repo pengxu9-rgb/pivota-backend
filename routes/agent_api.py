@@ -415,6 +415,10 @@ AGENT_EXTERNAL_SEED_CACHE_MAX_ENTRIES = int(
         max_value=5000.0,
     )
 )
+AGENT_EXTERNAL_SEED_SCOPE_BYPASS_ENABLED = _env_bool(
+    "AGENT_EXTERNAL_SEED_SCOPE_BYPASS_ENABLED",
+    True,
+)
 AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT = int(
     _env_float(
         "AGENT_PRODUCT_DETAIL_UPSTREAM_SCAN_LIMIT",
@@ -2432,8 +2436,11 @@ async def agent_search_products(
             and min_price is None
             and max_price is None
         )
+        merchant_scope_override_reason: Optional[str] = None
         if external_seed_only and not merchant_id:
             merchant_id = EXTERNAL_SEED_MERCHANT_ID
+        if external_seed_only and fast_mode_enabled:
+            fast_mode_enabled = False
 
         # Fast path: cross-merchant browse (empty query/filters).
         #
@@ -2604,6 +2611,7 @@ async def agent_search_products(
                             stage_timings_ms=search_stage_timings,
                         ),
                         "external_seed_returned_count": 0,
+                        "merchant_scope_override_reason": merchant_scope_override_reason,
                     },
                 }
             except Exception:
@@ -2634,8 +2642,19 @@ async def agent_search_products(
             # Prefer searching within the agent's allowed merchants when set,
             # otherwise fall back to cross-merchant search (legacy behavior).
             if isinstance(getattr(context, "allowed_merchants", None), list):
-                allowed = [m for m in context.allowed_merchants if m]
-                if len(allowed) == 1:
+                allowed = [str(m).strip() for m in context.allowed_merchants if str(m).strip()]
+                bypass_external_seed_only_scope = (
+                    AGENT_EXTERNAL_SEED_SCOPE_BYPASS_ENABLED
+                    and search_all_merchants is True
+                    and not external_seed_only
+                    and not merchant_id
+                    and not merchant_ids
+                    and len(allowed) == 1
+                    and allowed[0] == EXTERNAL_SEED_MERCHANT_ID
+                )
+                if bypass_external_seed_only_scope:
+                    merchant_scope_override_reason = "allowed_external_seed_only_bypassed"
+                elif len(allowed) == 1:
                     merchants_to_search = allowed
                     merchant_id = allowed[0]
                 elif allowed:
@@ -2890,6 +2909,7 @@ async def agent_search_products(
                     "brand_entities": brand_query_terms,
                     "brand_scope": brand_scope,
                     "brand_detection_mode": brand_detection_mode,
+                    "merchant_scope_override_reason": merchant_scope_override_reason,
                     "external_seed_inclusion_reason": external_seed_inclusion_reason,
                     "external_seed_skip_reason": external_seed_skip_reason,
                     "external_seed_cache_status": str(
@@ -3606,6 +3626,7 @@ async def agent_search_products(
                 "brand_entities": brand_query_terms,
                 "brand_scope": brand_scope,
                 "brand_detection_mode": brand_detection_mode,
+                "merchant_scope_override_reason": merchant_scope_override_reason,
                 "search_window": {
                     "per_merchant_limit": per_merchant_limit,
                     "merchants_searched": len(merchants_to_search),
