@@ -1914,6 +1914,7 @@ async def _load_external_seed_products_for_search(
         scope=strict_scope,
     )
     rows = fetch_result.get("rows") or []
+    strict_rows_count = len(rows)
     strict_brand_relevant_rows = (
         sum(
             1
