@@ -4486,13 +4486,8 @@ async def _handle_find_products_multi(
 
         seed_limit = min(max(limit * max(page, 1) * 2, 30), 200)
         if is_shopping_surface:
-            shopping_seed_cap = max(0, int(MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING))
-            if SEARCH_EXTERNAL_HARD_RULE_PRUNE:
-                shopping_seed_cap = max(shopping_seed_cap, 200)
-            if shopping_seed_cap <= 0:
-                seed_limit = 0
-            else:
-                seed_limit = min(seed_limit, shopping_seed_cap)
+            shopping_seed_cap = max(200, int(MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING or 0))
+            seed_limit = min(seed_limit, shopping_seed_cap)
         seed_params: Dict[str, Any] = {"limit": seed_limit}
         seed_where = "status = 'active'"
         if q_lower:
@@ -4508,11 +4503,7 @@ async def _handle_find_products_multi(
                     + " OR LOWER(COALESCE(canonical_url,'')) LIKE :" + key
                     + " OR LOWER(COALESCE(destination_url,'')) LIKE :" + key
                 )
-                seed_text_scan_enabled = (
-                    (not is_shopping_surface)
-                    or MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN
-                    or SEARCH_EXTERNAL_HARD_RULE_PRUNE
-                )
+                seed_text_scan_enabled = True
                 if seed_text_scan_enabled:
                     clause += " OR LOWER(CAST(seed_data AS TEXT)) LIKE :" + key
                 clause += ")"
@@ -4578,7 +4569,8 @@ async def _handle_find_products_multi(
                 elif _fuzzy_token_match(seed_query_terms or q_tokens, _tokenize(blob_ascii), max_dist=1):
                     score = 0.6
                 else:
-                    continue
+                    # Recall-first: keep low-confidence external seeds for downstream rerank.
+                    score = 0.12
             else:
                 score = 0.15
 

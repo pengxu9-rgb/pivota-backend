@@ -1906,6 +1906,12 @@ def _request_base_url(req: Request) -> str:
     return str(req.base_url).rstrip("/")
 
 
+async def get_allowed_domains_for_market(*, market: str) -> List[str]:
+    # Compatibility shim: external seed domain allowlist is intentionally disabled.
+    _ = market
+    return []
+
+
 async def _build_external_seed_product(
     *,
     req: Request,

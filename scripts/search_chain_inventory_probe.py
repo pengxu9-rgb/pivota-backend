@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import statistics
+import subprocess
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -30,6 +32,7 @@ DEFAULT_QUERIES = [
     "lingerie",
     "perfume",
 ]
+SCHEMA_VERSION = "v2"
 ROUTE_HEALTH_CONTRACT_FIELDS = [
     "orchestrator_path",
     "decision_node",
@@ -178,11 +181,32 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _sha12_for_file(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    return hashlib.sha1(data).hexdigest()[:12]
+
+
+def _git_short_sha(repo_dir: Path) -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return out.strip()
+    except Exception:
+        return ""
+
+
 def _probe_agent_search(
     *,
     base_url: str,
     query: str,
     limit: int,
+    source: str,
     timeout_seconds: float,
     headers: Dict[str, str],
 ) -> Tuple[int, Dict[str, Any]]:
@@ -191,6 +215,7 @@ def _probe_agent_search(
         "search_all_merchants": "true",
         "limit": limit,
         "offset": 0,
+        "source": source,
     }
     res = requests.get(
         f"{base_url.rstrip('/')}/agent/v1/products/search",
@@ -210,6 +235,7 @@ def _probe_gateway(
     gateway_url: str,
     query: str,
     limit: int,
+    source: str,
     timeout_seconds: float,
     headers: Dict[str, str],
 ) -> Tuple[int, Dict[str, Any]]:
@@ -224,7 +250,7 @@ def _probe_gateway(
             }
         },
         "metadata": {
-            "source": "shopping_agent",
+            "source": source,
         },
     }
     res = requests.post(
@@ -303,6 +329,11 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _render_markdown(
     *,
     generated_at: str,
+    schema_version: str,
+    probe_script_sha: str,
+    release_sha_agent: str,
+    release_sha_backend: str,
+    source_used: str,
     rounds: int,
     limit: int,
     agent_base_url: str,
@@ -313,6 +344,11 @@ def _render_markdown(
     lines.append("# Search Chain Inventory Report")
     lines.append("")
     lines.append(f"- Generated at: `{generated_at}`")
+    lines.append(f"- Schema version: `{schema_version}`")
+    lines.append(f"- Probe script SHA: `{probe_script_sha or 'unknown'}`")
+    lines.append(f"- Release SHA (agent): `{release_sha_agent or 'unknown'}`")
+    lines.append(f"- Release SHA (backend): `{release_sha_backend or 'unknown'}`")
+    lines.append(f"- Source used (both entries): `{source_used}`")
     lines.append(f"- Rounds per query: `{rounds}`")
     lines.append(f"- Requested limit: `{limit}`")
     lines.append(f"- Agent entry: `{agent_base_url.rstrip('/')}/agent/v1/products/search`")
@@ -413,6 +449,23 @@ def main() -> int:
         ),
     )
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--source", default="shopping_agent")
+    parser.add_argument(
+        "--agent-api-key",
+        default=os.getenv("AGENT_API_KEY", "").strip(),
+        help="Optional API key for /agent/v1/products/search (sent as X-Agent-API-Key and X-API-Key).",
+    )
+    parser.add_argument(
+        "--gateway-api-key",
+        default=(
+            os.getenv("GATEWAY_API_KEY", "").strip()
+            or os.getenv("X_API_KEY", "").strip()
+            or os.getenv("API_KEY", "").strip()
+        ),
+        help="Optional API key for /api/gateway (sent as X-API-Key).",
+    )
+    parser.add_argument("--release-sha-agent", default=os.getenv("RELEASE_SHA_AGENT", "").strip())
+    parser.add_argument("--release-sha-backend", default=os.getenv("RELEASE_SHA_BACKEND", "").strip())
     args = parser.parse_args()
 
     rounds = max(1, int(args.rounds))
@@ -420,13 +473,24 @@ def main() -> int:
     sleep_seconds = max(0.0, int(args.sleep_ms) / 1000.0)
 
     timestamp = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    source_used = str(args.source or "").strip() or "shopping_agent"
+    script_path = Path(__file__).resolve()
+    probe_script_sha = _sha12_for_file(script_path)
+    repo_root = script_path.parents[1]
+    release_sha_backend = str(args.release_sha_backend or "").strip() or _git_short_sha(repo_root)
+    release_sha_agent = str(args.release_sha_agent or "").strip()
 
     agent_headers: Dict[str, str] = {}
-    agent_api_key = os.getenv("AGENT_API_KEY", "").strip()
+    agent_api_key = str(args.agent_api_key or "").strip()
     if agent_api_key:
         agent_headers["X-Agent-API-Key"] = agent_api_key
+        # Some deployments only inspect X-API-Key.
+        agent_headers["X-API-Key"] = agent_api_key
 
     gateway_headers: Dict[str, str] = {}
+    gateway_api_key = str(args.gateway_api_key or "").strip()
+    if gateway_api_key:
+        gateway_headers["X-API-Key"] = gateway_api_key
 
     records: List[Dict[str, Any]] = []
 
@@ -440,6 +504,7 @@ def main() -> int:
                             base_url=args.agent_base_url,
                             query=query,
                             limit=limit,
+                            source=source_used,
                             timeout_seconds=float(args.timeout_seconds),
                             headers=agent_headers,
                         )
@@ -448,6 +513,7 @@ def main() -> int:
                             gateway_url=args.gateway_url,
                             query=query,
                             limit=limit,
+                            source=source_used,
                             timeout_seconds=float(args.timeout_seconds),
                             headers=gateway_headers,
                         )
@@ -478,6 +544,7 @@ def main() -> int:
                         "error": error_message,
                         "metrics": metrics,
                         "raw": body,
+                        "source_used": source_used,
                     }
                 )
 
@@ -487,6 +554,11 @@ def main() -> int:
     aggregation = _aggregate(records)
 
     payload = {
+        "schema_version": SCHEMA_VERSION,
+        "probe_script_sha": probe_script_sha,
+        "release_sha_agent": release_sha_agent,
+        "release_sha_backend": release_sha_backend,
+        "source_used": source_used,
         "generated_at": timestamp,
         "config": {
             "rounds": rounds,
@@ -495,6 +567,9 @@ def main() -> int:
             "queries": list(args.queries),
             "agent_base_url": args.agent_base_url,
             "gateway_url": args.gateway_url,
+            "source": source_used,
+            "agent_auth_header_used": bool(agent_api_key),
+            "gateway_auth_header_used": bool(gateway_api_key),
         },
         "aggregation": aggregation,
         "records": records,
@@ -510,6 +585,11 @@ def main() -> int:
     md_path.write_text(
         _render_markdown(
             generated_at=timestamp,
+            schema_version=SCHEMA_VERSION,
+            probe_script_sha=probe_script_sha,
+            release_sha_agent=release_sha_agent,
+            release_sha_backend=release_sha_backend,
+            source_used=source_used,
             rounds=rounds,
             limit=limit,
             agent_base_url=args.agent_base_url,

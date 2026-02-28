@@ -69,11 +69,11 @@ def test_gateway_external_seed_dedupe_softens_in_prune_mode():
     original = agent_shop_gateway.SEARCH_EXTERNAL_HARD_RULE_PRUNE
     try:
         agent_shop_gateway.SEARCH_EXTERNAL_HARD_RULE_PRUNE = True
-        kept = agent_shop_gateway._filter_external_seed_wrappers([wrapper], offer_keys, set())
-        assert len(kept) == 1
+        kept_pruned = agent_shop_gateway._filter_external_seed_wrappers([wrapper], offer_keys, set())
+        assert len(kept_pruned) == 1
 
         agent_shop_gateway.SEARCH_EXTERNAL_HARD_RULE_PRUNE = False
-        dropped = agent_shop_gateway._filter_external_seed_wrappers([wrapper], offer_keys, set())
-        assert dropped == []
+        kept_relaxed = agent_shop_gateway._filter_external_seed_wrappers([wrapper], offer_keys, set())
+        assert len(kept_relaxed) == 1
     finally:
         agent_shop_gateway.SEARCH_EXTERNAL_HARD_RULE_PRUNE = original

@@ -280,15 +280,8 @@ async def fetch_external_seed_rows(
     if text_clause:
         where.append(text_clause)
         values.update(text_values)
-    if use_required_terms_filter:
-        required_clause, required_values = build_external_seed_required_terms_clause(
-            required_terms=required_terms,
-            include_seed_data_text_match=True,
-            param_prefix="required",
-        )
-        if required_clause:
-            where.append(required_clause)
-            values.update(required_values)
+    # Recall-first policy: required_terms are ranking hints only (via prefer_terms),
+    # never a hard SQL filter.
     rank_sql, rank_values = build_external_seed_prefer_terms_rank_sql(
         prefer_terms=prefer_terms or required_terms,
         param_prefix="prefer",

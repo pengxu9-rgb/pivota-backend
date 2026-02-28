@@ -23,6 +23,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify release source
+        shell: bash
+        env:
+          EXPECTED_REPO_NAME: pivota-backend
+          ALLOWED_BRANCH_REGEX: "^(main|deploy/.+|release/.+)$"
+        run: |
+          bash scripts/verify_release_source.sh
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:

@@ -75,11 +75,11 @@ async def test_fetch_external_seed_rows_supports_brand_terms_and_rank_ordering()
 
     assert "AS brand_term_hit" in db.last_query
     assert "ORDER BY brand_term_hit DESC, updated_at DESC, created_at DESC" in db.last_query
-    assert "required_0" in db.last_query
+    assert "required_0" not in db.last_query
     assert "prefer_0" in db.last_query
     assert "required_term_" not in db.last_query
     assert "prefer_term_" not in db.last_query
-    assert db.last_values.get("required_0") == "%fenty%"
+    assert db.last_values.get("required_0") is None
     assert db.last_values.get("prefer_0") == "%fenty beauty%"
     placeholders = set(re.findall(r":([a-zA-Z_][a-zA-Z0-9_]*)", db.last_query))
     missing = sorted(name for name in placeholders if name not in db.last_values)
