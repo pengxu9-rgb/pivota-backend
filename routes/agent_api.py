@@ -1314,6 +1314,15 @@ async def _load_external_seed_products_with_cache(
         metrics["build_ms"] = 0
         metrics["query_timeout"] = False
         metrics["budget_exhausted"] = False
+        metrics["brand_strict_rows"] = len(cached_products)
+        if brand_query_detected and normalized_brand_prefer_terms:
+            metrics["brand_relevant_rows"] = sum(
+                1
+                for product in cached_products
+                if _is_brand_relevant_product(product, normalized_brand_prefer_terms)
+            )
+        else:
+            metrics["brand_relevant_rows"] = len(cached_products)
         return cached_products[:limit]
 
     metrics["cache_hit"] = False

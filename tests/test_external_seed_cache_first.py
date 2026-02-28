@@ -188,10 +188,9 @@ async def test_brand_broad_fallback_triggers_when_strict_rows_have_no_brand_rele
         include_seed_data_text_match=True,
         enable_broad_fallback=True,
         brand_terms=["fenty beauty"],
+        brand_required_terms=["fenty"],
+        brand_prefer_terms=["fenty beauty"],
         brand_query_detected=True,
-        required_terms=["fenty"],
-        prefer_terms=["fenty beauty"],
-        scope="brand_strict",
         metrics_out=metrics,
     )
 
