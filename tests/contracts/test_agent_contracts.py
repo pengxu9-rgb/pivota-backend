@@ -100,6 +100,21 @@ async def test_contract_agent_products_search_response_shape(
     assert isinstance(first.get("id"), str)
     assert isinstance(first.get("title"), str)
     assert isinstance(first.get("merchant_id"), str)
+    route_health = (body.get("metadata") or {}).get("route_health") or {}
+    for key in (
+        "orchestrator_path",
+        "decision_node",
+        "domain_filter_dropped_external",
+        "external_fill_gate_reason",
+        "semantic_retry_applied",
+        "semantic_retry_query",
+        "semantic_retry_hits",
+        "external_seed_brand_strict_rows",
+        "external_seed_brand_relevant_rows",
+        "external_seed_broad_fallback_used",
+        "external_seed_broad_scope_rows",
+    ):
+        assert key in route_health
 
 
 @pytest.mark.asyncio
@@ -152,6 +167,21 @@ async def test_contract_agent_shop_invoke_find_products_multi_response_shape(
     assert isinstance(body.get("page"), int)
     assert isinstance(body.get("page_size"), int)
     assert isinstance(body.get("metadata"), dict)
+    route_health = (body.get("metadata") or {}).get("route_health") or {}
+    for key in (
+        "orchestrator_path",
+        "decision_node",
+        "domain_filter_dropped_external",
+        "external_fill_gate_reason",
+        "semantic_retry_applied",
+        "semantic_retry_query",
+        "semantic_retry_hits",
+        "external_seed_brand_strict_rows",
+        "external_seed_brand_relevant_rows",
+        "external_seed_broad_fallback_used",
+        "external_seed_broad_scope_rows",
+    ):
+        assert key in route_health
 
 
 @pytest.mark.asyncio

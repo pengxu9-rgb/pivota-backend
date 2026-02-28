@@ -401,16 +401,27 @@ def _resolve_retrieval_profile(
     }
 
 
+def _normalize_semantic_class_from_profile(profile_id: Optional[str]) -> str:
+    token = str(profile_id or "").strip().lower()
+    if token.startswith("fragrance"):
+        return "fragrance"
+    if token.startswith("lingerie"):
+        return "lingerie"
+    if token.startswith("beauty"):
+        return "beauty"
+    return "default"
+
+
 def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -> bool:
     pid = str(profile_id or "").strip().lower()
     if not pid or pid == "default":
         return True
     blob = _build_product_search_blob(product)
-    if pid == "fragrance_strict":
+    if pid in {"fragrance", "fragrance_strict"}:
         if _has_beauty_tool_signal(blob):
             return False
         return _has_fragrance_signal(blob)
-    if pid == "lingerie_strict":
+    if pid in {"lingerie", "lingerie_strict"}:
         return _has_lingerie_signal(blob)
     return True
 
@@ -440,8 +451,12 @@ AGENT_SEARCH_LIMIT_MAX = int(
         "AGENT_SEARCH_LIMIT_MAX",
         200.0,
         min_value=1.0,
-        max_value=500.0,
+        max_value=200.0,
     )
+)
+SEARCH_BRAND_FAILOPEN_GUARD = _env_bool(
+    "SEARCH_BRAND_FAILOPEN_GUARD",
+    True,
 )
 AGENT_SEARCH_FAST_MODE_CANDIDATE_LIMIT = int(
     _env_float(
@@ -891,6 +906,10 @@ def _build_route_health(
     auth_dependency_total_ms: Optional[int] = None,
     db_pool_wait_ms: Optional[int] = None,
     stage_timings_ms: Optional[Dict[str, Any]] = None,
+    orchestrator_path: Optional[str] = None,
+    decision_node: Optional[str] = None,
+    query_semantic_class: Optional[str] = None,
+    external_fill_gate_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     stale_cache_used = bool((source_breakdown or {}).get("stale_cache_used"))
     triggered = bool(fallback_reason) or stale_cache_used
@@ -914,11 +933,37 @@ def _build_route_health(
     segment_unattributed_ms = max(
         0, max(0, int(primary_latency_ms or 0)) - segment_known_total_ms
     )
+    semantic_retry_applied = bool(seed_health.get("semantic_retry_applied") or False)
+    semantic_retry_query = str(seed_health.get("semantic_retry_query") or "").strip() or None
+    semantic_retry_hits = max(0, int(seed_health.get("semantic_retry_hits") or 0))
+    domain_filter_dropped_external = max(
+        0,
+        int(seed_health.get("domain_filter_dropped_external") or 0),
+    )
+    normalized_fill_gate_reason = (
+        str(external_fill_gate_reason or "").strip()
+        or str(seed_health.get("external_fill_gate_reason") or "").strip()
+        or str(seed_health.get("external_seed_skip_reason") or "").strip()
+        or None
+    )
+    normalized_semantic_class = (
+        str(query_semantic_class or "").strip().lower()
+        or str(seed_health.get("query_semantic_class") or "").strip().lower()
+        or "default"
+    )
     return {
+        "orchestrator_path": str(orchestrator_path or "agent_api.products.search"),
+        "decision_node": str(decision_node or primary_path_used or "unknown"),
         "primary_path_used": primary_path_used,
         "primary_latency_ms": max(0, int(primary_latency_ms or 0)),
         "fallback_triggered": triggered,
         "fallback_reason": reason,
+        "query_semantic_class": normalized_semantic_class,
+        "domain_filter_dropped_external": domain_filter_dropped_external,
+        "external_fill_gate_reason": normalized_fill_gate_reason,
+        "semantic_retry_applied": semantic_retry_applied,
+        "semantic_retry_query": semantic_retry_query,
+        "semantic_retry_hits": semantic_retry_hits,
         "external_seed_executed": bool(seed_health.get("external_seed_executed") or False),
         "external_seed_skip_reason": str(seed_health.get("external_seed_skip_reason") or "").strip() or None,
         "external_seed_query_ms": max(0, int(seed_health.get("external_seed_query_ms") or 0)),
@@ -964,6 +1009,12 @@ def _new_external_seed_health() -> Dict[str, Any]:
         "external_seed_brand_relevant_rows": 0,
         "external_seed_broad_fallback_used": False,
         "external_seed_broad_scope_rows": 0,
+        "domain_filter_dropped_external": 0,
+        "external_fill_gate_reason": None,
+        "query_semantic_class": "default",
+        "semantic_retry_applied": False,
+        "semantic_retry_query": None,
+        "semantic_retry_hits": 0,
     }
 
 
@@ -1032,6 +1083,44 @@ def _apply_external_seed_metrics(
             metrics.get("broad_scope_rows")
             or metrics.get("broad_scope_rows_fetched")
             or external_seed_health.get("external_seed_broad_scope_rows")
+            or 0
+        ),
+    )
+    external_seed_health["domain_filter_dropped_external"] = max(
+        0,
+        int(
+            metrics.get("domain_filter_dropped_external")
+            or external_seed_health.get("domain_filter_dropped_external")
+            or 0
+        ),
+    )
+    semantic_class = str(
+        metrics.get("query_semantic_class")
+        or external_seed_health.get("query_semantic_class")
+        or ""
+    ).strip().lower()
+    if semantic_class:
+        external_seed_health["query_semantic_class"] = semantic_class
+    external_seed_health["external_fill_gate_reason"] = (
+        str(metrics.get("external_fill_gate_reason") or "").strip()
+        or external_seed_health.get("external_fill_gate_reason")
+        or None
+    )
+    external_seed_health["semantic_retry_applied"] = bool(
+        metrics.get("semantic_retry_applied")
+        or external_seed_health.get("semantic_retry_applied")
+        or False
+    )
+    external_seed_health["semantic_retry_query"] = (
+        str(metrics.get("semantic_retry_query") or "").strip()
+        or external_seed_health.get("semantic_retry_query")
+        or None
+    )
+    external_seed_health["semantic_retry_hits"] = max(
+        0,
+        int(
+            metrics.get("semantic_retry_hits")
+            or external_seed_health.get("semantic_retry_hits")
             or 0
         ),
     )
@@ -1508,6 +1597,7 @@ async def _search_products_fast_mode(
     normalized_seed_strategy: str,
     allow_external_seed: bool,
     allow_stale_cache: bool,
+    query_semantic_class: str = "default",
 ) -> Dict[str, Any]:
     normalized_query = str(query or "").strip().lower()
     normalized_category = str(category or "").strip().lower()
@@ -1600,6 +1690,8 @@ async def _search_products_fast_mode(
         if not product["merchant_id"]:
             continue
         if not _matches_catalog_surface(product, catalog_surface):
+            continue
+        if not _passes_retrieval_profile_filter(product, query_semantic_class):
             continue
 
         key = f"{product['merchant_id']}::{str(product.get('product_id') or product.get('id') or '').strip()}"
@@ -1699,6 +1791,7 @@ async def _build_external_seed_product(
     req: Request,
     seed_row: Dict[str, Any],
     allowed_domains: Optional[List[str]] = None,
+    metrics_out: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     seed_id = str(seed_row.get("id") or "").strip()
     if not seed_id:
@@ -1780,6 +1873,11 @@ async def _build_external_seed_product(
         destination_url=dest_with_utm,
         allowed_domains=allowed_domains,
     ):
+        if isinstance(metrics_out, dict):
+            metrics_out["domain_filter_dropped_external"] = max(
+                0,
+                int(metrics_out.get("domain_filter_dropped_external") or 0),
+            ) + 1
         return None
 
     token = make_redirect_token(
@@ -2060,6 +2158,7 @@ async def _load_external_seed_products_for_search(
                     req=req,
                     seed_row=seed_row,
                     allowed_domains=allowed_domains,
+                    metrics_out=metrics,
                 )
             except Exception:
                 return None
@@ -2680,7 +2779,7 @@ async def agent_search_products(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
-    limit: int = Query(default=20, ge=1, le=AGENT_SEARCH_LIMIT_MAX),
+    limit: int = Query(default=20, ge=1),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     external_seed_only: bool = Query(default=False),
@@ -2745,6 +2844,10 @@ async def agent_search_products(
             ),
         }
     try:
+        # Contract: allow callers to request above 200, but clamp internally.
+        limit = max(1, min(int(limit or 20), AGENT_SEARCH_LIMIT_MAX))
+        offset = max(0, int(offset or 0))
+
         def _record_search_metric(*, mode: str, path: str, result: str) -> None:
             try:
                 record_catalog_search(
@@ -2788,6 +2891,14 @@ async def agent_search_products(
 
         normalized_query = query.strip() if isinstance(query, str) else ""
         normalized_category = category.strip() if isinstance(category, str) else ""
+        retrieval_profile = _resolve_retrieval_profile(
+            query_text=normalized_query,
+            category_text=normalized_category,
+            profile_hint=None,
+        )
+        query_semantic_class = _normalize_semantic_class_from_profile(
+            str(retrieval_profile.get("id") or "default").strip().lower()
+        )
         brand_query = _detect_brand_query(normalized_query)
         brand_query_detected = bool(brand_query.get("brand_like"))
         brand_query_terms: List[str] = list(brand_query.get("brand_terms") or [])
@@ -2819,6 +2930,7 @@ async def agent_search_products(
         )
         normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
         external_seed_health = _new_external_seed_health()
+        external_seed_health["query_semantic_class"] = query_semantic_class
         search_stage_timings: Dict[str, int] = {
             "fetch_ms": 0,
             "external_seed_ms": 0,
@@ -3003,6 +3115,10 @@ async def agent_search_products(
                     "metadata": {
                         "source": "agent_search_products",
                         "catalog_surface": normalized_catalog_surface,
+                        "query_semantic_class": query_semantic_class,
+                        "semantic_retry_applied": False,
+                        "semantic_retry_query": None,
+                        "semantic_retry_hits": 0,
                         "reason_code": "ok" if page_items else "no_candidates",
                         "latency_ms": latency_ms,
                         "source_breakdown": {
@@ -3025,6 +3141,7 @@ async def agent_search_products(
                             auth_dependency_total_ms=auth_dependency_total_ms,
                             db_pool_wait_ms=db_pool_wait_ms,
                             stage_timings_ms=search_stage_timings,
+                            query_semantic_class=query_semantic_class,
                         ),
                         "external_seed_returned_count": 0,
                         "merchant_scope_override_reason": merchant_scope_override_reason,
@@ -3122,6 +3239,7 @@ async def agent_search_products(
                 normalized_seed_strategy=normalized_seed_strategy,
                 allow_external_seed=allow_external_seed,
                 allow_stale_cache=allow_stale_cache,
+                query_semantic_class=query_semantic_class,
             )
             paginated_products = list(fast_result["products"])
             fast_ranked_candidates = list(fast_result.get("ranked_candidates") or [])
@@ -3338,7 +3456,11 @@ async def agent_search_products(
                     )
                     low_confidence = True
                     low_confidence_reasons.append("brand_strict_no_match_fallback_broad")
-                    if not paginated_products and merged_pool_for_brand:
+                    if not SEARCH_BRAND_FAILOPEN_GUARD:
+                        paginated_products = []
+                        total = 0
+                        unified_merge_pool_size = 0
+                    elif not paginated_products and merged_pool_for_brand:
                         total = len(merged_pool_for_brand)
                         unified_merge_pool_size = total
                         paginated_products = merged_pool_for_brand[offset : offset + limit]
@@ -3353,6 +3475,9 @@ async def agent_search_products(
                 decision="applied" if source_breakdown.get("external_seed_count", 0) > 0 else "pass",
                 reason=external_seed_inclusion_reason or external_seed_skip_reason,
                 cost_ms_estimate=90,
+            )
+            external_seed_health["external_fill_gate_reason"] = (
+                external_seed_inclusion_reason or external_seed_skip_reason
             )
 
             latency_ms = int((time.perf_counter() - started) * 1000)
@@ -3412,6 +3537,10 @@ async def agent_search_products(
                 "metadata": {
                     "source": "agent_search_products_fast_mode",
                     "catalog_surface": normalized_catalog_surface,
+                    "query_semantic_class": query_semantic_class,
+                    "semantic_retry_applied": False,
+                    "semantic_retry_query": None,
+                    "semantic_retry_hits": 0,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "retrieval_mix_strategy": normalized_seed_strategy,
@@ -3473,6 +3602,8 @@ async def agent_search_products(
                         auth_dependency_total_ms=auth_dependency_total_ms,
                         db_pool_wait_ms=db_pool_wait_ms,
                         stage_timings_ms=search_stage_timings,
+                        query_semantic_class=query_semantic_class,
+                        external_fill_gate_reason=external_seed_inclusion_reason or external_seed_skip_reason,
                     ),
                     },
                 }
@@ -3670,6 +3801,8 @@ async def agent_search_products(
                     continue
                 if not _matches_catalog_surface(product, normalized_catalog_surface):
                     continue
+                if not _passes_retrieval_profile_filter(product, query_semantic_class):
+                    continue
 
                 price = _safe_price_number(product.get("price", 0), 0.0)
                 if min_price and price < min_price:
@@ -3721,6 +3854,9 @@ async def agent_search_products(
                 decision="applied" if external_count > 0 else "pass",
                 reason=external_seed_inclusion_reason or external_seed_skip_reason,
                 cost_ms_estimate=80,
+            )
+            external_seed_health["external_fill_gate_reason"] = (
+                external_seed_inclusion_reason or external_seed_skip_reason
             )
 
             background_tasks.add_task(
@@ -3778,6 +3914,10 @@ async def agent_search_products(
                 "metadata": {
                     "source": "agent_search_products",
                     "catalog_surface": normalized_catalog_surface,
+                    "query_semantic_class": query_semantic_class,
+                    "semantic_retry_applied": False,
+                    "semantic_retry_query": None,
+                    "semantic_retry_hits": 0,
                     "reason_code": "ok" if paginated_products else "no_candidates",
                     "latency_ms": latency_ms,
                     "retrieval_mix_strategy": normalized_seed_strategy,
@@ -3836,6 +3976,8 @@ async def agent_search_products(
                         auth_dependency_total_ms=auth_dependency_total_ms,
                         db_pool_wait_ms=db_pool_wait_ms,
                         stage_timings_ms=search_stage_timings,
+                        query_semantic_class=query_semantic_class,
+                        external_fill_gate_reason=external_seed_inclusion_reason or external_seed_skip_reason,
                     ),
                         "external_seed_returned_count": external_count,
                     },
@@ -3852,6 +3994,8 @@ async def agent_search_products(
             if in_stock_only and not product.get("in_stock", True):
                 continue
             if not _matches_catalog_surface(product, normalized_catalog_surface):
+                continue
+            if not _passes_retrieval_profile_filter(product, query_semantic_class):
                 continue
 
             price = _safe_price_number(product.get("price", 0), 0.0)
@@ -4091,6 +4235,8 @@ async def agent_search_products(
                     cost_ms_estimate=25,
                     query_class="brand_query",
                 )
+                if not SEARCH_BRAND_FAILOPEN_GUARD:
+                    ranked_candidates = []
 
         # Pagination
         total = len(ranked_candidates)
@@ -4119,6 +4265,9 @@ async def agent_search_products(
             decision="applied" if external_count > 0 else "pass",
             reason=external_seed_inclusion_reason or external_seed_skip_reason,
             cost_ms_estimate=90,
+        )
+        external_seed_health["external_fill_gate_reason"] = (
+            external_seed_inclusion_reason or external_seed_skip_reason
         )
 
         # Log a compact view of ranking features for top N
@@ -4249,6 +4398,10 @@ async def agent_search_products(
             "metadata": {
                 "source": "agent_search_products",
                 "catalog_surface": normalized_catalog_surface,
+                "query_semantic_class": query_semantic_class,
+                "semantic_retry_applied": False,
+                "semantic_retry_query": None,
+                "semantic_retry_hits": 0,
                 "reason_code": "ok" if paginated_products else "no_candidates",
                 "latency_ms": latency_ms,
                 "retrieval_mix_strategy": normalized_seed_strategy,
@@ -4312,6 +4465,8 @@ async def agent_search_products(
                     auth_dependency_total_ms=auth_dependency_total_ms,
                     db_pool_wait_ms=db_pool_wait_ms,
                     stage_timings_ms=search_stage_timings,
+                    query_semantic_class=query_semantic_class,
+                    external_fill_gate_reason=external_seed_inclusion_reason or external_seed_skip_reason,
                 ),
                 "external_seed_returned_count": external_count,
             },
@@ -4365,7 +4520,7 @@ async def agent_search_products_beauty(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
-    limit: int = Query(default=20, ge=1, le=AGENT_SEARCH_LIMIT_MAX),
+    limit: int = Query(default=20, ge=1),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),

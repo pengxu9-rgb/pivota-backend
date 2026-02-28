@@ -101,6 +101,61 @@ async def test_invoke_find_products_multi_shopping_bypasses_queue(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_invoke_find_products_multi_clamps_limit_and_includes_route_health_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_shop_gateway.agent_task_manager = AgentTaskManager(
+        max_workers=1,
+        max_queue_size=0,
+        task_timeout_seconds=5.0,
+        max_calls_per_session=100,
+        max_duplicate_payloads=1,
+    )
+    monkeypatch.setattr(agent_shop_gateway, "INVOKE_MULTI_BYPASS_QUEUE_SHOPPING", True)
+
+    observed: Dict[str, Any] = {}
+
+    async def fake_handler(payload: Any, metadata: Dict[str, Any], background_tasks: Any) -> Dict[str, Any]:
+        observed["limit"] = payload.search.limit
+        return {
+            "products": [],
+            "total": 0,
+            "page": 1,
+            "page_size": 0,
+            "reply": "ok",
+            "metadata": {"query_source": "contract_probe"},
+        }
+
+    monkeypatch.setattr(agent_shop_gateway, "_handle_find_products_multi", fake_handler)
+
+    body = _base_multi_body()
+    body["payload"]["search"]["limit"] = 201
+    body["metadata"] = {"source": "shopping_agent"}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        resp = await async_client.post("/agent/shop/v1/invoke", json=body)
+
+    assert resp.status_code == 200
+    assert observed.get("limit") == 200
+    payload = resp.json()
+    meta = payload.get("metadata", {})
+    route_health = meta.get("route_health", {})
+    assert route_health.get("orchestrator_path") == "shop_gateway.find_products_multi"
+    assert route_health.get("decision_node") == "contract_probe"
+    for key in (
+        "domain_filter_dropped_external",
+        "semantic_retry_applied",
+        "semantic_retry_hits",
+        "external_seed_brand_strict_rows",
+        "external_seed_brand_relevant_rows",
+        "external_seed_broad_fallback_used",
+        "external_seed_broad_scope_rows",
+    ):
+        assert key in route_health
+
+
+@pytest.mark.asyncio
 async def test_invoke_find_products_multi_shopping_alias_source_bypasses_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

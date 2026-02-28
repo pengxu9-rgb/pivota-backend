@@ -55,3 +55,6 @@ def test_profile_filter_blocks_tools_for_fragrance():
     }
     assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance_strict") is False
     assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance_strict") is True
+    # Contract-facing semantic class is normalized to "fragrance".
+    assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance") is False
+    assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance") is True

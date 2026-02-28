@@ -401,6 +401,192 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+SEARCH_ORCHESTRATOR_UNIFIED = _env_bool(
+    "SEARCH_ORCHESTRATOR_UNIFIED",
+    True,
+)
+SEARCH_FRAGRANCE_SEMANTIC_RETRY = _env_bool(
+    "SEARCH_FRAGRANCE_SEMANTIC_RETRY",
+    True,
+)
+SEARCH_LIMIT_MAX = _env_int(
+    "AGENT_SEARCH_LIMIT_MAX",
+    200,
+    min_value=1,
+    max_value=200,
+)
+
+
+def _clamp_search_limit(raw_limit: Any, *, fallback: int = 20) -> int:
+    try:
+        limit = int(raw_limit) if raw_limit is not None else int(fallback)
+    except Exception:
+        limit = int(fallback)
+    return max(1, min(limit, SEARCH_LIMIT_MAX))
+
+
+def _classify_query_semantic_class(query: Optional[str]) -> str:
+    q = str(query or "").strip().lower()
+    if not q:
+        return "default"
+    if re.search(
+        r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist)\b",
+        q,
+    ):
+        return "fragrance"
+    if re.search(
+        r"\b(lingerie|underwear|bra|panties|panty|briefs|thong|lencer[ií]a|ropa interior)\b",
+        q,
+    ):
+        return "lingerie"
+    if re.search(
+        r"\b(beauty|skincare|skin care|cosmetic|cosmetics|makeup|serum|toner|moisturizer|cleanser)\b",
+        q,
+    ):
+        return "beauty"
+    return "default"
+
+
+def _build_fragrance_semantic_retry_query(query: Optional[str]) -> Optional[str]:
+    q = str(query or "").strip().lower()
+    if not q:
+        return None
+    tokens = re.findall(r"[a-z0-9]+", q)
+    if not tokens:
+        return None
+    drop_tokens = {
+        "a",
+        "an",
+        "and",
+        "for",
+        "with",
+        "the",
+        "to",
+        "beauty",
+        "cosmetics",
+        "makeup",
+        "tool",
+        "tools",
+        "brush",
+        "brushes",
+        "kit",
+    }
+    keep: List[str] = []
+    for token in tokens:
+        if token in drop_tokens:
+            continue
+        if token in keep:
+            continue
+        keep.append(token)
+        if len(keep) >= 8:
+            break
+    if not keep:
+        return None
+    if not any(
+        token in {"perfume", "perfumes", "fragrance", "fragrances", "parfum", "parfums", "cologne", "mist"}
+        for token in keep
+    ):
+        keep.append("fragrance")
+    retry_query = " ".join(keep)
+    if retry_query == q:
+        return None
+    return retry_query
+
+
+def _normalize_gateway_route_health(
+    metadata: Optional[Dict[str, Any]],
+    *,
+    default_decision_node: str,
+) -> Dict[str, Any]:
+    md = metadata if isinstance(metadata, dict) else {}
+    current = md.get("route_health")
+    route_health: Dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+
+    def _int_non_negative(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except Exception:
+            return 0
+
+    route_health["orchestrator_path"] = str(
+        route_health.get("orchestrator_path")
+        or md.get("orchestrator_path")
+        or "shop_gateway.find_products_multi"
+    )
+    route_health["decision_node"] = str(
+        route_health.get("decision_node")
+        or md.get("decision_node")
+        or default_decision_node
+    )
+    route_health["domain_filter_dropped_external"] = _int_non_negative(
+        route_health.get("domain_filter_dropped_external")
+        if route_health.get("domain_filter_dropped_external") is not None
+        else md.get("domain_filter_dropped_external")
+    )
+    route_health["external_fill_gate_reason"] = (
+        str(
+            route_health.get("external_fill_gate_reason")
+            or md.get("external_fill_gate_reason")
+            or md.get("query_source")
+            or ""
+        ).strip()
+        or None
+    )
+    semantic_retry_applied = bool(
+        route_health.get("semantic_retry_applied")
+        if route_health.get("semantic_retry_applied") is not None
+        else md.get("semantic_retry_applied")
+    )
+    route_health["semantic_retry_applied"] = semantic_retry_applied
+    route_health["semantic_retry_query"] = (
+        str(
+            route_health.get("semantic_retry_query")
+            or md.get("semantic_retry_query")
+            or ""
+        ).strip()
+        or None
+    )
+    route_health["semantic_retry_hits"] = _int_non_negative(
+        route_health.get("semantic_retry_hits")
+        if route_health.get("semantic_retry_hits") is not None
+        else md.get("semantic_retry_hits")
+    )
+    route_health["external_seed_brand_strict_rows"] = _int_non_negative(
+        route_health.get("external_seed_brand_strict_rows")
+        if route_health.get("external_seed_brand_strict_rows") is not None
+        else md.get("external_seed_brand_strict_rows")
+    )
+    route_health["external_seed_brand_relevant_rows"] = _int_non_negative(
+        route_health.get("external_seed_brand_relevant_rows")
+        if route_health.get("external_seed_brand_relevant_rows") is not None
+        else md.get("external_seed_brand_relevant_rows")
+    )
+    route_health["external_seed_broad_fallback_used"] = bool(
+        route_health.get("external_seed_broad_fallback_used")
+        if route_health.get("external_seed_broad_fallback_used") is not None
+        else md.get("external_seed_broad_fallback_used")
+    )
+    route_health["external_seed_broad_scope_rows"] = _int_non_negative(
+        route_health.get("external_seed_broad_scope_rows")
+        if route_health.get("external_seed_broad_scope_rows") is not None
+        else md.get("external_seed_broad_scope_rows")
+    )
+
+    md["orchestrator_path"] = route_health["orchestrator_path"]
+    md["decision_node"] = route_health["decision_node"]
+    md["domain_filter_dropped_external"] = route_health["domain_filter_dropped_external"]
+    md["external_fill_gate_reason"] = route_health["external_fill_gate_reason"]
+    md["semantic_retry_applied"] = route_health["semantic_retry_applied"]
+    md["semantic_retry_query"] = route_health["semantic_retry_query"]
+    md["semantic_retry_hits"] = route_health["semantic_retry_hits"]
+    md["external_seed_brand_strict_rows"] = route_health["external_seed_brand_strict_rows"]
+    md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
+    md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
+    md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
+    md["route_health"] = route_health
+    return md
+
+
 MULTI_SEARCH_MERCHANT_SCAN_LIMIT = _env_int(
     "AGENT_SHOP_MULTI_MERCHANT_SCAN_LIMIT",
     18,
@@ -1069,8 +1255,8 @@ class SearchFilters(BaseModel):
     price_min: Optional[float] = Field(None, description="Minimum price filter")
     price_max: Optional[float] = Field(None, description="Maximum price filter")
     page: int = Field(1, ge=1, description="Page number (1-based)")
-    # Allow larger requested limits; internal logic will clamp to safe bounds.
-    limit: int = Field(20, ge=1, le=500, description="Page size (max 500; internally clamped)")
+    # Allow larger requested limits; internal logic clamps to the public contract max (200).
+    limit: int = Field(20, ge=1, description="Page size (internally clamped to max 200)")
 
 
 class FindProductsPayload(BaseModel):
@@ -1082,8 +1268,8 @@ class MultiSearchFilters(BaseModel):
     price_min: Optional[float] = Field(None, description="Minimum price filter")
     price_max: Optional[float] = Field(None, description="Maximum price filter")
     page: int = Field(1, ge=1, description="Page number (1-based)")
-    # Front-ends may request up to 500; we still clamp internally.
-    limit: int = Field(20, ge=1, le=500, description="Page size (max 500; internally clamped)")
+    # Front-ends may request above 200; we clamp internally to 200.
+    limit: int = Field(20, ge=1, description="Page size (internally clamped to max 200)")
     in_stock_only: bool = Field(False, description="Return only in-stock products when true")
 
 
@@ -2968,7 +3154,7 @@ async def _handle_find_products(
     """
     merchant_id = filters.merchant_id
     page = filters.page or 1
-    limit = min(filters.limit or 20, 100)
+    limit = _clamp_search_limit(filters.limit, fallback=20)
 
     # To support pagination, fetch up to page * limit items (capped)
     # and slice in-memory. For now we cap to 500 for safety.
@@ -3192,6 +3378,7 @@ async def _handle_find_products_multi(
     source: Optional[str] = None
     source_normalized = ""
     upstream_fallback_hop = 0
+    semantic_retry_attempted = False
     if creator_meta:
         creator_id = creator_meta.creator_id
         creator_name = creator_meta.creator_name
@@ -3205,6 +3392,7 @@ async def _handle_find_products_multi(
             )
         except Exception:
             upstream_fallback_hop = 0
+        semantic_retry_attempted = bool(request_metadata.get("semantic_retry_attempted") or False)
 
     # Creator surfaces (creator-agent UI + creator category service) are
     # allowed to use a broader cross-merchant pool and slightly more
@@ -3218,7 +3406,7 @@ async def _handle_find_products_multi(
         is_creator_surface,
     )
     page = filters.page or 1
-    limit = min(filters.limit or 20, 100)
+    limit = _clamp_search_limit(filters.limit, fallback=20)
 
     should_try_upstream = (
         is_shopping_surface
@@ -3885,6 +4073,7 @@ async def _handle_find_products_multi(
     q = q_raw.strip()
     q_lower = q.lower()
     q_ascii = _strip_accents(q_lower)
+    query_semantic_class = _classify_query_semantic_class(q_ascii or q_lower)
     q_tokens = _tokenize(q_ascii)
     q_compact = re.sub(r"[^a-z0-9]+", "", q_lower)
 
@@ -5062,7 +5251,7 @@ async def _handle_find_products_multi(
 
         # Beauty preference exclusions: when exclude_tags are present, drop
         # products whose text contains those markers (best-effort).
-        if beauty_exclude_tags:
+        if beauty_exclude_tags and query_semantic_class != "fragrance":
             if any(tag in blob_for_filters_ascii for tag in beauty_exclude_tags):
                 continue
 
@@ -5326,6 +5515,10 @@ async def _handle_find_products_multi(
             item["merchant_name"] = merchant_name
         out_products.append(item)
 
+    semantic_retry_applied = False
+    semantic_retry_query: Optional[str] = None
+    semantic_retry_hits = 0
+
     # Fallback: if primary query returned nothing, surface top-sellers instead
     # - For general queries: only when creator_id is present (as before)
     # - For tee intent queries: also allow a global tee-only fallback so we don't
@@ -5465,6 +5658,65 @@ async def _handle_find_products_multi(
                     rewritten_query=q_ascii,
                 )
 
+    if (
+        not out_products
+        and SEARCH_FRAGRANCE_SEMANTIC_RETRY
+        and query_semantic_class == "fragrance"
+        and bool(q)
+        and not semantic_retry_attempted
+    ):
+        retry_query = _build_fragrance_semantic_retry_query(q_ascii or q_lower)
+        if retry_query:
+            retry_payload = FindProductsMultiPayload(
+                search=MultiSearchFilters(
+                    query=retry_query,
+                    category=filters.category,
+                    price_min=filters.price_min,
+                    price_max=filters.price_max,
+                    page=filters.page,
+                    limit=limit,
+                    in_stock_only=filters.in_stock_only,
+                ),
+                user=payload.user,
+                metadata=payload.metadata,
+                creator_id=payload.creator_id,
+                intent_safety=payload.intent_safety,
+            )
+            retry_metadata = dict(request_metadata or {})
+            retry_metadata["semantic_retry_attempted"] = True
+            retry_result = await _handle_find_products_multi(
+                retry_payload,
+                retry_metadata,
+                background_tasks,
+            )
+            if isinstance(retry_result, dict):
+                retry_products = retry_result.get("products")
+                retry_count = len(retry_products) if isinstance(retry_products, list) else 0
+                semantic_retry_applied = True
+                semantic_retry_query = retry_query
+                semantic_retry_hits = retry_count
+                retry_meta = retry_result.get("metadata")
+                if not isinstance(retry_meta, dict):
+                    retry_meta = {}
+                retry_meta["query_semantic_class"] = query_semantic_class
+                retry_meta["semantic_retry_applied"] = True
+                retry_meta["semantic_retry_query"] = retry_query
+                retry_meta["semantic_retry_hits"] = retry_count
+                retry_meta.setdefault("external_fill_gate_reason", "semantic_retry")
+                retry_result["metadata"] = retry_meta
+                if retry_count > 0:
+                    return _maybe_attach_eval_debug(
+                        retry_result,
+                        rewritten_query=_strip_accents(retry_query.lower()),
+                    )
+        semantic_retry_applied = True
+        semantic_retry_query = semantic_retry_query or retry_query
+        semantic_retry_hits = 0
+        reply_text = reply_text or (
+            "I couldn’t find a strong fragrance match yet. "
+            "Try adding a brand, scent note, or budget."
+        )
+
     if not out_products and toys_intent_query:
         reply_text = reply_text or (
             "I couldn’t find toy items in the current shop catalog for that query. "
@@ -5482,6 +5734,10 @@ async def _handle_find_products_multi(
             "reply": reply_text,
             "metadata": {
                 "query_source": "cache_multi_intent",
+                "query_semantic_class": query_semantic_class,
+                "semantic_retry_applied": semantic_retry_applied,
+                "semantic_retry_query": semantic_retry_query,
+                "semantic_retry_hits": semantic_retry_hits,
                 "fetched_at": datetime.utcnow().isoformat(),
                 "merchants_searched": len(merchant_map),
                 "merchants_scanned": merchants_scanned,
@@ -7065,6 +7321,8 @@ async def invoke_shop_operation(
         payload = FindProductsMultiPayload(
             **_normalize_find_products_multi_payload(request.payload)
         )
+        payload.search.limit = _clamp_search_limit(payload.search.limit, fallback=20)
+        query_semantic_class = _classify_query_semantic_class(payload.search.query)
         source_normalized = _normalize_surface_source(normalized_metadata.get("source"))
         is_shopping_surface = _is_shopping_multi_source(source_normalized)
         page_request_id = (
@@ -7169,6 +7427,12 @@ async def invoke_shop_operation(
                     response_metadata["page_request_dedup_enabled"] = True
                     response_metadata["page_request_dedup_cache_hit"] = dedup_cache_hit
                     response_metadata["page_request_dedup_inflight_joined"] = dedup_inflight_joined
+                response_metadata.setdefault("query_semantic_class", query_semantic_class)
+                if SEARCH_ORCHESTRATOR_UNIFIED:
+                    response_metadata = _normalize_gateway_route_health(
+                        response_metadata,
+                        default_decision_node=str(response_metadata.get("query_source") or "cache_multi_intent"),
+                    )
                 result["metadata"] = response_metadata
                 try:
                     products = result.get("products")

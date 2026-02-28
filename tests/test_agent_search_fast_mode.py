@@ -89,6 +89,20 @@ def test_agent_search_fast_mode_returns_route_health(
     ):
         assert isinstance(route_health.get(key), int)
         assert route_health.get(key) >= 0
+    for key in (
+        "orchestrator_path",
+        "decision_node",
+        "domain_filter_dropped_external",
+        "external_fill_gate_reason",
+        "semantic_retry_applied",
+        "semantic_retry_query",
+        "semantic_retry_hits",
+        "external_seed_brand_strict_rows",
+        "external_seed_brand_relevant_rows",
+        "external_seed_broad_fallback_used",
+        "external_seed_broad_scope_rows",
+    ):
+        assert key in route_health
     assert payload["metadata"]["source_breakdown"]["internal_count"] == 1
 
 
@@ -243,19 +257,22 @@ def test_agent_search_catalog_surface_param_filters_non_beauty_products(
     assert payload["metadata"]["catalog_surface"] == "beauty"
 
 
-def test_agent_sdk_fixed_search_route_accepts_limit_200(
+def test_agent_sdk_fixed_search_route_clamps_limit_201_to_200(
     monkeypatch: pytest.MonkeyPatch,
     client: TestClient,
 ) -> None:
     import routes.agent_api as agent_api_module
 
-    async def fake_agent_search_products(**_kwargs):
+    observed = {}
+
+    async def fake_agent_search_products(**kwargs):
+        observed["limit"] = kwargs.get("limit")
         return {
             "status": "success",
             "products": [],
             "pagination": {
                 "total_count": 0,
-                "limit": 200,
+                "limit": kwargs.get("limit"),
                 "offset": 0,
                 "has_more": False,
             },
@@ -272,7 +289,7 @@ def test_agent_sdk_fixed_search_route_accepts_limit_200(
         "/agent/v1/products/search",
         params={
             "query": "ipsa",
-            "limit": 200,
+            "limit": 201,
             "offset": 0,
             "search_all_merchants": "true",
             "allow_external_seed": "false",
@@ -282,6 +299,7 @@ def test_agent_sdk_fixed_search_route_accepts_limit_200(
     )
     assert response.status_code == 200
     payload = response.json()
+    assert observed.get("limit") == 200
     assert payload["status"] == "success"
     assert payload["pagination"]["limit"] == 200
     assert payload["metadata"]["source"] == "agent_sdk_fixed_delegate"

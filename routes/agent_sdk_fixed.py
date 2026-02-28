@@ -107,7 +107,7 @@ AGENT_SDK_FIXED_SEARCH_LIMIT_MAX = int(
         "AGENT_SEARCH_LIMIT_MAX",
         200.0,
         min_value=1.0,
-        max_value=500.0,
+        max_value=200.0,
     )
 )
 
@@ -737,7 +737,7 @@ async def search_products(
     max_price: Optional[float] = None,
     in_stock: Optional[bool] = None,
     in_stock_only: Optional[bool] = Query(None),
-    limit: int = Query(default=20, ge=1, le=AGENT_SDK_FIXED_SEARCH_LIMIT_MAX),
+    limit: int = Query(default=20, ge=1),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),
@@ -979,6 +979,9 @@ async def search_products(
             }
 
     started = time.perf_counter()
+    # Contract: allow callers to request above 200, but clamp internally.
+    limit = max(1, min(int(limit or 20), AGENT_SDK_FIXED_SEARCH_LIMIT_MAX))
+    offset = max(0, int(offset or 0))
     effective_in_stock_only = (
         in_stock_only
         if in_stock_only is not None
@@ -1024,10 +1027,18 @@ async def search_products(
                 "latency_ms": latency_ms,
                 "external_seed_returned_count": len(external_products),
                 "route_health": {
+                    "orchestrator_path": "agent_sdk_fixed.products.search",
+                    "decision_node": "agent_sdk_fixed_external_seed",
                     "primary_path_used": "agent_sdk_fixed_external_seed",
                     "primary_latency_ms": max(0, int(latency_ms)),
                     "fallback_triggered": False,
                     "fallback_reason": None,
+                    "query_semantic_class": "default",
+                    "domain_filter_dropped_external": 0,
+                    "external_fill_gate_reason": seed_skip_reason,
+                    "semantic_retry_applied": False,
+                    "semantic_retry_query": None,
+                    "semantic_retry_hits": 0,
                     "external_seed_executed": seed_executed,
                     "external_seed_skip_reason": seed_skip_reason,
                     "external_seed_query_ms": seed_query_ms,
@@ -1037,6 +1048,10 @@ async def search_products(
                     "external_seed_rows_fetched": seed_rows_fetched,
                     "external_seed_rows_built": seed_rows_built,
                     "external_seed_budget_exhausted": seed_budget_exhausted,
+                    "external_seed_brand_strict_rows": 0,
+                    "external_seed_brand_relevant_rows": 0,
+                    "external_seed_broad_fallback_used": False,
+                    "external_seed_broad_scope_rows": 0,
                     "segment_fetch_ms": 0,
                     "segment_external_seed_ms": seed_query_ms + seed_build_ms,
                     "segment_filter_ms": 0,
@@ -1126,7 +1141,7 @@ async def search_products_beauty(
     max_price: Optional[float] = None,
     in_stock: Optional[bool] = None,
     in_stock_only: Optional[bool] = Query(None),
-    limit: int = Query(default=20, ge=1, le=AGENT_SDK_FIXED_SEARCH_LIMIT_MAX),
+    limit: int = Query(default=20, ge=1),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),
