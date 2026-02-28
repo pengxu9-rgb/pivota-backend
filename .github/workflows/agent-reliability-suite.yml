@@ -27,7 +27,7 @@ jobs:
         shell: bash
         env:
           EXPECTED_REPO_NAME: pivota-backend
-          ALLOWED_BRANCH_REGEX: "^(main|deploy/.+|release/.+)$"
+          ALLOWED_BRANCH_REGEX: "^main$"
         run: |
           bash scripts/verify_release_source.sh
 

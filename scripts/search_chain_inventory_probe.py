@@ -70,6 +70,9 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
     route_health = metadata.get("route_health")
     if not isinstance(route_health, dict):
         route_health = {}
+    search_decision = metadata.get("search_decision")
+    if not isinstance(search_decision, dict):
+        search_decision = {}
     missing_route_health_fields = [
         field for field in ROUTE_HEALTH_CONTRACT_FIELDS if field not in route_health
     ]
@@ -97,6 +100,28 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         or metadata.get("query_source")
         or primary_path_used
     )
+    top_domain_drop = _non_negative_int(metadata.get("domain_filter_dropped_external") or 0)
+    route_domain_drop = _non_negative_int(
+        route_health.get("domain_filter_dropped_external")
+        if route_health.get("domain_filter_dropped_external") is not None
+        else top_domain_drop
+    )
+    decision_domain_drop = _non_negative_int(
+        search_decision.get("domain_filter_dropped_external")
+        if search_decision.get("domain_filter_dropped_external") is not None
+        else route_domain_drop
+    )
+    top_semantic_class = str(metadata.get("query_semantic_class") or "").strip().lower()
+    route_semantic_class = str(
+        route_health.get("query_semantic_class")
+        if route_health.get("query_semantic_class") is not None
+        else top_semantic_class
+    ).strip().lower()
+    decision_semantic_class = str(
+        search_decision.get("query_semantic_class")
+        if search_decision.get("query_semantic_class") is not None
+        else route_semantic_class
+    ).strip().lower()
 
     return {
         "status": str(body.get("status") if isinstance(body, dict) else ""),
@@ -112,15 +137,18 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         "fallback_reason": route_health.get("fallback_reason"),
         "fallback_triggered": bool(route_health.get("fallback_triggered") or False),
         "primary_latency_ms": _non_negative_int(route_health.get("primary_latency_ms") or metadata.get("latency_ms") or 0),
-        "query_semantic_class": str(
-            route_health.get("query_semantic_class")
-            or metadata.get("query_semantic_class")
-            or ""
+        "query_semantic_class": route_semantic_class,
+        "metadata_query_semantic_class": top_semantic_class,
+        "search_decision_query_semantic_class": decision_semantic_class,
+        "query_semantic_class_sync_ok": bool(
+            top_semantic_class == route_semantic_class == decision_semantic_class
         ),
-        "domain_filter_dropped_external": _non_negative_int(
-            route_health.get("domain_filter_dropped_external")
-            or metadata.get("domain_filter_dropped_external")
-            or 0
+        "domain_filter_dropped_external": route_domain_drop,
+        "metadata_domain_filter_dropped_external": top_domain_drop,
+        "search_decision_domain_filter_dropped_external": decision_domain_drop,
+        "domain_filter_shadow_dropped_external": decision_domain_drop,
+        "domain_filter_sync_ok": bool(
+            top_domain_drop == route_domain_drop == decision_domain_drop
         ),
         "external_fill_gate_reason": (
             route_health.get("external_fill_gate_reason")
@@ -309,6 +337,22 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 _non_negative_int(r.get("metrics", {}).get("domain_filter_dropped_external") or 0)
                 for r in ok_rows
             ),
+            "domain_filter_shadow_dropped_external_total": sum(
+                _non_negative_int(
+                    r.get("metrics", {}).get("domain_filter_shadow_dropped_external") or 0
+                )
+                for r in ok_rows
+            ),
+            "domain_filter_sync_fail_rounds": sum(
+                1
+                for r in ok_rows
+                if not bool(r.get("metrics", {}).get("domain_filter_sync_ok"))
+            ),
+            "query_semantic_class_sync_fail_rounds": sum(
+                1
+                for r in ok_rows
+                if not bool(r.get("metrics", {}).get("query_semantic_class_sync_ok"))
+            ),
             "route_health_contract_missing_rounds": sum(
                 1
                 for r in ok_rows
@@ -376,6 +420,30 @@ def _render_markdown(
         )
 
     lines.append("")
+    lines.append("## Field Consistency")
+    lines.append("")
+    lines.append(
+        "| Entry | Query | Domain Drop Avg (route/shadow) | Domain Sync Fail | Semantic Sync Fail |"
+    )
+    lines.append("|---|---|---|---:|---:|")
+    for key in sorted(aggregation.keys()):
+        row = aggregation[key]
+        rounds_ok = max(1, int(row.get("rounds_ok") or 0))
+        route_avg = round(
+            _safe_float(row.get("domain_filter_dropped_external_total")) / rounds_ok,
+            2,
+        )
+        shadow_avg = round(
+            _safe_float(row.get("domain_filter_shadow_dropped_external_total")) / rounds_ok,
+            2,
+        )
+        lines.append(
+            f"| {row['entry']} | {row['query']} | {route_avg}/{shadow_avg} | "
+            f"{row.get('domain_filter_sync_fail_rounds', 0)} | "
+            f"{row.get('query_semantic_class_sync_fail_rounds', 0)} |"
+        )
+
+    lines.append("")
     lines.append("## Structural Signals")
     lines.append("")
 
@@ -411,6 +479,17 @@ def _render_markdown(
             missing_contract_rows.append(
                 f"- `{row['entry']}::{row['query']}` fallback reason top-level/route_health mismatch in "
                 f"`{row['fallback_reason_sync_fail_rounds']}/{row['rounds_ok']}` rounds."
+            )
+        if row.get("domain_filter_sync_fail_rounds", 0) > 0:
+            missing_contract_rows.append(
+                f"- `{row['entry']}::{row['query']}` domain_filter_dropped_external split detected in "
+                f"`{row['domain_filter_sync_fail_rounds']}/{row['rounds_ok']}` rounds "
+                f"(route/top vs search_decision)."
+            )
+        if row.get("query_semantic_class_sync_fail_rounds", 0) > 0:
+            missing_contract_rows.append(
+                f"- `{row['entry']}::{row['query']}` query_semantic_class split detected in "
+                f"`{row['query_semantic_class_sync_fail_rounds']}/{row['rounds_ok']}` rounds."
             )
 
     if missing_contract_rows:

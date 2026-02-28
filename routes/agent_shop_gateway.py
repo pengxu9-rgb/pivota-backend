@@ -503,6 +503,9 @@ def _normalize_gateway_route_health(
     md = metadata if isinstance(metadata, dict) else {}
     current = md.get("route_health")
     route_health: Dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+    search_decision = md.get("search_decision")
+    if not isinstance(search_decision, dict):
+        search_decision = None
 
     def _int_non_negative(value: Any) -> int:
         try:
@@ -520,10 +523,25 @@ def _normalize_gateway_route_health(
         or md.get("decision_node")
         or default_decision_node
     )
+    route_health["query_semantic_class"] = (
+        str(
+            route_health.get("query_semantic_class")
+            or md.get("query_semantic_class")
+            or (search_decision or {}).get("query_semantic_class")
+            or "default"
+        )
+        .strip()
+        .lower()
+        or "default"
+    )
     route_health["domain_filter_dropped_external"] = _int_non_negative(
         route_health.get("domain_filter_dropped_external")
         if route_health.get("domain_filter_dropped_external") is not None
-        else md.get("domain_filter_dropped_external")
+        else (
+            md.get("domain_filter_dropped_external")
+            if md.get("domain_filter_dropped_external") is not None
+            else (search_decision or {}).get("domain_filter_dropped_external")
+        )
     )
     route_health["external_fill_gate_reason"] = (
         str(
@@ -580,6 +598,7 @@ def _normalize_gateway_route_health(
 
     md["orchestrator_path"] = route_health["orchestrator_path"]
     md["decision_node"] = route_health["decision_node"]
+    md["query_semantic_class"] = route_health["query_semantic_class"]
     md["domain_filter_dropped_external"] = route_health["domain_filter_dropped_external"]
     md["external_fill_gate_reason"] = route_health["external_fill_gate_reason"]
     md["fallback_reason"] = route_health["fallback_reason"]
@@ -590,6 +609,12 @@ def _normalize_gateway_route_health(
     md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
+    if search_decision is not None:
+        search_decision["query_semantic_class"] = route_health["query_semantic_class"]
+        search_decision["domain_filter_dropped_external"] = route_health[
+            "domain_filter_dropped_external"
+        ]
+        md["search_decision"] = search_decision
     md["route_health"] = route_health
     return md
 

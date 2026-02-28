@@ -130,12 +130,12 @@ _CATALOG_BEAUTY_KEYWORDS = (
 )
 _BRAND_STATIC_ALIASES: Dict[str, List[str]] = {
     "tom ford": ["tom ford", "tomford"],
-    "jo malone": ["jo malone", "jo malone london", "jomalone"],
+    "jo malone": ["jo malone london", "jo malone", "jomalone", "jomalonelondon"],
     "byredo": ["byredo"],
     "dior": ["dior", "christian dior"],
-    "fenty beauty": ["fenty beauty", "fenty"],
-    "kylie cosmetics": ["kylie cosmetics", "kylie"],
-    "sigma beauty": ["sigma beauty", "sigma"],
+    "fenty beauty": ["fenty beauty", "fentybeauty", "fenty"],
+    "kylie cosmetics": ["kylie cosmetics", "kyliecosmetics", "kylie"],
+    "sigma beauty": ["sigma beauty", "sigmabeauty", "sigma"],
 }
 _BRAND_HINT_SUFFIXES = ("beauty", "cosmetics", "fragrance", "perfume", "parfum")
 _CATEGORY_HINT_PATTERN = re.compile(
@@ -255,17 +255,21 @@ def _detect_brand_query(query: Optional[str]) -> Dict[str, Any]:
         }
 
     has_category_hint = bool(_CATEGORY_HINT_PATTERN.search(normalized))
+    normalized_compact = re.sub(r"[^a-z0-9]+", "", normalized)
     static_hits: List[str] = []
     for canonical, aliases in _BRAND_STATIC_ALIASES.items():
-        for alias in aliases:
+        sorted_aliases = sorted(aliases, key=lambda item: len(str(item or "")), reverse=True)
+        for alias in sorted_aliases:
             alias_norm = _normalize_brand_query_text(alias)
             if not alias_norm:
                 continue
+            alias_compact = re.sub(r"[^a-z0-9]+", "", alias_norm)
             if (
                 normalized == alias_norm
                 or f" {alias_norm} " in f" {normalized} "
                 or normalized.startswith(f"{alias_norm} ")
                 or normalized.endswith(f" {alias_norm}")
+                or (alias_compact and normalized_compact and alias_compact in normalized_compact)
             ):
                 static_hits.append(canonical)
                 break
@@ -1014,6 +1018,9 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     route_health = md.get("route_health")
     if not isinstance(route_health, dict):
         route_health = {}
+    search_decision = md.get("search_decision")
+    if not isinstance(search_decision, dict):
+        search_decision = None
     def _int_non_negative(value: Any) -> int:
         try:
             return max(0, int(value))
@@ -1032,10 +1039,25 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
         or md.get("query_source")
         or "unknown"
     )
+    route_health["query_semantic_class"] = (
+        str(
+            route_health.get("query_semantic_class")
+            or md.get("query_semantic_class")
+            or (search_decision or {}).get("query_semantic_class")
+            or "default"
+        )
+        .strip()
+        .lower()
+        or "default"
+    )
     route_health["domain_filter_dropped_external"] = _int_non_negative(
         route_health.get("domain_filter_dropped_external")
         if route_health.get("domain_filter_dropped_external") is not None
-        else md.get("domain_filter_dropped_external")
+        else (
+            md.get("domain_filter_dropped_external")
+            if md.get("domain_filter_dropped_external") is not None
+            else (search_decision or {}).get("domain_filter_dropped_external")
+        )
     )
     route_health["external_fill_gate_reason"] = (
         str(
@@ -1089,6 +1111,7 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     route_health["fallback_reason"] = fallback_reason
     md["orchestrator_path"] = route_health["orchestrator_path"]
     md["decision_node"] = route_health["decision_node"]
+    md["query_semantic_class"] = route_health["query_semantic_class"]
     md["domain_filter_dropped_external"] = route_health["domain_filter_dropped_external"]
     md["external_fill_gate_reason"] = route_health["external_fill_gate_reason"]
     md["semantic_retry_applied"] = route_health["semantic_retry_applied"]
@@ -1099,6 +1122,12 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
     md["fallback_reason"] = fallback_reason
+    if search_decision is not None:
+        search_decision["query_semantic_class"] = route_health["query_semantic_class"]
+        search_decision["domain_filter_dropped_external"] = route_health[
+            "domain_filter_dropped_external"
+        ]
+        md["search_decision"] = search_decision
     if route_health:
         md["route_health"] = route_health
     return md
@@ -1289,6 +1318,11 @@ def _normalize_external_seed_terms(terms: Optional[List[str]], *, max_terms: int
             continue
         seen.add(normalized)
         out.append(normalized)
+        if " " in normalized:
+            compact = normalized.replace(" ", "")
+            if len(compact) >= 4 and compact not in seen:
+                seen.add(compact)
+                out.append(compact)
         if len(out) >= max_terms:
             break
     return out
