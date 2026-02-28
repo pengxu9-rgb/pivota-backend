@@ -296,27 +296,6 @@ async def fetch_external_seed_rows(
     rank_expr = rank_sql if rank_enabled else "0"
     query_values: Dict[str, Any] = {**values, **rank_values}
 
-    required_term_list = _normalize_text_terms(required_terms, max_terms=6)
-    for idx, term in enumerate(required_term_list):
-        term_key = f"required_term_{idx}"
-        values[term_key] = f"%{term}%"
-        where.append(
-            _build_text_match_clause(
-                param_key=term_key,
-                include_seed_data_text_match=include_seed_data_text_match,
-            )
-        )
-
-    prefer_term_list = _normalize_text_terms(prefer_terms, max_terms=8)
-    prefer_term_clauses: List[str] = []
-    for idx, term in enumerate(prefer_term_list):
-        term_key = f"prefer_term_{idx}"
-        values[term_key] = f"%{term}%"
-        prefer_term_clauses.append(
-            f"CASE WHEN {_build_text_match_clause(param_key=term_key, include_seed_data_text_match=include_seed_data_text_match)} THEN 1 ELSE 0 END"
-        )
-    brand_term_hit_expr = " + ".join(prefer_term_clauses) if prefer_term_clauses else "0"
-
     query_sql = f"""
                 SELECT
                   id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
