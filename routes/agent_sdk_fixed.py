@@ -102,6 +102,14 @@ AGENT_SDK_FIXED_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     min_value=0.05,
     max_value=5.0,
 )
+AGENT_SDK_FIXED_SEARCH_LIMIT_MAX = int(
+    _env_float(
+        "AGENT_SEARCH_LIMIT_MAX",
+        200.0,
+        min_value=1.0,
+        max_value=500.0,
+    )
+)
 
 def _resolve_delegate_timeout_seconds(merchant_id: Optional[str]) -> float:
     return (
@@ -729,7 +737,7 @@ async def search_products(
     max_price: Optional[float] = None,
     in_stock: Optional[bool] = None,
     in_stock_only: Optional[bool] = Query(None),
-    limit: int = Query(default=20, le=100),
+    limit: int = Query(default=20, ge=1, le=AGENT_SDK_FIXED_SEARCH_LIMIT_MAX),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),
@@ -1118,7 +1126,7 @@ async def search_products_beauty(
     max_price: Optional[float] = None,
     in_stock: Optional[bool] = None,
     in_stock_only: Optional[bool] = Query(None),
-    limit: int = Query(default=20, le=100),
+    limit: int = Query(default=20, ge=1, le=AGENT_SDK_FIXED_SEARCH_LIMIT_MAX),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
     allow_stale_cache: bool = Query(default=True),

@@ -241,3 +241,47 @@ def test_agent_search_catalog_surface_param_filters_non_beauty_products(
     assert len(payload["products"]) == 1
     assert payload["products"][0]["product_id"] == "prod_beauty_2"
     assert payload["metadata"]["catalog_surface"] == "beauty"
+
+
+def test_agent_sdk_fixed_search_route_accepts_limit_200(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    async def fake_agent_search_products(**_kwargs):
+        return {
+            "status": "success",
+            "products": [],
+            "pagination": {
+                "total_count": 0,
+                "limit": 200,
+                "offset": 0,
+                "has_more": False,
+            },
+            "metadata": {
+                "reason_code": "ok",
+                "route_health": {"primary_path_used": "test_delegate"},
+            },
+        }
+
+    monkeypatch.setattr(agent_api_module, "agent_search_products", fake_agent_search_products)
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+
+    response = client.get(
+        "/agent/v1/products/search",
+        params={
+            "query": "ipsa",
+            "limit": 200,
+            "offset": 0,
+            "search_all_merchants": "true",
+            "allow_external_seed": "false",
+            "allow_stale_cache": "false",
+        },
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["pagination"]["limit"] == 200
+    assert payload["metadata"]["source"] == "agent_sdk_fixed_delegate"
