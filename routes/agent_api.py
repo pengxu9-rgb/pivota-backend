@@ -1174,6 +1174,8 @@ def _schedule_external_seed_cache_refresh(
     include_seed_data_text_match: bool,
     enable_broad_fallback: bool,
     brand_terms: Optional[List[str]],
+    brand_required_terms: Optional[List[str]],
+    brand_prefer_terms: Optional[List[str]],
     brand_query_detected: bool,
 ) -> bool:
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
@@ -1192,6 +1194,8 @@ def _schedule_external_seed_cache_refresh(
                 include_seed_data_text_match=include_seed_data_text_match,
                 enable_broad_fallback=enable_broad_fallback,
                 brand_terms=brand_terms,
+                brand_required_terms=brand_required_terms,
+                brand_prefer_terms=brand_prefer_terms,
                 brand_query_detected=brand_query_detected,
                 metrics_out={},
             )
@@ -1218,6 +1222,8 @@ async def _load_external_seed_products_with_cache(
     page_offset: int,
     enable_broad_fallback: bool = False,
     brand_terms: Optional[List[str]] = None,
+    brand_required_terms: Optional[List[str]] = None,
+    brand_prefer_terms: Optional[List[str]] = None,
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1236,6 +1242,13 @@ async def _load_external_seed_products_with_cache(
     metrics.setdefault("broad_fallback_used", False)
     metrics.setdefault("broad_scope_rows", 0)
 
+    normalized_brand_required_terms = _normalize_external_seed_terms_for_cache(
+        brand_required_terms if brand_required_terms is not None else brand_terms
+    )
+    normalized_brand_prefer_terms = _normalize_external_seed_terms_for_cache(
+        brand_prefer_terms if brand_prefer_terms is not None else brand_terms
+    )
+
     if not AGENT_EXTERNAL_SEED_CACHE_ENABLED:
         metrics["executed"] = True
         metrics["skip_reason"] = None
@@ -1249,6 +1262,8 @@ async def _load_external_seed_products_with_cache(
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
             brand_terms=brand_terms,
+            brand_required_terms=normalized_brand_required_terms,
+            brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
         )
@@ -1267,6 +1282,8 @@ async def _load_external_seed_products_with_cache(
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
             brand_terms=brand_terms,
+            brand_required_terms=normalized_brand_required_terms,
+            brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
         )
@@ -1282,7 +1299,7 @@ async def _load_external_seed_products_with_cache(
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         scope=cache_scope,
-        required_terms=brand_terms if brand_query_detected else None,
+        required_terms=normalized_brand_required_terms if brand_query_detected else None,
         limit=limit,
         page_offset=page_offset,
     )
@@ -1310,6 +1327,8 @@ async def _load_external_seed_products_with_cache(
         include_seed_data_text_match=include_seed_data_text_match,
         enable_broad_fallback=enable_broad_fallback,
         brand_terms=brand_terms,
+        brand_required_terms=normalized_brand_required_terms,
+        brand_prefer_terms=normalized_brand_prefer_terms,
         brand_query_detected=brand_query_detected,
         metrics_out=metrics,
     )
@@ -1328,6 +1347,8 @@ async def _load_external_seed_products_with_cache(
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
             brand_terms=brand_terms,
+            brand_required_terms=normalized_brand_required_terms,
+            brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
         )
     return sync_rows[:limit]
@@ -1875,6 +1896,8 @@ async def _load_external_seed_products_for_search(
     include_seed_data_text_match: bool = False,
     enable_broad_fallback: bool = False,
     brand_terms: Optional[List[str]] = None,
+    brand_required_terms: Optional[List[str]] = None,
+    brand_prefer_terms: Optional[List[str]] = None,
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1898,7 +1921,12 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("broad_fallback_used", False)
         metrics.setdefault("broad_scope_rows", 0)
 
-    normalized_brand_terms = _normalize_external_seed_terms_for_cache(brand_terms)
+    normalized_brand_required_terms = _normalize_external_seed_terms_for_cache(
+        brand_required_terms if brand_required_terms is not None else brand_terms
+    )
+    normalized_brand_prefer_terms = _normalize_external_seed_terms_for_cache(
+        brand_prefer_terms if brand_prefer_terms is not None else brand_terms
+    )
     strict_scope = "brand_strict" if brand_query_detected else "default"
     fetch_result = await fetch_external_seed_rows(
         database=database,
@@ -1909,8 +1937,8 @@ async def _load_external_seed_products_for_search(
         include_seed_data_text_match=include_seed_data_text_match,
         only_unattached=True,
         query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
-        required_terms=normalized_brand_terms if brand_query_detected else None,
-        prefer_terms=normalized_brand_terms if brand_query_detected else None,
+        required_terms=normalized_brand_required_terms if brand_query_detected else None,
+        prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
         scope=strict_scope,
     )
     rows = fetch_result.get("rows") or []
@@ -1919,9 +1947,9 @@ async def _load_external_seed_products_for_search(
         sum(
             1
             for row in rows
-            if _is_brand_relevant_product(row, normalized_brand_terms)
+            if _is_brand_relevant_product(row, normalized_brand_prefer_terms)
         )
-        if brand_query_detected and normalized_brand_terms
+        if brand_query_detected and normalized_brand_prefer_terms
         else len(rows)
     )
     if metrics is not None:
@@ -1935,7 +1963,7 @@ async def _load_external_seed_products_for_search(
             not rows
             or (
                 brand_query_detected
-                and normalized_brand_terms
+                and normalized_brand_prefer_terms
                 and strict_brand_relevant_rows <= 0
             )
         )
@@ -1953,8 +1981,8 @@ async def _load_external_seed_products_for_search(
             include_seed_data_text_match=True,
             only_unattached=False,
             query_timeout_seconds=max(float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35), 0.8),
-            required_terms=normalized_brand_terms if brand_query_detected else None,
-            prefer_terms=normalized_brand_terms if brand_query_detected else None,
+            required_terms=normalized_brand_required_terms if brand_query_detected else None,
+            prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
             scope="brand_broad" if brand_query_detected else "default",
         )
         broad_rows = broad_fetch_result.get("rows") or []
@@ -3134,6 +3162,8 @@ async def agent_search_products(
                         page_offset=offset,
                         enable_broad_fallback=brand_query_detected,
                         brand_terms=brand_query_terms,
+                        brand_required_terms=brand_required_terms,
+                        brand_prefer_terms=brand_prefer_terms,
                         brand_query_detected=brand_query_detected,
                         metrics_out=seed_metrics,
                     )
@@ -3581,6 +3611,8 @@ async def agent_search_products(
                     page_offset=offset,
                     enable_broad_fallback=brand_query_detected,
                     brand_terms=brand_query_terms,
+                    brand_required_terms=brand_required_terms,
+                    brand_prefer_terms=brand_prefer_terms,
                     brand_query_detected=brand_query_detected,
                     metrics_out=seed_metrics,
                 )
