@@ -54,7 +54,7 @@ async def test_fetch_external_seed_rows_optionally_matches_seed_data_text() -> N
 
 
 @pytest.mark.asyncio
-async def test_fetch_external_seed_rows_applies_required_terms_and_brand_hit_ordering() -> None:
+async def test_fetch_external_seed_rows_supports_brand_terms_and_rank_ordering() -> None:
     from services.external_seed_search import fetch_external_seed_rows
 
     db = _FakeDatabase()
@@ -71,9 +71,9 @@ async def test_fetch_external_seed_rows_applies_required_terms_and_brand_hit_ord
         query_timeout_seconds=0.5,
     )
 
-    assert "required_term_0" in db.last_values
-    assert db.last_values.get("required_term_0") == "%fenty%"
-    assert "prefer_term_0" in db.last_values
-    assert db.last_values.get("prefer_term_0") == "%fenty beauty%"
     assert "AS brand_term_hit" in db.last_query
     assert "ORDER BY brand_term_hit DESC, updated_at DESC, created_at DESC" in db.last_query
+    assert "required_0" in db.last_query
+    assert "prefer_0" in db.last_query
+    assert db.last_values.get("required_0") == "%fenty%"
+    assert db.last_values.get("prefer_0") == "%fenty beauty%"

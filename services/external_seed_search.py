@@ -153,6 +153,71 @@ def build_external_seed_text_clause(
     return "(" + " OR ".join(clauses) + ")", values
 
 
+def _normalize_seed_terms(
+    terms: Optional[List[str]],
+    *,
+    max_items: int = 8,
+) -> List[str]:
+    normalized: List[str] = []
+    for term in terms or []:
+        token = re.sub(r"\s+", " ", str(term or "").strip().lower())
+        if not token:
+            continue
+        if token in normalized:
+            continue
+        normalized.append(token)
+        if len(normalized) >= max_items:
+            break
+    return normalized
+
+
+def build_external_seed_required_terms_clause(
+    *,
+    required_terms: Optional[List[str]],
+    include_seed_data_text_match: bool = True,
+    param_prefix: str = "required",
+) -> tuple[str, Dict[str, Any]]:
+    terms = _normalize_seed_terms(required_terms, max_items=6)
+    if not terms:
+        return "", {}
+    values: Dict[str, Any] = {}
+    clauses: List[str] = []
+    for idx, term in enumerate(terms):
+        key = f"{param_prefix}_{idx}"
+        values[key] = f"%{term}%"
+        clauses.append(
+            _build_text_match_clause(
+                param_key=key,
+                include_seed_data_text_match=include_seed_data_text_match,
+            )
+        )
+    return "(" + " AND ".join(clauses) + ")", values
+
+
+def build_external_seed_prefer_terms_rank_sql(
+    *,
+    prefer_terms: Optional[List[str]],
+    param_prefix: str = "prefer",
+) -> tuple[str, Dict[str, Any]]:
+    terms = _normalize_seed_terms(prefer_terms, max_items=8)
+    if not terms:
+        return "0", {}
+    values: Dict[str, Any] = {}
+    rank_terms: List[str] = []
+    for idx, term in enumerate(terms):
+        key = f"{param_prefix}_{idx}"
+        values[key] = f"%{term}%"
+        rank_terms.append(
+            "(CASE WHEN "
+            + _build_text_match_clause(
+                param_key=key,
+                include_seed_data_text_match=True,
+            )
+            + " THEN 1 ELSE 0 END)"
+        )
+    return "(" + " + ".join(rank_terms) + ")", values
+
+
 def _is_missing_external_seed_table(exc: Exception) -> bool:
     msg = str(exc or "")
     return (
@@ -214,6 +279,22 @@ async def fetch_external_seed_rows(
     if text_clause:
         where.append(text_clause)
         values.update(text_values)
+    required_clause, required_values = build_external_seed_required_terms_clause(
+        required_terms=required_terms,
+        include_seed_data_text_match=True,
+        param_prefix="required",
+    )
+    if required_clause:
+        where.append(required_clause)
+        values.update(required_values)
+    rank_sql, rank_values = build_external_seed_prefer_terms_rank_sql(
+        prefer_terms=prefer_terms or required_terms,
+        param_prefix="prefer",
+    )
+    scope_token = str(scope or "default").strip().lower() or "default"
+    rank_enabled = scope_token in {"brand_strict", "brand_broad", "brand", "default"}
+    rank_expr = rank_sql if rank_enabled else "0"
+    query_values: Dict[str, Any] = {**values, **rank_values}
 
     required_term_list = _normalize_text_terms(required_terms, max_terms=6)
     for idx, term in enumerate(required_term_list):
@@ -245,7 +326,7 @@ async def fetch_external_seed_rows(
                   status, notes, created_by_employee_id,
                   attached_product_key, attached_variant_id,
                   created_at, updated_at,
-                  ({brand_term_hit_expr}) AS brand_term_hit
+                  {rank_expr} AS brand_term_hit
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
                 ORDER BY brand_term_hit DESC, updated_at DESC, created_at DESC
@@ -274,7 +355,7 @@ async def fetch_external_seed_rows(
             try:
                 async with database.transaction():
                     await database.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
-                    rows = await database.fetch_all(query_sql, values)
+                    rows = await database.fetch_all(query_sql, query_values)
                     try:
                         count_row = await database.fetch_one(count_sql, count_values)
                         total_count = int(
@@ -301,7 +382,7 @@ async def fetch_external_seed_rows(
                         "table_missing": False,
                     }
                 rows = await asyncio.wait_for(
-                    database.fetch_all(query_sql, values),
+                    database.fetch_all(query_sql, query_values),
                     timeout=timeout_seconds,
                 )
                 try:
@@ -321,7 +402,7 @@ async def fetch_external_seed_rows(
                     total_count = len(rows or [])
         else:
             rows = await asyncio.wait_for(
-                database.fetch_all(query_sql, values),
+                database.fetch_all(query_sql, query_values),
                 timeout=timeout_seconds,
             )
             try:
