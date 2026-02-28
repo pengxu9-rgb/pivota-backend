@@ -37,8 +37,6 @@ from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
-    get_allowed_domains_for_market,
-    is_destination_domain_allowed,
     make_redirect_token,
 )
 from services.external_seed_search import (
@@ -470,10 +468,6 @@ AGENT_SEARCH_LIMIT_MAX = int(
         min_value=1.0,
         max_value=200.0,
     )
-)
-SEARCH_BRAND_FAILOPEN_GUARD = _env_bool(
-    "SEARCH_BRAND_FAILOPEN_GUARD",
-    True,
 )
 SEARCH_EXTERNAL_HARD_RULE_PRUNE = _env_bool(
     "SEARCH_EXTERNAL_HARD_RULE_PRUNE",
@@ -1993,18 +1987,6 @@ async def _build_external_seed_product(
     utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
 
     dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
-    if allowed_domains is None:
-        allowed_domains = await get_allowed_domains_for_market(market=market)
-    if not is_destination_domain_allowed(
-        destination_url=dest_with_utm,
-        allowed_domains=allowed_domains,
-    ):
-        if isinstance(metrics_out, dict):
-            metrics_out["domain_filter_dropped_external"] = max(
-                0,
-                int(metrics_out.get("domain_filter_dropped_external") or 0),
-            ) + 1
-        return None
 
     token = make_redirect_token(
         {
@@ -2161,8 +2143,8 @@ async def _load_external_seed_products_for_search(
         brand_prefer_terms if brand_prefer_terms is not None else brand_terms
     )
     strict_scope = "brand_strict" if brand_query_detected else "default"
-    strict_only_unattached = not SEARCH_EXTERNAL_HARD_RULE_PRUNE
-    strict_use_required_terms_filter = bool(brand_query_detected and not SEARCH_EXTERNAL_HARD_RULE_PRUNE)
+    strict_only_unattached = False
+    strict_use_required_terms_filter = False
     fetch_result = await fetch_external_seed_rows(
         database=database,
         market=DEFAULT_EXTERNAL_SEED_MARKET,
@@ -2172,7 +2154,7 @@ async def _load_external_seed_products_for_search(
         include_seed_data_text_match=include_seed_data_text_match,
         only_unattached=strict_only_unattached,
         query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
-        required_terms=normalized_brand_required_terms if strict_use_required_terms_filter else None,
+        required_terms=None,
         prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
         scope=strict_scope,
         use_required_terms_filter=strict_use_required_terms_filter,
@@ -2225,7 +2207,7 @@ async def _load_external_seed_products_for_search(
             include_seed_data_text_match=True,
             only_unattached=False,
             query_timeout_seconds=max(float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35), 0.8),
-            required_terms=normalized_brand_required_terms if strict_use_required_terms_filter else None,
+            required_terms=None,
             prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
             scope="brand_broad" if brand_query_detected else "default",
             use_required_terms_filter=strict_use_required_terms_filter,
@@ -2265,13 +2247,7 @@ async def _load_external_seed_products_for_search(
                 metrics["skip_reason"] = "no_seed_candidates"
         return []
 
-    allowlist_by_market: Dict[str, List[str]] = {}
     build_started = time.perf_counter()
-    for seed_row in candidate_rows:
-        seed_market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
-        if seed_market in allowlist_by_market:
-            continue
-        allowlist_by_market[seed_market] = await get_allowed_domains_for_market(market=seed_market)
 
     concurrency = max(
         1,
@@ -2290,12 +2266,10 @@ async def _load_external_seed_products_for_search(
             if deadline is not None and time.perf_counter() >= deadline:
                 return None
             try:
-                seed_market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
-                allowed_domains = allowlist_by_market.get(seed_market, [])
                 return await _build_external_seed_product(
                     req=req,
                     seed_row=seed_row,
-                    allowed_domains=allowed_domains,
+                    allowed_domains=None,
                     metrics_out=metrics,
                 )
             except Exception:
@@ -3470,11 +3444,7 @@ async def agent_search_products(
                             query_semantic_class=query_semantic_class,
                         )
                         if brand_query_detected and not brand_relevant:
-                            if not SEARCH_EXTERNAL_HARD_RULE_PRUNE:
-                                continue
                             score = max(0.05, float(score or 0.0) * 0.55)
-                        if normalized_query and score <= 0 and not SEARCH_EXTERNAL_HARD_RULE_PRUNE:
-                            continue
                         if normalized_query and score <= 0:
                             score = 0.05
                         product = dict(product)
@@ -3603,11 +3573,7 @@ async def agent_search_products(
                     )
                     low_confidence = True
                     low_confidence_reasons.append("brand_strict_no_match_fallback_broad")
-                    if not SEARCH_BRAND_FAILOPEN_GUARD:
-                        paginated_products = []
-                        total = 0
-                        unified_merge_pool_size = 0
-                    elif not paginated_products and merged_pool_for_brand:
+                    if not paginated_products and merged_pool_for_brand:
                         total = len(merged_pool_for_brand)
                         unified_merge_pool_size = total
                         paginated_products = merged_pool_for_brand[offset : offset + limit]
@@ -4387,9 +4353,6 @@ async def agent_search_products(
                     cost_ms_estimate=25,
                     query_class="brand_query",
                 )
-                if not SEARCH_BRAND_FAILOPEN_GUARD:
-                    ranked_candidates = []
-
         # Pagination
         total = len(ranked_candidates)
         paginated_products = ranked_candidates[offset : offset + limit]

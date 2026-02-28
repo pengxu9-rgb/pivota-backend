@@ -258,7 +258,7 @@ async def fetch_external_seed_rows(
     required_terms: Optional[List[str]] = None,
     prefer_terms: Optional[List[str]] = None,
     scope: str = "default",
-    use_required_terms_filter: bool = True,
+    use_required_terms_filter: bool = False,
 ) -> Dict[str, Any]:
     where = ["status = :status"]
     values: Dict[str, Any] = {

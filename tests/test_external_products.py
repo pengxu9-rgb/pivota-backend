@@ -28,7 +28,7 @@ def _patch_agent_sdk_ranking(monkeypatch: pytest.MonkeyPatch, module) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_api_load_external_seed_products_prefetches_allowlist_once(
+async def test_agent_api_load_external_seed_products_builds_without_allowlist_prefetch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_api as agent_api_module
@@ -67,9 +67,7 @@ async def test_agent_api_load_external_seed_products_prefetches_allowlist_once(
             "source": "external_seed",
         }
 
-    allowlist_loader = AsyncMock(return_value=["example.com"])
     monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_api_module, "get_allowed_domains_for_market", allowlist_loader)
     monkeypatch.setattr(agent_api_module, "_build_external_seed_product", fake_build_external_seed_product)
 
     products = await agent_api_module._load_external_seed_products_for_search(
@@ -80,18 +78,14 @@ async def test_agent_api_load_external_seed_products_prefetches_allowlist_once(
     )
 
     assert len(products) == 2
-    assert all(item == ["example.com"] for item in build_seen_allowed)
-    allowlist_loader.assert_awaited_once()
+    assert all(item == [] for item in build_seen_allowed)
 
 
 @pytest.mark.asyncio
-async def test_shop_gateway_make_external_redirect_url_uses_preloaded_allowlist(
+async def test_shop_gateway_make_external_redirect_url_without_allowlist_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_shop_gateway as agent_shop_gateway_module
-
-    domain_check = AsyncMock(return_value=["example.com"])
-    monkeypatch.setattr(agent_shop_gateway_module, "get_allowed_domains_for_market", domain_check)
 
     redirect = await agent_shop_gateway_module._make_external_redirect_url(
         market="US",
@@ -104,7 +98,6 @@ async def test_shop_gateway_make_external_redirect_url_uses_preloaded_allowlist(
 
     assert isinstance(redirect, str)
     assert "/r?token=" in redirect
-    domain_check.assert_not_awaited()
 
 
 def test_agent_cart_validate_rejects_external_seed_merchant(client: TestClient) -> None:

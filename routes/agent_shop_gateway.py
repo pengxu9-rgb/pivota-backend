@@ -46,8 +46,6 @@ from services.similarity_config import get_similarity_scoring_weights
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
-    get_allowed_domains_for_market,
-    is_destination_domain_allowed,
     make_redirect_token,
 )
 from models.standard_product import StandardProduct, ProductStatus
@@ -2910,19 +2908,6 @@ def _filter_external_seed_wrappers(
         external_id = product.get("product_id") or product.get("external_product_id")
         if external_id and str(external_id) in internal_ids:
             continue
-        title = product.get("title") or ""
-        price = product.get("price")
-        currency = product.get("currency") or "USD"
-        vendor = product.get("vendor") or product.get("brand") or product.get("merchant_name")
-        external_keys = _build_offer_keys(str(title), price, str(currency), str(vendor) if vendor else None)
-        if external_keys:
-            shared_keys = offer_keys.intersection(external_keys)
-            if shared_keys:
-                if not SEARCH_EXTERNAL_HARD_RULE_PRUNE:
-                    continue
-                # In prune mode only drop near-certain duplicates.
-                if len(shared_keys) >= 2:
-                    continue
         filtered.append(wrapper)
     return filtered
 
@@ -2941,13 +2926,6 @@ async def _make_external_redirect_url(
         utm_template or DEFAULT_UTM_TEMPLATE,
         {"market": market, "tool": tool},
     )
-    if allowed_domains is None:
-        allowed_domains = await get_allowed_domains_for_market(market=market)
-    if not is_destination_domain_allowed(
-        destination_url=dest_with_utm,
-        allowed_domains=allowed_domains,
-    ):
-        return None
     token = make_redirect_token(
         {
             "market": market,
@@ -3428,9 +3406,7 @@ async def _handle_find_products_multi(
         and bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL)
         and upstream_fallback_hop < 1
     )
-    force_local_fallback_on_delegate_fail = bool(
-        SEARCH_EXTERNAL_HARD_RULE_PRUNE and is_shopping_surface
-    )
+    force_local_fallback_on_delegate_fail = bool(is_shopping_surface)
     upstream_timeout_seconds = _resolve_multi_upstream_timeout_seconds(is_shopping_surface)
     upstream_cache_key: Optional[str] = None
     skip_delegate_due_circuit_local_fallback = False
@@ -4562,7 +4538,6 @@ async def _handle_find_products_multi(
 
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
-        allowed_domains_by_market: Dict[str, List[str]] = {}
         seed_budget_ms = int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 0)
         seed_build_deadline = (
             time.perf_counter() + (seed_budget_ms / 1000.0)
@@ -4621,13 +4596,6 @@ async def _handle_find_products_multi(
             market = str(row_dict.get("market") or "US")
             tool = str(row_dict.get("tool") or "*")
             utm_template = row_dict.get("utm_template") or seed_data.get("utm_template")
-            allowed_domains = allowed_domains_by_market.get(market)
-            if allowed_domains is None:
-                try:
-                    allowed_domains = await get_allowed_domains_for_market(market=market)
-                except Exception:
-                    allowed_domains = []
-                allowed_domains_by_market[market] = allowed_domains
             redirect_cache_key = "||".join(
                 [
                     market,
@@ -4645,7 +4613,7 @@ async def _handle_find_products_multi(
                     destination_url=dest,
                     utm_template=utm_template,
                     ctx={"seedId": row_dict.get("id")},
-                    allowed_domains=allowed_domains,
+                    allowed_domains=None,
                 )
                 external_redirect_cache[redirect_cache_key] = redirect_url
             if not redirect_url:
