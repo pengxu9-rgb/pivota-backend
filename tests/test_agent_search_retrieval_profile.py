@@ -41,6 +41,8 @@ def test_resolve_retrieval_profile_respects_hint():
 
 
 def test_profile_filter_blocks_tools_for_fragrance():
+    original = agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE
+    agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = False
     brush_like = {
         "title": "Makeup Brush Set",
         "category": "beauty tools",
@@ -53,8 +55,26 @@ def test_profile_filter_blocks_tools_for_fragrance():
         "product_type": "perfume",
         "tags": ["parfum"],
     }
-    assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance_strict") is False
-    assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance_strict") is True
-    # Contract-facing semantic class is normalized to "fragrance".
-    assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance") is False
-    assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance") is True
+    try:
+        assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance_strict") is False
+        assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance_strict") is True
+        # Contract-facing semantic class is normalized to "fragrance".
+        assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance") is False
+        assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance") is True
+    finally:
+        agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = original
+
+
+def test_profile_filter_keeps_tool_candidate_when_prune_enabled():
+    original = agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE
+    agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = True
+    mixed_like = {
+        "title": "Fragrance Discovery Brush Set",
+        "category": "fragrance beauty tools",
+        "product_type": "perfume brush",
+        "tags": ["tool", "brush", "fragrance"],
+    }
+    try:
+        assert agent_api._passes_retrieval_profile_filter(mixed_like, "fragrance") is True
+    finally:
+        agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = original

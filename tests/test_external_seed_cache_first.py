@@ -22,6 +22,7 @@ async def test_external_seed_cache_hit_serves_first_screen_without_live_query(
         strategy="supplement_internal_first",
         surface="beauty",
         limit=20,
+        hard_rule_prune=bool(agent_api_module.SEARCH_EXTERNAL_HARD_RULE_PRUNE),
     )
     cached_item = {
         "id": "ext_cache_1",
@@ -107,6 +108,7 @@ async def test_external_seed_cache_miss_sync_fills_before_async_refresh(
         strategy="supplement_internal_first",
         surface="beauty",
         limit=20,
+        hard_rule_prune=bool(agent_api_module.SEARCH_EXTERNAL_HARD_RULE_PRUNE),
     )
     cached = agent_api_module._get_cached_external_seed_products(cache_key)
     assert isinstance(cached, list)
@@ -162,7 +164,7 @@ async def test_brand_broad_fallback_triggers_when_strict_rows_have_no_brand_rele
             "table_missing": False,
         }
 
-    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains):
+    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains, metrics_out=None):
         return {
             "id": str(seed_row.get("external_product_id")),
             "product_id": str(seed_row.get("external_product_id")),

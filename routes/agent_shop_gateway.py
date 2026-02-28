@@ -409,6 +409,10 @@ SEARCH_FRAGRANCE_SEMANTIC_RETRY = _env_bool(
     "SEARCH_FRAGRANCE_SEMANTIC_RETRY",
     True,
 )
+SEARCH_EXTERNAL_HARD_RULE_PRUNE = _env_bool(
+    "SEARCH_EXTERNAL_HARD_RULE_PRUNE",
+    True,
+)
 SEARCH_LIMIT_MAX = _env_int(
     "AGENT_SEARCH_LIMIT_MAX",
     200,
@@ -532,6 +536,10 @@ def _normalize_gateway_route_health(
         ).strip()
         or None
     )
+    fallback_reason = route_health.get("fallback_reason")
+    if fallback_reason is None:
+        fallback_reason = md.get("fallback_reason")
+    route_health["fallback_reason"] = fallback_reason
     semantic_retry_applied = bool(
         route_health.get("semantic_retry_applied")
         if route_health.get("semantic_retry_applied") is not None
@@ -576,6 +584,7 @@ def _normalize_gateway_route_health(
     md["decision_node"] = route_health["decision_node"]
     md["domain_filter_dropped_external"] = route_health["domain_filter_dropped_external"]
     md["external_fill_gate_reason"] = route_health["external_fill_gate_reason"]
+    md["fallback_reason"] = route_health["fallback_reason"]
     md["semantic_retry_applied"] = route_health["semantic_retry_applied"]
     md["semantic_retry_query"] = route_health["semantic_retry_query"]
     md["semantic_retry_hits"] = route_health["semantic_retry_hits"]
@@ -2906,8 +2915,14 @@ def _filter_external_seed_wrappers(
         currency = product.get("currency") or "USD"
         vendor = product.get("vendor") or product.get("brand") or product.get("merchant_name")
         external_keys = _build_offer_keys(str(title), price, str(currency), str(vendor) if vendor else None)
-        if external_keys and offer_keys.intersection(external_keys):
-            continue
+        if external_keys:
+            shared_keys = offer_keys.intersection(external_keys)
+            if shared_keys:
+                if not SEARCH_EXTERNAL_HARD_RULE_PRUNE:
+                    continue
+                # In prune mode only drop near-certain duplicates.
+                if len(shared_keys) >= 2:
+                    continue
         filtered.append(wrapper)
     return filtered
 
@@ -3413,6 +3428,9 @@ async def _handle_find_products_multi(
         and bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL)
         and upstream_fallback_hop < 1
     )
+    force_local_fallback_on_delegate_fail = bool(
+        SEARCH_EXTERNAL_HARD_RULE_PRUNE and is_shopping_surface
+    )
     upstream_timeout_seconds = _resolve_multi_upstream_timeout_seconds(is_shopping_surface)
     upstream_cache_key: Optional[str] = None
     skip_delegate_due_circuit_local_fallback = False
@@ -3444,7 +3462,7 @@ async def _handle_find_products_multi(
 
         upstream_circuit_open = _multi_upstream_circuit_is_open()
         if upstream_circuit_open:
-            if _allow_local_fallback_after_delegate_fail(request_metadata):
+            if _allow_local_fallback_after_delegate_fail(request_metadata) or force_local_fallback_on_delegate_fail:
                 skip_delegate_due_circuit_local_fallback = True
                 logger.info(
                     "multi.upstream_fallback.local_fallback_on_circuit_open",
@@ -3490,8 +3508,18 @@ async def _handle_find_products_multi(
                 result_kind = "empty"
             if upstream_cache_key:
                 _multi_upstream_cache_put(upstream_cache_key, delegated, result_kind)
-            return delegated
-        if _allow_local_fallback_after_delegate_fail(request_metadata):
+            if result_kind == "empty" and force_local_fallback_on_delegate_fail:
+                logger.info(
+                    "multi.upstream_fallback.empty_result_local_fallback",
+                    extra={
+                        "event": "multi.upstream_fallback.empty_result_local_fallback",
+                        "source": source_normalized,
+                    },
+                )
+                record_catalog_upstream_fallback(reason="delegate_empty_local_fallback")
+            else:
+                return delegated
+        if _allow_local_fallback_after_delegate_fail(request_metadata) or force_local_fallback_on_delegate_fail:
             logger.info(
                 "multi.upstream_fallback.local_fallback_enabled",
                 extra={
@@ -4483,6 +4511,8 @@ async def _handle_find_products_multi(
         seed_limit = min(max(limit * max(page, 1) * 2, 30), 200)
         if is_shopping_surface:
             shopping_seed_cap = max(0, int(MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING))
+            if SEARCH_EXTERNAL_HARD_RULE_PRUNE:
+                shopping_seed_cap = max(shopping_seed_cap, 200)
             if shopping_seed_cap <= 0:
                 seed_limit = 0
             else:
@@ -4502,7 +4532,12 @@ async def _handle_find_products_multi(
                     + " OR LOWER(COALESCE(canonical_url,'')) LIKE :" + key
                     + " OR LOWER(COALESCE(destination_url,'')) LIKE :" + key
                 )
-                if (not is_shopping_surface) or MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN:
+                seed_text_scan_enabled = (
+                    (not is_shopping_surface)
+                    or MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN
+                    or SEARCH_EXTERNAL_HARD_RULE_PRUNE
+                )
+                if seed_text_scan_enabled:
                     clause += " OR LOWER(CAST(seed_data AS TEXT)) LIKE :" + key
                 clause += ")"
                 where_clauses.append(clause)
@@ -7428,11 +7463,16 @@ async def invoke_shop_operation(
                     response_metadata["page_request_dedup_cache_hit"] = dedup_cache_hit
                     response_metadata["page_request_dedup_inflight_joined"] = dedup_inflight_joined
                 response_metadata.setdefault("query_semantic_class", query_semantic_class)
-                if SEARCH_ORCHESTRATOR_UNIFIED:
-                    response_metadata = _normalize_gateway_route_health(
-                        response_metadata,
-                        default_decision_node=str(response_metadata.get("query_source") or "cache_multi_intent"),
-                    )
+                response_metadata = _normalize_gateway_route_health(
+                    response_metadata,
+                    default_decision_node=str(response_metadata.get("query_source") or "cache_multi_intent"),
+                )
+                route_health = response_metadata.get("route_health")
+                if isinstance(route_health, dict):
+                    fallback_reason = route_health.get("fallback_reason")
+                    route_health["fallback_reason"] = fallback_reason
+                    response_metadata["fallback_reason"] = fallback_reason
+                    response_metadata["route_health"] = route_health
                 result["metadata"] = response_metadata
                 try:
                     products = result.get("products")

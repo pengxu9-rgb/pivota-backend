@@ -30,6 +30,20 @@ DEFAULT_QUERIES = [
     "lingerie",
     "perfume",
 ]
+ROUTE_HEALTH_CONTRACT_FIELDS = [
+    "orchestrator_path",
+    "decision_node",
+    "domain_filter_dropped_external",
+    "external_fill_gate_reason",
+    "semantic_retry_applied",
+    "semantic_retry_query",
+    "semantic_retry_hits",
+    "external_seed_brand_strict_rows",
+    "external_seed_brand_relevant_rows",
+    "external_seed_broad_fallback_used",
+    "external_seed_broad_scope_rows",
+    "fallback_reason",
+]
 
 
 def _non_negative_int(value: Any) -> int:
@@ -53,6 +67,9 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
     route_health = metadata.get("route_health")
     if not isinstance(route_health, dict):
         route_health = {}
+    missing_route_health_fields = [
+        field for field in ROUTE_HEALTH_CONTRACT_FIELDS if field not in route_health
+    ]
 
     source_breakdown = metadata.get("source_breakdown")
     if not isinstance(source_breakdown, dict):
@@ -155,6 +172,9 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "internal_count": _non_negative_int(source_breakdown.get("internal_count") or 0),
         "source_breakdown_external_count": _non_negative_int(source_breakdown.get("external_seed_count") or 0),
+        "route_health_contract_missing_count": len(missing_route_health_fields),
+        "route_health_contract_missing_fields": missing_route_health_fields,
+        "fallback_reason_sync_ok": metadata.get("fallback_reason") == route_health.get("fallback_reason"),
     }
 
 
@@ -263,6 +283,19 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 _non_negative_int(r.get("metrics", {}).get("domain_filter_dropped_external") or 0)
                 for r in ok_rows
             ),
+            "route_health_contract_missing_rounds": sum(
+                1
+                for r in ok_rows
+                if _non_negative_int(
+                    r.get("metrics", {}).get("route_health_contract_missing_count") or 0
+                )
+                > 0
+            ),
+            "fallback_reason_sync_fail_rounds": sum(
+                1
+                for r in ok_rows
+                if not bool(r.get("metrics", {}).get("fallback_reason_sync_ok"))
+            ),
         }
     return out
 
@@ -332,6 +365,16 @@ def _render_markdown(
             missing_contract_rows.append(
                 f"- `{row['entry']}::{row['query']}` fallback contains `primary_irrelevant_no_fallback` "
                 f"({row['fallback_distribution']['primary_irrelevant_no_fallback']} rounds)."
+            )
+        if row["route_health_contract_missing_rounds"] > 0:
+            missing_contract_rows.append(
+                f"- `{row['entry']}::{row['query']}` route_health contract missing "
+                f"`{row['route_health_contract_missing_rounds']}/{row['rounds_ok']}` rounds."
+            )
+        if row["fallback_reason_sync_fail_rounds"] > 0:
+            missing_contract_rows.append(
+                f"- `{row['entry']}::{row['query']}` fallback reason top-level/route_health mismatch in "
+                f"`{row['fallback_reason_sync_fail_rounds']}/{row['rounds_ok']}` rounds."
             )
 
     if missing_contract_rows:

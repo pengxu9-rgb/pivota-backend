@@ -84,3 +84,28 @@ async def test_fetch_external_seed_rows_supports_brand_terms_and_rank_ordering()
     placeholders = set(re.findall(r":([a-zA-Z_][a-zA-Z0-9_]*)", db.last_query))
     missing = sorted(name for name in placeholders if name not in db.last_values)
     assert not missing
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_seed_rows_can_disable_required_terms_filter() -> None:
+    from services.external_seed_search import fetch_external_seed_rows
+
+    db = _FakeDatabase()
+    await fetch_external_seed_rows(
+        database=db,
+        market="US",
+        query="kylie cosmetics",
+        limit=24,
+        offset=0,
+        include_seed_data_text_match=True,
+        required_terms=["kylie"],
+        prefer_terms=["kylie cosmetics"],
+        scope="brand_strict",
+        use_required_terms_filter=False,
+        query_timeout_seconds=0.5,
+    )
+
+    assert "required_0" not in db.last_query
+    assert "prefer_0" in db.last_query
+    assert db.last_values.get("required_0") is None
+    assert db.last_values.get("prefer_0") == "%kylie cosmetics%"
