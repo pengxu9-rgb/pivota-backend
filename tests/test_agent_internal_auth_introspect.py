@@ -85,3 +85,23 @@ def test_introspect_returns_inactive_when_agent_status_inactive(monkeypatch):
     assert body["agent_id"] == "agent_456"
     assert body["is_active"] is False
     assert body["auth_source"] == "legacy_auto"
+
+
+def test_introspect_returns_503_on_transient_auth_lookup_error(monkeypatch):
+    monkeypatch.setenv("AGENT_AUTH_INTROSPECT_INTERNAL_KEY", "internal_test_key")
+
+    async def _fake_get_agent_by_key(_api_key, metrics_out=None):
+        raise introspect_module.AgentAuthLookupTransientError("pool is closing")
+
+    monkeypatch.setattr(introspect_module, "get_agent_by_key", _fake_get_agent_by_key)
+    client = _build_client()
+
+    response = client.post(
+        "/agent/internal/auth/introspect",
+        headers={"X-Internal-Key": "internal_test_key"},
+        json={"api_key": "ak_live_" + "d" * 64},
+    )
+
+    assert response.status_code == 503
+    detail = response.json().get("detail") or {}
+    assert detail.get("error") == "TEMPORARY_UNAVAILABLE"

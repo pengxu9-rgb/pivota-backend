@@ -13,6 +13,7 @@ from datetime import datetime
 
 from db.agents import (
     get_agent_by_key,
+    AgentAuthLookupTransientError,
     get_agent,
     check_rate_limit,
     check_daily_quota,
@@ -20,6 +21,7 @@ from db.agents import (
     update_agent_stats
 )
 from utils.logger import logger
+from utils.transient_errors import db_busy_http_exception
 import os
 import base64
 import hashlib
@@ -228,7 +230,10 @@ async def get_agent_context(
     # 3. 查找 Agent
     auth_started = time.perf_counter()
     auth_metrics: Dict[str, Any] = {}
-    agent = await get_agent_by_key(api_key, metrics_out=auth_metrics)
+    try:
+        agent = await get_agent_by_key(api_key, metrics_out=auth_metrics)
+    except AgentAuthLookupTransientError:
+        raise db_busy_http_exception()
     try:
         request.state.agent_auth_lookup_ms = max(0, int(auth_metrics.get("auth_lookup_ms") or 0))
         request.state.agent_auth_cache_hit = bool(auth_metrics.get("auth_cache_hit") or False)

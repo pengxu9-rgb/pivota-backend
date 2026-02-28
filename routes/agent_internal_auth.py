@@ -16,7 +16,8 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel
 
-from db.agents import get_agent_by_key
+from db.agents import AgentAuthLookupTransientError, get_agent_by_key
+from utils.transient_errors import db_busy_http_exception
 
 router = APIRouter(prefix="/agent/internal/auth", tags=["agent-internal-auth"])
 
@@ -84,7 +85,10 @@ async def introspect_agent_api_key(
         return IntrospectResponse(valid=False, auth_source="format_invalid")
 
     metrics: Dict[str, Any] = {}
-    agent = await get_agent_by_key(raw_key, metrics_out=metrics)
+    try:
+        agent = await get_agent_by_key(raw_key, metrics_out=metrics)
+    except AgentAuthLookupTransientError:
+        raise db_busy_http_exception()
     if not agent:
         return IntrospectResponse(
             valid=False,

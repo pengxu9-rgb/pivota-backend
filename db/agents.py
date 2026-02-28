@@ -15,6 +15,7 @@ import os
 import time
 
 from db.database import metadata, database, IS_POSTGRES
+from utils.transient_errors import is_asyncpg_busy_error
 
 _AGENT_AUTH_CACHE_MAX_ENTRIES = max(
     100,
@@ -43,6 +44,10 @@ _AGENT_AUTH_KEY_TABLE_CACHE_TTL_SECONDS = max(
 )
 _AGENT_AUTH_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _AGENT_AUTH_KEY_TABLE_CACHE: Dict[str, Any] = {"table": None, "expires_at": 0.0}
+
+
+class AgentAuthLookupTransientError(RuntimeError):
+    """Raised when agent key lookup fails due to transient DB/pool state."""
 
 
 def _agent_auth_cache_key(api_key: str) -> str:
@@ -398,6 +403,13 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
             metrics["auth_source"] = source
         return agent
     except Exception as e:
+        if is_asyncpg_busy_error(e):
+            if metrics is not None:
+                metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
+                metrics["auth_cache_hit"] = False
+                metrics["auth_source"] = "error_transient"
+            raise AgentAuthLookupTransientError(str(e)) from e
+
         if _is_missing_table_error(e, "api_keys") or _is_missing_table_error(e, "agent_api_keys"):
             _clear_auth_key_table_cache()
         should_try_legacy = _AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK or _is_missing_table_error(e, "api_keys") or _is_missing_table_error(e, "agent_api_keys")

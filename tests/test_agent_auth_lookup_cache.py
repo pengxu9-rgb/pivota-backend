@@ -200,3 +200,26 @@ async def test_get_agent_by_key_auto_legacy_when_no_key_table(
     assert calls["detect"] == 1
     assert calls["legacy"] == 1
     assert metrics.get("auth_source") == "legacy_auto"
+
+
+@pytest.mark.asyncio
+async def test_get_agent_by_key_raises_transient_error_on_pool_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.agents as agents_module
+
+    agents_module._AGENT_AUTH_CACHE.clear()
+    agents_module._clear_auth_key_table_cache()
+    monkeypatch.setattr(agents_module, "_AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK", False)
+    monkeypatch.setattr(agents_module, "_AGENT_AUTH_KEY_TABLE_MODE", "api_keys")
+
+    async def fake_fetch_one(_query: str, values=None):
+        raise RuntimeError("pool is closing")
+
+    monkeypatch.setattr(agents_module.database, "fetch_one", fake_fetch_one)
+
+    metrics = {}
+    with pytest.raises(agents_module.AgentAuthLookupTransientError):
+        await agents_module.get_agent_by_key("ak_" + ("f" * 64), metrics_out=metrics)
+
+    assert metrics.get("auth_source") == "error_transient"

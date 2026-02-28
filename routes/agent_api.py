@@ -6178,15 +6178,15 @@ async def agent_create_order(
             try:
                 order_response = await order_routes_module.create_new_order(order_request, background_tasks)
             except Exception as e:
-                # Emergency self-heal: if a pooled asyncpg connection is in a poisoned/busy state,
-                # reset the pool and retry once. Idempotency keys (when present) prevent duplicates.
+                # For transient asyncpg pool-state issues, retry once without resetting
+                # the shared global pool. Global disconnect/reconnect can break
+                # concurrent requests on unrelated endpoints.
                 if is_asyncpg_busy_error(e):
                     try:
                         logger.warning(
-                            "[agent_orders_create] asyncpg connection busy; resetting DB pool and retrying once"
+                            "[agent_orders_create] transient asyncpg state; retrying once without pool reset"
                         )
-                        await database.disconnect()
-                        await database.connect()
+                        await asyncio.sleep(0.05)
                     except Exception:
                         pass
                     try:
