@@ -543,6 +543,8 @@ def _normalize_gateway_route_health(
     search_decision = md.get("search_decision")
     if not isinstance(search_decision, dict):
         search_decision = None
+    source_breakdown = md.get("source_breakdown")
+    source_breakdown = source_breakdown if isinstance(source_breakdown, dict) else {}
 
     def _int_non_negative(value: Any) -> int:
         try:
@@ -679,7 +681,19 @@ def _normalize_gateway_route_health(
     route_health["external_raw_count"] = _int_non_negative(
         route_health.get("external_raw_count")
         if route_health.get("external_raw_count") is not None
-        else md.get("external_raw_count")
+        else (md.get("external_raw_count") if md.get("external_raw_count") is not None else source_breakdown.get("external_seed_count"))
+    )
+    route_health["external_seed_returned_count"] = max(
+        _int_non_negative(
+            route_health.get("external_seed_returned_count")
+            if route_health.get("external_seed_returned_count") is not None
+            else (
+                md.get("external_seed_returned_count")
+                if md.get("external_seed_returned_count") is not None
+                else source_breakdown.get("external_seed_count")
+            )
+        ),
+        route_health["external_raw_count"],
     )
     route_health["merged_pre_limit_count"] = _int_non_negative(
         route_health.get("merged_pre_limit_count")
@@ -759,8 +773,12 @@ def _normalize_gateway_route_health(
     md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
+    md["external_seed_returned_count"] = route_health["external_seed_returned_count"]
     md["internal_raw_count"] = route_health["internal_raw_count"]
     md["external_raw_count"] = route_health["external_raw_count"]
+    if source_breakdown and source_breakdown.get("external_seed_count") is None:
+        source_breakdown["external_seed_count"] = route_health["external_seed_returned_count"]
+        md["source_breakdown"] = source_breakdown
     md["merged_pre_limit_count"] = route_health["merged_pre_limit_count"]
     md["primary_quality_gate_passed"] = route_health["primary_quality_gate_passed"]
     md["primary_quality_score"] = route_health["primary_quality_score"]
