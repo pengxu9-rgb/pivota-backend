@@ -468,6 +468,15 @@ def _normalize_external_seed_strategy(value: Any, fallback: str = "legacy") -> s
     return str(fallback or "legacy").strip().lower() or "legacy"
 
 
+def _derive_external_seed_cache_hit(
+    *,
+    skip_reason: Optional[Any],
+    cache_hit: Any,
+) -> bool:
+    reason_token = str(skip_reason or "").strip().lower()
+    return bool(cache_hit) or reason_token == "cache_hit"
+
+
 def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -> bool:
     pid = str(profile_id or "").strip().lower()
     if not pid or pid == "default":
@@ -1112,6 +1121,11 @@ def _build_route_health(
             else internal_raw_count + external_raw_count
         ),
     )
+    external_seed_skip_reason = str(seed_health.get("external_seed_skip_reason") or "").strip() or None
+    external_seed_cache_hit = _derive_external_seed_cache_hit(
+        skip_reason=external_seed_skip_reason,
+        cache_hit=seed_health.get("external_seed_cache_hit") or False,
+    )
     return {
         "orchestrator_path": str(orchestrator_path or "agent_api.products.search"),
         "decision_node": str(decision_node or primary_path_used or "unknown"),
@@ -1126,10 +1140,10 @@ def _build_route_health(
         "semantic_retry_query": semantic_retry_query,
         "semantic_retry_hits": semantic_retry_hits,
         "external_seed_executed": bool(seed_health.get("external_seed_executed") or False),
-        "external_seed_skip_reason": str(seed_health.get("external_seed_skip_reason") or "").strip() or None,
+        "external_seed_skip_reason": external_seed_skip_reason,
         "external_seed_query_ms": max(0, int(seed_health.get("external_seed_query_ms") or 0)),
         "external_seed_build_ms": max(0, int(seed_health.get("external_seed_build_ms") or 0)),
-        "external_seed_cache_hit": bool(seed_health.get("external_seed_cache_hit") or False),
+        "external_seed_cache_hit": external_seed_cache_hit,
         "external_seed_query_timeout": bool(seed_health.get("external_seed_query_timeout") or False),
         "external_seed_rows_fetched": max(0, int(seed_health.get("external_seed_rows_fetched") or 0)),
         "external_seed_rows_built": max(0, int(seed_health.get("external_seed_rows_built") or 0)),
@@ -1263,10 +1277,13 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
         ).strip()
         or None
     )
-    route_health["external_seed_cache_hit"] = bool(
-        route_health.get("external_seed_cache_hit")
-        if route_health.get("external_seed_cache_hit") is not None
-        else md.get("external_seed_cache_hit")
+    route_health["external_seed_cache_hit"] = _derive_external_seed_cache_hit(
+        skip_reason=route_health["external_seed_skip_reason"],
+        cache_hit=(
+            route_health.get("external_seed_cache_hit")
+            if route_health.get("external_seed_cache_hit") is not None
+            else md.get("external_seed_cache_hit")
+        ),
     )
     route_health["external_seed_query_timeout"] = bool(
         route_health.get("external_seed_query_timeout")
@@ -1471,8 +1488,9 @@ def _apply_external_seed_metrics(
     external_seed_health["external_seed_build_ms"] = max(
         0, int(metrics.get("build_ms") or external_seed_health.get("external_seed_build_ms") or 0)
     )
-    external_seed_health["external_seed_cache_hit"] = bool(
-        metrics.get("cache_hit", external_seed_health.get("external_seed_cache_hit") or False)
+    external_seed_health["external_seed_cache_hit"] = _derive_external_seed_cache_hit(
+        skip_reason=metrics.get("skip_reason", external_seed_health.get("external_seed_skip_reason")),
+        cache_hit=metrics.get("cache_hit", external_seed_health.get("external_seed_cache_hit") or False),
     )
     external_seed_health["external_seed_query_timeout"] = bool(
         metrics.get("query_timeout", external_seed_health.get("external_seed_query_timeout") or False)

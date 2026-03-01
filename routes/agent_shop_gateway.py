@@ -635,7 +635,7 @@ def _normalize_gateway_route_health(
         route_health.get("external_seed_cache_hit")
         if route_health.get("external_seed_cache_hit") is not None
         else md.get("external_seed_cache_hit")
-    )
+    ) or route_health["external_seed_skip_reason"] == "cache_hit"
     route_health["external_seed_query_timeout"] = bool(
         route_health.get("external_seed_query_timeout")
         if route_health.get("external_seed_query_timeout") is not None
