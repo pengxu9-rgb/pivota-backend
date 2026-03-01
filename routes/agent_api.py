@@ -1333,18 +1333,7 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     )
     source_breakdown = md.get("source_breakdown")
     source_breakdown = source_breakdown if isinstance(source_breakdown, dict) else {}
-    route_health["external_seed_returned_count"] = max(
-        _int_non_negative(
-            route_health.get("external_seed_returned_count")
-            if route_health.get("external_seed_returned_count") is not None
-            else (
-                md.get("external_seed_returned_count")
-                if md.get("external_seed_returned_count") is not None
-                else source_breakdown.get("external_seed_count")
-            )
-        ),
-        route_health["external_raw_count"],
-    )
+    route_health["external_seed_returned_count"] = route_health["external_raw_count"]
     route_health["merged_pre_limit_count"] = _int_non_negative(
         route_health.get("merged_pre_limit_count")
         if route_health.get("merged_pre_limit_count") is not None
