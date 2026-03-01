@@ -40,7 +40,7 @@ def test_resolve_retrieval_profile_respects_hint():
     assert profile["reason"] == "explicit_profile_hint"
 
 
-def test_profile_filter_blocks_tools_for_fragrance():
+def test_profile_filter_is_recall_first_for_fragrance():
     original = agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE
     agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = False
     brush_like = {
@@ -56,10 +56,10 @@ def test_profile_filter_blocks_tools_for_fragrance():
         "tags": ["parfum"],
     }
     try:
-        assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance_strict") is False
+        assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance_strict") is True
         assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance_strict") is True
         # Contract-facing semantic class is normalized to "fragrance".
-        assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance") is False
+        assert agent_api._passes_retrieval_profile_filter(brush_like, "fragrance") is True
         assert agent_api._passes_retrieval_profile_filter(perfume_like, "fragrance") is True
     finally:
         agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = original
@@ -78,3 +78,8 @@ def test_profile_filter_keeps_tool_candidate_when_prune_enabled():
         assert agent_api._passes_retrieval_profile_filter(mixed_like, "fragrance") is True
     finally:
         agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = original
+
+
+def test_has_fragrance_signal_supports_compact_tokens():
+    assert agent_api._has_fragrance_signal("EAUDEPARFUM collection") is True
+    assert agent_api._has_fragrance_signal("best bodymist picks") is True

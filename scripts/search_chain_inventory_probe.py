@@ -80,9 +80,19 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
     source_breakdown = metadata.get("source_breakdown")
     if not isinstance(source_breakdown, dict):
         source_breakdown = {}
+    fallback_strategy = metadata.get("fallback_strategy")
+    if not isinstance(fallback_strategy, dict):
+        fallback_strategy = {}
+    proxy_search_fallback = metadata.get("proxy_search_fallback")
+    if not isinstance(proxy_search_fallback, dict):
+        proxy_search_fallback = {}
 
     products = body.get("products") if isinstance(body, dict) else []
     product_count = len(products) if isinstance(products, list) else 0
+    clarification = body.get("clarification") if isinstance(body, dict) else None
+    has_clarification = bool(
+        isinstance(clarification, dict) and str(clarification.get("question") or "").strip()
+    )
 
     pagination = body.get("pagination") if isinstance(body, dict) else {}
     if not isinstance(pagination, dict):
@@ -122,6 +132,55 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         if search_decision.get("query_semantic_class") is not None
         else route_semantic_class
     ).strip().lower()
+    semantic_class_layer_diff = (
+        ""
+        if top_semantic_class == route_semantic_class == decision_semantic_class
+        else f"top={top_semantic_class or 'null'}|route={route_semantic_class or 'null'}|decision={decision_semantic_class or 'null'}"
+    )
+    fallback_attempt_count = _non_negative_int(
+        fallback_strategy.get("secondary_attempt_count")
+        if fallback_strategy.get("secondary_attempt_count") is not None
+        else len(fallback_strategy.get("secondary_attempts") or [])
+    )
+    base_query = str(
+        (metadata.get("search_trace") or {}).get("raw_query")
+        if isinstance(metadata.get("search_trace"), dict)
+        else ""
+    ).strip()
+    base_query_norm = " ".join(base_query.lower().split())
+    retry_query = str(
+        route_health.get("semantic_retry_query")
+        if route_health.get("semantic_retry_query") is not None
+        else metadata.get("semantic_retry_query")
+        or fallback_strategy.get("secondary_selected_query")
+        or ""
+    ).strip()
+    retry_query_norm = " ".join(retry_query.lower().split())
+    actual_retry_attempted = bool(
+        fallback_attempt_count > 1
+        or proxy_search_fallback.get("query_variant") == "semantic_retry"
+        or (
+            retry_query_norm
+            and base_query_norm
+            and retry_query_norm != base_query_norm
+        )
+    )
+    search_decision_final = str(search_decision.get("final_decision") or "").strip()
+    decision_final_vs_products_diff = False
+    if search_decision_final:
+        if product_count == 0 and has_clarification:
+            decision_final_vs_products_diff = search_decision_final not in {
+                "clarify",
+                "products_returned_with_clarification",
+            }
+        elif product_count == 0 and not has_clarification:
+            decision_final_vs_products_diff = search_decision_final in {
+                "products_returned",
+                "products_returned_with_clarification",
+                "upstream_returned",
+                "cache_returned",
+                "resolver_returned",
+            }
 
     return {
         "status": str(body.get("status") if isinstance(body, dict) else ""),
@@ -143,6 +202,7 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         "query_semantic_class_sync_ok": bool(
             top_semantic_class == route_semantic_class == decision_semantic_class
         ),
+        "semantic_class_layer_diff": semantic_class_layer_diff,
         "domain_filter_dropped_external": route_domain_drop,
         "metadata_domain_filter_dropped_external": top_domain_drop,
         "search_decision_domain_filter_dropped_external": decision_domain_drop,
@@ -172,6 +232,8 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
             else metadata.get("semantic_retry_hits")
             or 0
         ),
+        "actual_retry_attempted": actual_retry_attempted,
+        "fallback_attempt_count": fallback_attempt_count,
         "external_seed_brand_strict_rows": _non_negative_int(
             route_health.get("external_seed_brand_strict_rows")
             if route_health.get("external_seed_brand_strict_rows") is not None
@@ -203,6 +265,8 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "internal_count": _non_negative_int(source_breakdown.get("internal_count") or 0),
         "source_breakdown_external_count": _non_negative_int(source_breakdown.get("external_seed_count") or 0),
+        "search_decision_final_decision": search_decision_final,
+        "decision_final_vs_products_diff": bool(decision_final_vs_products_diff),
         "route_health_contract_missing_count": len(missing_route_health_fields),
         "route_health_contract_missing_fields": missing_route_health_fields,
         "fallback_reason_sync_ok": metadata.get("fallback_reason") == route_health.get("fallback_reason"),
@@ -330,6 +394,20 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "semantic_retry_applied_rounds": sum(
                 1 for r in ok_rows if bool(r.get("metrics", {}).get("semantic_retry_applied"))
             ),
+            "actual_retry_attempted_rounds": sum(
+                1 for r in ok_rows if bool(r.get("metrics", {}).get("actual_retry_attempted"))
+            ),
+            "avg_fallback_attempt_count": round(
+                statistics.mean(
+                    [
+                        _non_negative_int(r.get("metrics", {}).get("fallback_attempt_count") or 0)
+                        for r in ok_rows
+                    ]
+                ),
+                2,
+            )
+            if ok_rows
+            else 0.0,
             "brand_broad_fallback_rounds": sum(
                 1 for r in ok_rows if bool(r.get("metrics", {}).get("external_seed_broad_fallback_used"))
             ),
@@ -352,6 +430,16 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 1
                 for r in ok_rows
                 if not bool(r.get("metrics", {}).get("query_semantic_class_sync_ok"))
+            ),
+            "semantic_class_layer_diff_rounds": sum(
+                1
+                for r in ok_rows
+                if bool(str(r.get("metrics", {}).get("semantic_class_layer_diff") or "").strip())
+            ),
+            "decision_final_vs_products_diff_rounds": sum(
+                1
+                for r in ok_rows
+                if bool(r.get("metrics", {}).get("decision_final_vs_products_diff"))
             ),
             "route_health_contract_missing_rounds": sum(
                 1
@@ -456,6 +544,11 @@ def _render_markdown(
             missing_contract_rows.append(
                 f"- `{row['entry']}::{row['query']}` semantic retry observed rounds: `0/{row['rounds_ok']}`"
             )
+        if row["query"] == "perfume" and row.get("actual_retry_attempted_rounds", 0) == 0:
+            missing_contract_rows.append(
+                f"- `{row['entry']}::{row['query']}` had no actual retry attempts "
+                f"(`actual_retry_attempted_rounds=0/{row['rounds_ok']}`)."
+            )
         if (
             row["query"] == "perfume"
             and row["semantic_retry_applied_rounds"] > 0
@@ -490,6 +583,16 @@ def _render_markdown(
             missing_contract_rows.append(
                 f"- `{row['entry']}::{row['query']}` query_semantic_class split detected in "
                 f"`{row['query_semantic_class_sync_fail_rounds']}/{row['rounds_ok']}` rounds."
+            )
+        if row.get("semantic_class_layer_diff_rounds", 0) > 0:
+            missing_contract_rows.append(
+                f"- `{row['entry']}::{row['query']}` semantic class layer diff detected in "
+                f"`{row['semantic_class_layer_diff_rounds']}/{row['rounds_ok']}` rounds."
+            )
+        if row.get("decision_final_vs_products_diff_rounds", 0) > 0:
+            missing_contract_rows.append(
+                f"- `{row['entry']}::{row['query']}` search_decision.final_decision mismatched products in "
+                f"`{row['decision_final_vs_products_diff_rounds']}/{row['rounds_ok']}` rounds."
             )
 
     if missing_contract_rows:

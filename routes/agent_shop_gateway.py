@@ -431,9 +431,28 @@ def _classify_query_semantic_class(query: Optional[str]) -> str:
     q = str(query or "").strip().lower()
     if not q:
         return "default"
+    q_compact = re.sub(r"[^a-z0-9]+", "", q)
     if re.search(
         r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist)\b",
         q,
+    ):
+        return "fragrance"
+    if any(
+        token in q_compact
+        for token in (
+            "perfume",
+            "perfumes",
+            "fragrance",
+            "fragrances",
+            "parfum",
+            "parfums",
+            "cologne",
+            "bodymist",
+            "eaudeparfum",
+            "eaudetoilette",
+            "edp",
+            "edt",
+        )
     ):
         return "fragrance"
     if re.search(
@@ -484,15 +503,33 @@ def _build_fragrance_semantic_retry_query(query: Optional[str]) -> Optional[str]
             break
     if not keep:
         return None
-    if not any(
+    has_core_fragrance_term = any(
         token in {"perfume", "perfumes", "fragrance", "fragrances", "parfum", "parfums", "cologne", "mist"}
         for token in keep
-    ):
+    )
+    if not has_core_fragrance_term:
         keep.append("fragrance")
     retry_query = " ".join(keep)
-    if retry_query == q:
-        return None
-    return retry_query
+    if retry_query != q:
+        return retry_query
+
+    # Avoid no-op retries like query="perfume".
+    # We intentionally append compact semantic expansions to broaden recall.
+    expansions = [
+        "fragrance",
+        "parfum",
+        "cologne",
+        "body mist",
+        "eau de parfum",
+        "eau de toilette",
+    ]
+    expanded_parts: List[str] = [q]
+    for term in expansions:
+        if term in q:
+            continue
+        expanded_parts.append(term)
+    expanded_query = " ".join(expanded_parts).strip()
+    return expanded_query if expanded_query and expanded_query != q else None
 
 
 def _normalize_gateway_route_health(
@@ -645,13 +682,13 @@ MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS = _env_float(
 )
 MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_SEED_QUERY_TIMEOUT_SECONDS",
-    0.8,
+    1.6,
     min_value=0.1,
     max_value=5.0,
 )
 MULTI_SEARCH_SEED_BUILD_BUDGET_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_SEED_BUILD_BUDGET_SECONDS",
-    0.45,
+    1.0,
     min_value=0.05,
     max_value=3.0,
 )
@@ -681,7 +718,7 @@ MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN = _env_bool(
 )
 MULTI_SEARCH_SHOPPING_RECALL_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_SHOPPING_RECALL_QUERY_TIMEOUT_SECONDS",
-    0.45,
+    1.0,
     min_value=0.1,
     max_value=5.0,
 )
@@ -723,7 +760,7 @@ MULTI_SEARCH_SKIP_HISTORY_SHOPPING = _env_bool(
 )
 MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING = _env_int(
     "AGENT_SHOP_MULTI_SEED_QUERY_LIMIT_SHOPPING",
-    12,
+    200,
     min_value=0,
     max_value=300,
 )

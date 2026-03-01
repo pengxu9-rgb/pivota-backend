@@ -77,3 +77,11 @@ def test_gateway_external_seed_dedupe_softens_in_prune_mode():
         assert len(kept_relaxed) == 1
     finally:
         agent_shop_gateway.SEARCH_EXTERNAL_HARD_RULE_PRUNE = original
+
+
+def test_gateway_fragrance_retry_query_never_noop_for_perfume():
+    retry_query = agent_shop_gateway._build_fragrance_semantic_retry_query("perfume")
+    assert isinstance(retry_query, str)
+    assert retry_query
+    assert retry_query != "perfume"
+    assert "fragrance" in retry_query or "parfum" in retry_query or "cologne" in retry_query

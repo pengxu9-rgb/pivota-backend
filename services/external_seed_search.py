@@ -254,7 +254,7 @@ async def fetch_external_seed_rows(
     offset: int = 0,
     include_seed_data_text_match: bool = False,
     only_unattached: bool = True,
-    query_timeout_seconds: float = 0.35,
+    query_timeout_seconds: float = 0.8,
     required_terms: Optional[List[str]] = None,
     prefer_terms: Optional[List[str]] = None,
     scope: str = "default",
@@ -314,7 +314,7 @@ async def fetch_external_seed_rows(
     count_values: Dict[str, Any] = {
         k: v for k, v in values.items() if k not in {"limit", "offset"}
     }
-    timeout_seconds = max(0.05, float(query_timeout_seconds or 0.35))
+    timeout_seconds = max(0.05, float(query_timeout_seconds or 0.8))
     timeout_ms = max(50, int(timeout_seconds * 1000))
 
     started = time.perf_counter()

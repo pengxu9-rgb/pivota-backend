@@ -314,10 +314,30 @@ def _has_fragrance_signal(text: Optional[str]) -> bool:
     raw = str(text or "").strip().lower()
     if not raw:
         return False
-    return bool(
-        re.search(
-            r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist)\b",
-            raw,
+    if re.search(
+        r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist|scent|aroma|edp|edt|extrait)\b",
+        raw,
+    ):
+        return True
+    compact = re.sub(r"[^a-z0-9]+", "", raw)
+    if not compact:
+        return False
+    return any(
+        token in compact
+        for token in (
+            "perfume",
+            "perfumes",
+            "fragrance",
+            "fragrances",
+            "parfum",
+            "parfums",
+            "cologne",
+            "bodymist",
+            "eaudeparfum",
+            "eaudetoilette",
+            "extraitdeparfum",
+            "edp",
+            "edt",
         )
     )
 
@@ -420,9 +440,8 @@ def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -
         return True
     blob = _build_product_search_blob(product)
     if pid in {"fragrance", "fragrance_strict"}:
-        if _has_beauty_tool_signal(blob) and not SEARCH_EXTERNAL_HARD_RULE_PRUNE:
-            return False
-        return _has_fragrance_signal(blob)
+        # Recall-first policy: fragrance profile no longer hard-filters candidates.
+        return True
     if pid in {"lingerie", "lingerie_strict"}:
         return _has_lingerie_signal(blob)
     return True
@@ -507,20 +526,20 @@ AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY = int(
 )
 AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS",
-    0.35,
+    0.8,
     min_value=0.05,
     max_value=5.0,
 )
 AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS",
-    0.35,
+    0.8,
     min_value=0.05,
     max_value=5.0,
 )
 AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS",
-        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 400),
+        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 900),
         min_value=50.0,
         max_value=3000.0,
     )
@@ -528,7 +547,7 @@ AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
 AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS",
-        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 400),
+        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 1200),
         min_value=100.0,
         max_value=5000.0,
     )
@@ -2193,7 +2212,7 @@ async def _load_external_seed_products_for_search(
         offset=max(0, int(page_offset or 0)),
         include_seed_data_text_match=include_seed_data_text_match,
         only_unattached=strict_only_unattached,
-        query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35),
+        query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.8),
         required_terms=None,
         prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
         scope=strict_scope,
@@ -2246,7 +2265,7 @@ async def _load_external_seed_products_for_search(
             offset=0,
             include_seed_data_text_match=True,
             only_unattached=False,
-            query_timeout_seconds=max(float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.35), 0.8),
+            query_timeout_seconds=max(float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.8), 0.8),
             required_terms=None,
             prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
             scope="brand_broad" if brand_query_detected else "default",
