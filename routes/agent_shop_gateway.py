@@ -612,6 +612,45 @@ def _normalize_gateway_route_health(
         if route_health.get("semantic_retry_hits") is not None
         else md.get("semantic_retry_hits")
     )
+    route_health["semantic_retry_actual_attempted"] = bool(
+        route_health.get("semantic_retry_actual_attempted")
+        if route_health.get("semantic_retry_actual_attempted") is not None
+        else md.get("semantic_retry_actual_attempted")
+    )
+    route_health["external_seed_executed"] = bool(
+        route_health.get("external_seed_executed")
+        if route_health.get("external_seed_executed") is not None
+        else md.get("external_seed_executed")
+    )
+    route_health["external_seed_skip_reason"] = (
+        str(
+            route_health.get("external_seed_skip_reason")
+            if route_health.get("external_seed_skip_reason") is not None
+            else md.get("external_seed_skip_reason")
+            or ""
+        ).strip()
+        or None
+    )
+    route_health["external_seed_cache_hit"] = bool(
+        route_health.get("external_seed_cache_hit")
+        if route_health.get("external_seed_cache_hit") is not None
+        else md.get("external_seed_cache_hit")
+    )
+    route_health["external_seed_query_timeout"] = bool(
+        route_health.get("external_seed_query_timeout")
+        if route_health.get("external_seed_query_timeout") is not None
+        else md.get("external_seed_query_timeout")
+    )
+    route_health["external_seed_rows_fetched"] = _int_non_negative(
+        route_health.get("external_seed_rows_fetched")
+        if route_health.get("external_seed_rows_fetched") is not None
+        else md.get("external_seed_rows_fetched")
+    )
+    route_health["external_seed_rows_built"] = _int_non_negative(
+        route_health.get("external_seed_rows_built")
+        if route_health.get("external_seed_rows_built") is not None
+        else md.get("external_seed_rows_built")
+    )
     route_health["external_seed_brand_strict_rows"] = _int_non_negative(
         route_health.get("external_seed_brand_strict_rows")
         if route_health.get("external_seed_brand_strict_rows") is not None
@@ -684,6 +723,16 @@ def _normalize_gateway_route_health(
         if route_health.get("retry_attempt_count") is not None
         else md.get("retry_attempt_count")
     )
+    route_health["fallback_attempt_count"] = _int_non_negative(
+        route_health.get("fallback_attempt_count")
+        if route_health.get("fallback_attempt_count") is not None
+        else md.get("fallback_attempt_count")
+    )
+    route_health["selected_fallback_attempt"] = _int_non_negative(
+        route_health.get("selected_fallback_attempt")
+        if route_health.get("selected_fallback_attempt") is not None
+        else md.get("selected_fallback_attempt")
+    )
     route_health["final_returned_count"] = _int_non_negative(
         route_health.get("final_returned_count")
         if route_health.get("final_returned_count") is not None
@@ -699,6 +748,13 @@ def _normalize_gateway_route_health(
     md["semantic_retry_applied"] = route_health["semantic_retry_applied"]
     md["semantic_retry_query"] = route_health["semantic_retry_query"]
     md["semantic_retry_hits"] = route_health["semantic_retry_hits"]
+    md["semantic_retry_actual_attempted"] = route_health["semantic_retry_actual_attempted"]
+    md["external_seed_executed"] = route_health["external_seed_executed"]
+    md["external_seed_skip_reason"] = route_health["external_seed_skip_reason"]
+    md["external_seed_cache_hit"] = route_health["external_seed_cache_hit"]
+    md["external_seed_query_timeout"] = route_health["external_seed_query_timeout"]
+    md["external_seed_rows_fetched"] = route_health["external_seed_rows_fetched"]
+    md["external_seed_rows_built"] = route_health["external_seed_rows_built"]
     md["external_seed_brand_strict_rows"] = route_health["external_seed_brand_strict_rows"]
     md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
@@ -712,6 +768,8 @@ def _normalize_gateway_route_health(
     md["supplement_attempted"] = route_health["supplement_attempted"]
     md["supplement_skip_reason"] = route_health["supplement_skip_reason"]
     md["retry_attempt_count"] = route_health["retry_attempt_count"]
+    md["fallback_attempt_count"] = route_health["fallback_attempt_count"]
+    md["selected_fallback_attempt"] = route_health["selected_fallback_attempt"]
     md["final_returned_count"] = route_health["final_returned_count"]
     if search_decision is not None:
         search_decision["query_semantic_class"] = route_health["query_semantic_class"]

@@ -75,7 +75,7 @@ FIND_PRODUCTS_MULTI_SEED_BUDGET_MS = max(
     0,
     min(
         5000,
-        int(os.getenv("FIND_PRODUCTS_MULTI_SEED_BUDGET_MS", "400") or 400),
+        int(os.getenv("FIND_PRODUCTS_MULTI_SEED_BUDGET_MS", "800") or 800),
     ),
 )
 FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY = max(
@@ -316,6 +316,25 @@ def _detect_brand_query(query: Optional[str]) -> Dict[str, Any]:
     }
 
 
+_FRAGRANCE_EXPANSION_TERMS = [
+    "perfume",
+    "perfumes",
+    "fragrance",
+    "fragrances",
+    "parfum",
+    "parfums",
+    "cologne",
+    "body mist",
+    "scent",
+    "aroma",
+    "eau de parfum",
+    "eau de toilette",
+    "extrait de parfum",
+    "edp",
+    "edt",
+]
+
+
 def _has_fragrance_signal(text: Optional[str]) -> bool:
     raw = str(text or "").strip().lower()
     if not raw:
@@ -541,20 +560,32 @@ AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY = int(
 )
 AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS",
-    0.8,
+    1.6,
     min_value=0.05,
     max_value=5.0,
 )
 AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS",
-    0.8,
+    1.6,
+    min_value=0.05,
+    max_value=5.0,
+)
+AGENT_EXTERNAL_SEED_STAGE_A_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_EXTERNAL_SEED_STAGE_A_QUERY_TIMEOUT_SECONDS",
+    0.9,
+    min_value=0.05,
+    max_value=5.0,
+)
+AGENT_EXTERNAL_SEED_STAGE_B_QUERY_TIMEOUT_SECONDS = _env_float(
+    "AGENT_EXTERNAL_SEED_STAGE_B_QUERY_TIMEOUT_SECONDS",
+    1.4,
     min_value=0.05,
     max_value=5.0,
 )
 AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS",
-        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 900),
+        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 1800),
         min_value=50.0,
         max_value=3000.0,
     )
@@ -562,7 +593,7 @@ AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
 AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS",
-        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 1200),
+        float(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 2400),
         min_value=100.0,
         max_value=5000.0,
     )
@@ -1057,6 +1088,22 @@ def _build_route_health(
     if not supplement_attempted and not supplement_skip_reason and primary_quality_gate_passed:
         supplement_skip_reason = "not_needed"
     retry_attempt_count = max(0, int(funnel.get("retry_attempt_count") or 0))
+    fallback_attempt_count = max(
+        retry_attempt_count,
+        int(funnel.get("fallback_attempt_count") or 0),
+    )
+    selected_fallback_attempt = max(0, int(funnel.get("selected_fallback_attempt") or 0))
+    semantic_retry_actual_attempted = bool(
+        funnel.get("semantic_retry_actual_attempted")
+        if funnel.get("semantic_retry_actual_attempted") is not None
+        else (
+            semantic_retry_applied
+            and (
+                fallback_attempt_count > 1
+                or bool(str(semantic_retry_query or "").strip())
+            )
+        )
+    )
     final_returned_count = max(
         0,
         int(
@@ -1087,6 +1134,10 @@ def _build_route_health(
         "external_seed_rows_fetched": max(0, int(seed_health.get("external_seed_rows_fetched") or 0)),
         "external_seed_rows_built": max(0, int(seed_health.get("external_seed_rows_built") or 0)),
         "external_seed_budget_exhausted": bool(seed_health.get("external_seed_budget_exhausted") or False),
+        "external_seed_stage_a_rows": max(0, int(seed_health.get("external_seed_stage_a_rows") or 0)),
+        "external_seed_stage_b_attempted": bool(seed_health.get("external_seed_stage_b_attempted") or False),
+        "external_seed_stage_b_rows": max(0, int(seed_health.get("external_seed_stage_b_rows") or 0)),
+        "external_seed_stage_b_timeout": bool(seed_health.get("external_seed_stage_b_timeout") or False),
         "external_seed_brand_strict_rows": max(0, int(seed_health.get("external_seed_brand_strict_rows") or 0)),
         "external_seed_brand_relevant_rows": max(0, int(seed_health.get("external_seed_brand_relevant_rows") or 0)),
         "external_seed_broad_fallback_used": bool(seed_health.get("external_seed_broad_fallback_used") or False),
@@ -1100,6 +1151,9 @@ def _build_route_health(
         "supplement_attempted": supplement_attempted,
         "supplement_skip_reason": supplement_skip_reason,
         "retry_attempt_count": retry_attempt_count,
+        "fallback_attempt_count": fallback_attempt_count,
+        "selected_fallback_attempt": selected_fallback_attempt,
+        "semantic_retry_actual_attempted": semantic_retry_actual_attempted,
         "final_returned_count": final_returned_count,
         "auth_lookup_ms": max(0, int(auth_lookup_ms or 0)),
         "auth_total_ms": max(0, int(auth_total_ms or 0)),
@@ -1190,6 +1244,45 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
         if route_health.get("semantic_retry_hits") is not None
         else md.get("semantic_retry_hits")
     )
+    route_health["semantic_retry_actual_attempted"] = bool(
+        route_health.get("semantic_retry_actual_attempted")
+        if route_health.get("semantic_retry_actual_attempted") is not None
+        else md.get("semantic_retry_actual_attempted")
+    )
+    route_health["external_seed_executed"] = bool(
+        route_health.get("external_seed_executed")
+        if route_health.get("external_seed_executed") is not None
+        else md.get("external_seed_executed")
+    )
+    route_health["external_seed_skip_reason"] = (
+        str(
+            route_health.get("external_seed_skip_reason")
+            if route_health.get("external_seed_skip_reason") is not None
+            else md.get("external_seed_skip_reason")
+            or ""
+        ).strip()
+        or None
+    )
+    route_health["external_seed_cache_hit"] = bool(
+        route_health.get("external_seed_cache_hit")
+        if route_health.get("external_seed_cache_hit") is not None
+        else md.get("external_seed_cache_hit")
+    )
+    route_health["external_seed_query_timeout"] = bool(
+        route_health.get("external_seed_query_timeout")
+        if route_health.get("external_seed_query_timeout") is not None
+        else md.get("external_seed_query_timeout")
+    )
+    route_health["external_seed_rows_fetched"] = _int_non_negative(
+        route_health.get("external_seed_rows_fetched")
+        if route_health.get("external_seed_rows_fetched") is not None
+        else md.get("external_seed_rows_fetched")
+    )
+    route_health["external_seed_rows_built"] = _int_non_negative(
+        route_health.get("external_seed_rows_built")
+        if route_health.get("external_seed_rows_built") is not None
+        else md.get("external_seed_rows_built")
+    )
     route_health["external_seed_brand_strict_rows"] = _int_non_negative(
         route_health.get("external_seed_brand_strict_rows")
         if route_health.get("external_seed_brand_strict_rows") is not None
@@ -1266,6 +1359,16 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
         if route_health.get("retry_attempt_count") is not None
         else md.get("retry_attempt_count")
     )
+    route_health["fallback_attempt_count"] = _int_non_negative(
+        route_health.get("fallback_attempt_count")
+        if route_health.get("fallback_attempt_count") is not None
+        else md.get("fallback_attempt_count")
+    )
+    route_health["selected_fallback_attempt"] = _int_non_negative(
+        route_health.get("selected_fallback_attempt")
+        if route_health.get("selected_fallback_attempt") is not None
+        else md.get("selected_fallback_attempt")
+    )
     route_health["final_returned_count"] = _int_non_negative(
         route_health.get("final_returned_count")
         if route_health.get("final_returned_count") is not None
@@ -1283,6 +1386,13 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["semantic_retry_applied"] = route_health["semantic_retry_applied"]
     md["semantic_retry_query"] = route_health["semantic_retry_query"]
     md["semantic_retry_hits"] = route_health["semantic_retry_hits"]
+    md["semantic_retry_actual_attempted"] = route_health["semantic_retry_actual_attempted"]
+    md["external_seed_executed"] = route_health["external_seed_executed"]
+    md["external_seed_skip_reason"] = route_health["external_seed_skip_reason"]
+    md["external_seed_cache_hit"] = route_health["external_seed_cache_hit"]
+    md["external_seed_query_timeout"] = route_health["external_seed_query_timeout"]
+    md["external_seed_rows_fetched"] = route_health["external_seed_rows_fetched"]
+    md["external_seed_rows_built"] = route_health["external_seed_rows_built"]
     md["external_seed_brand_strict_rows"] = route_health["external_seed_brand_strict_rows"]
     md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
@@ -1296,6 +1406,8 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["supplement_attempted"] = route_health["supplement_attempted"]
     md["supplement_skip_reason"] = route_health["supplement_skip_reason"]
     md["retry_attempt_count"] = route_health["retry_attempt_count"]
+    md["fallback_attempt_count"] = route_health["fallback_attempt_count"]
+    md["selected_fallback_attempt"] = route_health["selected_fallback_attempt"]
     md["final_returned_count"] = route_health["final_returned_count"]
     md["fallback_reason"] = fallback_reason
     if search_decision is not None:
@@ -1320,6 +1432,10 @@ def _new_external_seed_health() -> Dict[str, Any]:
         "external_seed_rows_fetched": 0,
         "external_seed_rows_built": 0,
         "external_seed_budget_exhausted": False,
+        "external_seed_stage_a_rows": 0,
+        "external_seed_stage_b_attempted": False,
+        "external_seed_stage_b_rows": 0,
+        "external_seed_stage_b_timeout": False,
         "external_seed_brand_strict_rows": 0,
         "external_seed_brand_relevant_rows": 0,
         "external_seed_broad_fallback_used": False,
@@ -1370,6 +1486,24 @@ def _apply_external_seed_metrics(
     external_seed_health["external_seed_budget_exhausted"] = bool(
         metrics.get("budget_exhausted", external_seed_health.get("external_seed_budget_exhausted") or False)
     )
+    external_seed_health["external_seed_stage_a_rows"] = max(
+        0,
+        int(metrics.get("stage_a_rows") or external_seed_health.get("external_seed_stage_a_rows") or 0),
+    )
+    external_seed_health["external_seed_stage_b_attempted"] = bool(
+        metrics.get("stage_b_attempted")
+        or external_seed_health.get("external_seed_stage_b_attempted")
+        or False
+    )
+    external_seed_health["external_seed_stage_b_rows"] = max(
+        0,
+        int(metrics.get("stage_b_rows") or external_seed_health.get("external_seed_stage_b_rows") or 0),
+    )
+    external_seed_health["external_seed_stage_b_timeout"] = bool(
+        metrics.get("stage_b_timeout")
+        or external_seed_health.get("external_seed_stage_b_timeout")
+        or False
+    )
     external_seed_health["external_seed_brand_strict_rows"] = max(
         0,
         int(
@@ -1416,10 +1550,13 @@ def _apply_external_seed_metrics(
     ).strip().lower()
     if semantic_class:
         external_seed_health["query_semantic_class"] = semantic_class
-    external_seed_health["external_fill_gate_reason"] = (
-        str(metrics.get("external_fill_gate_reason") or "").strip()
-        or external_seed_health.get("external_fill_gate_reason")
-        or None
+    external_seed_health["external_fill_gate_reason"] = _external_seed_fill_reason_from_metrics(
+        metrics,
+        default=(
+            str(metrics.get("external_fill_gate_reason") or "").strip()
+            or external_seed_health.get("external_fill_gate_reason")
+            or None
+        ),
     )
     external_seed_health["semantic_retry_applied"] = bool(
         metrics.get("semantic_retry_applied")
@@ -1512,6 +1649,45 @@ def _hash_external_seed_terms(terms: Optional[List[str]]) -> str:
     return digest[:12]
 
 
+def _build_external_seed_expansion_terms(
+    *,
+    query: Optional[str],
+    query_semantic_class: Optional[str],
+    brand_terms: Optional[List[str]],
+) -> List[str]:
+    semantic_class = str(query_semantic_class or "").strip().lower()
+    query_terms = _normalize_external_seed_terms(
+        [str(token or "") for token in re.findall(r"[a-z0-9]+", str(query or "").lower())],
+        max_terms=12,
+    )
+    expansion_terms: List[str] = list(query_terms)
+    if semantic_class == "fragrance":
+        expansion_terms.extend(_FRAGRANCE_EXPANSION_TERMS)
+    expansion_terms.extend(_normalize_external_seed_terms(brand_terms, max_terms=8))
+    return _normalize_external_seed_terms(expansion_terms, max_terms=24)
+
+
+def _resolve_external_seed_stage_b_min_rows(*, limit: int, query_semantic_class: Optional[str]) -> int:
+    semantic_class = str(query_semantic_class or "").strip().lower()
+    safe_limit = max(1, int(limit or 1))
+    if semantic_class == "fragrance":
+        return max(8, min(safe_limit, 20))
+    return max(4, min(safe_limit, 12))
+
+
+def _external_seed_fill_reason_from_metrics(metrics: Dict[str, Any], *, default: Optional[str]) -> Optional[str]:
+    if not isinstance(metrics, dict):
+        return default
+    if bool(metrics.get("query_timeout") or False):
+        return "external_seed_query_timeout"
+    if bool(metrics.get("budget_exhausted") or False):
+        return "external_seed_budget_exhausted"
+    skip_reason = str(metrics.get("skip_reason") or "").strip()
+    if skip_reason in {"seed_loader_error", "seed_table_missing"}:
+        return skip_reason
+    return default
+
+
 def _build_external_seed_cache_key(
     *,
     query: Optional[str],
@@ -1519,6 +1695,8 @@ def _build_external_seed_cache_key(
     strategy: str,
     surface: str,
     scope: str = "default",
+    query_semantic_class: Optional[str] = None,
+    expansion_terms: Optional[List[str]] = None,
     required_terms: Optional[List[str]] = None,
     hard_rule_prune: bool = False,
     limit: int,
@@ -1529,18 +1707,23 @@ def _build_external_seed_cache_key(
     normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
     normalized_surface = str(surface or "all").strip().lower() or "all"
     normalized_scope = str(scope or "default").strip().lower() or "default"
+    normalized_semantic_class = (
+        str(query_semantic_class or "default").strip().lower() or "default"
+    )
     normalized_required_terms = _normalize_external_seed_terms_for_cache(required_terms)
     required_terms_hash = (
         hashlib.sha1("||".join(normalized_required_terms).encode("utf-8")).hexdigest()[:12]
         if normalized_required_terms
         else "none"
     )
+    expansion_hash = _hash_external_seed_terms(expansion_terms)
     limit_bucket = _external_seed_limit_bucket(limit)
     offset_bucket = max(0, int(page_offset or 0))
     prune_token = "prune1" if hard_rule_prune else "prune0"
     return (
         f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_scope}|"
-        f"{normalized_surface}|{required_terms_hash}|{prune_token}|{limit_bucket}|{offset_bucket}"
+        f"{normalized_surface}|{normalized_semantic_class}|{expansion_hash}|{required_terms_hash}|"
+        f"{prune_token}|{limit_bucket}|{offset_bucket}"
     )
 
 
@@ -1573,17 +1756,38 @@ def _put_cached_external_seed_products(cache_key: str, products: List[Dict[str, 
         _EXTERNAL_SEED_SEARCH_CACHE.popitem(last=False)
 
 
+def _should_cache_external_seed_result(
+    *,
+    products: List[Dict[str, Any]],
+    metrics: Optional[Dict[str, Any]],
+) -> bool:
+    if products:
+        return True
+    if not isinstance(metrics, dict):
+        return False
+    if bool(metrics.get("query_timeout") or False):
+        return False
+    if bool(metrics.get("budget_exhausted") or False):
+        return False
+    skip_reason = str(metrics.get("skip_reason") or "").strip()
+    if skip_reason in {"seed_loader_error", "seed_table_missing"}:
+        return False
+    return True
+
+
 def _schedule_external_seed_cache_refresh(
     *,
     cache_key: str,
     req: Request,
     query: Optional[str],
+    query_semantic_class: Optional[str],
     limit: int,
     page_offset: int,
     build_budget_ms: Optional[int],
     build_concurrency: Optional[int],
     include_seed_data_text_match: bool,
     enable_broad_fallback: bool,
+    expansion_terms: Optional[List[str]],
     brand_terms: Optional[List[str]],
     brand_required_terms: Optional[List[str]],
     brand_prefer_terms: Optional[List[str]],
@@ -1595,6 +1799,7 @@ def _schedule_external_seed_cache_refresh(
 
     async def _runner() -> None:
         try:
+            refresh_metrics: Dict[str, Any] = {}
             refreshed = await _load_external_seed_products_for_search(
                 req=req,
                 query=query,
@@ -1604,13 +1809,16 @@ def _schedule_external_seed_cache_refresh(
                 build_concurrency=build_concurrency,
                 include_seed_data_text_match=include_seed_data_text_match,
                 enable_broad_fallback=enable_broad_fallback,
+                query_semantic_class=query_semantic_class,
+                expansion_terms=expansion_terms,
                 brand_terms=brand_terms,
                 brand_required_terms=brand_required_terms,
                 brand_prefer_terms=brand_prefer_terms,
                 brand_query_detected=brand_query_detected,
-                metrics_out={},
+                metrics_out=refresh_metrics,
             )
-            _put_cached_external_seed_products(cache_key, refreshed or [])
+            if _should_cache_external_seed_result(products=refreshed or [], metrics=refresh_metrics):
+                _put_cached_external_seed_products(cache_key, refreshed or [])
         except Exception:
             logger.debug("external seed async cache refresh failed", exc_info=True)
         finally:
@@ -1624,6 +1832,7 @@ async def _load_external_seed_products_with_cache(
     *,
     req: Request,
     query: Optional[str],
+    query_semantic_class: Optional[str],
     limit: int,
     build_budget_ms: Optional[int],
     build_concurrency: Optional[int],
@@ -1632,6 +1841,7 @@ async def _load_external_seed_products_with_cache(
     normalized_catalog_surface: str,
     page_offset: int,
     enable_broad_fallback: bool = False,
+    expansion_terms: Optional[List[str]] = None,
     brand_terms: Optional[List[str]] = None,
     brand_required_terms: Optional[List[str]] = None,
     brand_prefer_terms: Optional[List[str]] = None,
@@ -1672,6 +1882,8 @@ async def _load_external_seed_products_with_cache(
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
+            query_semantic_class=query_semantic_class,
+            expansion_terms=expansion_terms,
             brand_terms=brand_terms,
             brand_required_terms=normalized_brand_required_terms,
             brand_prefer_terms=normalized_brand_prefer_terms,
@@ -1692,6 +1904,8 @@ async def _load_external_seed_products_with_cache(
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
+            query_semantic_class=query_semantic_class,
+            expansion_terms=expansion_terms,
             brand_terms=brand_terms,
             brand_required_terms=normalized_brand_required_terms,
             brand_prefer_terms=normalized_brand_prefer_terms,
@@ -1710,6 +1924,8 @@ async def _load_external_seed_products_with_cache(
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         scope=cache_scope,
+        query_semantic_class=query_semantic_class,
+        expansion_terms=expansion_terms,
         required_terms=normalized_brand_required_terms if brand_query_detected else None,
         hard_rule_prune=bool(SEARCH_EXTERNAL_HARD_RULE_PRUNE),
         limit=limit,
@@ -1726,6 +1942,7 @@ async def _load_external_seed_products_with_cache(
         metrics["build_ms"] = 0
         metrics["query_timeout"] = False
         metrics["budget_exhausted"] = False
+        metrics["external_fill_gate_reason"] = "cache_hit"
         metrics["brand_strict_rows"] = len(cached_products)
         if brand_query_detected and normalized_brand_prefer_terms:
             metrics["brand_relevant_rows"] = sum(
@@ -1747,6 +1964,8 @@ async def _load_external_seed_products_with_cache(
         build_concurrency=build_concurrency,
         include_seed_data_text_match=include_seed_data_text_match,
         enable_broad_fallback=enable_broad_fallback,
+        query_semantic_class=query_semantic_class,
+        expansion_terms=expansion_terms,
         brand_terms=brand_terms,
         brand_required_terms=normalized_brand_required_terms,
         brand_prefer_terms=normalized_brand_prefer_terms,
@@ -1754,19 +1973,29 @@ async def _load_external_seed_products_with_cache(
         metrics_out=metrics,
     )
     metrics["executed"] = True
-    metrics["skip_reason"] = "cache_miss_sync_filled" if sync_rows else "cache_miss_sync_empty"
-    _put_cached_external_seed_products(cache_key, sync_rows or [])
+    if sync_rows:
+        metrics["skip_reason"] = "cache_miss_sync_filled"
+    elif not str(metrics.get("skip_reason") or "").strip():
+        metrics["skip_reason"] = "cache_miss_sync_empty"
+    metrics["external_fill_gate_reason"] = _external_seed_fill_reason_from_metrics(
+        metrics,
+        default=metrics.get("skip_reason"),
+    )
+    if _should_cache_external_seed_result(products=sync_rows or [], metrics=metrics):
+        _put_cached_external_seed_products(cache_key, sync_rows or [])
     if not sync_rows:
         _schedule_external_seed_cache_refresh(
             cache_key=cache_key,
             req=req,
             query=query,
+            query_semantic_class=query_semantic_class,
             limit=limit,
             page_offset=page_offset,
             build_budget_ms=build_budget_ms,
             build_concurrency=build_concurrency,
             include_seed_data_text_match=include_seed_data_text_match,
             enable_broad_fallback=enable_broad_fallback,
+            expansion_terms=expansion_terms,
             brand_terms=brand_terms,
             brand_required_terms=normalized_brand_required_terms,
             brand_prefer_terms=normalized_brand_prefer_terms,
@@ -2321,12 +2550,14 @@ async def _load_external_seed_products_for_search(
     *,
     req: Request,
     query: Optional[str],
+    query_semantic_class: Optional[str] = None,
     limit: int,
     page_offset: int = 0,
     build_budget_ms: Optional[int] = None,
     build_concurrency: Optional[int] = None,
     include_seed_data_text_match: bool = False,
     enable_broad_fallback: bool = False,
+    expansion_terms: Optional[List[str]] = None,
     brand_terms: Optional[List[str]] = None,
     brand_required_terms: Optional[List[str]] = None,
     brand_prefer_terms: Optional[List[str]] = None,
@@ -2346,12 +2577,17 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("rows_fetched", 0)
         metrics.setdefault("rows_built", 0)
         metrics.setdefault("budget_exhausted", False)
+        metrics.setdefault("external_fill_gate_reason", None)
         metrics.setdefault("broad_scope_fallback_used", False)
         metrics.setdefault("broad_scope_rows_fetched", 0)
         metrics.setdefault("brand_strict_rows", 0)
         metrics.setdefault("brand_relevant_rows", 0)
         metrics.setdefault("broad_fallback_used", False)
         metrics.setdefault("broad_scope_rows", 0)
+        metrics.setdefault("stage_a_rows", 0)
+        metrics.setdefault("stage_b_attempted", False)
+        metrics.setdefault("stage_b_rows", 0)
+        metrics.setdefault("stage_b_timeout", False)
 
     normalized_brand_required_terms = _normalize_external_seed_terms_for_cache(
         brand_required_terms if brand_required_terms is not None else brand_terms
@@ -2359,37 +2595,136 @@ async def _load_external_seed_products_for_search(
     normalized_brand_prefer_terms = _normalize_external_seed_terms_for_cache(
         brand_prefer_terms if brand_prefer_terms is not None else brand_terms
     )
+    normalized_semantic_class = (
+        str(query_semantic_class or "default").strip().lower() or "default"
+    )
+    normalized_expansion_terms = _normalize_external_seed_terms_for_cache(
+        expansion_terms
+        if expansion_terms is not None
+        else _build_external_seed_expansion_terms(
+            query=query,
+            query_semantic_class=normalized_semantic_class,
+            brand_terms=normalized_brand_prefer_terms,
+        )
+    )
     strict_scope = "brand_strict" if brand_query_detected else "default"
     strict_only_unattached = False
     strict_use_required_terms_filter = False
-    fetch_result = await fetch_external_seed_rows(
+    stage_a_timeout_seconds = max(
+        0.05,
+        min(
+            float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 1.6),
+            float(AGENT_EXTERNAL_SEED_STAGE_A_QUERY_TIMEOUT_SECONDS or 0.9),
+        ),
+    )
+    stage_b_timeout_seconds = max(
+        stage_a_timeout_seconds,
+        float(AGENT_EXTERNAL_SEED_STAGE_B_QUERY_TIMEOUT_SECONDS or 1.4),
+    )
+    stage_a_result = await fetch_external_seed_rows(
         database=database,
         market=DEFAULT_EXTERNAL_SEED_MARKET,
         query=query,
         limit=limit,
         offset=max(0, int(page_offset or 0)),
-        include_seed_data_text_match=include_seed_data_text_match,
+        # Stage-A is intentionally fast and avoids full seed_data text scan.
+        include_seed_data_text_match=False,
         only_unattached=strict_only_unattached,
-        query_timeout_seconds=float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.8),
+        query_timeout_seconds=stage_a_timeout_seconds,
         required_terms=None,
         prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
         scope=strict_scope,
         use_required_terms_filter=strict_use_required_terms_filter,
     )
-    rows = fetch_result.get("rows") or []
-    strict_rows_count = len(rows)
+    stage_a_rows = stage_a_result.get("rows") or []
+    stage_a_timeout = bool(stage_a_result.get("query_timeout") or False)
+    rows = list(stage_a_rows)
+    stage_b_attempted = False
+    stage_b_timeout = False
+    stage_b_rows: List[Dict[str, Any]] = []
+    stage_b_result: Optional[Dict[str, Any]] = None
+    stage_b_min_rows = _resolve_external_seed_stage_b_min_rows(
+        limit=limit,
+        query_semantic_class=normalized_semantic_class,
+    )
+    should_attempt_stage_b = (
+        bool(str(query or "").strip())
+        and (
+            stage_a_timeout
+            or len(stage_a_rows) < stage_b_min_rows
+            or (normalized_semantic_class == "fragrance" and len(stage_a_rows) < max(4, int(limit or 0)))
+        )
+    )
+    if should_attempt_stage_b:
+        stage_b_attempted = True
+        stage_b_terms = _normalize_external_seed_terms(
+            [str(query or "").strip(), *normalized_expansion_terms],
+            max_terms=14,
+        )
+        stage_b_query = " ".join(stage_b_terms).strip() or str(query or "").strip()
+        stage_b_limit = min(1000, max(int(limit or 20) * 4, 120))
+        stage_b_prefer_terms = _normalize_external_seed_terms_for_cache(
+            [*normalized_brand_prefer_terms, *normalized_expansion_terms]
+        )
+        stage_b_result = await fetch_external_seed_rows(
+            database=database,
+            market=DEFAULT_EXTERNAL_SEED_MARKET,
+            query=stage_b_query,
+            limit=stage_b_limit,
+            offset=0,
+            include_seed_data_text_match=include_seed_data_text_match,
+            only_unattached=False,
+            query_timeout_seconds=stage_b_timeout_seconds,
+            required_terms=None,
+            prefer_terms=stage_b_prefer_terms if stage_b_prefer_terms else None,
+            scope="semantic_expansion" if normalized_semantic_class != "default" else "default",
+            use_required_terms_filter=False,
+        )
+        stage_b_rows = stage_b_result.get("rows") or []
+        stage_b_timeout = bool(stage_b_result.get("query_timeout") or False)
+        if stage_b_rows:
+            merged_rows: List[Dict[str, Any]] = []
+            seen_row_keys: set[str] = set()
+            for item in [*stage_b_rows, *rows]:
+                row = dict(item or {})
+                seed_data = _ensure_json_obj(row.get("seed_data"))
+                row_key = (
+                    str(row.get("external_product_id") or "").strip()
+                    or str(seed_data.get("external_product_id") or "").strip()
+                    or str(row.get("canonical_url") or "").strip()
+                    or str(row.get("destination_url") or "").strip()
+                )
+                if not row_key or row_key in seen_row_keys:
+                    continue
+                seen_row_keys.add(row_key)
+                merged_rows.append(row)
+            rows = merged_rows
+    fetch_result: Dict[str, Any] = dict(stage_a_result)
+    fetch_result["rows"] = rows
+    fetch_result["query_timeout"] = bool(stage_a_timeout or stage_b_timeout)
+    fetch_result["query_ms"] = max(
+        0,
+        int(stage_a_result.get("query_ms") or 0)
+        + int((stage_b_result or {}).get("query_ms") or 0),
+    )
+    strict_rows_count = len(stage_a_rows)
     strict_brand_relevant_rows = (
         sum(
             1
-            for row in rows
+            for row in stage_a_rows
             if _is_brand_relevant_product(row, normalized_brand_prefer_terms)
         )
         if brand_query_detected and normalized_brand_prefer_terms
-        else len(rows)
+        else len(stage_a_rows)
     )
     if metrics is not None:
-        metrics["brand_strict_rows"] = len(rows)
+        metrics["brand_strict_rows"] = strict_rows_count
         metrics["brand_relevant_rows"] = strict_brand_relevant_rows
+        metrics["query_semantic_class"] = normalized_semantic_class
+        metrics["stage_a_rows"] = len(stage_a_rows)
+        metrics["stage_b_attempted"] = bool(stage_b_attempted)
+        metrics["stage_b_rows"] = len(stage_b_rows)
+        metrics["stage_b_timeout"] = bool(stage_b_timeout)
     brand_underfilled_for_recall = (
         brand_query_detected
         and normalized_brand_prefer_terms
@@ -2423,9 +2758,18 @@ async def _load_external_seed_products_for_search(
             offset=0,
             include_seed_data_text_match=True,
             only_unattached=False,
-            query_timeout_seconds=max(float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 0.8), 0.8),
+            query_timeout_seconds=max(
+                float(AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS or 1.6),
+                stage_b_timeout_seconds,
+            ),
             required_terms=None,
-            prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
+            prefer_terms=(
+                _normalize_external_seed_terms_for_cache(
+                    [*normalized_brand_prefer_terms, *normalized_expansion_terms]
+                )
+                if brand_query_detected
+                else normalized_expansion_terms or None
+            ),
             scope="brand_broad" if brand_query_detected else "default",
             use_required_terms_filter=strict_use_required_terms_filter,
         )
@@ -2446,11 +2790,13 @@ async def _load_external_seed_products_for_search(
         metrics["rows_fetched"] = len(rows)
         if metrics["query_timeout"]:
             metrics["skip_reason"] = "query_timeout"
+            metrics["external_fill_gate_reason"] = "external_seed_query_timeout"
         if fetch_result.get("table_missing"):
             metrics["rows_built"] = 0
             metrics["build_ms"] = 0
             metrics["budget_exhausted"] = False
             metrics["skip_reason"] = "seed_table_missing"
+            metrics["external_fill_gate_reason"] = "seed_table_missing"
     if fetch_result.get("table_missing"):
         return []
 
@@ -2462,6 +2808,10 @@ async def _load_external_seed_products_for_search(
             metrics["budget_exhausted"] = False
             if not str(metrics.get("skip_reason") or "").strip():
                 metrics["skip_reason"] = "no_seed_candidates"
+            metrics["external_fill_gate_reason"] = _external_seed_fill_reason_from_metrics(
+                metrics,
+                default="no_external_seed_candidates",
+            )
         return []
 
     build_started = time.perf_counter()
@@ -2524,6 +2874,12 @@ async def _load_external_seed_products_for_search(
         metrics["budget_exhausted"] = budget_exhausted
         if budget_exhausted and not products:
             metrics["skip_reason"] = "build_budget_exhausted"
+            metrics["external_fill_gate_reason"] = "external_seed_budget_exhausted"
+        elif not products and not str(metrics.get("skip_reason") or "").strip():
+            metrics["external_fill_gate_reason"] = _external_seed_fill_reason_from_metrics(
+                metrics,
+                default="no_external_seed_candidates",
+            )
     return products[:limit]
 
 
@@ -3253,6 +3609,11 @@ async def agent_search_products(
             cost_ms_estimate=8,
             query_class="brand_query" if brand_query_detected else None,
         )
+        seed_expansion_terms = _build_external_seed_expansion_terms(
+            query=normalized_query,
+            query_semantic_class=query_semantic_class,
+            brand_terms=brand_prefer_terms,
+        )
         include_seed_data_text_match = bool(
             brand_query_detected
             or normalized_seed_strategy == "legacy"
@@ -3610,6 +3971,7 @@ async def agent_search_products(
                     external_seed_products = await _load_external_seed_products_with_cache(
                         req=req,
                         query=query,
+                        query_semantic_class=query_semantic_class,
                         limit=ext_limit,
                         build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
                         build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
@@ -3618,6 +3980,7 @@ async def agent_search_products(
                         normalized_catalog_surface=normalized_catalog_surface,
                         page_offset=offset,
                         enable_broad_fallback=brand_query_detected,
+                        expansion_terms=seed_expansion_terms,
                         brand_terms=brand_query_terms,
                         brand_required_terms=brand_required_terms,
                         brand_prefer_terms=brand_prefer_terms,
@@ -3717,7 +4080,10 @@ async def agent_search_products(
                         source_breakdown["external_seed_count"] = external_count_now
                         source_breakdown["internal_count"] = max(0, len(paginated_products) - external_count_now)
                     else:
-                        external_seed_skip_reason = "no_relevant_external_seed_candidates"
+                        external_seed_skip_reason = _external_seed_fill_reason_from_metrics(
+                            seed_metrics,
+                            default="no_relevant_external_seed_candidates",
+                        )
                 except Exception:
                     external_seed_skip_reason = "seed_loader_error"
                     _set_external_seed_skip_reason(
@@ -3748,7 +4114,7 @@ async def agent_search_products(
                 external_seed_inclusion_reason = "fast_pool_contains_external"
             if not external_seed_skip_reason:
                 external_seed_skip_reason = str(
-                    external_seed_health.get("skip_reason")
+                    external_seed_health.get("external_fill_gate_reason")
                     or external_seed_health.get("external_seed_skip_reason")
                     or ""
                 ).strip() or None
@@ -3894,8 +4260,8 @@ async def agent_search_products(
                     "low_confidence": low_confidence,
                     "low_confidence_reasons": low_confidence_reasons,
                     "external_seed_cache_status": str(
-                        external_seed_health.get("skip_reason")
-                        or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
+                        external_seed_health.get("external_seed_skip_reason")
+                        or ("cache_hit" if external_seed_health.get("external_seed_cache_hit") else "cache_miss")
                     ),
                     "external_seed_brand_strict_rows": int(
                         external_seed_health.get("external_seed_brand_strict_rows") or 0
@@ -4067,6 +4433,7 @@ async def agent_search_products(
                 external_seed_products = await _load_external_seed_products_with_cache(
                     req=req,
                     query=query,
+                    query_semantic_class=query_semantic_class,
                     limit=external_seed_limit,
                     build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,
                     build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
@@ -4075,6 +4442,7 @@ async def agent_search_products(
                     normalized_catalog_surface=normalized_catalog_surface,
                     page_offset=offset,
                     enable_broad_fallback=brand_query_detected,
+                    expansion_terms=seed_expansion_terms,
                     brand_terms=brand_query_terms,
                     brand_required_terms=brand_required_terms,
                     brand_prefer_terms=brand_prefer_terms,
@@ -4089,7 +4457,10 @@ async def agent_search_products(
                     all_products.extend(external_seed_products)
                     external_seed_inclusion_reason = "cross_merchant_joined"
                 else:
-                    external_seed_skip_reason = "no_external_seed_candidates"
+                    external_seed_skip_reason = _external_seed_fill_reason_from_metrics(
+                        seed_metrics,
+                        default="no_external_seed_candidates",
+                    )
             except Exception as e:
                 external_seed_skip_reason = "seed_loader_error"
                 _set_external_seed_skip_reason(
@@ -4271,8 +4642,8 @@ async def agent_search_products(
                     "low_confidence": False,
                     "low_confidence_reasons": [],
                     "external_seed_cache_status": str(
-                        external_seed_health.get("skip_reason")
-                        or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
+                        external_seed_health.get("external_seed_skip_reason")
+                        or ("cache_hit" if external_seed_health.get("external_seed_cache_hit") else "cache_miss")
                     ),
                     "external_seed_brand_strict_rows": int(
                         external_seed_health.get("external_seed_brand_strict_rows") or 0
@@ -4573,7 +4944,7 @@ async def agent_search_products(
             external_seed_inclusion_reason = "ranked_pool_contains_external"
         if not external_seed_skip_reason:
             external_seed_skip_reason = str(
-                external_seed_health.get("skip_reason")
+                external_seed_health.get("external_fill_gate_reason")
                 or external_seed_health.get("external_seed_skip_reason")
                 or ""
             ).strip() or None
@@ -4762,8 +5133,8 @@ async def agent_search_products(
                 "low_confidence": low_confidence,
                 "low_confidence_reasons": low_confidence_reasons,
                 "external_seed_cache_status": str(
-                    external_seed_health.get("skip_reason")
-                    or ("cache_hit" if external_seed_health.get("cache_hit") else "cache_miss")
+                    external_seed_health.get("external_seed_skip_reason")
+                    or ("cache_hit" if external_seed_health.get("external_seed_cache_hit") else "cache_miss")
                 ),
                 "external_seed_brand_strict_rows": int(
                     external_seed_health.get("external_seed_brand_strict_rows") or 0

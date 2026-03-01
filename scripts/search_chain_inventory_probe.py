@@ -32,7 +32,7 @@ DEFAULT_QUERIES = [
     "lingerie",
     "perfume",
 ]
-SCHEMA_VERSION = "v2"
+SCHEMA_VERSION = "v2.1"
 ROUTE_HEALTH_CONTRACT_FIELDS = [
     "orchestrator_path",
     "decision_node",
@@ -41,6 +41,12 @@ ROUTE_HEALTH_CONTRACT_FIELDS = [
     "semantic_retry_applied",
     "semantic_retry_query",
     "semantic_retry_hits",
+    "semantic_retry_actual_attempted",
+    "external_seed_query_timeout",
+    "external_seed_skip_reason",
+    "external_seed_cache_hit",
+    "external_seed_rows_fetched",
+    "external_seed_rows_built",
     "external_seed_brand_strict_rows",
     "external_seed_brand_relevant_rows",
     "external_seed_broad_fallback_used",
@@ -54,6 +60,8 @@ ROUTE_HEALTH_CONTRACT_FIELDS = [
     "supplement_attempted",
     "supplement_skip_reason",
     "retry_attempt_count",
+    "fallback_attempt_count",
+    "selected_fallback_attempt",
     "final_returned_count",
     "fallback_reason",
 ]
@@ -148,7 +156,9 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         else f"top={top_semantic_class or 'null'}|route={route_semantic_class or 'null'}|decision={decision_semantic_class or 'null'}"
     )
     fallback_attempt_count = _non_negative_int(
-        fallback_strategy.get("secondary_attempt_count")
+        route_health.get("fallback_attempt_count")
+        if route_health.get("fallback_attempt_count") is not None
+        else fallback_strategy.get("secondary_attempt_count")
         if fallback_strategy.get("secondary_attempt_count") is not None
         else len(fallback_strategy.get("secondary_attempts") or [])
     )
@@ -166,13 +176,64 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         or ""
     ).strip()
     retry_query_norm = " ".join(retry_query.lower().split())
-    actual_retry_attempted = bool(
+    heuristic_retry_attempted = bool(
         fallback_attempt_count > 1
         or proxy_search_fallback.get("query_variant") == "semantic_retry"
         or (
             retry_query_norm
             and base_query_norm
             and retry_query_norm != base_query_norm
+        )
+    )
+    semantic_retry_actual_attempted = bool(
+        route_health.get("semantic_retry_actual_attempted")
+        if route_health.get("semantic_retry_actual_attempted") is not None
+        else metadata.get("semantic_retry_actual_attempted")
+        if metadata.get("semantic_retry_actual_attempted") is not None
+        else heuristic_retry_attempted
+    )
+    selected_fallback_attempt = _non_negative_int(
+        route_health.get("selected_fallback_attempt")
+        if route_health.get("selected_fallback_attempt") is not None
+        else metadata.get("selected_fallback_attempt")
+        or fallback_strategy.get("secondary_selected_attempt")
+        or 0
+    )
+    selected_attempt_is_retry = bool(
+        selected_fallback_attempt > 1
+        or (
+            retry_query_norm
+            and base_query_norm
+            and retry_query_norm != base_query_norm
+        )
+    )
+    external_seed_skip_reason = (
+        str(
+            route_health.get("external_seed_skip_reason")
+            if route_health.get("external_seed_skip_reason") is not None
+            else metadata.get("external_seed_skip_reason")
+            or ""
+        ).strip()
+        or None
+    )
+    external_seed_query_timeout = bool(
+        route_health.get("external_seed_query_timeout")
+        if route_health.get("external_seed_query_timeout") is not None
+        else metadata.get("external_seed_query_timeout")
+        or False
+    )
+    external_seed_rows_fetched = _non_negative_int(
+        route_health.get("external_seed_rows_fetched")
+        if route_health.get("external_seed_rows_fetched") is not None
+        else metadata.get("external_seed_rows_fetched")
+        or 0
+    )
+    timeout_empty_cache_round = bool(
+        external_seed_query_timeout
+        and external_seed_rows_fetched == 0
+        and (
+            external_seed_skip_reason in {"query_timeout", "cache_miss_sync_empty", "cache_hit"}
+            or external_seed_skip_reason is None
         )
     )
     search_decision_final = str(search_decision.get("final_decision") or "").strip()
@@ -242,7 +303,9 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
             else metadata.get("semantic_retry_hits")
             or 0
         ),
-        "actual_retry_attempted": actual_retry_attempted,
+        "actual_retry_attempted": semantic_retry_actual_attempted,
+        "selected_fallback_attempt": selected_fallback_attempt,
+        "selected_attempt_is_retry": selected_attempt_is_retry,
         "fallback_attempt_count": fallback_attempt_count,
         "retry_attempt_count": _non_negative_int(
             route_health.get("retry_attempt_count")
@@ -334,6 +397,22 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
             else metadata.get("external_seed_broad_scope_rows")
             or 0
         ),
+        "external_seed_query_timeout": external_seed_query_timeout,
+        "external_seed_skip_reason": external_seed_skip_reason,
+        "external_seed_cache_hit": bool(
+            route_health.get("external_seed_cache_hit")
+            if route_health.get("external_seed_cache_hit") is not None
+            else metadata.get("external_seed_cache_hit")
+            or False
+        ),
+        "external_seed_rows_fetched": external_seed_rows_fetched,
+        "external_seed_rows_built": _non_negative_int(
+            route_health.get("external_seed_rows_built")
+            if route_health.get("external_seed_rows_built") is not None
+            else metadata.get("external_seed_rows_built")
+            or 0
+        ),
+        "timeout_empty_cache_round": timeout_empty_cache_round,
         "external_seed_returned_count": _non_negative_int(
             metadata.get("external_seed_returned_count")
             or source_breakdown.get("external_seed_count")
@@ -508,6 +587,23 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                     r.get("metrics", {}).get("domain_filter_shadow_dropped_external") or 0
                 )
                 for r in ok_rows
+            ),
+            "timeout_empty_cache_rounds": sum(
+                1 for r in ok_rows if bool(r.get("metrics", {}).get("timeout_empty_cache_round"))
+            ),
+            "fallback_attempt_count_avg": round(
+                statistics.mean(
+                    [
+                        _non_negative_int(r.get("metrics", {}).get("fallback_attempt_count") or 0)
+                        for r in ok_rows
+                    ]
+                ),
+                2,
+            )
+            if ok_rows
+            else 0.0,
+            "selected_attempt_is_retry_rounds": sum(
+                1 for r in ok_rows if bool(r.get("metrics", {}).get("selected_attempt_is_retry"))
             ),
             "domain_filter_sync_fail_rounds": sum(
                 1

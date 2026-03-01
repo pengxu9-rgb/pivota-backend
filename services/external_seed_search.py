@@ -197,6 +197,7 @@ def build_external_seed_required_terms_clause(
 def build_external_seed_prefer_terms_rank_sql(
     *,
     prefer_terms: Optional[List[str]],
+    include_seed_data_text_match: bool = True,
     param_prefix: str = "prefer",
 ) -> tuple[str, Dict[str, Any]]:
     terms = _normalize_seed_terms(prefer_terms, max_items=8)
@@ -211,7 +212,7 @@ def build_external_seed_prefer_terms_rank_sql(
             "(CASE WHEN "
             + _build_text_match_clause(
                 param_key=key,
-                include_seed_data_text_match=True,
+                include_seed_data_text_match=include_seed_data_text_match,
             )
             + " THEN 1 ELSE 0 END)"
         )
@@ -284,6 +285,7 @@ async def fetch_external_seed_rows(
     # never a hard SQL filter.
     rank_sql, rank_values = build_external_seed_prefer_terms_rank_sql(
         prefer_terms=prefer_terms or required_terms,
+        include_seed_data_text_match=include_seed_data_text_match,
         param_prefix="prefer",
     )
     scope_token = str(scope or "default").strip().lower() or "default"
