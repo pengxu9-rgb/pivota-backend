@@ -434,6 +434,15 @@ def _normalize_semantic_class_from_profile(profile_id: Optional[str]) -> str:
     return "default"
 
 
+def _normalize_external_seed_strategy(value: Any, fallback: str = "legacy") -> str:
+    token = str(value or "").strip().lower()
+    if token == "supplement_internal_first":
+        return "unified_relevance"
+    if token in {"legacy", "unified_relevance"}:
+        return token
+    return str(fallback or "legacy").strip().lower() or "legacy"
+
+
 def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -> bool:
     pid = str(profile_id or "").strip().lower()
     if not pid or pid == "default":
@@ -948,6 +957,7 @@ def _build_route_health(
     decision_node: Optional[str] = None,
     query_semantic_class: Optional[str] = None,
     external_fill_gate_reason: Optional[str] = None,
+    funnel_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     stale_cache_used = bool((source_breakdown or {}).get("stale_cache_used"))
     triggered = bool(fallback_reason) or stale_cache_used
@@ -989,6 +999,66 @@ def _build_route_health(
         or str(seed_health.get("query_semantic_class") or "").strip().lower()
         or "default"
     )
+    funnel = funnel_metrics or {}
+    internal_raw_count = max(
+        0,
+        int(
+            funnel.get("internal_raw_count")
+            if funnel.get("internal_raw_count") is not None
+            else (source_breakdown or {}).get("internal_count")
+            or 0
+        ),
+    )
+    external_raw_count = max(
+        0,
+        int(
+            funnel.get("external_raw_count")
+            if funnel.get("external_raw_count") is not None
+            else (source_breakdown or {}).get("external_seed_count")
+            or 0
+        ),
+    )
+    merged_pre_limit_count = max(
+        0,
+        int(
+            funnel.get("merged_pre_limit_count")
+            or max(
+                internal_raw_count + external_raw_count,
+                int((source_breakdown or {}).get("internal_count") or 0)
+                + int((source_breakdown or {}).get("external_seed_count") or 0),
+            )
+        ),
+    )
+    primary_quality_gate_passed = bool(
+        funnel.get("primary_quality_gate_passed")
+        if funnel.get("primary_quality_gate_passed") is not None
+        else True
+    )
+    primary_quality_score_raw = funnel.get("primary_quality_score")
+    try:
+        primary_quality_score = (
+            max(0.0, min(1.0, float(primary_quality_score_raw)))
+            if primary_quality_score_raw is not None
+            else None
+        )
+    except Exception:
+        primary_quality_score = None
+    low_quality_nonempty_detected = bool(
+        funnel.get("low_quality_nonempty_detected") or False
+    )
+    supplement_attempted = bool(funnel.get("supplement_attempted") or False)
+    supplement_skip_reason = str(funnel.get("supplement_skip_reason") or "").strip() or None
+    if not supplement_attempted and not supplement_skip_reason and primary_quality_gate_passed:
+        supplement_skip_reason = "not_needed"
+    retry_attempt_count = max(0, int(funnel.get("retry_attempt_count") or 0))
+    final_returned_count = max(
+        0,
+        int(
+            funnel.get("final_returned_count")
+            if funnel.get("final_returned_count") is not None
+            else internal_raw_count + external_raw_count
+        ),
+    )
     return {
         "orchestrator_path": str(orchestrator_path or "agent_api.products.search"),
         "decision_node": str(decision_node or primary_path_used or "unknown"),
@@ -1015,6 +1085,16 @@ def _build_route_health(
         "external_seed_brand_relevant_rows": max(0, int(seed_health.get("external_seed_brand_relevant_rows") or 0)),
         "external_seed_broad_fallback_used": bool(seed_health.get("external_seed_broad_fallback_used") or False),
         "external_seed_broad_scope_rows": max(0, int(seed_health.get("external_seed_broad_scope_rows") or 0)),
+        "internal_raw_count": internal_raw_count,
+        "external_raw_count": external_raw_count,
+        "merged_pre_limit_count": merged_pre_limit_count,
+        "primary_quality_gate_passed": primary_quality_gate_passed,
+        "primary_quality_score": primary_quality_score,
+        "low_quality_nonempty_detected": low_quality_nonempty_detected,
+        "supplement_attempted": supplement_attempted,
+        "supplement_skip_reason": supplement_skip_reason,
+        "retry_attempt_count": retry_attempt_count,
+        "final_returned_count": final_returned_count,
         "auth_lookup_ms": max(0, int(auth_lookup_ms or 0)),
         "auth_total_ms": max(0, int(auth_total_ms or 0)),
         "rate_limit_check_ms": max(0, int(rate_limit_check_ms or 0)),
@@ -1124,6 +1204,67 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
         if route_health.get("external_seed_broad_scope_rows") is not None
         else md.get("external_seed_broad_scope_rows")
     )
+    route_health["internal_raw_count"] = _int_non_negative(
+        route_health.get("internal_raw_count")
+        if route_health.get("internal_raw_count") is not None
+        else md.get("internal_raw_count")
+    )
+    route_health["external_raw_count"] = _int_non_negative(
+        route_health.get("external_raw_count")
+        if route_health.get("external_raw_count") is not None
+        else md.get("external_raw_count")
+    )
+    route_health["merged_pre_limit_count"] = _int_non_negative(
+        route_health.get("merged_pre_limit_count")
+        if route_health.get("merged_pre_limit_count") is not None
+        else md.get("merged_pre_limit_count")
+    )
+    route_health["primary_quality_gate_passed"] = bool(
+        route_health.get("primary_quality_gate_passed")
+        if route_health.get("primary_quality_gate_passed") is not None
+        else md.get("primary_quality_gate_passed")
+    )
+    primary_quality_score_raw = (
+        route_health.get("primary_quality_score")
+        if route_health.get("primary_quality_score") is not None
+        else md.get("primary_quality_score")
+    )
+    try:
+        route_health["primary_quality_score"] = (
+            max(0.0, min(1.0, float(primary_quality_score_raw)))
+            if primary_quality_score_raw is not None
+            else None
+        )
+    except Exception:
+        route_health["primary_quality_score"] = None
+    route_health["low_quality_nonempty_detected"] = bool(
+        route_health.get("low_quality_nonempty_detected")
+        if route_health.get("low_quality_nonempty_detected") is not None
+        else md.get("low_quality_nonempty_detected")
+    )
+    route_health["supplement_attempted"] = bool(
+        route_health.get("supplement_attempted")
+        if route_health.get("supplement_attempted") is not None
+        else md.get("supplement_attempted")
+    )
+    route_health["supplement_skip_reason"] = (
+        str(
+            route_health.get("supplement_skip_reason")
+            or md.get("supplement_skip_reason")
+            or ""
+        ).strip()
+        or None
+    )
+    route_health["retry_attempt_count"] = _int_non_negative(
+        route_health.get("retry_attempt_count")
+        if route_health.get("retry_attempt_count") is not None
+        else md.get("retry_attempt_count")
+    )
+    route_health["final_returned_count"] = _int_non_negative(
+        route_health.get("final_returned_count")
+        if route_health.get("final_returned_count") is not None
+        else md.get("final_returned_count")
+    )
     fallback_reason = route_health.get("fallback_reason")
     if fallback_reason is None:
         fallback_reason = md.get("fallback_reason")
@@ -1140,6 +1281,16 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
+    md["internal_raw_count"] = route_health["internal_raw_count"]
+    md["external_raw_count"] = route_health["external_raw_count"]
+    md["merged_pre_limit_count"] = route_health["merged_pre_limit_count"]
+    md["primary_quality_gate_passed"] = route_health["primary_quality_gate_passed"]
+    md["primary_quality_score"] = route_health["primary_quality_score"]
+    md["low_quality_nonempty_detected"] = route_health["low_quality_nonempty_detected"]
+    md["supplement_attempted"] = route_health["supplement_attempted"]
+    md["supplement_skip_reason"] = route_health["supplement_skip_reason"]
+    md["retry_attempt_count"] = route_health["retry_attempt_count"]
+    md["final_returned_count"] = route_health["final_returned_count"]
     md["fallback_reason"] = fallback_reason
     if search_decision is not None:
         search_decision["query_semantic_class"] = route_health["query_semantic_class"]
@@ -1765,6 +1916,9 @@ async def _search_products_fast_mode(
     allow_stale_cache: bool,
     query_semantic_class: str = "default",
 ) -> Dict[str, Any]:
+    normalized_seed_strategy = _normalize_external_seed_strategy(
+        normalized_seed_strategy, fallback="legacy"
+    )
     normalized_query = str(query or "").strip().lower()
     normalized_category = str(category or "").strip().lower()
     page_limit = max(1, min(int(limit or 20), AGENT_SEARCH_LIMIT_MAX))
@@ -1911,9 +2065,7 @@ async def _search_products_fast_mode(
     external_ranked.sort(key=lambda p: p.get("ranking_score", 0.0), reverse=True)
 
     ranked: List[Dict[str, Any]]
-    if normalized_seed_strategy == "supplement_internal_first":
-        ranked = internal_ranked + external_ranked
-    elif normalized_seed_strategy == "unified_relevance":
+    if normalized_seed_strategy == "unified_relevance":
         ranked = internal_ranked + external_ranked
         ranked.sort(
             key=lambda p: float(p.get("ranking_score", p.get("relevance_score", 0.0)) or 0.0),
@@ -3030,9 +3182,10 @@ async def agent_search_products(
             except Exception:
                 pass
 
-        normalized_seed_strategy = str(external_seed_strategy or "legacy").strip().lower()
-        if normalized_seed_strategy not in {"legacy", "supplement_internal_first", "unified_relevance"}:
-            normalized_seed_strategy = "legacy"
+        normalized_seed_strategy = _normalize_external_seed_strategy(
+            external_seed_strategy,
+            fallback="legacy",
+        )
         _push_gate_trace(
             gate_id="seed_strategy",
             applied=True,
@@ -3425,7 +3578,7 @@ async def agent_search_products(
             is_unified_relevance = normalized_seed_strategy == "unified_relevance"
             should_supplement_external_seed = (
                 allow_external_seed
-                and normalized_seed_strategy in {"supplement_internal_first", "unified_relevance"}
+                and is_unified_relevance
                 and merchant_id != EXTERNAL_SEED_MERCHANT_ID
                 and is_cross_merchant_scope
                 and (
@@ -3569,18 +3722,12 @@ async def agent_search_products(
             else:
                 if not allow_external_seed:
                     reason = "external_seed_disabled"
-                elif normalized_seed_strategy not in {"supplement_internal_first", "unified_relevance"}:
+                elif normalized_seed_strategy != "unified_relevance":
                     reason = "strategy_not_supported"
                 elif merchant_id == EXTERNAL_SEED_MERCHANT_ID:
                     reason = "merchant_scope_external_seed_only"
                 elif not (merchant_id is None and not merchant_ids):
                     reason = "non_cross_merchant_scope"
-                elif (
-                    normalized_seed_strategy == "supplement_internal_first"
-                    and len(paginated_products) >= limit
-                    and not brand_query_detected
-                ):
-                    reason = "page_already_full"
                 else:
                     reason = "not_applicable"
                 external_seed_skip_reason = reason

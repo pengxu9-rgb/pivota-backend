@@ -632,6 +632,63 @@ def _normalize_gateway_route_health(
         if route_health.get("external_seed_broad_scope_rows") is not None
         else md.get("external_seed_broad_scope_rows")
     )
+    route_health["internal_raw_count"] = _int_non_negative(
+        route_health.get("internal_raw_count")
+        if route_health.get("internal_raw_count") is not None
+        else md.get("internal_raw_count")
+    )
+    route_health["external_raw_count"] = _int_non_negative(
+        route_health.get("external_raw_count")
+        if route_health.get("external_raw_count") is not None
+        else md.get("external_raw_count")
+    )
+    route_health["merged_pre_limit_count"] = _int_non_negative(
+        route_health.get("merged_pre_limit_count")
+        if route_health.get("merged_pre_limit_count") is not None
+        else md.get("merged_pre_limit_count")
+    )
+    route_health["primary_quality_gate_passed"] = bool(
+        route_health.get("primary_quality_gate_passed")
+        if route_health.get("primary_quality_gate_passed") is not None
+        else md.get("primary_quality_gate_passed")
+    )
+    primary_quality_score_raw = (
+        route_health.get("primary_quality_score")
+        if route_health.get("primary_quality_score") is not None
+        else md.get("primary_quality_score")
+    )
+    try:
+        route_health["primary_quality_score"] = (
+            max(0.0, min(1.0, float(primary_quality_score_raw)))
+            if primary_quality_score_raw is not None
+            else None
+        )
+    except Exception:
+        route_health["primary_quality_score"] = None
+    route_health["low_quality_nonempty_detected"] = bool(
+        route_health.get("low_quality_nonempty_detected")
+        if route_health.get("low_quality_nonempty_detected") is not None
+        else md.get("low_quality_nonempty_detected")
+    )
+    route_health["supplement_attempted"] = bool(
+        route_health.get("supplement_attempted")
+        if route_health.get("supplement_attempted") is not None
+        else md.get("supplement_attempted")
+    )
+    route_health["supplement_skip_reason"] = (
+        str(route_health.get("supplement_skip_reason") or md.get("supplement_skip_reason") or "").strip()
+        or None
+    )
+    route_health["retry_attempt_count"] = _int_non_negative(
+        route_health.get("retry_attempt_count")
+        if route_health.get("retry_attempt_count") is not None
+        else md.get("retry_attempt_count")
+    )
+    route_health["final_returned_count"] = _int_non_negative(
+        route_health.get("final_returned_count")
+        if route_health.get("final_returned_count") is not None
+        else md.get("final_returned_count")
+    )
 
     md["orchestrator_path"] = route_health["orchestrator_path"]
     md["decision_node"] = route_health["decision_node"]
@@ -646,6 +703,16 @@ def _normalize_gateway_route_health(
     md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
+    md["internal_raw_count"] = route_health["internal_raw_count"]
+    md["external_raw_count"] = route_health["external_raw_count"]
+    md["merged_pre_limit_count"] = route_health["merged_pre_limit_count"]
+    md["primary_quality_gate_passed"] = route_health["primary_quality_gate_passed"]
+    md["primary_quality_score"] = route_health["primary_quality_score"]
+    md["low_quality_nonempty_detected"] = route_health["low_quality_nonempty_detected"]
+    md["supplement_attempted"] = route_health["supplement_attempted"]
+    md["supplement_skip_reason"] = route_health["supplement_skip_reason"]
+    md["retry_attempt_count"] = route_health["retry_attempt_count"]
+    md["final_returned_count"] = route_health["final_returned_count"]
     if search_decision is not None:
         search_decision["query_semantic_class"] = route_health["query_semantic_class"]
         search_decision["domain_filter_dropped_external"] = route_health[
@@ -1671,7 +1738,7 @@ async def _handle_offers_resolve(
     """
     Resolve purchasable offers for a given sku_id/product_id.
 
-    Contract goal: external outbound links are primary; internal checkout is a fallback.
+    Contract goal: internal checkout offers are primary; external outbound links are fallback.
     """
     from db.database import database
 
@@ -1950,11 +2017,12 @@ async def _handle_offers_resolve(
             query="external_seed_by_ref",
         )
 
-    # 2) Internal checkout offers (fallback)
+    # 2) Internal checkout offers (primary)
     internal_offers: List[Dict[str, Any]] = []
     canonical_group_id: Optional[str] = None
     canonical_member: Optional[Dict[str, Any]] = None
-    if len(external_offers) == 0 or all((o.get("confidence") or 0) < 0.75 for o in external_offers):
+    internal_first_checkout = True
+    if internal_first_checkout:
         internal_started = time.perf_counter()
         try:
             internal_deadline = time.perf_counter() + OFFERS_RESOLVE_INTERNAL_TOTAL_BUDGET_SECONDS
@@ -2324,8 +2392,8 @@ async def _handle_offers_resolve(
                 query="products_cache_by_alias",
             )
 
-    # External offers always come first.
-    offers = external_offers + internal_offers
+    # Internal offers always come first for checkout.
+    offers = internal_offers + external_offers
     offers = offers[:limit]
 
     canonical_ref: Optional[str] = None

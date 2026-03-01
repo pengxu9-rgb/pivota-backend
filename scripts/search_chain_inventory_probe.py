@@ -45,6 +45,16 @@ ROUTE_HEALTH_CONTRACT_FIELDS = [
     "external_seed_brand_relevant_rows",
     "external_seed_broad_fallback_used",
     "external_seed_broad_scope_rows",
+    "internal_raw_count",
+    "external_raw_count",
+    "merged_pre_limit_count",
+    "primary_quality_gate_passed",
+    "primary_quality_score",
+    "low_quality_nonempty_detected",
+    "supplement_attempted",
+    "supplement_skip_reason",
+    "retry_attempt_count",
+    "final_returned_count",
     "fallback_reason",
 ]
 
@@ -234,6 +244,72 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "actual_retry_attempted": actual_retry_attempted,
         "fallback_attempt_count": fallback_attempt_count,
+        "retry_attempt_count": _non_negative_int(
+            route_health.get("retry_attempt_count")
+            if route_health.get("retry_attempt_count") is not None
+            else metadata.get("retry_attempt_count")
+            or fallback_attempt_count
+        ),
+        "internal_raw_count": _non_negative_int(
+            route_health.get("internal_raw_count")
+            if route_health.get("internal_raw_count") is not None
+            else metadata.get("internal_raw_count")
+            or source_breakdown.get("internal_count")
+            or 0
+        ),
+        "external_raw_count": _non_negative_int(
+            route_health.get("external_raw_count")
+            if route_health.get("external_raw_count") is not None
+            else metadata.get("external_raw_count")
+            or source_breakdown.get("external_seed_count")
+            or 0
+        ),
+        "merged_pre_limit_count": _non_negative_int(
+            route_health.get("merged_pre_limit_count")
+            if route_health.get("merged_pre_limit_count") is not None
+            else metadata.get("merged_pre_limit_count")
+            or body.get("total")
+            or 0
+        ),
+        "primary_quality_gate_passed": bool(
+            route_health.get("primary_quality_gate_passed")
+            if route_health.get("primary_quality_gate_passed") is not None
+            else metadata.get("primary_quality_gate_passed")
+            if metadata.get("primary_quality_gate_passed") is not None
+            else True
+        ),
+        "primary_quality_score": _safe_float(
+            route_health.get("primary_quality_score")
+            if route_health.get("primary_quality_score") is not None
+            else metadata.get("primary_quality_score")
+        ),
+        "low_quality_nonempty_detected": bool(
+            route_health.get("low_quality_nonempty_detected")
+            if route_health.get("low_quality_nonempty_detected") is not None
+            else metadata.get("low_quality_nonempty_detected")
+            or False
+        ),
+        "supplement_attempted": bool(
+            route_health.get("supplement_attempted")
+            if route_health.get("supplement_attempted") is not None
+            else metadata.get("supplement_attempted")
+            or False
+        ),
+        "supplement_skip_reason": (
+            str(
+                route_health.get("supplement_skip_reason")
+                if route_health.get("supplement_skip_reason") is not None
+                else metadata.get("supplement_skip_reason")
+                or ""
+            ).strip()
+            or None
+        ),
+        "final_returned_count": _non_negative_int(
+            route_health.get("final_returned_count")
+            if route_health.get("final_returned_count") is not None
+            else metadata.get("final_returned_count")
+            or product_count
+        ),
         "external_seed_brand_strict_rows": _non_negative_int(
             route_health.get("external_seed_brand_strict_rows")
             if route_health.get("external_seed_brand_strict_rows") is not None
@@ -368,6 +444,9 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         ok_rows = [r for r in rows if r.get("http_status") == 200 and r.get("parse_ok")]
         product_counts = [int(r.get("metrics", {}).get("product_count") or 0) for r in ok_rows]
         external_counts = [int(r.get("metrics", {}).get("external_seed_returned_count") or 0) for r in ok_rows]
+        internal_raw_counts = [int(r.get("metrics", {}).get("internal_raw_count") or 0) for r in ok_rows]
+        external_raw_counts = [int(r.get("metrics", {}).get("external_raw_count") or 0) for r in ok_rows]
+        merged_pre_limit_counts = [int(r.get("metrics", {}).get("merged_pre_limit_count") or 0) for r in ok_rows]
         latencies = [int(r.get("metrics", {}).get("primary_latency_ms") or 0) for r in ok_rows]
         path_counter = Counter(str(r.get("metrics", {}).get("primary_path_used") or "unknown") for r in ok_rows)
         decision_counter = Counter(str(r.get("metrics", {}).get("decision_node") or "unknown") for r in ok_rows)
@@ -387,6 +466,9 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "min_products": min(product_counts) if product_counts else 0,
             "max_products": max(product_counts) if product_counts else 0,
             "avg_external_seed_count": round(statistics.mean(external_counts), 2) if external_counts else 0.0,
+            "avg_internal_raw_count": round(statistics.mean(internal_raw_counts), 2) if internal_raw_counts else 0.0,
+            "avg_external_raw_count": round(statistics.mean(external_raw_counts), 2) if external_raw_counts else 0.0,
+            "avg_merged_pre_limit_count": round(statistics.mean(merged_pre_limit_counts), 2) if merged_pre_limit_counts else 0.0,
             "avg_primary_latency_ms": round(statistics.mean(latencies), 2) if latencies else 0.0,
             "path_distribution": dict(path_counter),
             "decision_distribution": dict(decision_counter),
@@ -396,6 +478,12 @@ def _aggregate(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             ),
             "actual_retry_attempted_rounds": sum(
                 1 for r in ok_rows if bool(r.get("metrics", {}).get("actual_retry_attempted"))
+            ),
+            "low_quality_nonempty_rounds": sum(
+                1 for r in ok_rows if bool(r.get("metrics", {}).get("low_quality_nonempty_detected"))
+            ),
+            "supplement_attempted_rounds": sum(
+                1 for r in ok_rows if bool(r.get("metrics", {}).get("supplement_attempted"))
             ),
             "avg_fallback_attempt_count": round(
                 statistics.mean(
