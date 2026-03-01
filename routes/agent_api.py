@@ -285,9 +285,15 @@ def _detect_brand_query(query: Optional[str]) -> Dict[str, Any]:
 
     suffix_hits: List[str] = []
     for match in _BRAND_SUFFIX_PATTERN.finditer(normalized):
+        if has_category_hint:
+            # Avoid classifying generic category/fragrance expansions as brand queries.
+            continue
         left = _normalize_brand_query_text(match.group(1))
         suffix = _normalize_brand_query_text(match.group(2))
         if not left:
+            continue
+        left_tokens = [tok for tok in left.split() if tok]
+        if len(left_tokens) > 3:
             continue
         candidate = f"{left} {suffix}".strip()
         suffix_hits.append(candidate)
