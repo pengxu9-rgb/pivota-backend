@@ -999,6 +999,47 @@ def _require_http_url(url: str) -> str:
     return u
 
 
+def _normalize_external_seed_domain(raw_domain: Any) -> str:
+    candidate = str(raw_domain or "").strip().lower()
+    if not candidate:
+        return ""
+    if "://" in candidate:
+        candidate = (urlparse(candidate).hostname or "").strip().lower()
+    else:
+        candidate = candidate.split("/", 1)[0].strip().lower()
+    candidate = candidate.strip(".")
+    if candidate.startswith("www."):
+        candidate = candidate[4:]
+    return candidate
+
+
+def _build_external_seed_domain_where_clause(
+    *,
+    raw_domain: Any,
+    include_subdomains: bool = True,
+    param_prefix: str = "domain_filter",
+) -> tuple[str, Dict[str, Any], str]:
+    normalized = _normalize_external_seed_domain(raw_domain)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="INVALID_DOMAIN")
+
+    values: Dict[str, Any] = {
+        f"{param_prefix}_exact": normalized,
+        f"{param_prefix}_www": f"www.{normalized}",
+        f"{param_prefix}_url_like": f"%{normalized}%",
+    }
+    clauses = [
+        f"LOWER(COALESCE(domain, '')) = :{param_prefix}_exact",
+        f"LOWER(COALESCE(domain, '')) = :{param_prefix}_www",
+        f"LOWER(COALESCE(destination_url, '')) LIKE :{param_prefix}_url_like",
+        f"LOWER(COALESCE(canonical_url, '')) LIKE :{param_prefix}_url_like",
+    ]
+    if include_subdomains:
+        values[f"{param_prefix}_subdomain"] = f"%.{normalized}"
+        clauses.append(f"LOWER(COALESCE(domain, '')) LIKE :{param_prefix}_subdomain")
+    return "(" + " OR ".join(clauses) + ")", values, normalized
+
+
 def _request_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
@@ -1075,6 +1116,13 @@ class UpdateExternalSeedRequest(BaseModel):
     utm_template: Optional[str] = None
     partner_type: Optional[str] = None
     disclosure_text: Optional[str] = None
+
+
+class HardDeleteExternalSeedsByDomainRequest(BaseModel):
+    domain: str = Field(..., min_length=3)
+    include_subdomains: bool = True
+    dry_run: bool = False
+    sample_limit: int = Field(default=20, ge=1, le=200)
 
 
 class PreviewExternalSeedRequest(BaseModel):
@@ -2522,6 +2570,66 @@ async def create_external_seed(
     }
 
 
+@router.post("/external-seeds/hard-delete-by-domain")
+async def hard_delete_external_seeds_by_domain(
+    body: HardDeleteExternalSeedsByDomainRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    where_clause, where_values, normalized_domain = _build_external_seed_domain_where_clause(
+        raw_domain=body.domain,
+        include_subdomains=bool(body.include_subdomains),
+    )
+
+    count_row = await database.fetch_one(
+        f"SELECT COUNT(*) AS n FROM external_product_seeds WHERE {where_clause}",
+        where_values,
+    )
+    match_count = int((dict(count_row) if count_row else {}).get("n") or 0)
+
+    sample_rows = await database.fetch_all(
+        f"""
+        SELECT id, external_product_id, status, domain, title, destination_url, canonical_url
+        FROM external_product_seeds
+        WHERE {where_clause}
+        ORDER BY created_at DESC
+        LIMIT :sample_limit
+        """,
+        {**where_values, "sample_limit": int(body.sample_limit)},
+    )
+    sample = [dict(row) for row in sample_rows]
+
+    if body.dry_run or match_count <= 0:
+        return {
+            "status": "success",
+            "domain": normalized_domain,
+            "dry_run": bool(body.dry_run),
+            "match_count": match_count,
+            "deleted_count": 0,
+            "sample": sample,
+        }
+
+    deleted_rows = await database.fetch_all(
+        f"""
+        DELETE FROM external_product_seeds
+        WHERE {where_clause}
+        RETURNING id, external_product_id, status, domain, title, destination_url, canonical_url
+        """,
+        where_values,
+    )
+    deleted = [dict(row) for row in deleted_rows]
+
+    return {
+        "status": "success",
+        "domain": normalized_domain,
+        "dry_run": False,
+        "match_count": match_count,
+        "deleted_count": len(deleted),
+        "deleted_ids": [str(row.get("id")) for row in deleted if row.get("id")],
+        "sample": deleted[: min(len(deleted), int(body.sample_limit))],
+    }
+
+
 @router.get("/external-seeds/{seed_id}")
 async def get_external_seed(
     seed_id: str,
@@ -2590,6 +2698,43 @@ async def get_external_seed(
             },
         },
         "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+    }
+
+
+@router.delete("/external-seeds/{seed_id}")
+async def delete_external_seed(
+    seed_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    row = await database.fetch_one(
+        """
+        SELECT id, external_product_id, status, domain, title, destination_url, canonical_url
+        FROM external_product_seeds
+        WHERE id = :id
+        """,
+        {"id": seed_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+
+    deleted_rows = await database.fetch_all(
+        """
+        DELETE FROM external_product_seeds
+        WHERE id = :id
+        RETURNING id, external_product_id, status, domain, title, destination_url, canonical_url
+        """,
+        {"id": seed_id},
+    )
+    deleted = [dict(item) for item in deleted_rows]
+    if not deleted:
+        deleted = [dict(row)]
+
+    return {
+        "status": "success",
+        "deleted_count": len(deleted),
+        "deleted_ids": [str(item.get("id")) for item in deleted if item.get("id")],
+        "items": deleted,
     }
 
 
