@@ -39,6 +39,13 @@ from services.outbound_links_service import (
     apply_utm,
     make_redirect_token,
 )
+from services.external_seed_audit import (
+    audit_external_seed_row,
+    audit_item_sort_key,
+    audit_result_matches_filters,
+    build_external_seed_audit_item,
+    summarize_audit_results,
+)
 from db.reviews_center import product_reviews
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
 
@@ -2075,6 +2082,201 @@ async def preview_external_seed(
             "variants": variants,
             "domain_allowed": domain_allowed,
         },
+    }
+
+
+def _build_external_seed_audit_where_clauses(
+    *,
+    q: Optional[str],
+    status: str,
+    attached: Optional[bool],
+    domain: Optional[str],
+    market: Optional[str],
+    seed_id: Optional[str],
+) -> tuple[list[str], Dict[str, Any]]:
+    where = ["status = :status"]
+    values: Dict[str, Any] = {"status": status}
+
+    if attached is True:
+        where.append("attached_product_key IS NOT NULL")
+    elif attached is False:
+        where.append("attached_product_key IS NULL")
+
+    normalized_domain = (domain or "").strip().lower()
+    if normalized_domain:
+        values["domain"] = normalized_domain
+        values["domain_like"] = f"%.{normalized_domain}"
+        where.append("(LOWER(domain) = :domain OR LOWER(domain) LIKE :domain_like)")
+
+    normalized_market = (market or "").strip().upper()
+    if normalized_market:
+        values["market"] = normalized_market
+        where.append("UPPER(market) = :market")
+
+    normalized_seed_id = (seed_id or "").strip()
+    if normalized_seed_id:
+        values["seed_id"] = normalized_seed_id
+        where.append("id = :seed_id")
+
+    normalized_q = (q or "").strip()
+    if normalized_q:
+        values["q"] = normalized_q
+        values["q_like"] = f"%{normalized_q}%"
+        where.append(
+            "("
+            "destination_url ILIKE :q_like"
+            " OR canonical_url ILIKE :q_like"
+            " OR domain ILIKE :q_like"
+            " OR title ILIKE :q_like"
+            " OR id = :q"
+            " OR external_product_id = :q"
+            ")"
+        )
+
+    return where, values
+
+
+async def _fetch_external_seed_rows_for_audit(
+    *,
+    q: Optional[str],
+    status: str,
+    attached: Optional[bool],
+    domain: Optional[str],
+    market: Optional[str],
+    seed_id: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    where, values = _build_external_seed_audit_where_clauses(
+        q=q,
+        status=status,
+        attached=attached,
+        domain=domain,
+        market=market,
+        seed_id=seed_id,
+    )
+    values["limit"] = limit
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT
+          id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+          destination_url, canonical_url, domain, title, image_url,
+          price_amount, price_currency, availability,
+          seed_data,
+          status, notes, created_by_employee_id,
+          attached_product_key, attached_variant_id,
+          created_at, updated_at
+        FROM external_product_seeds
+        WHERE {" AND ".join(where)}
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT :limit
+        """,
+        values,
+    )
+    return [dict(row) for row in rows]
+
+
+def _build_external_seed_audit_response_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    audit_result = audit_external_seed_row(row)
+    item = build_external_seed_audit_item(row, audit_result)
+    seed = item.get("seed") or {}
+    if row.get("created_at"):
+        seed["created_at"] = _to_iso(row.get("created_at"))
+    if row.get("updated_at"):
+        seed["updated_at"] = _to_iso(row.get("updated_at"))
+    return item
+
+
+@router.get("/external-seeds/audit-queue")
+async def list_external_seed_audit_queue(
+    q: Optional[str] = Query(default=None),
+    attached: Optional[bool] = Query(default=None),
+    status: str = Query(default="active"),
+    domain: Optional[str] = Query(default=None),
+    market: Optional[str] = Query(default=None),
+    severity: Optional[str] = Query(default=None),
+    anomaly_type: Optional[str] = Query(default=None),
+    flagged_only: bool = Query(default=True),
+    seed_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    rows = await _fetch_external_seed_rows_for_audit(
+        q=q,
+        status=status,
+        attached=attached,
+        domain=domain,
+        market=market,
+        seed_id=seed_id,
+        limit=limit,
+    )
+
+    results = [audit_external_seed_row(row) for row in rows]
+    filtered_pairs = [
+        (row, result)
+        for row, result in zip(rows, results)
+        if audit_result_matches_filters(
+            result,
+            severity=severity or "",
+            anomaly_type=anomaly_type or "",
+            flagged_only=bool(flagged_only),
+        )
+    ]
+
+    items = [_build_external_seed_audit_response_item(row) for row, _ in filtered_pairs]
+    items.sort(key=audit_item_sort_key)
+
+    return {
+        "status": "success",
+        "summary": summarize_audit_results([result for _, result in filtered_pairs]),
+        "meta": {
+            "returned": len(items),
+            "limit": limit,
+            "filters": {
+                "q": q,
+                "attached": attached,
+                "status": status,
+                "domain": domain,
+                "market": market,
+                "severity": severity,
+                "anomaly_type": anomaly_type,
+                "flagged_only": bool(flagged_only),
+                "seed_id": seed_id,
+            },
+        },
+        "items": items,
+    }
+
+
+@router.get("/external-seeds/{seed_id}/audit")
+async def get_external_seed_audit(
+    seed_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    rows = await _fetch_external_seed_rows_for_audit(
+        q=None,
+        status="active",
+        attached=None,
+        domain=None,
+        market=None,
+        seed_id=seed_id,
+        limit=1,
+    )
+    if not rows:
+        row = await database.fetch_one(
+            "SELECT * FROM external_product_seeds WHERE id = :id",
+            {"id": seed_id},
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+        rows = [dict(row)]
+
+    item = _build_external_seed_audit_response_item(rows[0])
+    return {
+        "status": "success",
+        "item": item,
     }
 
 
