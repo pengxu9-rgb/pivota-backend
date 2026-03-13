@@ -48,6 +48,11 @@ LANGUAGE_MARKERS = {
     ],
 }
 
+STALE_COPY_BLOCKING_FAILURE_CATEGORIES = {
+    "no_product_urls",
+    "non_product_fallback_page",
+}
+
 
 def normalize_non_empty_string(value: Any) -> str:
     return str(value or "").strip()
@@ -265,6 +270,25 @@ def get_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"seed_data": seed_data, "snapshot": snapshot}
 
 
+def snapshot_has_current_description(snapshot: Dict[str, Any]) -> bool:
+    if normalize_non_empty_string(snapshot.get("description")):
+        return True
+    for variant in ensure_json_list(snapshot.get("variants")):
+        if isinstance(variant, dict) and normalize_non_empty_string(variant.get("description")):
+            return True
+    return False
+
+
+def should_suppress_stale_description_fallback(row: Dict[str, Any]) -> bool:
+    payload = get_snapshot(row)
+    snapshot = payload["snapshot"]
+    diagnostics = ensure_json_object(snapshot.get("diagnostics"))
+    failure_category = normalize_non_empty_string(diagnostics.get("failure_category"))
+    if failure_category not in STALE_COPY_BLOCKING_FAILURE_CATEGORIES:
+        return False
+    return not snapshot_has_current_description(snapshot)
+
+
 def get_canonical_url(row: Dict[str, Any], snapshot: Dict[str, Any], seed_data: Dict[str, Any]) -> str:
     return normalize_url_like(
         snapshot.get("canonical_url")
@@ -284,20 +308,27 @@ def get_primary_description(row: Dict[str, Any]) -> str:
     payload = get_snapshot(row)
     seed_data = payload["seed_data"]
     snapshot = payload["snapshot"]
-    primary_description = normalize_non_empty_string(
-        snapshot.get("description") or row.get("description") or seed_data.get("description")
-    )
+    snapshot_variants = ensure_json_list(snapshot.get("variants"))
+    seed_variants = ensure_json_list(seed_data.get("variants"))
+    snapshot_description = normalize_non_empty_string(snapshot.get("description"))
+    if snapshot_description:
+        return snapshot_description
+
+    for variant in snapshot_variants:
+        if isinstance(variant, dict) and normalize_non_empty_string(variant.get("description")):
+            return normalize_non_empty_string(variant.get("description"))
+
+    if should_suppress_stale_description_fallback(row):
+        return ""
+
+    primary_description = normalize_non_empty_string(row.get("description") or seed_data.get("description"))
     if primary_description:
         return primary_description
 
-    snapshot_variants = ensure_json_list(snapshot.get("variants"))
-    seed_variants = ensure_json_list(seed_data.get("variants"))
-    variant_description = ""
-    for variant in snapshot_variants + seed_variants:
+    for variant in seed_variants:
         if isinstance(variant, dict) and normalize_non_empty_string(variant.get("description")):
-            variant_description = normalize_non_empty_string(variant.get("description"))
-            break
-    return normalize_non_empty_string(variant_description)
+            return normalize_non_empty_string(variant.get("description"))
+    return ""
 
 
 def detect_language(description: str) -> Optional[str]:

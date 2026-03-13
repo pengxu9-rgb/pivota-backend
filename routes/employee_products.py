@@ -46,7 +46,9 @@ from services.external_seed_audit import (
     audit_result_matches_filters,
     build_external_seed_audit_item,
     detect_language,
+    get_primary_description,
     parse_locale_segment,
+    should_suppress_stale_description_fallback,
     summarize_audit_results,
 )
 from db.reviews_center import product_reviews
@@ -950,7 +952,7 @@ async def _build_external_seed_product_view(
         or primary_row.get("destination_url")
         or external_product_id
     )
-    description = seed_data.get("description") or seed_data.get("snapshot", {}).get("description") or ""
+    description = get_primary_description(primary_row)
 
     primary_price = _seed_primary_price(primary_row, seed_data)
     raw_amount = primary_price.get("amount")
@@ -3264,6 +3266,14 @@ async def refresh_external_seed(
             seed_data["variants"] = snap_variants
         elif not existing_variants:
             seed_data["variants"] = snap_variants
+
+    pending_row = dict(row)
+    pending_row["seed_data"] = seed_data
+    if should_suppress_stale_description_fallback(pending_row):
+        seed_data.pop("description", None)
+        for variant in _seed_variants(seed_data):
+            if isinstance(variant, dict):
+                variant.pop("description", None)
 
     await _execute_seed_data_stmt(
         """

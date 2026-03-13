@@ -118,6 +118,49 @@ def test_employee_product_detail_external_seed_synthesizes_view(monkeypatch: pyt
     assert any(v.get("variant_id") == "v2" and v.get("label_image_url") == "https://example.com/v2_swatch.png" for v in raw_variants)
 
 
+def test_employee_product_detail_hides_stale_description_for_blocked_seed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.employee_products as employee_products_module
+
+    blocked_row = _seed_row(
+        title="The Clear Set",
+        canonical_url="https://theordinary.com/en-us/the-clear-set-100630.html",
+        destination_url="https://theordinary.com/en-us/the-clear-set-100630.html",
+        seed_data={
+            "title": "The Clear Set",
+            "description": "Ein dreistufiges Regimen mit Salicylic Acid 2% Solution für eine klarere Haut.",
+            "snapshot": {
+                "canonical_url": "https://theordinary.com/en-us/the-clear-set-100630.html",
+                "description": "",
+                "diagnostics": {"failure_category": "no_product_urls"},
+            },
+            "variants": [],
+        },
+    )
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [blocked_row]
+        return []
+
+    monkeypatch.setattr(employee_products_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module, "get_enrichment", AsyncMock(return_value=None))
+
+    res = client.get(
+        "/employee/products/external_seed%7Cexternal%7Cext_test_1",
+        headers={"Authorization": "Bearer test-token"},
+    )
+    assert res.status_code == 200
+
+    payload = res.json()
+    product = payload.get("product") or {}
+    raw = payload.get("raw") or {}
+    assert product.get("description") == ""
+    assert raw.get("description") == ""
+
+
 def test_employee_product_offers_external_seed_returns_external_offers(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
     import routes.employee_products as employee_products_module
 
