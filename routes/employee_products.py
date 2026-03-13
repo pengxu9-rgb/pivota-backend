@@ -469,6 +469,24 @@ def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def _set_manual_seed_description_override(seed_data: Dict[str, Any], description: Optional[str]) -> None:
+    manual_overrides = _ensure_json_obj(seed_data.get("manual_overrides"))
+    normalized = (description or "").strip()
+    if normalized:
+        manual_overrides["description"] = normalized
+        manual_overrides["source"] = "employee_review"
+        manual_overrides["updated_at"] = _to_iso(datetime.now(timezone.utc))
+        seed_data["manual_overrides"] = manual_overrides
+    else:
+        manual_overrides.pop("description", None)
+        manual_overrides.pop("source", None)
+        manual_overrides.pop("updated_at", None)
+        if manual_overrides:
+            seed_data["manual_overrides"] = manual_overrides
+        else:
+            seed_data.pop("manual_overrides", None)
+
+
 _SIZE_LIKE_RE = re.compile(
     r"\b\d+(?:\.\d+)?\s*(?:ml|mL|l|L|oz|fl\s*oz|g|kg|lb|lbs|cm|mm|in|inch|inches)\b",
     re.IGNORECASE,
@@ -3054,6 +3072,7 @@ async def update_external_seed(
     if body.description is not None:
         seed_data["description"] = body.description
         seed_data["snapshot"]["description"] = body.description
+        _set_manual_seed_description_override(seed_data, body.description)
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
         seed_data["snapshot"]["image_url"] = body.image_url

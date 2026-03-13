@@ -248,6 +248,33 @@ def test_audit_prefers_snapshot_description_over_stale_variant_description() -> 
     assert description == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
 
 
+def test_audit_prefers_manual_description_override_for_blocked_seed() -> None:
+    from services.external_seed_audit import get_primary_description
+
+    row = _seed_row(
+        title="The Clear Set",
+        canonical_url="https://theordinary.com/en-us/the-clear-set-100630.html",
+        destination_url="https://theordinary.com/en-us/the-clear-set-100630.html",
+        seed_data={
+            "title": "The Clear Set",
+            "description": "Ein dreistufiges Regimen mit Salicylic Acid 2% Solution für eine klarere Haut.",
+            "manual_overrides": {
+                "description": "A complete regimen that targets breakouts, blemishes, and the look of congestion.",
+                "source": "employee_review",
+            },
+            "snapshot": {
+                "canonical_url": "https://theordinary.com/en-us/the-clear-set-100630.html",
+                "description": "",
+                "diagnostics": {"failure_category": "no_product_urls"},
+            },
+            "variants": [],
+        },
+    )
+
+    description = get_primary_description(row)
+    assert description == "A complete regimen that targets breakouts, blemishes, and the look of congestion."
+
+
 def test_audit_queue_hides_stale_description_for_blocked_seed(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
@@ -441,3 +468,73 @@ def test_refresh_external_seed_clears_stale_description_when_seed_remains_blocke
     assert seed_data.get("description") is None
     assert seed_data["snapshot"].get("description") is None
     assert seed_data["variants"][0].get("description") is None
+
+
+def test_refresh_external_seed_preserves_manual_description_override_when_seed_remains_blocked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.employee_products as employee_products_module
+
+    stored_row = _seed_row(
+        title="The Clear Set",
+        canonical_url="https://theordinary.com/en-us/the-clear-set-100630.html",
+        destination_url="https://theordinary.com/en-us/the-clear-set-100630.html",
+        seed_data={
+            "title": "The Clear Set",
+            "description": "Ein dreistufiges Regimen mit Salicylic Acid 2% Solution für eine klarere Haut.",
+            "manual_overrides": {
+                "description": "A complete regimen that targets breakouts, blemishes, and the look of congestion.",
+                "source": "employee_review",
+            },
+            "variants": [],
+            "snapshot": {
+                "canonical_url": "https://theordinary.com/en-us/the-clear-set-100630.html",
+                "description": "",
+                "diagnostics": {"failure_category": "no_product_urls"},
+            },
+        },
+    )
+
+    async def fake_fetch_one(_query: str, values=None):
+        if values and values.get("id") == stored_row["id"]:
+            return stored_row
+        return None
+
+    async def fake_execute_seed_data_stmt(_query: str, values):
+        stored_row.update(values)
+        if "seed_data" in values:
+            stored_row["seed_data"] = values["seed_data"]
+
+    fake_snapshot = SimpleNamespace(
+        canonical_url="https://theordinary.com/en-us/the-clear-set-100630.html",
+        domain="theordinary.com",
+        title="The Clear Set",
+        image_url=None,
+        price_amount=None,
+        price_currency="USD",
+        availability="unknown",
+        fetched_at=None,
+        evidence={},
+    )
+
+    monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
+    monkeypatch.setattr(employee_products_module, "resolve_external_offer", AsyncMock(return_value=fake_snapshot))
+    monkeypatch.setattr(
+        employee_products_module,
+        "_make_redirect_url",
+        AsyncMock(return_value="https://employee.pivota.cc/redirect/test"),
+    )
+
+    res = client.post(
+        f"/employee/products/external-seeds/{stored_row['id']}/refresh",
+        headers={"Authorization": "Bearer test-token"},
+    )
+    assert res.status_code == 200, res.text
+
+    seed_data = stored_row["seed_data"]
+    assert seed_data.get("description") is None
+    assert seed_data.get("manual_overrides", {}).get("description") == (
+        "A complete regimen that targets breakouts, blemishes, and the look of congestion."
+    )

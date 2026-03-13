@@ -270,6 +270,13 @@ def get_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"seed_data": seed_data, "snapshot": snapshot}
 
 
+def get_manual_description_override(row: Dict[str, Any]) -> str:
+    payload = get_snapshot(row)
+    seed_data = payload["seed_data"]
+    manual_overrides = ensure_json_object(seed_data.get("manual_overrides"))
+    return normalize_non_empty_string(manual_overrides.get("description"))
+
+
 def snapshot_has_current_description(snapshot: Dict[str, Any]) -> bool:
     if normalize_non_empty_string(snapshot.get("description")):
         return True
@@ -308,6 +315,10 @@ def get_primary_description(row: Dict[str, Any]) -> str:
     payload = get_snapshot(row)
     seed_data = payload["seed_data"]
     snapshot = payload["snapshot"]
+    manual_override = get_manual_description_override(row)
+    if manual_override:
+        return manual_override
+
     snapshot_variants = ensure_json_list(snapshot.get("variants"))
     seed_variants = ensure_json_list(seed_data.get("variants"))
     snapshot_description = normalize_non_empty_string(snapshot.get("description"))
