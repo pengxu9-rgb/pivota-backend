@@ -284,6 +284,12 @@ def get_primary_description(row: Dict[str, Any]) -> str:
     payload = get_snapshot(row)
     seed_data = payload["seed_data"]
     snapshot = payload["snapshot"]
+    primary_description = normalize_non_empty_string(
+        snapshot.get("description") or row.get("description") or seed_data.get("description")
+    )
+    if primary_description:
+        return primary_description
+
     snapshot_variants = ensure_json_list(snapshot.get("variants"))
     seed_variants = ensure_json_list(seed_data.get("variants"))
     variant_description = ""
@@ -291,9 +297,7 @@ def get_primary_description(row: Dict[str, Any]) -> str:
         if isinstance(variant, dict) and normalize_non_empty_string(variant.get("description")):
             variant_description = normalize_non_empty_string(variant.get("description"))
             break
-    return normalize_non_empty_string(
-        variant_description or snapshot.get("description") or row.get("description") or seed_data.get("description")
-    )
+    return normalize_non_empty_string(variant_description)
 
 
 def detect_language(description: str) -> Optional[str]:

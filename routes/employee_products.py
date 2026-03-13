@@ -40,10 +40,13 @@ from services.outbound_links_service import (
     make_redirect_token,
 )
 from services.external_seed_audit import (
+    MARKET_LOCALE_SEGMENT,
     audit_external_seed_row,
     audit_item_sort_key,
     audit_result_matches_filters,
     build_external_seed_audit_item,
+    detect_language,
+    parse_locale_segment,
     summarize_audit_results,
 )
 from db.reviews_center import product_reviews
@@ -559,6 +562,87 @@ def _should_overwrite_seed_variants(
         return True
 
     return False
+
+
+def _seed_variant_description_map(variants: List[Dict[str, Any]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for idx, variant in enumerate(variants or []):
+        if not isinstance(variant, dict):
+            continue
+        variant_id = str(
+            variant.get("variant_id")
+            or variant.get("variantId")
+            or variant.get("id")
+            or variant.get("sku")
+            or variant.get("sku_id")
+            or f"variant-{idx + 1}"
+        ).strip()
+        description = str(variant.get("description") or "").strip()
+        if variant_id and description:
+            out[variant_id] = description
+    return out
+
+
+def _should_replace_localized_copy(
+    *,
+    existing_text: Optional[str],
+    incoming_text: Optional[str],
+    market: Optional[str],
+    previous_canonical_url: Optional[str],
+    refreshed_canonical_url: Optional[str],
+) -> bool:
+    existing = str(existing_text or "").strip()
+    incoming = str(incoming_text or "").strip()
+    if not existing or not incoming or existing == incoming:
+        return False
+
+    market_normalized = str(market or "").strip().upper()
+    expected_locale = MARKET_LOCALE_SEGMENT.get(market_normalized, "")
+    previous_locale = parse_locale_segment(str(previous_canonical_url or ""))
+    refreshed_locale = parse_locale_segment(str(refreshed_canonical_url or ""))
+    locale_corrected = bool(expected_locale and refreshed_locale == expected_locale and previous_locale and previous_locale != refreshed_locale)
+
+    existing_language = detect_language(existing)
+    incoming_language = detect_language(incoming)
+    incoming_looks_english = incoming_language is None
+    existing_is_non_english = existing_language in {"de", "fr", "es"}
+
+    if locale_corrected and incoming_looks_english:
+        return True
+    if market_normalized == "US" and existing_is_non_english and incoming_looks_english:
+        return True
+    return False
+
+
+def _should_replace_seed_variant_content(
+    *,
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+    market: Optional[str],
+    previous_canonical_url: Optional[str],
+    refreshed_canonical_url: Optional[str],
+) -> bool:
+    if not incoming:
+        return False
+    existing_map = _seed_variant_description_map(existing)
+    incoming_map = _seed_variant_description_map(incoming)
+    if not existing_map or not incoming_map:
+        return False
+
+    shared_ids = [variant_id for variant_id in incoming_map.keys() if variant_id in existing_map]
+    if not shared_ids:
+        return False
+
+    return any(
+        _should_replace_localized_copy(
+            existing_text=existing_map.get(variant_id),
+            incoming_text=incoming_map.get(variant_id),
+            market=market,
+            previous_canonical_url=previous_canonical_url,
+            refreshed_canonical_url=refreshed_canonical_url,
+        )
+        for variant_id in shared_ids
+    )
 
 
 def _seed_primary_price(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -3095,6 +3179,7 @@ async def refresh_external_seed(
     market = row.get("market")
     tool = row.get("tool")
     dest = row.get("destination_url")
+    previous_canonical_url = row.get("canonical_url")
     if not dest:
         raise HTTPException(status_code=400, detail="INVALID_URL")
 
@@ -3145,6 +3230,14 @@ async def refresh_external_seed(
         }
     )
     # Only overwrite curated fields if they are missing.
+    if _should_replace_localized_copy(
+        existing_text=seed_data.get("description"),
+        incoming_text=snap_description,
+        market=market,
+        previous_canonical_url=previous_canonical_url,
+        refreshed_canonical_url=canonical_url,
+    ):
+        seed_data["description"] = snap_description
     if not seed_data.get("title"):
         seed_data["title"] = snap_title
     if not seed_data.get("description"):
@@ -3160,6 +3253,14 @@ async def refresh_external_seed(
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
         if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=product_title):
+            seed_data["variants"] = snap_variants
+        elif _should_replace_seed_variant_content(
+            existing=existing_variants,
+            incoming=snap_variants,
+            market=market,
+            previous_canonical_url=previous_canonical_url,
+            refreshed_canonical_url=canonical_url,
+        ):
             seed_data["variants"] = snap_variants
         elif not existing_variants:
             seed_data["variants"] = snap_variants
