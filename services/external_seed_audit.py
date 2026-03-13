@@ -573,6 +573,25 @@ def stable_hash(value: Any) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
 
 
+def unique_url_records(*values: Any, limit: int = 8) -> List[str]:
+    out: List[str] = []
+    for value in values:
+        if isinstance(value, list):
+            for item in value:
+                url = normalize_url_like(item)
+                if url and url not in out:
+                    out.append(url)
+                    if len(out) >= limit:
+                        return out
+            continue
+        url = normalize_url_like(value)
+        if url and url not in out:
+            out.append(url)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def extract_raw_ingredient_text(description: Any) -> str:
     text = normalize_non_empty_string(description)
     if not text:
@@ -718,6 +737,35 @@ def build_external_seed_audit_item(row: Dict[str, Any], audit_result: Dict[str, 
     harvester_candidates = build_external_seed_harvester_candidates(row)
     prefilled_ingredient_count = sum(1 for candidate in harvester_candidates if normalize_non_empty_string(candidate.get("raw_ingredient_text")))
     seed_data = ensure_json_object(row.get("seed_data"))
+    snapshot = ensure_json_object(seed_data.get("snapshot"))
+    product_urls = unique_url_records(
+        row_meta.get("canonical_url"),
+        row.get("canonical_url"),
+        snapshot.get("canonical_url"),
+        row.get("destination_url"),
+        snapshot.get("destination_url"),
+        seed_data.get("canonical_url"),
+        seed_data.get("destination_url"),
+    )
+    ingredient_source_refs: List[Dict[str, Any]] = []
+    seen_source_refs: set[str] = set()
+    for candidate in harvester_candidates:
+        source_ref = normalize_url_like(candidate.get("source_ref") or candidate.get("url"))
+        if not source_ref or source_ref in seen_source_refs:
+            continue
+        seen_source_refs.add(source_ref)
+        ingredient_source_refs.append(
+            {
+                "source_ref": source_ref,
+                "product_name": normalize_non_empty_string(candidate.get("product_name")),
+                "variant_sku": normalize_non_empty_string(candidate.get("variant_sku")),
+                "variant_id": normalize_non_empty_string(candidate.get("variant_id")),
+                "source_type": normalize_non_empty_string(candidate.get("source_type") or "external_seed"),
+                "has_prefilled_ingredient_text": bool(normalize_non_empty_string(candidate.get("raw_ingredient_text"))),
+            }
+        )
+        if len(ingredient_source_refs) >= 6:
+            break
 
     seed_status = "pass"
     if severity_counts["blocker"] > 0:
@@ -734,6 +782,7 @@ def build_external_seed_audit_item(row: Dict[str, Any], audit_result: Dict[str, 
             "status": normalize_non_empty_string(row.get("status") or "active"),
             "domain": normalize_non_empty_string(row.get("domain")),
             "title": normalize_non_empty_string(row_meta.get("title") or row.get("title") or seed_data.get("title")),
+            "description": get_primary_description(row),
             "canonical_url": normalize_non_empty_string(row_meta.get("canonical_url") or row.get("canonical_url")),
             "destination_url": normalize_non_empty_string(row.get("destination_url")),
             "image_url": normalize_url_like(row.get("image_url"))
@@ -743,8 +792,10 @@ def build_external_seed_audit_item(row: Dict[str, Any], audit_result: Dict[str, 
             "variant_count": int(row_meta.get("variant_count") or 0),
             "attached_product_key": normalize_non_empty_string(row.get("attached_product_key")),
             "attached_variant_id": normalize_non_empty_string(row.get("attached_variant_id")),
+            "notes": normalize_non_empty_string(row.get("notes")),
             "last_extracted_at": normalize_non_empty_string(row_meta.get("last_extracted_at")),
             "updated_at": normalize_non_empty_string(row.get("updated_at")),
+            "product_urls": product_urls,
         },
         "audit": {
             "flagged": bool(findings),
@@ -759,6 +810,7 @@ def build_external_seed_audit_item(row: Dict[str, Any], audit_result: Dict[str, 
             "candidate_count": len(harvester_candidates),
             "prefilled_ingredient_count": prefilled_ingredient_count,
             "ready": severity_counts["blocker"] == 0,
+            "source_refs": ingredient_source_refs,
         },
         "pipeline": {
             "seed_status": seed_status,

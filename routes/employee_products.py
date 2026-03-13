@@ -1108,6 +1108,8 @@ class UpdateExternalSeedRequest(BaseModel):
     notes: Optional[str] = None
     market: Optional[str] = None
     tool: Optional[str] = None
+    destination_url: Optional[str] = None
+    canonical_url: Optional[str] = None
     merchant_display_name: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
@@ -2958,17 +2960,22 @@ async def update_external_seed(
         or _stable_external_product_id(row.get("canonical_url") or row.get("destination_url") or "")
     )
     seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
+    seed_data.setdefault("snapshot", {})
 
     if body.title is not None:
         seed_data["title"] = body.title
+        seed_data["snapshot"]["title"] = body.title
     if body.description is not None:
         seed_data["description"] = body.description
+        seed_data["snapshot"]["description"] = body.description
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
+        seed_data["snapshot"]["image_url"] = body.image_url
     if body.image_urls is not None:
         cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
         deduped = _dedupe_seed_image_urls(cleaned, limit=20)
         seed_data["image_urls"] = deduped
+        seed_data["snapshot"]["image_urls"] = deduped
         if body.image_url is None and deduped:
             seed_data["image_url"] = deduped[0]
     if body.availability is not None:
@@ -3001,6 +3008,27 @@ async def update_external_seed(
     if body.tool is not None:
         updates["tool"] = _normalize_tool(body.tool)
         set_clauses.append("tool = :tool")
+    next_destination_url = row.get("destination_url")
+    next_canonical_url = row.get("canonical_url")
+    if body.destination_url is not None:
+        next_destination_url = _require_http_url(body.destination_url)
+        updates["destination_url"] = next_destination_url
+        set_clauses.append("destination_url = :destination_url")
+        seed_data["destination_url"] = next_destination_url
+        seed_data["snapshot"]["destination_url"] = next_destination_url
+    if body.canonical_url is not None:
+        next_canonical_url = _require_http_url(body.canonical_url) if str(body.canonical_url).strip() else None
+        updates["canonical_url"] = next_canonical_url
+        set_clauses.append("canonical_url = :canonical_url")
+        seed_data["canonical_url"] = next_canonical_url
+        seed_data["snapshot"]["canonical_url"] = next_canonical_url
+    if body.destination_url is not None or body.canonical_url is not None:
+        next_url_for_domain = next_canonical_url or next_destination_url
+        try:
+            updates["domain"] = (urlparse(next_url_for_domain or "").hostname or "").lower() or None
+        except Exception:
+            updates["domain"] = None
+        set_clauses.append("domain = :domain")
     if body.notes is not None:
         updates["notes"] = body.notes
         set_clauses.append("notes = :notes")

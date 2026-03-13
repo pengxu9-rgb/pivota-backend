@@ -141,6 +141,8 @@ def test_external_seed_audit_queue_lists_flagged_rows(monkeypatch: pytest.Monkey
     assert "locale_market_mismatch" in item["audit"]["anomaly_types"]
     assert item["harvester"]["candidate_count"] == 1
     assert item["harvester"]["prefilled_ingredient_count"] == 1
+    assert item["seed"]["product_urls"][0].startswith("https://theordinary.com/")
+    assert item["harvester"]["source_refs"][0]["source_ref"].startswith("https://theordinary.com/")
     assert item["pipeline"]["seed_status"] == "blocked"
 
 
@@ -170,4 +172,54 @@ def test_external_seed_audit_detail_returns_item(monkeypatch: pytest.MonkeyPatch
     assert item["seed"]["id"] == row["id"]
     assert item["audit"]["blocker_count"] >= 1
     assert any(f["anomaly_type"] == "locale_market_mismatch" for f in item["findings"])
+    assert len(item["seed"]["product_urls"]) >= 1
+    assert len(item["harvester"]["source_refs"]) >= 1
     assert item["harvester"]["ready"] is False
+
+
+def test_update_external_seed_supports_audit_review_edits(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.employee_products as employee_products_module
+
+    stored_row = _seed_row()
+
+    async def fake_fetch_one(_query: str, values=None):
+        if values and values.get("id") == stored_row["id"]:
+            return stored_row
+        return None
+
+    async def fake_execute_seed_data_stmt(_query: str, values):
+        stored_row.update(values)
+        if "seed_data" in values:
+            stored_row["seed_data"] = values["seed_data"]
+
+    monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
+
+    res = client.patch(
+        f"/employee/products/external-seeds/{stored_row['id']}",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "title": "Retitled Serum",
+            "description": "Updated reviewer description",
+            "destination_url": "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html",
+            "canonical_url": "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html",
+            "image_url": "https://cdn.example.com/reviewed.jpg",
+            "notes": "Reviewed by audit ops",
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "success"
+
+    assert stored_row["destination_url"] == "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html"
+    assert stored_row["canonical_url"] == "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html"
+    assert stored_row["domain"] == "theordinary.com"
+    assert stored_row["notes"] == "Reviewed by audit ops"
+
+    seed_data = stored_row["seed_data"]
+    assert seed_data["title"] == "Retitled Serum"
+    assert seed_data["description"] == "Updated reviewer description"
+    assert seed_data["image_url"] == "https://cdn.example.com/reviewed.jpg"
+    assert seed_data["snapshot"]["title"] == "Retitled Serum"
+    assert seed_data["snapshot"]["description"] == "Updated reviewer description"
+    assert seed_data["snapshot"]["canonical_url"] == "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html"
