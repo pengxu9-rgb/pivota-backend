@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from sqlalchemy import and_, select, update
@@ -1066,6 +1066,79 @@ def _availability_from_raw(raw: Optional[str]) -> str:
     return "unknown"
 
 
+def _normalize_description_text(raw: Optional[str]) -> Optional[str]:
+    if not raw or not str(raw).strip():
+        return None
+
+    text = (
+        str(raw)
+        .replace("\xa0", " ")
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</p>", "\n")
+        .replace("</div>", "\n")
+        .replace("</li>", "\n")
+    )
+    text = re.sub(r"</?(?:ul|ol)\b[^>]*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"\r\n", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    return text or None
+
+
+def _prefer_detailed_description(*, primary: Optional[str], detailed: Optional[str], fallback: Optional[str]) -> Optional[str]:
+    structured = _normalize_description_text(primary)
+    detailed_text = _normalize_description_text(detailed)
+    fallback_text = _normalize_description_text(fallback)
+
+    if detailed_text:
+        if not structured:
+            return detailed_text
+        structured_lower = structured.lower()
+        detailed_lower = detailed_text.lower()
+        starts_with_structured = detailed_lower.startswith(structured_lower)
+        materially_longer = len(detailed_text) >= max(len(structured) + 60, round(len(structured) * 1.35))
+        looks_like_expanded = bool(re.search(r"\bthis set includes\b|\bproduct details\b|\n|•|\bto use\b", detailed_text, re.IGNORECASE))
+        if starts_with_structured or (materially_longer and looks_like_expanded):
+            return detailed_text
+
+    return structured or fallback_text
+
+
+def _extract_long_description_from_html(html: str) -> Optional[str]:
+    hidden_match = re.search(
+        r'<input[^>]+id=["\\\']overview-about-text["\\\'][^>]+value=["\\\']([^"\\\']+)["\\\']',
+        html,
+        flags=re.IGNORECASE,
+    )
+    if hidden_match:
+        raw = html_lib.unescape(hidden_match.group(1))
+        try:
+            decoded = unquote(raw)
+        except Exception:
+            decoded = raw
+        text = _normalize_description_text(decoded)
+        if text:
+            return text
+
+    modal_match = re.search(
+        r'<div[^>]+class=["\\\'][^"\\\']*more-about-product-content[^"\\\']*["\\\'][^>]*>(.*?)</div>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if modal_match:
+        text = _normalize_description_text(modal_match.group(1))
+        if text:
+            return text
+
+    return None
+
+
 async def _fetch_html(url: str) -> Tuple[str, str]:
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA}) as client:
@@ -1093,6 +1166,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     title = meta("property:og:title", "name:twitter:title") or (p.title.strip() if p.title else None)
     image = meta("property:og:image", "property:og:image:secure_url", "name:twitter:image")
     description = meta("property:og:description", "name:description", "name:twitter:description")
+    detailed_description = _extract_long_description_from_html(html)
 
     price = meta("property:product:price:amount", "property:og:price:amount", "property:product:price") or None
     currency = meta("property:product:price:currency", "property:og:price:currency") or None
@@ -1177,7 +1251,11 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     out = {
         "canonical_url": canonical,
         "title": jsonld.get("title") or title,
-        "description": jsonld.get("description") or description,
+        "description": _prefer_detailed_description(
+            primary=jsonld.get("description"),
+            detailed=detailed_description,
+            fallback=description,
+        ),
         "brand": jsonld.get("brand") or None,
         "image_url": (image_urls[0] if image_urls else None) or jsonld.get("image_url") or image,
         "image_urls": image_urls,

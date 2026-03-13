@@ -197,3 +197,43 @@ def test_extract_from_html_prefers_size_titles_from_data_attrs_when_jsonld_title
     assert any(v.get("variant_id") == "T2KD01" and v.get("title") == "250 ml" for v in variants)
 
     assert "Explore desire" in (out.get("description") or "")
+
+
+def test_extract_from_html_prefers_expanded_product_details_over_short_jsonld_description() -> None:
+    html = """
+    <html>
+      <head>
+        <title>The Acne Set</title>
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "Product",
+          "name": "The Acne Set",
+          "description": "A 3-step regimen with Salicylic Acid 2% Solution for clearer skin",
+          "offers": {
+            "@type":"Offer",
+            "price":"16.70",
+            "priceCurrency":"USD",
+            "availability":"https://schema.org/InStock"
+          }
+        }
+        </script>
+      </head>
+      <body>
+        <input
+          type="hidden"
+          id="overview-about-text"
+          value="%3Cp%3E%3Cstrong%3EThe%20Acne%20Set%3C/strong%3E%20offers%20a%20targeted%20skincare%20regimen%20featuring%20%3Cstrong%3ESalicylic%20Acid%202%25%20Solution%3C/strong%3E%20for%20treating%20acne.%3C/p%3E%0A%3Cp%3EThis%20set%20includes...%3C/p%3E%0A%3Cul%3E%3Cli%3E%3Cstrong%3EGlucoside%20Foaming%20Cleanser%3C/strong%3E%20removes%20dirt%20and%20impurities.%3C/li%3E%3Cli%3E%3Cstrong%3ESalicylic%20Acid%202%25%20Solution%3C/strong%3E%20helps%20clear%20pores.%3C/li%3E%3C/ul%3E"
+        />
+      </body>
+    </html>
+    """
+
+    out = _extract_from_html("https://theordinary.com/en-us/the-acne-set-100631.html", html)
+
+    assert out.get("description") == (
+        "The Acne Set offers a targeted skincare regimen featuring Salicylic Acid 2% Solution for treating acne.\n\n"
+        "This set includes...\n\n"
+        "Glucoside Foaming Cleanser removes dirt and impurities.\n"
+        "Salicylic Acid 2% Solution helps clear pores."
+    )
