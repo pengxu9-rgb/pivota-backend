@@ -51,6 +51,15 @@ from services.external_seed_audit import (
     should_suppress_stale_description_fallback,
     summarize_audit_results,
 )
+from services.pci_kb_scope_review import (
+    REVIEW_DECISION_RESOLVED,
+    build_queue_items,
+    delete_pci_kb_rows_sync,
+    extract_seed_id_from_sku_key,
+    fetch_pci_kb_rows_sync,
+    filter_queue_items,
+    summarize_filtered_queue,
+)
 from db.reviews_center import product_reviews
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
 
@@ -61,6 +70,9 @@ _EXTERNAL_SEEDS_TABLE_LOCK = asyncio.Lock()
 
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = False
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
+
+_EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = False
+_EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_LOCK = asyncio.Lock()
 
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 EXTERNAL_SEED_PLATFORM = "external"
@@ -363,6 +375,43 @@ async def _ensure_external_seed_import_tasks_table() -> None:
             "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_updated_at ON employee_external_seed_import_tasks(updated_at DESC);"
         )
         _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = True
+
+
+async def _ensure_employee_pci_kb_scope_reviews_table() -> None:
+    global _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY
+    if _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY:
+        return
+    async with _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_LOCK:
+        if _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY:
+            return
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS employee_pci_kb_scope_reviews (
+              sku_key TEXT PRIMARY KEY,
+              decision TEXT NOT NULL,
+              notes TEXT NULL,
+              reviewed_by_employee_id TEXT NULL,
+              reviewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              external_seed_id TEXT NULL,
+              brand TEXT NULL,
+              product_name TEXT NULL,
+              scope_decision TEXT NULL,
+              scope_reason TEXT NULL,
+              source_ref TEXT NULL,
+              canonical_url TEXT NULL,
+              market TEXT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_decision ON employee_pci_kb_scope_reviews(decision);"
+        )
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_reviewed_at ON employee_pci_kb_scope_reviews(reviewed_at DESC);"
+        )
+        _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = True
 
 
 async def _ensure_primary_offers_table() -> None:
@@ -1250,6 +1299,11 @@ class ExternalSeedsCsvImportResponse(BaseModel):
     errors: List[str] = Field(default_factory=list)
     seedIds: List[str] = Field(default_factory=list)
     taskId: Optional[str] = None
+
+
+class UpdatePciKbScopeReviewRequest(BaseModel):
+    decision: str = Field(..., min_length=1)
+    notes: Optional[str] = None
 
 
 def _parse_float(raw: Any) -> Optional[float]:
@@ -2293,6 +2347,133 @@ def _build_external_seed_audit_response_item(row: Dict[str, Any]) -> Dict[str, A
     return item
 
 
+def _employee_id_from_user(current_user: Dict[str, Any]) -> str:
+    return str(
+        current_user.get("employee_id")
+        or current_user.get("id")
+        or current_user.get("user_id")
+        or current_user.get("email")
+        or ""
+    ).strip()
+
+
+async def _fetch_external_seed_rows_by_ids(seed_ids: List[str]) -> List[Dict[str, Any]]:
+    normalized_ids = [str(seed_id).strip() for seed_id in seed_ids if str(seed_id).strip()]
+    if not normalized_ids:
+        return []
+    rows = await database.fetch_all(
+        """
+        SELECT
+          id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+          destination_url, canonical_url, domain, title, image_url,
+          price_amount, price_currency, availability,
+          seed_data,
+          status, notes, created_by_employee_id,
+          attached_product_key, attached_variant_id,
+          created_at, updated_at
+        FROM external_product_seeds
+        WHERE id = ANY(:seed_ids)
+        """,
+        {"seed_ids": normalized_ids},
+    )
+    return [dict(row) for row in rows]
+
+
+async def _fetch_employee_pci_kb_scope_review_rows() -> List[Dict[str, Any]]:
+    await _ensure_employee_pci_kb_scope_reviews_table()
+    rows = await database.fetch_all(
+        """
+        SELECT
+          sku_key,
+          decision,
+          notes,
+          reviewed_by_employee_id,
+          reviewed_at,
+          external_seed_id,
+          brand,
+          product_name,
+          scope_decision,
+          scope_reason,
+          source_ref,
+          canonical_url,
+          market,
+          created_at,
+          updated_at
+        FROM employee_pci_kb_scope_reviews
+        ORDER BY reviewed_at DESC NULLS LAST, updated_at DESC NULLS LAST
+        """
+    )
+    return [dict(row) for row in rows]
+
+
+async def _upsert_employee_pci_kb_scope_review_row(
+    *,
+    sku_key: str,
+    decision: str,
+    notes: Optional[str],
+    current_user: Dict[str, Any],
+    item: Dict[str, Any],
+) -> None:
+    await _ensure_employee_pci_kb_scope_reviews_table()
+    await database.execute("DELETE FROM employee_pci_kb_scope_reviews WHERE sku_key = :sku_key", {"sku_key": sku_key})
+    await database.execute(
+        """
+        INSERT INTO employee_pci_kb_scope_reviews (
+          sku_key,
+          decision,
+          notes,
+          reviewed_by_employee_id,
+          reviewed_at,
+          external_seed_id,
+          brand,
+          product_name,
+          scope_decision,
+          scope_reason,
+          source_ref,
+          canonical_url,
+          market,
+          created_at,
+          updated_at
+        ) VALUES (
+          :sku_key,
+          :decision,
+          :notes,
+          :reviewed_by_employee_id,
+          NOW(),
+          :external_seed_id,
+          :brand,
+          :product_name,
+          :scope_decision,
+          :scope_reason,
+          :source_ref,
+          :canonical_url,
+          :market,
+          NOW(),
+          NOW()
+        )
+        """,
+        {
+          "sku_key": sku_key,
+          "decision": decision,
+          "notes": notes,
+          "reviewed_by_employee_id": _employee_id_from_user(current_user),
+          "external_seed_id": item.get("external_seed_id"),
+          "brand": item.get("brand"),
+          "product_name": item.get("product_name"),
+          "scope_decision": item.get("scope_decision"),
+          "scope_reason": item.get("scope_reason"),
+          "source_ref": item.get("source_ref"),
+          "canonical_url": item.get("canonical_url"),
+          "market": item.get("market"),
+        },
+    )
+
+
+async def _delete_employee_pci_kb_scope_review_row(sku_key: str) -> None:
+    await _ensure_employee_pci_kb_scope_reviews_table()
+    await database.execute("DELETE FROM employee_pci_kb_scope_reviews WHERE sku_key = :sku_key", {"sku_key": sku_key})
+
+
 @router.get("/external-seeds/audit-queue")
 async def list_external_seed_audit_queue(
     q: Optional[str] = Query(default=None),
@@ -2383,6 +2564,129 @@ async def get_external_seed_audit(
     return {
         "status": "success",
         "item": item,
+    }
+
+
+@router.get("/pci-kb-scope-reviews")
+async def list_pci_kb_scope_reviews(
+    q: Optional[str] = Query(default=None),
+    brand: Optional[str] = Query(default=None),
+    domain: Optional[str] = Query(default=None),
+    review_priority: Optional[str] = Query(default=None),
+    scope_reason: Optional[str] = Query(default=None),
+    decision: Optional[str] = Query(default=None),
+    unresolved_only: bool = Query(default=True),
+    limit: int = Query(default=200, ge=1, le=500),
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    await _ensure_employee_pci_kb_scope_reviews_table()
+    try:
+        kb_rows = await asyncio.to_thread(fetch_pci_kb_rows_sync)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    seed_ids = list({extract_seed_id_from_sku_key(row.get("sku_key")) for row in kb_rows if extract_seed_id_from_sku_key(row.get("sku_key"))})
+    seed_rows = await _fetch_external_seed_rows_by_ids(seed_ids)
+    review_rows = await _fetch_employee_pci_kb_scope_review_rows()
+
+    queue = build_queue_items(kb_rows, seed_rows, review_rows)
+    filtered_items = filter_queue_items(
+        queue["items"],
+        q=q or "",
+        brand=brand or "",
+        domain=domain or "",
+        review_priority=review_priority or "",
+        scope_reason=scope_reason or "",
+        decision=decision or "",
+        unresolved_only=bool(unresolved_only),
+    )[:limit]
+
+    return {
+        "status": "success",
+        "summary": {
+            **queue["summary"],
+            **summarize_filtered_queue(filtered_items),
+        },
+        "meta": {
+            "returned": len(filtered_items),
+            "limit": limit,
+            "filters": {
+                "q": q,
+                "brand": brand,
+                "domain": domain,
+                "review_priority": review_priority,
+                "scope_reason": scope_reason,
+                "decision": decision,
+                "unresolved_only": bool(unresolved_only),
+            },
+        },
+        "items": filtered_items,
+    }
+
+
+@router.patch("/pci-kb-scope-reviews/{sku_key:path}")
+async def update_pci_kb_scope_review(
+    sku_key: str,
+    body: UpdatePciKbScopeReviewRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    await _ensure_employee_pci_kb_scope_reviews_table()
+
+    decision = str(body.decision or "").strip()
+    allowed_decisions = {
+        "keep_in_kb",
+        "remove_from_kb",
+        "needs_seed_rebuild",
+        "needs_policy_review",
+        "reopen",
+    }
+    if decision not in allowed_decisions:
+        raise HTTPException(status_code=400, detail="INVALID_DECISION")
+
+    try:
+        kb_rows = await asyncio.to_thread(fetch_pci_kb_rows_sync)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    seed_ids = list({extract_seed_id_from_sku_key(row.get("sku_key")) for row in kb_rows if extract_seed_id_from_sku_key(row.get("sku_key"))})
+    seed_rows = await _fetch_external_seed_rows_by_ids(seed_ids)
+    review_rows = await _fetch_employee_pci_kb_scope_review_rows()
+    queue = build_queue_items(kb_rows, seed_rows, review_rows)
+    item = next((entry for entry in queue["items"] if str(entry.get("sku_key")) == sku_key), None)
+    if not item and decision != "remove_from_kb":
+        raise HTTPException(status_code=404, detail="PCI_KB_SCOPE_ITEM_NOT_FOUND")
+
+    if decision == "reopen":
+        await _delete_employee_pci_kb_scope_review_row(sku_key)
+    else:
+        if decision == "remove_from_kb":
+            await asyncio.to_thread(delete_pci_kb_rows_sync, [sku_key])
+        review_item = item or {
+            "sku_key": sku_key,
+            "external_seed_id": extract_seed_id_from_sku_key(sku_key),
+            "brand": None,
+            "product_name": None,
+            "scope_decision": "review",
+            "scope_reason": "manual_removed",
+            "source_ref": None,
+            "canonical_url": None,
+            "market": None,
+        }
+        await _upsert_employee_pci_kb_scope_review_row(
+            sku_key=sku_key,
+            decision=decision,
+            notes=body.notes,
+            current_user=current_user,
+            item=review_item,
+        )
+
+    return {
+        "status": "success",
+        "decision": decision,
+        "resolved": REVIEW_DECISION_RESOLVED.get(decision, False),
+        "sku_key": sku_key,
     }
 
 
