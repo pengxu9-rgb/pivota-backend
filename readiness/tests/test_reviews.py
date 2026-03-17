@@ -20,7 +20,7 @@ async def test_load_product_review_summaries_falls_back_when_group_membership_lo
 
     calls = {"count": 0}
 
-    async def fake_fetch_all(_query):
+    async def fake_fetch_all(_query, _params=None):
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("group membership query failed")
@@ -69,7 +69,7 @@ async def test_load_product_review_summaries_keeps_group_summary_when_featured_l
 
     calls = {"count": 0}
 
-    async def fake_fetch_all(_query):
+    async def fake_fetch_all(_query, _params=None):
         calls["count"] += 1
         if calls["count"] == 1:
             return [

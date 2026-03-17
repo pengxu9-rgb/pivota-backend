@@ -4,8 +4,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import case, func, select
-
 from db.database import database
 from db.reviews_center import product_reviews, review_featured, review_group, review_group_membership
 from models.standard_product import StandardProduct
@@ -79,6 +77,16 @@ def _append_warning(
     audit_notes.append(audit_note)
 
 
+def _build_in_clause(param_prefix: str, values: Iterable[Any]) -> Tuple[str, Dict[str, Any]]:
+    params: Dict[str, Any] = {}
+    placeholders: List[str] = []
+    for idx, value in enumerate(values):
+        key = f"{param_prefix}_{idx}"
+        params[key] = value
+        placeholders.append(f":{key}")
+    return ", ".join(placeholders) or "NULL", params
+
+
 def _combine_review_totals(*totals: Dict[str, Any]) -> Dict[str, Any]:
     latest_candidates = [_parse_datetime(item.get("latest_review_at")) for item in totals if item]
     latest_review_at = max((item for item in latest_candidates if item is not None), default=None)
@@ -96,34 +104,26 @@ def _combine_review_totals(*totals: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _build_review_aggregate_query(group_by_column):
-    return (
-        select(
-            group_by_column.label("bucket"),
-            func.count(product_reviews.c.id).label("review_count"),
-            func.sum(
-                case(
-                    ((product_reviews.c.rating.isnot(None)) & (product_reviews.c.rating > 0), 1),
-                    else_=0,
-                )
-            ).label("rated_total"),
-            func.sum(
-                case(
-                    ((product_reviews.c.rating.isnot(None)) & (product_reviews.c.rating > 0), product_reviews.c.rating),
-                    else_=0,
-                )
-            ).label("rating_sum"),
-            func.sum(
-                case(
-                    (product_reviews.c.verification.in_(("verified_purchase", "partner_verified")), 1),
-                    else_=0,
-                )
-            ).label("verified_review_count"),
-            func.max(product_reviews.c.created_at).label("latest_review_at"),
-        )
-        .where(product_reviews.c.status == "active")
-        .group_by(group_by_column)
-    )
+def _build_review_aggregate_query_sql(
+    *,
+    bucket_expression: str,
+    param_prefix: str,
+    values: Iterable[Any],
+) -> Tuple[str, Dict[str, Any]]:
+    in_clause, params = _build_in_clause(param_prefix, values)
+    sql = f"""
+    SELECT {bucket_expression} AS bucket,
+           COUNT(id)::int AS review_count,
+           SUM(CASE WHEN rating IS NOT NULL AND rating > 0 THEN 1 ELSE 0 END)::int AS rated_total,
+           SUM(CASE WHEN rating IS NOT NULL AND rating > 0 THEN rating ELSE 0 END)::float AS rating_sum,
+           SUM(CASE WHEN verification IN ('verified_purchase', 'partner_verified') THEN 1 ELSE 0 END)::int AS verified_review_count,
+           MAX(created_at) AS latest_review_at
+    FROM product_reviews
+    WHERE status = 'active'
+      AND {bucket_expression} IN ({in_clause})
+    GROUP BY {bucket_expression}
+    """
+    return sql, params
 
 
 async def load_product_review_summaries(
@@ -173,30 +173,22 @@ async def load_product_review_summaries(
         product_lookup_available = False
 
         try:
+            product_key_clause, membership_params = _build_in_clause("membership_product_key", product_keys_by_id.values())
             membership_rows = await database.fetch_all(
-                select(
-                    review_group_membership.c.product_key,
-                    review_group_membership.c.group_id,
-                    review_group_membership.c.confidence.label("membership_confidence"),
-                    review_group.c.group_key,
-                    review_group.c.confidence.label("group_confidence"),
-                )
-                .select_from(
-                    review_group_membership.join(
-                        review_group, review_group.c.id == review_group_membership.c.group_id
-                    )
-                )
-                .where(
-                    (review_group_membership.c.status == "active")
-                    & (review_group.c.status == "active")
-                    & (review_group_membership.c.product_key.in_(list(product_keys_by_id.values())))
-                )
-                .order_by(
-                    review_group_membership.c.product_key.asc(),
-                    review_group_membership.c.confidence.desc(),
-                    review_group_membership.c.updated_at.desc(),
-                    review_group_membership.c.id.desc(),
-                )
+                f"""
+                SELECT m.product_key,
+                       m.group_id,
+                       m.confidence AS membership_confidence,
+                       g.group_key,
+                       g.confidence AS group_confidence
+                FROM review_group_membership m
+                JOIN review_group g ON g.id = m.group_id
+                WHERE m.status = 'active'
+                  AND g.status = 'active'
+                  AND m.product_key IN ({product_key_clause})
+                ORDER BY m.product_key ASC, m.confidence DESC, m.updated_at DESC, m.id DESC
+                """,
+                membership_params,
             )
         except Exception:
             logger.warning("Review-group membership lookup failed for merchant=%s", merchant_id, exc_info=True)
@@ -228,11 +220,12 @@ async def load_product_review_summaries(
 
         if group_ids:
             try:
-                group_rows = await database.fetch_all(
-                    _build_review_aggregate_query(product_reviews.c.group_id).where(
-                        product_reviews.c.group_id.in_(group_ids)
-                    )
+                group_sql, group_params = _build_review_aggregate_query_sql(
+                    bucket_expression="group_id",
+                    param_prefix="group_id",
+                    values=group_ids,
                 )
+                group_rows = await database.fetch_all(group_sql, group_params)
                 group_lookup_available = True
                 group_aggregates = {
                     int(_row_get(row, "bucket")): _aggregate_row_to_dict(row)
@@ -250,13 +243,16 @@ async def load_product_review_summaries(
                 group_aggregates = {}
 
             try:
+                group_id_clause, featured_params = _build_in_clause("featured_group_id", group_ids)
                 featured_rows = await database.fetch_all(
-                    select(
-                        review_featured.c.group_id.label("bucket"),
-                        func.count(review_featured.c.review_id).label("featured_review_count"),
-                    )
-                    .group_by(review_featured.c.group_id)
-                    .where(review_featured.c.group_id.in_(group_ids))
+                    f"""
+                    SELECT group_id AS bucket,
+                           COUNT(review_id)::int AS featured_review_count
+                    FROM review_featured
+                    WHERE group_id IN ({group_id_clause})
+                    GROUP BY group_id
+                    """,
+                    featured_params,
                 )
                 featured_counts = {
                     int(_row_get(row, "bucket")): int(_row_get(row, "featured_review_count", 0) or 0)
@@ -274,11 +270,12 @@ async def load_product_review_summaries(
 
         all_product_keys = list(product_keys_by_id.values()) + list(global_product_keys_by_id.values())
         try:
-            product_rows = await database.fetch_all(
-                _build_review_aggregate_query(product_reviews.c.product_key).where(
-                    product_reviews.c.product_key.in_(all_product_keys)
-                )
+            product_sql, product_params = _build_review_aggregate_query_sql(
+                bucket_expression="product_key",
+                param_prefix="product_key",
+                values=all_product_keys,
             )
+            product_rows = await database.fetch_all(product_sql, product_params)
             product_lookup_available = True
             product_aggregates = {
                 str(_row_get(row, "bucket") or "").strip(): _aggregate_row_to_dict(row)
@@ -302,7 +299,7 @@ async def load_product_review_summaries(
                 "products_with_reviews": 0,
                 "grouped_products_with_reviews": 0,
                 "products_without_reviews": len(products_list),
-            }, ["reviews_summary_lookup_failed"], [
+            }, warnings + ["reviews_summary_lookup_failed"], audit_notes + [
                 "Readiness alpha could not hydrate Reviews Center summaries for this merchant."
             ]
 
