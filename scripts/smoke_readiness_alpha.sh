@@ -376,7 +376,7 @@ main() {
     local blocked_status
     blocked_status="$(request_json POST "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/checkout" "$blocked_checkout_json" "$blocked_payload_json")"
     expect_status "$blocked_status" "409" "Blocked checkout" "$blocked_checkout_json"
-    jq -e '.code == "VARIANT_NOT_READY_FOR_CHECKOUT"' "$blocked_checkout_json" >/dev/null || die "Blocked checkout did not return VARIANT_NOT_READY_FOR_CHECKOUT"
+    jq -e '(.code // .detail.code // .error.details.code // "") == "VARIANT_NOT_READY_FOR_CHECKOUT"' "$blocked_checkout_json" >/dev/null || die "Blocked checkout did not return VARIANT_NOT_READY_FOR_CHECKOUT"
     pretty_json "$blocked_checkout_json"
   else
     warn "No blocked variant found in the report; skipping blocked checkout smoke"

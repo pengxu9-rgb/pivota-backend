@@ -9,13 +9,14 @@ from fastapi.testclient import TestClient
 
 from readiness.flags import DEFAULT_ALPHA_MERCHANT_ID
 from readiness.order_sync import InMemoryReadinessJournal
-from readiness.tests.conftest import load_real_merchant_fixture
+from readiness.tests.conftest import build_live_shopify_products, load_real_merchant_fixture
 
 
 def _install_live_source_mocks(monkeypatch, *, psp_enabled: bool):
     from readiness.sources import shopify_live
 
     fixture = load_real_merchant_fixture()
+    live_products = build_live_shopify_products()
 
     async def fake_get_merchant_onboarding(_merchant_id: str):
         return {"merchant_id": fixture["merchant_id"], "business_name": fixture["merchant_name"]}
@@ -40,11 +41,15 @@ def _install_live_source_mocks(monkeypatch, *, psp_enabled: bool):
     async def fake_get_active_psp(_merchant_id: str):
         return fixture["merchant_psp"] if psp_enabled else None
 
+    async def fake_fetch_live_products(_merchant_id: str, _shop_domain: str, _access_token: str):
+        return live_products, None
+
     monkeypatch.setattr(shopify_live, "get_merchant_onboarding", fake_get_merchant_onboarding)
     monkeypatch.setattr(shopify_live, "get_primary_store", fake_get_primary_store)
     monkeypatch.setattr(shopify_live, "_get_shopify_config_for_merchant", fake_get_shopify_cfg)
     monkeypatch.setattr(shopify_live, "get_cached_products", fake_get_cached_products)
     monkeypatch.setattr(shopify_live, "_fetch_active_psp_config", fake_get_active_psp)
+    monkeypatch.setattr(shopify_live, "_fetch_live_products", fake_fetch_live_products)
 
 
 def _build_test_client(monkeypatch, *, psp_enabled: bool) -> TestClient:
@@ -81,11 +86,12 @@ def test_real_merchant_report_and_export(monkeypatch):
     export_json = export.json()
     assert export_json["merchant_alpha_mode"] == "real_merchant_alpha"
     assert export_json["capability_status"]["checkout"] == "ready"
-    assert len(export_json["offers"]) == 2
+    assert len(export_json["offers"]) == 3
     offer_variant_ids = {offer["variant_id"] for offer in export_json["offers"]}
     assert "431000000001" in offer_variant_ids
     assert "431000000002" in offer_variant_ids
-    assert "431000000003" not in offer_variant_ids
+    assert "431000000003" in offer_variant_ids
+    assert "431000000004" not in offer_variant_ids
 
 
 def test_checkout_blocked_when_capability_missing(monkeypatch):

@@ -6,12 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from adapters.product_adapters import ShopifyProductAdapter
+from adapters.product_adapters import SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE, ShopifyProductAdapter
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import get_cached_products
 from jobs.catalog_import_worker import _get_shopify_config_for_merchant
-from models.standard_product import StandardProduct
+from models.standard_product import StandardProduct, StandardProductVariant
 from readiness.flags import readiness_alpha_merchant_id
 from readiness.models import MerchantSourceDataset
 from services.merchant_store_service import get_primary_store
@@ -42,6 +42,25 @@ def _load_policy_map() -> Dict[str, Any]:
     except Exception:
         logger.exception("Failed to parse alpha merchant policy fixture")
         return {}
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    raw = _iso(value)
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _model_dump(model: Any) -> Dict[str, Any]:
+    dump = getattr(model, "model_dump", None)
+    if callable(dump):
+        return dump()
+    return model.dict()
 
 
 def _map_cache_row_to_standard_product(merchant_id: str, row: Dict[str, Any]) -> Optional[StandardProduct]:
@@ -82,13 +101,140 @@ async def _fetch_active_psp_config(merchant_id: str) -> Optional[Dict[str, Any]]
 
 
 async def _fetch_live_products(merchant_id: str, shop_domain: str, access_token: str) -> Tuple[List[StandardProduct], Optional[str]]:
-    products, _, error = await ShopifyProductAdapter.fetch_products(
-        shop_domain=shop_domain,
-        access_token=access_token,
-        merchant_id=merchant_id,
-        limit=250,
-    )
-    return products, error
+    all_products: List[StandardProduct] = []
+    page_info: Optional[str] = None
+    page_count = 0
+
+    while True:
+        products, next_page_token, error = await ShopifyProductAdapter.fetch_products(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            merchant_id=merchant_id,
+            limit=250,
+            page_info=page_info,
+        )
+        if error:
+            return all_products, error if all_products else error
+        all_products.extend(products)
+        page_count += 1
+
+        if not next_page_token:
+            break
+        if next_page_token == SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE:
+            return all_products, f"live_shopify_pagination_unparseable_after_{page_count}_pages"
+        if next_page_token == page_info:
+            return all_products, f"live_shopify_pagination_loop_detected_after_{page_count}_pages"
+        page_info = next_page_token
+
+    deduped: Dict[str, StandardProduct] = {}
+    for product in all_products:
+        deduped[product.id] = product
+    return list(deduped.values()), None
+
+
+def _cached_rows_need_live_overlay(rows: List[Dict[str, Any]], reference_time: datetime) -> bool:
+    inventory_max_age_hours = 0.25
+    for row in rows:
+        observed_at = _parse_datetime(row.get("cached_at"))
+        if observed_at is None:
+            return True
+        age_hours = (reference_time - observed_at.astimezone(timezone.utc)).total_seconds() / 3600
+        if age_hours > inventory_max_age_hours:
+            return True
+    return False
+
+
+def _merge_variant_with_live_overlay(
+    cached_variant: StandardProductVariant,
+    live_variant: StandardProductVariant,
+) -> StandardProductVariant:
+    merged = _model_dump(cached_variant)
+    live = _model_dump(live_variant)
+    for field in (
+        "title",
+        "sku",
+        "barcode",
+        "price",
+        "compare_at_price",
+        "inventory_quantity",
+        "weight",
+        "weight_unit",
+        "options",
+        "image_url",
+    ):
+        value = live.get(field)
+        if value is not None or field in {"price", "inventory_quantity"}:
+            merged[field] = value
+    return StandardProductVariant(**merged)
+
+
+def _merge_product_with_live_overlay(
+    cached_product: StandardProduct,
+    live_product: StandardProduct,
+) -> StandardProduct:
+    merged = _model_dump(cached_product)
+    live = _model_dump(live_product)
+
+    for field in ("price", "compare_at_price", "currency", "inventory_quantity", "sku", "barcode", "updated_at", "orderable", "orderable_validation", "in_stock"):
+        value = live.get(field)
+        if value is not None:
+            merged[field] = value
+
+    if not merged.get("title"):
+        merged["title"] = live.get("title")
+    if not merged.get("description"):
+        merged["description"] = live.get("description")
+    if not merged.get("vendor"):
+        merged["vendor"] = live.get("vendor")
+    if not merged.get("product_type"):
+        merged["product_type"] = live.get("product_type")
+    if not merged.get("image_url"):
+        merged["image_url"] = live.get("image_url")
+    if not merged.get("images"):
+        merged["images"] = live.get("images") or []
+
+    cached_variants = {str(variant.id): variant for variant in cached_product.variants or []}
+    live_variants = {str(variant.id): variant for variant in live_product.variants or []}
+    merged_variants: List[StandardProductVariant] = []
+    seen_variant_ids: set[str] = set()
+
+    for variant in cached_product.variants or []:
+        live_variant = live_variants.get(str(variant.id))
+        if live_variant is None:
+            merged_variants.append(variant)
+        else:
+            merged_variants.append(_merge_variant_with_live_overlay(variant, live_variant))
+            seen_variant_ids.add(str(variant.id))
+
+    for variant in live_product.variants or []:
+        if str(variant.id) not in seen_variant_ids and str(variant.id) not in cached_variants:
+            merged_variants.append(variant)
+
+    merged["variants"] = merged_variants
+    return StandardProduct(**merged)
+
+
+def _merge_cached_products_with_live_overlay(
+    cached_products: List[StandardProduct],
+    live_products: List[StandardProduct],
+) -> List[StandardProduct]:
+    live_by_id = {str(product.id): product for product in live_products}
+    merged_products: List[StandardProduct] = []
+    seen_product_ids: set[str] = set()
+
+    for product in cached_products:
+        live_product = live_by_id.get(str(product.id))
+        if live_product is None:
+            merged_products.append(product)
+        else:
+            merged_products.append(_merge_product_with_live_overlay(product, live_product))
+            seen_product_ids.add(str(product.id))
+
+    for product in live_products:
+        if str(product.id) not in seen_product_ids and not any(str(existing.id) == str(product.id) for existing in cached_products):
+            merged_products.append(product)
+
+    return merged_products
 
 
 class ShopifyLiveMerchantSource:
@@ -109,6 +255,7 @@ class ShopifyLiveMerchantSource:
         merchant_blockers: List[str] = []
         merchant_warnings: List[str] = []
         audit_notes: List[str] = []
+        reference_time = datetime.now(timezone.utc)
 
         shop_domain = str(shopify_cfg.get("shop_domain") or (store or {}).get("domain") or "").strip()
         access_token = str(shopify_cfg.get("access_token") or "").strip()
@@ -136,6 +283,8 @@ class ShopifyLiveMerchantSource:
         products: List[StandardProduct] = []
         product_diagnostics: Dict[str, Dict[str, Any]] = {}
         variant_diagnostics: Dict[str, Dict[str, Any]] = {}
+        used_live_overlay = False
+        live_products: List[StandardProduct] = []
 
         if cached_rows:
             for row in cached_rows:
@@ -172,41 +321,75 @@ class ShopifyLiveMerchantSource:
                         },
                     }
 
-        if not products and shopify_connected:
+        live_overlay_needed = bool(shopify_connected and (not products or _cached_rows_need_live_overlay(cached_rows, reference_time)))
+        live_fetch_error: Optional[str] = None
+        if live_overlay_needed:
             live_products, live_error = await _fetch_live_products(merchant_id, shop_domain, access_token)
             if live_products:
-                now_iso = _iso(datetime.now(timezone.utc))
-                products = live_products
+                used_live_overlay = True
+                now_iso = _iso(reference_time)
+                if products:
+                    products = _merge_cached_products_with_live_overlay(products, live_products)
+                    audit_notes.append("Fresh price/inventory overlay pulled from live Shopify Admin API because cached offer/inventory snapshots were stale.")
+                else:
+                    products = live_products
+                    audit_notes.append("products_cache was empty; readiness report fell back to live Shopify Admin API.")
+
+                live_product_ids = {str(product.id) for product in live_products}
                 for product in products:
-                    product_diagnostics[product.id] = {
-                        "catalog_last_refreshed_at": now_iso,
-                        "media_last_refreshed_at": now_iso,
-                        "price_last_refreshed_at": now_iso,
-                        "inventory_last_refreshed_at": now_iso,
-                        "field_sources": {
-                            "catalog": {"source": "shopify_admin.products.v2024-07"},
-                            "price": {"source": "shopify_admin.products.v2024-07"},
-                            "inventory": {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"},
-                        },
-                    }
-                    for variant in product.variants or []:
-                        variant_diagnostics[variant.id] = {
+                    if str(product.id) not in live_product_ids:
+                        continue
+                    if product.id not in product_diagnostics:
+                        product_diagnostics[product.id] = {
                             "catalog_last_refreshed_at": now_iso,
                             "media_last_refreshed_at": now_iso,
                             "price_last_refreshed_at": now_iso,
                             "inventory_last_refreshed_at": now_iso,
-                            "shipping_profile": policy.get("shipping_profile") or "alpha_default",
                             "field_sources": {
                                 "catalog": {"source": "shopify_admin.products.v2024-07"},
                                 "price": {"source": "shopify_admin.products.v2024-07"},
                                 "inventory": {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"},
                             },
                         }
-                audit_notes.append("products_cache was empty; readiness report fell back to live Shopify Admin API.")
-            elif live_error:
+                    else:
+                        diag = product_diagnostics[product.id]
+                        diag["price_last_refreshed_at"] = now_iso
+                        diag["inventory_last_refreshed_at"] = now_iso
+                        field_sources = diag.setdefault("field_sources", {})
+                        field_sources["price"] = {"source": "shopify_admin.products.v2024-07", "fallback_source": "shopify_cache.variant_offer.v1"}
+                        field_sources["inventory"] = {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"}
+
+                    for variant in product.variants or []:
+                        if variant.id not in variant_diagnostics:
+                            variant_diagnostics[variant.id] = {
+                                "catalog_last_refreshed_at": now_iso,
+                                "media_last_refreshed_at": now_iso,
+                                "price_last_refreshed_at": now_iso,
+                                "inventory_last_refreshed_at": now_iso,
+                                "shipping_profile": policy.get("shipping_profile") or "alpha_default",
+                                "field_sources": {
+                                    "catalog": {"source": "shopify_admin.products.v2024-07"},
+                                    "price": {"source": "shopify_admin.products.v2024-07"},
+                                    "inventory": {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"},
+                                },
+                            }
+                        else:
+                            diag = variant_diagnostics[variant.id]
+                            diag["price_last_refreshed_at"] = now_iso
+                            diag["inventory_last_refreshed_at"] = now_iso
+                            diag.setdefault("shipping_profile", policy.get("shipping_profile") or "alpha_default")
+                            field_sources = diag.setdefault("field_sources", {})
+                            field_sources["price"] = {"source": "shopify_admin.products.v2024-07", "fallback_source": "shopify_cache.variant_offer.v1"}
+                            field_sources["inventory"] = {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"}
+            if live_error:
+                live_fetch_error = live_error
+        if live_fetch_error:
+            if not products:
                 merchant_blockers.append("catalog_unavailable")
                 merchant_warnings.append("live_shopify_fetch_failed")
-                audit_notes.append(f"Live Shopify catalog fetch failed: {live_error}")
+            else:
+                merchant_warnings.append("live_shopify_overlay_failed")
+            audit_notes.append(f"Live Shopify catalog fetch failed: {live_fetch_error}")
 
         if not products:
             merchant_blockers.append("catalog_missing")
@@ -232,14 +415,14 @@ class ShopifyLiveMerchantSource:
 
         source_of_truth = {
             "catalog": "shopify_cache.standard_product.v1" if cached_rows else "shopify_admin.products.v2024-07",
-            "price": "shopify_cache.variant_offer.v1" if cached_rows else "shopify_admin.products.v2024-07",
-            "inventory": "shopify_cache.inventory.v1" if cached_rows else "shopify_admin.inventory.v2024-07",
+            "price": "shopify_admin.products.v2024-07" if used_live_overlay else ("shopify_cache.variant_offer.v1" if cached_rows else "shopify_admin.products.v2024-07"),
+            "inventory": "shopify_admin.inventory.v2024-07" if used_live_overlay else ("shopify_cache.inventory.v1" if cached_rows else "shopify_admin.inventory.v2024-07"),
             "fulfillment_policy": str(policy.get("policy_source") or "readiness.alpha_policy_config.v1"),
             "checkout_capability": "readiness.checkout_capability.v1",
             "order_status": "readiness.order_sync.v2",
         }
 
-        evaluation_reference_time = _iso(datetime.now(timezone.utc)) or "2026-03-17T00:00:00Z"
+        evaluation_reference_time = _iso(reference_time) or "2026-03-17T00:00:00Z"
         merchant_connection = {
             "platform": "shopify",
             "store": store or {},
