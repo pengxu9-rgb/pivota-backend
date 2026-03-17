@@ -46,6 +46,28 @@ bash scripts/smoke_readiness_alpha.sh \
 
 The script writes all responses to `/tmp/pivota-readiness-smoke-<run_id>` unless `--out-dir` is provided.
 
+For large merchants, prefer inspecting the saved artifacts with compact `jq` summaries instead of relying on the script's full stdout:
+
+```bash
+jq '{
+  merchant_id,
+  readiness_score,
+  ready_variant_count: ([.products[].variants[] | select(.channel_coverage.ucp=="ready")] | length),
+  blocked_variant_count: ([.products[].variants[] | select(.channel_coverage.ucp!="ready")] | length),
+  reviews_capability: .capability_status.reviews_confidence,
+  source_of_truth
+}' /tmp/pivota-readiness-smoke-<run_id>/report.json
+
+jq '{
+  merchant_id,
+  readiness_score,
+  offer_count: (.offers | length),
+  review_offer_count: ([.offers[] | select(.reviews.has_reviews==true)] | length),
+  source_of_truth,
+  validation_warnings
+}' /tmp/pivota-readiness-smoke-<run_id>/export_ucp.json
+```
+
 ## Report
 
 ```bash

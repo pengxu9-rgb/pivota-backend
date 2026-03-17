@@ -12,20 +12,19 @@ The live codebase has several meaningful building blocks:
 - partial UCP business-proxy code in `routes/ucp_business_proxy_routes.py`
 - partial merchant-native Shopify order write-back intent in `routes/order_routes.py` and `services/shopify_transactions_service.py`
 
-But the system still fails the readiness-infra bar because the current implementation is fragmented across repos, mixes cache with source-of-truth, lacks normalized reviews/confidence, lacks Google Merchant Center support, leaves UCP unmounted in `main.py`, and has brittle legacy checkout/order/webhook code paths with concrete defects.
+But the system still fails the readiness-infra bar because the current implementation is fragmented across repos, mixes cache with source-of-truth, still lacks Google Merchant Center support, and still relies on brittle legacy checkout/order/webhook code paths outside the readiness-owned alpha path. The stricter gap is no longer "reviews or payment do not exist"; it is that those platform capabilities are still only partially converged into one canonical readiness contract.
 
 ## Why It Fails Today
 
 1. There is no canonical readiness data model spanning catalog, offers, inventory, fulfillment policy, checkout capability, and order state.
 2. Product data is mostly a cache layer (`products_cache`), not a durable normalized commerce source of truth.
-3. Review ingestion and confidence scoring for commerce products are effectively absent. `PIVOTA-Agent` expects review summary fields, but the backend does not provide a corresponding normalized pipeline.
+3. Reviews Center and confidence primitives exist, but readiness only recently began projecting product-level review summaries from `review_group` / `product_reviews`. Broader freshness, ranking, and full coverage are still incomplete.
 4. Google Merchant Center feed/export support is absent in live code.
-5. UCP code exists, but it is not wired into the main FastAPI app today.
-6. Checkout/payment/order flows are split across multiple stacks and contain brittle defects:
+5. Readiness UCP routes now exist behind flags, but checkout/payment/order flows are still split across multiple stacks and contain brittle defects outside the alpha path:
    - `routes/agent_api.py` calls `get_cached_products()` with the wrong signature.
    - `db/orders.py` performs runtime `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` on write failures.
    - `routes/order_routes.py` and `routes/webhook_routes.py` reference `store_info` in unsafe ways.
-7. Merchant credentials are inconsistently handled. Encrypted connector credentials exist, but raw store tokens are still written into `merchant_stores.api_key`.
+6. Merchant credentials are inconsistently handled. Encrypted connector credentials exist, but raw store tokens are still written into `merchant_stores.api_key`.
 
 ## Top Strengths
 
@@ -33,15 +32,17 @@ But the system still fails the readiness-infra bar because the current implement
 - A usable normalized product/variant model in `models/standard_product.py`.
 - Real intent toward merchant-native commerce in Shopify order creation, refund handling, and transaction annotation.
 - A real UCP codebase with signed offer/session concepts, request signing policy, and tests under `ucp/tests`.
+- A real Reviews Center with cross-merchant grouping, confidence, verified-purchase states, and buyer review flows.
+- Real PSP routing / authorize / capture / refund infrastructure outside the readiness router.
 - Enough existing components to prove feasibility with a narrow feature-flagged thin slice.
 
 ## Top Blockers
 
 - No canonical readiness/source-of-truth layer.
-- No normalized reviews/confidence service.
+- Reviews/confidence is now partially projected into readiness, but not yet fully normalized across freshness, ranking, and all merchants.
 - No Google channel implementation.
-- UCP routes exist but are not mounted in `main.py`.
-- Checkout/payment/order paths are fragmented and partially admin-gated.
+- Checkout/payment/order execution is not yet fully converged onto one readiness-owned canonical PSP path.
+- Legacy checkout/payment/order paths remain fragmented and partially admin-gated.
 - Observability is table-heavy but not productized into merchant/SKU readiness diagnostics.
 
 ## Recommended Next Step
@@ -54,5 +55,4 @@ Use the implemented thin slice as the bootstrap path:
 - stubbed checkout session
 - stubbed order-sync journal
 
-Then replace the synthetic source with one real merchant adapter and converge on one source-of-truth for product freshness, checkout capability, and order state before attempting ChatGPT or Google channel claims.
-
+Then finish converging the real-merchant alpha path: keep the current one-merchant Shopify adapter, wire Reviews Center more deeply into readiness ranking/diagnostics, and collapse payment execution onto one explicit readiness-owned contract before attempting broader channel claims.

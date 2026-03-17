@@ -6,7 +6,8 @@
     "channel_export": "ready",
     "checkout": "stubbed",
     "merchant_adapter": "ready",
-    "order_sync": "stubbed"
+    "order_sync": "stubbed",
+    "reviews_confidence": "blocked"
   },
   "ready_variant_ids": [
     "var_cleanser_150ml",
@@ -23,6 +24,7 @@
     "fulfillment_policy": "synthetic_fixture.policy.v1",
     "inventory": "synthetic_fixture.inventory.v1",
     "order_state": "readiness.stub.order_sync.v1",
-    "price": "synthetic_fixture.offer.v1"
+    "price": "synthetic_fixture.offer.v1",
+    "reviews_confidence": "readiness.synthetic_reviews.none.v1"
   }
 }

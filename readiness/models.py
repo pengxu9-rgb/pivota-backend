@@ -47,6 +47,24 @@ class CapabilityStatus(BaseModel):
     notes: List[str] = Field(default_factory=list)
 
 
+class ReviewSummary(BaseModel):
+    scope: str = "product"
+    source: str
+    default_view: str = "none"
+    has_group: bool = False
+    has_reviews: bool = False
+    group_id: Optional[int] = None
+    group_key: Optional[str] = None
+    group_confidence: Optional[float] = None
+    membership_confidence: Optional[float] = None
+    review_count: int = 0
+    rating_count: int = 0
+    average_rating: Optional[float] = None
+    verified_review_count: int = 0
+    featured_review_count: int = 0
+    latest_review_at: Optional[str] = None
+
+
 class ChannelCoverageStatus(BaseModel):
     channel: str
     status: str
@@ -64,6 +82,7 @@ class ReadyVariant(BaseModel):
     freshness: Dict[str, FieldFreshness] = Field(default_factory=dict)
     provenance: List[FieldProvenance] = Field(default_factory=list)
     source_of_truth: Dict[str, FieldFamilyStatus] = Field(default_factory=dict)
+    reviews: Optional[ReviewSummary] = None
     blockers: Dict[str, List[str]] = Field(default_factory=dict)
     warnings: Dict[str, List[str]] = Field(default_factory=dict)
     discovery: CapabilityStatus
@@ -78,6 +97,7 @@ class ReadyProduct(BaseModel):
     brand: Optional[str] = None
     category: Optional[str] = None
     default_image_url: Optional[str] = None
+    reviews: Optional[ReviewSummary] = None
     variants: List[ReadyVariant] = Field(default_factory=list)
 
 
@@ -130,6 +150,9 @@ class MerchantSourceDataset(BaseModel):
     merchant_policy: Dict[str, Any] = Field(default_factory=dict)
     payment_capabilities: Dict[str, Any] = Field(default_factory=dict)
     merchant_connection: Dict[str, Any] = Field(default_factory=dict)
+    product_review_summaries: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    variant_review_summaries: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    review_diagnostics: Dict[str, Any] = Field(default_factory=dict)
     products: List[StandardProduct] = Field(default_factory=list)
     product_diagnostics: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     variant_diagnostics: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

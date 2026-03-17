@@ -47,3 +47,11 @@
 - freshness: realtime locally, async against merchant write-back side effects
 - degradation: session remains replayable and explicit about blocked/failed states
 - blockers: local order creation failure, merchant write-back failure, missing buyer context, missing merchant configuration
+
+## 7. Reviews / Confidence
+
+- canonical source: Reviews Center group summary resolved from `review_group` / `review_group_membership`
+- fallback source: Reviews Center product-level aggregate from `product_reviews`
+- freshness: 30d review recency window for readiness scoring
+- degradation: no-review products remain exportable, but readiness score and diagnostics should reflect lower confidence or unresolved grouping
+- blockers: review summary lookup failure only; missing reviews are a warning/coverage issue, not a checkout blocker

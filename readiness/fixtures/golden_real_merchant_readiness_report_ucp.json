@@ -1,27 +1,29 @@
 {
   "merchant_id": "merch_efbc46b4619cfbdf",
   "merchant_alpha_mode": "real_merchant_alpha",
-  "readiness_score": 63,
+  "readiness_score": 76,
   "capability_status": {
     "channel_export": "ready",
     "checkout": "ready",
     "merchant_adapter": "ready",
-    "order_sync": "ready"
+    "order_sync": "ready",
+    "reviews_confidence": "ready"
   },
   "ready_variant_ids": [
     "431000000001",
-    "431000000002"
+    "431000000002",
+    "431000000003"
   ],
   "blocked_variant_ids": [
-    "431000000003",
     "431000000004"
   ],
   "source_of_truth": {
     "catalog": "shopify_cache.standard_product.v1",
     "checkout_capability": "readiness.checkout_capability.v1",
     "fulfillment_policy": "readiness.alpha_policy_config.v1",
-    "inventory": "shopify_cache.inventory.v1",
+    "inventory": "shopify_admin.inventory.v2024-07",
     "order_status": "readiness.order_sync.v2",
-    "price": "shopify_cache.variant_offer.v1"
+    "price": "shopify_admin.products.v2024-07",
+    "reviews_confidence": "reviews_center.review_group.v1"
   }
 }

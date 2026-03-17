@@ -40,3 +40,20 @@ def test_build_field_family_status_ready_when_fresh():
     assert status.stale is False
     assert freshness.stale is False
     assert provenance.source == "shopify_cache.variant_offer.v1"
+
+
+def test_build_field_family_status_supports_reviews_confidence():
+    status, freshness, provenance = build_field_family_status(
+        family="reviews_confidence",
+        source="reviews_center.review_group.v1",
+        observed_at="2026-03-16T12:00:00Z",
+        reference_time=datetime(2026, 3, 17, 12, 0, tzinfo=timezone.utc),
+        blockers=[],
+        warnings=[],
+        notes=["reviews center aggregate"],
+    )
+
+    assert status.status == "ready"
+    assert status.stale is False
+    assert freshness.source == "reviews_center.review_group.v1"
+    assert provenance.source_of_truth is True

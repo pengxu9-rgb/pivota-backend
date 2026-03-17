@@ -72,6 +72,12 @@ FIELD_FAMILY_RULES: Dict[str, FieldFamilyRule] = {
         fallback_source="orders.local.v1",
         max_age_hours=1,
     ),
+    "reviews_confidence": FieldFamilyRule(
+        family="reviews_confidence",
+        canonical_source="reviews_center.review_group.v1",
+        fallback_source="reviews_center.product_reviews.v1",
+        max_age_hours=24 * 30,
+    ),
 }
 
 

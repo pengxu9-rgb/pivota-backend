@@ -22,6 +22,8 @@ class SyntheticMerchantSource:
         merchant = payload.get("merchant") or {}
         raw_products = payload.get("products") or []
         products = [StandardProduct(**product) for product in raw_products]
+        source_of_truth = dict(merchant.get("source_of_truth") or {})
+        source_of_truth.setdefault("reviews_confidence", "readiness.synthetic_reviews.none.v1")
 
         product_diagnostics: Dict[str, Dict[str, Any]] = {}
         variant_diagnostics: Dict[str, Dict[str, Any]] = {}
@@ -44,18 +46,26 @@ class SyntheticMerchantSource:
             merchant_name=str(merchant.get("display_name") or "Synthetic Demo Merchant"),
             evaluation_reference_time=str(merchant.get("evaluation_reference_time") or "2026-03-17T12:00:00Z"),
             merchant_alpha_mode="synthetic_fixture",
-            source_of_truth=merchant.get("source_of_truth") or {},
+            source_of_truth=source_of_truth,
             capability_status={
                 "merchant_adapter": "ready",
                 "checkout": "stubbed",
                 "order_sync": "stubbed",
                 "channel_export": "ready",
+                "reviews_confidence": "blocked",
             },
             merchant_blockers=[],
             merchant_warnings=["synthetic_fixture_mode"],
             stubbed_capabilities=merchant.get("stubbed_capabilities") or [],
             merchant_policy=merchant.get("merchant_policy") or {},
             payment_capabilities=merchant.get("payment_capabilities") or {},
+            review_diagnostics={
+                "integration_status": "blocked",
+                "observed_at": None,
+                "products_with_reviews": 0,
+                "grouped_products_with_reviews": 0,
+                "products_without_reviews": len(products),
+            },
             products=products,
             product_diagnostics=product_diagnostics,
             variant_diagnostics=variant_diagnostics,

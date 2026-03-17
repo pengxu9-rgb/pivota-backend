@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from sqlalchemy import case, func, select
+
+from db.database import database
+from db.reviews_center import product_reviews, review_featured, review_group, review_group_membership
+from models.standard_product import StandardProduct
+from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key
+
+logger = logging.getLogger(__name__)
+
+
+def _iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.endswith("+00:00"):
+            return raw.replace("+00:00", "Z")
+        return raw or None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping.get(key, default)
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    raw = _iso(value)
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _aggregate_row_to_dict(row: Any) -> Dict[str, Any]:
+    rated_total = int(_row_get(row, "rated_total", 0) or 0)
+    rating_sum = float(_row_get(row, "rating_sum", 0.0) or 0.0)
+    latest_review_at = _iso(_row_get(row, "latest_review_at"))
+    return {
+        "review_count": int(_row_get(row, "review_count", 0) or 0),
+        "rating_count": rated_total,
+        "rating_sum": rating_sum,
+        "average_rating": round(rating_sum / rated_total, 2) if rated_total > 0 else None,
+        "verified_review_count": int(_row_get(row, "verified_review_count", 0) or 0),
+        "latest_review_at": latest_review_at,
+    }
+
+
+def _combine_review_totals(*totals: Dict[str, Any]) -> Dict[str, Any]:
+    latest_candidates = [_parse_datetime(item.get("latest_review_at")) for item in totals if item]
+    latest_review_at = max((item for item in latest_candidates if item is not None), default=None)
+    review_count = sum(int(item.get("review_count", 0) or 0) for item in totals if item)
+    rating_count = sum(int(item.get("rating_count", 0) or 0) for item in totals if item)
+    rating_sum = sum(float(item.get("rating_sum", 0.0) or 0.0) for item in totals if item)
+    verified_review_count = sum(int(item.get("verified_review_count", 0) or 0) for item in totals if item)
+    return {
+        "review_count": review_count,
+        "rating_count": rating_count,
+        "rating_sum": rating_sum,
+        "average_rating": round(rating_sum / rating_count, 2) if rating_count > 0 else None,
+        "verified_review_count": verified_review_count,
+        "latest_review_at": _iso(latest_review_at),
+    }
+
+
+def _build_review_aggregate_query(group_by_column):
+    return (
+        select(
+            group_by_column.label("bucket"),
+            func.count(product_reviews.c.id).label("review_count"),
+            func.sum(
+                case(
+                    ((product_reviews.c.rating.isnot(None)) & (product_reviews.c.rating > 0), 1),
+                    else_=0,
+                )
+            ).label("rated_total"),
+            func.sum(
+                case(
+                    ((product_reviews.c.rating.isnot(None)) & (product_reviews.c.rating > 0), product_reviews.c.rating),
+                    else_=0,
+                )
+            ).label("rating_sum"),
+            func.sum(
+                case(
+                    (product_reviews.c.verification.in_(("verified_purchase", "partner_verified")), 1),
+                    else_=0,
+                )
+            ).label("verified_review_count"),
+            func.max(product_reviews.c.created_at).label("latest_review_at"),
+        )
+        .where(product_reviews.c.status == "active")
+        .group_by(group_by_column)
+    )
+
+
+async def load_product_review_summaries(
+    *,
+    merchant_id: str,
+    platform: str,
+    products: Iterable[StandardProduct],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], List[str], List[str]]:
+    products_list = list(products)
+    observed_at = _iso(datetime.now(timezone.utc))
+    if not products_list:
+        return {}, {
+            "integration_status": "ready",
+            "observed_at": observed_at,
+            "products_with_reviews": 0,
+            "grouped_products_with_reviews": 0,
+            "products_without_reviews": 0,
+        }, [], []
+
+    product_keys_by_id = {
+        str(product.id): build_product_key(
+            merchant_id=merchant_id,
+            platform=platform,
+            platform_product_id=str(product.id),
+        )
+        for product in products_list
+    }
+    global_product_keys_by_id = {
+        str(product.id): build_product_key(
+            merchant_id=GLOBAL_IMPORT_MERCHANT_ID,
+            platform=platform,
+            platform_product_id=str(product.id),
+        )
+        for product in products_list
+    }
+
+    warnings: List[str] = []
+    audit_notes: List[str] = []
+    summaries: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        membership_rows = await database.fetch_all(
+            select(
+                review_group_membership.c.product_key,
+                review_group_membership.c.group_id,
+                review_group_membership.c.confidence.label("membership_confidence"),
+                review_group.c.group_key,
+                review_group.c.confidence.label("group_confidence"),
+            )
+            .select_from(
+                review_group_membership.join(
+                    review_group, review_group.c.id == review_group_membership.c.group_id
+                )
+            )
+            .where(
+                (review_group_membership.c.status == "active")
+                & (review_group.c.status == "active")
+                & (review_group_membership.c.product_key.in_(list(product_keys_by_id.values())))
+            )
+            .order_by(
+                review_group_membership.c.product_key.asc(),
+                review_group_membership.c.confidence.desc(),
+                review_group_membership.c.updated_at.desc(),
+                review_group_membership.c.id.desc(),
+            )
+        )
+
+        membership_by_product_key: Dict[str, Dict[str, Any]] = {}
+        for row in membership_rows:
+            product_key = str(_row_get(row, "product_key") or "").strip()
+            if product_key and product_key not in membership_by_product_key:
+                membership_by_product_key[product_key] = {
+                    "group_id": int(_row_get(row, "group_id")),
+                    "group_key": str(_row_get(row, "group_key") or "").strip() or None,
+                    "group_confidence": float(_row_get(row, "group_confidence") or 0.0),
+                    "membership_confidence": float(_row_get(row, "membership_confidence") or 0.0),
+                }
+
+        group_ids = sorted(
+            {
+                int(item["group_id"])
+                for item in membership_by_product_key.values()
+                if item.get("group_id") is not None
+            }
+        )
+
+        group_aggregates: Dict[int, Dict[str, Any]] = {}
+        if group_ids:
+            group_rows = await database.fetch_all(
+                _build_review_aggregate_query(product_reviews.c.group_id).where(
+                    product_reviews.c.group_id.in_(group_ids)
+                )
+            )
+            group_aggregates = {
+                int(_row_get(row, "bucket")): _aggregate_row_to_dict(row)
+                for row in group_rows
+                if _row_get(row, "bucket") is not None
+            }
+            featured_rows = await database.fetch_all(
+                select(
+                    review_featured.c.group_id.label("bucket"),
+                    func.count(review_featured.c.review_id).label("featured_review_count"),
+                )
+                .group_by(review_featured.c.group_id)
+                .where(review_featured.c.group_id.in_(group_ids))
+            )
+            featured_counts = {
+                int(_row_get(row, "bucket")): int(_row_get(row, "featured_review_count", 0) or 0)
+                for row in featured_rows
+            }
+        else:
+            featured_counts = {}
+
+        all_product_keys = list(product_keys_by_id.values()) + list(global_product_keys_by_id.values())
+        product_rows = await database.fetch_all(
+            _build_review_aggregate_query(product_reviews.c.product_key).where(
+                product_reviews.c.product_key.in_(all_product_keys)
+            )
+        )
+        product_aggregates = {
+            str(_row_get(row, "bucket") or "").strip(): _aggregate_row_to_dict(row)
+            for row in product_rows
+            if str(_row_get(row, "bucket") or "").strip()
+        }
+
+        for product in products_list:
+            product_id = str(product.id)
+            product_key = product_keys_by_id[product_id]
+            global_product_key = global_product_keys_by_id[product_id]
+            membership = membership_by_product_key.get(product_key) or {}
+            group_id = membership.get("group_id")
+            group_summary = group_aggregates.get(int(group_id)) if group_id is not None else None
+            local_summary = product_aggregates.get(product_key) or {}
+            global_summary = product_aggregates.get(global_product_key) or {}
+            fallback_summary = _combine_review_totals(local_summary, global_summary)
+            active_summary = group_summary if group_summary and int(group_summary.get("review_count", 0) or 0) > 0 else fallback_summary
+
+            has_reviews = int(active_summary.get("review_count", 0) or 0) > 0
+            uses_group = bool(group_summary and int(group_summary.get("review_count", 0) or 0) > 0)
+            source = "reviews_center.review_group.v1" if uses_group else "reviews_center.product_reviews.v1"
+            summaries[product_id] = {
+                "scope": "product",
+                "source": source,
+                "default_view": "group" if uses_group else "merchant" if has_reviews else "none",
+                "has_group": bool(group_id is not None),
+                "has_reviews": has_reviews,
+                "group_id": int(group_id) if group_id is not None else None,
+                "group_key": membership.get("group_key"),
+                "group_confidence": membership.get("group_confidence"),
+                "membership_confidence": membership.get("membership_confidence"),
+                "review_count": int(active_summary.get("review_count", 0) or 0),
+                "rating_count": int(active_summary.get("rating_count", 0) or 0),
+                "average_rating": active_summary.get("average_rating"),
+                "verified_review_count": int(active_summary.get("verified_review_count", 0) or 0),
+                "featured_review_count": int(featured_counts.get(int(group_id), 0) if group_id is not None else 0),
+                "latest_review_at": active_summary.get("latest_review_at"),
+            }
+
+        grouped_products_with_reviews = sum(
+            1 for summary in summaries.values() if summary.get("has_group") and summary.get("has_reviews")
+        )
+        products_with_reviews = sum(1 for summary in summaries.values() if summary.get("has_reviews"))
+        products_without_reviews = len(products_list) - products_with_reviews
+        if products_with_reviews:
+            audit_notes.append(
+                "Readiness alpha now projects product-level review summaries from Reviews Center using review-group matches first and merchant/global fallbacks second."
+            )
+        else:
+            warnings.append("reviews_present_but_no_product_summaries_found")
+
+        return summaries, {
+            "integration_status": "ready",
+            "observed_at": observed_at,
+            "products_with_reviews": products_with_reviews,
+            "grouped_products_with_reviews": grouped_products_with_reviews,
+            "products_without_reviews": products_without_reviews,
+        }, warnings, audit_notes
+    except Exception:
+        logger.warning("Review summary lookup failed for merchant=%s", merchant_id, exc_info=True)
+        return {}, {
+            "integration_status": "blocked",
+            "observed_at": observed_at,
+            "products_with_reviews": 0,
+            "grouped_products_with_reviews": 0,
+            "products_without_reviews": len(products_list),
+        }, ["reviews_summary_lookup_failed"], [
+            "Readiness alpha could not hydrate Reviews Center summaries for this merchant."
+        ]

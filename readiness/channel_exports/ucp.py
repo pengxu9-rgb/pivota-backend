@@ -64,11 +64,19 @@ def build_ucp_export(snapshot: MerchantReadinessSnapshot) -> ChannelReadinessRep
                         family: freshness.model_dump() if hasattr(freshness, "model_dump") else freshness.dict()
                         for family, freshness in variant.freshness.items()
                     },
+                    "reviews": (
+                        variant.reviews.model_dump() if hasattr(variant.reviews, "model_dump") else variant.reviews.dict()
+                    )
+                    if variant.reviews
+                    else None,
                 }
             )
 
     validation_warnings = list(snapshot.warnings)
-    validation_warnings.append("review ingestion is absent from the readiness model today")
+    if snapshot.capability_status.get("reviews_confidence") == "blocked":
+        validation_warnings.append("review summaries are unavailable for the readiness model")
+    elif any(not offer.get("reviews") or not offer["reviews"].get("has_reviews") for offer in offers):
+        validation_warnings.append("review coverage is partial across exported offers")
     if snapshot.merchant_alpha_mode != "real_merchant_alpha":
         validation_warnings.append("checkout execution is stubbed for this thin slice")
         validation_warnings.append("merchant write-back is stubbed for this thin slice")

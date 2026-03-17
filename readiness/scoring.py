@@ -10,6 +10,7 @@ from readiness.models import (
     MerchantReadinessSnapshot,
     MerchantSourceDataset,
     ReadyProduct,
+    ReviewSummary,
     ReadyVariant,
 )
 from readiness.source_of_truth import build_field_family_status
@@ -74,6 +75,8 @@ def _build_variant_readiness(
     image_url = variant.image_url or product.image_url or (product.images[0] if product.images else None)
     inventory_quantity = int(variant.inventory_quantity or 0)
     shipping_profile = variant_diag.get("shipping_profile")
+    review_payload = dataset.variant_review_summaries.get(variant.id) or dataset.product_review_summaries.get(product.id) or {}
+    review_summary = ReviewSummary(**review_payload) if review_payload else None
 
     catalog_blockers: List[str] = []
     catalog_warnings: List[str] = []
@@ -197,6 +200,39 @@ def _build_variant_readiness(
         notes=["canonical outward order state comes from readiness order-sync journal"],
     )
 
+    reviews_blockers: List[str] = []
+    reviews_warnings: List[str] = []
+    reviews_notes: List[str] = []
+    review_integration_status = str(dataset.review_diagnostics.get("integration_status") or "blocked")
+    if review_integration_status == "blocked":
+        reviews_blockers.append("reviews_summary_unavailable")
+    elif review_summary is None or not review_summary.has_reviews:
+        reviews_warnings.append("no_reviews_available")
+    elif review_summary.default_view != "group":
+        reviews_warnings.append("cross_merchant_review_group_unresolved")
+    if review_summary is not None:
+        reviews_notes.extend(
+            [
+                f"default_view={review_summary.default_view}",
+                f"review_count={review_summary.review_count}",
+                f"verified_review_count={review_summary.verified_review_count}",
+            ]
+        )
+        if review_summary.group_id is not None:
+            reviews_notes.append(f"group_id={review_summary.group_id}")
+        if review_summary.group_confidence is not None:
+            reviews_notes.append(f"group_confidence={review_summary.group_confidence}")
+    reviews_status, reviews_freshness, reviews_provenance = build_field_family_status(
+        family="reviews_confidence",
+        source=(review_payload or {}).get("source") or dataset.source_of_truth.get("reviews_confidence"),
+        fallback_source="reviews_center.product_reviews.v1",
+        observed_at=(review_payload or {}).get("latest_review_at") or dataset.review_diagnostics.get("observed_at"),
+        reference_time=reference_time,
+        blockers=reviews_blockers,
+        warnings=reviews_warnings,
+        notes=reviews_notes or ["product-level reviews summary for readiness diagnostics"],
+    )
+
     discovery_blockers = list(catalog_status.blockers) + list(price_status.blockers)
     discovery_warnings = list(catalog_status.warnings) + list(price_status.warnings)
 
@@ -250,6 +286,7 @@ def _build_variant_readiness(
             "fulfillment_policy": policy_freshness,
             "checkout_capability": checkout_capability_freshness,
             "order_status": order_status_freshness,
+            "reviews_confidence": reviews_freshness,
         },
         provenance=[
             catalog_provenance,
@@ -258,6 +295,7 @@ def _build_variant_readiness(
             policy_provenance,
             checkout_capability_provenance,
             order_status_provenance,
+            reviews_provenance,
         ],
         source_of_truth={
             "catalog": catalog_status,
@@ -266,7 +304,9 @@ def _build_variant_readiness(
             "fulfillment_policy": policy_status,
             "checkout_capability": checkout_capability_status,
             "order_status": order_status_status,
+            "reviews_confidence": reviews_status,
         },
+        reviews=review_summary,
         blockers={"discovery": discovery_blockers, "checkout": checkout_blockers},
         warnings={"discovery": discovery_warnings, "checkout": checkout_warnings},
         discovery=CapabilityStatus(
@@ -331,6 +371,9 @@ def build_merchant_snapshot(dataset: MerchantSourceDataset, channel: str = "ucp"
                 brand=product.vendor,
                 category=product.product_type,
                 default_image_url=product.image_url or (product.images[0] if product.images else None),
+                reviews=ReviewSummary(**dataset.product_review_summaries[product.id])
+                if dataset.product_review_summaries.get(product.id)
+                else None,
                 variants=variants,
             )
         )
@@ -354,7 +397,17 @@ def build_merchant_snapshot(dataset: MerchantSourceDataset, channel: str = "ucp"
         order_sync_score = 45
     observability_score = 30
     security_score = 35
-    reviews_score = 0
+    total_products = len(dataset.products)
+    review_products_with_reviews = int(dataset.review_diagnostics.get("products_with_reviews") or 0)
+    grouped_review_products = int(dataset.review_diagnostics.get("grouped_products_with_reviews") or 0)
+    if str(dataset.review_diagnostics.get("integration_status") or "blocked") == "blocked":
+        reviews_score = 0
+    elif total_products <= 0:
+        reviews_score = 0
+    else:
+        review_coverage_ratio = review_products_with_reviews / float(total_products)
+        grouped_review_ratio = grouped_review_products / float(total_products)
+        reviews_score = min(100, round(25 + (50 * review_coverage_ratio) + (25 * grouped_review_ratio)))
 
     domain_scores = {
         "catalog": catalog_score,
@@ -402,9 +455,19 @@ def build_merchant_snapshot(dataset: MerchantSourceDataset, channel: str = "ucp"
         ),
         CapabilityStatus(
             capability="reviews_confidence",
-            status="blocked",
-            score=0,
-            blockers=["normalized_review_ingestion_absent"],
+            status=dataset.capability_status.get("reviews_confidence", "blocked"),
+            score=reviews_score,
+            blockers=["reviews_summary_unavailable"]
+            if dataset.capability_status.get("reviews_confidence") == "blocked"
+            else [],
+            warnings=["review_coverage_partial"]
+            if dataset.capability_status.get("reviews_confidence") != "blocked"
+            and review_products_with_reviews < max(1, total_products)
+            else [],
+            notes=[
+                f"products_with_reviews={review_products_with_reviews}",
+                f"grouped_products_with_reviews={grouped_review_products}",
+            ],
         ),
     ]
 

@@ -27,6 +27,7 @@
 | fulfillment/returns policy | `readiness.alpha_policy_config.v1` | none | 30d |
 | checkout capability | readiness capability resolver | none | realtime |
 | order status | readiness order-sync journal | local `orders` row | realtime local / async merchant |
+| reviews/confidence | Reviews Center `review_group` summary | Reviews Center `product_reviews` summary | 30d |
 
 Synthetic mode keeps older offline freshness tolerances so the test harness remains stable.
 
@@ -59,11 +60,16 @@ Each `ReadyVariant` now includes:
 - `freshness`
 - `provenance`
 - `source_of_truth`
+- `reviews`
 - `blockers`
 - `warnings`
 - `discovery`
 - `checkout`
 - `channel_coverage`
+
+Each `ReadyProduct` now also carries:
+
+- `reviews`
 
 ## `ChannelReadinessReport`
 
@@ -96,6 +102,7 @@ Each UCP offer includes:
 - `readiness`
 - `source_of_truth`
 - `freshness`
+- `reviews`
 
 ## Checkout Contract
 
@@ -189,4 +196,4 @@ Real merchant alpha summary goldens:
 - multi-merchant rollout
 - Google Merchant Center export
 - ChatGPT product-feed production adapter
-- normalized product reviews/confidence
+- full review freshness/ranking normalization beyond the current product-level Reviews Center projection

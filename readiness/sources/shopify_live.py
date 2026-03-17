@@ -14,6 +14,7 @@ from jobs.catalog_import_worker import _get_shopify_config_for_merchant
 from models.standard_product import StandardProduct, StandardProductVariant
 from readiness.flags import readiness_alpha_merchant_id
 from readiness.models import MerchantSourceDataset
+from readiness.reviews import load_product_review_summaries
 from services.merchant_store_service import get_primary_store
 
 logger = logging.getLogger(__name__)
@@ -394,6 +395,32 @@ class ShopifyLiveMerchantSource:
         if not products:
             merchant_blockers.append("catalog_missing")
 
+        product_review_summaries: Dict[str, Dict[str, Any]] = {}
+        variant_review_summaries: Dict[str, Dict[str, Any]] = {}
+        review_diagnostics: Dict[str, Any] = {
+            "integration_status": "blocked",
+            "observed_at": None,
+            "products_with_reviews": 0,
+            "grouped_products_with_reviews": 0,
+            "products_without_reviews": len(products),
+        }
+        review_warnings: List[str] = []
+        review_audit_notes: List[str] = []
+        if products:
+            product_review_summaries, review_diagnostics, review_warnings, review_audit_notes = await load_product_review_summaries(
+                merchant_id=merchant_id,
+                platform="shopify",
+                products=products,
+            )
+            for product in products:
+                summary = product_review_summaries.get(product.id)
+                if not summary:
+                    continue
+                for variant in product.variants or []:
+                    variant_review_summaries[variant.id] = dict(summary)
+        merchant_warnings.extend(review_warnings)
+        audit_notes.extend(review_audit_notes)
+
         if not psp_config:
             merchant_warnings.append("active_psp_configuration_missing")
 
@@ -411,6 +438,11 @@ class ShopifyLiveMerchantSource:
             "channel_export": "ready" if products else "blocked",
             "checkout": "ready" if payment_capabilities["merchant_native_checkout_supported"] else "blocked",
             "order_sync": "ready" if shopify_connected else "blocked",
+            "reviews_confidence": "ready"
+            if review_diagnostics.get("integration_status") == "ready" and review_diagnostics.get("products_with_reviews")
+            else "partial"
+            if review_diagnostics.get("integration_status") == "ready"
+            else "blocked",
         }
 
         source_of_truth = {
@@ -420,6 +452,7 @@ class ShopifyLiveMerchantSource:
             "fulfillment_policy": str(policy.get("policy_source") or "readiness.alpha_policy_config.v1"),
             "checkout_capability": "readiness.checkout_capability.v1",
             "order_status": "readiness.order_sync.v2",
+            "reviews_confidence": "reviews_center.review_group.v1",
         }
 
         evaluation_reference_time = _iso(reference_time) or "2026-03-17T00:00:00Z"
@@ -437,7 +470,6 @@ class ShopifyLiveMerchantSource:
         audit_notes.extend(
             [
                 "Real-merchant alpha is restricted to one Shopify merchant.",
-                "Normalized review ingestion remains absent and is still scored as blocked.",
             ]
         )
 
@@ -454,6 +486,9 @@ class ShopifyLiveMerchantSource:
             merchant_policy=policy,
             payment_capabilities=payment_capabilities,
             merchant_connection=merchant_connection,
+            product_review_summaries=product_review_summaries,
+            variant_review_summaries=variant_review_summaries,
+            review_diagnostics=review_diagnostics,
             products=products,
             product_diagnostics=product_diagnostics,
             variant_diagnostics=variant_diagnostics,
