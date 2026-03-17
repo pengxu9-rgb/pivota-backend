@@ -1,0 +1,8 @@
+{
+  "code": "VARIANT_NOT_READY_FOR_CHECKOUT",
+  "variant_id": "431000000001",
+  "blockers": [
+    "merchant_checkout_capability_missing"
+  ],
+  "warnings": []
+}

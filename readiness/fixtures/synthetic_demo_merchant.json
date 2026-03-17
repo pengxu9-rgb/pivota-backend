@@ -1,0 +1,174 @@
+{
+  "merchant": {
+    "merchant_id": "synthetic-demo-merchant",
+    "display_name": "Synthetic Demo Merchant",
+    "evaluation_reference_time": "2026-03-17T12:00:00Z",
+    "source_of_truth": {
+      "catalog": "synthetic_fixture.catalog.v1",
+      "price": "synthetic_fixture.offer.v1",
+      "inventory": "synthetic_fixture.inventory.v1",
+      "fulfillment_policy": "synthetic_fixture.policy.v1",
+      "channel_export": "readiness.channel_export.ucp.v1",
+      "checkout": "readiness.stub.checkout.v1",
+      "order_state": "readiness.stub.order_sync.v1"
+    },
+    "stubbed_capabilities": [
+      "payment_execution",
+      "merchant_writeback",
+      "webhook_verification",
+      "non_synthetic_merchant_adapter"
+    ],
+    "merchant_policy": {
+      "shipping_supported": true,
+      "returns_supported": true,
+      "shipping_summary": "US standard shipping in 3-5 business days; free over USD 25.",
+      "returns_summary": "30-day returns accepted for unopened items.",
+      "merchant_of_record": "merchant"
+    },
+    "payment_capabilities": {
+      "merchant_native_checkout_supported": false,
+      "ucp_checkout_stub_supported": true,
+      "supported_psps": []
+    },
+    "audit_notes": [
+      "Synthetic merchant fixture is intentionally narrow and does not represent production onboarding.",
+      "One variant is intentionally blocked to exercise readiness diagnostics."
+    ]
+  },
+  "products": [
+    {
+      "id": "prod_recovery_cleanser",
+      "platform": "synthetic",
+      "merchant_id": "synthetic-demo-merchant",
+      "title": "Pivota Recovery Cleanser",
+      "description": "Low-foam daily cleanser with ceramides and glycerin.",
+      "vendor": "Pivota Labs",
+      "product_type": "cleanser",
+      "tags": ["cleanser", "hydrating", "barrier-support"],
+      "price": 24.0,
+      "compare_at_price": 28.0,
+      "currency": "USD",
+      "inventory_quantity": 26,
+      "sku": "PIV-CLN-BASE",
+      "image_url": "https://cdn.synthetic.pivota.dev/cleanser/main.jpg",
+      "images": [
+        "https://cdn.synthetic.pivota.dev/cleanser/main.jpg",
+        "https://cdn.synthetic.pivota.dev/cleanser/texture.jpg"
+      ],
+      "orderable": true,
+      "orderable_validation": {
+        "orderable": true,
+        "errors": []
+      },
+      "readiness": {
+        "catalog_last_refreshed_at": "2026-03-17T08:00:00Z",
+        "price_last_refreshed_at": "2026-03-17T08:30:00Z",
+        "inventory_last_refreshed_at": "2026-03-17T09:00:00Z"
+      },
+      "variants": [
+        {
+          "id": "var_cleanser_150ml",
+          "title": "150 mL",
+          "sku": "PIV-CLN-150",
+          "price": 24.0,
+          "compare_at_price": 28.0,
+          "inventory_quantity": 18,
+          "options": {
+            "Size": "150 mL"
+          },
+          "image_url": "https://cdn.synthetic.pivota.dev/cleanser/150.jpg",
+          "readiness": {
+            "catalog_last_refreshed_at": "2026-03-17T08:00:00Z",
+            "price_last_refreshed_at": "2026-03-17T08:30:00Z",
+            "inventory_last_refreshed_at": "2026-03-17T09:00:00Z",
+            "shipping_profile": "standard-us"
+          }
+        },
+        {
+          "id": "var_cleanser_300ml",
+          "title": "300 mL",
+          "sku": "PIV-CLN-300",
+          "price": 36.0,
+          "compare_at_price": 40.0,
+          "inventory_quantity": 8,
+          "options": {
+            "Size": "300 mL"
+          },
+          "image_url": "https://cdn.synthetic.pivota.dev/cleanser/300.jpg",
+          "readiness": {
+            "catalog_last_refreshed_at": "2026-03-17T08:00:00Z",
+            "price_last_refreshed_at": "2026-03-17T08:30:00Z",
+            "inventory_last_refreshed_at": "2026-03-17T09:00:00Z",
+            "shipping_profile": "standard-us"
+          }
+        }
+      ]
+    },
+    {
+      "id": "prod_peptide_serum",
+      "platform": "synthetic",
+      "merchant_id": "synthetic-demo-merchant",
+      "title": "Pivota Peptide Serum",
+      "description": "Barrier-supporting peptide serum with panthenol and beta-glucan.",
+      "vendor": "Pivota Labs",
+      "product_type": "serum",
+      "tags": ["serum", "peptide", "repair"],
+      "price": 42.0,
+      "compare_at_price": 48.0,
+      "currency": "USD",
+      "inventory_quantity": 11,
+      "sku": "PIV-SRM-BASE",
+      "image_url": "https://cdn.synthetic.pivota.dev/serum/main.jpg",
+      "images": [
+        "https://cdn.synthetic.pivota.dev/serum/main.jpg"
+      ],
+      "orderable": true,
+      "orderable_validation": {
+        "orderable": true,
+        "errors": []
+      },
+      "readiness": {
+        "catalog_last_refreshed_at": "2026-03-16T21:00:00Z",
+        "price_last_refreshed_at": "2026-03-17T07:15:00Z",
+        "inventory_last_refreshed_at": "2026-03-17T07:30:00Z"
+      },
+      "variants": [
+        {
+          "id": "var_serum_30ml",
+          "title": "30 mL",
+          "sku": "PIV-SRM-30",
+          "price": 42.0,
+          "compare_at_price": 48.0,
+          "inventory_quantity": 11,
+          "options": {
+            "Size": "30 mL"
+          },
+          "image_url": "https://cdn.synthetic.pivota.dev/serum/30.jpg",
+          "readiness": {
+            "catalog_last_refreshed_at": "2026-03-16T21:00:00Z",
+            "price_last_refreshed_at": "2026-03-17T07:15:00Z",
+            "inventory_last_refreshed_at": "2026-03-17T07:30:00Z",
+            "shipping_profile": "standard-us"
+          }
+        },
+        {
+          "id": "var_serum_refill",
+          "title": "30 mL Refill",
+          "sku": "PIV-SRM-RFL",
+          "price": 36.0,
+          "compare_at_price": 42.0,
+          "inventory_quantity": 4,
+          "options": {
+            "Format": "Refill"
+          },
+          "image_url": "https://cdn.synthetic.pivota.dev/serum/refill.jpg",
+          "readiness": {
+            "catalog_last_refreshed_at": "2026-03-16T21:00:00Z",
+            "price_last_refreshed_at": "2026-03-16T05:00:00Z",
+            "inventory_last_refreshed_at": "2026-03-15T04:00:00Z"
+          }
+        }
+      ]
+    }
+  ]
+}

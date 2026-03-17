@@ -268,6 +268,7 @@ from routes.outbound_links import router as outbound_links_router
 from routes.external_offers import router as external_offers_router
 from routes.prometheus_metrics import router as prometheus_metrics_router
 from routes.employee_reviews import router as employee_reviews_router
+from routes.readiness_internal import router as readiness_internal_router
 from routes.employee_products import router as employee_products_router
 from routes.buyer_reviews import router as buyer_reviews_router
 from routes.questions_api import router as questions_router
@@ -506,6 +507,17 @@ if settings.enable_amazon_sp_api:
     app.include_router(admin_amazon_oauth_router)  # Amazon SP-API OAuth (admin-only)
     app.include_router(admin_amazon_orders_router)  # Amazon SP-API orders sync (admin-only)
     app.include_router(admin_amazon_fulfillment_router)  # Amazon SP-API fulfillment feeds (admin-only)
+if (
+    settings.feature_readiness_audit
+    or settings.feature_readiness_ucp_thin_slice
+    or settings.feature_readiness_real_merchant_alpha
+    or settings.feature_readiness_source_of_truth_v1
+    or settings.feature_readiness_canonical_checkout_alpha
+):
+    app.include_router(readiness_internal_router)
+    logger.info("✅ Readiness audit / UCP thin-slice router registered")
+else:
+    logger.info("⏭️  Readiness audit / UCP thin-slice router disabled")
 app.include_router(products_cache_maintenance_router)  # Products cache maintenance
 app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
 app.include_router(admin_recover_psps_router)  # Admin PSP recovery

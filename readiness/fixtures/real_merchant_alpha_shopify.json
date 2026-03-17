@@ -1,0 +1,188 @@
+{
+  "merchant_id": "merch_efbc46b4619cfbdf",
+  "merchant_name": "Pivota Alpha Beauty Merchant",
+  "store": {
+    "store_id": "store_shopify_alpha",
+    "merchant_id": "merch_efbc46b4619cfbdf",
+    "platform": "shopify",
+    "name": "Pivota Alpha Shopify",
+    "domain": "alpha-beauty-demo.myshopify.com",
+    "status": "active",
+    "source": "merchant_stores"
+  },
+  "shopify_config": {
+    "source_type": "connector",
+    "shop_domain": "alpha-beauty-demo.myshopify.com",
+    "access_token": "shpat_test_alpha",
+    "connector_id": "cred_shopify_alpha"
+  },
+  "merchant_psp": {
+    "provider": "stripe",
+    "psp_id": "psp_stripe_alpha",
+    "status": "active",
+    "connected_at": "2026-03-16T09:00:00Z"
+  },
+  "products_cache_rows": [
+    {
+      "merchant_id": "merch_efbc46b4619cfbdf",
+      "platform": "shopify",
+      "platform_product_id": "9886500749640",
+      "cached_at": "2026-03-17T06:45:00Z",
+      "expires_at": "2026-03-24T06:45:00Z",
+      "product_data": {
+        "id": "9886500749640",
+        "platform": "shopify",
+        "merchant_id": "merch_efbc46b4619cfbdf",
+        "title": "Winona Soothing Repair Serum",
+        "description": "Barrier-support serum for reactive skin.",
+        "vendor": "Winona",
+        "product_type": "serum",
+        "tags": ["barrier", "serum"],
+        "price": 29.0,
+        "compare_at_price": 32.0,
+        "currency": "USD",
+        "inventory_quantity": 12,
+        "sku": "WIN-SRS-30",
+        "barcode": null,
+        "image_url": "https://cdn.example.com/winona-serum-main.jpg",
+        "images": [
+          "https://cdn.example.com/winona-serum-main.jpg",
+          "https://cdn.example.com/winona-serum-alt.jpg"
+        ],
+        "variants": [
+          {
+            "id": "431000000001",
+            "title": "30ml",
+            "sku": "WIN-SRS-30",
+            "barcode": null,
+            "price": 29.0,
+            "compare_at_price": 32.0,
+            "inventory_quantity": 12,
+            "weight": null,
+            "weight_unit": null,
+            "options": {
+              "Size": "30ml"
+            },
+            "image_url": "https://cdn.example.com/winona-serum-main.jpg"
+          },
+          {
+            "id": "431000000002",
+            "title": "50ml",
+            "sku": "WIN-SRS-50",
+            "barcode": null,
+            "price": 39.0,
+            "compare_at_price": 42.0,
+            "inventory_quantity": 7,
+            "weight": null,
+            "weight_unit": null,
+            "options": {
+              "Size": "50ml"
+            },
+            "image_url": "https://cdn.example.com/winona-serum-main.jpg"
+          }
+        ],
+        "status": "active",
+        "published_at": null,
+        "created_at": "2026-01-10T00:00:00Z",
+        "updated_at": "2026-03-17T06:40:00Z",
+        "data_completeness_score": 0.98,
+        "platform_metadata": {
+          "shopify_id": "9886500749640",
+          "handle": "winona-soothing-repair-serum"
+        },
+        "orderable": true,
+        "orderable_validation": {
+          "orderable": true,
+          "required_fields_present": {
+            "id": true,
+            "platform": true,
+            "price": true,
+            "currency": true,
+            "variant_id": true
+          },
+          "errors": []
+        }
+      }
+    },
+    {
+      "merchant_id": "merch_efbc46b4619cfbdf",
+      "platform": "shopify",
+      "platform_product_id": "9886500127048",
+      "cached_at": "2026-03-15T00:00:00Z",
+      "expires_at": "2026-03-16T00:00:00Z",
+      "product_data": {
+        "id": "9886500127048",
+        "platform": "shopify",
+        "merchant_id": "merch_efbc46b4619cfbdf",
+        "title": "IPSA Time Reset Aqua",
+        "description": "Hydrating treatment lotion.",
+        "vendor": "IPSA",
+        "product_type": "lotion",
+        "tags": ["hydration", "lotion"],
+        "price": 48.0,
+        "compare_at_price": null,
+        "currency": "USD",
+        "inventory_quantity": 5,
+        "sku": "IPSA-TRA-200",
+        "barcode": null,
+        "image_url": "https://cdn.example.com/ipsa-aqua-main.jpg",
+        "images": [
+          "https://cdn.example.com/ipsa-aqua-main.jpg"
+        ],
+        "variants": [
+          {
+            "id": "431000000003",
+            "title": "200ml",
+            "sku": "IPSA-TRA-200",
+            "barcode": null,
+            "price": 48.0,
+            "compare_at_price": null,
+            "inventory_quantity": 5,
+            "weight": null,
+            "weight_unit": null,
+            "options": {
+              "Size": "200ml"
+            },
+            "image_url": "https://cdn.example.com/ipsa-aqua-main.jpg"
+          },
+          {
+            "id": "431000000004",
+            "title": "100ml Travel",
+            "sku": "IPSA-TRA-100",
+            "barcode": null,
+            "price": 26.0,
+            "compare_at_price": null,
+            "inventory_quantity": 0,
+            "weight": null,
+            "weight_unit": null,
+            "options": {
+              "Size": "100ml"
+            },
+            "image_url": "https://cdn.example.com/ipsa-aqua-main.jpg"
+          }
+        ],
+        "status": "active",
+        "published_at": null,
+        "created_at": "2026-01-12T00:00:00Z",
+        "updated_at": "2026-03-14T18:00:00Z",
+        "data_completeness_score": 0.95,
+        "platform_metadata": {
+          "shopify_id": "9886500127048",
+          "handle": "ipsa-time-reset-aqua"
+        },
+        "orderable": true,
+        "orderable_validation": {
+          "orderable": true,
+          "required_fields_present": {
+            "id": true,
+            "platform": true,
+            "price": true,
+            "currency": true,
+            "variant_id": true
+          },
+          "errors": []
+        }
+      }
+    }
+  ]
+}

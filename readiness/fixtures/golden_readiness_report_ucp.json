@@ -1,0 +1,28 @@
+{
+  "merchant_id": "synthetic-demo-merchant",
+  "merchant_alpha_mode": "synthetic_fixture",
+  "readiness_score": 58,
+  "capability_status": {
+    "channel_export": "ready",
+    "checkout": "stubbed",
+    "merchant_adapter": "ready",
+    "order_sync": "stubbed"
+  },
+  "ready_variant_ids": [
+    "var_cleanser_150ml",
+    "var_cleanser_300ml",
+    "var_serum_30ml"
+  ],
+  "blocked_variant_ids": [
+    "var_serum_refill"
+  ],
+  "source_of_truth": {
+    "catalog": "synthetic_fixture.catalog.v1",
+    "channel_export": "readiness.channel_export.ucp.v1",
+    "checkout": "readiness.stub.checkout.v1",
+    "fulfillment_policy": "synthetic_fixture.policy.v1",
+    "inventory": "synthetic_fixture.inventory.v1",
+    "order_state": "readiness.stub.order_sync.v1",
+    "price": "synthetic_fixture.offer.v1"
+  }
+}

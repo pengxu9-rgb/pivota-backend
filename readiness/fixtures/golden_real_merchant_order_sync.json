@@ -1,0 +1,12 @@
+{
+  "merchant_id": "merch_efbc46b4619cfbdf",
+  "merchant_alpha_mode": "real_merchant_alpha",
+  "status": "state_synced",
+  "event_types": [
+    "checkout_created",
+    "payment_capability_verified",
+    "order_created",
+    "order_forwarded_to_merchant",
+    "state_synced"
+  ]
+}

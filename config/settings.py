@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     
     # Platform Orders ACP Integration
     enable_platform_orders_acp: bool = os.getenv("FEATURE_PLATFORM_ORDERS_ACP", "false").lower() == "true"
+
+    # Readiness audit / thin-slice flags
+    feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"
+    feature_readiness_ucp_thin_slice: bool = os.getenv("FEATURE_READINESS_UCP_THIN_SLICE", "false").lower() == "true"
+    feature_readiness_real_merchant_alpha: bool = os.getenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "false").lower() == "true"
+    feature_readiness_source_of_truth_v1: bool = os.getenv("FEATURE_READINESS_SOURCE_OF_TRUTH_V1", "false").lower() == "true"
+    feature_readiness_canonical_checkout_alpha: bool = os.getenv("FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA", "false").lower() == "true"
+    readiness_alpha_merchant_id: str = os.getenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+    readiness_internal_api_key: Optional[str] = os.getenv("READINESS_INTERNAL_API_KEY")
+    readiness_allow_unauthenticated_dev: bool = os.getenv("READINESS_ALLOW_UNAUTHED_DEV", "false").lower() == "true"
     
     # Amazon SP-API Integration
     amazon_sp_api_client_id: Optional[str] = os.getenv("AMAZON_SP_API_CLIENT_ID")

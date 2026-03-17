@@ -1,0 +1,11 @@
+{
+  "merch_efbc46b4619cfbdf": {
+    "shipping_supported": true,
+    "returns_supported": true,
+    "shipping_profile": "standard_domestic",
+    "shipping_summary": "Alpha merchant shipping summary configured for UCP-style export. Carrier/service mapping is still merchant-managed and not yet normalized per destination.",
+    "returns_summary": "Alpha merchant returns policy reviewed for readiness export. Return authorization remains merchant-native outside the readiness alpha path.",
+    "policy_source": "readiness.alpha_policy_config.v1",
+    "last_reviewed_at": "2026-03-10T00:00:00Z"
+  }
+}

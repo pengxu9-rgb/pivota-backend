@@ -1,0 +1,26 @@
+{
+  "merchant_id": "merch_efbc46b4619cfbdf",
+  "merchant_alpha_mode": "real_merchant_alpha",
+  "readiness_score": 50,
+  "capability_status": {
+    "channel_export": "ready",
+    "checkout": "ready",
+    "merchant_adapter": "ready",
+    "order_sync": "ready"
+  },
+  "offer_ids": [
+    "ucp:merch_efbc46b4619cfbdf:9886500749640:431000000001",
+    "ucp:merch_efbc46b4619cfbdf:9886500749640:431000000002"
+  ],
+  "validation_warnings": [
+    "review ingestion is absent from the readiness model today"
+  ],
+  "source_of_truth": {
+    "catalog": "shopify_cache.standard_product.v1",
+    "checkout_capability": "readiness.checkout_capability.v1",
+    "fulfillment_policy": "readiness.alpha_policy_config.v1",
+    "inventory": "shopify_cache.inventory.v1",
+    "order_status": "readiness.order_sync.v2",
+    "price": "shopify_cache.variant_offer.v1"
+  }
+}
