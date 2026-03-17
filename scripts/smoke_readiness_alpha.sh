@@ -237,7 +237,11 @@ validate_report_contract() {
     '
       .merchant_id == $merchant_id and
       .merchant_alpha_mode == "real_merchant_alpha" and
-      (.source_of_truth | keys | sort) == ["catalog","checkout_capability","fulfillment_policy","inventory","order_status","price"]
+      (
+        .source_of_truth | keys
+      ) as $keys
+      | ["catalog","checkout_capability","fulfillment_policy","inventory","order_status","price","reviews_confidence"]
+      | all(. as $required | ($keys | index($required) != null))
     ' \
     "$report_file" >/dev/null || die "Readiness report contract check failed"
 }
@@ -249,7 +253,11 @@ validate_export_contract() {
     '
       .merchant_id == $merchant_id and
       .merchant_alpha_mode == "real_merchant_alpha" and
-      (.source_of_truth | keys | sort) == ["catalog","checkout_capability","fulfillment_policy","inventory","order_status","price"]
+      (
+        .source_of_truth | keys
+      ) as $keys
+      | ["catalog","checkout_capability","fulfillment_policy","inventory","order_status","price","reviews_confidence"]
+      | all(. as $required | ($keys | index($required) != null))
     ' \
     "$export_file" >/dev/null || die "UCP export contract check failed"
 }

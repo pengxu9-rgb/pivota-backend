@@ -67,6 +67,18 @@ def _aggregate_row_to_dict(row: Any) -> Dict[str, Any]:
     }
 
 
+def _append_warning(
+    warnings: List[str],
+    audit_notes: List[str],
+    *,
+    code: str,
+    audit_note: str,
+) -> None:
+    if code not in warnings:
+        warnings.append(code)
+    audit_notes.append(audit_note)
+
+
 def _combine_review_totals(*totals: Dict[str, Any]) -> Dict[str, Any]:
     latest_candidates = [_parse_datetime(item.get("latest_review_at")) for item in totals if item]
     latest_review_at = max((item for item in latest_candidates if item is not None), default=None)
@@ -153,33 +165,49 @@ async def load_product_review_summaries(
     summaries: Dict[str, Dict[str, Any]] = {}
 
     try:
-        membership_rows = await database.fetch_all(
-            select(
-                review_group_membership.c.product_key,
-                review_group_membership.c.group_id,
-                review_group_membership.c.confidence.label("membership_confidence"),
-                review_group.c.group_key,
-                review_group.c.confidence.label("group_confidence"),
-            )
-            .select_from(
-                review_group_membership.join(
-                    review_group, review_group.c.id == review_group_membership.c.group_id
+        membership_by_product_key: Dict[str, Dict[str, Any]] = {}
+        group_aggregates: Dict[int, Dict[str, Any]] = {}
+        featured_counts: Dict[int, int] = {}
+        product_aggregates: Dict[str, Dict[str, Any]] = {}
+        group_lookup_available = False
+        product_lookup_available = False
+
+        try:
+            membership_rows = await database.fetch_all(
+                select(
+                    review_group_membership.c.product_key,
+                    review_group_membership.c.group_id,
+                    review_group_membership.c.confidence.label("membership_confidence"),
+                    review_group.c.group_key,
+                    review_group.c.confidence.label("group_confidence"),
+                )
+                .select_from(
+                    review_group_membership.join(
+                        review_group, review_group.c.id == review_group_membership.c.group_id
+                    )
+                )
+                .where(
+                    (review_group_membership.c.status == "active")
+                    & (review_group.c.status == "active")
+                    & (review_group_membership.c.product_key.in_(list(product_keys_by_id.values())))
+                )
+                .order_by(
+                    review_group_membership.c.product_key.asc(),
+                    review_group_membership.c.confidence.desc(),
+                    review_group_membership.c.updated_at.desc(),
+                    review_group_membership.c.id.desc(),
                 )
             )
-            .where(
-                (review_group_membership.c.status == "active")
-                & (review_group.c.status == "active")
-                & (review_group_membership.c.product_key.in_(list(product_keys_by_id.values())))
+        except Exception:
+            logger.warning("Review-group membership lookup failed for merchant=%s", merchant_id, exc_info=True)
+            _append_warning(
+                warnings,
+                audit_notes,
+                code="reviews_group_membership_lookup_failed",
+                audit_note="Readiness alpha could not resolve review-group membership and fell back to direct product-review summaries where available.",
             )
-            .order_by(
-                review_group_membership.c.product_key.asc(),
-                review_group_membership.c.confidence.desc(),
-                review_group_membership.c.updated_at.desc(),
-                review_group_membership.c.id.desc(),
-            )
-        )
+            membership_rows = []
 
-        membership_by_product_key: Dict[str, Dict[str, Any]] = {}
         for row in membership_rows:
             product_key = str(_row_get(row, "product_key") or "").strip()
             if product_key and product_key not in membership_by_product_key:
@@ -198,44 +226,85 @@ async def load_product_review_summaries(
             }
         )
 
-        group_aggregates: Dict[int, Dict[str, Any]] = {}
         if group_ids:
-            group_rows = await database.fetch_all(
-                _build_review_aggregate_query(product_reviews.c.group_id).where(
-                    product_reviews.c.group_id.in_(group_ids)
+            try:
+                group_rows = await database.fetch_all(
+                    _build_review_aggregate_query(product_reviews.c.group_id).where(
+                        product_reviews.c.group_id.in_(group_ids)
+                    )
                 )
-            )
-            group_aggregates = {
-                int(_row_get(row, "bucket")): _aggregate_row_to_dict(row)
-                for row in group_rows
-                if _row_get(row, "bucket") is not None
-            }
-            featured_rows = await database.fetch_all(
-                select(
-                    review_featured.c.group_id.label("bucket"),
-                    func.count(review_featured.c.review_id).label("featured_review_count"),
+                group_lookup_available = True
+                group_aggregates = {
+                    int(_row_get(row, "bucket")): _aggregate_row_to_dict(row)
+                    for row in group_rows
+                    if _row_get(row, "bucket") is not None
+                }
+            except Exception:
+                logger.warning("Review-group aggregate lookup failed for merchant=%s", merchant_id, exc_info=True)
+                _append_warning(
+                    warnings,
+                    audit_notes,
+                    code="reviews_group_aggregate_lookup_failed",
+                    audit_note="Readiness alpha could not aggregate review-group totals and fell back to direct product-review summaries where available.",
                 )
-                .group_by(review_featured.c.group_id)
-                .where(review_featured.c.group_id.in_(group_ids))
-            )
-            featured_counts = {
-                int(_row_get(row, "bucket")): int(_row_get(row, "featured_review_count", 0) or 0)
-                for row in featured_rows
-            }
-        else:
-            featured_counts = {}
+                group_aggregates = {}
+
+            try:
+                featured_rows = await database.fetch_all(
+                    select(
+                        review_featured.c.group_id.label("bucket"),
+                        func.count(review_featured.c.review_id).label("featured_review_count"),
+                    )
+                    .group_by(review_featured.c.group_id)
+                    .where(review_featured.c.group_id.in_(group_ids))
+                )
+                featured_counts = {
+                    int(_row_get(row, "bucket")): int(_row_get(row, "featured_review_count", 0) or 0)
+                    for row in featured_rows
+                }
+            except Exception:
+                logger.warning("Featured review lookup failed for merchant=%s", merchant_id, exc_info=True)
+                _append_warning(
+                    warnings,
+                    audit_notes,
+                    code="reviews_featured_lookup_failed",
+                    audit_note="Readiness alpha could not hydrate featured-review counts and continued with featured counts set to zero.",
+                )
+                featured_counts = {}
 
         all_product_keys = list(product_keys_by_id.values()) + list(global_product_keys_by_id.values())
-        product_rows = await database.fetch_all(
-            _build_review_aggregate_query(product_reviews.c.product_key).where(
-                product_reviews.c.product_key.in_(all_product_keys)
+        try:
+            product_rows = await database.fetch_all(
+                _build_review_aggregate_query(product_reviews.c.product_key).where(
+                    product_reviews.c.product_key.in_(all_product_keys)
+                )
             )
-        )
-        product_aggregates = {
-            str(_row_get(row, "bucket") or "").strip(): _aggregate_row_to_dict(row)
-            for row in product_rows
-            if str(_row_get(row, "bucket") or "").strip()
-        }
+            product_lookup_available = True
+            product_aggregates = {
+                str(_row_get(row, "bucket") or "").strip(): _aggregate_row_to_dict(row)
+                for row in product_rows
+                if str(_row_get(row, "bucket") or "").strip()
+            }
+        except Exception:
+            logger.warning("Product-review aggregate lookup failed for merchant=%s", merchant_id, exc_info=True)
+            _append_warning(
+                warnings,
+                audit_notes,
+                code="reviews_product_summary_lookup_failed",
+                audit_note="Readiness alpha could not aggregate direct product-review summaries for this merchant.",
+            )
+            product_aggregates = {}
+
+        if not group_lookup_available and not product_lookup_available:
+            return {}, {
+                "integration_status": "blocked",
+                "observed_at": observed_at,
+                "products_with_reviews": 0,
+                "grouped_products_with_reviews": 0,
+                "products_without_reviews": len(products_list),
+            }, ["reviews_summary_lookup_failed"], [
+                "Readiness alpha could not hydrate Reviews Center summaries for this merchant."
+            ]
 
         for product in products_list:
             product_id = str(product.id)
