@@ -38,6 +38,25 @@ def _loads(value: Any) -> Any:
     return value
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return _json_safe(dump())
+    if hasattr(value, "dict") and callable(getattr(value, "dict")):
+        return _json_safe(value.dict())
+    return value
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(_json_safe(value))
+
+
 class ReadinessJournal(Protocol):
     async def create_checkout_session(
         self,
@@ -112,7 +131,7 @@ class InMemoryReadinessJournal(ReadinessJournal):
             status="checkout_created",
             continue_url=continue_url,
             idempotency_key=idempotency_key,
-            session_payload=session_payload,
+            session_payload=_json_safe(session_payload),
             created_at=now,
             updated_at=now,
         )
@@ -121,11 +140,11 @@ class InMemoryReadinessJournal(ReadinessJournal):
             OrderSyncEventRecord(
                 checkout_id=checkout_id,
                 event_type="checkout_created",
-                event_payload={
+                event_payload=_json_safe({
                     "variant_id": variant_id,
                     "quantity": quantity,
                     "payment_mode": payment_mode,
-                },
+                }),
                 created_at=now,
             )
         )
@@ -173,7 +192,7 @@ class InMemoryReadinessJournal(ReadinessJournal):
         if session_payload_patch:
             next_payload = dict(session.session_payload or {})
             next_payload.update(session_payload_patch)
-            session.session_payload = next_payload
+            session.session_payload = _json_safe(next_payload)
         session.updated_at = _now_iso()
         return session
 
@@ -330,7 +349,7 @@ class DatabaseReadinessJournal(ReadinessJournal):
                 "payment_mode": payment_mode,
                 "continue_url": continue_url,
                 "idempotency_key": idempotency_key,
-                "session_payload": json.dumps(session_payload),
+                "session_payload": _json_dumps(session_payload),
             },
         )
         await self.append_event(
@@ -351,7 +370,7 @@ class DatabaseReadinessJournal(ReadinessJournal):
             {
                 "checkout_id": checkout_id,
                 "event_type": event_type,
-                "event_payload": json.dumps(event_payload),
+                "event_payload": _json_dumps(event_payload),
             },
         )
 
@@ -383,7 +402,7 @@ class DatabaseReadinessJournal(ReadinessJournal):
             merged_payload = dict(checkout.session_payload or {})
             merged_payload.update(session_payload_patch)
             assignments.append("session_payload = CAST(:session_payload AS JSONB)")
-            params["session_payload"] = json.dumps(merged_payload)
+            params["session_payload"] = _json_dumps(merged_payload)
         if not assignments:
             return await self.get_checkout_session(checkout_id)
         assignments.append("updated_at = NOW()")
