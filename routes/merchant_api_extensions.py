@@ -23,6 +23,7 @@ from services.payment_routing_service import PaymentRoutingService
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
+from readiness.summary import build_readiness_summary
 
 router = APIRouter()
 
@@ -676,7 +677,8 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
                 "conversion_rate": round(len(paid_orders) / total_orders * 100, 2) if total_orders > 0 else 0,
                 "top_products": top_products,
                 "recent_orders": recent_orders,
-                "psp_count": psp_count  # Add real PSP count
+                "psp_count": psp_count,  # Add real PSP count
+                "readiness_summary": (await build_readiness_summary(merchant_id)).model_dump(),
             }
         }
     except Exception as e:

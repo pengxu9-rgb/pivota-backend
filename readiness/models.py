@@ -121,6 +121,23 @@ class MerchantReadinessSnapshot(BaseModel):
     products: List[ReadyProduct] = Field(default_factory=list)
 
 
+class ReadinessSummary(BaseModel):
+    tier: str
+    label: str
+    assessment_state: str
+    assessment_scope: str = "one_merchant_alpha"
+    channel: str = "ucp"
+    score: Optional[int] = None
+    merchant_alpha_mode: Optional[str] = None
+    ready_variant_count: int = 0
+    blocked_variant_count: int = 0
+    top_blockers: List[str] = Field(default_factory=list)
+    top_warnings: List[str] = Field(default_factory=list)
+    capability_status: Dict[str, str] = Field(default_factory=dict)
+    generated_at: Optional[str] = None
+    next_action: Optional[str] = None
+
+
 class ChannelReadinessReport(BaseModel):
     export_version: str = "readiness_ucp_export.v1"
     merchant_id: str

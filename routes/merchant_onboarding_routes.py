@@ -25,6 +25,7 @@ from db.merchant_onboarding import (
 )
 from db.payment_router import register_merchant_psp_route
 from db.database import database
+from readiness.summary import build_readiness_summary
 from utils.auth import get_current_user, require_admin
 from urllib.parse import urlparse
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
@@ -650,6 +651,7 @@ async def get_onboarding_details(
         "psp_connected": merchant.get("psp_connected", False),
         "psp_type": merchant.get("psp_type"),
         "created_at": merchant.get("created_at").isoformat() if merchant.get("created_at") else None,
+        "readiness_summary": (await build_readiness_summary(merchant_id)).model_dump(),
         "stores": stores,
         "psps": psps,
         "stats": stats
@@ -723,6 +725,7 @@ async def list_all_onboardings(
                 "products_expired": has_expired,
                 "expired_count": expired_count,
                 "created_at": m["created_at"].isoformat() if m["created_at"] else None,
+                "readiness_summary": (await build_readiness_summary(m["merchant_id"])).model_dump(),
             })
         
         return {
