@@ -57,6 +57,29 @@ Supervised production payment-intent canary on March 18, 2026:
   - readiness normalized that to `awaiting_payment`
   - no false paid bridge occurred
 
+Supervised production paid -> refund validation on March 18, 2026:
+
+- checkout id: `rdchk_e34ae1b6eb6141e4`
+- local order id: `ORD_9919FDEADB87D765`
+- merchant order id: `7473943740744`
+- real paid Stripe payment intent: `pi_3TCFwlGeIEg0wZyU0L46SlLK`
+- refund id: `REF_A4FFAA0699239FBB`
+- PSP refund id: `re_3TCFwlGeIEg0wZyU0l9r07hf`
+- persisted `platform_refund_id`: `re_3TCFwlGeIEg0wZyU0l9r07hf`
+- post-refund audit:
+  - `checkout_status=refunded`
+  - `order_state.payment_status=refunded`
+  - `refund_sync=ready`
+
+Follow-up production soft-skip validation on March 18, 2026:
+
+- checkout id: `rdchk_b5926962c3c649ab`
+- local order id: `ORD_9A304500654CF1D9`
+- merchant order id: `7474005967176`
+- canonical refund still succeeded with `platform_refund_id=re_3TCGMaGeIEg0wZyU1YII02SA`
+- Shopify refund transaction mirror returned `soft_skipped=true`, `reason=missing_parent_transaction`
+- the attempted manual parent-transaction fallback also failed against Shopify with `sale is not a valid transaction`
+
 Captured fixture expectation kept for regression:
 
 - readiness score: `76`
@@ -68,14 +91,13 @@ Captured fixture expectation kept for regression:
 
 ## Primary Blockers Still Visible
 
-- readiness now projects product-level Reviews Center summaries successfully, but grouped review coverage is still `0` in the current merchant observation
-- merchant-native payment execution exists in the platform, but the readiness router still does not own direct PSP authorize/capture
+- readiness now projects product-level Reviews Center summaries successfully, but broader review freshness/ranking convergence is still outside the alpha contract
+- merchant-native payment execution exists in the platform, but the readiness router still does not own one universal PSP authorize/capture surface
 - live blocked variants are now dominated by `out_of_stock` and `missing_price`, not stale inventory snapshots
 - full report/export payloads are still expensive unless internal consumers use `summary_only=true`
-- refund / cancel / return sync still require a controlled live exercise; the new order-sync audit only surfaces their evidence paths and current observation state
-- readiness now has an internal `payment-bridge` surface that can attach an externally successful PSP reference to the readiness-owned order and make refund validation meaningful without refactoring the platform payment stack first
-- readiness now also has an internal `payment-intent` surface that can mint a PSP payment intent directly for the readiness-owned local order
-- that `payment-intent` surface is now live-validated for intent creation and idempotent replay, but not yet for confirmed payment -> paid bridge -> refund
+- return sync still has no live exercise
+- Shopify refund transaction mirroring is still best-effort; for some real Shopify order shapes there is no valid parent transaction, so readiness must treat `soft_skipped: missing_parent_transaction` as a controlled degradation rather than a failed refund
+- readiness now has internal `payment-bridge`, `payment-intent`, and `payment-status-sync` surfaces, and the canonical readiness refund path has been live-validated end-to-end
 
 Follow-up live validation on March 18, 2026:
 
@@ -146,6 +168,7 @@ Current intent:
 - mark the local `orders` row `paid`
 - best-effort sync the external payment reference into the linked Shopify order transaction list
 - make `refund_sync.refund_eligible=true` in the post-order audit before a controlled refund test
+- in production this has now been live-validated; if Shopify refuses to establish a valid parent transaction, the transaction sync surface degrades to `soft_skipped` while canonical refund state still converges through the local order and `refund_records`
 
 New internal surface:
 

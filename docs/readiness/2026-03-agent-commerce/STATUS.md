@@ -17,6 +17,7 @@ Implemented:
 - internal payment-intent route for minting a PSP payment intent directly against a readiness-created local order
 - internal payment-status-sync route for polling PSP state from a readiness-owned `payment_intent_id` and auto-bridging only on real paid status
 - internal refund route for readiness-owned paid orders, reusing the platform refund service and refund-record flow
+- best-effort Shopify parent/refund transaction handling that degrades to explicit `soft_skipped` results instead of hard `422` failures when Shopify refuses to create a valid parent transaction
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
 
@@ -30,12 +31,20 @@ Validated:
   - `bash -n scripts/smoke_readiness_alpha.sh`
 - targeted follow-up validation for replay convergence:
   - `python3 -m pytest readiness/tests/test_sync_audit.py readiness/tests/test_routes.py -q`
+- targeted follow-up validation for Shopify transaction parent/refund handling:
+  - `python3 -m pytest tests/test_shopify_transactions_service.py readiness/tests/test_routes.py readiness/tests/test_sync_audit.py tests/test_error_handler.py tests/test_refund_service.py -q`
+  - result: `50 passed`
 - production deploy progression:
   - `ad49b8c`: hardened review fallback logic
   - `e20086b`: switched readiness review aggregates to raw SQL
   - `078b46c`: added summary-only report/export views
   - `6fe88e1`: preserved readiness top-level error codes
   - `f29000c`: expanded readiness error-contract coverage and smoke assertions
+  - `427c160`: added readiness payment-status-sync route
+  - `9c5b13b`: added readiness refund route
+  - `ff8a286`: added Stripe Checkout status resolution for readiness payment-status-sync
+  - `403bc7b`: persisted `platform_refund_id` into `refund_records`
+  - `fc7a63b`: hardened Shopify parent/refund transaction handling and soft-skip behavior
 - production summary-only smoke against `https://web-production-fedb.up.railway.app`
   - readiness report summary: `200`
   - UCP export summary: `200`
@@ -81,6 +90,27 @@ Validated:
   - normalized payment status: `awaiting_payment`
   - `bridged_to_paid=false`
   - `replayed=true`
+- supervised production paid -> refund validation on March 18, 2026
+  - readiness checkout id: `rdchk_e34ae1b6eb6141e4`
+  - local order id: `ORD_9919FDEADB87D765`
+  - merchant write-back Shopify order id: `7473943740744`
+  - paid Stripe payment intent: `pi_3TCFwlGeIEg0wZyU0L46SlLK`
+  - refund id: `REF_A4FFAA0699239FBB`
+  - PSP refund id: `re_3TCFwlGeIEg0wZyU0l9r07hf`
+  - persisted `platform_refund_id`: `re_3TCFwlGeIEg0wZyU0l9r07hf`
+  - post-refund audit:
+    - `checkout_status=refunded`
+    - `order_state.status=refunded`
+    - `order_state.payment_status=refunded`
+    - `refund_sync=ready`
+- supervised production soft-skip refund mirror validation on March 18, 2026
+  - readiness checkout id: `rdchk_b5926962c3c649ab`
+  - local order id: `ORD_9A304500654CF1D9`
+  - merchant write-back Shopify order id: `7474005967176`
+  - bridged Stripe payment intent: `pi_3TCGMaGeIEg0wZyU1Q5aWuWr`
+  - canonical refund still succeeded with `platform_refund_id=re_3TCGMaGeIEg0wZyU1YII02SA`
+  - Shopify refund transaction mirror returned `soft_skipped=true`, `reason=missing_parent_transaction`
+  - the attempted parent-transaction fallback also failed against Shopify with `sale is not a valid transaction`
 - supervised production canary write on March 17, 2026
   - checkout create: `200`
   - checkout id: `rdchk_4b7c7a42214f4bf0`
@@ -95,8 +125,8 @@ Validated:
 Not yet executed live:
 
 - no direct PSP authorize/capture executed by the readiness router itself
-- no live webhook/reconciliation validation for readiness order state
-- no live production re-smoke yet for the new Reviews Center projection
+- no live return sync validation yet
+- no inbound PSP-webhook-driven paid confirmation path validated from the readiness router itself
 
 Major remaining risks:
 
@@ -104,6 +134,6 @@ Major remaining risks:
 - merchant-native payment execution exists in the platform, but the readiness router still uses capability check + merchant order write-back instead of a fully unified PSP execution step
 - merchant fulfillment/returns policy is still manual config, not live-ingested
 - full report/export payloads remain large when `summary_only` is not used
-- refund and return sync still need a live exercise; cancellation sync is live-validated, and refund is now structurally unblocked by the payment bridge, but a real paid canary reference still needs operator validation
-- readiness can now create PSP payment intents itself, and production has validated live intent creation plus idempotent replay, but not yet PSP confirmation/capture or a paid-bridge refund exercise
-- readiness can now also poll PSP status from the stored payment intent without confirming the payment itself, and production has validated the non-paid `awaiting_payment` branch; what remains is a real paid transition followed by refund validation
+- return sync still has no live exercise
+- readiness can create PSP payment intents and absorb real paid state, but the canonical paid transition is still status-sync / bridge based rather than a single readiness-owned capture surface
+- Shopify transaction mirroring is explicitly best-effort; some Shopify order shapes reject both external sale creation and manual parent sale creation, so readiness must rely on canonical PSP + local refund records rather than a guaranteed Shopify refund transaction graph

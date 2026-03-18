@@ -321,6 +321,13 @@ This route is intentionally narrow:
 - it best-effort syncs a matching Shopify refund transaction when the refund completes
 - it should fail closed with `CHECKOUT_REFUND_NOT_ELIGIBLE` for unpaid canaries
 
+Observed production alpha behavior on March 18, 2026:
+
+- a controlled paid canary successfully converged through refund with a persisted `platform_refund_id`
+- `order-sync-audit` showed `refund_sync=ready`
+- a separate live probe also showed that Shopify refund transaction mirroring can legally degrade to `soft_skipped=true`, `reason=missing_parent_transaction`
+- treat that soft-skip as a Shopify mirror limitation, not as a canonical refund failure, as long as the local order state and `refund_records.platform_refund_id` are present
+
 ## Error Contract Probes
 
 Blocked checkout should fail closed with a readiness-specific top-level code:

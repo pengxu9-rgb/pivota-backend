@@ -213,6 +213,7 @@ Current semantics:
 - it attaches an already successful external payment reference to the local `orders` row
 - it marks the order `paid`
 - it best-effort syncs a matching Shopify transaction when the readiness order is already linked to Shopify
+- if Shopify rejects both external sale mirroring and manual parent-sale creation, `transaction_sync` degrades to `soft_skipped` with explicit reason codes and the canonical readiness order still remains paid
 - it makes the readiness order refund-eligible for the existing refund path
 
 ## Payment Intent Contract
@@ -324,6 +325,7 @@ Current semantics:
 - it requires the local order to already be in a refundable payment state
 - it reuses the existing refund service and refund records flow
 - it best-effort syncs a matching Shopify refund transaction when the refund completes
+- if Shopify cannot establish a valid parent transaction, the refund still completes canonically and `transaction_sync` returns `soft_skipped=true`, usually with `reason=missing_parent_transaction`
 - it fails closed with `CHECKOUT_REFUND_NOT_ELIGIBLE` when the readiness order is still unpaid
 
 ## Order Sync Contract
@@ -401,6 +403,7 @@ Current signal semantics:
   - `ready`: `refund_records`, refund webhook topics, or refunded order state is present
   - `not_observed`: the order is refund-eligible but no refund evidence has landed yet
   - `not_eligible`: the order is still unpaid or missing a payment reference, so refund validation is not yet meaningful
+  - note: `ready` does not require a successful Shopify refund transaction mirror when canonical PSP/local refund evidence has already landed
 - `return_sync`
   - `ready`: `return_records` or Shopify `returns/*` webhook evidence is present
   - `not_observed`: no return evidence yet
@@ -476,6 +479,7 @@ Current endpoint matrix:
 | `GET /internal/readiness/checkout-sessions/{checkout_id}` with unknown checkout | `404` | `CHECKOUT_NOT_FOUND` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` before local order creation | `409` | `CHECKOUT_ORDER_NOT_CREATED` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` for already-paid order with different reference | `409` | `ORDER_ALREADY_PAID` |
+| `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/refund` for unpaid or non-refundable order | `409` | `CHECKOUT_REFUND_NOT_ELIGIBLE` |
 | `POST /internal/readiness/merchants/{merchant_id}/order-sync/{checkout_id}` with unknown checkout | `404` | `CHECKOUT_NOT_FOUND` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout` or `/order-sync/{checkout_id}` with invalid request shape | `400` | `CHECKOUT_INVALID` |
 
