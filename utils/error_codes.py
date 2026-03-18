@@ -142,6 +142,11 @@ class ErrorCode(Enum):
         409,
         "Checkout does not have a payment intent yet"
     )
+    CHECKOUT_REFUND_NOT_ELIGIBLE = ErrorDefinition(
+        "CHECKOUT_REFUND_NOT_ELIGIBLE",
+        409,
+        "Checkout refund is not eligible"
+    )
     PAYMENT_STATUS_SYNC_FAILED = ErrorDefinition(
         "PAYMENT_STATUS_SYNC_FAILED",
         502,

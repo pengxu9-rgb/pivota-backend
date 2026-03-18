@@ -19,7 +19,11 @@ from readiness.order_sync import get_default_journal
 from readiness.scoring import build_merchant_snapshot, find_ready_variant
 from readiness.sources import load_merchant_source_dataset, supported_merchant_ids
 from readiness.sync_audit import build_order_sync_audit_snapshot
-from services.shopify_transactions_service import ensure_external_payment_transaction_best_effort
+from services.refund_service import refund_service
+from services.shopify_transactions_service import (
+    ensure_external_payment_transaction_best_effort,
+    ensure_external_refund_transaction_best_effort,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1116,6 +1120,197 @@ async def sync_payment_status_for_checkout(
         "transaction_sync": transaction_sync,
         "replayed": replayed,
         "bridged_to_paid": bridged_to_paid,
+    }
+
+
+async def create_refund_for_checkout(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    amount: Optional[float] = None,
+    reason: str = "readiness_alpha_refund",
+    source: str = "readiness_alpha_refund",
+    idempotency_key: Optional[str] = None,
+    sync_shopify_refund_transaction: bool = True,
+) -> Dict[str, Any]:
+    journal = get_default_journal()
+    checkout = await journal.get_checkout_session(checkout_id)
+    if checkout is None or checkout.merchant_id != merchant_id:
+        raise KeyError(checkout_id)
+
+    payload = checkout.session_payload or {}
+    if payload.get("merchant_alpha_mode") != "real_merchant_alpha":
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "message": "Refund is only supported for the real-merchant alpha path.",
+            }
+        )
+
+    order_id = str(checkout.order_id or "").strip()
+    if not order_id:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_ORDER_NOT_CREATED",
+                "checkout_id": checkout_id,
+                "message": "Run /order-sync first so the checkout creates a local order before refunding it.",
+            }
+        )
+
+    order_row = await get_order(order_id)
+    if not order_row:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Checkout references a local order that could not be loaded.",
+            }
+        )
+
+    payment_status = _normalized_payment_status(order_row)
+    if payment_status not in {"paid", "completed", "partially_refunded"}:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_REFUND_NOT_ELIGIBLE",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "payment_status": payment_status or None,
+                "message": "Refund requires a paid or partially_refunded order.",
+            }
+        )
+
+    order_total = Decimal(str(order_row.get("total") or "0"))
+    total_refunded = Decimal(str(order_row.get("total_refunded") or "0"))
+    remaining = max(order_total - total_refunded, Decimal("0"))
+    if remaining <= Decimal("0"):
+        raise ValueError(
+            {
+                "code": "CHECKOUT_REFUND_NOT_ELIGIBLE",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "payment_status": payment_status or None,
+                "message": "Order is already fully refunded.",
+            }
+        )
+
+    refund_amount = Decimal(str(amount)) if amount is not None else remaining
+    if refund_amount <= Decimal("0") or refund_amount > remaining:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_REFUND_NOT_ELIGIBLE",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "payment_status": payment_status or None,
+                "remaining_refundable_amount": float(remaining),
+                "message": f"Refund amount must be > 0 and <= remaining refundable amount {float(remaining):.2f}.",
+            }
+        )
+
+    refund_result = await refund_service.create_refund(
+        order_id=order_id,
+        amount=float(refund_amount),
+        reason=str(reason or "readiness_alpha_refund").strip() or "readiness_alpha_refund",
+        source=str(source or "readiness_alpha_refund").strip() or "readiness_alpha_refund",
+        created_by="readiness_internal",
+        idempotency_key=idempotency_key,
+    )
+
+    refund_status = str((refund_result or {}).get("status") or "unknown")
+    refund_id = (refund_result or {}).get("refund_id")
+    psp_refund_id = (refund_result or {}).get("psp_refund_id")
+
+    await log_order_event(
+        event_type="readiness_refund_requested",
+        merchant_id=merchant_id,
+        order_id=order_id,
+        total_amount=float(refund_amount),
+        currency=str(order_row.get("currency") or "USD"),
+        payment_method=str(order_row.get("psp_used") or "").strip().lower() or None,
+        status=refund_status,
+        metadata={
+            "checkout_id": checkout_id,
+            "refund_id": refund_id,
+            "psp_refund_id": psp_refund_id,
+            "amount": float(refund_amount),
+            "reason": reason,
+            "source": source,
+            "idempotency_key": idempotency_key,
+        },
+    )
+
+    await journal.append_event(
+        checkout_id=checkout_id,
+        event_type="refund_requested" if refund_status != "failed" else "refund_processing_enqueued",
+        event_payload={
+            "order_id": order_id,
+            "refund_id": refund_id,
+            "psp_refund_id": psp_refund_id,
+            "amount": float(refund_amount),
+            "reason": reason,
+            "refund_status": refund_status,
+        },
+    )
+
+    refreshed_order = await get_order(order_id) or order_row
+    transaction_sync: Dict[str, Any] = {"ok": False, "skipped": True, "reason": "refund_not_completed"}
+
+    if refund_status in {"success", "duplicate"} and sync_shopify_refund_transaction:
+        shopify_order_id = str((refreshed_order or {}).get("shopify_order_id") or "").strip()
+        merchant_connection = payload.get("merchant_connection") or {}
+        shopify_conn = merchant_connection.get("shopify") or {}
+        shop_domain = str(shopify_conn.get("shop_domain") or "").strip()
+        access_token = str(shopify_conn.get("access_token") or "").strip()
+        currency = str((refreshed_order or {}).get("currency") or ((payload.get("price") or {}).get("currency")) or "USD")
+        if shopify_order_id and shop_domain and access_token:
+            try:
+                transaction_sync = await ensure_external_refund_transaction_best_effort(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    shopify_order_id=shopify_order_id,
+                    psp_used=str((refreshed_order or {}).get("psp_used") or payload.get("payment_psp_used") or "").strip().lower() or None,
+                    external_refund_ref=str(psp_refund_id or refund_id or "").strip() or None,
+                    amount=float(refund_amount),
+                    currency=currency,
+                    pivota_order_id=order_id,
+                )
+            except Exception:
+                logger.warning("Refund transaction sync failed for checkout=%s", checkout_id, exc_info=True)
+                transaction_sync = {"ok": False, "skipped": False, "reason": "refund_transaction_sync_failed"}
+
+    reconciled = await _reconcile_checkout_state_from_order(
+        journal=journal,
+        checkout=checkout,
+        order_row=refreshed_order,
+    )
+    if reconciled is not None:
+        checkout = reconciled
+    else:
+        checkout = await journal.update_checkout_session(
+            checkout_id,
+            session_payload_patch={
+                "last_refund": {
+                    "refund_id": refund_id,
+                    "psp_refund_id": psp_refund_id,
+                    "amount": float(refund_amount),
+                    "refund_status": refund_status,
+                    "source": source,
+                }
+            },
+        ) or checkout
+
+    return {
+        "checkout": checkout,
+        "events": await journal.list_events(checkout_id),
+        "order": refreshed_order,
+        "refund_status": refund_status,
+        "refund_id": refund_id,
+        "psp_refund_id": psp_refund_id,
+        "amount": float(refund_amount),
+        "remaining_refundable_before": float(remaining),
+        "transaction_sync": transaction_sync,
+        "replayed": refund_status == "duplicate",
     }
 
 

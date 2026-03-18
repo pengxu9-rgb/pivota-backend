@@ -11,6 +11,7 @@ from readiness import service as readiness_service
 from readiness.flags import (
     readiness_payment_bridge_enabled,
     readiness_payment_intent_enabled,
+    readiness_refund_enabled,
     readiness_payment_status_sync_enabled,
     readiness_router_enabled,
 )
@@ -61,6 +62,14 @@ class PaymentStatusSyncRequest(BaseModel):
     mark_paid_on_success: bool = True
     sync_shopify_transaction: bool = True
     source: str = Field(default="readiness_payment_status_sync", min_length=1, max_length=128)
+
+
+class CheckoutRefundRequest(BaseModel):
+    amount: Optional[float] = Field(default=None, gt=0)
+    reason: str = Field(default="readiness_alpha_refund", min_length=1, max_length=500)
+    source: str = Field(default="readiness_alpha_refund", min_length=1, max_length=128)
+    idempotency_key: Optional[str] = Field(default=None, max_length=255)
+    sync_shopify_refund_transaction: bool = True
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -117,6 +126,11 @@ def _require_payment_intent_enabled() -> None:
 
 def _require_payment_status_sync_enabled() -> None:
     if not readiness_payment_status_sync_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _require_refund_enabled() -> None:
+    if not readiness_refund_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
 
 
@@ -412,6 +426,60 @@ async def sync_payment_status(
         "normalized_payment_status": result["normalized_payment_status"],
         "transaction_sync": result["transaction_sync"],
         "bridged_to_paid": bool(result.get("bridged_to_paid")),
+        "replayed": bool(result.get("replayed")),
+        "events": [_model_dump(event) for event in result["events"]],
+    }
+
+
+@router.post("/merchants/{merchant_id}/checkout-sessions/{checkout_id}/refund")
+async def create_checkout_refund(
+    merchant_id: str,
+    checkout_id: str,
+    body: Optional[CheckoutRefundRequest],
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    _require_refund_enabled()
+    try:
+        result = await readiness_service.create_refund_for_checkout(
+            merchant_id,
+            checkout_id,
+            amount=body.amount if body else None,
+            reason=body.reason if body else "readiness_alpha_refund",
+            source=body.source if body else "readiness_alpha_refund",
+            idempotency_key=body.idempotency_key if body else None,
+            sync_shopify_refund_transaction=body.sync_shopify_refund_transaction if body else True,
+        )
+    except readiness_service.UnsupportedMerchantError:
+        raise _unsupported_merchant(merchant_id)
+    except KeyError:
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
+    except ValueError as exc:
+        detail = exc.args[0] if exc.args else {"code": "CHECKOUT_INVALID"}
+        code = str(detail.get("code") or "CHECKOUT_INVALID")
+        status_code = 400 if code in {"CHECKOUT_INVALID"} else 409
+        raise _readiness_http_exception(status_code, code, detail)
+
+    checkout = result["checkout"]
+    order = result["order"] or {}
+    return {
+        "merchant_id": merchant_id,
+        "merchant_alpha_mode": (checkout.session_payload or {}).get("merchant_alpha_mode"),
+        "checkout_id": checkout_id,
+        "order_id": checkout.order_id,
+        "status": checkout.status,
+        "payment_status": order.get("payment_status"),
+        "refund_status": result["refund_status"],
+        "refund_id": result["refund_id"],
+        "psp_refund_id": result["psp_refund_id"],
+        "amount": result["amount"],
+        "remaining_refundable_before": result["remaining_refundable_before"],
+        "transaction_sync": result["transaction_sync"],
         "replayed": bool(result.get("replayed")),
         "events": [_model_dump(event) for event in result["events"]],
     }

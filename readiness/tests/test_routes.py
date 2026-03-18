@@ -64,6 +64,7 @@ def _build_test_client(monkeypatch, *, psp_enabled: bool, include_error_handler:
     monkeypatch.setenv("FEATURE_READINESS_PAYMENT_BRIDGE_ALPHA", "true")
     monkeypatch.setenv("FEATURE_READINESS_PAYMENT_INTENT_ALPHA", "true")
     monkeypatch.setenv("FEATURE_READINESS_PAYMENT_STATUS_SYNC_ALPHA", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REFUND_ALPHA", "true")
     monkeypatch.setenv("READINESS_ALLOW_UNAUTHED_DEV", "true")
     monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", DEFAULT_ALPHA_MERCHANT_ID)
 
@@ -255,6 +256,21 @@ def test_payment_status_sync_not_found_error_code_is_preserved(monkeypatch):
 
     response = client.post(
         f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_missing/payment-status-sync",
+        json={},
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
+def test_refund_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_missing/refund",
         json={},
     )
 
@@ -951,6 +967,189 @@ def test_payment_status_sync_bridges_paid_status(monkeypatch):
     assert body["transaction_sync"]["ok"] is True
     assert body["psp_used"] == "stripe"
     assert bridged_calls[0]["source"] == "readiness_payment_status_sync"
+
+
+def test_refund_requires_paid_order(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    from readiness import service as readiness_service
+
+    order_state = {
+        "order_id": "ORD_ALPHA_REFUND_NOPE",
+        "shopify_order_id": None,
+        "status": "pending",
+        "payment_status": "awaiting_payment",
+        "payment_intent_id": "pi_alpha_refund_nope",
+        "client_secret": "cs_alpha_refund_nope",
+        "psp_used": "stripe",
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_REFUND_NOPE"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        assert order_id == "ORD_ALPHA_REFUND_NOPE"
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777333",
+            "shopify_order_name": "#1773",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777333",
+        }
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-refund-nope",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    sync = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    assert sync.status_code == 200
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/refund",
+        json={},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_REFUND_NOT_ELIGIBLE"
+    assert body["error"]["details"]["payment_status"] == "awaiting_payment"
+
+
+def test_refund_success_reconciles_order_state(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    order_state = {
+        "order_id": "ORD_ALPHA_REFUND_OK",
+        "shopify_order_id": None,
+        "status": "paid",
+        "payment_status": "paid",
+        "payment_intent_id": "pi_alpha_refund_ok",
+        "client_secret": "cs_alpha_refund_ok",
+        "psp_used": "stripe",
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_REFUND_OK"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        assert order_id == "ORD_ALPHA_REFUND_OK"
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777444",
+            "shopify_order_name": "#1774",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777444",
+        }
+
+    async def fake_create_refund(*, order_id: str, amount: float, reason: str, source: str, created_by: str, idempotency_key=None):
+        assert order_id == "ORD_ALPHA_REFUND_OK"
+        assert amount == 29.0
+        order_state["status"] = "refunded"
+        order_state["payment_status"] = "refunded"
+        order_state["total_refunded"] = 29.0
+        return {
+            "status": "success",
+            "refund_id": "REF_ALPHA_OK",
+            "psp_refund_id": "re_alpha_ok",
+        }
+
+    async def fake_ensure_external_refund_transaction_best_effort(**kwargs):
+        assert kwargs["shopify_order_id"] == "9001777444"
+        assert kwargs["external_refund_ref"] == "re_alpha_ok"
+        return {"ok": True, "created": True, "transaction_id": "txn_ref_alpha_ok"}
+
+    async def fake_log_order_event(**_kwargs):
+        return None
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+    monkeypatch.setattr(readiness_service.refund_service, "create_refund", fake_create_refund)
+    monkeypatch.setattr(readiness_service, "ensure_external_refund_transaction_best_effort", fake_ensure_external_refund_transaction_best_effort)
+    monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-refund-ok",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    sync = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    assert sync.status_code == 200
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/refund",
+        json={"reason": "operator_canary_refund"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["refund_status"] == "success"
+    assert body["refund_id"] == "REF_ALPHA_OK"
+    assert body["psp_refund_id"] == "re_alpha_ok"
+    assert body["payment_status"] == "refunded"
+    assert body["status"] == "refunded"
+    assert body["transaction_sync"]["ok"] is True
+    assert body["replayed"] is False
 
 
 def test_order_sync_replay_reconciles_cancelled_order_state(monkeypatch):

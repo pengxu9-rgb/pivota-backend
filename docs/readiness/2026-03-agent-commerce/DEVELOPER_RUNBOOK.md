@@ -286,6 +286,29 @@ This route is intentionally narrow:
 
 Use this path when payment intent creation already happened through readiness and you want readiness to absorb real PSP state before attempting refund validation.
 
+## Refund
+
+When a readiness-owned checkout has already converged to a paid or partially-refunded order, you can trigger an internal refund through the readiness router:
+
+```bash
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout-sessions/<checkout_id>/refund" \
+  -d '{
+    "reason": "readiness_alpha_refund",
+    "sync_shopify_refund_transaction": true
+  }'
+```
+
+This route is intentionally narrow:
+
+- it requires a readiness-owned local order
+- it requires `payment_status` to already be refundable (`paid`, `completed`, or `partially_refunded`)
+- it reuses the existing refund service rather than a separate readiness-only refund stack
+- it best-effort syncs a matching Shopify refund transaction when the refund completes
+- it should fail closed with `CHECKOUT_REFUND_NOT_ELIGIBLE` for unpaid canaries
+
 ## Error Contract Probes
 
 Blocked checkout should fail closed with a readiness-specific top-level code:

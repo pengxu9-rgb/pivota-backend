@@ -299,6 +299,33 @@ Current semantics:
 - if the PSP still reports `requires_payment_method` / `requires_action`, readiness keeps the order in `awaiting_payment`
 - the March 18, 2026 production spot-check for `merch_efbc46b4619cfbdf` validated the non-paid branch against a live Stripe intent and returned `normalized_payment_status=awaiting_payment` with `bridged_to_paid=false`
 
+## Refund Contract
+
+Readiness alpha also exposes an additive internal refund surface once the readiness-owned order has become refundable:
+
+- `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/refund`
+
+Request:
+
+```json
+{
+  "amount": null,
+  "reason": "readiness_alpha_refund",
+  "source": "readiness_alpha_refund",
+  "idempotency_key": null,
+  "sync_shopify_refund_transaction": true
+}
+```
+
+Current semantics:
+
+- the route is internal-only and feature-flagged
+- it requires a readiness-owned local order
+- it requires the local order to already be in a refundable payment state
+- it reuses the existing refund service and refund records flow
+- it best-effort syncs a matching Shopify refund transaction when the refund completes
+- it fails closed with `CHECKOUT_REFUND_NOT_ELIGIBLE` when the readiness order is still unpaid
+
 ## Order Sync Contract
 
 Request:

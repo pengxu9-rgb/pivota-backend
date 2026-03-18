@@ -16,6 +16,7 @@ Implemented:
 - internal payment bridge for attaching an externally successful PSP reference to a readiness order and making refund validation possible without rewriting the payment stack
 - internal payment-intent route for minting a PSP payment intent directly against a readiness-created local order
 - internal payment-status-sync route for polling PSP state from a readiness-owned `payment_intent_id` and auto-bridging only on real paid status
+- internal refund route for readiness-owned paid orders, reusing the platform refund service and refund-record flow
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
 
@@ -23,7 +24,7 @@ Validated:
 
 - `python3 -m py_compile` on the readiness modules and router
 - `python3 -m pytest readiness/tests -q`
-- result after current payment-intent + payment-bridge + payment-status-sync + audit-eligibility work: `40 passed`
+- result after current payment-intent + payment-bridge + payment-status-sync + refund-route work: `43 passed`
 - targeted follow-up validation for sync-audit work:
   - `python3 -m pytest readiness/tests/test_sync_audit.py readiness/tests/test_routes.py tests/test_error_handler.py -q`
   - `bash -n scripts/smoke_readiness_alpha.sh`
