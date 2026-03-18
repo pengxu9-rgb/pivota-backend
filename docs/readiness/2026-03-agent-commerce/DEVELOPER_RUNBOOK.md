@@ -35,6 +35,8 @@ bash scripts/smoke_readiness_alpha.sh \
   --internal-key "$READINESS_INTERNAL_API_KEY"
 ```
 
+The smoke script now uses the lightweight readiness summary views for its read-only report/export steps so production probes do not have to stream full product or offer payloads.
+
 Single supervised live canary:
 
 ```bash
@@ -76,12 +78,28 @@ curl -s \
   "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/report?channel=ucp"
 ```
 
+Compact summary view:
+
+```bash
+curl -s \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/report?channel=ucp&summary_only=true&sample_limit=25"
+```
+
 ## Export
 
 ```bash
 curl -s \
   -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
   "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/exports/ucp"
+```
+
+Compact summary view:
+
+```bash
+curl -s \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/exports/ucp?summary_only=true&sample_limit=25"
 ```
 
 ## Checkout

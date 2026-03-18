@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_MERCHANT_ID="merch_efbc46b4619cfbdf"
+SUMMARY_QUERY_SUFFIX="summary_only=true&sample_limit=25"
 
 BASE_URL=""
 MERCHANT_ID="${READINESS_ALPHA_MERCHANT_ID:-$DEFAULT_MERCHANT_ID}"
@@ -343,29 +344,29 @@ main() {
 
   info "Step 1/4: readiness report"
   local report_status
-  report_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/report?channel=ucp" "$report_json")"
+  report_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/report?channel=ucp&$SUMMARY_QUERY_SUFFIX" "$report_json")"
   expect_status "$report_status" "200" "Readiness report" "$report_json"
   validate_report_contract "$report_json"
-  jq '{merchant_id,merchant_alpha_mode,readiness_score,capability_status,blockers,warnings,source_of_truth,ready_variant_ids:[.products[].variants[]|select(.channel_coverage.ucp=="ready")|.variant_id],blocked_variant_ids:[.products[].variants[]|select(.channel_coverage.ucp!="ready")|.variant_id]}' "$report_json"
+  jq '{merchant_id,merchant_alpha_mode,response_mode,readiness_score,capability_status,blockers,warnings,source_of_truth,summary}' "$report_json"
 
   info "Step 2/4: UCP export"
   local export_status
-  export_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/exports/ucp" "$export_json")"
+  export_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/exports/ucp?$SUMMARY_QUERY_SUFFIX" "$export_json")"
   expect_status "$export_status" "200" "UCP export" "$export_json"
   validate_export_contract "$export_json"
-  jq '{merchant_id,merchant_alpha_mode,readiness_score,capability_status,blockers,warnings,validation_warnings,source_of_truth,offer_ids:[.offers[].offer_id]}' "$export_json"
+  jq '{merchant_id,merchant_alpha_mode,response_mode,readiness_score,capability_status,blockers,warnings,validation_warnings,source_of_truth,summary}' "$export_json"
 
   local ready_variant_count
-  ready_variant_count="$(jq '[.products[].variants[] | select(.channel_coverage.ucp=="ready")] | length' "$report_json")"
+  ready_variant_count="$(jq '.summary.ready_variant_count // 0' "$report_json")"
   if [[ "$ready_variant_count" -gt 0 ]]; then
-    jq -e '.offers | length > 0' "$export_json" >/dev/null || die "Export returned zero offers even though the report has ready variants"
+    jq -e '.summary.offer_count > 0' "$export_json" >/dev/null || die "Export returned zero offers even though the report has ready variants"
   fi
 
   if [[ -z "$READY_VARIANT_ID" ]]; then
-    READY_VARIANT_ID="$(jq -r '([.products[].variants[] | select(.channel_coverage.ucp=="ready") | .variant_id][0] // "")' "$report_json")"
+    READY_VARIANT_ID="$(jq -r '(.summary.ready_variant_ids_sample[0] // "")' "$report_json")"
   fi
   if [[ -z "$BLOCKED_VARIANT_ID" ]]; then
-    BLOCKED_VARIANT_ID="$(jq -r '([.products[].variants[] | select(.channel_coverage.ucp!="ready") | .variant_id][0] // "")' "$report_json")"
+    BLOCKED_VARIANT_ID="$(jq -r '(.summary.blocked_variant_ids_sample[0] // "")' "$report_json")"
   fi
 
   local checkout_capability

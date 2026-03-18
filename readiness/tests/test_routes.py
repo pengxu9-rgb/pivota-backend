@@ -102,6 +102,37 @@ def test_real_merchant_report_and_export(monkeypatch):
     assert all(offer["reviews"]["has_reviews"] is True for offer in export_json["offers"])
 
 
+def test_real_merchant_summary_report_and_export(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    report = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/report?channel=ucp&summary_only=true&sample_limit=2"
+    )
+    assert report.status_code == 200
+    report_json = report.json()
+    assert report_json["response_mode"] == "summary"
+    assert report_json["products"] == []
+    assert report_json["summary"]["product_count"] == 2
+    assert report_json["summary"]["variant_count"] == 4
+    assert report_json["summary"]["ready_variant_count"] == 3
+    assert report_json["summary"]["blocked_variant_count"] == 1
+    assert report_json["summary"]["sample_limit"] == 2
+    assert len(report_json["summary"]["ready_variant_ids_sample"]) == 2
+    assert report_json["summary"]["blocked_variant_ids_sample"] == ["431000000004"]
+
+    export = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/exports/ucp?summary_only=true&sample_limit=2"
+    )
+    assert export.status_code == 200
+    export_json = export.json()
+    assert export_json["response_mode"] == "summary"
+    assert export_json["offers"] == []
+    assert export_json["summary"]["offer_count"] == 3
+    assert export_json["summary"]["review_backed_offer_count"] == 3
+    assert export_json["summary"]["sample_limit"] == 2
+    assert len(export_json["summary"]["offer_ids_sample"]) == 2
+
+
 def test_checkout_blocked_when_capability_missing(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=False)
 

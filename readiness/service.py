@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -19,6 +20,162 @@ logger = logging.getLogger(__name__)
 
 class UnsupportedMerchantError(KeyError):
     pass
+
+
+def _append_sample(sample: List[str], value: Optional[str], *, sample_limit: int) -> None:
+    candidate = str(value or "").strip()
+    if not candidate or len(sample) >= sample_limit or candidate in sample:
+        return
+    sample.append(candidate)
+
+
+def build_snapshot_summary_response(
+    snapshot: MerchantReadinessSnapshot,
+    *,
+    sample_limit: int = 25,
+) -> Dict[str, Any]:
+    ready_variant_ids_sample: List[str] = []
+    blocked_variant_ids_sample: List[str] = []
+    product_ids_sample: List[str] = []
+    blocked_checkout_reason_counts: Counter[str] = Counter()
+    blocked_discovery_reason_counts: Counter[str] = Counter()
+    products_with_reviews = 0
+    grouped_products_with_reviews = 0
+    total_variants = 0
+
+    for product in snapshot.products:
+        _append_sample(product_ids_sample, product.product_id, sample_limit=sample_limit)
+        if product.reviews and product.reviews.has_reviews:
+            products_with_reviews += 1
+            if product.reviews.has_group:
+                grouped_products_with_reviews += 1
+        for variant in product.variants:
+            total_variants += 1
+            if variant.channel_coverage.get("ucp") == "ready":
+                _append_sample(ready_variant_ids_sample, variant.variant_id, sample_limit=sample_limit)
+            else:
+                _append_sample(blocked_variant_ids_sample, variant.variant_id, sample_limit=sample_limit)
+            blocked_checkout_reason_counts.update(variant.checkout.blockers)
+            blocked_discovery_reason_counts.update(variant.discovery.blockers)
+
+    return {
+        "report_version": snapshot.report_version,
+        "merchant_id": snapshot.merchant_id,
+        "merchant_name": snapshot.merchant_name,
+        "channel": snapshot.channel,
+        "generated_at": snapshot.generated_at,
+        "merchant_alpha_mode": snapshot.merchant_alpha_mode,
+        "response_mode": "summary",
+        "readiness_score": snapshot.readiness_score,
+        "domain_scores": snapshot.domain_scores,
+        "capability_status": snapshot.capability_status,
+        "blockers": snapshot.blockers,
+        "warnings": snapshot.warnings,
+        "merchant_capabilities": [
+            capability.model_dump() if hasattr(capability, "model_dump") else capability.dict()
+            for capability in snapshot.merchant_capabilities
+        ],
+        "channel_coverage": [
+            coverage.model_dump() if hasattr(coverage, "model_dump") else coverage.dict()
+            for coverage in snapshot.channel_coverage
+        ],
+        "source_of_truth": snapshot.source_of_truth,
+        "stubbed_capabilities": snapshot.stubbed_capabilities,
+        "audit_notes": snapshot.audit_notes,
+        "products": [],
+        "summary": {
+            "product_count": len(snapshot.products),
+            "variant_count": total_variants,
+            "ready_variant_count": next(
+                (coverage.ready_variant_count for coverage in snapshot.channel_coverage if coverage.channel == snapshot.channel),
+                0,
+            ),
+            "blocked_variant_count": next(
+                (coverage.blocked_variant_count for coverage in snapshot.channel_coverage if coverage.channel == snapshot.channel),
+                0,
+            ),
+            "product_ids_sample": product_ids_sample,
+            "ready_variant_ids_sample": ready_variant_ids_sample,
+            "blocked_variant_ids_sample": blocked_variant_ids_sample,
+            "blocked_checkout_reason_counts": dict(sorted(blocked_checkout_reason_counts.items())),
+            "blocked_discovery_reason_counts": dict(sorted(blocked_discovery_reason_counts.items())),
+            "products_with_reviews": products_with_reviews,
+            "grouped_products_with_reviews": grouped_products_with_reviews,
+            "sample_limit": sample_limit,
+        },
+    }
+
+
+def build_export_summary_response(
+    snapshot: MerchantReadinessSnapshot,
+    *,
+    sample_limit: int = 25,
+) -> Dict[str, Any]:
+    offer_ids_sample: List[str] = []
+    product_ids_sample: List[str] = []
+    availability_counts: Counter[str] = Counter()
+    currency_counts: Counter[str] = Counter()
+    review_backed_offer_count = 0
+    offer_count = 0
+
+    for product in snapshot.products:
+        for variant in product.variants:
+            if variant.channel_coverage.get("ucp") != "ready":
+                continue
+            offer_count += 1
+            _append_sample(product_ids_sample, product.product_id, sample_limit=sample_limit)
+            _append_sample(
+                offer_ids_sample,
+                f"ucp:{snapshot.merchant_id}:{product.product_id}:{variant.variant_id}",
+                sample_limit=sample_limit,
+            )
+            availability_counts.update([str(variant.inventory.get("availability") or "unknown")])
+            currency_counts.update([str(variant.price.get("currency") or "USD")])
+            if variant.reviews and variant.reviews.has_reviews:
+                review_backed_offer_count += 1
+
+    readiness_score = next(
+        (
+            coverage.ready_variant_count * 100 // max(1, coverage.ready_variant_count + coverage.blocked_variant_count)
+            for coverage in snapshot.channel_coverage
+            if coverage.channel == "ucp"
+        ),
+        0,
+    )
+    validation_warnings = list(snapshot.warnings)
+    if snapshot.capability_status.get("reviews_confidence") == "blocked":
+        validation_warnings.append("review summaries are unavailable for the readiness model")
+    elif review_backed_offer_count < offer_count:
+        validation_warnings.append("review coverage is partial across exported offers")
+    if snapshot.merchant_alpha_mode != "real_merchant_alpha":
+        validation_warnings.append("checkout execution is stubbed for this thin slice")
+        validation_warnings.append("merchant write-back is stubbed for this thin slice")
+
+    return {
+        "export_version": "readiness_ucp_export.v1",
+        "merchant_id": snapshot.merchant_id,
+        "channel": "ucp",
+        "generated_at": snapshot.generated_at,
+        "merchant_alpha_mode": snapshot.merchant_alpha_mode,
+        "response_mode": "summary",
+        "readiness_score": readiness_score,
+        "capability_status": snapshot.capability_status,
+        "blockers": snapshot.blockers,
+        "warnings": snapshot.warnings,
+        "source_of_truth": snapshot.source_of_truth,
+        "validation_warnings": validation_warnings,
+        "stubbed_capabilities": snapshot.stubbed_capabilities,
+        "offers": [],
+        "summary": {
+            "offer_count": offer_count,
+            "review_backed_offer_count": review_backed_offer_count,
+            "availability_counts": dict(sorted(availability_counts.items())),
+            "currency_counts": dict(sorted(currency_counts.items())),
+            "offer_ids_sample": offer_ids_sample,
+            "product_ids_sample": product_ids_sample,
+            "sample_limit": sample_limit,
+        },
+    }
 
 
 async def build_readiness_snapshot(merchant_id: str, channel: str = "ucp") -> MerchantReadinessSnapshot:
