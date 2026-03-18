@@ -164,6 +164,74 @@ def test_checkout_blocked_error_code_is_preserved_with_error_handler(monkeypatch
     assert "merchant_checkout_capability_missing" in body["error"]["details"]["blockers"]
 
 
+def test_report_unsupported_channel_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/report?channel=google"
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "UNSUPPORTED_CHANNEL"
+    assert body["error"]["details"]["code"] == "UNSUPPORTED_CHANNEL"
+    assert body["error"]["details"]["channel"] == "google"
+
+
+def test_report_unsupported_merchant_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.get("/internal/readiness/merchants/not-supported-merchant/report?channel=ucp")
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "READINESS_MERCHANT_UNSUPPORTED"
+    assert body["error"]["details"]["code"] == "READINESS_MERCHANT_UNSUPPORTED"
+    assert "supported_merchants" in body["error"]["details"]
+
+
+def test_checkout_variant_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={"variant_id": "does-not-exist", "quantity": 1},
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "VARIANT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "VARIANT_NOT_FOUND"
+    assert body["error"]["details"]["variant_id"] == "does-not-exist"
+
+
+def test_checkout_session_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.get("/internal/readiness/checkout-sessions/rdchk_missing")
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
+def test_order_sync_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/rdchk_missing",
+        json={"replay": False},
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
 def test_real_merchant_checkout_and_order_sync_are_idempotent(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=True)
 
