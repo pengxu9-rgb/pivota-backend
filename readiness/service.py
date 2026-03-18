@@ -618,6 +618,8 @@ def _fulfilled_like_for_return(status_value: Any) -> bool:
     status = str(status_value or "").strip().lower()
     return status in {
         "fulfilled",
+        "shipped",
+        "delivered",
         "partial",
         "partially_fulfilled",
         "partial_fulfilled",
