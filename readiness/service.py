@@ -150,6 +150,15 @@ def _stripe_obj_value(obj: Any, field: str) -> Any:
     return getattr(obj, field, None)
 
 
+def _infer_psp_from_payment_reference(payment_reference: Any) -> Optional[str]:
+    ref = str(payment_reference or "").strip().lower()
+    if not ref:
+        return None
+    if ref.startswith(("pi_", "cs_", "ch_", "src_", "seti_")):
+        return "stripe"
+    return None
+
+
 async def _query_stripe_checkout_session_status(adapter: Any, checkout_session_id: str) -> Dict[str, Any]:
     api_key = str(getattr(adapter, "api_key", "") or "").strip()
     if not api_key:
@@ -1058,8 +1067,10 @@ async def attach_payment_reference_to_checkout(
             )
         replayed = True
 
+    inferred_psp = _infer_psp_from_payment_reference(payment_reference)
     resolved_psp = (
         str(psp_used or "").strip().lower()
+        or inferred_psp
         or str(order_row.get("psp_used") or "").strip().lower()
         or str(((payload.get("payment_capabilities") or {}).get("psp_provider")) or "").strip().lower()
     )
@@ -1115,6 +1126,12 @@ async def attach_payment_reference_to_checkout(
     next_payload = {
         "payment_reference": payment_reference,
         "payment_psp_used": resolved_psp,
+        "payment_reference_type": (
+            "stripe_checkout_session"
+            if payment_reference.startswith("cs_")
+            else ("payment_intent" if payment_reference.startswith("pi_") else payload.get("payment_reference_type"))
+        ),
+        "checkout_session_id": payment_reference if payment_reference.startswith("cs_") else payload.get("checkout_session_id"),
         "payment_bridge": {
             "source": source,
             "mark_paid": mark_paid,
