@@ -1344,6 +1344,7 @@ def test_refund_success_reconciles_order_state(monkeypatch):
     assert body["refund_status"] == "success"
     assert body["refund_id"] == "REF_ALPHA_OK"
     assert body["psp_refund_id"] == "re_alpha_ok"
+    assert body["platform_refund_id"] == "re_alpha_ok"
     assert body["payment_status"] == "refunded"
     assert body["status"] == "refunded"
     assert body["transaction_sync"]["ok"] is True

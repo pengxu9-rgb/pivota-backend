@@ -480,6 +480,7 @@ async def create_checkout_refund(
         "refund_status": result["refund_status"],
         "refund_id": result["refund_id"],
         "psp_refund_id": result["psp_refund_id"],
+        "platform_refund_id": result.get("platform_refund_id"),
         "amount": result["amount"],
         "remaining_refundable_before": result["remaining_refundable_before"],
         "transaction_sync": result["transaction_sync"],

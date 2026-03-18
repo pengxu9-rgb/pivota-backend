@@ -62,6 +62,8 @@ class RefundService:
                     return {
                         "status": "duplicate",
                         "refund_id": existing["refund_id"],
+                        "psp_refund_id": existing.get("psp_refund_id"),
+                        "platform_refund_id": existing.get("platform_refund_id") or existing.get("psp_refund_id"),
                         "message": "Refund already processed",
                         "refund": existing
                     }
@@ -113,6 +115,7 @@ class RefundService:
                         "status": "success",
                         "refund_id": refund_id,
                         "psp_refund_id": psp_result["refund_id"],
+                        "platform_refund_id": psp_result["refund_id"],
                         "amount": amount,
                         "message": "Refund processed successfully"
                     }
@@ -139,7 +142,7 @@ class RefundService:
     async def _check_existing_refund(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
         """Check if refund with this idempotency key already exists"""
         query = """
-        SELECT refund_id, order_id, amount, status, created_at
+        SELECT refund_id, order_id, amount, status, created_at, psp_refund_id, platform_refund_id
         FROM refund_records
         WHERE idempotency_key = :key
         """
@@ -331,6 +334,7 @@ class RefundService:
         SET 
             status = 'completed',
             psp_refund_id = :psp_refund_id,
+            platform_refund_id = COALESCE(platform_refund_id, :psp_refund_id),
             processed_at = NOW()
         WHERE refund_id = :refund_id
         """

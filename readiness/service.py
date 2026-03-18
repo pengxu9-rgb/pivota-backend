@@ -1311,6 +1311,7 @@ async def create_refund_for_checkout(
     refund_status = str((refund_result or {}).get("status") or "unknown")
     refund_id = (refund_result or {}).get("refund_id")
     psp_refund_id = (refund_result or {}).get("psp_refund_id")
+    platform_refund_id = (refund_result or {}).get("platform_refund_id") or psp_refund_id
 
     await log_order_event(
         event_type="readiness_refund_requested",
@@ -1324,6 +1325,7 @@ async def create_refund_for_checkout(
             "checkout_id": checkout_id,
             "refund_id": refund_id,
             "psp_refund_id": psp_refund_id,
+            "platform_refund_id": platform_refund_id,
             "amount": float(refund_amount),
             "reason": reason,
             "source": source,
@@ -1338,6 +1340,7 @@ async def create_refund_for_checkout(
             "order_id": order_id,
             "refund_id": refund_id,
             "psp_refund_id": psp_refund_id,
+            "platform_refund_id": platform_refund_id,
             "amount": float(refund_amount),
             "reason": reason,
             "refund_status": refund_status,
@@ -1384,6 +1387,7 @@ async def create_refund_for_checkout(
                 "last_refund": {
                     "refund_id": refund_id,
                     "psp_refund_id": psp_refund_id,
+                    "platform_refund_id": platform_refund_id,
                     "amount": float(refund_amount),
                     "refund_status": refund_status,
                     "source": source,
@@ -1398,6 +1402,7 @@ async def create_refund_for_checkout(
         "refund_status": refund_status,
         "refund_id": refund_id,
         "psp_refund_id": psp_refund_id,
+        "platform_refund_id": platform_refund_id,
         "amount": float(refund_amount),
         "remaining_refundable_before": float(remaining),
         "transaction_sync": transaction_sync,
