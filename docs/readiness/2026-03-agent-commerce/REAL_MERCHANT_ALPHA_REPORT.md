@@ -51,6 +51,11 @@ Supervised production payment-intent canary on March 18, 2026:
   - `refund_sync=not_eligible`
   - refund ineligibility reason: `order_not_paid`
 - the next readiness-owned bridge point is `payment-status-sync`, which can poll the PSP for that `payment_intent_id` and only auto-mark paid if the PSP reports a real successful terminal state
+- production spot-check on that route succeeded on March 18, 2026:
+  - missing checkout returned `CHECKOUT_NOT_FOUND`
+  - existing Stripe-backed checkout `rdchk_cce46acd5fc340c1` returned `payment_intent_status=requires_payment_method`
+  - readiness normalized that to `awaiting_payment`
+  - no false paid bridge occurred
 
 Captured fixture expectation kept for regression:
 

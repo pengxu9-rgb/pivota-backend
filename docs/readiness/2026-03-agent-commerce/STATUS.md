@@ -71,6 +71,15 @@ Validated:
     - `webhook_ingest=ready`
     - `refund_sync=not_eligible`
     - refund ineligibility reason: `order_not_paid`
+- production payment-status-sync probe on March 18, 2026
+  - missing checkout probe: `404`
+  - top-level error code: `CHECKOUT_NOT_FOUND`
+  - existing readiness checkout probe: `200`
+  - checkout id: `rdchk_cce46acd5fc340c1`
+  - payment intent status from PSP: `requires_payment_method`
+  - normalized payment status: `awaiting_payment`
+  - `bridged_to_paid=false`
+  - `replayed=true`
 - supervised production canary write on March 17, 2026
   - checkout create: `200`
   - checkout id: `rdchk_4b7c7a42214f4bf0`
@@ -96,4 +105,4 @@ Major remaining risks:
 - full report/export payloads remain large when `summary_only` is not used
 - refund and return sync still need a live exercise; cancellation sync is live-validated, and refund is now structurally unblocked by the payment bridge, but a real paid canary reference still needs operator validation
 - readiness can now create PSP payment intents itself, and production has validated live intent creation plus idempotent replay, but not yet PSP confirmation/capture or a paid-bridge refund exercise
-- readiness can now also poll PSP status from the stored payment intent without confirming the payment itself, but this new sync route still needs a production spot-check
+- readiness can now also poll PSP status from the stored payment intent without confirming the payment itself, and production has validated the non-paid `awaiting_payment` branch; what remains is a real paid transition followed by refund validation

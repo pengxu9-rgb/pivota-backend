@@ -297,6 +297,7 @@ Current semantics:
 - it does not confirm or capture the payment
 - if the PSP reports a paid terminal state, readiness auto-bridges that payment reference back into the order and best-effort syncs the Shopify transaction
 - if the PSP still reports `requires_payment_method` / `requires_action`, readiness keeps the order in `awaiting_payment`
+- the March 18, 2026 production spot-check for `merch_efbc46b4619cfbdf` validated the non-paid branch against a live Stripe intent and returned `normalized_payment_status=awaiting_payment` with `bridged_to_paid=false`
 
 ## Order Sync Contract
 

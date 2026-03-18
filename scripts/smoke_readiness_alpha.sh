@@ -14,9 +14,13 @@ OUT_DIR=""
 CANARY_WRITE=0
 READY_VARIANT_ID=""
 BLOCKED_VARIANT_ID=""
+CREATE_PAYMENT_INTENT=0
+PAYMENT_STATUS_SYNC=0
 PAYMENT_REFERENCE="${PAYMENT_REFERENCE:-}"
 PAYMENT_PSP="${PAYMENT_PSP:-stripe}"
 PAYMENT_BRIDGE_SOURCE="${PAYMENT_BRIDGE_SOURCE:-operator_canary_bridge}"
+PAYMENT_INTENT_PREFERRED_PSPS="${PAYMENT_INTENT_PREFERRED_PSPS:-}"
+PAYMENT_INTENT_PSP_MODE="${PAYMENT_INTENT_PSP_MODE:-}"
 BUYER_EMAIL="${BUYER_EMAIL:-ops-canary@example.com}"
 CUSTOMER_NAME="${CUSTOMER_NAME:-Pivota Canary}"
 ADDRESS_NAME="${ADDRESS_NAME:-Pivota Canary}"
@@ -47,9 +51,15 @@ Options:
   --ready-variant-id ID        Override the ready variant selected from the report.
   --blocked-variant-id ID      Override the blocked variant selected from the report.
   --canary-write               Opt in to one live checkout + order-sync canary.
+  --create-payment-intent      After canary order-sync, mint a readiness-owned PSP payment intent.
+  --payment-status-sync        After canary order-sync, poll PSP status for the readiness payment intent.
   --payment-reference REF      Optional. Attach an external paid payment reference after canary write.
   --payment-psp PSP            Optional. PSP provider for the payment bridge. Default: $PAYMENT_PSP
   --payment-bridge-source SRC  Optional. Source label for the payment bridge event. Default: $PAYMENT_BRIDGE_SOURCE
+  --payment-intent-preferred-psps CSV
+                               Optional. Comma-separated PSP preference order for payment-intent creation.
+  --payment-intent-psp-mode VALUE
+                               Optional. Pass through psp_mode for payment-intent creation, e.g. stripe_checkout.
   --buyer-email EMAIL          Canary checkout buyer email. Default: $BUYER_EMAIL
   --customer-name NAME         Canary checkout customer name. Default: $CUSTOMER_NAME
   --address-name NAME          Canary shipping recipient. Default: $ADDRESS_NAME
@@ -66,6 +76,7 @@ Examples:
   $SCRIPT_NAME --base-url https://prod.example.com --internal-key "\$READINESS_INTERNAL_API_KEY"
   $SCRIPT_NAME --base-url https://prod.example.com --internal-key "\$READINESS_INTERNAL_API_KEY" --canary-write
   $SCRIPT_NAME --base-url https://prod.example.com --internal-key "\$READINESS_INTERNAL_API_KEY" --canary-write --payment-reference pi_live_123
+  $SCRIPT_NAME --base-url https://prod.example.com --internal-key "\$READINESS_INTERNAL_API_KEY" --canary-write --create-payment-intent --payment-status-sync
 EOF
 }
 
@@ -121,6 +132,14 @@ parse_args() {
         CANARY_WRITE=1
         shift
         ;;
+      --create-payment-intent)
+        CREATE_PAYMENT_INTENT=1
+        shift
+        ;;
+      --payment-status-sync)
+        PAYMENT_STATUS_SYNC=1
+        shift
+        ;;
       --payment-reference)
         PAYMENT_REFERENCE="${2:-}"
         shift 2
@@ -131,6 +150,14 @@ parse_args() {
         ;;
       --payment-bridge-source)
         PAYMENT_BRIDGE_SOURCE="${2:-}"
+        shift 2
+        ;;
+      --payment-intent-preferred-psps)
+        PAYMENT_INTENT_PREFERRED_PSPS="${2:-}"
+        shift 2
+        ;;
+      --payment-intent-psp-mode)
+        PAYMENT_INTENT_PSP_MODE="${2:-}"
         shift 2
         ;;
       --buyer-email)
@@ -342,8 +369,13 @@ main() {
   local order_sync_json="$OUT_DIR/order_sync.json"
   local checkout_session_after_json="$OUT_DIR/checkout_session_after_sync.json"
   local order_sync_audit_json="$OUT_DIR/order_sync_audit.json"
+  local payment_intent_payload_json="$OUT_DIR/payment_intent_payload.json"
+  local payment_intent_json="$OUT_DIR/payment_intent.json"
+  local payment_status_sync_payload_json="$OUT_DIR/payment_status_sync_payload.json"
+  local payment_status_sync_json="$OUT_DIR/payment_status_sync.json"
   local payment_bridge_payload_json="$OUT_DIR/payment_bridge_payload.json"
   local payment_bridge_json="$OUT_DIR/payment_bridge.json"
+  local order_sync_audit_after_status_sync_json="$OUT_DIR/order_sync_audit_after_status_sync.json"
   local order_sync_audit_after_payment_json="$OUT_DIR/order_sync_audit_after_payment.json"
   local order_sync_replay_json="$OUT_DIR/order_sync_replay.json"
 
@@ -351,6 +383,8 @@ main() {
   info "Output directory: $OUT_DIR"
   info "Merchant: $MERCHANT_ID"
   info "Canary write enabled: $CANARY_WRITE"
+  info "Create payment intent: $CREATE_PAYMENT_INTENT"
+  info "Payment status sync: $PAYMENT_STATUS_SYNC"
 
   maybe_run_db_query \
     "merchant_onboarding preflight" \
@@ -466,6 +500,50 @@ main() {
   expect_status "$audit_status" "200" "Order sync audit" "$order_sync_audit_json"
   jq '{checkout_id,order_id,shopify_order_id,checkout_status,order_state,sync_signals,warnings,recommendations}' "$order_sync_audit_json"
   jq -e '.sync_signals.merchant_writeback.status == "ready"' "$order_sync_audit_json" >/dev/null || die "Order sync audit did not confirm merchant_writeback=ready"
+
+  if [[ "$CREATE_PAYMENT_INTENT" -eq 1 ]]; then
+    info "Optional payment-intent: creating readiness-owned PSP intent"
+    jq -n \
+      --arg preferred_psps_csv "$PAYMENT_INTENT_PREFERRED_PSPS" \
+      --arg psp_mode "$PAYMENT_INTENT_PSP_MODE" \
+      '
+        {
+          preferred_psps: (
+            if $preferred_psps_csv == "" then null
+            else ($preferred_psps_csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))
+            end
+          ),
+          psp_mode: (if $psp_mode == "" then null else $psp_mode end)
+        }
+      ' >"$payment_intent_payload_json"
+
+    local payment_intent_status
+    payment_intent_status="$(request_json POST "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/checkout-sessions/$checkout_id/payment-intent" "$payment_intent_json" "$payment_intent_payload_json")"
+    expect_status "$payment_intent_status" "200" "Payment intent creation" "$payment_intent_json"
+    jq '{checkout_id,order_id,status,payment_status,payment_intent_id,psp_used,payment_intent_status,bridged_to_paid,replayed,payment_action}' "$payment_intent_json"
+    jq -e '(.payment_intent_id // "") != ""' "$payment_intent_json" >/dev/null || die "Payment intent response did not include payment_intent_id"
+  fi
+
+  if [[ "$PAYMENT_STATUS_SYNC" -eq 1 ]]; then
+    info "Optional payment-status-sync: polling PSP state for readiness payment intent"
+    jq -n \
+      '{
+        mark_paid_on_success: true,
+        sync_shopify_transaction: true
+      }' >"$payment_status_sync_payload_json"
+
+    local payment_status_sync_status
+    payment_status_sync_status="$(request_json POST "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/checkout-sessions/$checkout_id/payment-status-sync" "$payment_status_sync_json" "$payment_status_sync_payload_json")"
+    expect_status "$payment_status_sync_status" "200" "Payment status sync" "$payment_status_sync_json"
+    jq '{checkout_id,order_id,status,payment_status,payment_intent_id,psp_used,payment_intent_status,normalized_payment_status,bridged_to_paid,replayed}' "$payment_status_sync_json"
+    jq -e '(.payment_intent_id // "") != ""' "$payment_status_sync_json" >/dev/null || die "Payment status sync did not return a payment_intent_id"
+    jq -e '(.normalized_payment_status // "") != ""' "$payment_status_sync_json" >/dev/null || die "Payment status sync did not return normalized_payment_status"
+
+    local audit_after_status_sync_status
+    audit_after_status_sync_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/order-sync-audit/$checkout_id?sample_limit=10" "$order_sync_audit_after_status_sync_json")"
+    expect_status "$audit_after_status_sync_status" "200" "Order sync audit after payment status sync" "$order_sync_audit_after_status_sync_json"
+    jq '{checkout_id,order_id,checkout_status,order_state,sync_signals,warnings,recommendations}' "$order_sync_audit_after_status_sync_json"
+  fi
 
   if [[ -n "$PAYMENT_REFERENCE" ]]; then
     info "Optional payment bridge: attaching external payment reference"

@@ -49,6 +49,17 @@ bash scripts/smoke_readiness_alpha.sh \
   --canary-write
 ```
 
+Canary with readiness-owned payment intent plus PSP status poll:
+
+```bash
+bash scripts/smoke_readiness_alpha.sh \
+  --base-url https://<prod-host> \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --canary-write \
+  --create-payment-intent \
+  --payment-status-sync
+```
+
 If you already have a successful PSP payment reference from an external execution path, the smoke script can bridge it into the readiness order after the canary write:
 
 ```bash
@@ -248,6 +259,7 @@ Observed production alpha behavior on March 18, 2026:
 - the initial live response converged to `payment_status=awaiting_payment`
 - a repeated call replayed the same `payment_intent_id` with `replayed=true`
 - the follow-up `order-sync-audit` remained `refund_sync=not_eligible` until a paid confirmation or explicit `payment-bridge` occurs
+- the smoke script now supports `--create-payment-intent` and `--payment-status-sync` so this operator path can be exercised without hand-written curls
 
 ## Payment Status Sync
 
