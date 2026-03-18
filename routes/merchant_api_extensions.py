@@ -688,6 +688,25 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         # DON'T catch errors silently - raise them so we can see what's wrong
         raise HTTPException(status_code=500, detail=f"Dashboard stats failed: {str(e)}")
 
+
+@router.get("/merchant/dashboard/readiness")
+async def get_dashboard_readiness(current_user: dict = Depends(get_current_user)):
+    """Get readiness summary independently from heavier dashboard analytics."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        summary = await build_readiness_summary(merchant_id)
+        return {
+            "status": "success",
+            "data": summary.model_dump(),
+        }
+    except Exception as e:
+        logger.error(f"❌ Dashboard readiness error for merchant {merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Dashboard readiness failed: {str(e)}")
+
 @router.put("/merchant/profile")
 async def update_merchant_profile(
     profile_data: Dict[str, Any] = Body(...),
