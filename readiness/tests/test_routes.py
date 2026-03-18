@@ -502,6 +502,7 @@ def test_real_merchant_payment_bridge_marks_order_paid_and_syncs_transaction(mon
         "total_refunded": 0,
     }
     payment_updates = []
+    order_updates = []
     bridged_events = []
 
     async def fake_create_order(_order_data):
@@ -544,19 +545,34 @@ def test_real_merchant_payment_bridge_marks_order_paid_and_syncs_transaction(mon
         order_state["payment_status"] = "paid"
         return True
 
+    async def fake_update_order(order_id: str, update_data):
+        assert order_id == "ORD_ALPHA_PAID"
+        order_updates.append(dict(update_data))
+        if "metadata" in update_data:
+            order_state["metadata"] = dict(update_data["metadata"])
+        return True
+
     async def fake_log_order_event(**kwargs):
         bridged_events.append(kwargs)
 
     async def fake_ensure_external_payment_transaction_best_effort(**kwargs):
         assert kwargs["shopify_order_id"] == "9001888999"
         assert kwargs["external_payment_ref"] == "pi_alpha_bridge_1"
-        return {"ok": True, "created": True, "transaction_id": "txn_alpha_bridge_1"}
+        return {
+            "ok": True,
+            "created": True,
+            "transaction_id": "txn_alpha_bridge_1",
+            "parent_transaction_id": 991,
+            "parent_transaction_gateway": "manual",
+            "parent_transaction_source": "created_manual_parent",
+        }
 
     monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
     monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
     monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
     monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
     monkeypatch.setattr(readiness_service, "update_payment_info", fake_update_payment_info)
+    monkeypatch.setattr(readiness_service, "update_order", fake_update_order)
     monkeypatch.setattr(readiness_service, "mark_order_paid", fake_mark_order_paid)
     monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
     monkeypatch.setattr(readiness_service, "ensure_external_payment_transaction_best_effort", fake_ensure_external_payment_transaction_best_effort)
@@ -602,10 +618,13 @@ def test_real_merchant_payment_bridge_marks_order_paid_and_syncs_transaction(mon
     assert bridge_json["payment_reference"] == "pi_alpha_bridge_1"
     assert bridge_json["psp_used"] == "stripe"
     assert bridge_json["transaction_sync"]["ok"] is True
+    assert bridge_json["transaction_sync"]["parent_transaction_id"] == 991
     assert bridge_json["replayed"] is False
 
     assert payment_updates[0]["payment_intent_id"] == "pi_alpha_bridge_1"
     assert payment_updates[0]["payment_status"] == "paid"
+    assert order_updates[0]["metadata"]["shopify_parent_transaction_id"] == 991
+    assert order_updates[0]["metadata"]["shopify_parent_transaction_gateway"] == "manual"
     assert bridged_events[0]["event_type"] == "readiness_payment_bridged"
 
     checkout_view = client.get(f"/internal/readiness/checkout-sessions/{checkout_id}")
@@ -613,6 +632,7 @@ def test_real_merchant_payment_bridge_marks_order_paid_and_syncs_transaction(mon
     payload = checkout_view.json()["checkout"]["session_payload"]
     assert payload["payment_reference"] == "pi_alpha_bridge_1"
     assert payload["payment_psp_used"] == "stripe"
+    assert payload["shopify_parent_transaction_id"] == 991
 
 
 def test_real_merchant_payment_intent_creation_is_idempotent(monkeypatch):
@@ -1258,6 +1278,7 @@ def test_refund_success_reconciles_order_state(monkeypatch):
         "payment_intent_id": "pi_alpha_refund_ok",
         "client_secret": "cs_alpha_refund_ok",
         "psp_used": "stripe",
+        "metadata": {"shopify_parent_transaction_id": 1444},
         "total": 29.0,
         "currency": "USD",
         "total_refunded": 0,
@@ -1297,6 +1318,7 @@ def test_refund_success_reconciles_order_state(monkeypatch):
     async def fake_ensure_external_refund_transaction_best_effort(**kwargs):
         assert kwargs["shopify_order_id"] == "9001777444"
         assert kwargs["external_refund_ref"] == "re_alpha_ok"
+        assert kwargs["parent_transaction_id"] == 1444
         return {"ok": True, "created": True, "transaction_id": "txn_ref_alpha_ok"}
 
     async def fake_log_order_event(**_kwargs):

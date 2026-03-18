@@ -11,7 +11,7 @@ import stripe
 
 from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
 from adapters.psp_adapter import get_psp_adapter
-from db.orders import create_order, get_order, mark_order_paid, update_fulfillment_info, update_payment_info
+from db.orders import create_order, get_order, mark_order_paid, update_fulfillment_info, update_order, update_payment_info
 from db.products import log_order_event
 from readiness.channel_exports.ucp import build_ucp_export
 from readiness.flags import readiness_alpha_merchant_id
@@ -47,6 +47,26 @@ def _normalized_payment_status(order_row: Optional[Dict[str, Any]]) -> str:
     if not order_row:
         return ""
     return str(order_row.get("payment_status") or "").strip().lower()
+
+
+def _normalized_metadata(order_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not order_row:
+        return {}
+    metadata = order_row.get("metadata")
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    return {}
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value))
+    except Exception:
+        return None
 
 
 def _coerce_psp_status_result(result: Any) -> Tuple[bool, str, Optional[str]]:
@@ -818,6 +838,19 @@ async def attach_payment_reference_to_checkout(
         except Exception:
             logger.warning("Payment transaction sync failed for checkout=%s", checkout_id, exc_info=True)
             transaction_sync = {"ok": False, "skipped": False, "reason": "transaction_sync_failed"}
+        parent_transaction_id = _coerce_int(transaction_sync.get("parent_transaction_id"))
+        if parent_transaction_id is not None:
+            refreshed_for_metadata = await get_order(order_id) or refreshed_order or order_row
+            merged_metadata = _normalized_metadata(refreshed_for_metadata)
+            merged_metadata["shopify_parent_transaction_id"] = parent_transaction_id
+            if transaction_sync.get("parent_transaction_gateway"):
+                merged_metadata["shopify_parent_transaction_gateway"] = transaction_sync.get("parent_transaction_gateway")
+            if transaction_sync.get("parent_transaction_source"):
+                merged_metadata["shopify_parent_transaction_source"] = transaction_sync.get("parent_transaction_source")
+            await update_order(order_id, {"metadata": merged_metadata})
+            next_payload["shopify_parent_transaction_id"] = parent_transaction_id
+            if transaction_sync.get("parent_transaction_gateway"):
+                next_payload["shopify_parent_transaction_gateway"] = transaction_sync.get("parent_transaction_gateway")
         if transaction_sync.get("ok"):
             await journal.append_event(
                 checkout_id=checkout_id,
@@ -828,6 +861,8 @@ async def attach_payment_reference_to_checkout(
                     "payment_reference": payment_reference,
                     "psp_used": resolved_psp,
                     "created": transaction_sync.get("created"),
+                    "parent_transaction_id": parent_transaction_id,
+                    "parent_transaction_gateway": transaction_sync.get("parent_transaction_gateway"),
                 },
             )
     elif sync_shopify_transaction:
@@ -1352,6 +1387,8 @@ async def create_refund_for_checkout(
 
     if refund_status in {"success", "duplicate"} and sync_shopify_refund_transaction:
         shopify_order_id = str((refreshed_order or {}).get("shopify_order_id") or "").strip()
+        order_metadata = _normalized_metadata(refreshed_order)
+        known_parent_transaction_id = _coerce_int(order_metadata.get("shopify_parent_transaction_id"))
         merchant_connection = payload.get("merchant_connection") or {}
         shopify_conn = merchant_connection.get("shopify") or {}
         shop_domain = str(shopify_conn.get("shop_domain") or "").strip()
@@ -1367,6 +1404,7 @@ async def create_refund_for_checkout(
                     external_refund_ref=str(psp_refund_id or refund_id or "").strip() or None,
                     amount=float(refund_amount),
                     currency=currency,
+                    parent_transaction_id=known_parent_transaction_id,
                     pivota_order_id=order_id,
                 )
             except Exception:

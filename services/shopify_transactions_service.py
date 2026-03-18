@@ -91,6 +91,94 @@ def _safe_text(resp: httpx.Response, limit: int = 800) -> str:
         return ""
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value))
+    except Exception:
+        return None
+
+
+def _find_successful_parent_transaction(
+    txns: List[Dict[str, Any]],
+    *,
+    preferred_gateway: Optional[str] = None,
+) -> Dict[str, Any]:
+    preferred_gateway = str(preferred_gateway or "").strip().lower() or None
+    fallback: Optional[Dict[str, Any]] = None
+    for t in reversed(txns):
+        if not isinstance(t, dict):
+            continue
+        kind = str(t.get("kind") or "").lower()
+        status = str(t.get("status") or "").lower()
+        if kind not in ("sale", "capture") or status != "success":
+            continue
+        tid = _coerce_int(t.get("id"))
+        if tid is None:
+            continue
+        gateway = str(t.get("gateway") or "").strip().lower() or None
+        candidate = {"id": tid, "gateway": gateway}
+        if preferred_gateway and gateway == preferred_gateway:
+            return candidate
+        if fallback is None:
+            fallback = candidate
+    return fallback or {}
+
+
+async def ensure_shopify_parent_transaction_best_effort(
+    *,
+    shop_domain: str,
+    access_token: str,
+    shopify_order_id: str,
+    amount: float,
+    currency: str,
+    api_version: str = DEFAULT_API_VERSION,
+    txns: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    observed = list(txns or [])
+    existing = _find_successful_parent_transaction(observed)
+    if existing.get("id") is not None:
+        return {
+            "ok": True,
+            "created": False,
+            "transaction_id": existing["id"],
+            "gateway": existing.get("gateway"),
+            "source": "existing_success_transaction",
+        }
+
+    try:
+        txn = await create_shopify_order_transaction(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            shopify_order_id=shopify_order_id,
+            api_version=api_version,
+            transaction={
+                "kind": "sale",
+                "status": "success",
+                "amount": str(amount),
+                "currency": str(currency or "USD"),
+                "gateway": "manual",
+            },
+        )
+    except Exception as e:
+        return {"ok": False, "created": False, "error": str(e), "source": "manual_parent_create_failed"}
+
+    txn_id = _coerce_int(txn.get("id"))
+    if txn_id is None:
+        return {"ok": False, "created": False, "error": "missing_transaction_id", "source": "manual_parent_create_failed"}
+
+    return {
+        "ok": True,
+        "created": True,
+        "transaction_id": txn_id,
+        "gateway": str(txn.get("gateway") or "manual").strip().lower() or "manual",
+        "source": "created_manual_parent",
+    }
+
+
 def _is_non_fatal_invalid_sale_error(err: Exception) -> bool:
     if not isinstance(err, ShopifyTransactionSyncHttpError):
         return False
@@ -256,7 +344,14 @@ async def ensure_external_payment_transaction_best_effort(
         if str(t.get("gateway") or "").lower() != gateway:
             continue
         if str(t.get("authorization") or "").strip() == payment_ref:
-            return {"ok": True, "created": False, "transaction_id": t.get("id")}
+            return {
+                "ok": True,
+                "created": False,
+                "transaction_id": t.get("id"),
+                "parent_transaction_id": _coerce_int(t.get("id")),
+                "parent_transaction_gateway": str(t.get("gateway") or "").strip().lower() or gateway,
+                "parent_transaction_source": "existing_authorization",
+            }
 
     # Some Shopify orders are already recorded as external/manual sales when created.
     # If the authorization already exists on another gateway, treat it as already synced.
@@ -274,6 +369,9 @@ async def ensure_external_payment_transaction_best_effort(
             "transaction_id": t.get("id"),
             "matched_existing_authorization": True,
             "existing_gateway": t.get("gateway"),
+            "parent_transaction_id": _coerce_int(t.get("id")),
+            "parent_transaction_gateway": str(t.get("gateway") or "").strip().lower() or None,
+            "parent_transaction_source": "existing_authorization_other_gateway",
         }
 
     try:
@@ -292,9 +390,25 @@ async def ensure_external_payment_transaction_best_effort(
                 "source_name": "external",
             },
         )
-        return {"ok": True, "created": True, "transaction_id": txn.get("id")}
+        return {
+            "ok": True,
+            "created": True,
+            "transaction_id": txn.get("id"),
+            "parent_transaction_id": _coerce_int(txn.get("id")),
+            "parent_transaction_gateway": str(txn.get("gateway") or "").strip().lower() or gateway,
+            "parent_transaction_source": "created_external_sale",
+        }
     except Exception as e:
         if _is_non_fatal_invalid_sale_error(e):
+            parent_sync = await ensure_shopify_parent_transaction_best_effort(
+                shop_domain=shop_domain,
+                access_token=access_token,
+                shopify_order_id=shopify_order_id,
+                amount=amount,
+                currency=currency,
+                api_version=api_version,
+                txns=txns,
+            )
             logger.info(
                 "shopify_txn.create_soft_skipped order_id=%s shopify_order_id=%s gateway=%s reason=invalid_sale_kind",
                 pivota_order_id,
@@ -319,6 +433,11 @@ async def ensure_external_payment_transaction_best_effort(
                 "soft_skipped": True,
                 "reason": "invalid_sale_kind",
                 "annotation": annotation,
+                "parent_transaction_id": parent_sync.get("transaction_id"),
+                "parent_transaction_gateway": parent_sync.get("gateway"),
+                "parent_transaction_source": parent_sync.get("source"),
+                "parent_transaction_created": parent_sync.get("created"),
+                "parent_transaction_error": parent_sync.get("error"),
             }
         logger.warning(
             "shopify_txn.create_failed order_id=%s shopify_order_id=%s gateway=%s err=%s",
@@ -351,6 +470,7 @@ async def ensure_external_refund_transaction_best_effort(
     external_refund_ref: Optional[str],
     amount: float,
     currency: str,
+    parent_transaction_id: Optional[int] = None,
     api_version: str = DEFAULT_API_VERSION,
     pivota_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -381,40 +501,62 @@ async def ensure_external_refund_transaction_best_effort(
         if str(t.get("gateway") or "").lower() != gateway:
             continue
         if str(t.get("authorization") or "").strip() == refund_ref:
-            return {"ok": True, "created": False, "transaction_id": t.get("id")}
+            return {
+                "ok": True,
+                "created": False,
+                "transaction_id": t.get("id"),
+                "parent_transaction_id": parent_transaction_id,
+            }
 
-    parent_id: Optional[int] = None
-    for t in reversed(txns):
-        if not isinstance(t, dict):
-            continue
-        if str(t.get("gateway") or "").lower() != gateway:
-            continue
-        kind = str(t.get("kind") or "").lower()
-        status = str(t.get("status") or "").lower()
-        if kind in ("sale", "capture") and status == "success":
-            tid = t.get("id")
-            if isinstance(tid, int):
-                parent_id = tid
-            else:
-                try:
-                    parent_id = int(str(tid))
-                except Exception:
-                    parent_id = None
-            if parent_id is not None:
-                break
+    parent_id = _coerce_int(parent_transaction_id)
+    parent_gateway: Optional[str] = None
+    if parent_id is not None:
+        for t in txns:
+            if not isinstance(t, dict):
+                continue
+            if _coerce_int(t.get("id")) != parent_id:
+                continue
+            parent_gateway = str(t.get("gateway") or "").strip().lower() or None
+            break
+
+    if parent_id is None:
+        preferred_parent = _find_successful_parent_transaction(txns, preferred_gateway=gateway)
+        parent_id = preferred_parent.get("id")
+        parent_gateway = preferred_parent.get("gateway")
+
+    if parent_id is None:
+        annotation = await annotate_shopify_order_best_effort(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            shopify_order_id=shopify_order_id,
+            api_version=api_version,
+            note_attributes={
+                "pivota_order_id": str(pivota_order_id or ""),
+                "pivota_psp": gateway,
+                "pivota_psp_refund_ref": refund_ref,
+            },
+            tags=["pivota-external-psp-refund", "pivota-missing-parent-transaction"],
+        )
+        return {
+            "ok": True,
+            "created": False,
+            "soft_skipped": True,
+            "reason": "missing_parent_transaction",
+            "annotation": annotation,
+        }
 
     try:
+        refund_gateway = parent_gateway or gateway
         txn_payload: Dict[str, Any] = {
             "kind": "refund",
             "status": "success",
             "amount": str(amount),
             "currency": str(currency or "USD"),
-            "gateway": gateway,
+            "gateway": refund_gateway,
             "authorization": refund_ref,
             "source_name": "external",
         }
-        if parent_id is not None:
-            txn_payload["parent_id"] = parent_id
+        txn_payload["parent_id"] = parent_id
         txn = await create_shopify_order_transaction(
             shop_domain=shop_domain,
             access_token=access_token,
@@ -422,7 +564,13 @@ async def ensure_external_refund_transaction_best_effort(
             api_version=api_version,
             transaction=txn_payload,
         )
-        return {"ok": True, "created": True, "transaction_id": txn.get("id")}
+        return {
+            "ok": True,
+            "created": True,
+            "transaction_id": txn.get("id"),
+            "parent_transaction_id": parent_id,
+            "parent_transaction_gateway": refund_gateway,
+        }
     except Exception as e:
         logger.warning(
             "shopify_refund_txn.create_failed order_id=%s shopify_order_id=%s gateway=%s err=%s",
