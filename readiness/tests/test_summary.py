@@ -53,6 +53,7 @@ def test_summarize_readiness_snapshot_green():
     assert summary.assessment_state == "assessed"
     assert summary.ready_variant_count == 1
     assert summary.blocked_variant_count == 0
+    assert "ready for supervised LLM commerce" in str(summary.summary_text)
 
 
 def test_summarize_readiness_snapshot_yellow_when_variants_blocked():
@@ -68,6 +69,7 @@ def test_summarize_readiness_snapshot_yellow_when_variants_blocked():
     assert summary.tier == "yellow"
     assert summary.top_warnings == ["inventory_snapshot_stale"]
     assert "Resolve blocked variants" in str(summary.next_action)
+    assert "Most of the catalog is usable" in str(summary.summary_text)
 
 
 def test_summarize_readiness_snapshot_red_when_checkout_blocked():
@@ -94,3 +96,4 @@ async def test_build_readiness_summary_returns_not_assessed_when_non_alpha(monke
     assert summary.tier == "red"
     assert summary.assessment_state == "not_assessed"
     assert summary.top_blockers == ["merchant_not_assessed_for_readiness_alpha"]
+    assert summary.recommended_actions

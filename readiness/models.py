@@ -133,6 +133,10 @@ class ReadinessSummary(BaseModel):
     blocked_variant_count: int = 0
     top_blockers: List[str] = Field(default_factory=list)
     top_warnings: List[str] = Field(default_factory=list)
+    summary_text: Optional[str] = None
+    action_text: Optional[str] = None
+    recommended_actions: List[str] = Field(default_factory=list)
+    blocker_breakdown: List[Dict[str, Any]] = Field(default_factory=list)
     capability_status: Dict[str, str] = Field(default_factory=dict)
     generated_at: Optional[str] = None
     next_action: Optional[str] = None
