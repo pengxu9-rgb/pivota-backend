@@ -32,8 +32,6 @@ def _returns_list_query(*, first: int) -> str:
         nodes {{
           id
           status
-          createdAt
-          updatedAt
           order {{
             id
             legacyResourceId
@@ -53,8 +51,6 @@ def _shop_returns_list_query(*, first: int) -> str:
           nodes {{
             id
             status
-            createdAt
-            updatedAt
             order {{
               id
               legacyResourceId
@@ -99,8 +95,6 @@ def _order_return_probe_query(*, include_return_status: bool, include_returns: b
               nodes {{
                 id
                 status
-                createdAt
-                updatedAt
               }}
             }}
             """
@@ -220,6 +214,21 @@ def _is_returns_undefined_field(err: ShopifyGraphQLError) -> bool:
 
 def _shopify_order_gid(shopify_order_id: Any) -> str:
     return f"gid://shopify/Order/{str(shopify_order_id or '').strip()}"
+
+
+def _normalize_graphql_return_node(node: Dict[str, Any]) -> Dict[str, Any]:
+    order = (node.get("order") or {}) if isinstance(node, dict) else {}
+    order_id = node.get("order_id") or order.get("legacyResourceId") or order.get("id")
+    payload: Dict[str, Any] = {
+        "id": node.get("id"),
+        "status": node.get("status"),
+        "order_id": order_id,
+    }
+    if "createdAt" in node:
+        payload["created_at"] = node.get("createdAt")
+    if "updatedAt" in node:
+        payload["updated_at"] = node.get("updatedAt")
+    return payload
 
 
 async def _fetch_shopify_returns_via_orders_best_effort(
@@ -650,15 +659,8 @@ async def sync_shopify_returns_best_effort(
             # Normalize into the same payload-ish shape our webhook upsert understands.
             order = (r.get("order") or {}) if isinstance(r, dict) else {}
             payload: Dict[str, Any]
-            if isinstance(r, dict) and ("createdAt" in r or "updatedAt" in r):
-                order_id = r.get("order_id") or order.get("legacyResourceId") or order.get("id")
-                payload = {
-                    "id": r.get("id"),
-                    "status": r.get("status"),
-                    "created_at": r.get("createdAt"),
-                    "updated_at": r.get("updatedAt"),
-                    "order_id": order_id,
-                }
+            if isinstance(r, dict) and (("order" in r) or ("order_id" in r) or ("createdAt" in r) or ("updatedAt" in r)):
+                payload = _normalize_graphql_return_node(r)
             else:
                 # REST-ish fallback shape
                 payload = dict(r or {})
