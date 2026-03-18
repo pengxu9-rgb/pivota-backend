@@ -83,6 +83,16 @@ bash scripts/smoke_readiness_alpha.sh \
   --return-sync
 ```
 
+If you want a read-only answer first on whether a canary order is even a good return candidate, run the return eligibility probe:
+
+```bash
+bash scripts/smoke_readiness_alpha.sh \
+  --base-url https://<prod-host> \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --canary-write \
+  --return-eligibility
+```
+
 If you already have a successful PSP payment reference from an external execution path, the smoke script can bridge it into the readiness order after the canary write:
 
 ```bash
@@ -361,6 +371,24 @@ This route is intentionally narrow:
 - it reuses the existing Shopify returns best-effort sync path rather than a separate readiness-only returns stack
 - it returns both the raw `return_sync_result` and a refreshed readiness `sync_audit`
 - it does not create a return; it only pulls and normalizes already-existing Shopify return evidence
+
+## Return Eligibility
+
+Before doing a live merchant-side return, use the read-only eligibility probe:
+
+```bash
+curl -s \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout-sessions/<checkout_id>/return-eligibility?sample_limit=10"
+```
+
+Current semantics:
+
+- it is internal-only and reuses the same feature gate as `return-sync`
+- it never creates or mutates returns
+- it resolves Shopify Admin credentials through the merchant's primary Shopify store
+- it combines local readiness order state, Shopify order state, and Shopify return capability hints into one machine-readable `eligibility` object
+- it is intended to answer whether a checkout is a good live return canary before an operator creates a return in Shopify Admin
 
 ## Error Contract Probes
 

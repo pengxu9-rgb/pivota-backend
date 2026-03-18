@@ -353,6 +353,35 @@ Current semantics:
 - it does not create a return; it only normalizes already-existing Shopify return evidence into `return_records`
 - it fails closed with `CHECKOUT_RETURN_SYNC_UNAVAILABLE` when Shopify store/admin credentials are unavailable
 
+## Return Eligibility Contract
+
+Readiness alpha also exposes a read-only return eligibility probe for checkout sessions that already have a linked local order:
+
+- `GET /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/return-eligibility?api_version=2024-07&sample_limit=10`
+
+Response fields:
+
+- `merchant_id`
+- `merchant_alpha_mode`
+- `checkout_id`
+- `order_id`
+- `shopify_order_id`
+- `eligibility`
+- `platform_probe`
+- `sync_audit`
+
+Current semantics:
+
+- the route is internal-only and reuses the return-sync feature gate
+- it does not create or mutate returns
+- it reuses the same Shopify Admin credential resolution path as readiness `return-sync`
+- `eligibility.status` is currently one of:
+  - `likely_eligible`
+  - `not_ready`
+  - `return_observed`
+- it combines local order state, Shopify order state, existing readiness `return_records`, and Shopify schema/returns probes so operators can pick a real return canary without guessing
+- it fails closed with the same readiness checkout errors as `return-sync`, including `CHECKOUT_NOT_FOUND`, `CHECKOUT_ORDER_NOT_CREATED`, and `CHECKOUT_RETURN_SYNC_UNAVAILABLE`
+
 ## Order Sync Contract
 
 Request:

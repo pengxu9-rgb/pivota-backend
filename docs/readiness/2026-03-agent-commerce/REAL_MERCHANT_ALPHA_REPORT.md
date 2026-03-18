@@ -95,8 +95,9 @@ Captured fixture expectation kept for regression:
 - merchant-native payment execution exists in the platform, but the readiness router still does not own one universal PSP authorize/capture surface
 - live blocked variants are now dominated by `out_of_stock` and `missing_price`, not stale inventory snapshots
 - full report/export payloads are still expensive unless internal consumers use `summary_only=true`
-- return sync still has no live exercise
-- readiness now has an internal `return-sync` surface that can pull existing Shopify return evidence into `return_records` and immediately refresh the readiness audit, but this route has not yet been exercised against a live merchant-side return
+- return sync still has no live merchant-side return exercise
+- readiness now has both an internal `return-sync` surface and a read-only `return-eligibility` probe
+- live production probing now shows that Shopify `Order.returns` is reachable for this merchant, but the last canary checked had no actual return created yet, so `return_records` correctly stayed empty
 - Shopify refund transaction mirroring is still best-effort; for some real Shopify order shapes there is no valid parent transaction, so readiness must treat `soft_skipped: missing_parent_transaction` as a controlled degradation rather than a failed refund
 - readiness now has internal `payment-bridge`, `payment-intent`, and `payment-status-sync` surfaces, and the canonical readiness refund path has been live-validated end-to-end
 

@@ -24,7 +24,10 @@ from readiness.sync_audit import build_order_sync_audit_snapshot
 from services.refund_service import refund_service
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
-from services.shopify_returns_service import sync_shopify_returns_best_effort
+from services.shopify_returns_service import (
+    probe_shopify_return_eligibility_best_effort,
+    sync_shopify_returns_best_effort,
+)
 from services.shopify_transactions_service import (
     ensure_external_payment_transaction_best_effort,
     ensure_external_refund_transaction_best_effort,
@@ -606,13 +609,29 @@ async def build_order_sync_audit(
     )
 
 
-async def sync_returns_for_checkout(
+def _paid_like_for_return(status_value: Any) -> bool:
+    status = str(status_value or "").strip().lower()
+    return status in {"paid", "completed", "succeeded", "settled"}
+
+
+def _fulfilled_like_for_return(status_value: Any) -> bool:
+    status = str(status_value or "").strip().lower()
+    return status in {
+        "fulfilled",
+        "partial",
+        "partially_fulfilled",
+        "partial_fulfilled",
+        "success",
+    }
+
+
+def _normalize_return_probe_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+async def _resolve_shopify_return_context(
     merchant_id: str,
     checkout_id: str,
-    *,
-    api_version: Optional[str] = None,
-    limit: int = 20,
-    sample_limit: int = 10,
 ) -> Dict[str, Any]:
     journal = get_default_journal()
     checkout = await journal.get_checkout_session(checkout_id)
@@ -685,6 +704,34 @@ async def sync_returns_for_checkout(
             }
         )
 
+    return {
+        "journal": journal,
+        "checkout": checkout,
+        "order_id": order_id,
+        "order_row": order_row,
+        "store_info": store_info,
+        "shopify_cfg": shopify_cfg,
+        "shop_domain": shop_domain,
+        "access_token": access_token,
+    }
+
+
+async def sync_returns_for_checkout(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    api_version: Optional[str] = None,
+    limit: int = 20,
+    sample_limit: int = 10,
+) -> Dict[str, Any]:
+    context = await _resolve_shopify_return_context(merchant_id, checkout_id)
+    checkout = context["checkout"]
+    order_id = context["order_id"]
+    order_row = context["order_row"]
+    shopify_cfg = context["shopify_cfg"]
+    shop_domain = context["shop_domain"]
+    access_token = context["access_token"]
+
     from db.database import database
 
     return_sync_result = await sync_shopify_returns_best_effort(
@@ -705,6 +752,158 @@ async def sync_returns_for_checkout(
         "checkout": checkout,
         "order": latest_order,
         "return_sync_result": return_sync_result,
+        "audit": audit,
+    }
+
+
+def _build_return_eligibility_summary(
+    *,
+    checkout_id: str,
+    order_id: str,
+    order_row: Dict[str, Any],
+    audit: Dict[str, Any],
+    platform_probe: Dict[str, Any],
+) -> Dict[str, Any]:
+    order_state = audit.get("order_state") or {}
+    local_status = _normalize_return_probe_text(order_row.get("status") or order_state.get("status"))
+    local_payment_status = _normalize_return_probe_text(order_row.get("payment_status") or order_state.get("payment_status"))
+    local_fulfillment_status = _normalize_return_probe_text(order_row.get("fulfillment_status") or order_state.get("fulfillment_status"))
+
+    shopify_order = platform_probe.get("shopify_order") or {}
+    order_probe = platform_probe.get("order_probe") or {}
+    existing_returns = platform_probe.get("existing_returns") or []
+    return_records = ((audit.get("evidence") or {}).get("return_records")) or []
+    schema_diag = platform_probe.get("schema_diag") or {}
+    return_capabilities = platform_probe.get("return_capabilities") or {}
+
+    platform_payment_status = _normalize_return_probe_text(
+        shopify_order.get("financial_status") or shopify_order.get("display_financial_status")
+    )
+    platform_fulfillment_status = _normalize_return_probe_text(
+        shopify_order.get("fulfillment_status") or shopify_order.get("display_fulfillment_status")
+    )
+    platform_return_status = _normalize_return_probe_text(order_probe.get("returnStatus"))
+    cancelled = bool(shopify_order.get("cancelled_at")) or local_status == "cancelled"
+    shopify_order_id = str(order_row.get("shopify_order_id") or order_state.get("shopify_order_id") or "").strip()
+
+    blockers: List[str] = []
+    warnings: List[str] = []
+    recommendations: List[str] = []
+
+    if platform_probe.get("rest_error"):
+        warnings.append("shopify_order_rest_probe_failed")
+    if return_capabilities.get("queryroot_returnable_fulfillments_available") is False:
+        warnings.append("shopify_queryroot_returnable_fulfillments_unavailable")
+    if return_capabilities.get("order_returns_available") is False:
+        warnings.append("shopify_order_returns_unavailable")
+    if not shopify_order_id:
+        blockers.append("merchant_writeback_not_observed")
+
+    observed_return = bool(return_records) or bool(existing_returns) or platform_return_status in {"in_progress", "returned"}
+    resolved_payment_status = local_payment_status or platform_payment_status
+    resolved_fulfillment_status = local_fulfillment_status or platform_fulfillment_status
+
+    if observed_return:
+        status = "return_observed"
+        recommendations.append("Return evidence already exists for this order. Run /return-sync after Shopify-side changes to refresh local return_records.")
+    else:
+        if cancelled:
+            blockers.append("order_cancelled")
+        if resolved_payment_status in {"refunded", "partially_refunded"}:
+            blockers.append("order_already_refunded")
+        elif not _paid_like_for_return(resolved_payment_status):
+            blockers.append("order_not_paid")
+        if not _fulfilled_like_for_return(resolved_fulfillment_status):
+            blockers.append("order_not_fulfilled")
+
+        status = "likely_eligible" if not blockers else "not_ready"
+        if status == "likely_eligible":
+            recommendations.append("Create the return in Shopify Admin for this order, then rerun /return-sync to pull it into return_records.")
+        else:
+            if "order_not_fulfilled" in blockers:
+                recommendations.append("Use a fulfilled Shopify order for live return validation; unfulfilled orders are not good return canaries.")
+            if "order_not_paid" in blockers or "order_already_refunded" in blockers:
+                recommendations.append("Use a paid, non-refunded order for live return validation before expecting return_records to appear.")
+            if "merchant_writeback_not_observed" in blockers:
+                recommendations.append("Run /order-sync first so the readiness checkout is attached to a real Shopify order before probing returns.")
+            if "order_cancelled" in blockers:
+                recommendations.append("Choose a non-cancelled Shopify order for return validation.")
+
+    return {
+        "status": status,
+        "blockers": blockers,
+        "warnings": warnings,
+        "recommendations": recommendations,
+        "resolved_payment_status": resolved_payment_status or None,
+        "resolved_fulfillment_status": resolved_fulfillment_status or None,
+        "platform_return_status": platform_return_status or None,
+        "observed_return_record_count": len(return_records),
+        "observed_shopify_return_count": len(existing_returns),
+        "return_capabilities": {
+            "queryroot_returnable_fulfillments_available": bool(
+                return_capabilities.get("queryroot_returnable_fulfillments_available")
+            ),
+            "queryroot_returnable_fulfillment_available": bool(
+                return_capabilities.get("queryroot_returnable_fulfillment_available")
+            ),
+            "order_return_status_available": bool(return_capabilities.get("order_return_status_available")),
+            "order_returns_available": bool(return_capabilities.get("order_returns_available")),
+        },
+        "schema_diag": schema_diag,
+        "local_order_state": {
+            "status": local_status or None,
+            "payment_status": local_payment_status or None,
+            "fulfillment_status": local_fulfillment_status or None,
+            "shopify_order_id": shopify_order_id or None,
+        },
+        "platform_order_state": {
+            "financial_status": platform_payment_status or None,
+            "fulfillment_status": platform_fulfillment_status or None,
+            "cancelled_at": shopify_order.get("cancelled_at"),
+            "closed_at": shopify_order.get("closed_at"),
+        },
+    }
+
+
+async def probe_return_eligibility_for_checkout(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    api_version: Optional[str] = None,
+    sample_limit: int = 10,
+) -> Dict[str, Any]:
+    context = await _resolve_shopify_return_context(merchant_id, checkout_id)
+    checkout = context["checkout"]
+    order_id = context["order_id"]
+    order_row = context["order_row"]
+    shopify_cfg = context["shopify_cfg"]
+    shop_domain = context["shop_domain"]
+    access_token = context["access_token"]
+
+    platform_probe = await probe_shopify_return_eligibility_best_effort(
+        shop_domain=shop_domain,
+        access_token=access_token,
+        api_version=str(api_version or shopify_cfg.get("api_version") or "2024-07"),
+        shopify_order_id=str(order_row.get("shopify_order_id") or ""),
+    )
+    audit = await build_order_sync_audit(
+        merchant_id,
+        checkout_id,
+        sample_limit=sample_limit,
+    )
+    eligibility = _build_return_eligibility_summary(
+        checkout_id=checkout_id,
+        order_id=order_id,
+        order_row=order_row,
+        audit=audit,
+        platform_probe=platform_probe,
+    )
+    latest_order = await get_order(order_id) or order_row
+    return {
+        "checkout": checkout,
+        "order": latest_order,
+        "platform_probe": platform_probe,
+        "eligibility": eligibility,
         "audit": audit,
     }
 

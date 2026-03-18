@@ -298,6 +298,20 @@ def test_return_sync_not_found_error_code_is_preserved(monkeypatch):
     assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
 
 
+def test_return_eligibility_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_missing/return-eligibility"
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
 def test_order_sync_audit_not_found_error_code_is_preserved(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
 
@@ -427,6 +441,78 @@ def test_return_sync_unavailable_error_code_is_preserved(monkeypatch):
     response = client.post(
         f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_alpha_return_2/return-sync",
         json={},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_RETURN_SYNC_UNAVAILABLE"
+    assert body["error"]["details"]["code"] == "CHECKOUT_RETURN_SYNC_UNAVAILABLE"
+
+
+def test_return_eligibility_route_returns_service_payload(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    async def fake_probe_return_eligibility_for_checkout(
+        merchant_id: str,
+        checkout_id: str,
+        *,
+        api_version=None,
+        sample_limit: int = 10,
+    ):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert checkout_id == "rdchk_alpha_return_eligibility_1"
+        assert api_version == "2025-01"
+        assert sample_limit == 7
+        return {
+            "checkout": type("Checkout", (), {
+                "checkout_id": checkout_id,
+                "order_id": "ORD_RETURN_ELIGIBLE_1",
+                "session_payload": {"merchant_alpha_mode": "real_merchant_alpha"},
+            })(),
+            "order": {"shopify_order_id": "7001002005"},
+            "eligibility": {"status": "likely_eligible", "blockers": []},
+            "platform_probe": {"return_capabilities": {"order_returns_available": True}},
+            "audit": {"sync_signals": {"return_sync": {"status": "not_observed"}}},
+        }
+
+    monkeypatch.setattr(readiness_service, "probe_return_eligibility_for_checkout", fake_probe_return_eligibility_for_checkout)
+
+    response = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_alpha_return_eligibility_1/return-eligibility?api_version=2025-01&sample_limit=7"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "rdchk_alpha_return_eligibility_1"
+    assert body["order_id"] == "ORD_RETURN_ELIGIBLE_1"
+    assert body["shopify_order_id"] == "7001002005"
+    assert body["eligibility"]["status"] == "likely_eligible"
+    assert body["platform_probe"]["return_capabilities"]["order_returns_available"] is True
+
+
+def test_return_eligibility_unavailable_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    from readiness import service as readiness_service
+
+    async def fake_probe_return_eligibility_for_checkout(*_args, **_kwargs):
+        raise ValueError(
+            {
+                "code": "CHECKOUT_RETURN_SYNC_UNAVAILABLE",
+                "message": "Return eligibility requires a Shopify primary store for this merchant.",
+            }
+        )
+
+    monkeypatch.setattr(
+        readiness_service,
+        "probe_return_eligibility_for_checkout",
+        fake_probe_return_eligibility_for_checkout,
+    )
+
+    response = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_alpha_return_eligibility_2/return-eligibility"
     )
 
     assert response.status_code == 409

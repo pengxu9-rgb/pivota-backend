@@ -87,6 +87,38 @@ def _orders_with_returns_query(*, orders_first: int, returns_first: int) -> str:
     """
 
 
+def _order_return_probe_query(*, include_return_status: bool, include_returns: bool, returns_first: int) -> str:
+    safe_returns_first = max(1, min(int(returns_first), 25))
+    field_lines: List[str] = []
+    if include_return_status:
+        field_lines.append("returnStatus")
+    if include_returns:
+        field_lines.append(
+            f"""
+            returns(first: {safe_returns_first}) {{
+              nodes {{
+                id
+                status
+                createdAt
+                updatedAt
+              }}
+            }}
+            """
+        )
+    body = "\n".join(field_lines)
+    return f"""
+    query OrderReturnProbe($id: ID!) {{
+      node(id: $id) {{
+        ... on Order {{
+          id
+          legacyResourceId
+          {body}
+        }}
+      }}
+    }}
+    """
+
+
 async def _shopify_admin_rest_get(
     *,
     shop_domain: str,
@@ -186,6 +218,10 @@ def _is_returns_undefined_field(err: ShopifyGraphQLError) -> bool:
     return False
 
 
+def _shopify_order_gid(shopify_order_id: Any) -> str:
+    return f"gid://shopify/Order/{str(shopify_order_id or '').strip()}"
+
+
 async def _fetch_shopify_returns_via_orders_best_effort(
     *,
     shop_domain: str,
@@ -216,6 +252,150 @@ async def _fetch_shopify_returns_via_orders_best_effort(
                 continue
             flattened.append({**r, "order_id": shopify_order_id})
     return flattened
+
+
+async def probe_shopify_return_eligibility_best_effort(
+    *,
+    shop_domain: str,
+    access_token: str,
+    api_version: str,
+    shopify_order_id: str,
+    returns_first: int = 5,
+) -> Dict[str, Any]:
+    versions_to_try: List[str] = []
+    try:
+        versions_to_try = [str(api_version).strip()] if api_version else []
+    except Exception:
+        versions_to_try = []
+    for v in FALLBACK_ADMIN_API_VERSIONS:
+        if v not in versions_to_try:
+            versions_to_try.append(v)
+
+    schema_diag: Optional[Dict[str, Any]] = None
+    queryroot_fields: List[str] = []
+    order_fields: List[str] = []
+    shop_fields: List[str] = []
+    diag_version = versions_to_try[0] if versions_to_try else (api_version or "2024-07")
+    try:
+        queryroot_fields = await _introspect_type_fields(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            api_version=diag_version,
+            type_name="QueryRoot",
+        )
+        order_fields = await _introspect_type_fields(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            api_version=diag_version,
+            type_name="Order",
+        )
+        shop_fields = await _introspect_type_fields(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            api_version=diag_version,
+            type_name="Shop",
+        )
+        schema_diag = {
+            "api_version": diag_version,
+            "queryroot_returnish_fields": _filter_returnish_fields(queryroot_fields),
+            "order_returnish_fields": _filter_returnish_fields(order_fields),
+            "shop_returnish_fields": _filter_returnish_fields(shop_fields),
+        }
+    except Exception:
+        schema_diag = None
+
+    rest_order: Dict[str, Any] = {}
+    rest_error: Optional[str] = None
+    try:
+        rest_data = await _shopify_admin_rest_get(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            api_version=diag_version,
+            path=(
+                f"orders/{str(shopify_order_id).strip()}.json"
+                "?status=any&fields=id,name,fulfillment_status,financial_status,"
+                "display_fulfillment_status,display_financial_status,cancelled_at,closed_at,updated_at"
+            ),
+        )
+        rest_order = (rest_data or {}).get("order") or {}
+    except Exception as exc:
+        rest_error = str(exc)
+
+    include_return_status = "returnStatus" in set(order_fields)
+    include_returns = "returns" in set(order_fields)
+    order_probe: Dict[str, Any] = {}
+    existing_returns: List[Dict[str, Any]] = []
+    graphql_attempts: List[Dict[str, Any]] = []
+    api_version_used: Optional[str] = None
+
+    if include_return_status or include_returns:
+        query = _order_return_probe_query(
+            include_return_status=include_return_status,
+            include_returns=include_returns,
+            returns_first=returns_first,
+        )
+        for v in versions_to_try:
+            try:
+                data = await shopify_admin_graphql(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    query=query,
+                    variables={"id": _shopify_order_gid(shopify_order_id)},
+                    api_version=v,
+                )
+                node = (data or {}).get("node") or {}
+                order_probe = node if isinstance(node, dict) else {}
+                existing_returns = (((order_probe.get("returns") or {}).get("nodes")) or []) if include_returns else []
+                if not isinstance(existing_returns, list):
+                    existing_returns = []
+                api_version_used = v
+                graphql_attempts.append(
+                    {
+                        "api_version": v,
+                        "ok": True,
+                        "strategy": "Order.node",
+                        "existing_return_count": len(existing_returns),
+                    }
+                )
+                break
+            except ShopifyGraphQLError as exc:
+                graphql_attempts.append(
+                    {
+                        "api_version": v,
+                        "ok": False,
+                        "strategy": "Order.node",
+                        "error": str(exc),
+                        "request_id": getattr(exc, "request_id", None),
+                        "errors": (exc.errors or [])[:2],
+                    }
+                )
+            except Exception as exc:
+                graphql_attempts.append(
+                    {
+                        "api_version": v,
+                        "ok": False,
+                        "strategy": "Order.node",
+                        "error": str(exc),
+                    }
+                )
+
+    return {
+        "ok": True,
+        "shopify_order_id": str(shopify_order_id or "").strip(),
+        "api_version_used": api_version_used or diag_version,
+        "schema_diag": schema_diag,
+        "return_capabilities": {
+            "queryroot_returnable_fulfillments_available": "returnableFulfillments" in set(queryroot_fields),
+            "queryroot_returnable_fulfillment_available": "returnableFulfillment" in set(queryroot_fields),
+            "order_return_status_available": include_return_status,
+            "order_returns_available": include_returns,
+        },
+        "shopify_order": rest_order,
+        "order_probe": order_probe,
+        "existing_returns": existing_returns,
+        "graphql_attempts": graphql_attempts,
+        "rest_error": rest_error,
+    }
 
 
 async def sync_shopify_returns_best_effort(

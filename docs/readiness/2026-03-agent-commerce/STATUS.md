@@ -18,6 +18,7 @@ Implemented:
 - internal payment-status-sync route for polling PSP state from a readiness-owned `payment_intent_id` and auto-bridging only on real paid status
 - internal refund route for readiness-owned paid orders, reusing the platform refund service and refund-record flow
 - internal return-sync route for pulling existing Shopify return evidence into `return_records` and refreshing readiness audit output
+- internal return-eligibility probe for telling operators whether a readiness-owned Shopify order is actually a good live return candidate before they create a return
 - best-effort Shopify parent/refund transaction handling that degrades to explicit `soft_skipped` results instead of hard `422` failures when Shopify refuses to create a valid parent transaction
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
@@ -38,6 +39,9 @@ Validated:
 - targeted follow-up validation for readiness return-sync route:
   - `python3 -m pytest readiness/tests/test_return_sync.py readiness/tests/test_routes.py readiness/tests/test_sync_audit.py tests/test_error_handler.py tests/test_shopify_transactions_service.py tests/test_refund_service.py -q`
   - result: `55 passed`
+- targeted follow-up validation for readiness return-eligibility probe:
+  - `python3 -m pytest readiness/tests/test_return_sync.py readiness/tests/test_routes.py readiness/tests/test_sync_audit.py tests/test_error_handler.py tests/test_shopify_transactions_service.py tests/test_refund_service.py -q`
+  - result: `60 passed`
 - production deploy progression:
   - `ad49b8c`: hardened review fallback logic
   - `e20086b`: switched readiness review aggregates to raw SQL
@@ -49,6 +53,7 @@ Validated:
   - `ff8a286`: added Stripe Checkout status resolution for readiness payment-status-sync
   - `403bc7b`: persisted `platform_refund_id` into `refund_records`
   - `fc7a63b`: hardened Shopify parent/refund transaction handling and soft-skip behavior
+  - `9458e06`: added readiness return-sync route
 - production summary-only smoke against `https://web-production-fedb.up.railway.app`
   - readiness report summary: `200`
   - UCP export summary: `200`
@@ -71,6 +76,15 @@ Validated:
     - `offer_count=2098`
     - `review_backed_offer_count=2096`
   - dominant remaining blockers: `out_of_stock`, `missing_price`
+- production return follow-up on March 18, 2026
+  - `FEATURE_READINESS_RETURN_SYNC_ALPHA=true` is now enabled on production `web`
+  - missing-checkout `return-sync` probe now returns top-level `CHECKOUT_NOT_FOUND`
+  - live `return-sync` probe against canary `rdchk_e34ae1b6eb6141e4` returned `NO_RETURNS_FOUND`
+  - Shopify diagnostics showed:
+    - `Order.returns` is available
+    - `QueryRoot.returnableFulfillments` is present in schema hints
+    - no actual merchant-side return exists yet for that order
+  - consequence: the remaining gap is no longer route correctness; it is selecting a fulfilled, paid, non-refunded Shopify canary and creating a real return to exercise `return_records`
 - supervised production payment-intent canary on March 18, 2026
   - checkout create: `200`
   - checkout id: `rdchk_cce46acd5fc340c1`

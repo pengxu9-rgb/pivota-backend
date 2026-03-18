@@ -546,6 +546,52 @@ async def sync_checkout_returns(
     }
 
 
+@router.get("/merchants/{merchant_id}/checkout-sessions/{checkout_id}/return-eligibility")
+async def get_checkout_return_eligibility(
+    merchant_id: str,
+    checkout_id: str,
+    request: Request,
+    api_version: Optional[str] = Query(default=None),
+    sample_limit: int = Query(10, ge=1, le=50),
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    _require_return_sync_enabled()
+    try:
+        result = await readiness_service.probe_return_eligibility_for_checkout(
+            merchant_id,
+            checkout_id,
+            api_version=api_version,
+            sample_limit=sample_limit,
+        )
+    except readiness_service.UnsupportedMerchantError:
+        raise _unsupported_merchant(merchant_id)
+    except KeyError:
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
+    except ValueError as exc:
+        detail = exc.args[0] if exc.args else {"code": "CHECKOUT_INVALID"}
+        code = str(detail.get("code") or "CHECKOUT_INVALID")
+        status_code = 400 if code in {"CHECKOUT_INVALID"} else 409
+        raise _readiness_http_exception(status_code, code, detail)
+
+    checkout = result["checkout"]
+    order = result["order"] or {}
+    return {
+        "merchant_id": merchant_id,
+        "merchant_alpha_mode": (checkout.session_payload or {}).get("merchant_alpha_mode"),
+        "checkout_id": checkout_id,
+        "order_id": checkout.order_id,
+        "shopify_order_id": order.get("shopify_order_id"),
+        "eligibility": result["eligibility"],
+        "platform_probe": result["platform_probe"],
+        "sync_audit": result["audit"],
+    }
+
+
 @router.get("/merchants/{merchant_id}/order-sync-audit/{checkout_id}")
 async def get_order_sync_audit(
     merchant_id: str,
