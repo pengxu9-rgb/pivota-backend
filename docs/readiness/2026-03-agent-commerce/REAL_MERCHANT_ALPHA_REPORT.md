@@ -8,18 +8,25 @@
 
 ## Current Alpha Readiness
 
-Live production observation on March 17, 2026:
+Live production observation on March 18, 2026:
 
-- readiness score: `70` on the report path
+- report summary readiness score: `77`
+- export summary readiness score: `88`
 - ready variants: `2098`
 - blocked variants: `265`
 - checkout capability: `ready`
 - order-sync capability: `ready`
+- reviews/confidence capability: `ready`
 - export offer count: `2098`
+- review-backed exported offers: `2096`
 - live source-of-truth:
   - `catalog=shopify_cache.standard_product.v1`
   - `price=shopify_admin.products.v2024-07`
   - `inventory=shopify_admin.inventory.v2024-07`
+  - `reviews_confidence=reviews_center.review_group.v1`
+- live summary blocker mix:
+  - checkout blockers: `out_of_stock=217`, `missing_price=37`
+  - discovery blockers: `missing_price=37`, `missing_primary_image=12`
 
 Supervised production canary write:
 
@@ -41,9 +48,11 @@ Captured fixture expectation kept for regression:
 
 ## Primary Blockers Still Visible
 
-- readiness now projects product-level Reviews Center summaries, but live production has not yet been re-smoked after this projection change
+- readiness now projects product-level Reviews Center summaries successfully, but grouped review coverage is still `0` in the current merchant observation
 - merchant-native payment execution exists in the platform, but the readiness router still does not own direct PSP authorize/capture
 - live blocked variants are now dominated by `out_of_stock` and `missing_price`, not stale inventory snapshots
+- full report/export payloads are still expensive unless internal consumers use `summary_only=true`
+- refund / cancel / return sync still require a controlled live exercise; the new order-sync audit only surfaces their evidence paths and current observation state
 
 ## Evidence
 
@@ -59,6 +68,39 @@ Captured fixture expectation kept for regression:
   - `/tmp/pivota-readiness-direct-canary-20260317/checkout.json`
   - `/tmp/pivota-readiness-direct-canary-20260317/order_sync.json`
   - `/tmp/pivota-readiness-direct-canary-20260317/order_sync_replay.json`
+- live production summary smoke:
+  - `/tmp/pivota-readiness-smoke-20260318T000801Z/report.json`
+  - `/tmp/pivota-readiness-smoke-20260318T000801Z/export_ucp.json`
+
+## Error Contract
+
+Current production readiness error surface now preserves explicit top-level codes through the global error middleware:
+
+- blocked checkout:
+  - HTTP `409`
+  - `error.code=VARIANT_NOT_READY_FOR_CHECKOUT`
+- unsupported merchant:
+  - HTTP `404`
+  - `error.code=READINESS_MERCHANT_UNSUPPORTED`
+- missing checkout session:
+  - HTTP `404`
+  - `error.code=CHECKOUT_NOT_FOUND`
+
+## Post-Order Audit
+
+Readiness now exposes a read-only post-order audit:
+
+- `GET /internal/readiness/merchants/{merchant_id}/order-sync-audit/{checkout_id}`
+
+The audit is intended to validate the convergence of:
+
+- readiness journal state
+- local `orders` row
+- `pcs_shopify_webhook_events`
+- `refund_records`
+- `return_records`
+
+For the current alpha merchant, this makes cancellation/refund/return validation operationally tractable without changing the canonical checkout path.
 
 ## Local Validation Caveat
 

@@ -13,6 +13,7 @@ from readiness.models import ChannelReadinessReport, CheckoutSessionRecord, Merc
 from readiness.order_sync import get_default_journal
 from readiness.scoring import build_merchant_snapshot, find_ready_variant
 from readiness.sources import load_merchant_source_dataset, supported_merchant_ids
+from readiness.sync_audit import build_order_sync_audit_snapshot
 from services.shopify_transactions_service import ensure_external_payment_transaction_best_effort
 
 logger = logging.getLogger(__name__)
@@ -300,6 +301,30 @@ async def get_checkout_session_view(checkout_id: str) -> Dict[str, Any]:
         "checkout": checkout_json,
         "events": [event.model_dump() if hasattr(event, "model_dump") else event.dict() for event in events],
     }
+
+
+async def build_order_sync_audit(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    sample_limit: int = 10,
+) -> Dict[str, Any]:
+    journal = get_default_journal()
+    checkout = await journal.get_checkout_session(checkout_id)
+    if checkout is None or checkout.merchant_id != merchant_id:
+        raise KeyError(checkout_id)
+    events = await journal.list_events(checkout_id)
+
+    from db.database import database
+
+    return await build_order_sync_audit_snapshot(
+        merchant_id=merchant_id,
+        checkout=checkout,
+        readiness_events=events,
+        get_order_fn=get_order,
+        db=database,
+        sample_limit=sample_limit,
+    )
 
 
 def _validate_checkout_buyer_context(checkout: CheckoutSessionRecord) -> Optional[str]:

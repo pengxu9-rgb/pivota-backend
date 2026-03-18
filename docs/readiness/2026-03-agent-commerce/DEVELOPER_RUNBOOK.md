@@ -48,25 +48,25 @@ bash scripts/smoke_readiness_alpha.sh \
 
 The script writes all responses to `/tmp/pivota-readiness-smoke-<run_id>` unless `--out-dir` is provided.
 
-For large merchants, prefer inspecting the saved artifacts with compact `jq` summaries instead of relying on the script's full stdout:
+Read-only smoke artifacts are summary-only by design. Inspect the saved artifacts with compact `jq` summaries instead of relying on the script's full stdout:
 
 ```bash
 jq '{
   merchant_id,
+  response_mode,
   readiness_score,
-  ready_variant_count: ([.products[].variants[] | select(.channel_coverage.ucp=="ready")] | length),
-  blocked_variant_count: ([.products[].variants[] | select(.channel_coverage.ucp!="ready")] | length),
   reviews_capability: .capability_status.reviews_confidence,
-  source_of_truth
+  source_of_truth,
+  summary
 }' /tmp/pivota-readiness-smoke-<run_id>/report.json
 
 jq '{
   merchant_id,
+  response_mode,
   readiness_score,
-  offer_count: (.offers | length),
-  review_offer_count: ([.offers[] | select(.reviews.has_reviews==true)] | length),
   source_of_truth,
-  validation_warnings
+  validation_warnings,
+  summary
 }' /tmp/pivota-readiness-smoke-<run_id>/export_ucp.json
 ```
 
@@ -133,6 +133,64 @@ curl -s -X POST \
   -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
   "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/order-sync/<checkout_id>" \
   -d '{"replay": false}'
+```
+
+## Order Sync Audit
+
+After a live canary write, use the sync audit to check whether the readiness journal, `orders`, Shopify webhook ingest, `refund_records`, and `return_records` are converging:
+
+```bash
+curl -s \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/order-sync-audit/<checkout_id>?sample_limit=10"
+```
+
+Compact audit view:
+
+```bash
+jq '{
+  checkout_id,
+  order_id,
+  shopify_order_id,
+  checkout_status,
+  order_state,
+  sync_signals,
+  warnings,
+  recommendations
+}' /tmp/pivota-readiness-smoke-<run_id>/order_sync_audit.json
+```
+
+The production smoke script now fetches this audit automatically after a canary write and fails if `sync_signals.merchant_writeback.status != "ready"`.
+
+## Error Contract Probes
+
+Blocked checkout should fail closed with a readiness-specific top-level code:
+
+```bash
+curl -s -o /tmp/readiness-blocked.json -w "%{http_code}\n" \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout" \
+  -d '{"variant_id":"52327451230536","quantity":1,"idempotency_key":"blocked-probe"}'
+
+jq '{code: .error.code, detail: .error.details}' /tmp/readiness-blocked.json
+```
+
+Unsupported merchant and missing checkout probes should also preserve top-level readiness codes:
+
+```bash
+curl -s -o /tmp/readiness-unsupported.json -w "%{http_code}\n" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_unknown/report?channel=ucp"
+
+jq '.error.code' /tmp/readiness-unsupported.json
+
+curl -s -o /tmp/readiness-missing-checkout.json -w "%{http_code}\n" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/checkout-sessions/rdchk_missing"
+
+jq '.error.code' /tmp/readiness-missing-checkout.json
 ```
 
 ## Local Caveat

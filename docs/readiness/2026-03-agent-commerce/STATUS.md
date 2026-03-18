@@ -1,6 +1,6 @@
 # Status
 
-As of March 17, 2026, the one-merchant readiness alpha is implemented for `merch_efbc46b4619cfbdf` behind feature flags.
+As of March 18, 2026, the one-merchant readiness alpha is implemented for `merch_efbc46b4619cfbdf` behind feature flags and validated in production on Railway `Pivota Infra / production / web`.
 
 Implemented:
 
@@ -9,6 +9,9 @@ Implemented:
 - additive Reviews Center projection into readiness report/export/scoring
 - canonical readiness-owned checkout/order-sync path
 - machine-readable report/export/checkout/order-sync responses with blockers, warnings, provenance, and freshness
+- lightweight `summary_only=true` report/export modes for internal ops and production smoke
+- explicit readiness error contract preserved through the global error middleware
+- read-only order-sync audit that aggregates readiness journal, `orders`, Shopify webhook ingest, `refund_records`, and `return_records`
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
 
@@ -16,23 +19,38 @@ Validated:
 
 - `python3 -m py_compile` on the readiness modules and router
 - `python3 -m pytest readiness/tests -q`
-- result: `12 passed`
-- production deploy on Railway `Pivota Infra / production / web` at commit `20a40a74f2d1531403e898dde3c899ce50ef8ac0`
-- production read-only smoke against `https://web-production-fedb.up.railway.app`
-  - readiness report: `200`
-  - UCP export: `200`
-  - blocked checkout probe: `409 VARIANT_NOT_READY_FOR_CHECKOUT`
+- result after current error-contract + summary-only work: `24 passed`
+- targeted follow-up validation for sync-audit work:
+  - `python3 -m pytest readiness/tests/test_sync_audit.py readiness/tests/test_routes.py tests/test_error_handler.py -q`
+  - `bash -n scripts/smoke_readiness_alpha.sh`
+- production deploy progression:
+  - `ad49b8c`: hardened review fallback logic
+  - `e20086b`: switched readiness review aggregates to raw SQL
+  - `078b46c`: added summary-only report/export views
+  - `6fe88e1`: preserved readiness top-level error codes
+  - `f29000c`: expanded readiness error-contract coverage and smoke assertions
+- production summary-only smoke against `https://web-production-fedb.up.railway.app`
+  - readiness report summary: `200`
+  - UCP export summary: `200`
+  - blocked checkout probe: `409`
+  - top-level blocked checkout error code: `VARIANT_NOT_READY_FOR_CHECKOUT`
   - live source-of-truth outcome:
     - `catalog=shopify_cache.standard_product.v1`
     - `price=shopify_admin.products.v2024-07`
     - `inventory=shopify_admin.inventory.v2024-07`
-  - observed production alpha summary:
+    - `reviews_confidence=reviews_center.review_group.v1`
+  - observed production summary report:
+    - `readiness_score=77`
     - `product_count=740`
+    - `variant_count=2363`
     - `ready_variant_count=2098`
     - `blocked_variant_count=265`
+    - `products_with_reviews=737`
+  - observed production summary export:
+    - `readiness_score=88`
     - `offer_count=2098`
-    - dominant remaining blockers: `out_of_stock`, `missing_price`
-- production hotfix deploy on Railway `Pivota Infra / production / web` at commit `f0ba0419749306e772e5744f30983e3bee4283b2`
+    - `review_backed_offer_count=2096`
+  - dominant remaining blockers: `out_of_stock`, `missing_price`
 - supervised production canary write on March 17, 2026
   - checkout create: `200`
   - checkout id: `rdchk_4b7c7a42214f4bf0`
@@ -55,5 +73,5 @@ Major remaining risks:
 - readiness now projects product-level review summaries from Reviews Center, but broader review freshness/ranking/coverage still needs convergence
 - merchant-native payment execution exists in the platform, but the readiness router still uses capability check + merchant order write-back instead of a fully unified PSP execution step
 - merchant fulfillment/returns policy is still manual config, not live-ingested
-- the smoke script summary is too verbose for large merchants unless artifacts are inspected directly
-- webhook-driven reconciliation and refund/cancel sync remain unvalidated on the live alpha path
+- full report/export payloads remain large when `summary_only` is not used
+- webhook-driven reconciliation and refund/cancel sync still need a live exercise even though the new sync-audit surface now exposes their evidence paths

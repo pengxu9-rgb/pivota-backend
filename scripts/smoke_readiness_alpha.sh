@@ -322,6 +322,7 @@ main() {
   local checkout_session_before_json="$OUT_DIR/checkout_session_before_sync.json"
   local order_sync_json="$OUT_DIR/order_sync.json"
   local checkout_session_after_json="$OUT_DIR/checkout_session_after_sync.json"
+  local order_sync_audit_json="$OUT_DIR/order_sync_audit.json"
   local order_sync_replay_json="$OUT_DIR/order_sync_replay.json"
 
   info "Run ID: $RUN_ID"
@@ -437,6 +438,12 @@ main() {
   session_after_status="$(request_json GET "$BASE_URL/internal/readiness/checkout-sessions/$checkout_id" "$checkout_session_after_json")"
   expect_status "$session_after_status" "200" "Checkout session fetch after sync" "$checkout_session_after_json"
   jq '{checkout:.checkout|{checkout_id,status,order_id,payment_mode,updated_at},event_types:[.events[].event_type]}' "$checkout_session_after_json"
+
+  local audit_status
+  audit_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/order-sync-audit/$checkout_id?sample_limit=10" "$order_sync_audit_json")"
+  expect_status "$audit_status" "200" "Order sync audit" "$order_sync_audit_json"
+  jq '{checkout_id,order_id,shopify_order_id,checkout_status,order_state,sync_signals,warnings,recommendations}' "$order_sync_audit_json"
+  jq -e '.sync_signals.merchant_writeback.status == "ready"' "$order_sync_audit_json" >/dev/null || die "Order sync audit did not confirm merchant_writeback=ready"
 
   maybe_run_db_query \
     "readiness checkout session" \

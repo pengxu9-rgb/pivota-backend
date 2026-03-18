@@ -217,6 +217,20 @@ def test_checkout_session_not_found_error_code_is_preserved(monkeypatch):
     assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
 
 
+def test_order_sync_audit_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync-audit/rdchk_missing"
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
 def test_order_sync_not_found_error_code_is_preserved(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
 
@@ -230,6 +244,38 @@ def test_order_sync_not_found_error_code_is_preserved(monkeypatch):
     assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
     assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
     assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
+def test_order_sync_audit_route_returns_service_payload(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    async def fake_build_order_sync_audit(merchant_id: str, checkout_id: str, *, sample_limit: int = 10):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert checkout_id == "rdchk_alpha_1"
+        assert sample_limit == 7
+        return {
+            "merchant_id": merchant_id,
+            "checkout_id": checkout_id,
+            "merchant_alpha_mode": "real_merchant_alpha",
+            "sync_signals": {
+                "merchant_writeback": {"status": "ready"},
+                "webhook_ingest": {"status": "pending"},
+            },
+        }
+
+    monkeypatch.setattr(readiness_service, "build_order_sync_audit", fake_build_order_sync_audit)
+
+    response = client.get(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync-audit/rdchk_alpha_1?sample_limit=7"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "rdchk_alpha_1"
+    assert body["sync_signals"]["merchant_writeback"]["status"] == "ready"
+    assert body["sync_signals"]["webhook_ingest"]["status"] == "pending"
 
 
 def test_real_merchant_checkout_and_order_sync_are_idempotent(monkeypatch):

@@ -212,6 +212,31 @@ async def get_checkout_session(
         )
 
 
+@router.get("/merchants/{merchant_id}/order-sync-audit/{checkout_id}")
+async def get_order_sync_audit(
+    merchant_id: str,
+    checkout_id: str,
+    request: Request,
+    sample_limit: int = Query(10, ge=1, le=50),
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    try:
+        return await readiness_service.build_order_sync_audit(
+            merchant_id,
+            checkout_id,
+            sample_limit=sample_limit,
+        )
+    except readiness_service.UnsupportedMerchantError:
+        raise _unsupported_merchant(merchant_id)
+    except KeyError:
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
+
+
 @router.post("/merchants/{merchant_id}/order-sync/{checkout_id}")
 async def advance_order_sync(
     merchant_id: str,
