@@ -9,6 +9,7 @@ export FEATURE_READINESS_REAL_MERCHANT_ALPHA=true
 export FEATURE_READINESS_SOURCE_OF_TRUTH_V1=true
 export FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA=true
 export FEATURE_READINESS_PAYMENT_BRIDGE_ALPHA=true
+export FEATURE_READINESS_PAYMENT_INTENT_ALPHA=true
 export READINESS_ALPHA_MERCHANT_ID=merch_efbc46b4619cfbdf
 export READINESS_INTERNAL_API_KEY=change-me
 export DATABASE_URL='postgresql://...'
@@ -216,6 +217,29 @@ This bridge is intentionally narrow:
 - it best-effort syncs a matching Shopify transaction
 
 After the bridge, re-run the audit and confirm `refund_sync.refund_eligible=true` before attempting refund validation.
+
+## Payment Intent
+
+If you want readiness to mint a PSP payment intent for the readiness-owned local order instead of manually attaching an external reference, call:
+
+```bash
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout-sessions/<checkout_id>/payment-intent" \
+  -d '{
+    "preferred_psps": ["stripe"]
+  }'
+```
+
+This route is intentionally narrow:
+
+- it requires `/order-sync` to have already created a local order
+- it reuses the existing multi-PSP payment-intent creation stack
+- it is order-idempotent; repeated calls reuse the same `payment_intent_id`
+- it does not by itself guarantee a paid order unless the PSP returns immediate success or a later confirmation/webhook lands
+
+Use this path when you want readiness to own payment-intent creation, and use `payment-bridge` when payment execution already happened elsewhere.
 
 ## Error Contract Probes
 

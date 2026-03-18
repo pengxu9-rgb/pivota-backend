@@ -38,5 +38,9 @@ def readiness_payment_bridge_enabled() -> bool:
     return _env_flag("FEATURE_READINESS_PAYMENT_BRIDGE_ALPHA")
 
 
+def readiness_payment_intent_enabled() -> bool:
+    return _env_flag("FEATURE_READINESS_PAYMENT_INTENT_ALPHA")
+
+
 def readiness_alpha_merchant_id() -> str:
     return (os.getenv("READINESS_ALPHA_MERCHANT_ID") or DEFAULT_ALPHA_MERCHANT_ID).strip() or DEFAULT_ALPHA_MERCHANT_ID

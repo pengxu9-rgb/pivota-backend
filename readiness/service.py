@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from decimal import Decimal
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from adapters.multi_psp_orchestrator import create_payment_with_failover
 from db.orders import create_order, get_order, mark_order_paid, update_fulfillment_info, update_payment_info
 from db.products import log_order_event
 from readiness.channel_exports.ucp import build_ucp_export
@@ -439,6 +441,22 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _build_payment_action(*, psp_used: str, client_secret: Optional[str], redirect_url: Optional[str]) -> Dict[str, Any]:
+    if redirect_url:
+        return {"type": "redirect_url", "url": redirect_url}
+    secret = str(client_secret or "").strip()
+    psp = str(psp_used or "").strip().lower()
+    if not secret:
+        return {"type": None}
+    if secret.startswith("http"):
+        return {"type": "redirect_url", "url": secret}
+    if psp == "stripe":
+        return {"type": "stripe_client_secret", "client_secret": secret}
+    if psp == "adyen":
+        return {"type": "adyen_session", "client_secret": secret}
+    return {"type": "client_secret", "client_secret": secret}
+
+
 async def _create_local_order_for_checkout(checkout: CheckoutSessionRecord) -> str:
     payload = checkout.session_payload or {}
     quantity = int(checkout.quantity or 1)
@@ -668,6 +686,185 @@ async def attach_payment_reference_to_checkout(
         "psp_used": resolved_psp,
         "transaction_sync": transaction_sync,
         "replayed": replayed,
+    }
+
+
+async def create_payment_intent_for_checkout(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    preferred_psps: Optional[List[str]] = None,
+    psp_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    journal = get_default_journal()
+    checkout = await journal.get_checkout_session(checkout_id)
+    if checkout is None or checkout.merchant_id != merchant_id:
+        raise KeyError(checkout_id)
+
+    payload = checkout.session_payload or {}
+    if payload.get("merchant_alpha_mode") != "real_merchant_alpha":
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "message": "Payment intent creation is only supported for the real-merchant alpha path.",
+            }
+        )
+
+    order_id = str(checkout.order_id or "").strip()
+    if not order_id:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_ORDER_NOT_CREATED",
+                "checkout_id": checkout_id,
+                "message": "Run /order-sync first so the checkout creates a local order before creating a payment intent.",
+            }
+        )
+
+    order_row = await get_order(order_id)
+    if not order_row:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Checkout references a local order that could not be loaded.",
+            }
+        )
+
+    existing_payment_intent_id = str(order_row.get("payment_intent_id") or "").strip()
+    existing_payment_status = _normalized_payment_status(order_row)
+    existing_client_secret = str(order_row.get("client_secret") or "").strip()
+    existing_psp_used = str(order_row.get("psp_used") or "").strip().lower()
+    if existing_payment_intent_id:
+        return {
+            "checkout": checkout,
+            "events": await journal.list_events(checkout_id),
+            "order": order_row,
+            "payment_intent_id": existing_payment_intent_id,
+            "client_secret": existing_client_secret or None,
+            "psp_used": existing_psp_used or None,
+            "payment_intent_status": existing_payment_status or "processing",
+            "payment_action": _build_payment_action(
+                psp_used=existing_psp_used,
+                client_secret=existing_client_secret,
+                redirect_url=None,
+            ),
+            "replayed": True,
+            "bridged_to_paid": existing_payment_status == "paid",
+        }
+
+    amount = Decimal(str(order_row.get("total") or _safe_float((payload.get("price") or {}).get("amount")) * int(checkout.quantity or 1)))
+    currency = str(order_row.get("currency") or ((payload.get("price") or {}).get("currency")) or "USD")
+    metadata = {
+        "order_id": order_id,
+        "merchant_id": merchant_id,
+        "checkout_id": checkout_id,
+        "description": payload.get("product_title") or order_id,
+    }
+    if psp_mode:
+        metadata["psp_mode"] = str(psp_mode).strip()
+
+    success, payment_intent, error, psp_used = await create_payment_with_failover(
+        merchant_id=merchant_id,
+        amount=amount,
+        currency=currency,
+        metadata=metadata,
+        preferred_psps=preferred_psps,
+    )
+    if not success or payment_intent is None:
+        raise ValueError(
+            {
+                "code": "PAYMENT_FAILED",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": str(error or "Payment intent creation failed."),
+                "psp_used": psp_used,
+            }
+        )
+
+    payment_status = "awaiting_payment"
+    if str(payment_intent.status or "").lower() == "succeeded":
+        payment_status = "paid"
+    elif str(payment_intent.status or "").lower() in {"processing"}:
+        payment_status = "processing"
+
+    await update_payment_info(
+        order_id=order_id,
+        payment_intent_id=payment_intent.id,
+        client_secret=getattr(payment_intent, "client_secret", None) or "",
+        payment_status=payment_status,
+        psp_used=psp_used,
+    )
+    await log_order_event(
+        event_type="readiness_payment_intent_created",
+        merchant_id=merchant_id,
+        order_id=order_id,
+        total_amount=float(amount),
+        currency=currency,
+        payment_method=psp_used,
+        status=payment_status,
+        metadata={
+            "checkout_id": checkout_id,
+            "payment_intent_id": payment_intent.id,
+            "payment_intent_status": payment_intent.status,
+            "psp_used": psp_used,
+            "psp_mode": psp_mode,
+            "preferred_psps": preferred_psps or [],
+        },
+    )
+    await journal.append_event(
+        checkout_id=checkout_id,
+        event_type="payment_intent_created",
+        event_payload={
+            "order_id": order_id,
+            "payment_intent_id": payment_intent.id,
+            "payment_intent_status": payment_intent.status,
+            "psp_used": psp_used,
+        },
+    )
+    checkout = await journal.update_checkout_session(
+        checkout_id,
+        session_payload_patch={
+            "payment_intent_id": payment_intent.id,
+            "payment_psp_used": psp_used,
+            "payment_intent_status": payment_intent.status,
+        },
+    ) or checkout
+
+    bridged_to_paid = False
+    if str(payment_intent.status or "").lower() == "succeeded":
+        bridged = await attach_payment_reference_to_checkout(
+            merchant_id,
+            checkout_id,
+            payment_reference=payment_intent.id,
+            psp_used=psp_used,
+            client_secret=getattr(payment_intent, "client_secret", None),
+            source="readiness_payment_intent_succeeded",
+            mark_paid=True,
+            sync_shopify_transaction=True,
+        )
+        checkout = bridged["checkout"]
+        order_row = bridged["order"]
+        bridged_to_paid = True
+    else:
+        order_row = await get_order(order_id)
+
+    return {
+        "checkout": checkout,
+        "events": await journal.list_events(checkout_id),
+        "order": order_row,
+        "payment_intent_id": payment_intent.id,
+        "client_secret": getattr(payment_intent, "client_secret", None),
+        "psp_used": psp_used,
+        "payment_intent_status": payment_intent.status,
+        "payment_action": _build_payment_action(
+            psp_used=psp_used,
+            client_secret=getattr(payment_intent, "client_secret", None),
+            redirect_url=getattr(payment_intent, "redirect_url", None),
+        ),
+        "replayed": False,
+        "bridged_to_paid": bridged_to_paid,
     }
 
 

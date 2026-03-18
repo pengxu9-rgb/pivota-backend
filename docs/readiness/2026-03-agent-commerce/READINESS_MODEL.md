@@ -215,6 +215,46 @@ Current semantics:
 - it best-effort syncs a matching Shopify transaction when the readiness order is already linked to Shopify
 - it makes the readiness order refund-eligible for the existing refund path
 
+## Payment Intent Contract
+
+Readiness alpha now also exposes an additive internal bridge for creating a PSP payment intent against a readiness-created local order:
+
+- `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-intent`
+
+Request:
+
+```json
+{
+  "preferred_psps": ["stripe"],
+  "psp_mode": null
+}
+```
+
+Response fields:
+
+- `merchant_id`
+- `merchant_alpha_mode`
+- `checkout_id`
+- `order_id`
+- `status`
+- `payment_status`
+- `payment_intent_id`
+- `client_secret`
+- `psp_used`
+- `payment_intent_status`
+- `payment_action`
+- `bridged_to_paid`
+- `replayed`
+- `events`
+
+Current semantics:
+
+- the route is internal-only and feature-flagged
+- it requires the readiness checkout to have already created a local order via `/order-sync`
+- it reuses the existing multi-PSP payment-intent creation stack
+- it is idempotent at the order level; repeated calls reuse the existing `orders.payment_intent_id`
+- if the PSP returns `succeeded` immediately, readiness auto-bridges that payment reference back into the checkout/order state
+
 ## Order Sync Contract
 
 Request:
@@ -307,6 +347,7 @@ Synthetic path retains:
 Real merchant alpha adds:
 
 - `payment_capability_verified`
+- `payment_intent_created`
 - `payment_reference_attached`
 - `merchant_payment_transaction_synced`
 - `checkout_blocked`
@@ -349,6 +390,7 @@ Readiness internal routes now preserve explicit machine-readable top-level error
 - `CHECKOUT_NOT_FOUND`
 - `CHECKOUT_INVALID`
 - `CHECKOUT_ORDER_NOT_CREATED`
+- `CHECKOUT_PAYMENT_INTENT_NOT_FOUND`
 - `ORDER_ALREADY_PAID`
 
 Current endpoint matrix:
@@ -359,6 +401,7 @@ Current endpoint matrix:
 | `GET /internal/readiness/merchants/{merchant_id}/report` or `/exports/ucp` with unsupported channel | `400` | `UNSUPPORTED_CHANNEL` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout` with unknown variant | `404` | `VARIANT_NOT_FOUND` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout` with blocked variant | `409` | `VARIANT_NOT_READY_FOR_CHECKOUT` |
+| `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-intent` before local order creation | `409` | `CHECKOUT_ORDER_NOT_CREATED` |
 | `GET /internal/readiness/checkout-sessions/{checkout_id}` with unknown checkout | `404` | `CHECKOUT_NOT_FOUND` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` before local order creation | `409` | `CHECKOUT_ORDER_NOT_CREATED` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` for already-paid order with different reference | `409` | `ORDER_ALREADY_PAID` |

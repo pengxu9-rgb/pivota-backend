@@ -54,6 +54,7 @@ Captured fixture expectation kept for regression:
 - full report/export payloads are still expensive unless internal consumers use `summary_only=true`
 - refund / cancel / return sync still require a controlled live exercise; the new order-sync audit only surfaces their evidence paths and current observation state
 - readiness now has an internal `payment-bridge` surface that can attach an externally successful PSP reference to the readiness-owned order and make refund validation meaningful without refactoring the platform payment stack first
+- readiness now also has an internal `payment-intent` surface that can mint a PSP payment intent directly for the readiness-owned local order
 
 Follow-up live validation on March 18, 2026:
 
@@ -124,6 +125,16 @@ Current intent:
 - mark the local `orders` row `paid`
 - best-effort sync the external payment reference into the linked Shopify order transaction list
 - make `refund_sync.refund_eligible=true` in the post-order audit before a controlled refund test
+
+New internal surface:
+
+- `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-intent`
+
+Current intent:
+
+- let readiness own PSP payment-intent creation for the alpha order path
+- reuse the existing multi-PSP orchestration layer without rerouting public payment APIs
+- remove the operator dependency on separately sourcing a payment intent before later refund validation
 
 ## Local Validation Caveat
 

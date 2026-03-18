@@ -137,6 +137,11 @@ class ErrorCode(Enum):
         409,
         "Checkout has not created a local order yet"
     )
+    CHECKOUT_PAYMENT_INTENT_NOT_FOUND = ErrorDefinition(
+        "CHECKOUT_PAYMENT_INTENT_NOT_FOUND",
+        409,
+        "Checkout does not have a payment intent yet"
+    )
 
     # Additional Resource Errors (404)
     VARIANT_NOT_FOUND = ErrorDefinition(
