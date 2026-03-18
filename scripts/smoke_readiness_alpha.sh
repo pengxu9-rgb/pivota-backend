@@ -14,6 +14,9 @@ OUT_DIR=""
 CANARY_WRITE=0
 READY_VARIANT_ID=""
 BLOCKED_VARIANT_ID=""
+PAYMENT_REFERENCE="${PAYMENT_REFERENCE:-}"
+PAYMENT_PSP="${PAYMENT_PSP:-stripe}"
+PAYMENT_BRIDGE_SOURCE="${PAYMENT_BRIDGE_SOURCE:-operator_canary_bridge}"
 BUYER_EMAIL="${BUYER_EMAIL:-ops-canary@example.com}"
 CUSTOMER_NAME="${CUSTOMER_NAME:-Pivota Canary}"
 ADDRESS_NAME="${ADDRESS_NAME:-Pivota Canary}"
@@ -44,6 +47,9 @@ Options:
   --ready-variant-id ID        Override the ready variant selected from the report.
   --blocked-variant-id ID      Override the blocked variant selected from the report.
   --canary-write               Opt in to one live checkout + order-sync canary.
+  --payment-reference REF      Optional. Attach an external paid payment reference after canary write.
+  --payment-psp PSP            Optional. PSP provider for the payment bridge. Default: $PAYMENT_PSP
+  --payment-bridge-source SRC  Optional. Source label for the payment bridge event. Default: $PAYMENT_BRIDGE_SOURCE
   --buyer-email EMAIL          Canary checkout buyer email. Default: $BUYER_EMAIL
   --customer-name NAME         Canary checkout customer name. Default: $CUSTOMER_NAME
   --address-name NAME          Canary shipping recipient. Default: $ADDRESS_NAME
@@ -59,6 +65,7 @@ Options:
 Examples:
   $SCRIPT_NAME --base-url https://prod.example.com --internal-key "\$READINESS_INTERNAL_API_KEY"
   $SCRIPT_NAME --base-url https://prod.example.com --internal-key "\$READINESS_INTERNAL_API_KEY" --canary-write
+  $SCRIPT_NAME --base-url https://prod.example.com --internal-key "\$READINESS_INTERNAL_API_KEY" --canary-write --payment-reference pi_live_123
 EOF
 }
 
@@ -113,6 +120,18 @@ parse_args() {
       --canary-write)
         CANARY_WRITE=1
         shift
+        ;;
+      --payment-reference)
+        PAYMENT_REFERENCE="${2:-}"
+        shift 2
+        ;;
+      --payment-psp)
+        PAYMENT_PSP="${2:-}"
+        shift 2
+        ;;
+      --payment-bridge-source)
+        PAYMENT_BRIDGE_SOURCE="${2:-}"
+        shift 2
         ;;
       --buyer-email)
         BUYER_EMAIL="${2:-}"
@@ -323,6 +342,9 @@ main() {
   local order_sync_json="$OUT_DIR/order_sync.json"
   local checkout_session_after_json="$OUT_DIR/checkout_session_after_sync.json"
   local order_sync_audit_json="$OUT_DIR/order_sync_audit.json"
+  local payment_bridge_payload_json="$OUT_DIR/payment_bridge_payload.json"
+  local payment_bridge_json="$OUT_DIR/payment_bridge.json"
+  local order_sync_audit_after_payment_json="$OUT_DIR/order_sync_audit_after_payment.json"
   local order_sync_replay_json="$OUT_DIR/order_sync_replay.json"
 
   info "Run ID: $RUN_ID"
@@ -444,6 +466,32 @@ main() {
   expect_status "$audit_status" "200" "Order sync audit" "$order_sync_audit_json"
   jq '{checkout_id,order_id,shopify_order_id,checkout_status,order_state,sync_signals,warnings,recommendations}' "$order_sync_audit_json"
   jq -e '.sync_signals.merchant_writeback.status == "ready"' "$order_sync_audit_json" >/dev/null || die "Order sync audit did not confirm merchant_writeback=ready"
+
+  if [[ -n "$PAYMENT_REFERENCE" ]]; then
+    info "Optional payment bridge: attaching external payment reference"
+    jq -n \
+      --arg payment_reference "$PAYMENT_REFERENCE" \
+      --arg psp_used "$PAYMENT_PSP" \
+      --arg source "$PAYMENT_BRIDGE_SOURCE" \
+      '{
+        payment_reference: $payment_reference,
+        psp_used: $psp_used,
+        source: $source,
+        mark_paid: true,
+        sync_shopify_transaction: true
+      }' >"$payment_bridge_payload_json"
+
+    local payment_bridge_status
+    payment_bridge_status="$(request_json POST "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/checkout-sessions/$checkout_id/payment-bridge" "$payment_bridge_json" "$payment_bridge_payload_json")"
+    expect_status "$payment_bridge_status" "200" "Payment bridge" "$payment_bridge_json"
+    jq '{checkout_id,order_id,status,payment_status,payment_reference,psp_used,transaction_sync,replayed,event_types:[.events[].event_type]}' "$payment_bridge_json"
+
+    local audit_after_payment_status
+    audit_after_payment_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/order-sync-audit/$checkout_id?sample_limit=10" "$order_sync_audit_after_payment_json")"
+    expect_status "$audit_after_payment_status" "200" "Order sync audit after payment bridge" "$order_sync_audit_after_payment_json"
+    jq '{checkout_id,order_id,checkout_status,order_state,sync_signals,warnings,recommendations}' "$order_sync_audit_after_payment_json"
+    jq -e '.sync_signals.refund_sync.refund_eligible == true' "$order_sync_audit_after_payment_json" >/dev/null || die "Payment bridge did not make refund_sync eligible"
+  fi
 
   maybe_run_db_query \
     "readiness checkout session" \

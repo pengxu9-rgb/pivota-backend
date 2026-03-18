@@ -13,6 +13,7 @@ Implemented:
 - explicit readiness error contract preserved through the global error middleware
 - read-only order-sync audit that aggregates readiness journal, `orders`, Shopify webhook ingest, `refund_records`, and `return_records`
 - replay-based convergence from downstream merchant cancellation/refund state back into readiness checkout session state
+- internal payment bridge for attaching an externally successful PSP reference to a readiness order and making refund validation possible without rewriting the payment stack
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
 
@@ -20,7 +21,7 @@ Validated:
 
 - `python3 -m py_compile` on the readiness modules and router
 - `python3 -m pytest readiness/tests -q`
-- result after current error-contract + summary-only work: `24 passed`
+- result after current payment-bridge + audit-eligibility work: `34 passed`
 - targeted follow-up validation for sync-audit work:
   - `python3 -m pytest readiness/tests/test_sync_audit.py readiness/tests/test_routes.py tests/test_error_handler.py -q`
   - `bash -n scripts/smoke_readiness_alpha.sh`
@@ -77,4 +78,4 @@ Major remaining risks:
 - merchant-native payment execution exists in the platform, but the readiness router still uses capability check + merchant order write-back instead of a fully unified PSP execution step
 - merchant fulfillment/returns policy is still manual config, not live-ingested
 - full report/export payloads remain large when `summary_only` is not used
-- refund and return sync still need a live exercise; cancellation sync is now live-validated but refund remains blocked for unpaid readiness-alpha canary orders
+- refund and return sync still need a live exercise; cancellation sync is live-validated, and refund is now structurally unblocked by the payment bridge, but a real paid canary reference still needs operator validation

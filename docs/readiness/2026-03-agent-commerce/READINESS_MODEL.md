@@ -174,6 +174,47 @@ Blocked checkout contract:
   - `blockers`
   - `warnings`
 
+## Payment Bridge Contract
+
+Readiness alpha now exposes an additive internal bridge for attaching externally executed PSP state to a readiness-created order:
+
+- `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge`
+
+Request:
+
+```json
+{
+  "payment_reference": "pi_live_123",
+  "psp_used": "stripe",
+  "source": "operator_canary_bridge",
+  "mark_paid": true,
+  "sync_shopify_transaction": true
+}
+```
+
+Response fields:
+
+- `merchant_id`
+- `merchant_alpha_mode`
+- `checkout_id`
+- `order_id`
+- `status`
+- `payment_status`
+- `payment_reference`
+- `psp_used`
+- `transaction_sync`
+- `replayed`
+- `events`
+
+Current semantics:
+
+- the bridge is internal-only and feature-flagged
+- it does not execute a PSP authorization itself
+- it attaches an already successful external payment reference to the local `orders` row
+- it marks the order `paid`
+- it best-effort syncs a matching Shopify transaction when the readiness order is already linked to Shopify
+- it makes the readiness order refund-eligible for the existing refund path
+
 ## Order Sync Contract
 
 Request:
@@ -247,7 +288,8 @@ Current signal semantics:
   - `not_observed`: no cancellation evidence yet
 - `refund_sync`
   - `ready`: `refund_records`, refund webhook topics, or refunded order state is present
-  - `not_observed`: no refund evidence yet
+  - `not_observed`: the order is refund-eligible but no refund evidence has landed yet
+  - `not_eligible`: the order is still unpaid or missing a payment reference, so refund validation is not yet meaningful
 - `return_sync`
   - `ready`: `return_records` or Shopify `returns/*` webhook evidence is present
   - `not_observed`: no return evidence yet
@@ -265,6 +307,8 @@ Synthetic path retains:
 Real merchant alpha adds:
 
 - `payment_capability_verified`
+- `payment_reference_attached`
+- `merchant_payment_transaction_synced`
 - `checkout_blocked`
 - `order_forwarded_to_merchant`
 - `merchant_writeback_failed`
@@ -304,6 +348,8 @@ Readiness internal routes now preserve explicit machine-readable top-level error
 - `VARIANT_NOT_READY_FOR_CHECKOUT`
 - `CHECKOUT_NOT_FOUND`
 - `CHECKOUT_INVALID`
+- `CHECKOUT_ORDER_NOT_CREATED`
+- `ORDER_ALREADY_PAID`
 
 Current endpoint matrix:
 
@@ -314,6 +360,8 @@ Current endpoint matrix:
 | `POST /internal/readiness/merchants/{merchant_id}/checkout` with unknown variant | `404` | `VARIANT_NOT_FOUND` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout` with blocked variant | `409` | `VARIANT_NOT_READY_FOR_CHECKOUT` |
 | `GET /internal/readiness/checkout-sessions/{checkout_id}` with unknown checkout | `404` | `CHECKOUT_NOT_FOUND` |
+| `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` before local order creation | `409` | `CHECKOUT_ORDER_NOT_CREATED` |
+| `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` for already-paid order with different reference | `409` | `ORDER_ALREADY_PAID` |
 | `POST /internal/readiness/merchants/{merchant_id}/order-sync/{checkout_id}` with unknown checkout | `404` | `CHECKOUT_NOT_FOUND` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout` or `/order-sync/{checkout_id}` with invalid request shape | `400` | `CHECKOUT_INVALID` |
 

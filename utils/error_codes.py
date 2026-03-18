@@ -132,6 +132,11 @@ class ErrorCode(Enum):
         409,
         "Checkout request could not be completed"
     )
+    CHECKOUT_ORDER_NOT_CREATED = ErrorDefinition(
+        "CHECKOUT_ORDER_NOT_CREATED",
+        409,
+        "Checkout has not created a local order yet"
+    )
 
     # Additional Resource Errors (404)
     VARIANT_NOT_FOUND = ErrorDefinition(

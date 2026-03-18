@@ -174,6 +174,7 @@ async def build_order_sync_audit_snapshot(
 
     total_refunded = float(order_state.get("total_refunded") or 0)
     payment_status = str(order_state.get("payment_status") or "").lower()
+    payment_reference = str(order_state.get("payment_intent_id") or "").strip()
     refund_observed = (
         bool(refund_records)
         or "refunds/create" in webhook_topics
@@ -181,7 +182,14 @@ async def build_order_sync_audit_snapshot(
         or payment_status in {"refunded", "partially_refunded"}
         or total_refunded > 0
     )
-    refund_status = "ready" if refund_observed else "not_observed"
+    paid_like = payment_status in {"paid", "completed", "succeeded", "settled", "partially_refunded", "refunded"}
+    refund_eligible = bool(payment_reference) and paid_like
+    if refund_observed:
+        refund_status = "ready"
+    elif refund_eligible:
+        refund_status = "not_observed"
+    else:
+        refund_status = "not_eligible"
 
     return_observed = bool(return_records) or any(topic.startswith("returns/") for topic in webhook_topics)
     return_status = "ready" if return_observed else "not_observed"
@@ -202,6 +210,8 @@ async def build_order_sync_audit_snapshot(
         recommendations.append("Cancellation sync has not been exercised yet; trigger a controlled Shopify cancellation before treating this path as validated.")
     if refund_status == "not_observed":
         recommendations.append("Refund sync has not been exercised yet; trigger a controlled refund and verify refund_records plus order payment_status convergence.")
+    if refund_status == "not_eligible":
+        recommendations.append("Refund sync cannot be exercised on this readiness order yet; attach a paid payment reference or run real PSP execution before validating refunds.")
     if return_status == "not_observed":
         recommendations.append("Return sync has not been exercised yet; trigger a controlled return/RMA and verify return_records upsert.")
 
@@ -216,6 +226,8 @@ async def build_order_sync_audit_snapshot(
         "order_state": {
             "status": order_state.get("status"),
             "payment_status": order_state.get("payment_status"),
+            "payment_intent_id": order_state.get("payment_intent_id"),
+            "psp_used": order_state.get("psp_used"),
             "fulfillment_status": order_state.get("fulfillment_status"),
             "total_refunded": total_refunded,
             "updated_at": order_state.get("updated_at"),
@@ -240,6 +252,12 @@ async def build_order_sync_audit_snapshot(
             },
             "refund_sync": {
                 "status": refund_status,
+                "refund_eligible": refund_eligible,
+                "eligibility_reason": (
+                    None
+                    if refund_eligible or refund_observed
+                    else ("missing_payment_reference" if paid_like else "order_not_paid")
+                ),
                 "refund_record_count": len(refund_records),
                 "total_refunded": total_refunded,
                 "payment_status": order_state.get("payment_status"),

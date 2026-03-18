@@ -8,7 +8,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr, Field
 
 from readiness import service as readiness_service
-from readiness.flags import readiness_router_enabled
+from readiness.flags import readiness_payment_bridge_enabled, readiness_router_enabled
 
 
 router = APIRouter(prefix="/internal/readiness", tags=["internal-readiness"])
@@ -36,6 +36,15 @@ class CheckoutRequest(BaseModel):
 
 class OrderSyncAdvanceRequest(BaseModel):
     replay: bool = False
+
+
+class PaymentBridgeRequest(BaseModel):
+    payment_reference: str = Field(..., min_length=1, max_length=255)
+    psp_used: Optional[str] = Field(default=None, max_length=64)
+    client_secret: Optional[str] = Field(default=None, max_length=1024)
+    source: str = Field(default="external_payment_execution", min_length=1, max_length=128)
+    mark_paid: bool = True
+    sync_shopify_transaction: bool = True
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -78,6 +87,11 @@ def _require_internal_access(request: Request, x_pivota_internal_key: Optional[s
     provided = _extract_internal_key(request, x_pivota_internal_key)
     if not provided or not hmac.compare_digest(provided, secret):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
+def _require_payment_bridge_enabled() -> None:
+    if not readiness_payment_bridge_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
 
 
 def _unsupported_merchant(merchant_id: str) -> HTTPException:
@@ -210,6 +224,58 @@ async def get_checkout_session(
             "CHECKOUT_NOT_FOUND",
             {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
         )
+
+
+@router.post("/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge")
+async def attach_payment_reference(
+    merchant_id: str,
+    checkout_id: str,
+    body: PaymentBridgeRequest,
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    _require_payment_bridge_enabled()
+    try:
+        result = await readiness_service.attach_payment_reference_to_checkout(
+            merchant_id,
+            checkout_id,
+            payment_reference=body.payment_reference,
+            psp_used=body.psp_used,
+            client_secret=body.client_secret,
+            source=body.source,
+            mark_paid=body.mark_paid,
+            sync_shopify_transaction=body.sync_shopify_transaction,
+        )
+    except readiness_service.UnsupportedMerchantError:
+        raise _unsupported_merchant(merchant_id)
+    except KeyError:
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
+    except ValueError as exc:
+        detail = exc.args[0] if exc.args else {"code": "CHECKOUT_INVALID"}
+        code = str(detail.get("code") or "CHECKOUT_INVALID")
+        status_code = 400 if code in {"CHECKOUT_INVALID"} else 409
+        raise _readiness_http_exception(status_code, code, detail)
+
+    checkout = result["checkout"]
+    order = result["order"] or {}
+    return {
+        "merchant_id": merchant_id,
+        "merchant_alpha_mode": (checkout.session_payload or {}).get("merchant_alpha_mode"),
+        "checkout_id": checkout_id,
+        "order_id": checkout.order_id,
+        "status": checkout.status,
+        "payment_status": order.get("payment_status"),
+        "payment_reference": result["payment_reference"],
+        "psp_used": result["psp_used"],
+        "transaction_sync": result["transaction_sync"],
+        "replayed": bool(result.get("replayed")),
+        "events": [_model_dump(event) for event in result["events"]],
+    }
 
 
 @router.get("/merchants/{merchant_id}/order-sync-audit/{checkout_id}")

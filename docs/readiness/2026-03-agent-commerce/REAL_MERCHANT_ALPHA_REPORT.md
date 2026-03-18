@@ -53,6 +53,7 @@ Captured fixture expectation kept for regression:
 - live blocked variants are now dominated by `out_of_stock` and `missing_price`, not stale inventory snapshots
 - full report/export payloads are still expensive unless internal consumers use `summary_only=true`
 - refund / cancel / return sync still require a controlled live exercise; the new order-sync audit only surfaces their evidence paths and current observation state
+- readiness now has an internal `payment-bridge` surface that can attach an externally successful PSP reference to the readiness-owned order and make refund validation meaningful without refactoring the platform payment stack first
 
 Follow-up live validation on March 18, 2026:
 
@@ -110,6 +111,19 @@ The audit is intended to validate the convergence of:
 - `return_records`
 
 For the current alpha merchant, this makes cancellation/refund/return validation operationally tractable without changing the canonical checkout path.
+
+## Payment Bridge
+
+New internal surface:
+
+- `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge`
+
+Current intent:
+
+- bridge an already-successful PSP payment reference into the readiness alpha order
+- mark the local `orders` row `paid`
+- best-effort sync the external payment reference into the linked Shopify order transaction list
+- make `refund_sync.refund_eligible=true` in the post-order audit before a controlled refund test
 
 ## Local Validation Caveat
 

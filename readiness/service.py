@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from db.orders import create_order, get_order, update_fulfillment_info
+from db.orders import create_order, get_order, mark_order_paid, update_fulfillment_info, update_payment_info
+from db.products import log_order_event
 from readiness.channel_exports.ucp import build_ucp_export
 from readiness.flags import readiness_alpha_merchant_id
 from readiness.models import ChannelReadinessReport, CheckoutSessionRecord, MerchantReadinessSnapshot, ReadyProduct, ReadyVariant
@@ -431,6 +432,13 @@ def _validate_checkout_buyer_context(checkout: CheckoutSessionRecord) -> Optiona
     return None
 
 
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
 async def _create_local_order_for_checkout(checkout: CheckoutSessionRecord) -> str:
     payload = checkout.session_payload or {}
     quantity = int(checkout.quantity or 1)
@@ -470,6 +478,197 @@ async def _create_local_order_for_checkout(checkout: CheckoutSessionRecord) -> s
         "payment_method": None,
     }
     return await create_order(order_data)
+
+
+async def attach_payment_reference_to_checkout(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    payment_reference: str,
+    psp_used: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    source: str = "external_payment_execution",
+    mark_paid: bool = True,
+    sync_shopify_transaction: bool = True,
+) -> Dict[str, Any]:
+    journal = get_default_journal()
+    checkout = await journal.get_checkout_session(checkout_id)
+    if checkout is None or checkout.merchant_id != merchant_id:
+        raise KeyError(checkout_id)
+
+    payload = checkout.session_payload or {}
+    if payload.get("merchant_alpha_mode") != "real_merchant_alpha":
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "message": "Payment bridge is only supported for the real-merchant alpha path.",
+            }
+        )
+
+    order_id = str(checkout.order_id or "").strip()
+    if not order_id:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_ORDER_NOT_CREATED",
+                "checkout_id": checkout_id,
+                "message": "Run /order-sync first so the checkout creates a local order before attaching payment state.",
+            }
+        )
+
+    order_row = await get_order(order_id)
+    if not order_row:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Checkout references a local order that could not be loaded.",
+            }
+        )
+
+    payment_reference = str(payment_reference or "").strip()
+    if not payment_reference:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "message": "payment_reference is required",
+            }
+        )
+
+    order_payment_status = _normalized_payment_status(order_row)
+    existing_payment_ref = str(order_row.get("payment_intent_id") or "").strip()
+    replayed = False
+    if order_payment_status == "paid":
+        if existing_payment_ref and existing_payment_ref != payment_reference:
+            raise ValueError(
+                {
+                    "code": "ORDER_ALREADY_PAID",
+                    "checkout_id": checkout_id,
+                    "order_id": order_id,
+                    "message": "Order is already paid with a different payment reference.",
+                    "existing_payment_reference": existing_payment_ref,
+                }
+            )
+        replayed = True
+
+    resolved_psp = (
+        str(psp_used or "").strip().lower()
+        or str(order_row.get("psp_used") or "").strip().lower()
+        or str(((payload.get("payment_capabilities") or {}).get("psp_provider")) or "").strip().lower()
+    )
+    if not resolved_psp:
+        resolved_psp = "stripe"
+
+    resolved_client_secret = (
+        str(client_secret or "").strip()
+        or str(order_row.get("client_secret") or "").strip()
+        or payment_reference
+    )
+
+    if not replayed:
+        await update_payment_info(
+            order_id=order_id,
+            payment_intent_id=payment_reference,
+            client_secret=resolved_client_secret,
+            payment_status="paid" if mark_paid else (order_payment_status or "processing"),
+            psp_used=resolved_psp,
+        )
+        if mark_paid:
+            await mark_order_paid(order_id)
+        await log_order_event(
+            event_type="readiness_payment_bridged",
+            merchant_id=merchant_id,
+            order_id=order_id,
+            total_amount=_safe_float(order_row.get("total")),
+            currency=str(order_row.get("currency") or "USD"),
+            payment_method=resolved_psp,
+            status="paid" if mark_paid else (order_payment_status or "processing"),
+            metadata={
+                "checkout_id": checkout_id,
+                "payment_reference": payment_reference,
+                "source": source,
+                "mark_paid": mark_paid,
+                "sync_shopify_transaction": sync_shopify_transaction,
+            },
+        )
+
+    await journal.append_event(
+        checkout_id=checkout_id,
+        event_type="payment_reference_attached",
+        event_payload={
+            "order_id": order_id,
+            "payment_reference": payment_reference,
+            "psp_used": resolved_psp,
+            "source": source,
+            "mark_paid": mark_paid,
+        },
+    )
+
+    transaction_sync: Dict[str, Any] = {"ok": False, "skipped": True, "reason": "shopify_sync_not_attempted"}
+    next_payload = {
+        "payment_reference": payment_reference,
+        "payment_psp_used": resolved_psp,
+        "payment_bridge": {
+            "source": source,
+            "mark_paid": mark_paid,
+            "sync_shopify_transaction": sync_shopify_transaction,
+        },
+    }
+
+    refreshed_order = await get_order(order_id)
+    shopify_order_id = str((refreshed_order or {}).get("shopify_order_id") or "").strip()
+    merchant_connection = payload.get("merchant_connection") or {}
+    shopify_conn = merchant_connection.get("shopify") or {}
+    shop_domain = str(shopify_conn.get("shop_domain") or "").strip()
+    access_token = str(shopify_conn.get("access_token") or "").strip()
+    amount = _safe_float((payload.get("price") or {}).get("amount")) * int(checkout.quantity or 1)
+    currency = str(((payload.get("price") or {}).get("currency")) or (refreshed_order or {}).get("currency") or "USD")
+
+    if sync_shopify_transaction and shopify_order_id and shop_domain and access_token:
+        try:
+            transaction_sync = await ensure_external_payment_transaction_best_effort(
+                shop_domain=shop_domain,
+                access_token=access_token,
+                shopify_order_id=shopify_order_id,
+                psp_used=resolved_psp,
+                external_payment_ref=payment_reference,
+                amount=amount,
+                currency=currency,
+                pivota_order_id=order_id,
+            )
+        except Exception:
+            logger.warning("Payment transaction sync failed for checkout=%s", checkout_id, exc_info=True)
+            transaction_sync = {"ok": False, "skipped": False, "reason": "transaction_sync_failed"}
+        if transaction_sync.get("ok"):
+            await journal.append_event(
+                checkout_id=checkout_id,
+                event_type="merchant_payment_transaction_synced",
+                event_payload={
+                    "order_id": order_id,
+                    "shopify_order_id": shopify_order_id,
+                    "payment_reference": payment_reference,
+                    "psp_used": resolved_psp,
+                    "created": transaction_sync.get("created"),
+                },
+            )
+    elif sync_shopify_transaction:
+        transaction_sync = {"ok": False, "skipped": True, "reason": "shopify_order_or_credentials_missing"}
+
+    updated_checkout = await journal.update_checkout_session(
+        checkout_id,
+        session_payload_patch=next_payload,
+    )
+    return {
+        "checkout": updated_checkout or checkout,
+        "events": await journal.list_events(checkout_id),
+        "order": await get_order(order_id),
+        "payment_reference": payment_reference,
+        "psp_used": resolved_psp,
+        "transaction_sync": transaction_sync,
+        "replayed": replayed,
+    }
 
 
 def _to_shopify_shipping_address(shipping_address: Dict[str, Any]) -> Dict[str, Any]:

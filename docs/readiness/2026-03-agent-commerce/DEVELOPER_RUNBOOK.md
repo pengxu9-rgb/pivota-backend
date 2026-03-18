@@ -8,6 +8,7 @@ export FEATURE_READINESS_UCP_THIN_SLICE=true
 export FEATURE_READINESS_REAL_MERCHANT_ALPHA=true
 export FEATURE_READINESS_SOURCE_OF_TRUTH_V1=true
 export FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA=true
+export FEATURE_READINESS_PAYMENT_BRIDGE_ALPHA=true
 export READINESS_ALPHA_MERCHANT_ID=merch_efbc46b4619cfbdf
 export READINESS_INTERNAL_API_KEY=change-me
 export DATABASE_URL='postgresql://...'
@@ -44,6 +45,17 @@ bash scripts/smoke_readiness_alpha.sh \
   --base-url https://<prod-host> \
   --internal-key "$READINESS_INTERNAL_API_KEY" \
   --canary-write
+```
+
+If you already have a successful PSP payment reference from an external execution path, the smoke script can bridge it into the readiness order after the canary write:
+
+```bash
+bash scripts/smoke_readiness_alpha.sh \
+  --base-url https://<prod-host> \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --canary-write \
+  --payment-reference pi_live_123 \
+  --payment-psp stripe
 ```
 
 The script writes all responses to `/tmp/pivota-readiness-smoke-<run_id>` unless `--out-dir` is provided.
@@ -178,6 +190,33 @@ Expected replay outcomes for real-merchant alpha:
 - `refunded` after a full refund has landed in `orders.payment_status`
 - `partially_refunded` after partial refund evidence lands in `orders.total_refunded`
 
+## Payment Bridge
+
+If payment execution happened outside the readiness router but you need the readiness order to become refund-eligible, attach the successful PSP reference to the readiness checkout:
+
+```bash
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout-sessions/<checkout_id>/payment-bridge" \
+  -d '{
+    "payment_reference": "pi_live_123",
+    "psp_used": "stripe",
+    "source": "operator_canary_bridge",
+    "mark_paid": true,
+    "sync_shopify_transaction": true
+  }'
+```
+
+This bridge is intentionally narrow:
+
+- it does not authorize or capture a payment
+- it writes an already-successful payment reference back into the readiness-owned local order
+- it marks the order `paid`
+- it best-effort syncs a matching Shopify transaction
+
+After the bridge, re-run the audit and confirm `refund_sync.refund_eligible=true` before attempting refund validation.
+
 ## Error Contract Probes
 
 Blocked checkout should fail closed with a readiness-specific top-level code:
@@ -207,6 +246,19 @@ curl -s -o /tmp/readiness-missing-checkout.json -w "%{http_code}\n" \
   "http://127.0.0.1:8000/internal/readiness/checkout-sessions/rdchk_missing"
 
 jq '.error.code' /tmp/readiness-missing-checkout.json
+```
+
+Payment bridge failures should also preserve readiness-specific top-level codes:
+
+```bash
+curl -s -o /tmp/readiness-payment-bridge.json -w "%{http_code}\n" \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout-sessions/<checkout_id>/payment-bridge" \
+  -d '{"payment_reference":"pi_conflict"}'
+
+jq '.error.code' /tmp/readiness-payment-bridge.json
 ```
 
 ## Local Caveat
