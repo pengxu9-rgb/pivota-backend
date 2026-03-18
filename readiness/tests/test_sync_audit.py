@@ -155,6 +155,8 @@ async def test_build_order_sync_audit_snapshot_reports_refund_and_return_observa
     assert audit["sync_signals"]["refund_transaction_mirror"]["status"] == "not_observed"
     assert audit["sync_signals"]["return_sync"]["status"] == "ready"
     assert audit["sync_signals"]["refund_sync"]["refund_record_count"] == 1
+    assert audit["sync_signals"]["refund_sync"]["successful_refund_record_count"] == 1
+    assert audit["sync_signals"]["refund_sync"]["failed_refund_record_count"] == 0
     assert audit["sync_signals"]["return_sync"]["return_record_count"] == 1
 
 
@@ -310,3 +312,73 @@ async def test_build_order_sync_audit_snapshot_surfaces_soft_skipped_refund_tran
     assert audit["sync_signals"]["refund_transaction_mirror"]["soft_skipped"] is True
     assert audit["sync_signals"]["refund_transaction_mirror"]["platform_refund_id"] == "re_alpha_softskip"
     assert "shopify_refund_transaction_mirror_degraded" in audit["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_build_order_sync_audit_snapshot_marks_failed_canonical_refund_as_failed():
+    checkout = CheckoutSessionRecord(
+        checkout_id="rdchk_alpha_6",
+        merchant_id="merch_1",
+        channel="ucp",
+        variant_id="431",
+        quantity=1,
+        payment_mode="merchant_native_alpha",
+        status="state_synced",
+        order_id="ORD_ALPHA_6",
+        session_payload={"merchant_alpha_mode": "real_merchant_alpha"},
+    )
+
+    async def fake_get_order(_order_id: str):
+        return {
+            "order_id": "ORD_ALPHA_6",
+            "status": "paid",
+            "payment_status": "paid",
+            "payment_intent_id": "pi_alpha_refund_failed",
+            "psp_used": "stripe",
+            "shopify_order_id": "9001002008",
+            "total_refunded": 0,
+        }
+
+    db = FakeDB(
+        order_events=[
+            {
+                "event_type": "readiness_refund_transaction_sync",
+                "status": "failed",
+                "metadata": {
+                    "transaction_sync": {
+                        "ok": False,
+                        "skipped": True,
+                        "reason": "refund_not_completed",
+                    }
+                },
+                "created_at": "2026-03-18T00:31:00Z",
+            }
+        ],
+        refund_records=[
+            {
+                "refund_id": "REF_ALPHA_6",
+                "amount": 29.0,
+                "currency": "EUR",
+                "status": "failed",
+                "error_message": "Invalid API Key provided",
+                "created_at": "2026-03-18T00:30:30Z",
+            }
+        ],
+    )
+
+    audit = await build_order_sync_audit_snapshot(
+        merchant_id="merch_1",
+        checkout=checkout,
+        readiness_events=[],
+        get_order_fn=fake_get_order,
+        db=db,
+        sample_limit=3,
+    )
+
+    assert audit["sync_signals"]["refund_sync"]["status"] == "failed"
+    assert audit["sync_signals"]["refund_sync"]["successful_refund_record_count"] == 0
+    assert audit["sync_signals"]["refund_sync"]["failed_refund_record_count"] == 1
+    assert audit["sync_signals"]["refund_sync"]["latest_refund_record_status"] == "failed"
+    assert audit["sync_signals"]["refund_sync"]["latest_error_message"] == "Invalid API Key provided"
+    assert audit["sync_signals"]["refund_transaction_mirror"]["status"] == "failed"
+    assert "canonical_refund_failed" in audit["warnings"]

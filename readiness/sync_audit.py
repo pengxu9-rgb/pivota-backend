@@ -131,7 +131,7 @@ async def build_order_sync_audit_snapshot(
     refund_records = await _fetch_rows_best_effort(
         db,
         """
-        SELECT refund_id, amount, currency, status, platform_type, platform_refund_id, created_at, processed_at
+        SELECT refund_id, amount, currency, status, error_message, platform_type, platform_refund_id, created_at, processed_at
         FROM refund_records
         WHERE merchant_id = :merchant_id AND order_id = :order_id
         ORDER BY created_at DESC
@@ -216,8 +216,14 @@ async def build_order_sync_audit_snapshot(
     total_refunded = float(order_state.get("total_refunded") or 0)
     payment_status = str(order_state.get("payment_status") or "").lower()
     payment_reference = str(order_state.get("payment_intent_id") or "").strip()
+    successful_refund_records = [
+        row for row in refund_records if str(row.get("status") or "").strip().lower() in {"completed", "success"}
+    ]
+    failed_refund_records = [
+        row for row in refund_records if str(row.get("status") or "").strip().lower() == "failed"
+    ]
     refund_observed = (
-        bool(refund_records)
+        bool(successful_refund_records)
         or "refunds/create" in webhook_topics
         or "orders/refunded" in webhook_topics
         or payment_status in {"refunded", "partially_refunded"}
@@ -227,6 +233,8 @@ async def build_order_sync_audit_snapshot(
     refund_eligible = bool(payment_reference) and paid_like
     if refund_observed:
         refund_status = "ready"
+    elif failed_refund_records:
+        refund_status = "failed"
     elif refund_eligible:
         refund_status = "not_observed"
     else:
@@ -268,6 +276,11 @@ async def build_order_sync_audit_snapshot(
         recommendations.append("Refund sync has not been exercised yet; trigger a controlled refund and verify refund_records plus order payment_status convergence.")
     if refund_status == "not_eligible":
         recommendations.append("Refund sync cannot be exercised on this readiness order yet; attach a paid payment reference or run real PSP execution before validating refunds.")
+    if refund_status == "failed":
+        warnings.append("canonical_refund_failed")
+        recommendations.append(
+            "Refund was attempted but canonical refund did not converge. Inspect refund_records.error_message, PSP state, and refund retry queue before retrying."
+        )
     if refund_transaction_mirror_status == "soft_skipped":
         warnings.append("shopify_refund_transaction_mirror_degraded")
         recommendations.append(
@@ -321,14 +334,18 @@ async def build_order_sync_audit_snapshot(
                 "refund_eligible": refund_eligible,
                 "eligibility_reason": (
                     None
-                    if refund_eligible or refund_observed
+                    if refund_eligible or refund_observed or refund_status == "failed"
                     else ("missing_payment_reference" if paid_like else "order_not_paid")
                 ),
                 "refund_record_count": len(refund_records),
+                "successful_refund_record_count": len(successful_refund_records),
+                "failed_refund_record_count": len(failed_refund_records),
+                "latest_refund_record_status": refund_records[0].get("status") if refund_records else None,
+                "latest_error_message": refund_records[0].get("error_message") if failed_refund_records else None,
                 "total_refunded": total_refunded,
                 "payment_status": order_state.get("payment_status"),
                 "observed_topics": sorted(topic for topic in set(webhook_topics) if topic in {"refunds/create", "orders/refunded"}),
-                "latest_refund_at": _latest_at(refund_records, "processed_at", "created_at"),
+                "latest_refund_at": _latest_at(successful_refund_records or refund_records, "processed_at", "created_at"),
             },
             "refund_transaction_mirror": {
                 "status": refund_transaction_mirror_status,

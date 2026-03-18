@@ -456,6 +456,7 @@ Current signal semantics:
   - `not_observed`: no cancellation evidence yet
 - `refund_sync`
   - `ready`: `refund_records`, refund webhook topics, or refunded order state is present
+  - `failed`: a refund was attempted and a failed `refund_records` row exists, but canonical refund state did not converge
   - `not_observed`: the order is refund-eligible but no refund evidence has landed yet
   - `not_eligible`: the order is still unpaid or missing a payment reference, so refund validation is not yet meaningful
   - note: `ready` does not require a successful Shopify refund transaction mirror when canonical PSP/local refund evidence has already landed
