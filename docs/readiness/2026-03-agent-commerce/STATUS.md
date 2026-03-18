@@ -12,6 +12,7 @@ Implemented:
 - lightweight `summary_only=true` report/export modes for internal ops and production smoke
 - explicit readiness error contract preserved through the global error middleware
 - read-only order-sync audit that aggregates readiness journal, `orders`, Shopify webhook ingest, `refund_records`, and `return_records`
+- replay-based convergence from downstream merchant cancellation/refund state back into readiness checkout session state
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
 
@@ -23,6 +24,8 @@ Validated:
 - targeted follow-up validation for sync-audit work:
   - `python3 -m pytest readiness/tests/test_sync_audit.py readiness/tests/test_routes.py tests/test_error_handler.py -q`
   - `bash -n scripts/smoke_readiness_alpha.sh`
+- targeted follow-up validation for replay convergence:
+  - `python3 -m pytest readiness/tests/test_sync_audit.py readiness/tests/test_routes.py -q`
 - production deploy progression:
   - `ad49b8c`: hardened review fallback logic
   - `e20086b`: switched readiness review aggregates to raw SQL
@@ -74,4 +77,4 @@ Major remaining risks:
 - merchant-native payment execution exists in the platform, but the readiness router still uses capability check + merchant order write-back instead of a fully unified PSP execution step
 - merchant fulfillment/returns policy is still manual config, not live-ingested
 - full report/export payloads remain large when `summary_only` is not used
-- webhook-driven reconciliation and refund/cancel sync still need a live exercise even though the new sync-audit surface now exposes their evidence paths
+- refund and return sync still need a live exercise; cancellation sync is now live-validated but refund remains blocked for unpaid readiness-alpha canary orders

@@ -54,6 +54,15 @@ Captured fixture expectation kept for regression:
 - full report/export payloads are still expensive unless internal consumers use `summary_only=true`
 - refund / cancel / return sync still require a controlled live exercise; the new order-sync audit only surfaces their evidence paths and current observation state
 
+Follow-up live validation on March 18, 2026:
+
+- merchant-side cancellation was successfully exercised on canary Shopify order `7473593680200`
+- `order-sync-audit` confirmed:
+  - `webhook_ingest=ready`
+  - `cancellation_sync=ready`
+  - `orders.status=cancelled`
+- this exposed one additional gap that is now closed in code: readiness replay must absorb downstream merchant-side cancellation/refund state back into the readiness checkout session
+
 ## Evidence
 
 - machine-readable summary fixture:

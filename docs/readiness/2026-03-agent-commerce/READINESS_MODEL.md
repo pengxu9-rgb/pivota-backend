@@ -268,8 +268,17 @@ Real merchant alpha adds:
 - `checkout_blocked`
 - `order_forwarded_to_merchant`
 - `merchant_writeback_failed`
+- `merchant_cancellation_observed`
+- `merchant_refund_observed`
+- `merchant_partial_refund_observed`
 
 Replay remains idempotent by `checkout_id + event_type`.
+
+For real-merchant alpha checkouts, replay is also the canonical convergence hook after downstream merchant-side state changes:
+
+- if `orders.status=cancelled`, replay upgrades the readiness checkout session to `cancelled`
+- if `orders.payment_status=refunded`, replay upgrades the readiness checkout session to `refunded`
+- if `orders.payment_status=partially_refunded` or `orders.total_refunded>0`, replay upgrades the readiness checkout session to `partially_refunded`
 
 ## Golden Examples
 

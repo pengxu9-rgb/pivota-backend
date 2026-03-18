@@ -352,3 +352,85 @@ def test_real_merchant_checkout_and_order_sync_are_idempotent(monkeypatch):
     sync_2_json = sync_2.json()
     assert sync_2_json["status"] == "state_synced"
     assert sync_2_json["replayed"] is True
+
+
+def test_order_sync_replay_reconciles_cancelled_order_state(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    order_state = {
+        "shopify_order_id": None,
+        "status": "pending",
+        "payment_status": "unpaid",
+        "total_refunded": 0,
+    }
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_CANCEL"
+
+    async def fake_get_order(_order_id: str):
+        return {
+            "order_id": "ORD_ALPHA_CANCEL",
+            "shopify_order_id": order_state["shopify_order_id"],
+            "status": order_state["status"],
+            "payment_status": order_state["payment_status"],
+            "total_refunded": order_state["total_refunded"],
+        }
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        assert order_id == "ORD_ALPHA_CANCEL"
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001002999",
+            "shopify_order_name": "#1099",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001002999",
+        }
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-cancel",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    sync_1 = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    assert sync_1.status_code == 200
+    assert sync_1.json()["status"] == "state_synced"
+
+    order_state["status"] = "cancelled"
+
+    sync_2 = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": True},
+    )
+    assert sync_2.status_code == 200
+    sync_2_json = sync_2.json()
+    assert sync_2_json["status"] == "cancelled"
+    assert sync_2_json["replayed"] is True
+    event_types = [event["event_type"] for event in sync_2_json["events"]]
+    assert "merchant_cancellation_observed" in event_types

@@ -162,6 +162,22 @@ jq '{
 
 The production smoke script now fetches this audit automatically after a canary write and fails if `sync_signals.merchant_writeback.status != "ready"`.
 
+If a downstream merchant-side cancellation or refund occurs after the initial readiness write-through, replay the readiness order-sync to absorb the new terminal state into the readiness journal:
+
+```bash
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/order-sync/<checkout_id>" \
+  -d '{"replay": true}'
+```
+
+Expected replay outcomes for real-merchant alpha:
+
+- `cancelled` after a merchant-side cancellation has landed in `orders`
+- `refunded` after a full refund has landed in `orders.payment_status`
+- `partially_refunded` after partial refund evidence lands in `orders.total_refunded`
+
 ## Error Contract Probes
 
 Blocked checkout should fail closed with a readiness-specific top-level code:

@@ -23,6 +23,99 @@ class UnsupportedMerchantError(KeyError):
     pass
 
 
+def _normalized_order_status(order_row: Optional[Dict[str, Any]]) -> str:
+    if not order_row:
+        return ""
+    return str(order_row.get("status") or "").strip().lower()
+
+
+def _normalized_payment_status(order_row: Optional[Dict[str, Any]]) -> str:
+    if not order_row:
+        return ""
+    return str(order_row.get("payment_status") or "").strip().lower()
+
+
+async def _reconcile_checkout_state_from_order(
+    *,
+    journal,
+    checkout: CheckoutSessionRecord,
+    order_row: Optional[Dict[str, Any]],
+) -> Optional[CheckoutSessionRecord]:
+    order_status = _normalized_order_status(order_row)
+    payment_status = _normalized_payment_status(order_row)
+    total_refunded = float((order_row or {}).get("total_refunded") or 0)
+
+    if order_status == "cancelled":
+        await journal.append_event(
+            checkout_id=checkout.checkout_id,
+            event_type="merchant_cancellation_observed",
+            event_payload={
+                "order_id": checkout.order_id,
+                "status": "cancelled",
+                "payment_status": payment_status,
+            },
+        )
+        return await journal.update_checkout_session(
+            checkout.checkout_id,
+            status="cancelled",
+            session_payload_patch={
+                "observed_order_state": {
+                    "status": "cancelled",
+                    "payment_status": payment_status,
+                    "total_refunded": total_refunded,
+                }
+            },
+        )
+
+    if payment_status == "refunded":
+        await journal.append_event(
+            checkout_id=checkout.checkout_id,
+            event_type="merchant_refund_observed",
+            event_payload={
+                "order_id": checkout.order_id,
+                "status": "refunded",
+                "payment_status": payment_status,
+                "total_refunded": total_refunded,
+            },
+        )
+        return await journal.update_checkout_session(
+            checkout.checkout_id,
+            status="refunded",
+            session_payload_patch={
+                "observed_order_state": {
+                    "status": order_status or "refunded",
+                    "payment_status": payment_status,
+                    "total_refunded": total_refunded,
+                }
+            },
+        )
+
+    if payment_status == "partially_refunded" or total_refunded > 0:
+        await journal.append_event(
+            checkout_id=checkout.checkout_id,
+            event_type="merchant_partial_refund_observed",
+            event_payload={
+                "order_id": checkout.order_id,
+                "status": order_status or "partially_refunded",
+                "payment_status": payment_status or "partially_refunded",
+                "total_refunded": total_refunded,
+            },
+        )
+        return await journal.update_checkout_session(
+            checkout.checkout_id,
+            status="partially_refunded",
+            session_payload_patch={
+                "observed_order_state": {
+                    "status": order_status or "partially_refunded",
+                    "payment_status": payment_status or "partially_refunded",
+                    "total_refunded": total_refunded,
+                }
+            },
+        )
+
+    return None
+
+
 def _append_sample(sample: List[str], value: Optional[str], *, sample_limit: int) -> None:
     candidate = str(value or "").strip()
     if not candidate or len(sample) >= sample_limit or candidate in sample:
@@ -520,6 +613,17 @@ async def advance_order_sync(
 
     order_row = await get_order(order_id)
     if order_row and order_row.get("shopify_order_id"):
+        reconciled = await _reconcile_checkout_state_from_order(
+            journal=journal,
+            checkout=checkout,
+            order_row=order_row,
+        )
+        if reconciled is not None:
+            return {
+                "checkout": reconciled,
+                "events": await journal.list_events(checkout_id),
+                "replayed": replay,
+            }
         if "order_forwarded_to_merchant" not in event_types:
             await journal.append_event(
                 checkout_id=checkout_id,

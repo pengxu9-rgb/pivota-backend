@@ -152,3 +152,44 @@ async def test_build_order_sync_audit_snapshot_reports_refund_and_return_observa
     assert audit["sync_signals"]["return_sync"]["status"] == "ready"
     assert audit["sync_signals"]["refund_sync"]["refund_record_count"] == 1
     assert audit["sync_signals"]["return_sync"]["return_record_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_order_sync_audit_snapshot_warns_when_checkout_state_lags_cancelled_order():
+    checkout = CheckoutSessionRecord(
+        checkout_id="rdchk_alpha_3",
+        merchant_id="merch_1",
+        channel="ucp",
+        variant_id="431",
+        quantity=1,
+        payment_mode="merchant_native_alpha",
+        status="state_synced",
+        order_id="ORD_ALPHA_3",
+        session_payload={"merchant_alpha_mode": "real_merchant_alpha"},
+    )
+
+    async def fake_get_order(_order_id: str):
+        return {
+            "order_id": "ORD_ALPHA_3",
+            "status": "cancelled",
+            "payment_status": "unpaid",
+            "shopify_order_id": "9001002005",
+            "total_refunded": 0,
+        }
+
+    db = FakeDB(
+        webhook_events=[
+            {"topic": "orders/cancelled", "signature_verified": True, "received_at": "2026-03-18T00:20:00Z"}
+        ]
+    )
+
+    audit = await build_order_sync_audit_snapshot(
+        merchant_id="merch_1",
+        checkout=checkout,
+        readiness_events=[],
+        get_order_fn=fake_get_order,
+        db=db,
+        sample_limit=3,
+    )
+
+    assert "readiness_checkout_state_lags_order_state" in audit["warnings"]

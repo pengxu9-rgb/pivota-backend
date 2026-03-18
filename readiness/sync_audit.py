@@ -186,6 +186,12 @@ async def build_order_sync_audit_snapshot(
     return_observed = bool(return_records) or any(topic.startswith("returns/") for topic in webhook_topics)
     return_status = "ready" if return_observed else "not_observed"
 
+    checkout_status = str(checkout.status or "").strip().lower()
+    order_status = str(order_state.get("status") or "").strip().lower()
+    if order_status in {"cancelled", "refunded"} and checkout_status and checkout_status != order_status:
+        warnings.append("readiness_checkout_state_lags_order_state")
+        recommendations.append("Replay /order-sync for this checkout so the readiness journal can absorb the downstream merchant order state.")
+
     if merchant_writeback_status == "blocked":
         recommendations.append("Inspect readiness journal for merchant_writeback_failed and verify Shopify credentials for the alpha merchant.")
     if merchant_writeback_status == "pending":
