@@ -125,26 +125,42 @@ async def build_order_sync_audit_snapshot(
         {"merchant_id": merchant_id, "order_id": order_id, "limit": sample_limit},
     ) if order_id else []
 
-    return_records = await _fetch_rows_best_effort(
-        db,
-        """
-        SELECT source_return_id, status, refund_status_raw, platform_order_id, updated_at, created_at
-        FROM return_records
-        WHERE merchant_id = :merchant_id
-          AND (
-            order_id = :order_id
-            OR (:shopify_order_id IS NOT NULL AND platform_order_id = :shopify_order_id)
-          )
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT :limit
-        """,
-        {
-            "merchant_id": merchant_id,
-            "order_id": order_id,
-            "shopify_order_id": shopify_order_id,
-            "limit": sample_limit,
-        },
-    ) if order_id else []
+    if order_id and shopify_order_id:
+        return_records = await _fetch_rows_best_effort(
+            db,
+            """
+            SELECT source_return_id, status, refund_status_raw, platform_order_id, updated_at, created_at
+            FROM return_records
+            WHERE merchant_id = :merchant_id
+              AND (order_id = :order_id OR platform_order_id = :shopify_order_id)
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """,
+            {
+                "merchant_id": merchant_id,
+                "order_id": order_id,
+                "shopify_order_id": shopify_order_id,
+                "limit": sample_limit,
+            },
+        )
+    elif order_id:
+        return_records = await _fetch_rows_best_effort(
+            db,
+            """
+            SELECT source_return_id, status, refund_status_raw, platform_order_id, updated_at, created_at
+            FROM return_records
+            WHERE merchant_id = :merchant_id AND order_id = :order_id
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """,
+            {
+                "merchant_id": merchant_id,
+                "order_id": order_id,
+                "limit": sample_limit,
+            },
+        )
+    else:
+        return_records = []
 
     webhook_topics = [str(row.get("topic") or "") for row in webhook_events if row.get("topic")]
     order_event_types = [str(row.get("event_type") or "") for row in order_events if row.get("event_type")]
