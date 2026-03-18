@@ -23,7 +23,7 @@ from services.payment_routing_service import PaymentRoutingService
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
-from readiness.summary import build_readiness_summary
+from readiness.summary import build_readiness_optimization, build_readiness_summary
 
 router = APIRouter()
 
@@ -706,6 +706,25 @@ async def get_dashboard_readiness(current_user: dict = Depends(get_current_user)
     except Exception as e:
         logger.error(f"❌ Dashboard readiness error for merchant {merchant_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Dashboard readiness failed: {str(e)}")
+
+
+@router.get("/merchant/readiness/optimization")
+async def get_readiness_optimization(current_user: dict = Depends(get_current_user)):
+    """Get merchant-safe readiness optimization payload for the product optimization workspace."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        payload = await build_readiness_optimization(merchant_id)
+        return {
+            "status": "success",
+            "data": payload.model_dump(),
+        }
+    except Exception as e:
+        logger.error(f"❌ Readiness optimization error for merchant {merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Readiness optimization failed: {str(e)}")
 
 @router.put("/merchant/profile")
 async def update_merchant_profile(

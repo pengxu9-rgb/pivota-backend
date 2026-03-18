@@ -366,6 +366,7 @@ def build_merchant_snapshot(dataset: MerchantSourceDataset, channel: str = "ucp"
         ready_products.append(
             ReadyProduct(
                 product_id=product.id,
+                platform=product.platform,
                 title=product.title,
                 description=product.description,
                 brand=product.vendor,

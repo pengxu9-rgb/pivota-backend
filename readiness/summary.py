@@ -1,15 +1,108 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from readiness.flags import (
     readiness_alpha_merchant_id,
     readiness_real_merchant_alpha_enabled,
     readiness_router_enabled,
 )
-from readiness.models import MerchantReadinessSnapshot, ReadinessSummary
+from readiness.models import (
+    MerchantReadinessAction,
+    MerchantReadinessOptimizationPayload,
+    MerchantReadinessSnapshot,
+    ProductQueueIssue,
+    ProductReadinessQueueItem,
+    ReadinessIssueBucket,
+    ReadinessSummary,
+)
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
+
+
+_BUCKET_DEFINITIONS: dict[str, dict[str, str]] = {
+    "catalog_content": {
+        "label": "Catalog content",
+        "fix_surface": "product_content",
+        "scope": "product",
+        "impact": "discovery_only",
+        "direct_target": "/dashboard/product-optimization?focus=catalog_content",
+    },
+    "price_currency": {
+        "label": "Price / currency",
+        "fix_surface": "catalog_data",
+        "scope": "product",
+        "impact": "full_agent_commerce",
+        "direct_target": "/dashboard/product-optimization?focus=price_currency",
+    },
+    "inventory_availability": {
+        "label": "Inventory / availability",
+        "fix_surface": "catalog_data",
+        "scope": "product",
+        "impact": "checkout",
+        "direct_target": "/dashboard/product-optimization?focus=inventory_availability",
+    },
+    "shipping_returns_setup": {
+        "label": "Shipping / returns setup",
+        "fix_surface": "policy",
+        "scope": "merchant",
+        "impact": "full_agent_commerce",
+        "direct_target": "/dashboard/integrations",
+    },
+    "checkout_payment_setup": {
+        "label": "Checkout / payment setup",
+        "fix_surface": "integrations",
+        "scope": "merchant",
+        "impact": "full_agent_commerce",
+        "direct_target": "/dashboard/integrations",
+    },
+    "reviews_trust": {
+        "label": "Reviews / trust signals",
+        "fix_surface": "pivota_managed",
+        "scope": "merchant",
+        "impact": "discovery_only",
+        "direct_target": "/dashboard/product-optimization?focus=reviews_trust",
+    },
+    "order_sync_operations": {
+        "label": "Order / sync operations",
+        "fix_surface": "integrations",
+        "scope": "merchant",
+        "impact": "full_agent_commerce",
+        "direct_target": "/dashboard/integrations",
+    },
+    "other": {
+        "label": "Other readiness issues",
+        "fix_surface": "pivota_managed",
+        "scope": "merchant",
+        "impact": "full_agent_commerce",
+        "direct_target": "/dashboard/product-optimization",
+    },
+}
+
+_CODE_TO_BUCKET = {
+    "missing_title": "catalog_content",
+    "missing_primary_image": "catalog_content",
+    "missing_description": "catalog_content",
+    "missing_price": "price_currency",
+    "missing_currency": "price_currency",
+    "out_of_stock": "inventory_availability",
+    "inventory_stale": "inventory_availability",
+    "missing_shipping_profile": "shipping_returns_setup",
+    "merchant_shipping_policy_missing": "shipping_returns_setup",
+    "merchant_return_policy_missing": "shipping_returns_setup",
+    "merchant_checkout_capability_missing": "checkout_payment_setup",
+    "checkout_stub_missing": "checkout_payment_setup",
+    "payment_execution_stubbed": "checkout_payment_setup",
+    "reviews_summary_unavailable": "reviews_trust",
+    "cross_merchant_review_group_unresolved": "reviews_trust",
+    "review_coverage_partial": "reviews_trust",
+    "no_reviews_available": "reviews_trust",
+    "merchant_writeback_unavailable": "order_sync_operations",
+    "order_sync_stubbed": "order_sync_operations",
+    "merchant_not_assessed_for_readiness_alpha": "other",
+    "readiness_assessment_disabled": "other",
+    "readiness_summary_unavailable": "other",
+}
 
 
 def _dedupe(values: Iterable[str], *, limit: int = 3) -> list[str]:
@@ -68,6 +161,200 @@ def _variant_blocker_counts(snapshot: MerchantReadinessSnapshot) -> Counter[str]
             for code in codes:
                 counts[code] += 1
     return counts
+
+
+def _bucket_code_for_reason(code: str) -> str:
+    return _CODE_TO_BUCKET.get(code, "other")
+
+
+def _severity_for_bucket(bucket_code: str, affected_count: int) -> str:
+    if bucket_code in {"checkout_payment_setup", "shipping_returns_setup", "order_sync_operations"}:
+        return "high"
+    if affected_count >= 25:
+        return "high"
+    if affected_count > 0:
+        return "medium"
+    return "low"
+
+
+def _product_issue_counts(product: Any, channel: str) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for variant in product.variants:
+        if variant.channel_coverage.get(channel) == "ready":
+            warning_codes = set(variant.warnings.get("discovery", []) + variant.warnings.get("checkout", []))
+            for code in warning_codes:
+                counts[code] += 1
+            continue
+        blocker_codes = set(variant.blockers.get("discovery", []) + variant.blockers.get("checkout", []))
+        for code in blocker_codes:
+            counts[code] += 1
+    return counts
+
+
+def _variant_impact(variant: Any) -> str:
+    if variant.blockers.get("checkout"):
+        return "full_agent_commerce"
+    if variant.blockers.get("discovery"):
+        return "discovery_only"
+    if variant.warnings.get("checkout"):
+        return "checkout"
+    if variant.warnings.get("discovery"):
+        return "discovery_only"
+    return "discovery_only"
+
+
+def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem:
+    issue_counts = _product_issue_counts(product, channel)
+    blocked_variant_count = sum(1 for variant in product.variants if variant.channel_coverage.get(channel) != "ready")
+    ready_variant_count = max(0, len(product.variants) - blocked_variant_count)
+
+    top_codes = [code for code, _ in issue_counts.most_common(3)]
+    top_issues = [
+        ProductQueueIssue(
+            code=code,
+            label=_humanize_code(code),
+            impact=_BUCKET_DEFINITIONS[_bucket_code_for_reason(code)]["impact"],
+            affected_variant_count=issue_counts[code],
+        )
+        for code in top_codes
+    ]
+
+    primary_code = top_codes[0] if top_codes else ""
+    primary_bucket = _BUCKET_DEFINITIONS[_bucket_code_for_reason(primary_code)] if primary_code else _BUCKET_DEFINITIONS["catalog_content"]
+    primary_action = None
+    if primary_code == "missing_price":
+        primary_action = "Fix missing prices for this product before enabling AI checkout."
+    elif primary_code == "out_of_stock":
+        primary_action = "Restock or exclude the blocked variants for this product."
+    elif primary_code == "missing_primary_image":
+        primary_action = "Add a primary image so this product can be shown safely."
+    elif primary_code == "missing_title":
+        primary_action = "Add a clear product title before exposing this product to agents."
+    elif primary_code:
+        primary_action = f"Resolve { _humanize_code(primary_code).lower() } for this product."
+    else:
+        primary_action = "Review this product and improve its enrichment if you want better agent performance."
+
+    impact = "discovery_only"
+    if any(_variant_impact(variant) == "full_agent_commerce" for variant in product.variants):
+        impact = "full_agent_commerce"
+    elif any(_variant_impact(variant) == "checkout" for variant in product.variants):
+        impact = "checkout"
+
+    return ProductReadinessQueueItem(
+        product_id=product.product_id,
+        platform=product.platform or "unknown",
+        title=product.title,
+        image_url=product.default_image_url,
+        brand=product.brand,
+        category=product.category,
+        blocked_variant_count=blocked_variant_count,
+        ready_variant_count=ready_variant_count,
+        top_issues=top_issues,
+        primary_action=primary_action,
+        fix_surface=primary_bucket["fix_surface"],
+        impact=impact,
+    )
+
+
+def _build_issue_buckets(snapshot: MerchantReadinessSnapshot) -> list[ReadinessIssueBucket]:
+    bucket_reason_counts: dict[str, Counter[str]] = {}
+    bucket_affected_counts: Counter[str] = Counter()
+
+    for code in snapshot.blockers:
+        bucket = _bucket_code_for_reason(code)
+        bucket_reason_counts.setdefault(bucket, Counter())[code] += 1
+        bucket_affected_counts[bucket] += 1
+
+    for code in snapshot.warnings:
+        bucket = _bucket_code_for_reason(code)
+        bucket_reason_counts.setdefault(bucket, Counter())[code] += 1
+
+    for product in snapshot.products:
+        issue_counts = _product_issue_counts(product, snapshot.channel)
+        for code, count in issue_counts.items():
+            bucket = _bucket_code_for_reason(code)
+            bucket_reason_counts.setdefault(bucket, Counter())[code] += count
+            bucket_affected_counts[bucket] += count
+
+    buckets: list[ReadinessIssueBucket] = []
+    for bucket_code, reason_counts in bucket_reason_counts.items():
+        definition = _BUCKET_DEFINITIONS[bucket_code]
+        affected_count = int(bucket_affected_counts.get(bucket_code, 0))
+        buckets.append(
+            ReadinessIssueBucket(
+                code=bucket_code,
+                label=definition["label"],
+                severity=_severity_for_bucket(bucket_code, affected_count),
+                scope=definition["scope"],
+                affected_count=affected_count,
+                fix_surface=definition["fix_surface"],
+                impact=definition["impact"],
+                direct_target=definition["direct_target"],
+                reason_codes=[code for code, _ in reason_counts.most_common(5)],
+            )
+        )
+    buckets.sort(
+        key=lambda bucket: (
+            {"high": 0, "medium": 1, "low": 2}.get(bucket.severity, 3),
+            -bucket.affected_count,
+            bucket.label,
+        )
+    )
+    return buckets
+
+
+def _build_merchant_actions(summary: ReadinessSummary, issue_buckets: list[ReadinessIssueBucket]) -> list[MerchantReadinessAction]:
+    actions: list[MerchantReadinessAction] = []
+    for bucket in issue_buckets:
+        if bucket.fix_surface == "integrations":
+            label = "Review integrations"
+            description = f"{bucket.label} is blocking checkout or order sync for this merchant."
+        elif bucket.fix_surface == "policy":
+            label = "Review shipping and returns setup"
+            description = "Complete shipping and returns setup before enabling agent commerce."
+        elif bucket.fix_surface in {"product_content", "catalog_data"}:
+            label = "Fix products in Product Optimization"
+            description = f"{bucket.label} is affecting discoverability or checkout for part of the catalog."
+        else:
+            label = "Review readiness details"
+            description = f"{bucket.label} still needs review before broader LLM exposure."
+
+        actions.append(
+            MerchantReadinessAction(
+                label=label,
+                description=description,
+                target_url=bucket.direct_target,
+                fix_surface=bucket.fix_surface,
+                scope=bucket.scope,
+                impact=bucket.impact,
+                affected_count=bucket.affected_count,
+                related_bucket_codes=[bucket.code],
+            )
+        )
+
+    if not actions and summary.next_action:
+        actions.append(
+            MerchantReadinessAction(
+                label="Review readiness",
+                description=summary.next_action,
+                target_url="/dashboard/product-optimization",
+                fix_surface="product_content",
+                scope="merchant",
+                impact="discovery_only",
+                affected_count=summary.blocked_variant_count,
+            )
+        )
+
+    deduped: list[MerchantReadinessAction] = []
+    seen: set[tuple[str, str]] = set()
+    for action in actions:
+        key = (action.label, action.target_url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(action)
+    return deduped[:6]
 
 
 def _recommended_actions(
@@ -314,13 +601,51 @@ def _fallback_summary(
     )
 
 
-async def build_readiness_summary(
+def _fallback_optimization_payload(summary: ReadinessSummary) -> MerchantReadinessOptimizationPayload:
+    actions: list[MerchantReadinessAction] = []
+    for action in summary.recommended_actions[:3]:
+        actions.append(
+            MerchantReadinessAction(
+                label="Review readiness",
+                description=action,
+                target_url="/dashboard/product-optimization",
+                fix_surface="product_content",
+                scope="merchant",
+                impact="full_agent_commerce",
+                affected_count=summary.blocked_variant_count,
+                related_bucket_codes=["other"],
+            )
+        )
+
+    return MerchantReadinessOptimizationPayload(
+        readiness_summary=summary,
+        issue_buckets=[
+            ReadinessIssueBucket(
+                code=item["code"],
+                label=item["label"],
+                severity="high",
+                scope="merchant",
+                affected_count=int(item.get("count", 0)),
+                fix_surface="pivota_managed",
+                impact="full_agent_commerce",
+                direct_target="/dashboard/product-optimization",
+                reason_codes=[item["code"]],
+            )
+            for item in summary.blocker_breakdown
+        ],
+        merchant_actions=actions,
+        product_queue=[],
+        last_generated_at=summary.generated_at,
+    )
+
+
+async def _load_readiness_snapshot_or_summary(
     merchant_id: str,
     *,
-    channel: str = "ucp",
-) -> ReadinessSummary:
+    channel: str,
+) -> tuple[Optional[MerchantReadinessSnapshot], Optional[ReadinessSummary]]:
     if not readiness_router_enabled():
-        return _fallback_summary(
+        return None, _fallback_summary(
             assessment_state="disabled",
             blocker="readiness_assessment_disabled",
             channel=channel,
@@ -329,25 +654,78 @@ async def build_readiness_summary(
     if merchant_id != "synthetic-demo-merchant":
         alpha_merchant_id = readiness_alpha_merchant_id()
         if not readiness_real_merchant_alpha_enabled() or merchant_id != alpha_merchant_id:
-            return _fallback_summary(
+            return None, _fallback_summary(
                 assessment_state="not_assessed",
                 blocker="merchant_not_assessed_for_readiness_alpha",
                 channel=channel,
             )
 
     try:
-        snapshot = await build_readiness_snapshot(merchant_id, channel=channel)
+        return await build_readiness_snapshot(merchant_id, channel=channel), None
     except UnsupportedMerchantError:
-        return _fallback_summary(
+        return None, _fallback_summary(
             assessment_state="not_assessed",
             blocker="merchant_not_assessed_for_readiness_alpha",
             channel=channel,
         )
     except Exception:
-        return _fallback_summary(
+        return None, _fallback_summary(
+            assessment_state="assessed",
+            blocker="readiness_summary_unavailable",
+            channel=channel,
+            merchant_alpha_mode="assessment_error",
+        )
+
+
+async def build_readiness_summary(
+    merchant_id: str,
+    *,
+    channel: str = "ucp",
+) -> ReadinessSummary:
+    snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
+    if fallback is not None or snapshot is None:
+        return fallback or _fallback_summary(
             assessment_state="assessed",
             blocker="readiness_summary_unavailable",
             channel=channel,
             merchant_alpha_mode="assessment_error",
         )
     return summarize_readiness_snapshot(snapshot, channel=channel)
+
+
+async def build_readiness_optimization(
+    merchant_id: str,
+    *,
+    channel: str = "ucp",
+) -> MerchantReadinessOptimizationPayload:
+    snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
+    if fallback is not None or snapshot is None:
+        return _fallback_optimization_payload(
+            fallback
+            or _fallback_summary(
+                assessment_state="assessed",
+                blocker="readiness_summary_unavailable",
+                channel=channel,
+                merchant_alpha_mode="assessment_error",
+            )
+        )
+
+    summary = summarize_readiness_snapshot(snapshot, channel=channel)
+    issue_buckets = _build_issue_buckets(snapshot)
+    merchant_actions = _build_merchant_actions(summary, issue_buckets)
+    product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
+    product_queue.sort(
+        key=lambda item: (
+            -item.blocked_variant_count,
+            {"full_agent_commerce": 0, "checkout": 1, "discovery_only": 2}.get(item.impact, 3),
+            -sum(issue.affected_variant_count for issue in item.top_issues),
+            item.title.lower(),
+        )
+    )
+    return MerchantReadinessOptimizationPayload(
+        readiness_summary=summary,
+        issue_buckets=issue_buckets,
+        merchant_actions=merchant_actions,
+        product_queue=product_queue,
+        last_generated_at=summary.generated_at,
+    )

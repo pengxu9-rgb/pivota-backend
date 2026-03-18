@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from middleware.error_handler import ErrorHandlerMiddleware
 from readiness.flags import DEFAULT_ALPHA_MERCHANT_ID
+from readiness.models import MerchantReadinessOptimizationPayload
 from readiness.order_sync import InMemoryReadinessJournal
 from readiness.tests.conftest import build_live_shopify_products, build_review_summaries, load_real_merchant_fixture
 
@@ -140,6 +141,103 @@ def test_real_merchant_summary_report_and_export(monkeypatch):
     assert export_json["summary"]["review_backed_offer_count"] == 3
     assert export_json["summary"]["sample_limit"] == 2
     assert len(export_json["summary"]["offer_ids_sample"]) == 2
+
+
+def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import summary as readiness_summary
+
+    async def fake_build_readiness_optimization(merchant_id: str, *, channel: str = "ucp"):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert channel == "ucp"
+        return MerchantReadinessOptimizationPayload.model_validate(
+            {
+                "readiness_summary": {
+                    "tier": "yellow",
+                    "label": "Needs Attention",
+                    "assessment_state": "assessed",
+                    "score": 77,
+                    "ready_variant_count": 3,
+                    "blocked_variant_count": 1,
+                },
+                "issue_buckets": [
+                    {
+                        "code": "price_currency",
+                        "label": "Price / currency",
+                        "severity": "high",
+                        "scope": "product",
+                        "affected_count": 1,
+                        "fix_surface": "catalog_data",
+                        "impact": "full_agent_commerce",
+                        "direct_target": "/dashboard/product-optimization?focus=price_currency",
+                        "reason_codes": ["missing_price"],
+                    }
+                ],
+                "merchant_actions": [
+                    {
+                        "label": "Fix products in Product Optimization",
+                        "description": "Price / currency is affecting checkout for part of the catalog.",
+                        "target_url": "/dashboard/product-optimization?focus=price_currency",
+                        "fix_surface": "catalog_data",
+                        "scope": "product",
+                        "impact": "full_agent_commerce",
+                        "affected_count": 1,
+                        "related_bucket_codes": ["price_currency"],
+                    }
+                ],
+                "product_queue": [
+                    {
+                        "product_id": "prod_1",
+                        "platform": "shopify",
+                        "title": "Alpha Product",
+                        "image_url": "https://example.com/p.jpg",
+                        "blocked_variant_count": 1,
+                        "ready_variant_count": 0,
+                        "top_issues": [
+                            {
+                                "code": "missing_price",
+                                "label": "Missing price",
+                                "impact": "full_agent_commerce",
+                                "affected_variant_count": 1,
+                            }
+                        ],
+                        "primary_action": "Fix missing prices for this product before enabling AI checkout.",
+                        "fix_surface": "catalog_data",
+                        "impact": "full_agent_commerce",
+                    }
+                ],
+                "last_generated_at": "2026-03-18T00:00:00Z",
+            }
+        )
+
+    monkeypatch.setattr(readiness_summary, "build_readiness_optimization", fake_build_readiness_optimization)
+
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    monkeypatch.setattr(merchant_api_extensions, "build_readiness_optimization", fake_build_readiness_optimization)
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.get("/merchant/readiness/optimization")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["readiness_summary"]["tier"] == "yellow"
+    assert body["data"]["issue_buckets"][0]["code"] == "price_currency"
+    assert body["data"]["product_queue"][0]["platform"] == "shopify"
 
 
 def test_checkout_blocked_when_capability_missing(monkeypatch):

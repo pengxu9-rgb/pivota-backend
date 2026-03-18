@@ -92,6 +92,7 @@ class ReadyVariant(BaseModel):
 
 class ReadyProduct(BaseModel):
     product_id: str
+    platform: Optional[str] = None
     title: str
     description: Optional[str] = None
     brand: Optional[str] = None
@@ -140,6 +141,59 @@ class ReadinessSummary(BaseModel):
     capability_status: Dict[str, str] = Field(default_factory=dict)
     generated_at: Optional[str] = None
     next_action: Optional[str] = None
+
+
+class ReadinessIssueBucket(BaseModel):
+    code: str
+    label: str
+    severity: str
+    scope: str
+    affected_count: int = 0
+    fix_surface: str
+    impact: str
+    direct_target: str
+    reason_codes: List[str] = Field(default_factory=list)
+
+
+class MerchantReadinessAction(BaseModel):
+    label: str
+    description: str
+    target_url: str
+    fix_surface: str
+    scope: str
+    impact: str
+    affected_count: int = 0
+    related_bucket_codes: List[str] = Field(default_factory=list)
+
+
+class ProductQueueIssue(BaseModel):
+    code: str
+    label: str
+    impact: str
+    affected_variant_count: int = 0
+
+
+class ProductReadinessQueueItem(BaseModel):
+    product_id: str
+    platform: str
+    title: str
+    image_url: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    blocked_variant_count: int = 0
+    ready_variant_count: int = 0
+    top_issues: List[ProductQueueIssue] = Field(default_factory=list)
+    primary_action: Optional[str] = None
+    fix_surface: str = "product_content"
+    impact: str = "discovery_only"
+
+
+class MerchantReadinessOptimizationPayload(BaseModel):
+    readiness_summary: ReadinessSummary
+    issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
+    merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
+    product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
+    last_generated_at: Optional[str] = None
 
 
 class ChannelReadinessReport(BaseModel):
