@@ -13,6 +13,7 @@ from readiness.flags import (
     readiness_payment_intent_enabled,
     readiness_refund_enabled,
     readiness_payment_status_sync_enabled,
+    readiness_return_sync_enabled,
     readiness_router_enabled,
 )
 
@@ -70,6 +71,12 @@ class CheckoutRefundRequest(BaseModel):
     source: str = Field(default="readiness_alpha_refund", min_length=1, max_length=128)
     idempotency_key: Optional[str] = Field(default=None, max_length=255)
     sync_shopify_refund_transaction: bool = True
+
+
+class CheckoutReturnSyncRequest(BaseModel):
+    api_version: Optional[str] = Field(default=None, max_length=16)
+    limit: int = Field(20, ge=1, le=100)
+    sample_limit: int = Field(10, ge=1, le=50)
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -131,6 +138,11 @@ def _require_payment_status_sync_enabled() -> None:
 
 def _require_refund_enabled() -> None:
     if not readiness_refund_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _require_return_sync_enabled() -> None:
+    if not readiness_return_sync_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
 
 
@@ -486,6 +498,51 @@ async def create_checkout_refund(
         "transaction_sync": result["transaction_sync"],
         "replayed": bool(result.get("replayed")),
         "events": [_model_dump(event) for event in result["events"]],
+    }
+
+
+@router.post("/merchants/{merchant_id}/checkout-sessions/{checkout_id}/return-sync")
+async def sync_checkout_returns(
+    merchant_id: str,
+    checkout_id: str,
+    body: Optional[CheckoutReturnSyncRequest],
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    _require_return_sync_enabled()
+    try:
+        result = await readiness_service.sync_returns_for_checkout(
+            merchant_id,
+            checkout_id,
+            api_version=body.api_version if body else None,
+            limit=body.limit if body else 20,
+            sample_limit=body.sample_limit if body else 10,
+        )
+    except readiness_service.UnsupportedMerchantError:
+        raise _unsupported_merchant(merchant_id)
+    except KeyError:
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
+    except ValueError as exc:
+        detail = exc.args[0] if exc.args else {"code": "CHECKOUT_INVALID"}
+        code = str(detail.get("code") or "CHECKOUT_INVALID")
+        status_code = 400 if code in {"CHECKOUT_INVALID"} else 409
+        raise _readiness_http_exception(status_code, code, detail)
+
+    checkout = result["checkout"]
+    order = result["order"] or {}
+    return {
+        "merchant_id": merchant_id,
+        "merchant_alpha_mode": (checkout.session_payload or {}).get("merchant_alpha_mode"),
+        "checkout_id": checkout_id,
+        "order_id": checkout.order_id,
+        "shopify_order_id": order.get("shopify_order_id"),
+        "return_sync_result": result["return_sync_result"],
+        "sync_audit": result["audit"],
     }
 
 

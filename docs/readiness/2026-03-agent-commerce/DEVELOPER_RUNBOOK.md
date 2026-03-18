@@ -11,6 +11,7 @@ export FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA=true
 export FEATURE_READINESS_PAYMENT_BRIDGE_ALPHA=true
 export FEATURE_READINESS_PAYMENT_INTENT_ALPHA=true
 export FEATURE_READINESS_PAYMENT_STATUS_SYNC_ALPHA=true
+export FEATURE_READINESS_RETURN_SYNC_ALPHA=true
 export READINESS_ALPHA_MERCHANT_ID=merch_efbc46b4619cfbdf
 export READINESS_INTERNAL_API_KEY=change-me
 export DATABASE_URL='postgresql://...'
@@ -70,6 +71,16 @@ bash scripts/smoke_readiness_alpha.sh \
   --create-payment-intent \
   --payment-status-sync \
   --refund
+```
+
+If a merchant-side return or RMA already exists and you want readiness to pull the latest Shopify return evidence into `return_records`, the smoke script can also trigger return sync:
+
+```bash
+bash scripts/smoke_readiness_alpha.sh \
+  --base-url https://<prod-host> \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --canary-write \
+  --return-sync
 ```
 
 If you already have a successful PSP payment reference from an external execution path, the smoke script can bridge it into the readiness order after the canary write:
@@ -327,6 +338,29 @@ Observed production alpha behavior on March 18, 2026:
 - `order-sync-audit` showed `refund_sync=ready`
 - a separate live probe also showed that Shopify refund transaction mirroring can legally degrade to `soft_skipped=true`, `reason=missing_parent_transaction`
 - treat that soft-skip as a Shopify mirror limitation, not as a canonical refund failure, as long as the local order state and `refund_records.platform_refund_id` are present
+
+## Return Sync
+
+If a readiness-owned checkout already has a linked Shopify order and you want readiness to pull the latest Shopify return evidence into `return_records`, call:
+
+```bash
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout-sessions/<checkout_id>/return-sync" \
+  -d '{
+    "limit": 20,
+    "sample_limit": 10
+  }'
+```
+
+This route is intentionally narrow:
+
+- it requires a readiness-owned local order
+- it resolves Shopify Admin credentials through the merchant's primary Shopify store
+- it reuses the existing Shopify returns best-effort sync path rather than a separate readiness-only returns stack
+- it returns both the raw `return_sync_result` and a refreshed readiness `sync_audit`
+- it does not create a return; it only pulls and normalizes already-existing Shopify return evidence
 
 ## Error Contract Probes
 

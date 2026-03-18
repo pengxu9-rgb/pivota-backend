@@ -328,6 +328,31 @@ Current semantics:
 - if Shopify cannot establish a valid parent transaction, the refund still completes canonically and `transaction_sync` returns `soft_skipped=true`, usually with `reason=missing_parent_transaction`
 - it fails closed with `CHECKOUT_REFUND_NOT_ELIGIBLE` when the readiness order is still unpaid
 
+## Return Sync Contract
+
+Readiness alpha also exposes an additive internal return sync surface once the readiness-owned order exists:
+
+- `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/return-sync`
+
+Request:
+
+```json
+{
+  "api_version": null,
+  "limit": 20,
+  "sample_limit": 10
+}
+```
+
+Current semantics:
+
+- the route is internal-only and feature-flagged
+- it requires a readiness-owned local order
+- it resolves Shopify Admin credentials from the merchant's primary Shopify store and Shopify config fallback
+- it reuses the existing Shopify returns best-effort sync path and then returns a refreshed readiness `order-sync-audit`
+- it does not create a return; it only normalizes already-existing Shopify return evidence into `return_records`
+- it fails closed with `CHECKOUT_RETURN_SYNC_UNAVAILABLE` when Shopify store/admin credentials are unavailable
+
 ## Order Sync Contract
 
 Request:
@@ -480,6 +505,7 @@ Current endpoint matrix:
 | `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` before local order creation | `409` | `CHECKOUT_ORDER_NOT_CREATED` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-bridge` for already-paid order with different reference | `409` | `ORDER_ALREADY_PAID` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/refund` for unpaid or non-refundable order | `409` | `CHECKOUT_REFUND_NOT_ELIGIBLE` |
+| `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/return-sync` without Shopify store/admin credentials | `409` | `CHECKOUT_RETURN_SYNC_UNAVAILABLE` |
 | `POST /internal/readiness/merchants/{merchant_id}/order-sync/{checkout_id}` with unknown checkout | `404` | `CHECKOUT_NOT_FOUND` |
 | `POST /internal/readiness/merchants/{merchant_id}/checkout` or `/order-sync/{checkout_id}` with invalid request shape | `400` | `CHECKOUT_INVALID` |
 

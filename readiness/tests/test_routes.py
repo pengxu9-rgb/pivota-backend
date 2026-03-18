@@ -66,6 +66,7 @@ def _build_test_client(monkeypatch, *, psp_enabled: bool, include_error_handler:
     monkeypatch.setenv("FEATURE_READINESS_PAYMENT_INTENT_ALPHA", "true")
     monkeypatch.setenv("FEATURE_READINESS_PAYMENT_STATUS_SYNC_ALPHA", "true")
     monkeypatch.setenv("FEATURE_READINESS_REFUND_ALPHA", "true")
+    monkeypatch.setenv("FEATURE_READINESS_RETURN_SYNC_ALPHA", "true")
     monkeypatch.setenv("READINESS_ALLOW_UNAUTHED_DEV", "true")
     monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", DEFAULT_ALPHA_MERCHANT_ID)
 
@@ -282,6 +283,21 @@ def test_refund_not_found_error_code_is_preserved(monkeypatch):
     assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
 
 
+def test_return_sync_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_missing/return-sync",
+        json={},
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
 def test_order_sync_audit_not_found_error_code_is_preserved(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
 
@@ -341,6 +357,82 @@ def test_order_sync_audit_route_returns_service_payload(monkeypatch):
     assert body["checkout_id"] == "rdchk_alpha_1"
     assert body["sync_signals"]["merchant_writeback"]["status"] == "ready"
     assert body["sync_signals"]["webhook_ingest"]["status"] == "pending"
+
+
+def test_return_sync_route_returns_service_payload(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    async def fake_sync_returns_for_checkout(
+        merchant_id: str,
+        checkout_id: str,
+        *,
+        api_version=None,
+        limit: int = 20,
+        sample_limit: int = 10,
+    ):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert checkout_id == "rdchk_alpha_return_1"
+        assert api_version == "2025-01"
+        assert limit == 12
+        assert sample_limit == 6
+        return {
+            "checkout": type("Checkout", (), {
+                "checkout_id": checkout_id,
+                "order_id": "ORD_RETURN_1",
+                "session_payload": {"merchant_alpha_mode": "real_merchant_alpha"},
+            })(),
+            "order": {"shopify_order_id": "7001002003"},
+            "return_sync_result": {"ok": True, "fetched": 1, "upserted": 1},
+            "audit": {
+                "checkout_id": checkout_id,
+                "sync_signals": {
+                    "return_sync": {"status": "ready", "return_record_count": 1},
+                },
+            },
+        }
+
+    monkeypatch.setattr(readiness_service, "sync_returns_for_checkout", fake_sync_returns_for_checkout)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_alpha_return_1/return-sync",
+        json={"api_version": "2025-01", "limit": 12, "sample_limit": 6},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "rdchk_alpha_return_1"
+    assert body["order_id"] == "ORD_RETURN_1"
+    assert body["shopify_order_id"] == "7001002003"
+    assert body["return_sync_result"]["ok"] is True
+    assert body["sync_audit"]["sync_signals"]["return_sync"]["status"] == "ready"
+
+
+def test_return_sync_unavailable_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    from readiness import service as readiness_service
+
+    async def fake_sync_returns_for_checkout(*_args, **_kwargs):
+        raise ValueError(
+            {
+                "code": "CHECKOUT_RETURN_SYNC_UNAVAILABLE",
+                "message": "Return sync requires a Shopify primary store for this merchant.",
+            }
+        )
+
+    monkeypatch.setattr(readiness_service, "sync_returns_for_checkout", fake_sync_returns_for_checkout)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_alpha_return_2/return-sync",
+        json={},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_RETURN_SYNC_UNAVAILABLE"
+    assert body["error"]["details"]["code"] == "CHECKOUT_RETURN_SYNC_UNAVAILABLE"
 
 
 def test_real_merchant_checkout_and_order_sync_are_idempotent(monkeypatch):

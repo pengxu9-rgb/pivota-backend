@@ -12,6 +12,7 @@ import stripe
 from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
 from adapters.psp_adapter import get_psp_adapter
 from db.orders import create_order, get_order, mark_order_paid, update_fulfillment_info, update_order, update_payment_info
+from jobs.catalog_import_worker import _get_shopify_config_for_merchant
 from db.products import log_order_event
 from readiness.channel_exports.ucp import build_ucp_export
 from readiness.flags import readiness_alpha_merchant_id
@@ -21,6 +22,9 @@ from readiness.scoring import build_merchant_snapshot, find_ready_variant
 from readiness.sources import load_merchant_source_dataset, supported_merchant_ids
 from readiness.sync_audit import build_order_sync_audit_snapshot
 from services.refund_service import refund_service
+from services.merchant_store_service import get_primary_store
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_returns_service import sync_shopify_returns_best_effort
 from services.shopify_transactions_service import (
     ensure_external_payment_transaction_best_effort,
     ensure_external_refund_transaction_best_effort,
@@ -600,6 +604,109 @@ async def build_order_sync_audit(
         db=database,
         sample_limit=sample_limit,
     )
+
+
+async def sync_returns_for_checkout(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    api_version: Optional[str] = None,
+    limit: int = 20,
+    sample_limit: int = 10,
+) -> Dict[str, Any]:
+    journal = get_default_journal()
+    checkout = await journal.get_checkout_session(checkout_id)
+    if checkout is None or checkout.merchant_id != merchant_id:
+        raise KeyError(checkout_id)
+
+    payload = checkout.session_payload or {}
+    if payload.get("merchant_alpha_mode") != "real_merchant_alpha":
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "message": "Return sync is only supported for the real-merchant alpha path.",
+            }
+        )
+
+    order_id = str(checkout.order_id or "").strip()
+    if not order_id:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_ORDER_NOT_CREATED",
+                "checkout_id": checkout_id,
+                "message": "Run /order-sync first so the checkout creates a local order before syncing returns.",
+            }
+        )
+
+    order_row = await get_order(order_id)
+    if not order_row:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Checkout references a local order that could not be loaded.",
+            }
+        )
+
+    store_info = await get_primary_store(merchant_id)
+    shopify_cfg = await _get_shopify_config_for_merchant(merchant_id)
+    if not store_info or str(store_info.get("platform") or "").strip().lower() != "shopify":
+        raise ValueError(
+            {
+                "code": "CHECKOUT_RETURN_SYNC_UNAVAILABLE",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Return sync requires a Shopify primary store for this merchant.",
+            }
+        )
+
+    shop_domain = str(shopify_cfg.get("shop_domain") or store_info.get("domain") or "").strip()
+    access_token = ""
+    if shop_domain:
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
+            store_id=str(store_info.get("store_id") or "").strip() or None,
+        )
+        access_token = str(access_token or "").strip()
+    if not access_token:
+        access_token = str(shopify_cfg.get("access_token") or "").strip()
+    if not shop_domain or not access_token:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_RETURN_SYNC_UNAVAILABLE",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Return sync requires valid Shopify Admin credentials for this merchant.",
+                "shop_domain_present": bool(shop_domain),
+                "access_token_present": bool(access_token),
+            }
+        )
+
+    from db.database import database
+
+    return_sync_result = await sync_shopify_returns_best_effort(
+        merchant_id=merchant_id,
+        shop_domain=shop_domain,
+        access_token=access_token,
+        api_version=str(api_version or shopify_cfg.get("api_version") or "2024-07"),
+        limit=limit,
+        db=database,
+    )
+    audit = await build_order_sync_audit(
+        merchant_id,
+        checkout_id,
+        sample_limit=sample_limit,
+    )
+    latest_order = await get_order(order_id) or order_row
+    return {
+        "checkout": checkout,
+        "order": latest_order,
+        "return_sync_result": return_sync_result,
+        "audit": audit,
+    }
 
 
 def _validate_checkout_buyer_context(checkout: CheckoutSessionRecord) -> Optional[str]:

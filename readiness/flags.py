@@ -50,5 +50,9 @@ def readiness_refund_enabled() -> bool:
     return _env_flag("FEATURE_READINESS_REFUND_ALPHA")
 
 
+def readiness_return_sync_enabled() -> bool:
+    return _env_flag("FEATURE_READINESS_RETURN_SYNC_ALPHA")
+
+
 def readiness_alpha_merchant_id() -> str:
     return (os.getenv("READINESS_ALPHA_MERCHANT_ID") or DEFAULT_ALPHA_MERCHANT_ID).strip() or DEFAULT_ALPHA_MERCHANT_ID

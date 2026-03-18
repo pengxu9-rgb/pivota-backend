@@ -17,6 +17,7 @@ Implemented:
 - internal payment-intent route for minting a PSP payment intent directly against a readiness-created local order
 - internal payment-status-sync route for polling PSP state from a readiness-owned `payment_intent_id` and auto-bridging only on real paid status
 - internal refund route for readiness-owned paid orders, reusing the platform refund service and refund-record flow
+- internal return-sync route for pulling existing Shopify return evidence into `return_records` and refreshing readiness audit output
 - best-effort Shopify parent/refund transaction handling that degrades to explicit `soft_skipped` results instead of hard `422` failures when Shopify refuses to create a valid parent transaction
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
@@ -34,6 +35,9 @@ Validated:
 - targeted follow-up validation for Shopify transaction parent/refund handling:
   - `python3 -m pytest tests/test_shopify_transactions_service.py readiness/tests/test_routes.py readiness/tests/test_sync_audit.py tests/test_error_handler.py tests/test_refund_service.py -q`
   - result: `50 passed`
+- targeted follow-up validation for readiness return-sync route:
+  - `python3 -m pytest readiness/tests/test_return_sync.py readiness/tests/test_routes.py readiness/tests/test_sync_audit.py tests/test_error_handler.py tests/test_shopify_transactions_service.py tests/test_refund_service.py -q`
+  - result: `55 passed`
 - production deploy progression:
   - `ad49b8c`: hardened review fallback logic
   - `e20086b`: switched readiness review aggregates to raw SQL

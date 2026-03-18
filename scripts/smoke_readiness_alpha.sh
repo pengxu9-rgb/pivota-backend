@@ -22,6 +22,7 @@ PAYMENT_BRIDGE_SOURCE="${PAYMENT_BRIDGE_SOURCE:-operator_canary_bridge}"
 PAYMENT_INTENT_PREFERRED_PSPS="${PAYMENT_INTENT_PREFERRED_PSPS:-}"
 PAYMENT_INTENT_PSP_MODE="${PAYMENT_INTENT_PSP_MODE:-}"
 RUN_REFUND=0
+RUN_RETURN_SYNC=0
 REFUND_AMOUNT="${REFUND_AMOUNT:-}"
 REFUND_REASON="${REFUND_REASON:-readiness_alpha_refund}"
 BUYER_EMAIL="${BUYER_EMAIL:-ops-canary@example.com}"
@@ -57,6 +58,7 @@ Options:
   --create-payment-intent      After canary order-sync, mint a readiness-owned PSP payment intent.
   --payment-status-sync        After canary order-sync, poll PSP status for the readiness payment intent.
   --refund                     After canary write, attempt a readiness refund.
+  --return-sync                After canary write, trigger readiness return sync and refresh the audit.
   --refund-amount VALUE        Optional. Partial refund amount. Default: full remaining refundable amount.
   --refund-reason VALUE        Optional. Refund reason. Default: $REFUND_REASON
   --payment-reference REF      Optional. Attach an external paid payment reference after canary write.
@@ -148,6 +150,10 @@ parse_args() {
         ;;
       --refund)
         RUN_REFUND=1
+        shift
+        ;;
+      --return-sync)
+        RUN_RETURN_SYNC=1
         shift
         ;;
       --refund-amount)
@@ -398,6 +404,8 @@ main() {
   local refund_payload_json="$OUT_DIR/refund_payload.json"
   local refund_json="$OUT_DIR/refund.json"
   local order_sync_audit_after_refund_json="$OUT_DIR/order_sync_audit_after_refund.json"
+  local return_sync_payload_json="$OUT_DIR/return_sync_payload.json"
+  local return_sync_json="$OUT_DIR/return_sync.json"
   local order_sync_replay_json="$OUT_DIR/order_sync_replay.json"
 
   info "Run ID: $RUN_ID"
@@ -407,6 +415,7 @@ main() {
   info "Create payment intent: $CREATE_PAYMENT_INTENT"
   info "Payment status sync: $PAYMENT_STATUS_SYNC"
   info "Run refund: $RUN_REFUND"
+  info "Run return sync: $RUN_RETURN_SYNC"
 
   maybe_run_db_query \
     "merchant_onboarding preflight" \
@@ -613,6 +622,16 @@ main() {
     audit_after_refund_status="$(request_json GET "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/order-sync-audit/$checkout_id?sample_limit=10" "$order_sync_audit_after_refund_json")"
     expect_status "$audit_after_refund_status" "200" "Order sync audit after refund" "$order_sync_audit_after_refund_json"
     jq '{checkout_id,order_id,checkout_status,order_state,sync_signals,warnings,recommendations}' "$order_sync_audit_after_refund_json"
+  fi
+
+  if [[ "$RUN_RETURN_SYNC" -eq 1 ]]; then
+    info "Optional return sync: invoking readiness return-sync route"
+    jq -n '{limit: 20, sample_limit: 10}' >"$return_sync_payload_json"
+
+    local return_sync_status
+    return_sync_status="$(request_json POST "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/checkout-sessions/$checkout_id/return-sync" "$return_sync_json" "$return_sync_payload_json")"
+    expect_status "$return_sync_status" "200" "Readiness return sync" "$return_sync_json"
+    jq '{checkout_id,order_id,shopify_order_id,return_sync_result,return_sync_status:.sync_audit.sync_signals.return_sync.status}' "$return_sync_json"
   fi
 
   maybe_run_db_query \

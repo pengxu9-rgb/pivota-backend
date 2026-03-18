@@ -147,6 +147,11 @@ class ErrorCode(Enum):
         409,
         "Checkout refund is not eligible"
     )
+    CHECKOUT_RETURN_SYNC_UNAVAILABLE = ErrorDefinition(
+        "CHECKOUT_RETURN_SYNC_UNAVAILABLE",
+        409,
+        "Checkout return sync is not available"
+    )
     PAYMENT_STATUS_SYNC_FAILED = ErrorDefinition(
         "PAYMENT_STATUS_SYNC_FAILED",
         502,
