@@ -390,15 +390,12 @@ class RefundService:
         ) VALUES (
             :refund_id,
             0,
-            :next_retry,
+            NOW() + INTERVAL '5 minutes',
             NOW()
         )
         """
-        # Retry in 5 minutes
-        next_retry = datetime.now(timezone.utc) + timedelta(minutes=5)
         await self.db.execute(query, {
             "refund_id": refund_id,
-            "next_retry": next_retry
         })
     
     async def get_refund_history(self, order_id: str) -> list[Dict[str, Any]]:
@@ -520,21 +517,19 @@ class RefundService:
                     processed += 1
                 else:
                     # Update retry count and next retry time
-                    next_retry = datetime.now(timezone.utc) + timedelta(
-                        minutes=5 * (2 ** refund["retry_count"])  # Exponential backoff
-                    )
+                    retry_delay_minutes = 5 * (2 ** refund["retry_count"])
                     
                     await self.db.execute("""
                         UPDATE refund_retry_queue
                         SET 
                             retry_count = retry_count + 1,
-                            next_retry_at = :next_retry,
+                            next_retry_at = NOW() + (:retry_delay_minutes * INTERVAL '1 minute'),
                             last_error = :error,
                             updated_at = NOW()
                         WHERE id = :id
                     """, {
                         "id": refund["queue_id"],
-                        "next_retry": next_retry,
+                        "retry_delay_minutes": retry_delay_minutes,
                         "error": psp_result["error"]
                     })
                     
