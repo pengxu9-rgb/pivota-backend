@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -51,6 +52,20 @@ def _latest_at(rows: List[Dict[str, Any]], *keys: str) -> Optional[str]:
 
 def _event_types(events: List[OrderSyncEventRecord]) -> List[str]:
     return [str(event.event_type) for event in events]
+
+
+def _metadata_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.get("metadata")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
 
 
 async def _fetch_rows_best_effort(db: Any, query: str, values: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -164,6 +179,16 @@ async def build_order_sync_audit_snapshot(
 
     webhook_topics = [str(row.get("topic") or "") for row in webhook_events if row.get("topic")]
     order_event_types = [str(row.get("event_type") or "") for row in order_events if row.get("event_type")]
+    refund_transaction_events = [
+        {**row, "metadata": _metadata_dict(row)}
+        for row in order_events
+        if str(row.get("event_type") or "") == "readiness_refund_transaction_sync"
+    ]
+    latest_refund_transaction_event = refund_transaction_events[0] if refund_transaction_events else None
+    latest_refund_transaction_metadata = _metadata_dict(latest_refund_transaction_event or {})
+    latest_transaction_sync = latest_refund_transaction_metadata.get("transaction_sync")
+    if not isinstance(latest_transaction_sync, dict):
+        latest_transaction_sync = {}
 
     merchant_writeback_status = "pending"
     if shopify_order_id:
@@ -207,6 +232,21 @@ async def build_order_sync_audit_snapshot(
     else:
         refund_status = "not_eligible"
 
+    refund_transaction_mirror_status = "not_applicable"
+    if latest_refund_transaction_event:
+        refund_transaction_mirror_status = str(
+            latest_refund_transaction_event.get("status")
+            or (
+                "ready"
+                if latest_transaction_sync.get("ok")
+                else ("soft_skipped" if latest_transaction_sync.get("soft_skipped") else "failed")
+            )
+        ).strip().lower() or "failed"
+    elif refund_observed:
+        refund_transaction_mirror_status = "not_observed"
+
+    refund_transaction_mirror_reason = str(latest_transaction_sync.get("reason") or "").strip() or None
+
     return_observed = bool(return_records) or any(topic.startswith("returns/") for topic in webhook_topics)
     return_status = "ready" if return_observed else "not_observed"
 
@@ -228,6 +268,16 @@ async def build_order_sync_audit_snapshot(
         recommendations.append("Refund sync has not been exercised yet; trigger a controlled refund and verify refund_records plus order payment_status convergence.")
     if refund_status == "not_eligible":
         recommendations.append("Refund sync cannot be exercised on this readiness order yet; attach a paid payment reference or run real PSP execution before validating refunds.")
+    if refund_transaction_mirror_status == "soft_skipped":
+        warnings.append("shopify_refund_transaction_mirror_degraded")
+        recommendations.append(
+            "Canonical refund succeeded, but Shopify refund transaction mirroring degraded. Treat this as a controlled Shopify limitation unless downstream reconciliation explicitly requires mirror transactions."
+        )
+    if refund_transaction_mirror_status == "failed":
+        warnings.append("shopify_refund_transaction_mirror_failed")
+        recommendations.append(
+            "Canonical refund succeeded, but Shopify refund transaction mirroring failed. Inspect readiness_refund_transaction_sync order-event metadata and shopify_transactions_service behavior."
+        )
     if return_status == "not_observed":
         recommendations.append("Return sync has not been exercised yet; trigger a controlled return/RMA and verify return_records upsert.")
 
@@ -279,6 +329,17 @@ async def build_order_sync_audit_snapshot(
                 "payment_status": order_state.get("payment_status"),
                 "observed_topics": sorted(topic for topic in set(webhook_topics) if topic in {"refunds/create", "orders/refunded"}),
                 "latest_refund_at": _latest_at(refund_records, "processed_at", "created_at"),
+            },
+            "refund_transaction_mirror": {
+                "status": refund_transaction_mirror_status,
+                "reason": refund_transaction_mirror_reason,
+                "soft_skipped": refund_transaction_mirror_status == "soft_skipped",
+                "event_count": len(refund_transaction_events),
+                "transaction_id": latest_transaction_sync.get("transaction_id"),
+                "parent_transaction_id": latest_transaction_sync.get("parent_transaction_id"),
+                "psp_refund_id": latest_refund_transaction_metadata.get("psp_refund_id"),
+                "platform_refund_id": latest_refund_transaction_metadata.get("platform_refund_id"),
+                "latest_event_at": _latest_at(refund_transaction_events, "created_at"),
             },
             "return_sync": {
                 "status": return_status,

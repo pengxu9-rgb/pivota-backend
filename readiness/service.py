@@ -1719,6 +1719,28 @@ async def create_refund_for_checkout(
                 logger.warning("Refund transaction sync failed for checkout=%s", checkout_id, exc_info=True)
                 transaction_sync = {"ok": False, "skipped": False, "reason": "refund_transaction_sync_failed"}
 
+    await log_order_event(
+        event_type="readiness_refund_transaction_sync",
+        merchant_id=merchant_id,
+        order_id=order_id,
+        total_amount=float(refund_amount),
+        currency=str((refreshed_order or order_row).get("currency") or "USD"),
+        payment_method=str((refreshed_order or order_row).get("psp_used") or "").strip().lower() or None,
+        status=(
+            "ready"
+            if transaction_sync.get("ok")
+            else ("soft_skipped" if transaction_sync.get("soft_skipped") else "failed")
+        ),
+        metadata={
+            "checkout_id": checkout_id,
+            "refund_id": refund_id,
+            "psp_refund_id": psp_refund_id,
+            "platform_refund_id": platform_refund_id,
+            "transaction_sync": transaction_sync,
+            "source": source,
+        },
+    )
+
     reconciled = await _reconcile_checkout_state_from_order(
         journal=journal,
         checkout=checkout,

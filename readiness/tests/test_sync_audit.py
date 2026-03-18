@@ -97,6 +97,7 @@ async def test_build_order_sync_audit_snapshot_reports_ready_writeback_and_pendi
     assert audit["sync_signals"]["refund_sync"]["status"] == "not_eligible"
     assert audit["sync_signals"]["refund_sync"]["refund_eligible"] is False
     assert audit["sync_signals"]["refund_sync"]["eligibility_reason"] == "order_not_paid"
+    assert audit["sync_signals"]["refund_transaction_mirror"]["status"] == "not_applicable"
     assert audit["sync_signals"]["return_sync"]["status"] == "not_observed"
     assert audit["evidence"]["sample_limit"] == 5
 
@@ -151,6 +152,7 @@ async def test_build_order_sync_audit_snapshot_reports_refund_and_return_observa
 
     assert audit["sync_signals"]["cancellation_sync"]["status"] == "ready"
     assert audit["sync_signals"]["refund_sync"]["status"] == "ready"
+    assert audit["sync_signals"]["refund_transaction_mirror"]["status"] == "not_observed"
     assert audit["sync_signals"]["return_sync"]["status"] == "ready"
     assert audit["sync_signals"]["refund_sync"]["refund_record_count"] == 1
     assert audit["sync_signals"]["return_sync"]["return_record_count"] == 1
@@ -236,3 +238,75 @@ async def test_build_order_sync_audit_snapshot_marks_paid_order_refund_eligible_
     assert audit["sync_signals"]["refund_sync"]["status"] == "not_observed"
     assert audit["sync_signals"]["refund_sync"]["refund_eligible"] is True
     assert audit["sync_signals"]["refund_sync"]["eligibility_reason"] is None
+    assert audit["sync_signals"]["refund_transaction_mirror"]["status"] == "not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_build_order_sync_audit_snapshot_surfaces_soft_skipped_refund_transaction_mirror():
+    checkout = CheckoutSessionRecord(
+        checkout_id="rdchk_alpha_5",
+        merchant_id="merch_1",
+        channel="ucp",
+        variant_id="431",
+        quantity=1,
+        payment_mode="merchant_native_alpha",
+        status="refunded",
+        order_id="ORD_ALPHA_5",
+        session_payload={"merchant_alpha_mode": "real_merchant_alpha"},
+    )
+
+    async def fake_get_order(_order_id: str):
+        return {
+            "order_id": "ORD_ALPHA_5",
+            "status": "refunded",
+            "payment_status": "refunded",
+            "payment_intent_id": "pi_alpha_refund_softskip",
+            "psp_used": "stripe",
+            "shopify_order_id": "9001002007",
+            "total_refunded": 29.0,
+        }
+
+    db = FakeDB(
+        order_events=[
+            {
+                "event_type": "readiness_refund_transaction_sync",
+                "status": "soft_skipped",
+                "metadata": {
+                    "psp_refund_id": "re_alpha_softskip",
+                    "platform_refund_id": "re_alpha_softskip",
+                    "transaction_sync": {
+                        "ok": False,
+                        "soft_skipped": True,
+                        "reason": "missing_parent_transaction",
+                    },
+                },
+                "created_at": "2026-03-18T00:30:00Z",
+            }
+        ],
+        refund_records=[
+            {
+                "refund_id": "REF_ALPHA_5",
+                "amount": 29.0,
+                "currency": "USD",
+                "status": "completed",
+                "platform_refund_id": "re_alpha_softskip",
+                "created_at": "2026-03-18T00:29:00Z",
+            }
+        ],
+    )
+
+    audit = await build_order_sync_audit_snapshot(
+        merchant_id="merch_1",
+        checkout=checkout,
+        readiness_events=[],
+        get_order_fn=fake_get_order,
+        db=db,
+        sample_limit=3,
+    )
+
+    assert audit["sync_signals"]["refund_sync"]["status"] == "ready"
+    assert audit["sync_signals"]["refund_transaction_mirror"]["status"] == "soft_skipped"
+    assert audit["sync_signals"]["refund_transaction_mirror"]["reason"] == "missing_parent_transaction"
+    assert audit["sync_signals"]["refund_transaction_mirror"]["soft_skipped"] is True
+    assert audit["sync_signals"]["refund_transaction_mirror"]["platform_refund_id"] == "re_alpha_softskip"
+    assert "shopify_refund_transaction_mirror_degraded" in audit["warnings"]

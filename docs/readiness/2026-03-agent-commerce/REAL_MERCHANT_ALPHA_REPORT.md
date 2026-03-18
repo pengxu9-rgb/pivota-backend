@@ -80,6 +80,18 @@ Follow-up production soft-skip validation on March 18, 2026:
 - Shopify refund transaction mirror returned `soft_skipped=true`, `reason=missing_parent_transaction`
 - the attempted manual parent-transaction fallback also failed against Shopify with `sale is not a valid transaction`
 
+Supervised production return validation on March 18, 2026:
+
+- checkout id: `rdchk_c124a93b347a44cf`
+- local order id: `ORD_9EE708DC133552AD`
+- merchant order id: `7474467799368`
+- Shopify return created: `gid://shopify/Return/31924650312`
+- `return-sync` result: `ok=true`, `fetched=1`, `upserted=1`
+- post-return audit:
+  - `return_sync=ready`
+  - `return_record_count=1`
+  - `latest_return_status=open`
+
 Captured fixture expectation kept for regression:
 
 - readiness score: `76`
@@ -95,9 +107,7 @@ Captured fixture expectation kept for regression:
 - merchant-native payment execution exists in the platform, but the readiness router still does not own one universal PSP authorize/capture surface
 - live blocked variants are now dominated by `out_of_stock` and `missing_price`, not stale inventory snapshots
 - full report/export payloads are still expensive unless internal consumers use `summary_only=true`
-- return sync still has no live merchant-side return exercise
 - readiness now has both an internal `return-sync` surface and a read-only `return-eligibility` probe
-- live production probing now shows that Shopify `Order.returns` is reachable for this merchant, but the last canary checked had no actual return created yet, so `return_records` correctly stayed empty
 - Shopify refund transaction mirroring is still best-effort; for some real Shopify order shapes there is no valid parent transaction, so readiness must treat `soft_skipped: missing_parent_transaction` as a controlled degradation rather than a failed refund
 - readiness now has internal `payment-bridge`, `payment-intent`, and `payment-status-sync` surfaces, and the canonical readiness refund path has been live-validated end-to-end
 
@@ -155,6 +165,11 @@ The audit is intended to validate the convergence of:
 - `pcs_shopify_webhook_events`
 - `refund_records`
 - `return_records`
+
+The audit now also separates canonical refund success from Shopify mirror behavior:
+
+- `sync_signals.refund_sync` answers whether refund state converged canonically
+- `sync_signals.refund_transaction_mirror` answers whether Shopify accepted or soft-skipped the mirrored refund transaction
 
 For the current alpha merchant, this makes cancellation/refund/return validation operationally tractable without changing the canonical checkout path.
 

@@ -346,6 +346,7 @@ Observed production alpha behavior on March 18, 2026:
 
 - a controlled paid canary successfully converged through refund with a persisted `platform_refund_id`
 - `order-sync-audit` showed `refund_sync=ready`
+- `order-sync-audit.sync_signals.refund_transaction_mirror` now breaks out the Shopify mirror outcome separately from canonical refund success
 - a separate live probe also showed that Shopify refund transaction mirroring can legally degrade to `soft_skipped=true`, `reason=missing_parent_transaction`
 - treat that soft-skip as a Shopify mirror limitation, not as a canonical refund failure, as long as the local order state and `refund_records.platform_refund_id` are present
 
@@ -371,6 +372,12 @@ This route is intentionally narrow:
 - it reuses the existing Shopify returns best-effort sync path rather than a separate readiness-only returns stack
 - it returns both the raw `return_sync_result` and a refreshed readiness `sync_audit`
 - it does not create a return; it only pulls and normalizes already-existing Shopify return evidence
+
+Observed production alpha behavior on March 18, 2026:
+
+- a real Shopify return was created for canary checkout `rdchk_c124a93b347a44cf`
+- `return-sync` upserted that return into `return_records`
+- `order-sync-audit` then showed `return_sync=ready`, `return_record_count=1`, `latest_return_status=open`
 
 ## Return Eligibility
 

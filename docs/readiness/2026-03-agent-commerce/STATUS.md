@@ -20,6 +20,7 @@ Implemented:
 - internal return-sync route for pulling existing Shopify return evidence into `return_records` and refreshing readiness audit output
 - internal return-eligibility probe for telling operators whether a readiness-owned Shopify order is actually a good live return candidate before they create a return
 - best-effort Shopify parent/refund transaction handling that degrades to explicit `soft_skipped` results instead of hard `422` failures when Shopify refuses to create a valid parent transaction
+- explicit `refund_transaction_mirror` audit signal that separates canonical refund success from Shopify refund-transaction mirror outcomes
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
 
@@ -129,6 +130,16 @@ Validated:
   - canonical refund still succeeded with `platform_refund_id=re_3TCGMaGeIEg0wZyU1YII02SA`
   - Shopify refund transaction mirror returned `soft_skipped=true`, `reason=missing_parent_transaction`
   - the attempted parent-transaction fallback also failed against Shopify with `sale is not a valid transaction`
+- supervised production return-sync validation on March 18, 2026
+  - readiness checkout id: `rdchk_c124a93b347a44cf`
+  - local order id: `ORD_9EE708DC133552AD`
+  - merchant write-back Shopify order id: `7474467799368`
+  - Shopify return created: `gid://shopify/Return/31924650312`
+  - `return-sync` result: `ok=true`, `fetched=1`, `upserted=1`
+  - post-return audit:
+    - `return_sync=ready`
+    - `return_record_count=1`
+    - `latest_return_status=open`
 - supervised production canary write on March 17, 2026
   - checkout create: `200`
   - checkout id: `rdchk_4b7c7a42214f4bf0`
@@ -143,7 +154,6 @@ Validated:
 Not yet executed live:
 
 - no direct PSP authorize/capture executed by the readiness router itself
-- no live return sync validation yet
 - no inbound PSP-webhook-driven paid confirmation path validated from the readiness router itself
 
 Major remaining risks:
@@ -152,6 +162,5 @@ Major remaining risks:
 - merchant-native payment execution exists in the platform, but the readiness router still uses capability check + merchant order write-back instead of a fully unified PSP execution step
 - merchant fulfillment/returns policy is still manual config, not live-ingested
 - full report/export payloads remain large when `summary_only` is not used
-- return sync still has no live exercise
 - readiness can create PSP payment intents and absorb real paid state, but the canonical paid transition is still status-sync / bridge based rather than a single readiness-owned capture surface
 - Shopify transaction mirroring is explicitly best-effort; some Shopify order shapes reject both external sale creation and manual parent sale creation, so readiness must rely on canonical PSP + local refund records rather than a guaranteed Shopify refund transaction graph

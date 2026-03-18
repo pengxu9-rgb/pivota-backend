@@ -432,6 +432,7 @@ Response fields:
 - `sync_signals.webhook_ingest`
 - `sync_signals.cancellation_sync`
 - `sync_signals.refund_sync`
+- `sync_signals.refund_transaction_mirror`
 - `sync_signals.return_sync`
 - `warnings`
 - `recommendations`
@@ -458,6 +459,12 @@ Current signal semantics:
   - `not_observed`: the order is refund-eligible but no refund evidence has landed yet
   - `not_eligible`: the order is still unpaid or missing a payment reference, so refund validation is not yet meaningful
   - note: `ready` does not require a successful Shopify refund transaction mirror when canonical PSP/local refund evidence has already landed
+- `refund_transaction_mirror`
+  - `ready`: readiness recorded a successful Shopify refund transaction sync event
+  - `soft_skipped`: canonical refund succeeded, but Shopify refused or could not support a mirrored refund transaction shape such as `missing_parent_transaction`
+  - `failed`: readiness attempted Shopify refund transaction sync and it failed outside the known controlled soft-skip cases
+  - `not_observed`: refund evidence exists, but no explicit readiness refund transaction sync event was recorded
+  - `not_applicable`: no refund has been observed yet, so refund transaction mirroring is not meaningful
 - `return_sync`
   - `ready`: `return_records` or Shopify `returns/*` webhook evidence is present
   - `not_observed`: no return evidence yet
@@ -484,6 +491,7 @@ Real merchant alpha adds:
 - `merchant_cancellation_observed`
 - `merchant_refund_observed`
 - `merchant_partial_refund_observed`
+- `readiness_refund_transaction_sync`
 
 Replay remains idempotent by `checkout_id + event_type`.
 
