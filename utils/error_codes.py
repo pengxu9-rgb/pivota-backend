@@ -93,6 +93,11 @@ class ErrorCode(Enum):
         400,
         "Store configuration is incomplete or invalid"
     )
+    UNSUPPORTED_CHANNEL = ErrorDefinition(
+        "UNSUPPORTED_CHANNEL",
+        400,
+        "Requested channel is not supported"
+    )
     
     # Business Logic Errors (400)
     OUT_OF_STOCK = ErrorDefinition(
@@ -114,6 +119,35 @@ class ErrorCode(Enum):
         "ORDER_ALREADY_PAID",
         400,
         "Order has already been paid"
+    )
+
+    # Conflict Errors (409)
+    VARIANT_NOT_READY_FOR_CHECKOUT = ErrorDefinition(
+        "VARIANT_NOT_READY_FOR_CHECKOUT",
+        409,
+        "Variant is not ready for checkout"
+    )
+    CHECKOUT_INVALID = ErrorDefinition(
+        "CHECKOUT_INVALID",
+        409,
+        "Checkout request could not be completed"
+    )
+
+    # Additional Resource Errors (404)
+    VARIANT_NOT_FOUND = ErrorDefinition(
+        "VARIANT_NOT_FOUND",
+        404,
+        "Variant not found"
+    )
+    CHECKOUT_NOT_FOUND = ErrorDefinition(
+        "CHECKOUT_NOT_FOUND",
+        404,
+        "Checkout session not found"
+    )
+    READINESS_MERCHANT_UNSUPPORTED = ErrorDefinition(
+        "READINESS_MERCHANT_UNSUPPORTED",
+        404,
+        "Merchant is not supported by readiness"
     )
     
     # Payment Errors (402)

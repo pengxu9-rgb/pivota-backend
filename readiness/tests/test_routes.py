@@ -7,6 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from middleware.error_handler import ErrorHandlerMiddleware
 from readiness.flags import DEFAULT_ALPHA_MERCHANT_ID
 from readiness.order_sync import InMemoryReadinessJournal
 from readiness.tests.conftest import build_live_shopify_products, build_review_summaries, load_real_merchant_fixture
@@ -56,7 +57,7 @@ def _install_live_source_mocks(monkeypatch, *, psp_enabled: bool):
     monkeypatch.setattr(shopify_live, "load_product_review_summaries", fake_load_product_review_summaries)
 
 
-def _build_test_client(monkeypatch, *, psp_enabled: bool) -> TestClient:
+def _build_test_client(monkeypatch, *, psp_enabled: bool, include_error_handler: bool = False) -> TestClient:
     monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
     monkeypatch.setenv("FEATURE_READINESS_SOURCE_OF_TRUTH_V1", "true")
     monkeypatch.setenv("FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA", "true")
@@ -71,6 +72,8 @@ def _build_test_client(monkeypatch, *, psp_enabled: bool) -> TestClient:
 
     readiness_order_sync._default_journal = InMemoryReadinessJournal()
     app = FastAPI()
+    if include_error_handler:
+        app.add_middleware(ErrorHandlerMiddleware)
     app.include_router(readiness_router)
     return TestClient(app)
 
@@ -144,6 +147,21 @@ def test_checkout_blocked_when_capability_missing(monkeypatch):
     detail = response.json()["detail"]
     assert detail["code"] == "VARIANT_NOT_READY_FOR_CHECKOUT"
     assert "merchant_checkout_capability_missing" in detail["blockers"]
+
+
+def test_checkout_blocked_error_code_is_preserved_with_error_handler(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=False, include_error_handler=True)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={"variant_id": "431000000001", "quantity": 1},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "VARIANT_NOT_READY_FOR_CHECKOUT"
+    assert body["error"]["details"]["code"] == "VARIANT_NOT_READY_FOR_CHECKOUT"
+    assert "merchant_checkout_capability_missing" in body["error"]["details"]["blockers"]
 
 
 def test_real_merchant_checkout_and_order_sync_are_idempotent(monkeypatch):

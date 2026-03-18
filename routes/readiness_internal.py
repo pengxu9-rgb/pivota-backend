@@ -88,6 +88,15 @@ def _unsupported_merchant(merchant_id: str) -> HTTPException:
             "message": f"Readiness currently supports only {', '.join(readiness_service.supported_merchants())}, not '{merchant_id}'.",
             "supported_merchants": readiness_service.supported_merchants(),
         },
+        headers={"X-Error-Code": "READINESS_MERCHANT_UNSUPPORTED"},
+    )
+
+
+def _readiness_http_exception(status_code: int, code: str, detail: Dict[str, Any]) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=detail,
+        headers={"X-Error-Code": code},
     )
 
 
@@ -102,7 +111,11 @@ async def get_readiness_report(
 ) -> Dict[str, Any]:
     _require_internal_access(request, x_pivota_internal_key)
     if channel != "ucp":
-        raise HTTPException(status_code=400, detail={"code": "UNSUPPORTED_CHANNEL", "channel": channel})
+        raise _readiness_http_exception(
+            400,
+            "UNSUPPORTED_CHANNEL",
+            {"code": "UNSUPPORTED_CHANNEL", "channel": channel},
+        )
     try:
         snapshot = await readiness_service.build_readiness_snapshot(merchant_id, channel=channel)
     except readiness_service.UnsupportedMerchantError:
@@ -144,11 +157,16 @@ async def create_readiness_checkout(
     except readiness_service.UnsupportedMerchantError:
         raise _unsupported_merchant(merchant_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail={"code": "VARIANT_NOT_FOUND", "variant_id": body.variant_id})
+        raise _readiness_http_exception(
+            404,
+            "VARIANT_NOT_FOUND",
+            {"code": "VARIANT_NOT_FOUND", "variant_id": body.variant_id},
+        )
     if variant.channel_coverage.get("ucp") != "ready":
-        raise HTTPException(
-            status_code=409,
-            detail={
+        raise _readiness_http_exception(
+            409,
+            "VARIANT_NOT_READY_FOR_CHECKOUT",
+            {
                 "code": "VARIANT_NOT_READY_FOR_CHECKOUT",
                 "variant_id": body.variant_id,
                 "blockers": variant.checkout.blockers,
@@ -170,7 +188,11 @@ async def create_readiness_checkout(
         )
     except ValueError as exc:
         detail = exc.args[0] if exc.args else {"code": "CHECKOUT_INVALID"}
-        raise HTTPException(status_code=409, detail=detail)
+        raise _readiness_http_exception(
+            409,
+            str(detail.get("code") or "CHECKOUT_INVALID"),
+            detail,
+        )
 
 
 @router.get("/checkout-sessions/{checkout_id}")
@@ -183,7 +205,11 @@ async def get_checkout_session(
     try:
         return await readiness_service.get_checkout_session_view(checkout_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail={"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id})
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
 
 
 @router.post("/merchants/{merchant_id}/order-sync/{checkout_id}")
@@ -200,7 +226,11 @@ async def advance_order_sync(
     except readiness_service.UnsupportedMerchantError:
         raise _unsupported_merchant(merchant_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail={"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id})
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
 
     updated_checkout = result["checkout"]
     return {
