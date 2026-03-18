@@ -8,7 +8,12 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr, Field
 
 from readiness import service as readiness_service
-from readiness.flags import readiness_payment_bridge_enabled, readiness_payment_intent_enabled, readiness_router_enabled
+from readiness.flags import (
+    readiness_payment_bridge_enabled,
+    readiness_payment_intent_enabled,
+    readiness_payment_status_sync_enabled,
+    readiness_router_enabled,
+)
 
 
 router = APIRouter(prefix="/internal/readiness", tags=["internal-readiness"])
@@ -50,6 +55,12 @@ class PaymentBridgeRequest(BaseModel):
 class PaymentIntentRequest(BaseModel):
     preferred_psps: Optional[list[str]] = None
     psp_mode: Optional[str] = Field(default=None, max_length=64)
+
+
+class PaymentStatusSyncRequest(BaseModel):
+    mark_paid_on_success: bool = True
+    sync_shopify_transaction: bool = True
+    source: str = Field(default="readiness_payment_status_sync", min_length=1, max_length=128)
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -101,6 +112,11 @@ def _require_payment_bridge_enabled() -> None:
 
 def _require_payment_intent_enabled() -> None:
     if not readiness_payment_intent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _require_payment_status_sync_enabled() -> None:
+    if not readiness_payment_status_sync_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
 
 
@@ -338,6 +354,63 @@ async def create_payment_intent(
         "psp_used": result["psp_used"],
         "payment_intent_status": result["payment_intent_status"],
         "payment_action": result["payment_action"],
+        "bridged_to_paid": bool(result.get("bridged_to_paid")),
+        "replayed": bool(result.get("replayed")),
+        "events": [_model_dump(event) for event in result["events"]],
+    }
+
+
+@router.post("/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-status-sync")
+async def sync_payment_status(
+    merchant_id: str,
+    checkout_id: str,
+    body: Optional[PaymentStatusSyncRequest],
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    _require_payment_status_sync_enabled()
+    try:
+        result = await readiness_service.sync_payment_status_for_checkout(
+            merchant_id,
+            checkout_id,
+            mark_paid_on_success=body.mark_paid_on_success if body else True,
+            sync_shopify_transaction=body.sync_shopify_transaction if body else True,
+            source=body.source if body else "readiness_payment_status_sync",
+        )
+    except readiness_service.UnsupportedMerchantError:
+        raise _unsupported_merchant(merchant_id)
+    except KeyError:
+        raise _readiness_http_exception(
+            404,
+            "CHECKOUT_NOT_FOUND",
+            {"code": "CHECKOUT_NOT_FOUND", "checkout_id": checkout_id},
+        )
+    except ValueError as exc:
+        detail = exc.args[0] if exc.args else {"code": "CHECKOUT_INVALID"}
+        code = str(detail.get("code") or "CHECKOUT_INVALID")
+        if code == "PAYMENT_STATUS_SYNC_FAILED":
+            status_code = 502
+        elif code in {"CHECKOUT_INVALID"}:
+            status_code = 400
+        else:
+            status_code = 409
+        raise _readiness_http_exception(status_code, code, detail)
+
+    checkout = result["checkout"]
+    order = result["order"] or {}
+    return {
+        "merchant_id": merchant_id,
+        "merchant_alpha_mode": (checkout.session_payload or {}).get("merchant_alpha_mode"),
+        "checkout_id": checkout_id,
+        "order_id": checkout.order_id,
+        "status": checkout.status,
+        "payment_status": order.get("payment_status"),
+        "payment_intent_id": result["payment_intent_id"],
+        "psp_used": result["psp_used"],
+        "payment_intent_status": result["payment_intent_status"],
+        "normalized_payment_status": result["normalized_payment_status"],
+        "transaction_sync": result["transaction_sync"],
         "bridged_to_paid": bool(result.get("bridged_to_paid")),
         "replayed": bool(result.get("replayed")),
         "events": [_model_dump(event) for event in result["events"]],

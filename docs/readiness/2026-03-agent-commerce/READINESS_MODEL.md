@@ -254,6 +254,49 @@ Current semantics:
 - it reuses the existing multi-PSP payment-intent creation stack
 - it is idempotent at the order level; repeated calls reuse the existing `orders.payment_intent_id`
 - if the PSP returns `succeeded` immediately, readiness auto-bridges that payment reference back into the checkout/order state
+- the March 18, 2026 production canary for `merch_efbc46b4619cfbdf` created a live Stripe payment intent, converged the local order to `payment_status=awaiting_payment`, and replayed the same `payment_intent_id` on a repeated call
+
+## Payment Status Sync Contract
+
+Readiness alpha also exposes an additive internal sync for polling PSP status from an already-created readiness payment intent:
+
+- `POST /internal/readiness/merchants/{merchant_id}/checkout-sessions/{checkout_id}/payment-status-sync`
+
+Request:
+
+```json
+{
+  "mark_paid_on_success": true,
+  "sync_shopify_transaction": true,
+  "source": "readiness_payment_status_sync"
+}
+```
+
+Response fields:
+
+- `merchant_id`
+- `merchant_alpha_mode`
+- `checkout_id`
+- `order_id`
+- `status`
+- `payment_status`
+- `payment_intent_id`
+- `psp_used`
+- `payment_intent_status`
+- `normalized_payment_status`
+- `transaction_sync`
+- `bridged_to_paid`
+- `replayed`
+- `events`
+
+Current semantics:
+
+- the route is internal-only and feature-flagged
+- it requires both `/order-sync` and an existing readiness-owned `payment_intent_id`
+- it queries the current PSP status using the merchant PSP configuration already chosen for the alpha merchant
+- it does not confirm or capture the payment
+- if the PSP reports a paid terminal state, readiness auto-bridges that payment reference back into the order and best-effort syncs the Shopify transaction
+- if the PSP still reports `requires_payment_method` / `requires_action`, readiness keeps the order in `awaiting_payment`
 
 ## Order Sync Contract
 

@@ -37,6 +37,21 @@ Supervised production canary write:
 - final order-sync state: `state_synced`
 - replay behavior: `replayed=true` with no duplicate event types
 
+Supervised production payment-intent canary on March 18, 2026:
+
+- checkout id: `rdchk_cce46acd5fc340c1`
+- local order id: `ORD_55131C19D6DE97BB`
+- merchant order id: `7473638277448`
+- PSP used: `stripe`
+- payment-intent creation result: `awaiting_payment`
+- payment-intent replay behavior: `replayed=true` with the same `payment_intent_id`
+- post-intent audit:
+  - `merchant_writeback=ready`
+  - `webhook_ingest=ready`
+  - `refund_sync=not_eligible`
+  - refund ineligibility reason: `order_not_paid`
+- the next readiness-owned bridge point is `payment-status-sync`, which can poll the PSP for that `payment_intent_id` and only auto-mark paid if the PSP reports a real successful terminal state
+
 Captured fixture expectation kept for regression:
 
 - readiness score: `76`
@@ -55,6 +70,7 @@ Captured fixture expectation kept for regression:
 - refund / cancel / return sync still require a controlled live exercise; the new order-sync audit only surfaces their evidence paths and current observation state
 - readiness now has an internal `payment-bridge` surface that can attach an externally successful PSP reference to the readiness-owned order and make refund validation meaningful without refactoring the platform payment stack first
 - readiness now also has an internal `payment-intent` surface that can mint a PSP payment intent directly for the readiness-owned local order
+- that `payment-intent` surface is now live-validated for intent creation and idempotent replay, but not yet for confirmed payment -> paid bridge -> refund
 
 Follow-up live validation on March 18, 2026:
 

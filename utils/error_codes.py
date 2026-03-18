@@ -142,6 +142,11 @@ class ErrorCode(Enum):
         409,
         "Checkout does not have a payment intent yet"
     )
+    PAYMENT_STATUS_SYNC_FAILED = ErrorDefinition(
+        "PAYMENT_STATUS_SYNC_FAILED",
+        502,
+        "Payment status sync with PSP failed"
+    )
 
     # Additional Resource Errors (404)
     VARIANT_NOT_FOUND = ErrorDefinition(

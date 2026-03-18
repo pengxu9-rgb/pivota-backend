@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone
 from decimal import Decimal
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from adapters.multi_psp_orchestrator import create_payment_with_failover
+from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
+from adapters.psp_adapter import get_psp_adapter
 from db.orders import create_order, get_order, mark_order_paid, update_fulfillment_info, update_payment_info
 from db.products import log_order_event
 from readiness.channel_exports.ucp import build_ucp_export
@@ -26,6 +28,10 @@ class UnsupportedMerchantError(KeyError):
     pass
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def _normalized_order_status(order_row: Optional[Dict[str, Any]]) -> str:
     if not order_row:
         return ""
@@ -36,6 +42,92 @@ def _normalized_payment_status(order_row: Optional[Dict[str, Any]]) -> str:
     if not order_row:
         return ""
     return str(order_row.get("payment_status") or "").strip().lower()
+
+
+def _coerce_psp_status_result(result: Any) -> Tuple[bool, str, Optional[str]]:
+    if isinstance(result, tuple):
+        if len(result) >= 3:
+            ok, status, error = result[0], result[1], result[2]
+            return bool(ok), str(status or "unknown").strip().lower(), str(error) if error else None
+        if len(result) == 2:
+            ok, status = result
+            return bool(ok), str(status or "unknown").strip().lower(), None
+        if len(result) == 1:
+            return True, str(result[0] or "unknown").strip().lower(), None
+    if isinstance(result, str):
+        status = str(result or "unknown").strip().lower()
+        return status not in {"", "unknown"}, status or "unknown", None
+    return False, "unknown", "Unsupported PSP status result"
+
+
+def _normalize_external_payment_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"succeeded", "paid", "completed", "settled"}:
+        return "paid"
+    if normalized in {"processing"}:
+        return "processing"
+    if normalized in {"requires_payment_method", "requires_action", "requires_capture", "awaiting_payment", "pending"}:
+        return "awaiting_payment"
+    if normalized in {"canceled", "cancelled"}:
+        return "cancelled"
+    if normalized in {"failed", "declined"}:
+        return "failed"
+    return normalized or "unknown"
+
+
+async def _resolve_psp_adapter_for_checkout(
+    merchant_id: str,
+    *,
+    psp_used: Optional[str],
+):
+    orchestrator = MultiPSPOrchestrator(merchant_id)
+    await orchestrator.load_psp_configs()
+    preferred_psp = str(psp_used or "").strip().lower()
+
+    selected = None
+    if preferred_psp:
+        for config in orchestrator.psp_configs:
+            if str(config.psp_type or "").strip().lower() == preferred_psp:
+                selected = config
+                break
+    if selected is None and orchestrator.psp_configs:
+        selected = orchestrator.psp_configs[0]
+
+    if selected is None:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "merchant_id": merchant_id,
+                "message": "No active PSP configuration was found for this merchant.",
+            }
+        )
+
+    adapter_kwargs: Dict[str, Any] = {}
+    if selected.psp_type == "adyen" and selected.merchant_account:
+        adapter_kwargs["merchant_account"] = selected.merchant_account
+    return get_psp_adapter(selected.psp_type, selected.api_key, **adapter_kwargs), selected.psp_type
+
+
+async def _query_payment_intent_status(
+    merchant_id: str,
+    *,
+    payment_reference: str,
+    psp_used: Optional[str],
+) -> Dict[str, Any]:
+    adapter, resolved_psp = await _resolve_psp_adapter_for_checkout(
+        merchant_id,
+        psp_used=psp_used,
+    )
+    result = await adapter.get_payment_status(payment_reference)
+    ok, raw_status, error = _coerce_psp_status_result(result)
+    normalized_status = _normalize_external_payment_status(raw_status)
+    return {
+        "ok": ok,
+        "raw_status": raw_status,
+        "normalized_status": normalized_status,
+        "error": error,
+        "psp_used": resolved_psp,
+    }
 
 
 async def _reconcile_checkout_state_from_order(
@@ -864,6 +956,165 @@ async def create_payment_intent_for_checkout(
             redirect_url=getattr(payment_intent, "redirect_url", None),
         ),
         "replayed": False,
+        "bridged_to_paid": bridged_to_paid,
+    }
+
+
+async def sync_payment_status_for_checkout(
+    merchant_id: str,
+    checkout_id: str,
+    *,
+    mark_paid_on_success: bool = True,
+    sync_shopify_transaction: bool = True,
+    source: str = "readiness_payment_status_sync",
+) -> Dict[str, Any]:
+    journal = get_default_journal()
+    checkout = await journal.get_checkout_session(checkout_id)
+    if checkout is None or checkout.merchant_id != merchant_id:
+        raise KeyError(checkout_id)
+
+    payload = checkout.session_payload or {}
+    if payload.get("merchant_alpha_mode") != "real_merchant_alpha":
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "message": "Payment status sync is only supported for the real-merchant alpha path.",
+            }
+        )
+
+    order_id = str(checkout.order_id or "").strip()
+    if not order_id:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_ORDER_NOT_CREATED",
+                "checkout_id": checkout_id,
+                "message": "Run /order-sync first so the checkout creates a local order before syncing payment status.",
+            }
+        )
+
+    order_row = await get_order(order_id)
+    if not order_row:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_INVALID",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Checkout references a local order that could not be loaded.",
+            }
+        )
+
+    payment_reference = str(order_row.get("payment_intent_id") or "").strip()
+    if not payment_reference:
+        raise ValueError(
+            {
+                "code": "CHECKOUT_PAYMENT_INTENT_NOT_FOUND",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "message": "Create or attach a payment intent before syncing payment status.",
+            }
+        )
+
+    external_status = await _query_payment_intent_status(
+        merchant_id,
+        payment_reference=payment_reference,
+        psp_used=str(order_row.get("psp_used") or (payload.get("payment_psp_used") or "")).strip().lower() or None,
+    )
+    if not external_status.get("ok"):
+        raise ValueError(
+            {
+                "code": "PAYMENT_STATUS_SYNC_FAILED",
+                "checkout_id": checkout_id,
+                "order_id": order_id,
+                "payment_intent_id": payment_reference,
+                "psp_used": external_status.get("psp_used"),
+                "message": str(external_status.get("error") or "PSP payment status lookup failed."),
+            }
+        )
+
+    normalized_status = str(external_status.get("normalized_status") or "unknown")
+    current_payment_status = _normalized_payment_status(order_row)
+    resolved_psp = str(external_status.get("psp_used") or order_row.get("psp_used") or "").strip().lower() or None
+    existing_client_secret = str(order_row.get("client_secret") or "").strip()
+
+    bridged_to_paid = False
+    transaction_sync: Dict[str, Any] = {"ok": False, "skipped": True, "reason": "payment_not_paid"}
+    replayed = current_payment_status == normalized_status
+
+    if normalized_status == "paid" and mark_paid_on_success:
+        bridged = await attach_payment_reference_to_checkout(
+            merchant_id,
+            checkout_id,
+            payment_reference=payment_reference,
+            psp_used=resolved_psp,
+            client_secret=existing_client_secret,
+            source=source,
+            mark_paid=True,
+            sync_shopify_transaction=sync_shopify_transaction,
+        )
+        checkout = bridged["checkout"]
+        order_row = bridged["order"] or order_row
+        transaction_sync = bridged.get("transaction_sync") or transaction_sync
+        replayed = bool(bridged.get("replayed"))
+        bridged_to_paid = True
+    else:
+        if normalized_status in {"awaiting_payment", "processing", "failed", "cancelled"} and normalized_status != current_payment_status:
+            await update_payment_info(
+                order_id=order_id,
+                payment_intent_id=payment_reference,
+                client_secret=existing_client_secret or payment_reference,
+                payment_status=normalized_status,
+                psp_used=resolved_psp,
+            )
+        await log_order_event(
+            event_type="readiness_payment_status_synced",
+            merchant_id=merchant_id,
+            order_id=order_id,
+            total_amount=_safe_float(order_row.get("total")),
+            currency=str(order_row.get("currency") or "USD"),
+            payment_method=resolved_psp,
+            status=normalized_status,
+            metadata={
+                "checkout_id": checkout_id,
+                "payment_intent_id": payment_reference,
+                "raw_payment_status": external_status.get("raw_status"),
+                "normalized_payment_status": normalized_status,
+                "source": source,
+            },
+        )
+        await journal.append_event(
+            checkout_id=checkout_id,
+            event_type="payment_status_synced",
+            event_payload={
+                "order_id": order_id,
+                "payment_intent_id": payment_reference,
+                "raw_payment_status": external_status.get("raw_status"),
+                "normalized_payment_status": normalized_status,
+                "psp_used": resolved_psp,
+                "source": source,
+            },
+        )
+        checkout = await journal.update_checkout_session(
+            checkout_id,
+            session_payload_patch={
+                "payment_intent_id": payment_reference,
+                "payment_psp_used": resolved_psp,
+                "payment_intent_status": external_status.get("raw_status"),
+                "payment_status_synced_at": _utc_now_iso(),
+            },
+        ) or checkout
+        order_row = await get_order(order_id) or order_row
+
+    return {
+        "checkout": checkout,
+        "events": await journal.list_events(checkout_id),
+        "order": order_row,
+        "payment_intent_id": payment_reference,
+        "payment_intent_status": external_status.get("raw_status"),
+        "normalized_payment_status": normalized_status,
+        "psp_used": resolved_psp,
+        "transaction_sync": transaction_sync,
+        "replayed": replayed,
         "bridged_to_paid": bridged_to_paid,
     }
 

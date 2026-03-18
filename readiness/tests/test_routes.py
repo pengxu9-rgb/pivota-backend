@@ -63,6 +63,7 @@ def _build_test_client(monkeypatch, *, psp_enabled: bool, include_error_handler:
     monkeypatch.setenv("FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA", "true")
     monkeypatch.setenv("FEATURE_READINESS_PAYMENT_BRIDGE_ALPHA", "true")
     monkeypatch.setenv("FEATURE_READINESS_PAYMENT_INTENT_ALPHA", "true")
+    monkeypatch.setenv("FEATURE_READINESS_PAYMENT_STATUS_SYNC_ALPHA", "true")
     monkeypatch.setenv("READINESS_ALLOW_UNAUTHED_DEV", "true")
     monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", DEFAULT_ALPHA_MERCHANT_ID)
 
@@ -239,6 +240,21 @@ def test_payment_intent_not_found_error_code_is_preserved(monkeypatch):
 
     response = client.post(
         f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_missing/payment-intent",
+        json={},
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["code"] == "CHECKOUT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == "rdchk_missing"
+
+
+def test_payment_status_sync_not_found_error_code_is_preserved(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_missing/payment-status-sync",
         json={},
     )
 
@@ -719,6 +735,222 @@ def test_real_merchant_payment_intent_creation_is_idempotent(monkeypatch):
     payload = checkout_view.json()["checkout"]["session_payload"]
     assert payload["payment_intent_id"] == "pi_alpha_intent_1"
     assert payload["payment_intent_status"] == "requires_action"
+
+
+def test_payment_status_sync_requires_existing_payment_intent(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True, include_error_handler=True)
+
+    from readiness import service as readiness_service
+
+    order_state = {
+        "order_id": "ORD_ALPHA_STATUS_1",
+        "shopify_order_id": None,
+        "status": "pending",
+        "payment_status": "unpaid",
+        "payment_intent_id": None,
+        "client_secret": None,
+        "psp_used": "stripe",
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_STATUS_1"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        assert order_id == "ORD_ALPHA_STATUS_1"
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777111",
+            "shopify_order_name": "#1771",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777111",
+        }
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-payment-status-no-intent",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    sync = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    assert sync.status_code == 200
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/payment-status-sync",
+        json={},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "CHECKOUT_PAYMENT_INTENT_NOT_FOUND"
+    assert body["error"]["details"]["checkout_id"] == checkout_id
+
+
+def test_payment_status_sync_bridges_paid_status(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    order_state = {
+        "order_id": "ORD_ALPHA_STATUS_2",
+        "shopify_order_id": None,
+        "status": "pending",
+        "payment_status": "awaiting_payment",
+        "payment_intent_id": "pi_alpha_status_1",
+        "client_secret": "cs_alpha_status_1",
+        "psp_used": "stripe",
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+    bridged_calls = []
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_STATUS_2"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        assert order_id == "ORD_ALPHA_STATUS_2"
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777222",
+            "shopify_order_name": "#1772",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777222",
+        }
+
+    async def fake_query_payment_intent_status(_merchant_id: str, *, payment_reference: str, psp_used=None):
+        assert payment_reference == "pi_alpha_status_1"
+        assert psp_used == "stripe"
+        return {
+            "ok": True,
+            "raw_status": "succeeded",
+            "normalized_status": "paid",
+            "error": None,
+            "psp_used": "stripe",
+        }
+
+    async def fake_attach_payment_reference_to_checkout(
+        merchant_id: str,
+        checkout_id: str,
+        *,
+        payment_reference: str,
+        psp_used=None,
+        client_secret=None,
+        source="external_payment_execution",
+        mark_paid=True,
+        sync_shopify_transaction=True,
+    ):
+        bridged_calls.append(
+            {
+                "merchant_id": merchant_id,
+                "checkout_id": checkout_id,
+                "payment_reference": payment_reference,
+                "psp_used": psp_used,
+                "client_secret": client_secret,
+                "source": source,
+                "mark_paid": mark_paid,
+                "sync_shopify_transaction": sync_shopify_transaction,
+            }
+        )
+        order_state["status"] = "paid"
+        order_state["payment_status"] = "paid"
+        journal = readiness_service.get_default_journal()
+        checkout = await journal.get_checkout_session(checkout_id)
+        checkout = await journal.update_checkout_session(
+            checkout_id,
+            session_payload_patch={"payment_reference": payment_reference},
+        ) or checkout
+        return {
+            "checkout": checkout,
+            "events": await journal.list_events(checkout_id),
+            "order": dict(order_state),
+            "payment_reference": payment_reference,
+            "psp_used": psp_used,
+            "transaction_sync": {"ok": True, "skipped": False, "created": True},
+            "replayed": False,
+        }
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+    monkeypatch.setattr(readiness_service, "_query_payment_intent_status", fake_query_payment_intent_status)
+    monkeypatch.setattr(readiness_service, "attach_payment_reference_to_checkout", fake_attach_payment_reference_to_checkout)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-payment-status-success",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    sync = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    assert sync.status_code == 200
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/payment-status-sync",
+        json={},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payment_intent_id"] == "pi_alpha_status_1"
+    assert body["payment_intent_status"] == "succeeded"
+    assert body["normalized_payment_status"] == "paid"
+    assert body["payment_status"] == "paid"
+    assert body["bridged_to_paid"] is True
+    assert body["transaction_sync"]["ok"] is True
+    assert body["psp_used"] == "stripe"
+    assert bridged_calls[0]["source"] == "readiness_payment_status_sync"
 
 
 def test_order_sync_replay_reconciles_cancelled_order_state(monkeypatch):

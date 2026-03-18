@@ -10,6 +10,7 @@ export FEATURE_READINESS_SOURCE_OF_TRUTH_V1=true
 export FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA=true
 export FEATURE_READINESS_PAYMENT_BRIDGE_ALPHA=true
 export FEATURE_READINESS_PAYMENT_INTENT_ALPHA=true
+export FEATURE_READINESS_PAYMENT_STATUS_SYNC_ALPHA=true
 export READINESS_ALPHA_MERCHANT_ID=merch_efbc46b4619cfbdf
 export READINESS_INTERNAL_API_KEY=change-me
 export DATABASE_URL='postgresql://...'
@@ -240,6 +241,38 @@ This route is intentionally narrow:
 - it does not by itself guarantee a paid order unless the PSP returns immediate success or a later confirmation/webhook lands
 
 Use this path when you want readiness to own payment-intent creation, and use `payment-bridge` when payment execution already happened elsewhere.
+
+Observed production alpha behavior on March 18, 2026:
+
+- live `payment-intent` creation succeeded for the alpha merchant with `psp_used=stripe`
+- the initial live response converged to `payment_status=awaiting_payment`
+- a repeated call replayed the same `payment_intent_id` with `replayed=true`
+- the follow-up `order-sync-audit` remained `refund_sync=not_eligible` until a paid confirmation or explicit `payment-bridge` occurs
+
+## Payment Status Sync
+
+If readiness already owns a `payment_intent_id` and you want it to query the PSP for the current status without manually attaching an external payment reference, call:
+
+```bash
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Pivota-Internal-Key: $READINESS_INTERNAL_API_KEY" \
+  "http://127.0.0.1:8000/internal/readiness/merchants/merch_efbc46b4619cfbdf/checkout-sessions/<checkout_id>/payment-status-sync" \
+  -d '{
+    "mark_paid_on_success": true,
+    "sync_shopify_transaction": true
+  }'
+```
+
+This route is intentionally narrow:
+
+- it requires a readiness-owned local order and an existing `payment_intent_id`
+- it queries the current PSP status using the stored merchant PSP configuration
+- it does not confirm or capture a payment
+- if the PSP reports a terminal paid state, readiness automatically bridges that paid result back into the local order and best-effort syncs the Shopify transaction
+- if the PSP still reports `requires_payment_method` / `requires_action`, the order remains `awaiting_payment`
+
+Use this path when payment intent creation already happened through readiness and you want readiness to absorb real PSP state before attempting refund validation.
 
 ## Error Contract Probes
 

@@ -15,6 +15,7 @@ Implemented:
 - replay-based convergence from downstream merchant cancellation/refund state back into readiness checkout session state
 - internal payment bridge for attaching an externally successful PSP reference to a readiness order and making refund validation possible without rewriting the payment stack
 - internal payment-intent route for minting a PSP payment intent directly against a readiness-created local order
+- internal payment-status-sync route for polling PSP state from a readiness-owned `payment_intent_id` and auto-bridging only on real paid status
 - synthetic regression path preserved
 - captured real-merchant fixtures and regression tests
 
@@ -22,7 +23,7 @@ Validated:
 
 - `python3 -m py_compile` on the readiness modules and router
 - `python3 -m pytest readiness/tests -q`
-- result after current payment-intent + payment-bridge + audit-eligibility work: `37 passed`
+- result after current payment-intent + payment-bridge + payment-status-sync + audit-eligibility work: `40 passed`
 - targeted follow-up validation for sync-audit work:
   - `python3 -m pytest readiness/tests/test_sync_audit.py readiness/tests/test_routes.py tests/test_error_handler.py -q`
   - `bash -n scripts/smoke_readiness_alpha.sh`
@@ -56,6 +57,20 @@ Validated:
     - `offer_count=2098`
     - `review_backed_offer_count=2096`
   - dominant remaining blockers: `out_of_stock`, `missing_price`
+- supervised production payment-intent canary on March 18, 2026
+  - checkout create: `200`
+  - checkout id: `rdchk_cce46acd5fc340c1`
+  - local order id: `ORD_55131C19D6DE97BB`
+  - merchant write-back Shopify order id: `7473638277448`
+  - payment-intent create: `200`
+  - PSP used: `stripe`
+  - payment-intent creation result: `awaiting_payment`
+  - replayed payment-intent create: `200`, `replayed=true`, same `payment_intent_id`
+  - post-intent sync audit:
+    - `merchant_writeback=ready`
+    - `webhook_ingest=ready`
+    - `refund_sync=not_eligible`
+    - refund ineligibility reason: `order_not_paid`
 - supervised production canary write on March 17, 2026
   - checkout create: `200`
   - checkout id: `rdchk_4b7c7a42214f4bf0`
@@ -80,4 +95,5 @@ Major remaining risks:
 - merchant fulfillment/returns policy is still manual config, not live-ingested
 - full report/export payloads remain large when `summary_only` is not used
 - refund and return sync still need a live exercise; cancellation sync is live-validated, and refund is now structurally unblocked by the payment bridge, but a real paid canary reference still needs operator validation
-- readiness can now create PSP payment intents itself, but this new route has not yet been live-validated against production PSP execution
+- readiness can now create PSP payment intents itself, and production has validated live intent creation plus idempotent replay, but not yet PSP confirmation/capture or a paid-bridge refund exercise
+- readiness can now also poll PSP status from the stored payment intent without confirming the payment itself, but this new sync route still needs a production spot-check
