@@ -1678,6 +1678,118 @@ def test_refund_success_reconciles_order_state(monkeypatch):
     assert body["replayed"] is False
 
 
+def test_refund_success_logs_soft_skipped_transaction_sync_when_shopify_mirror_degrades(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    order_state = {
+        "order_id": "ORD_ALPHA_REFUND_SOFTSKIP",
+        "shopify_order_id": None,
+        "status": "paid",
+        "payment_status": "paid",
+        "payment_intent_id": "pi_alpha_refund_softskip",
+        "client_secret": "cs_alpha_refund_softskip",
+        "psp_used": "stripe",
+        "metadata": {"shopify_parent_transaction_id": 1444},
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+    logged_events = []
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_REFUND_SOFTSKIP"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        assert order_id == "ORD_ALPHA_REFUND_SOFTSKIP"
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777555",
+            "shopify_order_name": "#1775",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777555",
+        }
+
+    async def fake_create_refund(*, order_id: str, amount: float, reason: str, source: str, created_by: str, idempotency_key=None):
+        assert order_id == "ORD_ALPHA_REFUND_SOFTSKIP"
+        order_state["status"] = "refunded"
+        order_state["payment_status"] = "refunded"
+        order_state["total_refunded"] = 29.0
+        return {
+            "status": "success",
+            "refund_id": "REF_ALPHA_SOFTSKIP",
+            "psp_refund_id": "re_alpha_softskip",
+        }
+
+    async def fake_ensure_external_refund_transaction_best_effort(**kwargs):
+        assert kwargs["shopify_order_id"] == "9001777555"
+        assert kwargs["external_refund_ref"] == "re_alpha_softskip"
+        return {
+            "ok": True,
+            "created": False,
+            "soft_skipped": True,
+            "reason": "missing_parent_transaction",
+            "annotation": {"ok": True, "status": 200, "error": None},
+        }
+
+    async def fake_log_order_event(**kwargs):
+        logged_events.append(kwargs)
+        return None
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+    monkeypatch.setattr(readiness_service.refund_service, "create_refund", fake_create_refund)
+    monkeypatch.setattr(readiness_service, "ensure_external_refund_transaction_best_effort", fake_ensure_external_refund_transaction_best_effort)
+    monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-refund-softskip",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    sync = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    assert sync.status_code == 200
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/refund",
+        json={"reason": "operator_canary_refund"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["refund_status"] == "success"
+    assert body["transaction_sync"]["soft_skipped"] is True
+    transaction_events = [event for event in logged_events if event["event_type"] == "readiness_refund_transaction_sync"]
+    assert len(transaction_events) == 1
+    assert transaction_events[0]["status"] == "soft_skipped"
+
+
 def test_order_sync_replay_reconciles_cancelled_order_state(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=True)
 

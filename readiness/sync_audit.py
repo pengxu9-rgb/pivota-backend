@@ -245,9 +245,9 @@ async def build_order_sync_audit_snapshot(
         refund_transaction_mirror_status = str(
             latest_refund_transaction_event.get("status")
             or (
-                "ready"
-                if latest_transaction_sync.get("ok")
-                else ("soft_skipped" if latest_transaction_sync.get("soft_skipped") else "failed")
+                "soft_skipped"
+                if latest_transaction_sync.get("soft_skipped")
+                else ("ready" if latest_transaction_sync.get("ok") else "failed")
             )
         ).strip().lower() or "failed"
     elif refund_observed:

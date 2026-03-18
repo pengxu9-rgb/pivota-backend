@@ -1744,9 +1744,9 @@ async def create_refund_for_checkout(
         currency=str((refreshed_order or order_row).get("currency") or "USD"),
         payment_method=str((refreshed_order or order_row).get("psp_used") or "").strip().lower() or None,
         status=(
-            "ready"
-            if transaction_sync.get("ok")
-            else ("soft_skipped" if transaction_sync.get("soft_skipped") else "failed")
+            "soft_skipped"
+            if transaction_sync.get("soft_skipped")
+            else ("ready" if transaction_sync.get("ok") else "failed")
         ),
         metadata={
             "checkout_id": checkout_id,
