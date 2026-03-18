@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import stripe
 
 from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
 from adapters.psp_adapter import get_psp_adapter
@@ -70,10 +71,12 @@ def _normalize_external_payment_status(status: str) -> str:
         return "paid"
     if normalized in {"processing"}:
         return "processing"
-    if normalized in {"requires_payment_method", "requires_action", "requires_capture", "awaiting_payment", "pending"}:
+    if normalized in {"requires_payment_method", "requires_action", "requires_capture", "awaiting_payment", "pending", "unpaid", "open"}:
         return "awaiting_payment"
     if normalized in {"canceled", "cancelled"}:
         return "cancelled"
+    if normalized in {"expired"}:
+        return "failed"
     if normalized in {"failed", "declined"}:
         return "failed"
     return normalized or "unknown"
@@ -112,6 +115,64 @@ async def _resolve_psp_adapter_for_checkout(
     return get_psp_adapter(selected.psp_type, selected.api_key, **adapter_kwargs), selected.psp_type
 
 
+def _stripe_obj_value(obj: Any, field: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(field)
+    return getattr(obj, field, None)
+
+
+async def _query_stripe_checkout_session_status(adapter: Any, checkout_session_id: str) -> Dict[str, Any]:
+    api_key = str(getattr(adapter, "api_key", "") or "").strip()
+    if not api_key:
+        return {
+            "ok": False,
+            "raw_status": "unknown",
+            "normalized_status": "unknown",
+            "error": "Stripe adapter is missing an API key.",
+            "psp_used": "stripe",
+        }
+
+    stripe.api_key = api_key
+    session = stripe.checkout.Session.retrieve(
+        checkout_session_id,
+        expand=["payment_intent"],
+    )
+    session_payment_status = str(_stripe_obj_value(session, "payment_status") or "").strip().lower()
+    session_status = str(_stripe_obj_value(session, "status") or "").strip().lower()
+    payment_intent = _stripe_obj_value(session, "payment_intent")
+    resolved_payment_reference = None
+    resolved_client_secret = None
+    payment_intent_status = ""
+
+    if isinstance(payment_intent, str):
+        resolved_payment_reference = payment_intent
+    elif payment_intent is not None:
+        resolved_payment_reference = str(_stripe_obj_value(payment_intent, "id") or "").strip() or None
+        resolved_client_secret = str(_stripe_obj_value(payment_intent, "client_secret") or "").strip() or None
+        payment_intent_status = str(_stripe_obj_value(payment_intent, "status") or "").strip().lower()
+
+    raw_status = payment_intent_status or session_payment_status or session_status or "unknown"
+    normalized_status = _normalize_external_payment_status(raw_status)
+    if session_payment_status == "paid":
+        normalized_status = "paid"
+
+    return {
+        "ok": True,
+        "raw_status": raw_status,
+        "normalized_status": normalized_status,
+        "error": None,
+        "psp_used": "stripe",
+        "payment_reference_type": "stripe_checkout_session",
+        "checkout_session_id": checkout_session_id,
+        "resolved_payment_reference": resolved_payment_reference,
+        "resolved_client_secret": resolved_client_secret,
+        "checkout_session_status": session_status or None,
+        "checkout_session_payment_status": session_payment_status or None,
+    }
+
+
 async def _query_payment_intent_status(
     merchant_id: str,
     *,
@@ -122,6 +183,8 @@ async def _query_payment_intent_status(
         merchant_id,
         psp_used=psp_used,
     )
+    if resolved_psp == "stripe" and str(payment_reference or "").strip().startswith("cs_"):
+        return await _query_stripe_checkout_session_status(adapter, str(payment_reference).strip())
     result = await adapter.get_payment_status(payment_reference)
     ok, raw_status, error = _coerce_psp_status_result(result)
     normalized_status = _normalize_external_payment_status(raw_status)
@@ -925,6 +988,8 @@ async def create_payment_intent_for_checkout(
             "payment_intent_id": payment_intent.id,
             "payment_psp_used": psp_used,
             "payment_intent_status": payment_intent.status,
+            "payment_reference_type": "stripe_checkout_session" if str(payment_intent.id or "").startswith("cs_") else "payment_intent",
+            "checkout_session_id": payment_intent.id if str(payment_intent.id or "").startswith("cs_") else None,
         },
     ) or checkout
 
@@ -1040,6 +1105,18 @@ async def sync_payment_status_for_checkout(
     current_payment_status = _normalized_payment_status(order_row)
     resolved_psp = str(external_status.get("psp_used") or order_row.get("psp_used") or "").strip().lower() or None
     existing_client_secret = str(order_row.get("client_secret") or "").strip()
+    resolved_payment_reference = str(external_status.get("resolved_payment_reference") or payment_reference).strip()
+    resolved_client_secret = str(external_status.get("resolved_client_secret") or existing_client_secret).strip()
+    payment_reference_type = str(
+        external_status.get("payment_reference_type")
+        or payload.get("payment_reference_type")
+        or ("stripe_checkout_session" if payment_reference.startswith("cs_") else "payment_intent")
+    ).strip()
+    checkout_session_id = str(
+        external_status.get("checkout_session_id")
+        or payload.get("checkout_session_id")
+        or (payment_reference if payment_reference.startswith("cs_") else "")
+    ).strip() or None
 
     bridged_to_paid = False
     transaction_sync: Dict[str, Any] = {"ok": False, "skipped": True, "reason": "payment_not_paid"}
@@ -1049,9 +1126,9 @@ async def sync_payment_status_for_checkout(
         bridged = await attach_payment_reference_to_checkout(
             merchant_id,
             checkout_id,
-            payment_reference=payment_reference,
+            payment_reference=resolved_payment_reference,
             psp_used=resolved_psp,
-            client_secret=existing_client_secret,
+            client_secret=resolved_client_secret,
             source=source,
             mark_paid=True,
             sync_shopify_transaction=sync_shopify_transaction,
@@ -1062,11 +1139,13 @@ async def sync_payment_status_for_checkout(
         replayed = bool(bridged.get("replayed"))
         bridged_to_paid = True
     else:
-        if normalized_status in {"awaiting_payment", "processing", "failed", "cancelled"} and normalized_status != current_payment_status:
+        if normalized_status in {"awaiting_payment", "processing", "failed", "cancelled"} and (
+            normalized_status != current_payment_status or resolved_payment_reference != payment_reference
+        ):
             await update_payment_info(
                 order_id=order_id,
-                payment_intent_id=payment_reference,
-                client_secret=existing_client_secret or payment_reference,
+                payment_intent_id=resolved_payment_reference,
+                client_secret=resolved_client_secret or resolved_payment_reference,
                 payment_status=normalized_status,
                 psp_used=resolved_psp,
             )
@@ -1080,7 +1159,10 @@ async def sync_payment_status_for_checkout(
             status=normalized_status,
             metadata={
                 "checkout_id": checkout_id,
-                "payment_intent_id": payment_reference,
+                "payment_intent_id": resolved_payment_reference,
+                "payment_reference": payment_reference,
+                "payment_reference_type": payment_reference_type,
+                "checkout_session_id": checkout_session_id,
                 "raw_payment_status": external_status.get("raw_status"),
                 "normalized_payment_status": normalized_status,
                 "source": source,
@@ -1091,7 +1173,10 @@ async def sync_payment_status_for_checkout(
             event_type="payment_status_synced",
             event_payload={
                 "order_id": order_id,
-                "payment_intent_id": payment_reference,
+                "payment_intent_id": resolved_payment_reference,
+                "payment_reference": payment_reference,
+                "payment_reference_type": payment_reference_type,
+                "checkout_session_id": checkout_session_id,
                 "raw_payment_status": external_status.get("raw_status"),
                 "normalized_payment_status": normalized_status,
                 "psp_used": resolved_psp,
@@ -1101,9 +1186,12 @@ async def sync_payment_status_for_checkout(
         checkout = await journal.update_checkout_session(
             checkout_id,
             session_payload_patch={
-                "payment_intent_id": payment_reference,
+                "payment_intent_id": resolved_payment_reference,
                 "payment_psp_used": resolved_psp,
                 "payment_intent_status": external_status.get("raw_status"),
+                "payment_reference": payment_reference,
+                "payment_reference_type": payment_reference_type,
+                "checkout_session_id": checkout_session_id,
                 "payment_status_synced_at": _utc_now_iso(),
             },
         ) or checkout
@@ -1113,7 +1201,10 @@ async def sync_payment_status_for_checkout(
         "checkout": checkout,
         "events": await journal.list_events(checkout_id),
         "order": order_row,
-        "payment_intent_id": payment_reference,
+        "payment_intent_id": resolved_payment_reference,
+        "payment_reference": payment_reference,
+        "payment_reference_type": payment_reference_type,
+        "checkout_session_id": checkout_session_id,
         "payment_intent_status": external_status.get("raw_status"),
         "normalized_payment_status": normalized_status,
         "psp_used": resolved_psp,
