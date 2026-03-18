@@ -60,6 +60,18 @@ bash scripts/smoke_readiness_alpha.sh \
   --payment-status-sync
 ```
 
+Once the readiness order is actually refund-eligible, the same smoke script can also exercise the refund leg:
+
+```bash
+bash scripts/smoke_readiness_alpha.sh \
+  --base-url https://<prod-host> \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --canary-write \
+  --create-payment-intent \
+  --payment-status-sync \
+  --refund
+```
+
 If you already have a successful PSP payment reference from an external execution path, the smoke script can bridge it into the readiness order after the canary write:
 
 ```bash
