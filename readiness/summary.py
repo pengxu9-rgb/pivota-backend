@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
+import time
 from typing import Any, Iterable, Optional
 
 from db.database import database
@@ -32,6 +33,10 @@ _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
 _PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
 _PLAN_TTL_HOURS = 6
 _PAID_PAYMENT_STATUSES_SQL = "('paid','completed','succeeded','success','settled','partially_refunded')"
+_OPTIMIZATION_CACHE_TTL_SECONDS = 60.0
+
+
+_OPTIMIZATION_CACHE: dict[str, tuple[float, MerchantReadinessOptimizationPayload]] = {}
 
 
 _BUCKET_DEFINITIONS: dict[str, dict[str, str]] = {
@@ -323,6 +328,58 @@ def _variant_blocker_counts(snapshot: MerchantReadinessSnapshot) -> Counter[str]
 
 def _bucket_code_for_reason(code: str) -> str:
     return _CODE_TO_BUCKET.get(code, "other")
+
+
+def _optimization_cache_key(merchant_id: str, channel: str) -> str:
+    return f"{merchant_id}|{channel}"
+
+
+def invalidate_readiness_optimization_cache(
+    merchant_id: Optional[str] = None,
+    *,
+    channel: Optional[str] = None,
+) -> None:
+    if merchant_id is None and channel is None:
+        _OPTIMIZATION_CACHE.clear()
+        return
+
+    keys_to_drop = []
+    for key in _OPTIMIZATION_CACHE:
+        cached_merchant_id, cached_channel = key.split("|", 1)
+        if merchant_id is not None and cached_merchant_id != merchant_id:
+            continue
+        if channel is not None and cached_channel != channel:
+            continue
+        keys_to_drop.append(key)
+    for key in keys_to_drop:
+        _OPTIMIZATION_CACHE.pop(key, None)
+
+
+def _cached_optimization_payload(
+    merchant_id: str,
+    *,
+    channel: str,
+) -> Optional[MerchantReadinessOptimizationPayload]:
+    cache_key = _optimization_cache_key(merchant_id, channel)
+    entry = _OPTIMIZATION_CACHE.get(cache_key)
+    if not entry:
+        return None
+    cached_at, payload = entry
+    if time.monotonic() - cached_at > _OPTIMIZATION_CACHE_TTL_SECONDS:
+        _OPTIMIZATION_CACHE.pop(cache_key, None)
+        return None
+    return payload.model_copy(deep=True)
+
+
+def _store_optimization_payload(
+    merchant_id: str,
+    *,
+    channel: str,
+    payload: MerchantReadinessOptimizationPayload,
+) -> MerchantReadinessOptimizationPayload:
+    cache_key = _optimization_cache_key(merchant_id, channel)
+    _OPTIMIZATION_CACHE[cache_key] = (time.monotonic(), payload.model_copy(deep=True))
+    return payload
 
 
 def _severity_for_bucket(bucket_code: str, affected_count: int) -> str:
@@ -1088,11 +1145,17 @@ async def build_readiness_optimization(
     merchant_id: str,
     *,
     channel: str = "ucp",
+    force_refresh: bool = False,
 ) -> MerchantReadinessOptimizationPayload:
+    if not force_refresh:
+        cached_payload = _cached_optimization_payload(merchant_id, channel=channel)
+        if cached_payload is not None:
+            return cached_payload
+
     dashboard_snapshot = await _load_dashboard_snapshot(merchant_id)
     snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
     if fallback is not None or snapshot is None:
-        return _fallback_optimization_payload(
+        payload = _fallback_optimization_payload(
             fallback
             or _fallback_summary(
                 assessment_state="assessed",
@@ -1102,6 +1165,7 @@ async def build_readiness_optimization(
             ),
             dashboard_snapshot=dashboard_snapshot,
         )
+        return _store_optimization_payload(merchant_id, channel=channel, payload=payload)
 
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
     issue_buckets = _build_issue_buckets(snapshot)
@@ -1139,7 +1203,7 @@ async def build_readiness_optimization(
         can_apply_actions=summary.assessment_state == "assessed",
         last_successful_rescore_at=summary.generated_at,
     )
-    return MerchantReadinessOptimizationPayload(
+    payload = MerchantReadinessOptimizationPayload(
         plan=plan,
         score_bundle=ScoreBundle(readiness_score=summary.score),
         readiness_summary=summary,
@@ -1149,3 +1213,4 @@ async def build_readiness_optimization(
         product_queue=product_queue,
         last_generated_at=summary.generated_at,
     )
+    return _store_optimization_payload(merchant_id, channel=channel, payload=payload)

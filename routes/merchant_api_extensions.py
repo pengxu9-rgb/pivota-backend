@@ -770,7 +770,7 @@ async def refresh_readiness_optimization(
     merchant_id = await get_merchant_id_from_user(current_user)
 
     try:
-        payload = await build_readiness_optimization(merchant_id)
+        payload = await build_readiness_optimization(merchant_id, force_refresh=True)
         return {
             "status": "success",
             "data": payload.model_dump(),

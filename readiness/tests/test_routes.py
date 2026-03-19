@@ -148,9 +148,15 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
 
     from readiness import summary as readiness_summary
 
-    async def fake_build_readiness_optimization(merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        merchant_id: str,
+        *,
+        channel: str = "ucp",
+        force_refresh: bool = False,
+    ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
         assert channel == "ucp"
+        assert force_refresh is False
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -274,8 +280,14 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
 def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
     from routes import merchant_api_extensions as merchant_api_extensions
 
-    async def fake_build_readiness_optimization(merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        merchant_id: str,
+        *,
+        channel: str = "ucp",
+        force_refresh: bool = False,
+    ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert force_refresh is True
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {

@@ -399,7 +399,11 @@ async def run_remediation_action(
                 }
             )
 
-    after_payload = await build_readiness_optimization(merchant_id, channel=channel)
+    after_payload = await build_readiness_optimization(
+        merchant_id,
+        channel=channel,
+        force_refresh=True,
+    )
     verification = VerificationResult(
         verification_id=f"rdverify_{job.job_id[-12:]}",
         action_id=action.action_id,

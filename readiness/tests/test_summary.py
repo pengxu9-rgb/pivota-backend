@@ -13,8 +13,16 @@ from readiness.models import (
 from readiness.summary import (
     build_readiness_optimization,
     build_readiness_summary,
+    invalidate_readiness_optimization_cache,
     summarize_readiness_snapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_optimization_cache():
+    invalidate_readiness_optimization_cache()
+    yield
+    invalidate_readiness_optimization_cache()
 
 
 def _snapshot(
@@ -239,3 +247,93 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
     assert payload.dashboard_snapshot.paid_orders == 9
     assert payload.dashboard_snapshot.total_products == 42
     assert payload.merchant_actions
+
+
+@pytest.mark.asyncio
+async def test_build_readiness_optimization_uses_ttl_cache_until_force_refresh(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    call_counts = {
+        "snapshot": 0,
+        "quality": 0,
+        "dashboard": 0,
+    }
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        call_counts["snapshot"] += 1
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=77,
+            domain_scores={},
+            capability_status={
+                "checkout_execution": "ready",
+                "order_writeback_state_sync": "ready",
+            },
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="ready",
+                    ready_variant_count=1,
+                    blocked_variant_count=0,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_1",
+                    platform="shopify",
+                    title="Alpha Product",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_1",
+                            title="Default",
+                            price={"amount": 10, "currency": "USD"},
+                            inventory={"quantity": 5, "availability": "in_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": []},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                            channel_coverage={"ucp": "ready"},
+                        )
+                    ],
+                )
+            ],
+        )
+
+    async def fake_quality_map(_merchant_id: str):
+        call_counts["quality"] += 1
+        return {}
+
+    async def fake_dashboard_snapshot(_merchant_id: str):
+        call_counts["dashboard"] += 1
+        return DashboardSnapshot(total_products=1)
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    monkeypatch.setattr("readiness.summary._load_latest_quality_map", fake_quality_map)
+    monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
+
+    first = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+    second = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+    refreshed = await build_readiness_optimization("merch_efbc46b4619cfbdf", force_refresh=True)
+
+    assert first.plan.plan_id == second.plan.plan_id
+    assert second.plan.plan_id == refreshed.plan.plan_id
+    assert call_counts == {
+        "snapshot": 2,
+        "quality": 2,
+        "dashboard": 2,
+    }

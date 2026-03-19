@@ -94,7 +94,12 @@ async def test_preview_remediation_action_returns_candidate_patches(monkeypatch)
 
     payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
 
-    async def fake_build_readiness_optimization(_merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        _merchant_id: str,
+        *,
+        channel: str = "ucp",
+        force_refresh: bool = False,
+    ):
         assert channel == "ucp"
         return payload
 
@@ -144,7 +149,12 @@ async def test_preview_remediation_action_rejects_superseded_plan(monkeypatch):
 
     payload = _optimization_payload(plan_id="rdplan_latest", snapshot_id="rdsnap_latest", score=77)
 
-    async def fake_build_readiness_optimization(_merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        _merchant_id: str,
+        *,
+        channel: str = "ucp",
+        force_refresh: bool = False,
+    ):
         return payload
 
     monkeypatch.setattr(remediation, "build_readiness_optimization", fake_build_readiness_optimization)
@@ -169,8 +179,15 @@ async def test_run_remediation_action_executes_pipeline_and_returns_verification
 
     call_count = {"count": 0}
 
-    async def fake_build_readiness_optimization(_merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        _merchant_id: str,
+        *,
+        channel: str = "ucp",
+        force_refresh: bool = False,
+    ):
         call_count["count"] += 1
+        if call_count["count"] == 2:
+            assert force_refresh is True
         return before_payload if call_count["count"] == 1 else after_payload
 
     async def fake_run_enrichment_for_product(**kwargs):
@@ -226,7 +243,12 @@ async def test_run_remediation_action_rejects_non_executable_action(monkeypatch)
         }
     )
 
-    async def fake_build_readiness_optimization(_merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        _merchant_id: str,
+        *,
+        channel: str = "ucp",
+        force_refresh: bool = False,
+    ):
         return payload
 
     monkeypatch.setattr(remediation, "build_readiness_optimization", fake_build_readiness_optimization)
