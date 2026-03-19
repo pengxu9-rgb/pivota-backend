@@ -16,6 +16,10 @@ from readiness.flags import (
     readiness_return_sync_enabled,
     readiness_router_enabled,
 )
+from readiness.summary import (
+    get_readiness_optimization_cache_metrics,
+    invalidate_readiness_optimization_cache,
+)
 
 
 router = APIRouter(prefix="/internal/readiness", tags=["internal-readiness"])
@@ -77,6 +81,11 @@ class CheckoutReturnSyncRequest(BaseModel):
     api_version: Optional[str] = Field(default=None, max_length=16)
     limit: int = Field(20, ge=1, le=100)
     sample_limit: int = Field(10, ge=1, le=50)
+
+
+class OptimizationCacheInvalidateRequest(BaseModel):
+    merchant_id: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    channel: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -208,6 +217,42 @@ async def get_ucp_export(
     except readiness_service.UnsupportedMerchantError:
         raise _unsupported_merchant(merchant_id)
     return _model_dump(export)
+
+
+@router.get("/cache/optimization/metrics")
+async def get_optimization_cache_metrics(
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    return {
+        "status": "success",
+        "data": get_readiness_optimization_cache_metrics(),
+    }
+
+
+@router.post("/cache/optimization/invalidate")
+async def invalidate_optimization_cache(
+    body: OptimizationCacheInvalidateRequest,
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    invalidated_entries = invalidate_readiness_optimization_cache(
+        merchant_id=body.merchant_id,
+        channel=body.channel,
+    )
+    return {
+        "status": "success",
+        "data": {
+            "invalidated_entries": invalidated_entries,
+            "scope": {
+                "merchant_id": body.merchant_id,
+                "channel": body.channel,
+            },
+            "cache_metrics": get_readiness_optimization_cache_metrics(),
+        },
+    }
 
 
 @router.post("/merchants/{merchant_id}/checkout")

@@ -13,16 +13,18 @@ from readiness.models import (
 from readiness.summary import (
     build_readiness_optimization,
     build_readiness_summary,
+    get_readiness_optimization_cache_metrics,
     invalidate_readiness_optimization_cache,
+    reset_readiness_optimization_cache_observability,
     summarize_readiness_snapshot,
 )
 
 
 @pytest.fixture(autouse=True)
 def _clear_optimization_cache():
-    invalidate_readiness_optimization_cache()
+    reset_readiness_optimization_cache_observability()
     yield
-    invalidate_readiness_optimization_cache()
+    reset_readiness_optimization_cache_observability()
 
 
 def _snapshot(
@@ -337,3 +339,67 @@ async def test_build_readiness_optimization_uses_ttl_cache_until_force_refresh(m
         "quality": 2,
         "dashboard": 2,
     }
+    metrics = get_readiness_optimization_cache_metrics()
+    assert metrics["hits"] == 1
+    assert metrics["misses"] == 1
+    assert metrics["refreshes"] == 1
+    assert metrics["stores"] == 2
+    assert metrics["entries"] == 1
+    assert metrics["active_keys"][0]["merchant_id"] == "merch_efbc46b4619cfbdf"
+    assert metrics["active_keys"][0]["channel"] == "ucp"
+
+
+@pytest.mark.asyncio
+async def test_invalidate_readiness_optimization_cache_returns_removed_entry_count(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=77,
+            domain_scores={},
+            capability_status={
+                "checkout_execution": "ready",
+                "order_writeback_state_sync": "ready",
+            },
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="ready",
+                    ready_variant_count=1,
+                    blocked_variant_count=0,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[],
+        )
+
+    async def fake_quality_map(_merchant_id: str):
+        return {}
+
+    async def fake_dashboard_snapshot(_merchant_id: str):
+        return DashboardSnapshot(total_products=1)
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    monkeypatch.setattr("readiness.summary._load_latest_quality_map", fake_quality_map)
+    monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
+
+    await build_readiness_optimization("merch_efbc46b4619cfbdf")
+    removed = invalidate_readiness_optimization_cache("merch_efbc46b4619cfbdf", channel="ucp")
+
+    assert removed == 1
+    metrics = get_readiness_optimization_cache_metrics()
+    assert metrics["entries"] == 0
+    assert metrics["invalidations"] == 1
+    assert metrics["invalidated_entries"] == 1

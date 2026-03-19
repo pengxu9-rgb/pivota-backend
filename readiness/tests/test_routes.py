@@ -143,6 +143,95 @@ def test_real_merchant_summary_report_and_export(monkeypatch):
     assert len(export_json["summary"]["offer_ids_sample"]) == 2
 
 
+def test_internal_readiness_optimization_cache_metrics_route(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from routes import readiness_internal as readiness_internal
+
+    monkeypatch.setattr(
+        readiness_internal,
+        "get_readiness_optimization_cache_metrics",
+        lambda: {
+            "hits": 3,
+            "misses": 1,
+            "stores": 2,
+            "expired": 0,
+            "refreshes": 1,
+            "invalidations": 0,
+            "invalidated_entries": 0,
+            "total_requests": 4,
+            "hit_rate": 75.0,
+            "entries": 1,
+            "ttl_seconds": 60.0,
+            "active_keys": [
+                {
+                    "merchant_id": DEFAULT_ALPHA_MERCHANT_ID,
+                    "channel": "ucp",
+                    "plan_id": "rdplan_test",
+                    "snapshot_id": "rdsnap_test",
+                    "age_seconds": 0.1,
+                    "expires_in_seconds": 59.9,
+                }
+            ],
+        },
+    )
+
+    response = client.get("/internal/readiness/cache/optimization/metrics")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["hits"] == 3
+    assert body["data"]["entries"] == 1
+    assert body["data"]["active_keys"][0]["merchant_id"] == DEFAULT_ALPHA_MERCHANT_ID
+
+
+def test_internal_readiness_optimization_cache_invalidate_route(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from routes import readiness_internal as readiness_internal
+
+    def fake_invalidate(*, merchant_id=None, channel=None):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert channel == "ucp"
+        return 1
+
+    monkeypatch.setattr(readiness_internal, "invalidate_readiness_optimization_cache", fake_invalidate)
+    monkeypatch.setattr(
+        readiness_internal,
+        "get_readiness_optimization_cache_metrics",
+        lambda: {
+            "hits": 0,
+            "misses": 0,
+            "stores": 0,
+            "expired": 0,
+            "refreshes": 0,
+            "invalidations": 1,
+            "invalidated_entries": 1,
+            "total_requests": 0,
+            "hit_rate": 0.0,
+            "entries": 0,
+            "ttl_seconds": 60.0,
+            "active_keys": [],
+        },
+    )
+
+    response = client.post(
+        "/internal/readiness/cache/optimization/invalidate",
+        json={
+            "merchant_id": DEFAULT_ALPHA_MERCHANT_ID,
+            "channel": "ucp",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["invalidated_entries"] == 1
+    assert body["data"]["scope"]["merchant_id"] == DEFAULT_ALPHA_MERCHANT_ID
+    assert body["data"]["scope"]["channel"] == "ucp"
+
+
 def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=True)
 
