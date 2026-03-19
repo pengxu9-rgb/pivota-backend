@@ -178,6 +178,61 @@ def test_external_seed_audit_detail_returns_item(monkeypatch: pytest.MonkeyPatch
     assert item["harvester"]["ready"] is False
 
 
+def test_external_seed_audit_queue_supports_merchant_id_filter(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.employee_products as employee_products_module
+
+    attached = _seed_row(
+        id="eps_attached",
+        attached_product_key="merch_1|shopify|prod_1",
+    )
+    unattached = _seed_row(
+        id="eps_unattached",
+        domain="example.com",
+        canonical_url="https://example.com/en-us/product/referral-1",
+        destination_url="https://example.com/en-us/product/referral-1",
+        seed_data={
+            "title": "Referral Serum",
+            "description": "Experience the ultimate luxury with Referral Serum.",
+            "snapshot": {
+                "canonical_url": "https://example.com/en-us/product/referral-1",
+                "title": "Referral Serum",
+                "description": "Experience the ultimate luxury with Referral Serum.",
+            },
+            "variants": [],
+        },
+    )
+
+    async def fake_inventory(*, merchant_id: str, status: str):
+        assert merchant_id == "merch_1"
+        assert status == "active"
+        return {
+            "merchant_id": merchant_id,
+            "matched_domains": ["example.com"],
+            "attached_rows": [attached],
+            "domain_unattached_rows": [unattached],
+            "rows": [attached, unattached],
+            "matched_via_by_seed": {"eps_attached": "attached_product_key", "eps_unattached": "merchant_domain"},
+        }
+
+    monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module, "fetch_merchant_referral_inventory", fake_inventory)
+
+    res = client.get(
+        "/employee/products/external-seeds/audit-queue",
+        params={"merchant_id": "merch_1", "flagged_only": "false"},
+        headers={"Authorization": "Bearer test-token"},
+    )
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["status"] == "success"
+    assert payload["meta"]["filters"]["merchant_id"] == "merch_1"
+    returned_ids = [item["seed"]["id"] for item in payload["items"]]
+    assert "eps_attached" in returned_ids
+    assert "eps_unattached" in returned_ids
+
+
 def test_update_external_seed_supports_audit_review_edits(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
     import routes.employee_products as employee_products_module
 

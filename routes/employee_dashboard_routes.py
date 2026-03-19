@@ -12,6 +12,7 @@ from readiness.summary import (
     get_readiness_optimization_cache_metrics,
     invalidate_readiness_optimization_cache,
 )
+from services.external_referral_readiness import build_external_referral_summary
 import random
 
 router = APIRouter()
@@ -555,6 +556,38 @@ async def get_employee_merchant_analytics(
                 "revenue_breakdown": {"confirmed": 0.0, "gmv": 0.0, "all_time_confirmed": 0.0, "all_time_gmv": 0.0},
                 "confirmed_revenue": 0.0,
                 "gmv": 0.0,
+            },
+        }
+
+
+@router.get("/employee/referral-readiness/summary")
+async def get_employee_referral_readiness_summary(
+    merchant_id: str = Query(..., min_length=1),
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe external referral summary for one merchant."""
+    try:
+        summary = await build_external_referral_summary(merchant_id)
+        return {"status": "success", "data": summary}
+    except Exception as e:
+        print(f"Error fetching employee referral readiness summary for {merchant_id}: {e}")
+        return {
+            "status": "success",
+            "data": {
+                "merchant_id": merchant_id,
+                "status": "red",
+                "gating_policy_version": "external_referral_v1",
+                "matched_domains": [],
+                "total_active_seeds": 0,
+                "attached_seed_count": 0,
+                "domain_unattached_seed_count": 0,
+                "healthy_seed_count": 0,
+                "blocked_seed_count": 0,
+                "review_seed_count": 0,
+                "issue_buckets": [],
+                "sample_blocked_seeds": [],
+                "last_extracted_at_oldest": None,
+                "last_extracted_at_newest": None,
             },
         }
 

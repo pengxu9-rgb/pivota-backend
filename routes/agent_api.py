@@ -37,12 +37,14 @@ from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
+    is_destination_domain_allowed,
     make_redirect_token,
 )
 from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
+from services.external_referral_readiness import should_block_external_referral_runtime
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -2449,6 +2451,20 @@ async def _build_external_seed_product(
         or _stable_external_product_id(canonical_url or destination_url)
     )
     if not external_product_id:
+        return None
+
+    blocked, gate_status = await should_block_external_referral_runtime(
+        seed_row,
+        matched_via="agent_api",
+        allowed_domains=allowed_domains,
+    )
+    if blocked:
+        if isinstance(metrics_out, dict):
+            metrics_out["blocked_by_referral_gate"] = metrics_out.get("blocked_by_referral_gate", 0) + 1
+            metrics_out.setdefault("blocked_referral_reasons", [])
+            for reason in gate_status.blocker_anomaly_types:
+                if reason not in metrics_out["blocked_referral_reasons"]:
+                    metrics_out["blocked_referral_reasons"].append(reason)
         return None
 
     disclosure_text = (

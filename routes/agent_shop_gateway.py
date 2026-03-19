@@ -46,8 +46,11 @@ from services.similarity_config import get_similarity_scoring_weights
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
+    get_allowed_domains_for_market,
+    is_destination_domain_allowed,
     make_redirect_token,
 )
+from services.external_referral_readiness import should_block_external_referral_runtime
 from models.standard_product import StandardProduct, ProductStatus
 from services.agent_task_manager import AgentTaskManager
 from observability.reliability_metrics import (
@@ -1936,6 +1939,23 @@ async def _handle_offers_resolve(
         seen_offer_ids: set[str] = set()
         for row in seed_rows:
             row_dict = _row_to_dict(row)
+            blocked, gate_status = await should_block_external_referral_runtime(
+                row_dict,
+                matched_via="agent_shop_gateway",
+            )
+            if blocked:
+                mapping_candidates.append(
+                    _conf(
+                        "external_seed",
+                        0.0,
+                        "filtered_external_seed",
+                        {
+                            "seed_id": row_dict.get("id"),
+                            "blockers": list(gate_status.blocker_anomaly_types),
+                        },
+                    )
+                )
+                continue
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
             variants = _seed_variants(seed_data)
 
@@ -3116,11 +3136,21 @@ async def _make_external_redirect_url(
     ctx: Dict[str, Any],
     allowed_domains: Optional[List[str]] = None,
 ) -> Optional[str]:
+    if not destination_url.startswith(("http://", "https://")):
+        return None
     dest_with_utm = apply_utm(
         destination_url,
         utm_template or DEFAULT_UTM_TEMPLATE,
         {"market": market, "tool": tool},
     )
+    runtime_allowed_domains = allowed_domains
+    if runtime_allowed_domains is None:
+        runtime_allowed_domains = await get_allowed_domains_for_market(market=market)
+    if not is_destination_domain_allowed(
+        destination_url=dest_with_utm,
+        allowed_domains=runtime_allowed_domains,
+    ):
+        return None
     token = make_redirect_token(
         {
             "market": market,

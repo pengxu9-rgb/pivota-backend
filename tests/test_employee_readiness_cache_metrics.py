@@ -188,3 +188,42 @@ def test_employee_merchant_analytics_route(monkeypatch):
     assert payload["data"]["total_products"] == 8
 
     app.dependency_overrides.clear()
+
+
+def test_employee_referral_readiness_summary_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_build(merchant_id: str):
+        assert merchant_id == "merch_1"
+        return {
+            "merchant_id": merchant_id,
+            "status": "yellow",
+            "gating_policy_version": "external_referral_v1",
+            "matched_domains": ["example.com"],
+            "total_active_seeds": 3,
+            "attached_seed_count": 2,
+            "domain_unattached_seed_count": 1,
+            "healthy_seed_count": 1,
+            "blocked_seed_count": 1,
+            "review_seed_count": 1,
+            "issue_buckets": [{"issue_type": "stale_snapshot", "severity": "blocker", "count": 1}],
+            "sample_blocked_seeds": [{"seed_id": "eps_1"}],
+            "last_extracted_at_oldest": "2026-03-10T00:00:00+00:00",
+            "last_extracted_at_newest": "2026-03-19T00:00:00+00:00",
+        }
+
+    monkeypatch.setattr(module, "build_external_referral_summary", fake_build)
+
+    response = client.get(
+        "/employee/referral-readiness/summary",
+        params={"merchant_id": "merch_1"},
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["status"] == "yellow"
+    assert payload["data"]["blocked_seed_count"] == 1
+
+    app.dependency_overrides.clear()

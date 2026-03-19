@@ -36,6 +36,7 @@ from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
+from services.external_referral_readiness import should_block_external_referral_runtime
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 
@@ -252,6 +253,14 @@ async def _build_external_seed_product(
         or _stable_external_product_id(canonical_url or destination_url)
     )
     if not external_product_id:
+        return None
+
+    blocked, _gate_status = await should_block_external_referral_runtime(
+        seed_row,
+        matched_via="agent_sdk_fixed",
+        allowed_domains=allowed_domains,
+    )
+    if blocked:
         return None
 
     disclosure_text = seed_row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT

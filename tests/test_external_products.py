@@ -58,7 +58,7 @@ async def test_agent_api_load_external_seed_products_builds_without_allowlist_pr
 
     build_seen_allowed = []
 
-    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None):
+    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
         build_seen_allowed.append(list(allowed_domains or []))
         return {
             "id": seed_row.get("external_product_id"),
@@ -79,6 +79,35 @@ async def test_agent_api_load_external_seed_products_builds_without_allowlist_pr
 
     assert len(products) == 2
     assert all(item == [] for item in build_seen_allowed)
+
+
+@pytest.mark.asyncio
+async def test_agent_api_build_external_seed_product_skips_blocked_referral_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    async def fake_gate(*args, **kwargs):
+        return True, type("GateStatus", (), {"blocker_anomaly_types": ["stale_snapshot"]})()
+
+    monkeypatch.setattr(agent_api_module, "should_block_external_referral_runtime", fake_gate)
+
+    product = await agent_api_module._build_external_seed_product(
+        req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
+        seed_row={
+            "id": "seed_1",
+            "external_product_id": "ext_1",
+            "market": "US",
+            "tool": "*",
+            "destination_url": "https://example.com/p/1",
+            "canonical_url": "https://example.com/p/1",
+            "seed_data": {},
+        },
+        allowed_domains=[],
+        metrics_out={},
+    )
+
+    assert product is None
 
 
 @pytest.mark.asyncio
@@ -165,14 +194,24 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
                     "canonical_url": None,
                     "domain": "example.com",
                     "title": "Example External Product",
-                    "image_url": None,
-                    "price_amount": 12.34,
-                    "price_currency": "USD",
-                    "availability": "in_stock",
-                    "seed_data": {},
-                    "status": "active",
-                    "notes": None,
-                    "created_by_employee_id": None,
+                        "image_url": None,
+                        "price_amount": 12.34,
+                        "price_currency": "USD",
+                        "availability": "in_stock",
+                        "seed_data": {
+                            "variants": [
+                                {
+                                    "variant_id": "v1",
+                                    "title": "50ml",
+                                    "price_amount": 12.34,
+                                    "price_currency": "USD",
+                                    "availability": "in_stock",
+                                }
+                            ]
+                        },
+                        "status": "active",
+                        "notes": None,
+                        "created_by_employee_id": None,
                     "attached_product_key": None,
                     "attached_variant_id": None,
                     "created_at": None,

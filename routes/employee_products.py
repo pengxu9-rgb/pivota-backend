@@ -51,6 +51,10 @@ from services.external_seed_audit import (
     should_suppress_stale_description_fallback,
     summarize_audit_results,
 )
+from services.external_referral_readiness import (
+    fetch_merchant_referral_inventory,
+    filter_referral_inventory_rows,
+)
 from services.pci_kb_scope_review import (
     REVIEW_DECISION_RESOLVED,
     build_queue_items,
@@ -2479,6 +2483,7 @@ async def list_external_seed_audit_queue(
     q: Optional[str] = Query(default=None),
     attached: Optional[bool] = Query(default=None),
     status: str = Query(default="active"),
+    merchant_id: Optional[str] = Query(default=None),
     domain: Optional[str] = Query(default=None),
     market: Optional[str] = Query(default=None),
     severity: Optional[str] = Query(default=None),
@@ -2489,15 +2494,27 @@ async def list_external_seed_audit_queue(
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    rows = await _fetch_external_seed_rows_for_audit(
-        q=q,
-        status=status,
-        attached=attached,
-        domain=domain,
-        market=market,
-        seed_id=seed_id,
-        limit=limit,
-    )
+    if merchant_id:
+        inventory = await fetch_merchant_referral_inventory(merchant_id=merchant_id, status=status)
+        rows = filter_referral_inventory_rows(
+            inventory["rows"],
+            q=q,
+            attached=attached,
+            domain=domain,
+            market=market,
+            seed_id=seed_id,
+            limit=limit,
+        )
+    else:
+        rows = await _fetch_external_seed_rows_for_audit(
+            q=q,
+            status=status,
+            attached=attached,
+            domain=domain,
+            market=market,
+            seed_id=seed_id,
+            limit=limit,
+        )
 
     results = [audit_external_seed_row(row) for row in rows]
     filtered_pairs = [
@@ -2524,6 +2541,7 @@ async def list_external_seed_audit_queue(
                 "q": q,
                 "attached": attached,
                 "status": status,
+                "merchant_id": merchant_id,
                 "domain": domain,
                 "market": market,
                 "severity": severity,
@@ -2695,96 +2713,108 @@ async def list_external_seeds(
     q: Optional[str] = Query(default=None),
     attached: Optional[bool] = Query(default=None),
     status: str = Query(default="active"),
+    merchant_id: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    where = ["status = :status"]
-    values: Dict[str, Any] = {"status": status, "limit": limit}
-    if attached is True:
-        where.append("attached_product_key IS NOT NULL")
-    elif attached is False:
-        where.append("attached_product_key IS NULL")
-    if q:
-        q = q.strip()
-        if q:
-            values["q"] = q
-            values["q_like"] = f"%{q}%"
-            where.append(
-                "("
-                "destination_url ILIKE :q_like"
-                " OR canonical_url ILIKE :q_like"
-                " OR domain ILIKE :q_like"
-                " OR title ILIKE :q_like"
-                " OR id = :q"
-                " OR external_product_id = :q"
-                " OR seed_data->>'external_product_id' = :q"
-                " OR seed_data->>'product_id' = :q"
-                " OR seed_data->'product'->>'product_id' = :q"
-                " OR EXISTS ("
-                "   SELECT 1"
-                "   FROM jsonb_array_elements("
-                "     CASE"
-                "       WHEN jsonb_typeof(seed_data->'variants') = 'array' THEN seed_data->'variants'"
-                "       ELSE '[]'::jsonb"
-                "     END"
-                "   ) AS v"
-                "   WHERE (v->>'variant_id' = :q OR v->>'id' = :q OR v->>'sku' = :q)"
-                " )"
-                ")"
-            )
-
-    try:
-        rows = await database.fetch_all(
-            f"""
-            SELECT
-              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-              destination_url, canonical_url, domain, title, image_url,
-              price_amount, price_currency, availability,
-              seed_data,
-              status, notes, created_by_employee_id,
-              attached_product_key, attached_variant_id,
-              created_at, updated_at
-            FROM external_product_seeds
-            WHERE {" AND ".join(where)}
-            ORDER BY created_at DESC
-            LIMIT :limit
-            """,
-            values,
+    rows: List[Dict[str, Any]]
+    if merchant_id:
+        inventory = await fetch_merchant_referral_inventory(merchant_id=merchant_id, status=status)
+        rows = filter_referral_inventory_rows(
+            inventory["rows"],
+            q=q,
+            attached=attached,
+            limit=limit,
         )
-    except Exception:
-        # Fallback for non-Postgres environments: drop JSONB variant/id filters.
-        where_fallback = ["status = :status"]
-        values_fallback: Dict[str, Any] = {"status": status, "limit": limit}
+    else:
+        where = ["status = :status"]
+        values: Dict[str, Any] = {"status": status, "limit": limit}
         if attached is True:
-            where_fallback.append("attached_product_key IS NOT NULL")
+            where.append("attached_product_key IS NOT NULL")
         elif attached is False:
-            where_fallback.append("attached_product_key IS NULL")
+            where.append("attached_product_key IS NULL")
         if q:
-            q2 = q.strip()
-            if q2:
-                where_fallback.append(
-                    "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
+            q = q.strip()
+            if q:
+                values["q"] = q
+                values["q_like"] = f"%{q}%"
+                where.append(
+                    "("
+                    "destination_url ILIKE :q_like"
+                    " OR canonical_url ILIKE :q_like"
+                    " OR domain ILIKE :q_like"
+                    " OR title ILIKE :q_like"
+                    " OR id = :q"
+                    " OR external_product_id = :q"
+                    " OR seed_data->>'external_product_id' = :q"
+                    " OR seed_data->>'product_id' = :q"
+                    " OR seed_data->'product'->>'product_id' = :q"
+                    " OR EXISTS ("
+                    "   SELECT 1"
+                    "   FROM jsonb_array_elements("
+                    "     CASE"
+                    "       WHEN jsonb_typeof(seed_data->'variants') = 'array' THEN seed_data->'variants'"
+                    "       ELSE '[]'::jsonb"
+                    "     END"
+                    "   ) AS v"
+                    "   WHERE (v->>'variant_id' = :q OR v->>'id' = :q OR v->>'sku' = :q)"
+                    " )"
+                    ")"
                 )
-                values_fallback["q_like"] = f"%{q2}%"
 
-        rows = await database.fetch_all(
-            f"""
-            SELECT
-              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-              destination_url, canonical_url, domain, title, image_url,
-              price_amount, price_currency, availability,
-              seed_data,
-              status, notes, created_by_employee_id,
-              attached_product_key, attached_variant_id,
-              created_at, updated_at
-            FROM external_product_seeds
-            WHERE {" AND ".join(where_fallback)}
-            ORDER BY created_at DESC
-            LIMIT :limit
-            """,
-            values_fallback,
-        )
+        try:
+            fetched_rows = await database.fetch_all(
+                f"""
+                SELECT
+                  id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+                  destination_url, canonical_url, domain, title, image_url,
+                  price_amount, price_currency, availability,
+                  seed_data,
+                  status, notes, created_by_employee_id,
+                  attached_product_key, attached_variant_id,
+                  created_at, updated_at
+                FROM external_product_seeds
+                WHERE {" AND ".join(where)}
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """,
+                values,
+            )
+        except Exception:
+            # Fallback for non-Postgres environments: drop JSONB variant/id filters.
+            where_fallback = ["status = :status"]
+            values_fallback: Dict[str, Any] = {"status": status, "limit": limit}
+            if attached is True:
+                where_fallback.append("attached_product_key IS NOT NULL")
+            elif attached is False:
+                where_fallback.append("attached_product_key IS NULL")
+            if q:
+                q2 = q.strip()
+                if q2:
+                    where_fallback.append(
+                        "(destination_url ILIKE :q_like OR canonical_url ILIKE :q_like OR domain ILIKE :q_like OR title ILIKE :q_like)"
+                    )
+                    values_fallback["q_like"] = f"%{q2}%"
+
+            fetched_rows = await database.fetch_all(
+                f"""
+                SELECT
+                  id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+                  destination_url, canonical_url, domain, title, image_url,
+                  price_amount, price_currency, availability,
+                  seed_data,
+                  status, notes, created_by_employee_id,
+                  attached_product_key, attached_variant_id,
+                  created_at, updated_at
+                FROM external_product_seeds
+                WHERE {" AND ".join(where_fallback)}
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """,
+                values_fallback,
+            )
+        rows = [dict(row) for row in fetched_rows or []]
     items = []
     for r in rows:
         r = dict(r)
@@ -3489,12 +3519,7 @@ async def update_external_seed(
     return {"status": "success"}
 
 
-@router.post("/external-seeds/{seed_id}/refresh")
-async def refresh_external_seed(
-    seed_id: str,
-    request: Request,
-    current_user: dict = Depends(get_current_employee),
-):
+async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
     if not row:
@@ -3624,20 +3649,51 @@ async def refresh_external_seed(
             "seed_data": _seed_data_payload(seed_data),
         },
     )
+    return {
+        "status": "success",
+        "seed_id": seed_id,
+        "market": market,
+        "tool": tool,
+        "dest": dest,
+        "canonical_url": canonical_url,
+        "domain": domain,
+        "seed_data": seed_data,
+        "attached_product_key": row.get("attached_product_key"),
+        "attached_variant_id": row.get("attached_variant_id"),
+        "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,
+        "utm_template": row.get("utm_template") or seed_data.get("utm_template"),
+    }
+
+
+@router.post("/external-seeds/{seed_id}/refresh")
+async def refresh_external_seed(
+    seed_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_employee),
+):
+    refreshed = await _refresh_external_seed_by_id(seed_id)
+    if refreshed.get("status") == "degraded":
+        return refreshed
     redirect_url = await _make_redirect_url(
         request=request,
-        market=market,
-        tool=tool,
-        destination_url=canonical_url or dest,
-        utm_template=row.get("utm_template") or seed_data.get("utm_template"),
+        market=refreshed["market"],
+        tool=refreshed["tool"],
+        destination_url=refreshed["canonical_url"] or refreshed["dest"],
+        utm_template=refreshed["utm_template"],
         ctx={
             "seedId": seed_id,
-            **({"productKey": row.get("attached_product_key")} if row.get("attached_product_key") else {}),
-            **({"variantId": row.get("attached_variant_id")} if row.get("attached_variant_id") else {}),
+            **({"productKey": refreshed["attached_product_key"]} if refreshed["attached_product_key"] else {}),
+            **({"variantId": refreshed["attached_variant_id"]} if refreshed["attached_variant_id"] else {}),
         },
     )
-    disclosure_text = row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
-    return {"status": "success", "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text}}
+    return {
+        "status": "success",
+        "action": {
+            "type": "redirect",
+            "redirect_url": redirect_url,
+            "disclosure_text": refreshed["disclosure_text"],
+        },
+    }
 
 
 class AttachSeedRequest(BaseModel):
