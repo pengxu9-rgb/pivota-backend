@@ -23,6 +23,15 @@ from services.payment_routing_service import PaymentRoutingService
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
+from readiness.remediation import (
+    ActionNotExecutableError,
+    ActionNotFoundError,
+    JobNotFoundError,
+    PlanSupersededError,
+    get_execution_job,
+    preview_remediation_action,
+    run_remediation_action,
+)
 from readiness.summary import build_readiness_optimization, build_readiness_summary
 
 router = APIRouter()
@@ -33,6 +42,28 @@ class RefundRequest(BaseModel):
     amount: float  # Required
     reason: str  # Required
     source: str = "pivota_merchant"
+
+
+class ReadinessRefreshRequest(BaseModel):
+    scope: str = "merchant"
+    reason: str = "manual"
+
+
+class ReadinessActionPreviewRequest(BaseModel):
+    plan_id: str
+    action_id: Optional[str] = None
+    action_type: Optional[str] = None
+    targets: List[Dict[str, Any]] = []
+    dry_run: bool = True
+
+
+class ReadinessActionRunRequest(BaseModel):
+    plan_id: str
+    action_id: Optional[str] = None
+    action_type: Optional[str] = None
+    targets: List[Dict[str, Any]] = []
+    idempotency_key: Optional[str] = None
+    execution_mode: str = "sync"
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
@@ -725,6 +756,145 @@ async def get_readiness_optimization(current_user: dict = Depends(get_current_us
     except Exception as e:
         logger.error(f"❌ Readiness optimization error for merchant {merchant_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Readiness optimization failed: {str(e)}")
+
+
+@router.post("/merchant/readiness/actions/refresh")
+async def refresh_readiness_optimization(
+    body: ReadinessRefreshRequest = Body(default=ReadinessRefreshRequest()),
+    current_user: dict = Depends(get_current_user),
+):
+    """Refresh the merchant optimization plan and return the latest workspace payload."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        payload = await build_readiness_optimization(merchant_id)
+        return {
+            "status": "success",
+            "data": payload.model_dump(),
+            "meta": {
+                "scope": body.scope,
+                "reason": body.reason,
+                "refresh_state": payload.plan.refresh_state,
+                "plan_id": payload.plan.plan_id,
+                "snapshot_id": payload.plan.snapshot_id,
+            },
+        }
+    except Exception as e:
+        logger.error(f"❌ Readiness optimization refresh error for merchant {merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Readiness optimization refresh failed: {str(e)}")
+
+
+@router.post("/merchant/readiness/actions/preview")
+async def preview_readiness_action(
+    body: ReadinessActionPreviewRequest = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Preview a remediation action against the latest optimization plan."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        preview = await preview_remediation_action(
+            merchant_id,
+            plan_id=body.plan_id,
+            action_id=body.action_id,
+            action_type=body.action_type,
+            targets=body.targets,
+        )
+        return {
+            "status": "success",
+            "data": preview,
+            "meta": {
+                "dry_run": body.dry_run,
+                "plan_id": body.plan_id,
+            },
+        }
+    except PlanSupersededError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
+                "current_plan_id": exc.current_plan_id,
+                "current_snapshot_id": exc.current_snapshot_id,
+            },
+        )
+    except ActionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"code": "OPTIMIZATION_ACTION_NOT_FOUND", "message": str(exc)})
+    except Exception as e:
+        logger.error(f"❌ Readiness action preview error for merchant {merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Readiness action preview failed: {str(e)}")
+
+
+@router.post("/merchant/readiness/actions/run")
+async def run_readiness_action(
+    body: ReadinessActionRunRequest = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Execute a remediation action against the latest optimization plan."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    if body.execution_mode != "sync":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "UNSUPPORTED_EXECUTION_MODE", "message": "Only sync execution is currently supported."},
+        )
+
+    try:
+        result = await run_remediation_action(
+            merchant_id,
+            plan_id=body.plan_id,
+            action_id=body.action_id,
+            action_type=body.action_type,
+            targets=body.targets,
+            idempotency_key=body.idempotency_key,
+        )
+        return {
+            "status": "success",
+            "data": result,
+        }
+    except PlanSupersededError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
+                "current_plan_id": exc.current_plan_id,
+                "current_snapshot_id": exc.current_snapshot_id,
+            },
+        )
+    except ActionNotExecutableError as exc:
+        raise HTTPException(status_code=409, detail={"code": "OPTIMIZATION_ACTION_NOT_EXECUTABLE", "message": str(exc)})
+    except ActionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"code": "OPTIMIZATION_ACTION_NOT_FOUND", "message": str(exc)})
+    except Exception as e:
+        logger.error(f"❌ Readiness action run error for merchant {merchant_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Readiness action run failed: {str(e)}")
+
+
+@router.get("/merchant/readiness/jobs/{job_id}")
+async def get_readiness_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the latest known state for a remediation execution job."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    try:
+        job = get_execution_job(job_id)
+        return {
+            "status": "success",
+            "data": job.model_dump(),
+        }
+    except JobNotFoundError:
+        raise HTTPException(status_code=404, detail={"code": "OPTIMIZATION_JOB_NOT_FOUND", "message": "Job not found."})
 
 @router.put("/merchant/profile")
 async def update_merchant_profile(

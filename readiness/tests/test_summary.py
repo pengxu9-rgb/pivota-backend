@@ -191,9 +191,18 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
 
     payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
 
+    assert payload.plan.snapshot_id.startswith("rdsnap_")
+    assert payload.plan.plan_id.startswith("rdplan_")
+    assert payload.plan.workspace_version == "agent_commerce_optimization.v1"
+    assert payload.plan.refresh_state in {"fresh", "stale", "expired"}
+    assert payload.score_bundle.readiness_score == 77
     assert payload.readiness_summary.tier == "red"
     assert payload.issue_buckets[0].code in {"shipping_returns_setup", "price_currency", "inventory_availability"}
+    assert payload.issue_buckets[0].priority_score > 0
     assert payload.product_queue[0].platform == "shopify"
+    assert payload.product_queue[0].queue_item_scope == "product"
+    assert payload.product_queue[0].queue_item_id.startswith("product:shopify:")
     assert payload.product_queue[0].blocked_variant_count == 1
+    assert payload.product_queue[0].priority_score > 0
     assert payload.product_queue[0].top_issues
     assert payload.merchant_actions

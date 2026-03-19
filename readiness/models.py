@@ -143,6 +143,25 @@ class ReadinessSummary(BaseModel):
     next_action: Optional[str] = None
 
 
+class ScoreBundle(BaseModel):
+    readiness_score: Optional[int] = None
+    exposure_score: Optional[int] = None
+    conversion_score: Optional[int] = None
+
+
+class OptimizationPlan(BaseModel):
+    plan_id: str
+    snapshot_id: str
+    workspace_version: str = "agent_commerce_optimization.v1"
+    priority_policy_version: str = "merchant_readiness_priority.v1"
+    refresh_state: str = "fresh"
+    plan_status: str = "active"
+    generated_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    can_apply_actions: bool = True
+    last_successful_rescore_at: Optional[str] = None
+
+
 class ReadinessIssueBucket(BaseModel):
     code: str
     label: str
@@ -150,19 +169,27 @@ class ReadinessIssueBucket(BaseModel):
     scope: str
     affected_count: int = 0
     fix_surface: str
+    fixability: str = "merchant_fixable"
     impact: str
     direct_target: str
+    priority_score: float = 0.0
+    priority_reason: Optional[str] = None
     reason_codes: List[str] = Field(default_factory=list)
 
 
 class MerchantReadinessAction(BaseModel):
+    action_id: Optional[str] = None
+    action_type: str = "review"
     label: str
     description: str
     target_url: str
     fix_surface: str
+    fixability: str = "merchant_fixable"
     scope: str
     impact: str
     affected_count: int = 0
+    priority_score: float = 0.0
+    priority_reason: Optional[str] = None
     related_bucket_codes: List[str] = Field(default_factory=list)
 
 
@@ -174,8 +201,11 @@ class ProductQueueIssue(BaseModel):
 
 
 class ProductReadinessQueueItem(BaseModel):
+    queue_item_scope: str = "product"
+    queue_item_id: str
     product_id: str
     platform: str
+    platform_product_id: Optional[str] = None
     title: str
     image_url: Optional[str] = None
     brand: Optional[str] = None
@@ -185,15 +215,76 @@ class ProductReadinessQueueItem(BaseModel):
     top_issues: List[ProductQueueIssue] = Field(default_factory=list)
     primary_action: Optional[str] = None
     fix_surface: str = "product_content"
+    fixability: str = "merchant_fixable"
     impact: str = "discovery_only"
+    priority_score: float = 0.0
+    priority_reason: Optional[str] = None
+    recommended_action_id: Optional[str] = None
+    recommended_action_type: Optional[str] = None
 
 
 class MerchantReadinessOptimizationPayload(BaseModel):
+    plan: OptimizationPlan
+    score_bundle: ScoreBundle = Field(default_factory=ScoreBundle)
     readiness_summary: ReadinessSummary
     issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
     last_generated_at: Optional[str] = None
+
+
+class RemediationAction(BaseModel):
+    action_id: str
+    plan_id: str
+    action_type: str
+    surface: str
+    scope: str
+    targets: List[Dict[str, Any]] = Field(default_factory=list)
+    fixability: str = "merchant_fixable"
+    priority_score: float = 0.0
+    priority_reason: Optional[str] = None
+    reason: Optional[str] = None
+    preconditions: List[str] = Field(default_factory=list)
+    idempotency_key: Optional[str] = None
+    status: str = "suggested"
+
+
+class ExecutionJob(BaseModel):
+    job_id: str
+    action_id: str
+    executor_type: str
+    status: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    result: Dict[str, Any] = Field(default_factory=dict)
+    error_code: Optional[str] = None
+    retry_count: int = 0
+
+
+class PatchCandidate(BaseModel):
+    candidate_id: str
+    action_id: str
+    target_field: str
+    before: Any = None
+    after: Any = None
+    confidence: Optional[float] = None
+    rationale: Optional[str] = None
+    evidence_used: List[Dict[str, Any]] = Field(default_factory=list)
+    risk_flags: List[str] = Field(default_factory=list)
+    requires_approval: bool = True
+
+
+class VerificationResult(BaseModel):
+    verification_id: str
+    action_id: str
+    before_snapshot_id: str
+    after_snapshot_id: str
+    delta_scores: Dict[str, Any] = Field(default_factory=dict)
+    resolved_issues: List[str] = Field(default_factory=list)
+    remaining_issues: List[str] = Field(default_factory=list)
+    expected_impact: Dict[str, Any] = Field(default_factory=dict)
+    observed_impact: Dict[str, Any] = Field(default_factory=dict)
+    merchant_visible_impact: Optional[str] = None
 
 
 class ChannelReadinessReport(BaseModel):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timedelta, timezone
+import hashlib
 from typing import Any, Iterable, Optional
 
 from readiness.flags import (
@@ -12,12 +14,19 @@ from readiness.models import (
     MerchantReadinessAction,
     MerchantReadinessOptimizationPayload,
     MerchantReadinessSnapshot,
+    OptimizationPlan,
     ProductQueueIssue,
     ProductReadinessQueueItem,
     ReadinessIssueBucket,
     ReadinessSummary,
+    ScoreBundle,
 )
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
+
+
+_WORKSPACE_VERSION = "agent_commerce_optimization.v1"
+_PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
+_PLAN_TTL_HOURS = 6
 
 
 _BUCKET_DEFINITIONS: dict[str, dict[str, str]] = {
@@ -151,6 +160,150 @@ def _humanize_code(code: str) -> str:
     return str(code or "").replace("_", " ").strip().capitalize()
 
 
+def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        normalized = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _format_timestamp(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _build_snapshot_id(snapshot: MerchantReadinessSnapshot) -> str:
+    raw = "|".join(
+        [
+            snapshot.report_version,
+            snapshot.merchant_id,
+            snapshot.channel,
+            snapshot.generated_at,
+            snapshot.merchant_alpha_mode,
+        ]
+    )
+    return f"rdsnap_{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _build_plan_id(
+    snapshot_id: str,
+    *,
+    summary: ReadinessSummary,
+    issue_buckets: list[ReadinessIssueBucket],
+    product_queue: list[ProductReadinessQueueItem],
+) -> str:
+    raw = "|".join(
+        [
+            snapshot_id,
+            _WORKSPACE_VERSION,
+            _PRIORITY_POLICY_VERSION,
+            summary.tier,
+            str(summary.blocked_variant_count),
+            ",".join(bucket.code for bucket in issue_buckets[:5]),
+            ",".join(item.queue_item_id for item in product_queue[:10]),
+        ]
+    )
+    return f"rdplan_{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _refresh_state(generated_at: Optional[str]) -> str:
+    generated_dt = _parse_timestamp(generated_at)
+    if generated_dt is None:
+        return "unavailable"
+    age = datetime.now(timezone.utc) - generated_dt
+    if age <= timedelta(hours=_PLAN_TTL_HOURS):
+        return "fresh"
+    if age <= timedelta(hours=24):
+        return "stale"
+    return "expired"
+
+
+def _plan_expiry(generated_at: Optional[str]) -> Optional[str]:
+    generated_dt = _parse_timestamp(generated_at)
+    if generated_dt is None:
+        return None
+    return _format_timestamp(generated_dt + timedelta(hours=_PLAN_TTL_HOURS))
+
+
+def _fixability_for_surface(fix_surface: str) -> str:
+    if fix_surface in {"product_content", "catalog_data", "integrations", "policy"}:
+        return "merchant_fixable"
+    if fix_surface == "pivota_managed":
+        return "pivota_managed"
+    return "informational"
+
+
+def _impact_weight(impact: str) -> int:
+    return {
+        "full_agent_commerce": 100,
+        "checkout": 75,
+        "discovery_only": 45,
+    }.get(impact, 30)
+
+
+def _bucket_priority_score(bucket_code: str, affected_count: int, *, impact: str, fix_surface: str) -> float:
+    severity_weight = {
+        "high": 90,
+        "medium": 55,
+        "low": 25,
+    }[_severity_for_bucket(bucket_code, affected_count)]
+    fixability_bonus = {
+        "merchant_fixable": 12,
+        "pivota_managed": 4,
+        "informational": 0,
+    }[_fixability_for_surface(fix_surface)]
+    return float(severity_weight + _impact_weight(impact) + min(affected_count, 50) + fixability_bonus)
+
+
+def _bucket_priority_reason(bucket: str, *, impact: str, fix_surface: str, scope: str) -> str:
+    if fix_surface in {"integrations", "policy"}:
+        return "Fixing this setup can unlock merchant-level agent commerce flows."
+    if impact == "full_agent_commerce":
+        return "Fixing this issue can unlock blocked agent commerce actions."
+    if impact == "checkout":
+        return "Fixing this issue can improve checkout readiness for blocked variants."
+    if scope == "product":
+        return "Fixing this issue can improve how agents understand and retrieve products."
+    return "This issue should be resolved before broader agent exposure."
+
+
+def _product_priority_score(
+    *,
+    blocked_variant_count: int,
+    impact: str,
+    fix_surface: str,
+    affected_variant_count: int,
+) -> float:
+    fixability_bonus = {
+        "merchant_fixable": 10,
+        "pivota_managed": 3,
+        "informational": 0,
+    }[_fixability_for_surface(fix_surface)]
+    return float(
+        _impact_weight(impact)
+        + min(blocked_variant_count * 12, 72)
+        + min(affected_variant_count * 5, 40)
+        + fixability_bonus
+    )
+
+
+def _product_priority_reason(*, blocked_variant_count: int, impact: str) -> str:
+    if blocked_variant_count > 0 and impact == "full_agent_commerce":
+        return "Fixing this product can unlock checkout for blocked variants."
+    if blocked_variant_count > 0:
+        return "Fixing this product can reduce blocked variants in the catalog."
+    if impact == "discovery_only":
+        return "Improving this product can increase agent understanding and retrieval."
+    return "Review this product to improve agent commerce performance."
+
+
 def _variant_blocker_counts(snapshot: MerchantReadinessSnapshot) -> Counter[str]:
     counts: Counter[str] = Counter()
     for product in snapshot.products:
@@ -241,9 +394,25 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
     elif any(_variant_impact(variant) == "checkout" for variant in product.variants):
         impact = "checkout"
 
+    affected_variant_count = sum(issue.affected_variant_count for issue in top_issues)
+    fixability = _fixability_for_surface(primary_bucket["fix_surface"])
+    priority_score = _product_priority_score(
+        blocked_variant_count=blocked_variant_count,
+        impact=impact,
+        fix_surface=primary_bucket["fix_surface"],
+        affected_variant_count=affected_variant_count,
+    )
+    priority_reason = _product_priority_reason(
+        blocked_variant_count=blocked_variant_count,
+        impact=impact,
+    )
+
     return ProductReadinessQueueItem(
+        queue_item_scope="product",
+        queue_item_id=f"product:{product.platform or 'unknown'}:{product.product_id}",
         product_id=product.product_id,
         platform=product.platform or "unknown",
+        platform_product_id=product.product_id,
         title=product.title,
         image_url=product.default_image_url,
         brand=product.brand,
@@ -253,7 +422,12 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
         top_issues=top_issues,
         primary_action=primary_action,
         fix_surface=primary_bucket["fix_surface"],
+        fixability=fixability,
         impact=impact,
+        priority_score=priority_score,
+        priority_reason=priority_reason,
+        recommended_action_id=f"act_product:{product.platform or 'unknown'}:{product.product_id}",
+        recommended_action_type="run_product_enrichment" if primary_bucket["fix_surface"] == "product_content" else "review_catalog_data",
     )
 
 
@@ -281,6 +455,13 @@ def _build_issue_buckets(snapshot: MerchantReadinessSnapshot) -> list[ReadinessI
     for bucket_code, reason_counts in bucket_reason_counts.items():
         definition = _BUCKET_DEFINITIONS[bucket_code]
         affected_count = int(bucket_affected_counts.get(bucket_code, 0))
+        fixability = _fixability_for_surface(definition["fix_surface"])
+        priority_score = _bucket_priority_score(
+            bucket_code,
+            affected_count,
+            impact=definition["impact"],
+            fix_surface=definition["fix_surface"],
+        )
         buckets.append(
             ReadinessIssueBucket(
                 code=bucket_code,
@@ -289,15 +470,23 @@ def _build_issue_buckets(snapshot: MerchantReadinessSnapshot) -> list[ReadinessI
                 scope=definition["scope"],
                 affected_count=affected_count,
                 fix_surface=definition["fix_surface"],
+                fixability=fixability,
                 impact=definition["impact"],
                 direct_target=definition["direct_target"],
+                priority_score=priority_score,
+                priority_reason=_bucket_priority_reason(
+                    bucket_code,
+                    impact=definition["impact"],
+                    fix_surface=definition["fix_surface"],
+                    scope=definition["scope"],
+                ),
                 reason_codes=[code for code, _ in reason_counts.most_common(5)],
             )
         )
     buckets.sort(
         key=lambda bucket: (
             {"high": 0, "medium": 1, "low": 2}.get(bucket.severity, 3),
-            -bucket.affected_count,
+            -bucket.priority_score,
             bucket.label,
         )
     )
@@ -322,13 +511,18 @@ def _build_merchant_actions(summary: ReadinessSummary, issue_buckets: list[Readi
 
         actions.append(
             MerchantReadinessAction(
+                action_id=f"act_{bucket.code}",
+                action_type="review_and_fix",
                 label=label,
                 description=description,
                 target_url=bucket.direct_target,
                 fix_surface=bucket.fix_surface,
+                fixability=bucket.fixability,
                 scope=bucket.scope,
                 impact=bucket.impact,
                 affected_count=bucket.affected_count,
+                priority_score=bucket.priority_score,
+                priority_reason=bucket.priority_reason,
                 related_bucket_codes=[bucket.code],
             )
         )
@@ -336,13 +530,18 @@ def _build_merchant_actions(summary: ReadinessSummary, issue_buckets: list[Readi
     if not actions and summary.next_action:
         actions.append(
             MerchantReadinessAction(
+                action_id="act_review_readiness",
+                action_type="review",
                 label="Review readiness",
                 description=summary.next_action,
                 target_url="/dashboard/product-optimization",
                 fix_surface="product_content",
+                fixability="merchant_fixable",
                 scope="merchant",
                 impact="discovery_only",
                 affected_count=summary.blocked_variant_count,
+                priority_score=float(max(summary.blocked_variant_count, 1) * 10),
+                priority_reason="Review the current readiness plan before broader agent exposure.",
             )
         )
 
@@ -602,37 +801,71 @@ def _fallback_summary(
 
 
 def _fallback_optimization_payload(summary: ReadinessSummary) -> MerchantReadinessOptimizationPayload:
+    snapshot_id = _build_snapshot_id(
+        MerchantReadinessSnapshot(
+            merchant_id="unknown",
+            merchant_name="unknown",
+            channel=summary.channel,
+            generated_at=summary.generated_at or "1970-01-01T00:00:00Z",
+            merchant_alpha_mode=summary.merchant_alpha_mode or "summary_fallback",
+            readiness_score=summary.score or 0,
+            blockers=summary.top_blockers,
+            warnings=summary.top_warnings,
+        )
+    )
     actions: list[MerchantReadinessAction] = []
     for action in summary.recommended_actions[:3]:
         actions.append(
             MerchantReadinessAction(
+                action_id="act_review_readiness",
+                action_type="review",
                 label="Review readiness",
                 description=action,
                 target_url="/dashboard/product-optimization",
                 fix_surface="product_content",
+                fixability="merchant_fixable",
                 scope="merchant",
                 impact="full_agent_commerce",
                 affected_count=summary.blocked_variant_count,
+                priority_score=float(max(summary.blocked_variant_count, 1) * 10),
+                priority_reason="Review the current readiness plan before broader agent exposure.",
                 related_bucket_codes=["other"],
             )
         )
 
+    issue_buckets = [
+        ReadinessIssueBucket(
+            code=item["code"],
+            label=item["label"],
+            severity="high",
+            scope="merchant",
+            affected_count=int(item.get("count", 0)),
+            fix_surface="pivota_managed",
+            fixability="pivota_managed",
+            impact="full_agent_commerce",
+            direct_target="/dashboard/product-optimization",
+            priority_score=float(100 + int(item.get("count", 0))),
+            priority_reason="Pivota needs to review this readiness issue before broader agent exposure.",
+            reason_codes=[item["code"]],
+        )
+        for item in summary.blocker_breakdown
+    ]
+    plan = OptimizationPlan(
+        plan_id=f"rdplan_fallback_{snapshot_id[-8:]}",
+        snapshot_id=snapshot_id,
+        workspace_version=_WORKSPACE_VERSION,
+        priority_policy_version=_PRIORITY_POLICY_VERSION,
+        refresh_state=_refresh_state(summary.generated_at),
+        generated_at=summary.generated_at,
+        expires_at=_plan_expiry(summary.generated_at),
+        can_apply_actions=summary.assessment_state == "assessed",
+        last_successful_rescore_at=summary.generated_at,
+    )
     return MerchantReadinessOptimizationPayload(
+        plan=plan,
+        score_bundle=ScoreBundle(readiness_score=summary.score),
         readiness_summary=summary,
-        issue_buckets=[
-            ReadinessIssueBucket(
-                code=item["code"],
-                label=item["label"],
-                severity="high",
-                scope="merchant",
-                affected_count=int(item.get("count", 0)),
-                fix_surface="pivota_managed",
-                impact="full_agent_commerce",
-                direct_target="/dashboard/product-optimization",
-                reason_codes=[item["code"]],
-            )
-            for item in summary.blocker_breakdown
-        ],
+        issue_buckets=issue_buckets,
         merchant_actions=actions,
         product_queue=[],
         last_generated_at=summary.generated_at,
@@ -716,13 +949,31 @@ async def build_readiness_optimization(
     product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
     product_queue.sort(
         key=lambda item: (
+            -item.priority_score,
             -item.blocked_variant_count,
-            {"full_agent_commerce": 0, "checkout": 1, "discovery_only": 2}.get(item.impact, 3),
-            -sum(issue.affected_variant_count for issue in item.top_issues),
             item.title.lower(),
         )
     )
+    snapshot_id = _build_snapshot_id(snapshot)
+    plan = OptimizationPlan(
+        plan_id=_build_plan_id(
+            snapshot_id,
+            summary=summary,
+            issue_buckets=issue_buckets,
+            product_queue=product_queue,
+        ),
+        snapshot_id=snapshot_id,
+        workspace_version=_WORKSPACE_VERSION,
+        priority_policy_version=_PRIORITY_POLICY_VERSION,
+        refresh_state=_refresh_state(summary.generated_at),
+        generated_at=summary.generated_at,
+        expires_at=_plan_expiry(summary.generated_at),
+        can_apply_actions=summary.assessment_state == "assessed",
+        last_successful_rescore_at=summary.generated_at,
+    )
     return MerchantReadinessOptimizationPayload(
+        plan=plan,
+        score_bundle=ScoreBundle(readiness_score=summary.score),
         readiness_summary=summary,
         issue_buckets=issue_buckets,
         merchant_actions=merchant_actions,

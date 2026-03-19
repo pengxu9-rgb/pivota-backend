@@ -153,6 +153,22 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
         assert channel == "ucp"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
+                "plan": {
+                    "plan_id": "rdplan_test",
+                    "snapshot_id": "rdsnap_test",
+                    "workspace_version": "agent_commerce_optimization.v1",
+                    "priority_policy_version": "merchant_readiness_priority.v1",
+                    "refresh_state": "fresh",
+                    "generated_at": "2026-03-18T00:00:00Z",
+                    "expires_at": "2026-03-18T06:00:00Z",
+                    "can_apply_actions": True,
+                    "last_successful_rescore_at": "2026-03-18T00:00:00Z",
+                },
+                "score_bundle": {
+                    "readiness_score": 77,
+                    "exposure_score": None,
+                    "conversion_score": None,
+                },
                 "readiness_summary": {
                     "tier": "yellow",
                     "label": "Needs Attention",
@@ -169,25 +185,35 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
                         "scope": "product",
                         "affected_count": 1,
                         "fix_surface": "catalog_data",
+                        "fixability": "merchant_fixable",
                         "impact": "full_agent_commerce",
                         "direct_target": "/dashboard/product-optimization?focus=price_currency",
+                        "priority_score": 181,
+                        "priority_reason": "Fixing this issue can unlock blocked agent commerce actions.",
                         "reason_codes": ["missing_price"],
                     }
                 ],
                 "merchant_actions": [
                     {
+                        "action_id": "act_price_currency",
+                        "action_type": "review_and_fix",
                         "label": "Fix products in Product Optimization",
                         "description": "Price / currency is affecting checkout for part of the catalog.",
                         "target_url": "/dashboard/product-optimization?focus=price_currency",
                         "fix_surface": "catalog_data",
+                        "fixability": "merchant_fixable",
                         "scope": "product",
                         "impact": "full_agent_commerce",
                         "affected_count": 1,
+                        "priority_score": 181,
+                        "priority_reason": "Fixing this issue can unlock blocked agent commerce actions.",
                         "related_bucket_codes": ["price_currency"],
                     }
                 ],
                 "product_queue": [
                     {
+                        "queue_item_scope": "product",
+                        "queue_item_id": "product:shopify:prod_1",
                         "product_id": "prod_1",
                         "platform": "shopify",
                         "title": "Alpha Product",
@@ -204,7 +230,10 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
                         ],
                         "primary_action": "Fix missing prices for this product before enabling AI checkout.",
                         "fix_surface": "catalog_data",
+                        "fixability": "merchant_fixable",
                         "impact": "full_agent_commerce",
+                        "priority_score": 157,
+                        "priority_reason": "Fixing this product can unlock checkout for blocked variants.",
                     }
                 ],
                 "last_generated_at": "2026-03-18T00:00:00Z",
@@ -235,9 +264,212 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
+    assert body["data"]["plan"]["plan_id"] == "rdplan_test"
+    assert body["data"]["score_bundle"]["readiness_score"] == 77
     assert body["data"]["readiness_summary"]["tier"] == "yellow"
     assert body["data"]["issue_buckets"][0]["code"] == "price_currency"
     assert body["data"]["product_queue"][0]["platform"] == "shopify"
+
+
+def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_build_readiness_optimization(merchant_id: str, *, channel: str = "ucp"):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        return MerchantReadinessOptimizationPayload.model_validate(
+            {
+                "plan": {
+                    "plan_id": "rdplan_refresh",
+                    "snapshot_id": "rdsnap_refresh",
+                    "workspace_version": "agent_commerce_optimization.v1",
+                    "priority_policy_version": "merchant_readiness_priority.v1",
+                    "refresh_state": "fresh",
+                    "generated_at": "2026-03-18T00:00:00Z",
+                    "expires_at": "2026-03-18T06:00:00Z",
+                    "can_apply_actions": True,
+                    "last_successful_rescore_at": "2026-03-18T00:00:00Z",
+                },
+                "score_bundle": {
+                    "readiness_score": 77,
+                    "exposure_score": None,
+                    "conversion_score": None,
+                },
+                "readiness_summary": {
+                    "tier": "yellow",
+                    "label": "Needs Attention",
+                    "assessment_state": "assessed",
+                    "score": 77,
+                    "ready_variant_count": 3,
+                    "blocked_variant_count": 1,
+                },
+                "issue_buckets": [],
+                "merchant_actions": [],
+                "product_queue": [],
+                "last_generated_at": "2026-03-18T00:00:00Z",
+            }
+        )
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    monkeypatch.setattr(merchant_api_extensions, "build_readiness_optimization", fake_build_readiness_optimization)
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.post(
+        "/merchant/readiness/actions/refresh",
+        json={"scope": "merchant", "reason": "manual"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["plan"]["plan_id"] == "rdplan_refresh"
+    assert body["meta"]["scope"] == "merchant"
+    assert body["meta"]["reason"] == "manual"
+    assert body["meta"]["refresh_state"] == "fresh"
+
+
+def test_merchant_readiness_action_preview_route_returns_preview(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_preview_remediation_action(_merchant_id: str, *, plan_id: str, action_id: str | None = None, action_type: str | None = None, targets=None):
+        assert plan_id == "rdplan_test"
+        assert action_id == "act_product:shopify:prod_1"
+        return {
+            "action": {
+                "action_id": action_id,
+                "action_type": "run_product_enrichment",
+            },
+            "candidate_patches": [{"target_field": "summary_short"}],
+            "expected_impact": {"targets": []},
+            "requires_approval": True,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "preview_remediation_action", fake_preview_remediation_action)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.post(
+        "/merchant/readiness/actions/preview",
+        json={"plan_id": "rdplan_test", "action_id": "act_product:shopify:prod_1", "dry_run": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["action"]["action_type"] == "run_product_enrichment"
+    assert body["data"]["candidate_patches"][0]["target_field"] == "summary_short"
+
+
+def test_merchant_readiness_action_preview_route_rejects_superseded_plan(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+    from readiness.remediation import PlanSupersededError
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_preview_remediation_action(_merchant_id: str, **_kwargs):
+        raise PlanSupersededError(current_plan_id="rdplan_latest", current_snapshot_id="rdsnap_latest")
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "preview_remediation_action", fake_preview_remediation_action)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.post(
+        "/merchant/readiness/actions/preview",
+        json={"plan_id": "rdplan_old", "action_id": "act_product:shopify:prod_1"},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "OPTIMIZATION_PLAN_SUPERSEDED"
+    assert detail["current_plan_id"] == "rdplan_latest"
+
+
+def test_merchant_readiness_action_run_and_job_routes(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_run_remediation_action(_merchant_id: str, **_kwargs):
+        return {
+            "job": {
+                "job_id": "rdjob_test",
+                "action_id": "act_product:shopify:prod_1",
+                "executor_type": "deterministic",
+                "status": "completed",
+            },
+            "action": {"action_id": "act_product:shopify:prod_1"},
+            "verification": {"after_snapshot_id": "rdsnap_after"},
+            "after_plan": {"plan_id": "rdplan_after"},
+        }
+
+    def fake_get_execution_job(job_id: str):
+        assert job_id == "rdjob_test"
+        from readiness.models import ExecutionJob
+
+        return ExecutionJob(
+            job_id="rdjob_test",
+            action_id="act_product:shopify:prod_1",
+            executor_type="deterministic",
+            status="completed",
+        )
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "run_remediation_action", fake_run_remediation_action)
+    monkeypatch.setattr(merchant_api_extensions, "get_execution_job", fake_get_execution_job)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    run_response = route_client.post(
+        "/merchant/readiness/actions/run",
+        json={"plan_id": "rdplan_test", "action_id": "act_product:shopify:prod_1", "execution_mode": "sync"},
+    )
+
+    assert run_response.status_code == 200
+    assert run_response.json()["data"]["job"]["job_id"] == "rdjob_test"
+
+    job_response = route_client.get("/merchant/readiness/jobs/rdjob_test")
+
+    assert job_response.status_code == 200
+    assert job_response.json()["data"]["status"] == "completed"
 
 
 def test_checkout_blocked_when_capability_missing(monkeypatch):

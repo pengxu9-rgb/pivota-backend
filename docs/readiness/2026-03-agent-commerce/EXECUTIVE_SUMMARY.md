@@ -56,3 +56,7 @@ Use the implemented thin slice as the bootstrap path:
 - stubbed order-sync journal
 
 Then finish converging the real-merchant alpha path: keep the current one-merchant Shopify adapter, wire Reviews Center more deeply into readiness ranking/diagnostics, and collapse payment execution onto one explicit readiness-owned contract before attempting broader channel claims.
+
+## Related Architecture
+
+- See `PRODUCT_OPTIMIZATION_BACKEND_ARCHITECTURE.md` for the backend design of the merchant-facing `Agent Commerce Readiness & Optimization Workspace`, including the funnel model, remediation object model, action APIs, and the boundary between deterministic execution and future LLM-assisted optimization.
