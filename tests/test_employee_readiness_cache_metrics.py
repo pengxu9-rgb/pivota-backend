@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def _build_client_with_employee_override():
+    from routes import employee_dashboard_routes as module
+
+    async def override_employee() -> Dict[str, Any]:
+        return {"employee_id": "emp_test", "role": "employee", "email": "ops@pivota.cc"}
+
+    app = FastAPI()
+    app.include_router(module.router)
+    app.dependency_overrides[module.get_current_employee] = override_employee
+    client = TestClient(app)
+    return module, app, client
+
+
+def test_employee_readiness_cache_metrics_filters_scope(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    monkeypatch.setattr(
+        module,
+        "get_readiness_optimization_cache_metrics",
+        lambda: {
+            "hits": 8,
+            "misses": 2,
+            "stores": 4,
+            "expired": 1,
+            "refreshes": 3,
+            "invalidations": 1,
+            "invalidated_entries": 2,
+            "total_requests": 10,
+            "hit_rate": 80.0,
+            "entries": 2,
+            "ttl_seconds": 60.0,
+            "active_keys": [
+                {
+                    "merchant_id": "merch_1",
+                    "channel": "ucp",
+                    "plan_id": "rdplan_1",
+                    "snapshot_id": "rdsnap_1",
+                    "age_seconds": 2.0,
+                    "expires_in_seconds": 58.0,
+                },
+                {
+                    "merchant_id": "merch_2",
+                    "channel": "ucp",
+                    "plan_id": "rdplan_2",
+                    "snapshot_id": "rdsnap_2",
+                    "age_seconds": 1.0,
+                    "expires_in_seconds": 59.0,
+                },
+            ],
+        },
+    )
+
+    response = client.get(
+        "/employee/readiness/cache/optimization/metrics",
+        params={"merchant_id": "merch_1", "channel": "ucp"},
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["hits"] == 8
+    assert payload["data"]["scope"]["merchant_id"] == "merch_1"
+    assert payload["data"]["scope"]["channel"] == "ucp"
+    assert payload["data"]["scoped_entry_count"] == 1
+    assert payload["data"]["has_active_entry"] is True
+    assert payload["data"]["active_entry"]["plan_id"] == "rdplan_1"
+    assert len(payload["data"]["scoped_active_keys"]) == 1
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_readiness_cache_invalidate_returns_updated_metrics(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    def fake_invalidate(*, merchant_id=None, channel=None):
+        assert merchant_id == "merch_1"
+        assert channel == "ucp"
+        return 1
+
+    monkeypatch.setattr(module, "invalidate_readiness_optimization_cache", fake_invalidate)
+    monkeypatch.setattr(
+        module,
+        "get_readiness_optimization_cache_metrics",
+        lambda: {
+            "hits": 0,
+            "misses": 0,
+            "stores": 0,
+            "expired": 0,
+            "refreshes": 0,
+            "invalidations": 1,
+            "invalidated_entries": 1,
+            "total_requests": 0,
+            "hit_rate": 0.0,
+            "entries": 0,
+            "ttl_seconds": 60.0,
+            "active_keys": [],
+        },
+    )
+
+    response = client.post(
+        "/employee/readiness/cache/optimization/invalidate",
+        json={"merchant_id": "merch_1", "channel": "ucp"},
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["invalidated_entries"] == 1
+    assert payload["data"]["scope"]["merchant_id"] == "merch_1"
+    assert payload["data"]["cache_metrics"]["invalidations"] == 1
+    assert payload["data"]["cache_metrics"]["scoped_entry_count"] == 0
+
+    app.dependency_overrides.clear()

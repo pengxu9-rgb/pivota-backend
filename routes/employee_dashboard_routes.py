@@ -3,13 +3,49 @@ Employee Dashboard Routes
 Provides analytics and management endpoints for employee portal
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from utils.auth import get_current_user
+from utils.auth import get_current_employee, get_current_user
 from db.database import database
+from readiness.summary import (
+    get_readiness_optimization_cache_metrics,
+    invalidate_readiness_optimization_cache,
+)
 import random
 
 router = APIRouter()
+
+
+class EmployeeOptimizationCacheInvalidateRequest(BaseModel):
+    merchant_id: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    channel: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+def _scoped_optimization_cache_metrics(
+    *,
+    merchant_id: Optional[str],
+    channel: Optional[str],
+) -> Dict[str, Any]:
+    metrics = get_readiness_optimization_cache_metrics()
+    active_keys = list(metrics.get("active_keys") or [])
+    scoped_entries = [
+        entry
+        for entry in active_keys
+        if (merchant_id is None or entry.get("merchant_id") == merchant_id)
+        and (channel is None or entry.get("channel") == channel)
+    ]
+    return {
+        **metrics,
+        "scope": {
+            "merchant_id": merchant_id,
+            "channel": channel,
+        },
+        "scoped_entry_count": len(scoped_entries),
+        "has_active_entry": bool(scoped_entries),
+        "active_entry": scoped_entries[0] if scoped_entries else None,
+        "scoped_active_keys": scoped_entries,
+    }
 
 @router.get("/analytics/dashboard")
 async def get_analytics_dashboard(
@@ -180,6 +216,48 @@ async def get_analytics_dashboard(
                 "time_range": time_range
             }
         }
+
+
+@router.get("/employee/readiness/cache/optimization/metrics")
+async def get_employee_optimization_cache_metrics(
+    merchant_id: Optional[str] = Query(default=None),
+    channel: Optional[str] = Query(default="ucp"),
+    current_user: dict = Depends(get_current_employee),
+):
+    """Get readiness optimization cache observability for employee debugging."""
+    return {
+        "status": "success",
+        "data": _scoped_optimization_cache_metrics(
+            merchant_id=merchant_id,
+            channel=channel,
+        ),
+    }
+
+
+@router.post("/employee/readiness/cache/optimization/invalidate")
+async def invalidate_employee_optimization_cache(
+    body: EmployeeOptimizationCacheInvalidateRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    """Invalidate readiness optimization cache for a merchant or channel."""
+    invalidated_entries = invalidate_readiness_optimization_cache(
+        merchant_id=body.merchant_id,
+        channel=body.channel,
+    )
+    return {
+        "status": "success",
+        "data": {
+            "invalidated_entries": invalidated_entries,
+            "scope": {
+                "merchant_id": body.merchant_id,
+                "channel": body.channel,
+            },
+            "cache_metrics": _scoped_optimization_cache_metrics(
+                merchant_id=body.merchant_id,
+                channel=body.channel,
+            ),
+        },
+    }
 
 @router.get("/agents")
 async def get_all_agents(
