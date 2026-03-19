@@ -12,7 +12,7 @@ experience, not the public Agent API.
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel
 
@@ -24,6 +24,7 @@ from db.product_enrichment import (
     upsert_enrichment,
 )
 from db.product_quality_backfill_jobs import (
+    complete_quality_backfill_job,
     create_quality_backfill_job,
     get_active_quality_backfill_job,
     get_quality_backfill_job,
@@ -53,6 +54,33 @@ class QualityBackfillRequest(BaseModel):
     platform: Optional[str] = None
     force_refresh: bool = False
     missing_only: bool = True
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        normalized = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _is_stale_backfill_job(job: Optional[Dict[str, Any]], *, stale_after_seconds: int = 120) -> bool:
+    if not job:
+        return False
+    if str(job.get("status") or "") != "running":
+        return False
+    if any(int(job.get(field) or 0) > 0 for field in ("processed", "skipped", "failed", "total_candidates")):
+        return False
+    started_at = _parse_iso_datetime(job.get("started_at"))
+    if started_at is None:
+        return False
+    age_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+    return age_seconds >= stale_after_seconds
 
 
 def _quality_response(projection: Dict[str, Any]) -> Dict[str, Any]:
@@ -340,6 +368,22 @@ async def queue_quality_backfill(
         merchant_id,
         platform=body.platform,
     )
+    if _is_stale_backfill_job(active_job):
+        await complete_quality_backfill_job(
+            str(active_job.get("job_id") or ""),
+            status="failed",
+            total_candidates=int(active_job.get("total_candidates") or 0),
+            processed=int(active_job.get("processed") or 0),
+            skipped=int(active_job.get("skipped") or 0),
+            failed=max(int(active_job.get("failed") or 0), 1),
+            errors_sample=[
+                {
+                    "error": "stale_backfill_job_reset",
+                    "message": "Previous quality backfill job did not make progress and was reset automatically.",
+                }
+            ],
+        )
+        active_job = None
     if active_job is not None:
         return {
             "status": "queued",
