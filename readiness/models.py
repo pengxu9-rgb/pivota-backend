@@ -149,6 +149,16 @@ class ScoreBundle(BaseModel):
     conversion_score: Optional[int] = None
 
 
+class DashboardSnapshot(BaseModel):
+    total_orders: int = 0
+    paid_orders: int = 0
+    total_revenue: float = 0.0
+    total_customers: int = 0
+    total_products: int = 0
+    order_growth: float = 0.0
+    revenue_growth: float = 0.0
+
+
 class OptimizationPlan(BaseModel):
     plan_id: str
     snapshot_id: str
@@ -233,6 +243,7 @@ class MerchantReadinessOptimizationPayload(BaseModel):
     plan: OptimizationPlan
     score_bundle: ScoreBundle = Field(default_factory=ScoreBundle)
     readiness_summary: ReadinessSummary
+    dashboard_snapshot: Optional[DashboardSnapshot] = None
     issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)

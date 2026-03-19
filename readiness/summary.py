@@ -13,6 +13,7 @@ from readiness.flags import (
     readiness_router_enabled,
 )
 from readiness.models import (
+    DashboardSnapshot,
     MerchantReadinessAction,
     MerchantReadinessOptimizationPayload,
     MerchantReadinessSnapshot,
@@ -30,6 +31,7 @@ from sqlalchemy import select
 _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
 _PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
 _PLAN_TTL_HOURS = 6
+_PAID_PAYMENT_STATUSES_SQL = "('paid','completed','succeeded','success','settled','partially_refunded')"
 
 
 _BUCKET_DEFINITIONS: dict[str, dict[str, str]] = {
@@ -391,6 +393,89 @@ async def _load_latest_quality_map(merchant_id: str) -> dict[str, dict[str, Any]
             "quality_last_evaluated_at": snapshot_date.isoformat() if snapshot_date else None,
         }
     return latest
+
+
+async def _load_dashboard_snapshot(merchant_id: str) -> DashboardSnapshot:
+    analytics_query = """
+        SELECT
+            COUNT(*) as total_orders_all_time,
+            COALESCE(SUM(total), 0) as gmv_all_time,
+            COALESCE(SUM(CASE WHEN payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_all_time,
+            SUM(CASE WHEN payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_all_time,
+            COUNT(DISTINCT customer_email) as total_customers,
+            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
+            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_last_30_days,
+            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_last_30_days
+        FROM orders
+        WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
+    """
+    growth_query = """
+        SELECT
+            COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
+                      AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as orders_prev_30,
+            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
+                    AND created_at < CURRENT_DATE - INTERVAL '30 days'
+                    AND payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_prev_30
+        FROM orders
+        WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
+    """
+    products_query = """
+        SELECT COUNT(*) as count
+        FROM products_cache
+        WHERE merchant_id = :merchant_id
+          AND (expires_at IS NULL OR expires_at > NOW())
+    """
+
+    def _to_int(value: Any) -> int:
+        try:
+            if value is None:
+                return 0
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        analytics = await database.fetch_one(analytics_query, {"merchant_id": merchant_id})
+        growth = await database.fetch_one(growth_query, {"merchant_id": merchant_id})
+        products = await database.fetch_one(products_query, {"merchant_id": merchant_id})
+
+        total_orders = _to_int(analytics["orders_last_30_days"]) if analytics else 0
+        paid_orders = _to_int(analytics["paid_orders_last_30_days"]) if analytics else 0
+        total_revenue = float(analytics["confirmed_revenue_last_30_days"] or 0) if analytics else 0.0
+        total_customers = _to_int(analytics["total_customers"]) if analytics else 0
+        total_products = _to_int(products["count"]) if products else 0
+
+        orders_prev_30 = _to_int(growth["orders_prev_30"]) if growth else 0
+        confirmed_revenue_prev_30 = float(growth["confirmed_revenue_prev_30"] or 0) if growth else 0.0
+
+        order_growth = 0.0
+        revenue_growth = 0.0
+        if orders_prev_30 > 0:
+            order_growth = round(((total_orders - orders_prev_30) / orders_prev_30) * 100, 1)
+        elif total_orders > 0:
+            order_growth = 100.0
+
+        if confirmed_revenue_prev_30 > 0:
+            revenue_growth = round(((total_revenue - confirmed_revenue_prev_30) / confirmed_revenue_prev_30) * 100, 1)
+        elif total_revenue > 0:
+            revenue_growth = 100.0
+
+        return DashboardSnapshot(
+            total_orders=total_orders,
+            paid_orders=paid_orders,
+            total_revenue=total_revenue,
+            total_customers=total_customers,
+            total_products=total_products,
+            order_growth=order_growth,
+            revenue_growth=revenue_growth,
+        )
+    except Exception:
+        try:
+            products = await database.fetch_one(products_query, {"merchant_id": merchant_id})
+            total_products = _to_int(products["count"]) if products else 0
+        except Exception:
+            total_products = 0
+        return DashboardSnapshot(total_products=total_products)
 
 
 def _queue_price(product: Any) -> tuple[Optional[float], Optional[str]]:
@@ -868,7 +953,11 @@ def _fallback_summary(
     )
 
 
-def _fallback_optimization_payload(summary: ReadinessSummary) -> MerchantReadinessOptimizationPayload:
+def _fallback_optimization_payload(
+    summary: ReadinessSummary,
+    *,
+    dashboard_snapshot: Optional[DashboardSnapshot] = None,
+) -> MerchantReadinessOptimizationPayload:
     snapshot_id = _build_snapshot_id(
         MerchantReadinessSnapshot(
             merchant_id="unknown",
@@ -933,6 +1022,7 @@ def _fallback_optimization_payload(summary: ReadinessSummary) -> MerchantReadine
         plan=plan,
         score_bundle=ScoreBundle(readiness_score=summary.score),
         readiness_summary=summary,
+        dashboard_snapshot=dashboard_snapshot,
         issue_buckets=issue_buckets,
         merchant_actions=actions,
         product_queue=[],
@@ -999,6 +1089,7 @@ async def build_readiness_optimization(
     *,
     channel: str = "ucp",
 ) -> MerchantReadinessOptimizationPayload:
+    dashboard_snapshot = await _load_dashboard_snapshot(merchant_id)
     snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
     if fallback is not None or snapshot is None:
         return _fallback_optimization_payload(
@@ -1008,7 +1099,8 @@ async def build_readiness_optimization(
                 blocker="readiness_summary_unavailable",
                 channel=channel,
                 merchant_alpha_mode="assessment_error",
-            )
+            ),
+            dashboard_snapshot=dashboard_snapshot,
         )
 
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
@@ -1051,6 +1143,7 @@ async def build_readiness_optimization(
         plan=plan,
         score_bundle=ScoreBundle(readiness_score=summary.score),
         readiness_summary=summary,
+        dashboard_snapshot=dashboard_snapshot,
         issue_buckets=issue_buckets,
         merchant_actions=merchant_actions,
         product_queue=product_queue,

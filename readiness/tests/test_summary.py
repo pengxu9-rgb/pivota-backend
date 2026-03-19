@@ -5,6 +5,7 @@ import pytest
 from readiness.models import (
     CapabilityStatus,
     ChannelCoverageStatus,
+    DashboardSnapshot,
     MerchantReadinessSnapshot,
     ReadyProduct,
     ReadyVariant,
@@ -199,6 +200,18 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
         }
 
     monkeypatch.setattr("readiness.summary._load_latest_quality_map", fake_quality_map)
+    async def fake_dashboard_snapshot(_merchant_id: str):
+        return DashboardSnapshot(
+            total_orders=12,
+            paid_orders=9,
+            total_revenue=321.5,
+            total_customers=7,
+            total_products=42,
+            order_growth=20.0,
+            revenue_growth=12.5,
+        )
+
+    monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
 
     payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
 
@@ -221,4 +234,8 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
     assert payload.product_queue[0].content_quality_score == 62.5
     assert payload.product_queue[0].model_readiness_score == 71.0
     assert payload.product_queue[0].conversion_potential_score == 55.0
+    assert payload.dashboard_snapshot is not None
+    assert payload.dashboard_snapshot.total_orders == 12
+    assert payload.dashboard_snapshot.paid_orders == 9
+    assert payload.dashboard_snapshot.total_products == 42
     assert payload.merchant_actions
