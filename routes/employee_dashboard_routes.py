@@ -15,6 +15,7 @@ from readiness.summary import (
 import random
 
 router = APIRouter()
+PAID_PAYMENT_STATUSES_SQL = "('paid','completed','succeeded','success','settled','partially_refunded')"
 
 
 class EmployeeOptimizationCacheInvalidateRequest(BaseModel):
@@ -45,6 +46,239 @@ def _scoped_optimization_cache_metrics(
         "has_active_entry": bool(scoped_entries),
         "active_entry": scoped_entries[0] if scoped_entries else None,
         "scoped_active_keys": scoped_entries,
+    }
+
+
+async def _fetch_employee_merchant_stores(merchant_id: str) -> List[Dict[str, Any]]:
+    stores: List[Dict[str, Any]] = []
+    cache_counts_by_platform: Dict[str, int] = {}
+    rows = await database.fetch_all(
+        """
+        SELECT
+            store_id,
+            platform,
+            name,
+            domain,
+            status,
+            connected_at,
+            last_sync,
+            product_count,
+            CASE WHEN api_key IS NOT NULL AND api_key != '' THEN true ELSE false END as api_key_present
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+        ORDER BY connected_at DESC
+        """,
+        {"merchant_id": merchant_id},
+    )
+    try:
+        cache_rows = await database.fetch_all(
+            """
+            SELECT platform, COUNT(*) AS active_cached
+            FROM products_cache
+            WHERE merchant_id = :merchant_id
+              AND (expires_at IS NULL OR expires_at > NOW())
+            GROUP BY platform
+            """,
+            {"merchant_id": merchant_id},
+        )
+        for row in cache_rows or []:
+            row_dict = dict(row)
+            platform = (row_dict.get("platform") or "").strip().lower()
+            if platform:
+                cache_counts_by_platform[platform] = int(row_dict.get("active_cached") or 0)
+    except Exception:
+        cache_counts_by_platform = {}
+
+    for row in rows:
+        platform = (row["platform"] or "").strip().lower()
+        cached_count = cache_counts_by_platform.get(platform, 0)
+        display_count = cached_count if cached_count > 0 else (row["product_count"] or 0)
+        is_active = row["status"] == "active"
+        has_api_key = bool(row["api_key_present"])
+        stores.append(
+            {
+                "id": row["store_id"],
+                "platform": row["platform"],
+                "name": row["name"],
+                "domain": row["domain"],
+                "status": row["status"],
+                "is_active": is_active,
+                "is_connected": is_active and has_api_key,
+                "api_key_present": has_api_key,
+                "shop_domain": row["domain"],
+                "connected_at": row["connected_at"],
+                "last_sync": row["last_sync"],
+                "product_count": display_count,
+                "product_count_source": "products_cache" if cached_count > 0 else "merchant_stores",
+            }
+        )
+
+    return stores
+
+
+async def _fetch_employee_merchant_psps(merchant_id: str) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT psp_id, provider, name, account_id, status, connected_at, capabilities, api_key
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id
+        ORDER BY connected_at DESC
+        """,
+        {"merchant_id": merchant_id},
+    )
+    psp_metrics = await database.fetch_all(
+        """
+        SELECT
+            COALESCE(psp_used, psp_id) AS psp_key,
+            COUNT(*) as total_orders,
+            SUM(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 ELSE 0 END) as successful_orders,
+            COALESCE(SUM(total), 0) as total_volume
+        FROM orders
+        WHERE merchant_id = :merchant_id
+          AND (psp_used IS NOT NULL OR psp_id IS NOT NULL)
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        GROUP BY COALESCE(psp_used, psp_id)
+        """,
+        {"merchant_id": merchant_id},
+    )
+    stats_by_key: Dict[str, Dict[str, Any]] = {}
+    for metric in psp_metrics or []:
+        total_orders = int(metric["total_orders"] or 0)
+        successful_orders = int(metric["successful_orders"] or 0)
+        stats_by_key[metric["psp_key"]] = {
+            "total_orders": total_orders,
+            "successful_orders": successful_orders,
+            "total_volume": float(metric["total_volume"] or 0),
+            "success_rate": round((successful_orders / total_orders) * 100, 1) if total_orders > 0 else 0,
+        }
+
+    psps: List[Dict[str, Any]] = []
+    for row in rows:
+        capabilities = row["capabilities"].split(",") if row["capabilities"] else []
+        psp_key = row["provider"] if row["provider"] in stats_by_key else row["psp_id"]
+        psp_stats = stats_by_key.get(psp_key, {"total_orders": 0, "successful_orders": 0, "total_volume": 0.0, "success_rate": 0})
+        api_key = row["api_key"]
+        configured = bool(api_key and str(api_key).strip() and api_key != "pending_setup")
+        effective_status = row["status"]
+        if not configured and (effective_status or "").lower() == "active":
+            effective_status = "pending_setup"
+        psps.append(
+            {
+                "id": row["psp_id"],
+                "provider": row["provider"],
+                "name": row["name"],
+                "account_id": row["account_id"],
+                "status": effective_status,
+                "configured": configured,
+                "connected_at": row["connected_at"],
+                "capabilities": capabilities,
+                "transaction_count": psp_stats["total_orders"],
+                "success_rate": psp_stats["success_rate"],
+                "total_volume": psp_stats["total_volume"],
+            }
+        )
+    return psps
+
+
+async def _fetch_employee_merchant_analytics(merchant_id: str) -> Dict[str, Any]:
+    analytics = await database.fetch_one(
+        """
+        SELECT
+            COUNT(*) as total_orders_all_time,
+            COALESCE(SUM(total), 0) as gmv_all_time,
+            COALESCE(SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_all_time,
+            SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_all_time,
+            COALESCE(AVG(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE NULL END), 0) as avg_order_value_all_time,
+            COUNT(DISTINCT customer_email) as total_customers,
+            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
+            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END), 0) as gmv_last_30_days,
+            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_last_30_days,
+            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_last_30_days
+        FROM orders
+        WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
+        """,
+        {"merchant_id": merchant_id},
+    )
+    growth = await database.fetch_one(
+        """
+        SELECT
+            COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
+                  AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as orders_prev_30,
+            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
+                    AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END), 0) as gmv_prev_30,
+            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
+                    AND created_at < CURRENT_DATE - INTERVAL '30 days'
+                    AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_prev_30,
+            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
+                    AND created_at < CURRENT_DATE - INTERVAL '30 days'
+                    AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_prev_30
+        FROM orders
+        WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
+        """,
+        {"merchant_id": merchant_id},
+    )
+    products_count = await database.fetch_one(
+        """
+        SELECT COUNT(*) as count
+        FROM products_cache
+        WHERE merchant_id = :merchant_id
+          AND (expires_at IS NULL OR expires_at > NOW())
+        """,
+        {"merchant_id": merchant_id},
+    )
+
+    def _to_int(value: Any) -> int:
+        try:
+            if value is None:
+                return 0
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    orders_last_30 = _to_int(analytics["orders_last_30_days"]) if analytics else 0
+    paid_orders_last_30 = _to_int(analytics["paid_orders_last_30_days"]) if analytics else 0
+    gmv_last_30 = float(analytics["gmv_last_30_days"] or 0) if analytics else 0.0
+    confirmed_revenue_last_30 = float(analytics["confirmed_revenue_last_30_days"] or 0) if analytics else 0.0
+    orders_prev_30 = _to_int(growth["orders_prev_30"]) if growth else 0
+    confirmed_revenue_prev_30 = float(growth["confirmed_revenue_prev_30"] or 0) if growth else 0.0
+    gmv_prev_30 = float(growth["gmv_prev_30"] or 0) if growth else 0.0
+
+    order_growth = ((orders_last_30 - orders_prev_30) / orders_prev_30 * 100) if orders_prev_30 > 0 else 0.0
+    revenue_growth = ((confirmed_revenue_last_30 - confirmed_revenue_prev_30) / confirmed_revenue_prev_30 * 100) if confirmed_revenue_prev_30 > 0 else 0.0
+    gmv_growth = ((gmv_last_30 - gmv_prev_30) / gmv_prev_30 * 100) if gmv_prev_30 > 0 else 0.0
+    average_order_value = round((confirmed_revenue_last_30 / paid_orders_last_30), 2) if paid_orders_last_30 > 0 else 0.0
+    payment_success_rate = round((paid_orders_last_30 / orders_last_30 * 100), 1) if orders_last_30 > 0 else 0.0
+
+    return {
+        "total_orders": orders_last_30,
+        "total_revenue": confirmed_revenue_last_30,
+        "total_customers": _to_int(analytics["total_customers"]) if analytics else 0,
+        "total_products": _to_int(products_count["count"]) if products_count else 0,
+        "average_order_value": average_order_value,
+        "order_growth": round(order_growth, 1),
+        "revenue_growth": round(revenue_growth, 1),
+        "gmv_growth": round(gmv_growth, 1),
+        "conversion_rate": payment_success_rate,
+        "order_generation_rate": 100.0 if orders_last_30 > 0 else 0.0,
+        "total_order_attempts": orders_last_30,
+        "order_placement_rate": 100.0 if orders_last_30 > 0 else 0.0,
+        "total_orders_placed": orders_last_30,
+        "payment_success_rate": payment_success_rate,
+        "total_payments_succeeded": paid_orders_last_30,
+        "order_breakdown": {
+            "total": orders_last_30,
+            "paid": paid_orders_last_30,
+            "all_time_total": _to_int(analytics["total_orders_all_time"]) if analytics else 0,
+            "all_time_paid": _to_int(analytics["paid_orders_all_time"]) if analytics else 0,
+        },
+        "revenue_breakdown": {
+            "confirmed": confirmed_revenue_last_30,
+            "gmv": gmv_last_30,
+            "all_time_confirmed": float(analytics["confirmed_revenue_all_time"] or 0) if analytics else 0.0,
+            "all_time_gmv": float(analytics["gmv_all_time"] or 0) if analytics else 0.0,
+        },
+        "confirmed_revenue": confirmed_revenue_last_30,
+        "gmv": gmv_last_30,
     }
 
 @router.get("/analytics/dashboard")
@@ -258,6 +492,71 @@ async def invalidate_employee_optimization_cache(
             ),
         },
     }
+
+
+@router.get("/employee/merchant/{merchant_id}/integrations")
+async def get_employee_merchant_integrations(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe view of merchant store integrations."""
+    try:
+        stores = await _fetch_employee_merchant_stores(merchant_id)
+        return {"status": "success", "data": {"stores": stores}}
+    except Exception as e:
+        print(f"Error fetching employee merchant integrations for {merchant_id}: {e}")
+        return {"status": "success", "data": {"stores": []}}
+
+
+@router.get("/employee/merchant/{merchant_id}/psps")
+async def get_employee_merchant_psps(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe view of merchant PSP connections."""
+    try:
+        psps = await _fetch_employee_merchant_psps(merchant_id)
+        return {"status": "success", "data": {"psps": psps}}
+    except Exception as e:
+        print(f"Error fetching employee merchant PSPs for {merchant_id}: {e}")
+        return {"status": "success", "data": {"psps": []}}
+
+
+@router.get("/employee/merchant/{merchant_id}/analytics")
+async def get_employee_merchant_analytics(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe analytics summary for one merchant."""
+    try:
+        analytics = await _fetch_employee_merchant_analytics(merchant_id)
+        return {"status": "success", "data": analytics}
+    except Exception as e:
+        print(f"Error fetching employee merchant analytics for {merchant_id}: {e}")
+        return {
+            "status": "success",
+            "data": {
+                "total_orders": 0,
+                "total_revenue": 0.0,
+                "total_customers": 0,
+                "total_products": 0,
+                "average_order_value": 0.0,
+                "order_growth": 0.0,
+                "revenue_growth": 0.0,
+                "gmv_growth": 0.0,
+                "conversion_rate": 0.0,
+                "order_generation_rate": 0.0,
+                "total_order_attempts": 0,
+                "order_placement_rate": 0.0,
+                "total_orders_placed": 0,
+                "payment_success_rate": 0.0,
+                "total_payments_succeeded": 0,
+                "order_breakdown": {"total": 0, "paid": 0, "all_time_total": 0, "all_time_paid": 0},
+                "revenue_breakdown": {"confirmed": 0.0, "gmv": 0.0, "all_time_confirmed": 0.0, "all_time_gmv": 0.0},
+                "confirmed_revenue": 0.0,
+                "gmv": 0.0,
+            },
+        }
 
 @router.get("/agents")
 async def get_all_agents(

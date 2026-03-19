@@ -121,3 +121,70 @@ def test_employee_readiness_cache_invalidate_returns_updated_metrics(monkeypatch
     assert payload["data"]["cache_metrics"]["scoped_entry_count"] == 0
 
     app.dependency_overrides.clear()
+
+
+def test_employee_merchant_integrations_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_fetch(merchant_id: str):
+        assert merchant_id == "merch_1"
+        return [{"id": "store_1", "platform": "shopify", "name": "Main Store"}]
+
+    monkeypatch.setattr(module, "_fetch_employee_merchant_stores", fake_fetch)
+
+    response = client.get(
+        "/employee/merchant/merch_1/integrations",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["stores"][0]["id"] == "store_1"
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_merchant_psps_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_fetch(merchant_id: str):
+        assert merchant_id == "merch_1"
+        return [{"id": "psp_1", "provider": "stripe", "status": "active"}]
+
+    monkeypatch.setattr(module, "_fetch_employee_merchant_psps", fake_fetch)
+
+    response = client.get(
+        "/employee/merchant/merch_1/psps",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["psps"][0]["provider"] == "stripe"
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_merchant_analytics_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_fetch(merchant_id: str):
+        assert merchant_id == "merch_1"
+        return {"total_orders": 5, "total_products": 8, "gmv": 12.5}
+
+    monkeypatch.setattr(module, "_fetch_employee_merchant_analytics", fake_fetch)
+
+    response = client.get(
+        "/employee/merchant/merch_1/analytics",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["total_orders"] == 5
+    assert payload["data"]["total_products"] == 8
+
+    app.dependency_overrides.clear()

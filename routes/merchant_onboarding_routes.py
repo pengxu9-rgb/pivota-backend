@@ -705,6 +705,15 @@ async def list_all_onboardings(
             last_synced = product_info["last_synced"] if product_info else None
             expired_count = product_info["expired_count"] if product_info else 0
             has_expired = expired_count > 0
+            store_info = await database.fetch_one(
+                """
+                SELECT COUNT(*) as count
+                FROM merchant_stores
+                WHERE merchant_id = :merchant_id
+                """,
+                {"merchant_id": m["merchant_id"]},
+            )
+            store_count = store_info["count"] if store_info else 0
             
             merchant_list.append({
                 "merchant_id": m["merchant_id"],
@@ -720,6 +729,7 @@ async def list_all_onboardings(
                 "psp_type": psp_type,
                 "mcp_connected": m.get("mcp_connected", False),
                 "mcp_platform": m.get("mcp_platform"),
+                "store_count": store_count,
                 "product_count": product_count,
                 "last_synced": last_synced.isoformat() if last_synced else None,
                 "products_expired": has_expired,
