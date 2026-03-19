@@ -47,7 +47,7 @@ _DDL_LOCK = asyncio.Lock()
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.utcnow().replace(microsecond=0)
 
 
 def _json_type_sql() -> str:
