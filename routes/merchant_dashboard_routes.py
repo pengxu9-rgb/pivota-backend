@@ -132,8 +132,15 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
         # Query merchant data from database
         merchant_query = """
             SELECT 
-                merchant_id, business_name, email, phone, website,
-                country, business_type, status, created_at
+                merchant_id,
+                business_name,
+                store_url,
+                website,
+                region,
+                contact_email,
+                contact_phone,
+                status,
+                created_at
             FROM merchant_onboarding
             WHERE merchant_id = :merchant_id
         """
@@ -157,11 +164,16 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
             "data": {
                 "merchant_id": merchant["merchant_id"],
                 "business_name": merchant["business_name"],
-                "email": merchant["email"],
-                "phone": merchant["phone"],
-                "website": merchant["website"],
-                "country": merchant["country"],
-                "business_type": merchant["business_type"],
+                "contact_email": merchant["contact_email"],
+                "email": merchant["contact_email"],
+                "contact_phone": merchant["contact_phone"],
+                "phone": merchant["contact_phone"],
+                "website": merchant["website"] or merchant["store_url"],
+                "store_url": merchant["store_url"],
+                "address": "",
+                "country": merchant["region"],
+                "region": merchant["region"],
+                "business_type": None,
                 "status": merchant["status"],
                 "created_at": merchant["created_at"].isoformat() if merchant["created_at"] else None,
                 "total_orders": stats["total_orders"] if stats else 0,
