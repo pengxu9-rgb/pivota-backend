@@ -10,9 +10,10 @@ They are intended to power the Merchant Portal "Product Optimization"
 experience, not the public Agent API.
 """
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
+import os
 
 from pydantic import BaseModel
 
@@ -31,7 +32,6 @@ from db.product_quality_backfill_jobs import (
 )
 from models.standard_product import StandardProduct
 from services.product_enrichment_pipeline import run_enrichment_for_product
-from services.product_quality_backfill_service import process_quality_backfill_job
 from services.product_quality_service import (
     build_quality_payload_from_cache_row,
     build_quality_projection,
@@ -74,13 +74,25 @@ def _is_stale_backfill_job(job: Optional[Dict[str, Any]], *, stale_after_seconds
         return False
     if str(job.get("status") or "") != "running":
         return False
-    if any(int(job.get(field) or 0) > 0 for field in ("processed", "skipped", "failed", "total_candidates")):
-        return False
     started_at = _parse_iso_datetime(job.get("started_at"))
     if started_at is None:
         return False
     age_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+    progress_total = sum(int(job.get(field) or 0) for field in ("processed", "skipped", "failed"))
+    total_candidates = int(job.get("total_candidates") or 0)
+    if total_candidates > 0 and progress_total >= total_candidates:
+        return False
     return age_seconds >= stale_after_seconds
+
+
+def _quality_backfill_stale_after_seconds() -> int:
+    raw = os.getenv("QUALITY_BACKFILL_STALE_AFTER_SECONDS")
+    try:
+        if raw is not None:
+            return max(60, int(raw))
+    except Exception:
+        pass
+    return 180
 
 
 def _quality_response(projection: Dict[str, Any]) -> Dict[str, Any]:
@@ -348,7 +360,6 @@ async def get_product_quality_summary(
 @router.post("/quality/backfill", status_code=202)
 async def queue_quality_backfill(
     body: QualityBackfillRequest,
-    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
 ):
     if current_user.get("role") != "merchant":
@@ -368,7 +379,10 @@ async def queue_quality_backfill(
         merchant_id,
         platform=body.platform,
     )
-    if _is_stale_backfill_job(active_job):
+    if _is_stale_backfill_job(
+        active_job,
+        stale_after_seconds=_quality_backfill_stale_after_seconds(),
+    ):
         await complete_quality_backfill_job(
             str(active_job.get("job_id") or ""),
             status="failed",
@@ -400,7 +414,6 @@ async def queue_quality_backfill(
         force_refresh=body.force_refresh,
         missing_only=body.missing_only,
     )
-    background_tasks.add_task(process_quality_backfill_job, job.get("job_id"))
 
     return {
         "status": "queued",

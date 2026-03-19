@@ -38,12 +38,8 @@ def test_queue_quality_backfill_creates_job(monkeypatch) -> None:
             "requested_at": "2026-03-19T00:00:00Z",
         }
 
-    async def fake_process_quality_backfill_job(_job_id):
-        return None
-
     monkeypatch.setattr(module, "get_active_quality_backfill_job", fake_get_active_quality_backfill_job)
     monkeypatch.setattr(module, "create_quality_backfill_job", fake_create_quality_backfill_job)
-    monkeypatch.setattr(module, "process_quality_backfill_job", fake_process_quality_backfill_job)
 
     response = client.post(
         "/merchant/products/quality/backfill",
@@ -90,16 +86,12 @@ def test_queue_quality_backfill_resets_stale_running_job(monkeypatch) -> None:
             "requested_by": kwargs["requested_by"],
             "force_refresh": kwargs["force_refresh"],
             "missing_only": kwargs["missing_only"],
-            "requested_at": "2026-03-19T00:10:00Z",
+        "requested_at": "2026-03-19T00:10:00Z",
         }
-
-    async def fake_process_quality_backfill_job(_job_id):
-        return None
 
     monkeypatch.setattr(module, "get_active_quality_backfill_job", fake_get_active_quality_backfill_job)
     monkeypatch.setattr(module, "complete_quality_backfill_job", fake_complete_quality_backfill_job)
     monkeypatch.setattr(module, "create_quality_backfill_job", fake_create_quality_backfill_job)
-    monkeypatch.setattr(module, "process_quality_backfill_job", fake_process_quality_backfill_job)
 
     response = client.post(
         "/merchant/products/quality/backfill",
@@ -110,6 +102,56 @@ def test_queue_quality_backfill_resets_stale_running_job(monkeypatch) -> None:
     body = response.json()
     assert body["data"]["already_active"] is False
     assert body["data"]["job"]["job_id"] == "qbf_new"
+
+
+def test_queue_quality_backfill_resets_stale_partial_running_job(monkeypatch) -> None:
+    client, module = _build_client()
+
+    stale_job = {
+        "job_id": "qbf_partial",
+        "merchant_id": "merch_test",
+        "platform": "shopify",
+        "status": "running",
+        "started_at": "2026-03-19T00:00:00Z",
+        "processed": 575,
+        "skipped": 0,
+        "failed": 0,
+        "total_candidates": 740,
+    }
+
+    async def fake_get_active_quality_backfill_job(_merchant_id, platform=None):
+        return dict(stale_job)
+
+    async def fake_complete_quality_backfill_job(job_id, **kwargs):
+        assert job_id == "qbf_partial"
+        assert kwargs["status"] == "failed"
+        return {"job_id": job_id, "status": "failed"}
+
+    async def fake_create_quality_backfill_job(**kwargs):
+        return {
+            "job_id": "qbf_retry",
+            "merchant_id": kwargs["merchant_id"],
+            "platform": kwargs["platform"],
+            "status": "queued",
+            "requested_by": kwargs["requested_by"],
+            "force_refresh": kwargs["force_refresh"],
+            "missing_only": kwargs["missing_only"],
+            "requested_at": "2026-03-19T00:15:00Z",
+        }
+
+    monkeypatch.setattr(module, "get_active_quality_backfill_job", fake_get_active_quality_backfill_job)
+    monkeypatch.setattr(module, "complete_quality_backfill_job", fake_complete_quality_backfill_job)
+    monkeypatch.setattr(module, "create_quality_backfill_job", fake_create_quality_backfill_job)
+
+    response = client.post(
+        "/merchant/products/quality/backfill",
+        json={"platform": "shopify", "missing_only": True, "force_refresh": False},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["data"]["already_active"] is False
+    assert body["data"]["job"]["job_id"] == "qbf_retry"
 
 
 def test_get_quality_backfill_status_returns_job_for_current_merchant(monkeypatch) -> None:

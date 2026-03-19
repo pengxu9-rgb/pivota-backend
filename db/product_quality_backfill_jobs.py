@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Index, Integer, JSON, String, Table
@@ -218,6 +218,52 @@ async def claim_next_quality_backfill_job() -> Optional[Dict[str, Any]]:
         return None
     queued_payload = dict(queued)
     return await claim_quality_backfill_job(str(queued_payload.get("job_id") or ""))
+
+
+async def requeue_stale_quality_backfill_jobs(
+    *,
+    stale_after_seconds: int = 300,
+    limit: int = 5,
+) -> int:
+    await ensure_product_quality_backfill_jobs_table()
+    cutoff = _utcnow() - timedelta(seconds=max(30, stale_after_seconds))
+    values: Dict[str, Any] = {
+        "cutoff": cutoff,
+        "limit": max(1, limit),
+        "errors_sample": _json_param(
+            [
+                {
+                    "error": "stale_backfill_job_requeued",
+                    "message": "Quality backfill worker requeued a stale running job.",
+                }
+            ]
+        ),
+    }
+    query = f"""
+    UPDATE product_quality_backfill_jobs
+    SET status = 'queued',
+        started_at = NULL,
+        finished_at = NULL,
+        total_candidates = 0,
+        processed = 0,
+        skipped = 0,
+        failed = 0,
+        errors_sample = {_json_assignment_sql()}
+    WHERE job_id IN (
+        SELECT job_id
+        FROM product_quality_backfill_jobs
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < :cutoff
+        ORDER BY started_at ASC
+        LIMIT :limit
+    )
+    """
+    result = await database.execute(query, values)
+    try:
+        return int(result or 0)
+    except Exception:
+        return 0
 
 
 async def update_quality_backfill_job_progress(

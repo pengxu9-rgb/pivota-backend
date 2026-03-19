@@ -114,6 +114,10 @@ from routes.admin_migrations import router as admin_migrations_router
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
+from jobs.product_quality_backfill_worker import (
+    start_product_quality_backfill_loop,
+    stop_product_quality_backfill_loop,
+)
 from routes.admin_fix_merchant import router as admin_fix_router
 from routes.admin_fix_psp_id import router as admin_fix_psp_id_router
 from routes.admin_debug_psp_metrics import router as admin_debug_psp_metrics_router
@@ -824,6 +828,11 @@ async def startup():
         except Exception:
             pass
 
+        try:
+            start_product_quality_backfill_loop()
+        except Exception as e:
+            logger.warning(f"⚠️ Product quality backfill loop skipped: {e}")
+
         # Minimal schema guard (fast; safe for prod "fast mode").
         # Prevents outages when a deploy accidentally skips SQL migrations.
         try:
@@ -1284,6 +1293,7 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
+        await stop_product_quality_backfill_loop()
         await database.disconnect()
         logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")
