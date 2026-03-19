@@ -3,11 +3,16 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
-import time
-from typing import Any, Iterable, Optional
+import logging
+from typing import Any, Dict, Iterable, Optional
 
 from db.database import database
+from db.product_enrichment import get_enrichments_for_products
 from db.product_quality import product_quality_snapshot
+from db.product_quality_backfill_jobs import get_active_quality_backfill_job
+from db.products import products_cache
+import time
+from sqlalchemy import select
 from readiness.flags import (
     readiness_alpha_merchant_id,
     readiness_real_merchant_alpha_enabled,
@@ -21,13 +26,22 @@ from readiness.models import (
     OptimizationPlan,
     ProductQueueIssue,
     ProductReadinessQueueItem,
+    QualityCoverageSummary,
     ReadinessIssueBucket,
     ReadinessSummary,
     ScoreBundle,
 )
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
-from sqlalchemy import select
+from services.product_quality_service import (
+    QUALITY_SOURCE_NONE,
+    build_quality_payload_from_cache_row,
+    build_quality_projection,
+    fetch_latest_quality_rows,
+    make_product_key,
+    summarize_quality_coverage,
+)
 
+logger = logging.getLogger(__name__)
 
 _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
 _PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
@@ -703,6 +717,102 @@ def _product_queue_item(
     )
 
 
+async def _load_cache_rows_for_product_keys(
+    merchant_id: str,
+    product_keys: list[tuple[str, str]],
+) -> Dict[tuple[str, str], Dict[str, Any]]:
+    if not product_keys:
+        return {}
+
+    platforms = sorted({platform for platform, _ in product_keys})
+    product_key_set = set(product_keys)
+
+    query = (
+        products_cache.select()
+        .where(products_cache.c.merchant_id == merchant_id)
+        .where(products_cache.c.platform.in_(platforms))
+        .where(products_cache.c.expires_at > datetime.now())
+        .order_by(products_cache.c.cached_at.desc())
+    )
+    rows = await database.fetch_all(query)
+
+    cache_rows_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row)
+        key = make_product_key(payload.get("platform"), payload.get("platform_product_id"))
+        if key is None or key not in product_key_set or key in cache_rows_by_key:
+            continue
+        cache_rows_by_key[key] = payload
+    return cache_rows_by_key
+
+
+async def _apply_quality_projection(
+    merchant_id: str,
+    *,
+    snapshot_products: list[Any],
+    product_queue: list[ProductReadinessQueueItem],
+) -> tuple[list[ProductReadinessQueueItem], QualityCoverageSummary]:
+    try:
+        product_keys = [
+            key
+            for key in (
+                make_product_key(product.platform or "unknown", product.product_id)
+                for product in snapshot_products
+            )
+            if key is not None
+        ]
+        if not product_keys:
+            return product_queue, QualityCoverageSummary()
+
+        cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
+        latest_quality_rows = await fetch_latest_quality_rows(
+            merchant_id,
+            platforms=sorted({platform for platform, _ in product_keys}),
+            product_keys=product_keys,
+        )
+        enrichments_by_key = await get_enrichments_for_products(
+            merchant_id,
+            product_keys=product_keys,
+            geo_code="default",
+        )
+        active_job = await get_active_quality_backfill_job(merchant_id)
+
+        projections_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for key in product_keys:
+            cache_row = cache_rows_by_key.get(key)
+            payload = (
+                build_quality_payload_from_cache_row(cache_row, enrichments_by_key.get(key) or {})
+                if cache_row
+                else None
+            )
+            projections_by_key[key] = build_quality_projection(
+                snapshot_row=latest_quality_rows.get(key),
+                payload=payload,
+            )
+
+        for item in product_queue:
+            key = make_product_key(item.platform, item.platform_product_id or item.product_id)
+            projection = projections_by_key.get(key or ("", ""), {})
+            item.content_quality_score = projection.get("content_quality_score")
+            item.model_readiness_score = projection.get("model_readiness_score")
+            item.conversion_potential_score = projection.get("conversion_potential_score")
+            item.quality_last_evaluated_at = projection.get("last_evaluated_at")
+            item.quality_source = projection.get("quality_source", QUALITY_SOURCE_NONE)
+
+        coverage = QualityCoverageSummary.model_validate(
+            summarize_quality_coverage(
+                product_keys,
+                projections_by_key=projections_by_key,
+                snapshot_rows_by_key=latest_quality_rows,
+                active_backfill_job=active_job,
+            )
+        )
+        return product_queue, coverage
+    except Exception as exc:
+        logger.warning("Failed to project quality coverage into readiness payload: %s", str(exc)[:200])
+        return product_queue, QualityCoverageSummary()
+
+
 def _build_issue_buckets(snapshot: MerchantReadinessSnapshot) -> list[ReadinessIssueBucket]:
     bucket_reason_counts: dict[str, Counter[str]] = {}
     bucket_affected_counts: Counter[str] = Counter()
@@ -1234,15 +1344,12 @@ async def build_readiness_optimization(
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
     issue_buckets = _build_issue_buckets(snapshot)
     merchant_actions = _build_merchant_actions(summary, issue_buckets)
-    quality_by_product = await _load_latest_quality_map(merchant_id)
-    product_queue = [
-        _product_queue_item(
-            product,
-            snapshot.channel,
-            quality_by_product=quality_by_product,
-        )
-        for product in snapshot.products
-    ]
+    product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
+    product_queue, quality_coverage = await _apply_quality_projection(
+        merchant_id,
+        snapshot_products=snapshot.products,
+        product_queue=product_queue,
+    )
     product_queue.sort(
         key=lambda item: (
             -item.priority_score,
@@ -1275,6 +1382,7 @@ async def build_readiness_optimization(
         issue_buckets=issue_buckets,
         merchant_actions=merchant_actions,
         product_queue=product_queue,
+        quality_coverage=quality_coverage,
         last_generated_at=summary.generated_at,
     )
     return _store_optimization_payload(merchant_id, channel=channel, payload=payload)

@@ -11,10 +11,28 @@ The scoring here is intentionally simple and fast. A fuller scoring
 pipeline (with behavior data and models) can be added separately.
 """
 
-from typing import Any, Dict, List, Tuple, Optional
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from sqlalchemy import func, select
 
 from db.database import database
 from db.product_quality import product_quality_snapshot
+from models.standard_product import StandardProduct
+
+ProductKey = Tuple[str, str]
+
+QUALITY_SOURCE_SNAPSHOT = "snapshot"
+QUALITY_SOURCE_PREVIEW = "preview"
+QUALITY_SOURCE_NONE = "none"
+
+_QUALITY_SCORE_FIELDS = (
+    "content_quality_score",
+    "model_readiness_score",
+    "conversion_potential_score",
+)
 
 
 def _text_length_score(text: str, min_len: int, max_len: int) -> float:
@@ -58,6 +76,347 @@ def _has_any(values: List[str], payload: Dict[str, Any]) -> bool:
         if v:
             return True
     return False
+
+
+def _normalize_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _coerce_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        normalized = value.strip()
+        return [normalized] if normalized else []
+    return [value]
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, list) and not value:
+            continue
+        return value
+    return None
+
+
+def _extract_main_image(product_data: Dict[str, Any]) -> Optional[str]:
+    candidate = _first_non_empty(
+        product_data.get("image_url"),
+        product_data.get("main_image_url"),
+        product_data.get("featured_image"),
+    )
+    if isinstance(candidate, dict):
+        return _as_text(
+            candidate.get("src")
+            or candidate.get("url")
+            or candidate.get("image_url")
+        ) or None
+    if candidate:
+        return _as_text(candidate) or None
+
+    images = _coerce_list(product_data.get("images") or product_data.get("image_list"))
+    for image in images:
+        if isinstance(image, dict):
+            url = _as_text(image.get("src") or image.get("url") or image.get("image_url"))
+            if url:
+                return url
+        else:
+            url = _as_text(image)
+            if url:
+                return url
+    return None
+
+
+def _extract_price_value(product_data: Dict[str, Any]) -> Any:
+    direct = _first_non_empty(
+        product_data.get("price"),
+        product_data.get("price_local_value"),
+        product_data.get("base_price_value"),
+    )
+    if direct is not None:
+        return direct
+
+    price_obj = product_data.get("price_data")
+    if isinstance(price_obj, dict):
+        return _first_non_empty(
+            price_obj.get("value"),
+            price_obj.get("amount"),
+        )
+
+    variants = _coerce_list(product_data.get("variants"))
+    for variant in variants:
+        if isinstance(variant, dict):
+            value = _first_non_empty(
+                variant.get("price"),
+                variant.get("price_local_value"),
+                variant.get("base_price_value"),
+            )
+            if value is not None:
+                return value
+    return None
+
+
+def _parse_standard_product(product_data: Dict[str, Any]) -> Optional[StandardProduct]:
+    try:
+        return StandardProduct.parse_obj(product_data)
+    except Exception:
+        return None
+
+
+def make_product_key(platform: Any, platform_product_id: Any) -> Optional[ProductKey]:
+    platform_value = _as_text(platform)
+    product_value = _as_text(platform_product_id)
+    if not platform_value or not product_value:
+        return None
+    return platform_value, product_value
+
+
+def quality_row_has_scores(row: Optional[Dict[str, Any]]) -> bool:
+    if not row:
+        return False
+    return any(row.get(field) is not None for field in _QUALITY_SCORE_FIELDS)
+
+
+def quality_projection_has_scores(row: Optional[Dict[str, Any]]) -> bool:
+    if not row:
+        return False
+    return any(row.get(field) is not None for field in _QUALITY_SCORE_FIELDS)
+
+
+def build_quality_payload(
+    product: Any,
+    enrichment: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    enrichment = enrichment or {}
+
+    if isinstance(product, StandardProduct):
+        product_data: Dict[str, Any] = product.dict()
+        title = product.title
+        description = product.description or ""
+        price_value = product.price
+        main_image_url = product.image_url or (product.images[0] if product.images else None)
+        brand = product.vendor or None
+        category = product.product_type or None
+    else:
+        product_data = dict(product or {})
+        title = _as_text(_first_non_empty(product_data.get("title"), product_data.get("name")))
+        description = _as_text(
+            _first_non_empty(
+                product_data.get("description"),
+                product_data.get("body_html"),
+                product_data.get("description_local"),
+            )
+        )
+        price_value = _extract_price_value(product_data)
+        main_image_url = _extract_main_image(product_data)
+        brand = _first_non_empty(product_data.get("vendor"), product_data.get("brand"))
+        category = _first_non_empty(
+            product_data.get("product_type"),
+            product_data.get("category"),
+            product_data.get("global_category_id"),
+        )
+
+    title_local = _as_text(_first_non_empty(enrichment.get("title_override"), title))
+    summary_short = _as_text(enrichment.get("summary_short"))
+
+    image_list = _coerce_list(product_data.get("images") or product_data.get("image_list"))
+    extra_images = _coerce_list(enrichment.get("extra_images"))
+    normalized_images: List[str] = []
+    for image in image_list + extra_images:
+        if isinstance(image, dict):
+            url = _as_text(image.get("src") or image.get("url") or image.get("image_url"))
+        else:
+            url = _as_text(image)
+        if url:
+            normalized_images.append(url)
+
+    if main_image_url:
+        main_image_url = _as_text(main_image_url)
+        if main_image_url and main_image_url not in normalized_images:
+            normalized_images.insert(0, main_image_url)
+
+    return {
+        "title_local": title_local,
+        "title_canonical": _as_text(title),
+        "description_local": description,
+        "price_local_value": price_value,
+        "main_image_url": main_image_url,
+        "image_list": normalized_images,
+        "summary_short": summary_short,
+        "bullet_points": _coerce_list(enrichment.get("bullet_points")),
+        "usage_scenarios": _coerce_list(enrichment.get("usage_scenarios")),
+        "audience_tags": _coerce_list(enrichment.get("audience_tags")),
+        "topic_tags": _coerce_list(enrichment.get("topic_tags")),
+        "brand": _as_text(brand) or None,
+        "global_category_id": _as_text(category) or None,
+    }
+
+
+def build_quality_payload_from_cache_row(
+    cache_row: Dict[str, Any],
+    enrichment: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    product_data = dict(cache_row.get("product_data") or {})
+    if not product_data:
+        return None
+
+    product = _parse_standard_product(product_data)
+    if product is not None:
+        return build_quality_payload(product, enrichment)
+    return build_quality_payload(product_data, enrichment)
+
+
+def build_quality_projection(
+    *,
+    snapshot_row: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if quality_row_has_scores(snapshot_row):
+        return {
+            "content_quality_score": snapshot_row.get("content_quality_score"),
+            "model_readiness_score": snapshot_row.get("model_readiness_score"),
+            "conversion_potential_score": snapshot_row.get("conversion_potential_score"),
+            "last_evaluated_at": _normalize_timestamp(snapshot_row.get("snapshot_date")),
+            "quality_source": QUALITY_SOURCE_SNAPSHOT,
+        }
+
+    if payload:
+        preview = preview_quality(payload)
+        if quality_projection_has_scores(preview):
+            return {
+                "content_quality_score": preview.get("content_quality_score"),
+                "model_readiness_score": preview.get("model_readiness_score"),
+                "conversion_potential_score": preview.get("conversion_potential_score"),
+                "last_evaluated_at": None,
+                "quality_source": QUALITY_SOURCE_PREVIEW,
+            }
+
+    return {
+        "content_quality_score": None,
+        "model_readiness_score": None,
+        "conversion_potential_score": None,
+        "last_evaluated_at": None,
+        "quality_source": QUALITY_SOURCE_NONE,
+    }
+
+
+async def fetch_latest_quality_rows(
+    merchant_id: str,
+    *,
+    platforms: Optional[Iterable[str]] = None,
+    product_keys: Optional[Iterable[ProductKey]] = None,
+) -> Dict[ProductKey, Dict[str, Any]]:
+    platform_values = sorted({_as_text(platform) for platform in (platforms or []) if _as_text(platform)})
+    key_filter = {key for key in (product_keys or []) if key and key[0] and key[1]}
+
+    ranked = (
+        select(
+            product_quality_snapshot,
+            func.row_number().over(
+                partition_by=[
+                    product_quality_snapshot.c.merchant_id,
+                    product_quality_snapshot.c.platform,
+                    product_quality_snapshot.c.platform_product_id,
+                ],
+                order_by=[
+                    product_quality_snapshot.c.snapshot_date.desc(),
+                    product_quality_snapshot.c.id.desc(),
+                ],
+            ).label("row_num"),
+        )
+        .where(product_quality_snapshot.c.merchant_id == merchant_id)
+    )
+    if platform_values:
+        ranked = ranked.where(product_quality_snapshot.c.platform.in_(platform_values))
+
+    ranked_subquery = ranked.subquery("ranked_quality")
+    query = select(*[col for col in ranked_subquery.c if col.key != "row_num"]).where(ranked_subquery.c.row_num == 1)
+    rows = await database.fetch_all(query)
+
+    latest: Dict[ProductKey, Dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row)
+        key = make_product_key(payload.get("platform"), payload.get("platform_product_id"))
+        if key is None:
+            continue
+        if key_filter and key not in key_filter:
+            continue
+        latest[key] = payload
+    return latest
+
+
+def summarize_quality_coverage(
+    product_keys: Sequence[ProductKey],
+    *,
+    projections_by_key: Dict[ProductKey, Dict[str, Any]],
+    snapshot_rows_by_key: Dict[ProductKey, Dict[str, Any]],
+    active_backfill_job: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    unique_product_keys = list(dict.fromkeys(product_keys))
+    total_products = len(unique_product_keys)
+    snapshot_scored_products = 0
+    effective_scored_products = 0
+    preview_only_products = 0
+    latest_snapshot_at: Optional[str] = None
+
+    for key in unique_product_keys:
+        snapshot_row = snapshot_rows_by_key.get(key)
+        projection = projections_by_key.get(key) or {}
+        if quality_row_has_scores(snapshot_row):
+            snapshot_scored_products += 1
+            snapshot_timestamp = _normalize_timestamp(snapshot_row.get("snapshot_date"))
+            if snapshot_timestamp and (latest_snapshot_at is None or snapshot_timestamp > latest_snapshot_at):
+                latest_snapshot_at = snapshot_timestamp
+        if quality_projection_has_scores(projection):
+            effective_scored_products += 1
+            if projection.get("quality_source") == QUALITY_SOURCE_PREVIEW:
+                preview_only_products += 1
+
+    unscored_products = max(total_products - effective_scored_products, 0)
+    if total_products <= 0 or effective_scored_products <= 0:
+        coverage_state = "empty"
+    elif effective_scored_products >= total_products:
+        coverage_state = "full"
+    else:
+        coverage_state = "partial"
+
+    return {
+        "total_products": total_products,
+        "snapshot_scored_products": snapshot_scored_products,
+        "effective_scored_products": effective_scored_products,
+        "preview_only_products": preview_only_products,
+        "unscored_products": unscored_products,
+        "coverage_state": coverage_state,
+        "latest_snapshot_at": latest_snapshot_at,
+        "backfill_recommended": total_products > 0 and snapshot_scored_products < total_products,
+        "active_backfill_job": active_backfill_job,
+    }
 
 
 def preview_quality(payload: Dict[str, Any]) -> Dict[str, Any]:

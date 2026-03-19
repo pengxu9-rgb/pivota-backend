@@ -22,7 +22,7 @@ import logging
 from db.products import get_product_cache_row
 from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
-from services.product_quality_service import full_quality_eval
+from services.product_quality_service import build_quality_payload, full_quality_eval
 from services.product_enrichment_ai import (
   build_context_from_standard_product,
   generate_summary,
@@ -61,34 +61,6 @@ def _simple_compliance_check(texts: Dict[str, str]) -> Dict[str, Any]:
       }
 
   return {"allowed": True, "reason": None}
-
-
-def _build_quality_payload(
-  product: StandardProduct,
-  enrichment: Dict[str, Any],
-) -> Dict[str, Any]:
-  """
-  Build a payload compatible with preview_quality/full_quality_eval.
-  """
-  summary = enrichment.get("summary_short") or ""
-  bullet_points = enrichment.get("bullet_points") or []
-
-  return {
-    "title_local": enrichment.get("title_override") or product.title,
-    "description_local": product.description or "",
-    "price_local_value": product.price,
-    "main_image_url": product.image_url or (product.images[0] if product.images else None),
-    "summary_short": summary,
-    "bullet_points": bullet_points,
-    "usage_scenarios": enrichment.get("usage_scenarios") or [],
-    "audience_tags": enrichment.get("audience_tags") or [],
-    "topic_tags": enrichment.get("topic_tags") or [],
-    # Approximations for brand/category from StandardProduct
-    "brand": product.vendor or None,
-    "global_category_id": product.product_type or None,
-  }
-
-
 async def run_enrichment_for_product(
   merchant_id: str,
   platform: str,
@@ -242,7 +214,7 @@ async def run_enrichment_for_product(
 
   # 6) Quality evaluation (writes snapshot)
   try:
-    quality_payload = _build_quality_payload(product, enrichment_data)
+    quality_payload = build_quality_payload(product, enrichment_data)
     quality_result = await full_quality_eval(
       merchant_id=merchant_id,
       platform=platform,
@@ -293,4 +265,3 @@ async def run_enrichment_for_product(
     "quality": quality_result,
     "auto_confidence": auto_confidence,
   }
-

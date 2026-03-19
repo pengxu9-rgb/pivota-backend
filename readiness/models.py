@@ -237,6 +237,23 @@ class ProductReadinessQueueItem(BaseModel):
     priority_reason: Optional[str] = None
     recommended_action_id: Optional[str] = None
     recommended_action_type: Optional[str] = None
+    content_quality_score: Optional[float] = None
+    model_readiness_score: Optional[float] = None
+    conversion_potential_score: Optional[float] = None
+    quality_last_evaluated_at: Optional[str] = None
+    quality_source: str = "none"
+
+
+class QualityCoverageSummary(BaseModel):
+    total_products: int = 0
+    snapshot_scored_products: int = 0
+    effective_scored_products: int = 0
+    preview_only_products: int = 0
+    unscored_products: int = 0
+    coverage_state: str = "empty"
+    latest_snapshot_at: Optional[str] = None
+    backfill_recommended: bool = False
+    active_backfill_job: Optional[Dict[str, Any]] = None
 
 
 class MerchantReadinessOptimizationPayload(BaseModel):
@@ -247,6 +264,7 @@ class MerchantReadinessOptimizationPayload(BaseModel):
     issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
+    quality_coverage: QualityCoverageSummary = Field(default_factory=QualityCoverageSummary)
     last_generated_at: Optional[str] = None
 
 

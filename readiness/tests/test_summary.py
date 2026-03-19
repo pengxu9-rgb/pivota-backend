@@ -7,6 +7,7 @@ from readiness.models import (
     ChannelCoverageStatus,
     DashboardSnapshot,
     MerchantReadinessSnapshot,
+    QualityCoverageSummary,
     ReadyProduct,
     ReadyVariant,
 )
@@ -199,17 +200,25 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
         )
 
     monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
-    async def fake_quality_map(_merchant_id: str):
-        return {
-            "shopify|prod_1": {
-                "content_quality_score": 62.5,
-                "model_readiness_score": 71.0,
-                "conversion_potential_score": 55.0,
-                "quality_last_evaluated_at": "2026-03-18T01:00:00+00:00",
-            }
-        }
 
-    monkeypatch.setattr("readiness.summary._load_latest_quality_map", fake_quality_map)
+    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
+        product_queue[0].content_quality_score = 62.5
+        product_queue[0].model_readiness_score = 71.0
+        product_queue[0].conversion_potential_score = 55.0
+        product_queue[0].quality_last_evaluated_at = "2026-03-18T01:00:00+00:00"
+        product_queue[0].quality_source = "snapshot"
+        return product_queue, QualityCoverageSummary(
+            total_products=1,
+            snapshot_scored_products=1,
+            effective_scored_products=1,
+            preview_only_products=0,
+            unscored_products=0,
+            coverage_state="full",
+            latest_snapshot_at="2026-03-18T01:00:00+00:00",
+            backfill_recommended=False,
+        )
+
+    monkeypatch.setattr("readiness.summary._apply_quality_projection", fake_apply_quality_projection)
     async def fake_dashboard_snapshot(_merchant_id: str):
         return DashboardSnapshot(
             total_orders=12,
@@ -249,6 +258,88 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
     assert payload.dashboard_snapshot.paid_orders == 9
     assert payload.dashboard_snapshot.total_products == 42
     assert payload.merchant_actions
+
+
+@pytest.mark.asyncio
+async def test_build_readiness_optimization_projects_quality_coverage(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=77,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="partial",
+                    ready_variant_count=1,
+                    blocked_variant_count=1,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_1",
+                    platform="shopify",
+                    title="Alpha Product",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_1",
+                            title="Default",
+                            price={"amount": 10, "currency": "USD"},
+                            inventory={"quantity": 0, "availability": "out_of_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": ["out_of_stock"]},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="blocked", score=40),
+                            channel_coverage={"ucp": "blocked"},
+                        )
+                    ],
+                )
+            ],
+        )
+
+    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
+        product_queue[0].content_quality_score = 83.0
+        product_queue[0].model_readiness_score = 71.0
+        product_queue[0].quality_source = "preview"
+        return product_queue, QualityCoverageSummary(
+            total_products=1,
+            snapshot_scored_products=0,
+            effective_scored_products=1,
+            preview_only_products=1,
+            unscored_products=0,
+            coverage_state="full",
+            backfill_recommended=True,
+        )
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    monkeypatch.setattr("readiness.summary._apply_quality_projection", fake_apply_quality_projection)
+
+    payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+
+    assert payload.product_queue[0].content_quality_score == 83.0
+    assert payload.product_queue[0].model_readiness_score == 71.0
+    assert payload.product_queue[0].quality_source == "preview"
+    assert payload.quality_coverage.effective_scored_products == 1
+    assert payload.quality_coverage.preview_only_products == 1
+    assert payload.quality_coverage.coverage_state == "full"
 
 
 @pytest.mark.asyncio
@@ -316,16 +407,16 @@ async def test_build_readiness_optimization_uses_ttl_cache_until_force_refresh(m
             ],
         )
 
-    async def fake_quality_map(_merchant_id: str):
+    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
         call_counts["quality"] += 1
-        return {}
+        return product_queue, QualityCoverageSummary(total_products=1)
 
     async def fake_dashboard_snapshot(_merchant_id: str):
         call_counts["dashboard"] += 1
         return DashboardSnapshot(total_products=1)
 
     monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
-    monkeypatch.setattr("readiness.summary._load_latest_quality_map", fake_quality_map)
+    monkeypatch.setattr("readiness.summary._apply_quality_projection", fake_apply_quality_projection)
     monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
 
     first = await build_readiness_optimization("merch_efbc46b4619cfbdf")
@@ -385,14 +476,14 @@ async def test_invalidate_readiness_optimization_cache_returns_removed_entry_cou
             products=[],
         )
 
-    async def fake_quality_map(_merchant_id: str):
-        return {}
+    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
+        return product_queue, QualityCoverageSummary(total_products=0)
 
     async def fake_dashboard_snapshot(_merchant_id: str):
         return DashboardSnapshot(total_products=1)
 
     monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
-    monkeypatch.setattr("readiness.summary._load_latest_quality_map", fake_quality_map)
+    monkeypatch.setattr("readiness.summary._apply_quality_projection", fake_apply_quality_projection)
     monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
 
     await build_readiness_optimization("merch_efbc46b4619cfbdf")

@@ -10,18 +10,34 @@ They are intended to power the Merchant Portal "Product Optimization"
 experience, not the public Agent API.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
 from pydantic import BaseModel
 
 from db.database import database
 from db.products import products_cache, get_cached_products
-from db.product_enrichment import get_enrichment, upsert_enrichment
-from db.product_quality import product_quality_snapshot
+from db.product_enrichment import (
+    get_enrichment,
+    get_enrichments_for_products,
+    upsert_enrichment,
+)
+from db.product_quality_backfill_jobs import (
+    create_quality_backfill_job,
+    get_active_quality_backfill_job,
+    get_quality_backfill_job,
+)
 from models.standard_product import StandardProduct
 from services.product_enrichment_pipeline import run_enrichment_for_product
+from services.product_quality_backfill_service import process_quality_backfill_job
+from services.product_quality_service import (
+    build_quality_payload_from_cache_row,
+    build_quality_projection,
+    fetch_latest_quality_rows,
+    make_product_key,
+    summarize_quality_coverage,
+)
 from utils.auth import get_current_user
 from sqlalchemy import func, or_, select
 
@@ -33,29 +49,79 @@ class EnrichmentBackfillRequest(BaseModel):
     limit: Optional[int] = 100
 
 
-async def _fetch_latest_quality_row(
+class QualityBackfillRequest(BaseModel):
+    platform: Optional[str] = None
+    force_refresh: bool = False
+    missing_only: bool = True
+
+
+def _quality_response(projection: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "content_quality_score": projection.get("content_quality_score"),
+        "model_readiness_score": projection.get("model_readiness_score"),
+        "conversion_potential_score": projection.get("conversion_potential_score"),
+        "last_evaluated_at": projection.get("last_evaluated_at"),
+        "quality_source": projection.get("quality_source", "none"),
+    }
+
+
+async def _build_quality_projection_bundle(
     merchant_id: str,
-    platform: str,
-    platform_product_id: str,
-) -> Optional[Dict[str, Any]]:
-    query = """
-    SELECT *
-    FROM product_quality_snapshot
-    WHERE merchant_id = :merchant_id
-      AND platform = :platform
-      AND platform_product_id = :platform_product_id
-    ORDER BY snapshot_date DESC
-    LIMIT 1
-    """
-    row = await database.fetch_one(
-        query,
-        {
-            "merchant_id": merchant_id,
-            "platform": platform,
-            "platform_product_id": platform_product_id,
-        },
+    cache_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    product_keys: List[Tuple[str, str]] = []
+    for row in cache_rows:
+        key = make_product_key(row.get("platform"), row.get("platform_product_id"))
+        if key is not None:
+            product_keys.append(key)
+
+    if not product_keys:
+        return {
+            "enrichments_by_key": {},
+            "snapshot_rows_by_key": {},
+            "projections_by_key": {},
+            "coverage": summarize_quality_coverage(
+                [],
+                projections_by_key={},
+                snapshot_rows_by_key={},
+                active_backfill_job=None,
+            ),
+        }
+
+    enrichments_by_key = await get_enrichments_for_products(
+        merchant_id,
+        product_keys=product_keys,
+        geo_code="default",
     )
-    return dict(row) if row else None
+    snapshot_rows_by_key = await fetch_latest_quality_rows(
+        merchant_id,
+        platforms=sorted({platform for platform, _ in product_keys}),
+        product_keys=product_keys,
+    )
+    active_backfill_job = await get_active_quality_backfill_job(merchant_id)
+
+    projections_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in cache_rows:
+        key = make_product_key(row.get("platform"), row.get("platform_product_id"))
+        if key is None:
+            continue
+        payload = build_quality_payload_from_cache_row(row, enrichments_by_key.get(key) or {})
+        projections_by_key[key] = build_quality_projection(
+            snapshot_row=snapshot_rows_by_key.get(key),
+            payload=payload,
+        )
+
+    return {
+        "enrichments_by_key": enrichments_by_key,
+        "snapshot_rows_by_key": snapshot_rows_by_key,
+        "projections_by_key": projections_by_key,
+        "coverage": summarize_quality_coverage(
+            product_keys,
+            projections_by_key=projections_by_key,
+            snapshot_rows_by_key=snapshot_rows_by_key,
+            active_backfill_job=active_backfill_job,
+        ),
+    }
 
 
 def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
@@ -143,26 +209,18 @@ async def list_merchant_products(
         .offset(offset)
     )
     rows = await database.fetch_all(query)
+    cache_rows = [dict(row) for row in rows]
+    quality_bundle = await _build_quality_projection_bundle(merchant_id, cache_rows)
 
     items: List[Dict[str, Any]] = []
-    for row in rows:
-        cache_row = dict(row)
+    for cache_row in cache_rows:
         platform_val = cache_row.get("platform")
         platform_product_id = cache_row.get("platform_product_id")
+        product_key = make_product_key(platform_val, platform_product_id)
 
         standard = _build_standard_summary(cache_row)
-
-        enrichment = await get_enrichment(
-            merchant_id=merchant_id,
-            platform=platform_val,
-            platform_product_id=platform_product_id,
-            geo_code="default",
-        )
-        quality = await _fetch_latest_quality_row(
-            merchant_id=merchant_id,
-            platform=platform_val,
-            platform_product_id=platform_product_id,
-        )
+        enrichment = quality_bundle["enrichments_by_key"].get(product_key or ("", ""), {})
+        projection = quality_bundle["projections_by_key"].get(product_key or ("", ""), {})
 
         items.append({
             "merchant_id": merchant_id,
@@ -170,12 +228,7 @@ async def list_merchant_products(
             "platform_product_id": platform_product_id,
             "standard": standard,
             "enrichment": enrichment or {},
-            "quality": {
-                "content_quality_score": quality.get("content_quality_score") if quality else None,
-                "model_readiness_score": quality.get("model_readiness_score") if quality else None,
-                "conversion_potential_score": quality.get("conversion_potential_score") if quality else None,
-                "last_evaluated_at": quality.get("snapshot_date") if quality else None,
-            },
+            "quality": _quality_response(projection),
         })
 
     return {
@@ -214,52 +267,125 @@ async def get_product_quality_summary(
     rows = [dict(r) for r in records]
 
     total_products = len(rows)
-    scored_products = 0
+    quality_bundle = await _build_quality_projection_bundle(merchant_id, rows)
+    coverage = quality_bundle["coverage"]
     sum_cq = 0.0
     sum_mr = 0.0
+    cq_count = 0
+    mr_count = 0
     low_cq_count = 0
     low_cq_threshold = 60.0
 
     for row in rows:
-        platform_val = row.get("platform")
-        platform_product_id = row.get("platform_product_id")
-        if not platform_val or not platform_product_id:
-            continue
-
-        quality = await _fetch_latest_quality_row(
-            merchant_id=merchant_id,
-            platform=platform_val,
-            platform_product_id=platform_product_id,
-        )
-        if not quality:
-            continue
-
-        cq = quality.get("content_quality_score")
-        mr = quality.get("model_readiness_score")
+        key = make_product_key(row.get("platform"), row.get("platform_product_id"))
+        projection = quality_bundle["projections_by_key"].get(key or ("", ""), {})
+        cq = projection.get("content_quality_score")
+        mr = projection.get("model_readiness_score")
         if cq is None and mr is None:
             continue
 
-        scored_products += 1
         if isinstance(cq, (int, float)):
             sum_cq += float(cq)
+            cq_count += 1
             if cq < low_cq_threshold:
                 low_cq_count += 1
         if isinstance(mr, (int, float)):
             sum_mr += float(mr)
+            mr_count += 1
 
-    avg_cq = sum_cq / scored_products if scored_products and sum_cq > 0 else None
-    avg_mr = sum_mr / scored_products if scored_products and sum_mr > 0 else None
+    avg_cq = sum_cq / cq_count if cq_count > 0 else None
+    avg_mr = sum_mr / mr_count if mr_count > 0 else None
 
     return {
         "status": "success",
         "data": {
             "total_products": total_products,
-            "scored_products": scored_products,
+            "scored_products": coverage["effective_scored_products"],
             "avg_content_quality": avg_cq,
             "avg_model_readiness": avg_mr,
             "low_cq_threshold": low_cq_threshold,
             "low_cq_count": low_cq_count,
+            "snapshot_scored_products": coverage["snapshot_scored_products"],
+            "effective_scored_products": coverage["effective_scored_products"],
+            "preview_only_products": coverage["preview_only_products"],
+            "unscored_products": coverage["unscored_products"],
+            "coverage_state": coverage["coverage_state"],
+            "latest_snapshot_at": coverage["latest_snapshot_at"],
+            "backfill_recommended": coverage["backfill_recommended"],
+            "active_backfill_job": coverage["active_backfill_job"],
         },
+    }
+
+
+@router.post("/quality/backfill", status_code=202)
+async def queue_quality_backfill(
+    body: QualityBackfillRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can backfill quality scores")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    requested_by = (
+        current_user.get("email")
+        or current_user.get("user_id")
+        or current_user.get("merchant_id")
+    )
+
+    active_job = await get_active_quality_backfill_job(
+        merchant_id,
+        platform=body.platform,
+    )
+    if active_job is not None:
+        return {
+            "status": "queued",
+            "data": {
+                "job": active_job,
+                "already_active": True,
+            },
+        }
+
+    job = await create_quality_backfill_job(
+        merchant_id=merchant_id,
+        platform=body.platform,
+        requested_by=str(requested_by) if requested_by else None,
+        force_refresh=body.force_refresh,
+        missing_only=body.missing_only,
+    )
+    background_tasks.add_task(process_quality_backfill_job, job.get("job_id"))
+
+    return {
+        "status": "queued",
+        "data": {
+            "job": job,
+            "already_active": False,
+        },
+    }
+
+
+@router.get("/quality/backfill/{job_id}")
+async def get_quality_backfill_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can view quality backfill jobs")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    job = await get_quality_backfill_job(job_id)
+    if job is None or job.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=404, detail="Quality backfill job not found")
+
+    return {
+        "status": "success",
+        "data": job,
     }
 
 
@@ -307,10 +433,10 @@ async def get_merchant_product_detail(
         platform_product_id=platform_product_id,
         geo_code="default",
     )
-    quality = await _fetch_latest_quality_row(
-        merchant_id=merchant_id,
-        platform=platform,
-        platform_product_id=platform_product_id,
+    quality_bundle = await _build_quality_projection_bundle(merchant_id, [cache_row])
+    projection = quality_bundle["projections_by_key"].get(
+        make_product_key(platform, platform_product_id) or ("", ""),
+        {},
     )
 
     return {
@@ -319,7 +445,7 @@ async def get_merchant_product_detail(
         "platform_product_id": platform_product_id,
         "standard": standard_full,
         "enrichment": enrichment or {},
-        "quality": quality or {},
+        "quality": _quality_response(projection),
     }
 
 
@@ -517,10 +643,10 @@ async def run_product_enrichment(
         platform_product_id=platform_product_id,
         geo_code="default",
     )
-    quality = await _fetch_latest_quality_row(
-        merchant_id=merchant_id,
-        platform=platform,
-        platform_product_id=platform_product_id,
+    quality_bundle = await _build_quality_projection_bundle(merchant_id, [cache_row])
+    projection = quality_bundle["projections_by_key"].get(
+        make_product_key(platform, platform_product_id) or ("", ""),
+        {},
     )
 
     return {
@@ -529,5 +655,5 @@ async def run_product_enrichment(
         "platform_product_id": platform_product_id,
         "standard": standard_full,
         "enrichment": enrichment or {},
-        "quality": quality or {},
+        "quality": _quality_response(projection),
     }

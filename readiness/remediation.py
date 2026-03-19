@@ -25,7 +25,7 @@ from services.product_enrichment_ai import (
     generate_summary,
 )
 from services.product_enrichment_pipeline import run_enrichment_for_product
-from services.product_quality_service import preview_quality
+from services.product_quality_service import build_quality_payload, preview_quality
 
 
 class PlanSupersededError(Exception):
@@ -80,24 +80,6 @@ def _default_disclaimer(context_text: str) -> str:
     if "鞋" in context_text or "shoe" in context_text.lower():
         return "本产品为运动鞋，不具备医疗功效，具体体验因人而异。"
     return "本产品为日常消费品，不提供任何医疗或金融收益承诺。"
-
-
-def _build_quality_payload(product: StandardProduct, enrichment: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "title_local": enrichment.get("title_override") or product.title,
-        "description_local": product.description or "",
-        "price_local_value": product.price,
-        "main_image_url": product.image_url or (product.images[0] if product.images else None),
-        "summary_short": enrichment.get("summary_short") or "",
-        "bullet_points": enrichment.get("bullet_points") or [],
-        "usage_scenarios": enrichment.get("usage_scenarios") or [],
-        "audience_tags": enrichment.get("audience_tags") or [],
-        "topic_tags": enrichment.get("topic_tags") or [],
-        "brand": product.vendor or None,
-        "global_category_id": product.product_type or None,
-    }
-
-
 def _generated_enrichment(product: StandardProduct) -> dict[str, Any]:
     context = build_context_from_standard_product(product)
     summary = generate_summary(context)

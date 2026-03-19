@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from sqlalchemy import Column, DateTime, Float, Index, JSON, String, Table, Text
 from sqlalchemy.sql import func
@@ -126,6 +126,50 @@ async def get_enrichment(
     )
     row = await database.fetch_one(query)
     return dict(row) if row else None
+
+
+async def get_enrichments_for_products(
+    merchant_id: str,
+    *,
+    product_keys: Optional[Iterable[Tuple[str, str]]] = None,
+    geo_code: str = "default",
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """
+    Bulk fetch enrichment rows for a merchant's products.
+
+    The query stays merchant-scoped and filters by geo_code in SQL, then applies
+    any product key filter in memory to avoid per-product lookups.
+    """
+    await ensure_product_enrichment_table()
+
+    keys = {
+        (str(platform or "").strip(), str(platform_product_id or "").strip())
+        for platform, platform_product_id in (product_keys or [])
+        if str(platform or "").strip() and str(platform_product_id or "").strip()
+    }
+    platforms = sorted({platform for platform, _ in keys})
+
+    query = product_enrichment.select().where(
+        (product_enrichment.c.merchant_id == merchant_id)
+        & (product_enrichment.c.geo_code == (geo_code or "default"))
+    )
+    if platforms:
+        query = query.where(product_enrichment.c.platform.in_(platforms))
+
+    rows = await database.fetch_all(query)
+    enrichments: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row)
+        key = (
+            str(payload.get("platform") or "").strip(),
+            str(payload.get("platform_product_id") or "").strip(),
+        )
+        if not key[0] or not key[1]:
+            continue
+        if keys and key not in keys:
+            continue
+        enrichments[key] = payload
+    return enrichments
 
 
 async def upsert_enrichment(
