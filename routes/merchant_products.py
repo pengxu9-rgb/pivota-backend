@@ -23,7 +23,7 @@ from db.product_quality import product_quality_snapshot
 from models.standard_product import StandardProduct
 from services.product_enrichment_pipeline import run_enrichment_for_product
 from utils.auth import get_current_user
-from sqlalchemy import or_
+from sqlalchemy import func, or_, select
 
 router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
 
@@ -116,16 +116,26 @@ async def list_merchant_products(
     offset = (page - 1) * page_size
 
     # Base query from products_cache (default: only active rows)
-    base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
+    filters = [products_cache.c.merchant_id == merchant_id]
     if platform:
-        base_query = base_query.where(products_cache.c.platform == platform)
+        filters.append(products_cache.c.platform == platform)
     if not include_expired:
-        base_query = base_query.where(
+        filters.append(
             or_(
                 products_cache.c.expires_at.is_(None),
                 products_cache.c.expires_at > datetime.now(),
             )
         )
+
+    base_query = products_cache.select().where(*filters)
+    count_query = select(func.count().label("total")).select_from(products_cache).where(*filters)
+    count_row = await database.fetch_one(count_query)
+    total = 0
+    if count_row is not None:
+        if hasattr(count_row, "get"):
+            total = int(count_row.get("total") or 0)
+        else:
+            total = int(dict(count_row).get("total") or 0)
 
     query = (
         base_query.order_by(products_cache.c.cached_at.desc())
@@ -133,8 +143,6 @@ async def list_merchant_products(
         .offset(offset)
     )
     rows = await database.fetch_all(query)
-    # Simple total for now; can be optimized later with a dedicated COUNT(*)
-    total = len(rows)
 
     items: List[Dict[str, Any]] = []
     for row in rows:
