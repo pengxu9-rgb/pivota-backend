@@ -210,6 +210,12 @@ class ProductReadinessQueueItem(BaseModel):
     image_url: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
+    price_value: Optional[float] = None
+    price_currency: Optional[str] = None
+    content_quality_score: Optional[float] = None
+    model_readiness_score: Optional[float] = None
+    conversion_potential_score: Optional[float] = None
+    quality_last_evaluated_at: Optional[str] = None
     blocked_variant_count: int = 0
     ready_variant_count: int = 0
     top_issues: List[ProductQueueIssue] = Field(default_factory=list)

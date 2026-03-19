@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Any, Iterable, Optional
 
+from db.database import database
+from db.product_quality import product_quality_snapshot
 from readiness.flags import (
     readiness_alpha_merchant_id,
     readiness_real_merchant_alpha_enabled,
@@ -22,6 +24,7 @@ from readiness.models import (
     ScoreBundle,
 )
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
+from sqlalchemy import select
 
 
 _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
@@ -356,7 +359,62 @@ def _variant_impact(variant: Any) -> str:
     return "discovery_only"
 
 
-def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem:
+async def _load_latest_quality_map(merchant_id: str) -> dict[str, dict[str, Any]]:
+    query = (
+        select(
+            product_quality_snapshot.c.platform,
+            product_quality_snapshot.c.platform_product_id,
+            product_quality_snapshot.c.snapshot_date,
+            product_quality_snapshot.c.content_quality_score,
+            product_quality_snapshot.c.model_readiness_score,
+            product_quality_snapshot.c.conversion_potential_score,
+        )
+        .where(product_quality_snapshot.c.merchant_id == merchant_id)
+        .order_by(
+            product_quality_snapshot.c.platform,
+            product_quality_snapshot.c.platform_product_id,
+            product_quality_snapshot.c.snapshot_date.desc(),
+        )
+    )
+    rows = await database.fetch_all(query)
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row)
+        key = f"{payload.get('platform') or 'unknown'}|{payload.get('platform_product_id') or ''}"
+        if key in latest:
+            continue
+        snapshot_date = payload.get("snapshot_date")
+        latest[key] = {
+            "content_quality_score": payload.get("content_quality_score"),
+            "model_readiness_score": payload.get("model_readiness_score"),
+            "conversion_potential_score": payload.get("conversion_potential_score"),
+            "quality_last_evaluated_at": snapshot_date.isoformat() if snapshot_date else None,
+        }
+    return latest
+
+
+def _queue_price(product: Any) -> tuple[Optional[float], Optional[str]]:
+    for variant in product.variants:
+        price = variant.price or {}
+        raw_value = price.get("amount")
+        if raw_value is None:
+            raw_value = price.get("value")
+        currency = str(price.get("currency") or "USD").strip() or "USD"
+        if raw_value is None:
+            continue
+        try:
+            return float(raw_value), currency
+        except (TypeError, ValueError):
+            continue
+    return None, None
+
+
+def _product_queue_item(
+    product: Any,
+    channel: str,
+    *,
+    quality_by_product: Optional[dict[str, dict[str, Any]]] = None,
+) -> ProductReadinessQueueItem:
     issue_counts = _product_issue_counts(product, channel)
     blocked_variant_count = sum(1 for variant in product.variants if variant.channel_coverage.get(channel) != "ready")
     ready_variant_count = max(0, len(product.variants) - blocked_variant_count)
@@ -406,6 +464,10 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
         blocked_variant_count=blocked_variant_count,
         impact=impact,
     )
+    price_value, price_currency = _queue_price(product)
+    quality = (quality_by_product or {}).get(
+        f"{product.platform or 'unknown'}|{product.product_id}"
+    ) or {}
 
     return ProductReadinessQueueItem(
         queue_item_scope="product",
@@ -417,6 +479,12 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
         image_url=product.default_image_url,
         brand=product.brand,
         category=product.category,
+        price_value=price_value,
+        price_currency=price_currency,
+        content_quality_score=quality.get("content_quality_score"),
+        model_readiness_score=quality.get("model_readiness_score"),
+        conversion_potential_score=quality.get("conversion_potential_score"),
+        quality_last_evaluated_at=quality.get("quality_last_evaluated_at"),
         blocked_variant_count=blocked_variant_count,
         ready_variant_count=ready_variant_count,
         top_issues=top_issues,
@@ -946,7 +1014,15 @@ async def build_readiness_optimization(
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
     issue_buckets = _build_issue_buckets(snapshot)
     merchant_actions = _build_merchant_actions(summary, issue_buckets)
-    product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
+    quality_by_product = await _load_latest_quality_map(merchant_id)
+    product_queue = [
+        _product_queue_item(
+            product,
+            snapshot.channel,
+            quality_by_product=quality_by_product,
+        )
+        for product in snapshot.products
+    ]
     product_queue.sort(
         key=lambda item: (
             -item.priority_score,

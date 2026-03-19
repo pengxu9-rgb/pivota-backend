@@ -188,6 +188,17 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
         )
 
     monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    async def fake_quality_map(_merchant_id: str):
+        return {
+            "shopify|prod_1": {
+                "content_quality_score": 62.5,
+                "model_readiness_score": 71.0,
+                "conversion_potential_score": 55.0,
+                "quality_last_evaluated_at": "2026-03-18T01:00:00+00:00",
+            }
+        }
+
+    monkeypatch.setattr("readiness.summary._load_latest_quality_map", fake_quality_map)
 
     payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
 
@@ -205,4 +216,9 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
     assert payload.product_queue[0].blocked_variant_count == 1
     assert payload.product_queue[0].priority_score > 0
     assert payload.product_queue[0].top_issues
+    assert payload.product_queue[0].price_value == 10.0
+    assert payload.product_queue[0].price_currency == "USD"
+    assert payload.product_queue[0].content_quality_score == 62.5
+    assert payload.product_queue[0].model_readiness_score == 71.0
+    assert payload.product_queue[0].conversion_potential_score == 55.0
     assert payload.merchant_actions
