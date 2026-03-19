@@ -233,6 +233,118 @@ def test_external_seed_audit_queue_supports_merchant_id_filter(
     assert "eps_unattached" in returned_ids
 
 
+def test_backfill_storefront_external_seeds_dry_run(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.employee_products as employee_products_module
+
+    async def fake_candidates(*, merchant_id: str, limit: int, market=None):
+        assert merchant_id == "merch_1"
+        assert limit == 25
+        assert market is None
+        return {
+            "merchant_id": merchant_id,
+            "market": "US",
+            "primary_domain": "example.com",
+            "matched_domains": ["example.com"],
+            "candidates": [
+                {
+                    "attached_product_key": "merch_1|shopify|prod_1",
+                    "storefront_url": "https://example.com/products/serum-1",
+                    "title": "Serum 1",
+                    "external_product_id": "ext_1",
+                },
+                {
+                    "attached_product_key": "merch_1|shopify|prod_2",
+                    "storefront_url": "https://example.com/products/serum-2",
+                    "title": "Serum 2",
+                    "external_product_id": "ext_2",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module, "_fetch_storefront_referral_seed_candidates", fake_candidates)
+
+    res = client.post(
+        "/employee/products/external-seeds/backfill-storefront",
+        headers={"Authorization": "Bearer test-token"},
+        json={"merchant_id": "merch_1", "limit": 25, "dry_run": True},
+    )
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["status"] == "success"
+    assert payload["dry_run"] is True
+    assert payload["candidate_count"] == 2
+    assert payload["created"] == 0
+    assert payload["items"][0]["action"] == "preview"
+    assert payload["items"][0]["canonical_url"] == "https://example.com/products/serum-1"
+
+
+def test_backfill_storefront_external_seeds_write_mode(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.employee_products as employee_products_module
+
+    candidates = [
+        {
+            "attached_product_key": "merch_1|shopify|prod_1",
+            "storefront_url": "https://example.com/products/serum-1",
+            "title": "Serum 1",
+            "external_product_id": "ext_1",
+        },
+        {
+            "attached_product_key": "merch_1|shopify|prod_2",
+            "storefront_url": "https://example.com/products/serum-2",
+            "title": "Serum 2",
+            "external_product_id": "ext_2",
+        },
+        {
+            "attached_product_key": "merch_1|shopify|prod_3",
+            "storefront_url": "https://example.com/products/serum-3",
+            "title": "Serum 3",
+            "external_product_id": "ext_3",
+        },
+    ]
+
+    async def fake_candidates(*, merchant_id: str, limit: int, market=None):
+        return {
+            "merchant_id": merchant_id,
+            "market": "US",
+            "primary_domain": "example.com",
+            "matched_domains": ["example.com"],
+            "candidates": candidates,
+        }
+
+    actions = [
+        {"action": "created", "seed_id": "eps_1", "canonical_url": candidates[0]["storefront_url"]},
+        {"action": "updated", "seed_id": "eps_2", "canonical_url": candidates[1]["storefront_url"]},
+        {"action": "skipped", "seed_id": "eps_3", "canonical_url": candidates[2]["storefront_url"]},
+    ]
+
+    async def fake_upsert(candidate, *, employee_id=None):
+        assert employee_id == "emp_test"
+        return actions.pop(0)
+
+    monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module, "_fetch_storefront_referral_seed_candidates", fake_candidates)
+    monkeypatch.setattr(employee_products_module, "_upsert_storefront_referral_seed_candidate", fake_upsert)
+
+    res = client.post(
+        "/employee/products/external-seeds/backfill-storefront",
+        headers={"Authorization": "Bearer test-token"},
+        json={"merchant_id": "merch_1", "dry_run": False},
+    )
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["status"] == "success"
+    assert payload["dry_run"] is False
+    assert payload["candidate_count"] == 3
+    assert payload["created"] == 1
+    assert payload["updated"] == 1
+    assert payload["skipped"] == 1
+
+
 def test_update_external_seed_supports_audit_review_edits(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
     import routes.employee_products as employee_products_module
 

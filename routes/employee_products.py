@@ -54,6 +54,7 @@ from services.external_seed_audit import (
 from services.external_referral_readiness import (
     fetch_merchant_referral_inventory,
     filter_referral_inventory_rows,
+    get_merchant_referral_domains,
 )
 from services.pci_kb_scope_review import (
     REVIEW_DECISION_RESOLVED,
@@ -1297,6 +1298,13 @@ class PreviewExternalSeedRequest(BaseModel):
     force_refresh: bool = False
 
 
+class BackfillStorefrontExternalSeedsRequest(BaseModel):
+    merchant_id: str = Field(..., min_length=1)
+    market: Optional[str] = None
+    limit: int = Field(default=50, ge=1, le=200)
+    dry_run: bool = False
+
+
 class ExternalSeedsCsvImportResponse(BaseModel):
     created: int
     updated: int = 0
@@ -1365,6 +1373,448 @@ def _normalize_seed_availability(raw: Any) -> Optional[str]:
     if v in {"out of stock", "out_of_stock", "outofstock", "sold out", "sold_out", "unavailable"}:
         return "out_of_stock"
     return v.replace(" ", "_")
+
+
+_CURRENCY_TO_REFERRAL_MARKET = {
+    "USD": "US",
+    "SGD": "SG",
+    "JPY": "JP",
+    "EUR": "EU-DE",
+}
+
+
+def _extract_storefront_handle(product_data: Dict[str, Any]) -> Optional[str]:
+    raw = _ensure_dict(product_data.get("raw"))
+    platform_metadata = _ensure_dict(product_data.get("platform_metadata"))
+    for candidate in (
+        product_data.get("handle"),
+        raw.get("handle"),
+        platform_metadata.get("handle"),
+    ):
+        value = str(candidate or "").strip().strip("/")
+        if value:
+            return value
+    return None
+
+
+def _extract_storefront_description(product_data: Dict[str, Any]) -> Optional[str]:
+    raw = _ensure_dict(product_data.get("raw"))
+    for candidate in (
+        product_data.get("description"),
+        product_data.get("description_raw"),
+        product_data.get("body_html"),
+        raw.get("body_html"),
+        raw.get("bodyHtml"),
+        raw.get("description"),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _extract_storefront_image_urls(product_data: Dict[str, Any]) -> List[str]:
+    raw = _ensure_dict(product_data.get("raw"))
+    candidates: List[str] = []
+    image_url = product_data.get("image_url")
+    if isinstance(image_url, str) and image_url.strip():
+        candidates.append(image_url.strip())
+    images = product_data.get("images")
+    if isinstance(images, list):
+        candidates.extend(str(item).strip() for item in images if isinstance(item, str) and str(item).strip())
+    raw_image = _ensure_dict(raw.get("image"))
+    raw_image_src = str(raw_image.get("src") or "").strip()
+    if raw_image_src:
+        candidates.append(raw_image_src)
+    raw_images = raw.get("images")
+    if isinstance(raw_images, list):
+        for item in raw_images:
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("src") or item.get("url") or "").strip()
+            if src:
+                candidates.append(src)
+    return _dedupe_seed_image_urls(candidates, limit=20)
+
+
+def _availability_from_product_summary(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return "in_stock" if value else "out_of_stock"
+    return _normalize_seed_availability(value)
+
+
+def _build_storefront_seed_variants(
+    *,
+    product_data: Dict[str, Any],
+    product_summary: Dict[str, Any],
+    fallback_image_url: Optional[str],
+) -> List[Dict[str, Any]]:
+    variants: List[Dict[str, Any]] = []
+    try:
+        sp = StandardProduct.model_validate(product_data)
+        for variant in sp.variants or []:
+            inventory_quantity = int(variant.inventory_quantity or 0)
+            availability = "in_stock" if inventory_quantity > 0 else "out_of_stock"
+            variants.append(
+                {
+                    "variant_id": str(variant.variant_id or variant.id),
+                    "id": str(variant.id),
+                    "sku": str(variant.sku or "").strip() or None,
+                    "title": str(variant.title or "").strip() or "Default",
+                    "price_amount": float(variant.price) if variant.price is not None else None,
+                    "currency": str(sp.currency or "").strip() or None,
+                    "availability": availability,
+                    "inventory_quantity": inventory_quantity,
+                    "image_url": str(variant.image_url or fallback_image_url or "").strip() or None,
+                }
+            )
+    except Exception:
+        variants = []
+
+    if variants:
+        return variants
+
+    fallback_price = product_summary.get("price")
+    if fallback_price is None:
+        return []
+
+    availability = _availability_from_product_summary(product_summary.get("availability")) or "in_stock"
+    variant_id = (
+        str(product_data.get("variant_id") or "").strip()
+        or str(product_data.get("product_id") or product_data.get("id") or "").strip()
+        or "default"
+    )
+    return [
+        {
+            "variant_id": variant_id,
+            "id": variant_id,
+            "sku": str(product_data.get("sku") or "").strip() or None,
+            "title": "Default",
+            "price_amount": fallback_price,
+            "currency": product_summary.get("currency"),
+            "availability": availability,
+            "inventory_quantity": int(product_data.get("inventory_quantity") or 0),
+            "image_url": str(fallback_image_url or "").strip() or None,
+        }
+    ]
+
+
+def _infer_storefront_referral_market(candidates: List[Dict[str, Any]], explicit_market: Optional[str]) -> str:
+    if explicit_market:
+        return _normalize_market(explicit_market)
+    counts: Dict[str, int] = {}
+    for candidate in candidates:
+        currency = str(candidate.get("price_currency") or "").strip().upper()
+        market = _CURRENCY_TO_REFERRAL_MARKET.get(currency)
+        if not market:
+            continue
+        counts[market] = int(counts.get(market) or 0) + 1
+    if not counts:
+        return "US"
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+async def _fetch_storefront_referral_seed_candidates(
+    *,
+    merchant_id: str,
+    limit: int,
+    market: Optional[str],
+) -> Dict[str, Any]:
+    matched_domains = await get_merchant_referral_domains(merchant_id)
+    primary_domain = matched_domains[0] if matched_domains else None
+    if not primary_domain:
+        return {
+            "merchant_id": merchant_id,
+            "matched_domains": matched_domains,
+            "primary_domain": None,
+            "market": _normalize_market(market),
+            "candidates": [],
+        }
+
+    row_limit = max(int(limit or 50) * 8, 200)
+    latest_rows = await database.fetch_all(
+        """
+        SELECT merchant_id, platform, platform_product_id, product_data, cached_at, expires_at
+        FROM (
+          SELECT DISTINCT ON (platform, platform_product_id)
+            merchant_id,
+            platform,
+            platform_product_id,
+            product_data,
+            cached_at,
+            expires_at,
+            id
+          FROM products_cache
+          WHERE merchant_id = :merchant_id
+            AND platform = 'shopify'
+          ORDER BY platform, platform_product_id, cached_at DESC NULLS LAST, id DESC NULLS LAST
+        ) latest
+        ORDER BY cached_at DESC NULLS LAST
+        LIMIT :limit
+        """,
+        {"merchant_id": merchant_id, "limit": row_limit},
+    )
+
+    candidates: List[Dict[str, Any]] = []
+    for row in latest_rows or []:
+        row_dict = dict(row or {})
+        product_data = _ensure_dict(row_dict.get("product_data"))
+        handle = _extract_storefront_handle(product_data)
+        if not handle:
+            continue
+        attached_product_key = f"{merchant_id}|shopify|{row_dict.get('platform_product_id')}"
+        storefront_url = _normalize_seed_url_for_id(f"https://{primary_domain}/products/{handle}")
+        product_summary = _extract_product_summary(product_data, str(row_dict.get("platform_product_id") or ""))
+        image_urls = _extract_storefront_image_urls(product_data)
+        image_url = image_urls[0] if image_urls else product_summary.get("image_url")
+        variants = _build_storefront_seed_variants(
+            product_data=product_data,
+            product_summary=product_summary,
+            fallback_image_url=image_url,
+        )
+        if not variants:
+            continue
+        title = str(product_summary.get("title") or "").strip()
+        if not title:
+            continue
+        availability = (
+            _availability_from_product_summary(product_summary.get("availability"))
+            or variants[0].get("availability")
+            or "in_stock"
+        )
+        candidates.append(
+            {
+                "merchant_id": merchant_id,
+                "platform": "shopify",
+                "platform_product_id": str(row_dict.get("platform_product_id") or "").strip(),
+                "attached_product_key": attached_product_key,
+                "storefront_url": storefront_url,
+                "domain": primary_domain,
+                "title": title,
+                "description": _extract_storefront_description(product_data),
+                "image_url": image_url,
+                "image_urls": image_urls,
+                "price_amount": product_summary.get("price"),
+                "price_currency": str(product_summary.get("currency") or "").strip().upper() or None,
+                "availability": availability,
+                "variants": variants,
+                "merchant_display_name": str(product_data.get("vendor") or "").strip() or None,
+                "brand": str(product_data.get("vendor") or "").strip() or None,
+                "category": str(product_data.get("product_type") or "").strip() or None,
+                "product_id": str(product_summary.get("product_id") or row_dict.get("platform_product_id") or "").strip() or None,
+            }
+        )
+        if len(candidates) >= int(limit or 50):
+            break
+
+    resolved_market = _infer_storefront_referral_market(candidates, market)
+    for candidate in candidates:
+        candidate["market"] = resolved_market
+        candidate["external_product_id"] = _stable_external_product_id(candidate["storefront_url"])
+
+    return {
+        "merchant_id": merchant_id,
+        "matched_domains": matched_domains,
+        "primary_domain": primary_domain,
+        "market": resolved_market,
+        "candidates": candidates,
+    }
+
+
+async def _upsert_storefront_referral_seed_candidate(
+    candidate: Dict[str, Any],
+    *,
+    employee_id: Optional[str],
+) -> Dict[str, Any]:
+    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
+    storefront_url = str(candidate.get("storefront_url") or "").strip()
+    external_product_id = str(candidate.get("external_product_id") or "").strip()
+    market = _normalize_market(candidate.get("market"))
+    tool = "*"
+
+    existing_row = await database.fetch_one(
+        """
+        SELECT *
+        FROM external_product_seeds
+        WHERE status = 'active'
+          AND (
+            attached_product_key = :attached_product_key
+            OR external_product_id = :external_product_id
+            OR canonical_url = :canonical_url
+            OR destination_url = :canonical_url
+          )
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        {
+            "attached_product_key": attached_product_key,
+            "external_product_id": external_product_id,
+            "canonical_url": storefront_url,
+        },
+    )
+
+    seed_data = {
+        "external_product_id": external_product_id,
+        "merchant_display_name": candidate.get("merchant_display_name"),
+        "product_id": candidate.get("product_id"),
+        "brand": candidate.get("brand"),
+        "category": candidate.get("category"),
+        "title": candidate.get("title"),
+        "description": candidate.get("description"),
+        "image_url": candidate.get("image_url"),
+        "image_urls": _dedupe_seed_image_urls(list(candidate.get("image_urls") or []), limit=20),
+        "availability": candidate.get("availability"),
+        "variants": list(candidate.get("variants") or []),
+        "utm_template": DEFAULT_UTM_TEMPLATE,
+        "partner_type": "merchant_storefront",
+        "disclosure_text": DEFAULT_DISCLOSURE_TEXT,
+        "source": "employee_storefront_seed_backfill",
+        "product": {
+            "product_id": candidate.get("product_id"),
+            "brand": candidate.get("brand"),
+            "category": candidate.get("category"),
+            "platform": candidate.get("platform"),
+            "platform_product_id": candidate.get("platform_product_id"),
+        },
+        "snapshot": {
+            "canonical_url": storefront_url,
+            "destination_url": storefront_url,
+            "domain": candidate.get("domain"),
+            "title": candidate.get("title"),
+            "description": candidate.get("description"),
+            "image_url": candidate.get("image_url"),
+            "image_urls": _dedupe_seed_image_urls(list(candidate.get("image_urls") or []), limit=20),
+            "price_amount": candidate.get("price_amount"),
+            "price_currency": candidate.get("price_currency"),
+            "availability": candidate.get("availability"),
+            "variants": list(candidate.get("variants") or []),
+        },
+    }
+
+    values = {
+        "external_product_id": external_product_id,
+        "market": market,
+        "tool": tool,
+        "utm_template": DEFAULT_UTM_TEMPLATE,
+        "partner_type": "merchant_storefront",
+        "disclosure_text": DEFAULT_DISCLOSURE_TEXT,
+        "destination_url": storefront_url,
+        "canonical_url": storefront_url,
+        "domain": candidate.get("domain"),
+        "title": candidate.get("title"),
+        "image_url": candidate.get("image_url"),
+        "price_amount": candidate.get("price_amount"),
+        "price_currency": candidate.get("price_currency"),
+        "availability": candidate.get("availability"),
+        "seed_data": _seed_data_payload(seed_data),
+        "notes": "storefront_seed_backfill",
+        "created_by_employee_id": str(employee_id) if employee_id else None,
+        "attached_product_key": attached_product_key,
+        "attached_variant_id": None,
+    }
+
+    if existing_row:
+        row = dict(existing_row)
+        if row.get("attached_product_key") and row.get("attached_product_key") == attached_product_key:
+            existing_url = str(row.get("canonical_url") or row.get("destination_url") or "").strip()
+            if existing_url and existing_url != storefront_url:
+                return {
+                    "action": "skipped",
+                    "reason": "custom_attached_seed_destination",
+                    "seed_id": row.get("id"),
+                    "external_product_id": external_product_id,
+                    "attached_product_key": attached_product_key,
+                    "canonical_url": existing_url,
+                    "title": row.get("title") or candidate.get("title"),
+                }
+
+        await _execute_seed_data_stmt(
+            """
+            UPDATE external_product_seeds
+            SET external_product_id = :external_product_id,
+                market = :market,
+                tool = :tool,
+                utm_template = :utm_template,
+                partner_type = :partner_type,
+                disclosure_text = :disclosure_text,
+                destination_url = :destination_url,
+                canonical_url = :canonical_url,
+                domain = :domain,
+                title = :title,
+                image_url = :image_url,
+                price_amount = :price_amount,
+                price_currency = :price_currency,
+                availability = :availability,
+                seed_data = :seed_data,
+                notes = :notes,
+                created_by_employee_id = :created_by_employee_id,
+                attached_product_key = :attached_product_key,
+                attached_variant_id = :attached_variant_id,
+                updated_at = NOW()
+            WHERE id = :id
+            """,
+            {
+                **values,
+                "id": row.get("id"),
+            },
+        )
+        seed_id = str(row.get("id") or "").strip()
+        action = "updated"
+    else:
+        seed_id = _seed_id()
+        await _execute_seed_data_stmt(
+            """
+            INSERT INTO external_product_seeds (
+              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+              destination_url, canonical_url, domain, title, image_url,
+              price_amount, price_currency, availability,
+              seed_data,
+              status, notes, created_by_employee_id, attached_product_key, attached_variant_id
+            ) VALUES (
+              :id, :external_product_id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
+              :destination_url, :canonical_url, :domain, :title, :image_url,
+              :price_amount, :price_currency, :availability,
+              :seed_data,
+              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id
+            )
+            """,
+            {
+                **values,
+                "id": seed_id,
+            },
+        )
+        action = "created"
+
+    await database.execute(
+        """
+        UPDATE external_product_seeds
+        SET status = 'disabled',
+            notes = COALESCE(notes, '') || :note,
+            updated_at = NOW()
+        WHERE id <> :id
+          AND status = 'active'
+          AND (
+            attached_product_key = :attached_product_key
+            OR canonical_url = :canonical_url
+            OR destination_url = :canonical_url
+          )
+        """,
+        {
+            "id": seed_id,
+            "attached_product_key": attached_product_key,
+            "canonical_url": storefront_url,
+            "note": f" superseded_by:{seed_id}",
+        },
+    )
+
+    return {
+        "action": action,
+        "seed_id": seed_id,
+        "external_product_id": external_product_id,
+        "attached_product_key": attached_product_key,
+        "canonical_url": storefront_url,
+        "title": candidate.get("title"),
+    }
 
 
 async def _run_external_seed_import_task(
@@ -2582,6 +3032,77 @@ async def get_external_seed_audit(
     return {
         "status": "success",
         "item": item,
+    }
+
+
+@router.post("/external-seeds/backfill-storefront")
+async def backfill_storefront_external_seeds(
+    body: BackfillStorefrontExternalSeedsRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    await _ensure_external_seeds_table()
+    merchant_id = str(body.merchant_id or "").strip()
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="MERCHANT_ID_REQUIRED")
+
+    candidate_bundle = await _fetch_storefront_referral_seed_candidates(
+        merchant_id=merchant_id,
+        limit=body.limit,
+        market=body.market,
+    )
+    candidates = list(candidate_bundle.get("candidates") or [])
+    if body.dry_run:
+        return {
+            "status": "success",
+            "merchant_id": merchant_id,
+            "market": candidate_bundle.get("market"),
+            "primary_domain": candidate_bundle.get("primary_domain"),
+            "matched_domains": candidate_bundle.get("matched_domains") or [],
+            "dry_run": True,
+            "candidate_count": len(candidates),
+            "created": 0,
+            "updated": 0,
+            "skipped": 0,
+            "items": [
+                {
+                    "action": "preview",
+                    "attached_product_key": candidate.get("attached_product_key"),
+                    "canonical_url": candidate.get("storefront_url"),
+                    "title": candidate.get("title"),
+                    "external_product_id": candidate.get("external_product_id"),
+                }
+                for candidate in candidates[:20]
+            ],
+        }
+
+    employee_id = _employee_id_from_user(current_user)
+    created = 0
+    updated = 0
+    skipped = 0
+    items: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        result = await _upsert_storefront_referral_seed_candidate(candidate, employee_id=employee_id)
+        items.append(result)
+        action = str(result.get("action") or "")
+        if action == "created":
+            created += 1
+        elif action == "updated":
+            updated += 1
+        else:
+            skipped += 1
+
+    return {
+        "status": "success",
+        "merchant_id": merchant_id,
+        "market": candidate_bundle.get("market"),
+        "primary_domain": candidate_bundle.get("primary_domain"),
+        "matched_domains": candidate_bundle.get("matched_domains") or [],
+        "dry_run": False,
+        "candidate_count": len(candidates),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "items": items[:20],
     }
 
 
