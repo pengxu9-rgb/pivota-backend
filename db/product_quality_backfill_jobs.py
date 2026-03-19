@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -52,6 +53,16 @@ def _utcnow() -> datetime:
 
 def _json_type_sql() -> str:
     return "JSONB" if IS_POSTGRES else "JSON"
+
+
+def _json_assignment_sql() -> str:
+    if IS_POSTGRES:
+        return "CAST(:errors_sample AS JSONB)"
+    return ":errors_sample"
+
+
+def _json_param(value: Any) -> str:
+    return json.dumps(value if value is not None else [])
 
 
 def _normalize_row(row: Any) -> Optional[Dict[str, Any]]:
@@ -235,8 +246,8 @@ async def update_quality_backfill_job_progress(
         assignments.append("failed = :failed")
         values["failed"] = failed
     if errors_sample is not None:
-        assignments.append("errors_sample = :errors_sample")
-        values["errors_sample"] = errors_sample
+        assignments.append(f"errors_sample = {_json_assignment_sql()}")
+        values["errors_sample"] = _json_param(errors_sample)
 
     if not assignments:
         return await get_quality_backfill_job(job_id)
@@ -266,12 +277,12 @@ async def complete_quality_backfill_job(
         "job_id": job_id,
         "status": status,
         "finished_at": _utcnow(),
-        "errors_sample": errors_sample or [],
+        "errors_sample": _json_param(errors_sample),
     }
     assignments = [
         "status = :status",
         "finished_at = :finished_at",
-        "errors_sample = :errors_sample",
+        f"errors_sample = {_json_assignment_sql()}",
     ]
     if total_candidates is not None:
         assignments.append("total_candidates = :total_candidates")
