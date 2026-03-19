@@ -19,6 +19,8 @@ In one sentence:
 
 That is good enough for a merchant-facing workspace v1. It is not yet sufficient as the long-term product and engineering control plane.
 
+This document is primarily about the merchant-facing optimization workspace for `internal commerce`. As of March 19, 2026, production also supports `external referral` surfaces through employee-managed external seeds and tracked outbound redirects, but those surfaces are not yet first-class in the optimization plan contract. See `UNIFIED_READINESS_SCORECARD.md` for the dual-track audit that combines internal commerce and external referral into one readiness framing.
+
 ## Initial Landing State
 
 The first implementation step is now landed in backend code:
@@ -132,11 +134,25 @@ And three issue classes:
 
 This distinction matters because most current readiness logic is strongest in stage 1, partially covers stage 2, and only selectively covers stage 3.
 
+## Dual-Track Scope Note
+
+The funnel model above is still most mature for `internal commerce`, where Pivota owns the product, checkout, and operational loop.
+
+Production also has a second agent-compatible surface:
+
+- `External Referral`
+  - employee-managed external seeds
+  - tracked redirects
+  - no-checkout handoff to merchant or partner destinations
+
+That external referral track is already real in runtime code, but it is not yet represented as a first-class merchant-safe readiness contract. The current `OptimizationPlan` and `MerchantReadinessOptimizationPayload` should therefore be treated as `internal-commerce-first` until referral-specific status and issue buckets are added.
+
 ## Goals
 
 - Keep the dashboard compact and decision-light.
 - Project internal readiness findings into a merchant-safe optimization plan.
 - Separate eligibility fixing from exposure and conversion lifting.
+- Avoid conflating `referral-ready` with `checkout-ready`.
 - Make optimization work explainable, auditable, and attributable.
 - Reuse the current product enrichment and quality machinery while introducing a cleaner orchestration boundary.
 - Create a controlled insertion point for future LLM-powered optimization.
@@ -147,6 +163,7 @@ This distinction matters because most current readiness logic is strongest in st
 - Exposing raw internal readiness reports directly to merchants.
 - Letting LLM mutate canonical price, inventory, checkout, policy, or order state.
 - Treating the product optimization workspace as the public contract for order execution.
+- Fully specifying the external referral readiness contract in this document.
 
 ## Architecture Principles
 
