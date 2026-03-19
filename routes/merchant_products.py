@@ -132,7 +132,7 @@ async def list_merchant_products(
     count_row = await database.fetch_one(count_query)
     total = 0
     if count_row is not None:
-        if hasattr(count_row, "get"):
+        if isinstance(count_row, dict):
             total = int(count_row.get("total") or 0)
         else:
             total = int(dict(count_row).get("total") or 0)
