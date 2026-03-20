@@ -440,6 +440,53 @@ def test_employee_merchant_commerce_cohort_summary_route(monkeypatch):
     app.dependency_overrides.clear()
 
 
+def test_employee_merchant_commerce_readiness_list_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_build():
+        return {
+            "generated_at": "2026-03-20T00:00:00+00:00",
+            "total_registered_merchants": 3,
+            "merchant_valid_count": 2,
+            "rollout_ready_count": 1,
+            "attention_count": 2,
+            "merchants": [
+                {
+                    "merchant_id": "merch_red",
+                    "business_name": "Red Merchant",
+                    "status": "red",
+                    "merchant_valid": False,
+                    "rollout_ready": False,
+                    "store_count": 0,
+                    "connected_store_domain_count": 0,
+                    "catalog_product_count": 0,
+                    "psp_connected": False,
+                    "psp_provider_count": 0,
+                    "psp_providers": [],
+                    "paid_orders_last_30_days": 0,
+                    "all_time_paid_orders": 0,
+                    "invalid_reasons": ["missing_store_domain"],
+                    "operator_action": "Connect a real merchant store domain before treating this merchant as rollout-valid.",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(module, "build_merchant_commerce_readiness_list", fake_build)
+
+    response = client.get(
+        "/employee/merchant-commerce/readiness-list",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["attention_count"] == 2
+    assert payload["data"]["merchants"][0]["status"] == "red"
+
+    app.dependency_overrides.clear()
+
+
 def test_employee_referral_readiness_fleet_summary_route_alias(monkeypatch):
     module, app, client = _build_client_with_employee_override()
 

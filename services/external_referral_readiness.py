@@ -161,6 +161,35 @@ class MerchantCommerceCohortSummary:
     top_invalid_merchants: List[Dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class MerchantCommerceReadinessListItem:
+    merchant_id: str
+    business_name: str
+    status: str
+    merchant_valid: bool
+    rollout_ready: bool
+    store_count: int
+    connected_store_domain_count: int
+    catalog_product_count: int
+    psp_connected: bool
+    psp_provider_count: int
+    psp_providers: List[str]
+    paid_orders_last_30_days: int
+    all_time_paid_orders: int
+    invalid_reasons: List[str]
+    operator_action: str
+
+
+@dataclass(frozen=True)
+class MerchantCommerceReadinessListSummary:
+    generated_at: str
+    total_registered_merchants: int
+    merchant_valid_count: int
+    rollout_ready_count: int
+    attention_count: int
+    merchants: List[Dict[str, Any]]
+
+
 def _record_metric(name: str, delta: int = 1) -> None:
     with _REFERRAL_METRICS_LOCK:
         _REFERRAL_METRICS[name] = int(_REFERRAL_METRICS.get(name) or 0) + int(delta)
@@ -433,6 +462,36 @@ async def _fetch_active_psp_providers_by_merchant() -> Dict[str, List[str]]:
         seen_pairs.add(pair)
         providers_by_merchant.setdefault(merchant_id, []).append(provider)
     return providers_by_merchant
+
+
+async def _fetch_paid_order_evidence_by_merchant() -> Dict[str, Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT
+            merchant_id,
+            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days'
+                     AND payment_status IN ('paid','completed','succeeded','success','settled','partially_refunded')
+                     THEN 1 ELSE 0 END) AS paid_orders_last_30_days,
+            SUM(CASE WHEN payment_status IN ('paid','completed','succeeded','success','settled','partially_refunded')
+                     THEN 1 ELSE 0 END) AS paid_orders_all_time
+        FROM orders
+        WHERE merchant_id IS NOT NULL
+          AND TRIM(merchant_id) != ''
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        GROUP BY merchant_id
+        """
+    )
+    evidence_by_merchant: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        row_dict = _row_to_dict(row)
+        merchant_id = str(row_dict.get("merchant_id") or "").strip()
+        if not merchant_id:
+            continue
+        evidence_by_merchant[merchant_id] = {
+            "paid_orders_last_30_days": int(row_dict.get("paid_orders_last_30_days") or 0),
+            "paid_orders_all_time": int(row_dict.get("paid_orders_all_time") or 0),
+        }
+    return evidence_by_merchant
 
 
 async def _fetch_all_active_referral_seed_rows() -> List[Dict[str, Any]]:
@@ -1151,6 +1210,133 @@ async def build_merchant_commerce_cohort_summary() -> Dict[str, Any]:
             merchant_valid_count=merchant_valid_count,
             merchant_invalid_count=max(0, total_registered_merchants - merchant_valid_count),
             top_invalid_merchants=sorted(invalid_rows, key=_merchant_invalid_sort_key)[:8],
+        )
+    )
+
+
+def _merchant_commerce_status(*, merchant_valid: bool, order_payment_loop_observed: bool) -> str:
+    if merchant_valid and order_payment_loop_observed:
+        return "green"
+    if merchant_valid:
+        return "yellow"
+    return "red"
+
+
+def _merchant_commerce_list_sort_key(row: Dict[str, Any]) -> Tuple[int, str]:
+    status = str(row.get("status") or "").lower()
+    if status == "red":
+        priority = 0
+    elif status == "yellow":
+        priority = 1
+    else:
+        priority = 2
+    return (
+        priority,
+        str(row.get("business_name") or row.get("merchant_id") or "").lower(),
+    )
+
+
+async def build_merchant_commerce_readiness_list() -> Dict[str, Any]:
+    merchants = await get_all_merchant_onboardings(include_deleted=False)
+    if not merchants:
+        return asdict(
+            MerchantCommerceReadinessListSummary(
+                generated_at=datetime.now(timezone.utc).isoformat(),
+                total_registered_merchants=0,
+                merchant_valid_count=0,
+                rollout_ready_count=0,
+                attention_count=0,
+                merchants=[],
+            )
+        )
+
+    product_counts_by_merchant, domains_by_merchant, psp_providers_by_merchant, paid_order_evidence_by_merchant = await asyncio.gather(
+        _fetch_catalog_product_counts_by_merchant(),
+        _fetch_store_domains_by_merchant(),
+        _fetch_active_psp_providers_by_merchant(),
+        _fetch_paid_order_evidence_by_merchant(),
+    )
+
+    rows: List[Dict[str, Any]] = []
+    merchant_valid_count = 0
+    rollout_ready_count = 0
+
+    for merchant in merchants:
+        merchant_id = str(merchant.get("merchant_id") or "").strip()
+        if not merchant_id:
+            continue
+
+        store_domains = list(domains_by_merchant.get(merchant_id) or [])
+        store_count = len(store_domains)
+        catalog_product_count = int(product_counts_by_merchant.get(merchant_id) or 0)
+        psp_providers = list(psp_providers_by_merchant.get(merchant_id) or [])
+        onboarding_psp = bool(merchant.get("psp_connected"))
+        if onboarding_psp and str(merchant.get("psp_type") or "").strip():
+            psp_type = str(merchant.get("psp_type") or "").strip().lower()
+            if psp_type not in psp_providers:
+                psp_providers.append(psp_type)
+
+        evidence = dict(paid_order_evidence_by_merchant.get(merchant_id) or {})
+        paid_orders_last_30_days = int(evidence.get("paid_orders_last_30_days") or 0)
+        all_time_paid_orders = int(evidence.get("paid_orders_all_time") or 0)
+
+        has_store_domain = store_count > 0
+        has_catalog_products = catalog_product_count > 0
+        has_psp = onboarding_psp or bool(psp_providers)
+        order_payment_loop_observed = all_time_paid_orders > 0
+        merchant_valid = has_store_domain and has_catalog_products and has_psp
+        status = _merchant_commerce_status(
+            merchant_valid=merchant_valid,
+            order_payment_loop_observed=order_payment_loop_observed,
+        )
+
+        invalid_reasons, operator_action = _merchant_invalid_action_and_reasons(
+            has_store_domain=has_store_domain,
+            has_catalog_products=has_catalog_products,
+            has_psp=has_psp,
+        )
+        if merchant_valid and not order_payment_loop_observed:
+            operator_action = "Run a real order and verify paid order evidence before rollout."
+
+        if merchant_valid:
+            merchant_valid_count += 1
+        if merchant_valid and order_payment_loop_observed:
+            rollout_ready_count += 1
+
+        rows.append(
+            asdict(
+                MerchantCommerceReadinessListItem(
+                    merchant_id=merchant_id,
+                    business_name=str(merchant.get("business_name") or merchant_id),
+                    status=status,
+                    merchant_valid=merchant_valid,
+                    rollout_ready=merchant_valid and order_payment_loop_observed,
+                    store_count=store_count,
+                    connected_store_domain_count=store_count,
+                    catalog_product_count=catalog_product_count,
+                    psp_connected=has_psp,
+                    psp_provider_count=len(psp_providers),
+                    psp_providers=sorted(psp_providers),
+                    paid_orders_last_30_days=paid_orders_last_30_days,
+                    all_time_paid_orders=all_time_paid_orders,
+                    invalid_reasons=invalid_reasons,
+                    operator_action=operator_action,
+                )
+            )
+        )
+
+    sorted_rows = sorted(rows, key=_merchant_commerce_list_sort_key)
+    total_registered_merchants = len(sorted_rows)
+    attention_count = max(0, total_registered_merchants - rollout_ready_count)
+
+    return asdict(
+        MerchantCommerceReadinessListSummary(
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            total_registered_merchants=total_registered_merchants,
+            merchant_valid_count=merchant_valid_count,
+            rollout_ready_count=rollout_ready_count,
+            attention_count=attention_count,
+            merchants=sorted_rows,
         )
     )
 

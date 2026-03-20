@@ -17,6 +17,7 @@ from readiness.summary import (
 from services.external_referral_readiness import (
     build_external_referral_fleet_summary,
     build_merchant_commerce_cohort_summary,
+    build_merchant_commerce_readiness_list,
     build_external_referral_summary,
     build_platform_fallback_program_summary,
 )
@@ -902,6 +903,29 @@ async def get_employee_merchant_commerce_cohort_summary(
                 "merchant_valid_count": 0,
                 "merchant_invalid_count": 0,
                 "top_invalid_merchants": [],
+            },
+        }
+
+
+@router.get("/employee/merchant-commerce/readiness-list")
+async def get_employee_merchant_commerce_readiness_list(
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe queue of merchant-valid commerce readiness states."""
+    try:
+        summary = await build_merchant_commerce_readiness_list()
+        return {"status": "success", "data": summary}
+    except Exception as e:
+        print(f"Error fetching employee merchant commerce readiness list: {e}")
+        return {
+            "status": "success",
+            "data": {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "total_registered_merchants": 0,
+                "merchant_valid_count": 0,
+                "rollout_ready_count": 0,
+                "attention_count": 0,
+                "merchants": [],
             },
         }
 

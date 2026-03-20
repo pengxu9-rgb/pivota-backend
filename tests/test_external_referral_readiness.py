@@ -372,3 +372,84 @@ async def test_build_merchant_commerce_cohort_summary_uses_store_catalog_and_psp
     assert summary["merchant_invalid_count"] == 2
     assert summary["top_invalid_merchants"][0]["merchant_id"] == "merch_missing_psp"
     assert "missing_psp_or_checkout" in summary["top_invalid_merchants"][0]["invalid_reasons"]
+
+
+@pytest.mark.asyncio
+async def test_build_merchant_commerce_readiness_list_distinguishes_red_yellow_green(monkeypatch):
+    from services import external_referral_readiness as module
+
+    async def fake_get_all_merchant_onboardings(include_deleted: bool = False):
+        assert include_deleted is False
+        return [
+            {
+                "merchant_id": "merch_green",
+                "business_name": "Green Merchant",
+                "psp_connected": True,
+                "psp_type": "stripe",
+            },
+            {
+                "merchant_id": "merch_yellow",
+                "business_name": "Yellow Merchant",
+                "psp_connected": True,
+                "psp_type": "checkout",
+            },
+            {
+                "merchant_id": "merch_red",
+                "business_name": "Red Merchant",
+                "psp_connected": False,
+                "psp_type": None,
+            },
+        ]
+
+    async def fake_fetch_catalog_counts():
+        return {
+            "merch_green": 120,
+            "merch_yellow": 85,
+            "merch_red": 0,
+        }
+
+    async def fake_fetch_store_domains():
+        return {
+            "merch_green": ["green.example"],
+            "merch_yellow": ["yellow.example"],
+            "merch_red": [],
+        }
+
+    async def fake_fetch_psps():
+        return {
+            "merch_green": ["stripe"],
+            "merch_yellow": ["checkout"],
+        }
+
+    async def fake_paid_evidence():
+        return {
+            "merch_green": {"paid_orders_last_30_days": 5, "paid_orders_all_time": 11},
+            "merch_yellow": {"paid_orders_last_30_days": 0, "paid_orders_all_time": 0},
+        }
+
+    monkeypatch.setattr(module, "get_all_merchant_onboardings", fake_get_all_merchant_onboardings)
+    monkeypatch.setattr(module, "_fetch_catalog_product_counts_by_merchant", fake_fetch_catalog_counts)
+    monkeypatch.setattr(module, "_fetch_store_domains_by_merchant", fake_fetch_store_domains)
+    monkeypatch.setattr(module, "_fetch_active_psp_providers_by_merchant", fake_fetch_psps)
+    monkeypatch.setattr(module, "_fetch_paid_order_evidence_by_merchant", fake_paid_evidence)
+
+    summary = await module.build_merchant_commerce_readiness_list()
+
+    assert summary["total_registered_merchants"] == 3
+    assert summary["merchant_valid_count"] == 2
+    assert summary["rollout_ready_count"] == 1
+    assert summary["attention_count"] == 2
+
+    rows = {row["merchant_id"]: row for row in summary["merchants"]}
+    assert rows["merch_green"]["status"] == "green"
+    assert rows["merch_green"]["rollout_ready"] is True
+    assert rows["merch_green"]["paid_orders_last_30_days"] == 5
+
+    assert rows["merch_yellow"]["status"] == "yellow"
+    assert rows["merch_yellow"]["merchant_valid"] is True
+    assert rows["merch_yellow"]["rollout_ready"] is False
+    assert rows["merch_yellow"]["invalid_reasons"] == []
+
+    assert rows["merch_red"]["status"] == "red"
+    assert rows["merch_red"]["merchant_valid"] is False
+    assert "missing_store_domain" in rows["merch_red"]["invalid_reasons"]
