@@ -1938,6 +1938,111 @@ async def _handle_offers_resolve(
         )
         return list(rows or [])
 
+    async def _prefetch_canonical_internal_context() -> Optional[Dict[str, Any]]:
+        if merchant_scope or (not product_id_aliases and not sku_id_aliases):
+            return None
+
+        rows: List[Any] = []
+        if product_id_aliases:
+            rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT merchant_id, platform, platform_product_id, product_data
+                    FROM products_cache
+                    WHERE (expires_at IS NULL OR expires_at > NOW())
+                      AND (
+                        platform_product_id = ANY(:pid_aliases)
+                        OR product_data->>'id' = ANY(:pid_aliases)
+                        OR product_data->>'product_id' = ANY(:pid_aliases)
+                      )
+                    ORDER BY cached_at DESC
+                    LIMIT 20
+                    """,
+                    {
+                        "pid_aliases": product_id_aliases,
+                    },
+                ),
+                timeout=min(OFFERS_RESOLVE_INTERNAL_PID_QUERY_TIMEOUT_SECONDS, 0.5),
+            )
+
+        if not rows and sku_id_aliases:
+            rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT merchant_id, platform, platform_product_id, product_data
+                    FROM products_cache
+                    WHERE (expires_at IS NULL OR expires_at > NOW())
+                      AND EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(
+                          CASE
+                            WHEN jsonb_typeof(product_data::jsonb->'variants') = 'array'
+                            THEN product_data::jsonb->'variants'
+                            ELSE '[]'::jsonb
+                          END
+                        ) AS variant
+                        WHERE COALESCE(
+                          variant->>'variant_id',
+                          variant->>'id',
+                          variant->>'sku',
+                          variant->>'sku_id'
+                        ) = ANY(:sku_aliases)
+                      )
+                    ORDER BY cached_at DESC
+                    LIMIT 20
+                    """,
+                    {
+                        "sku_aliases": sku_id_aliases,
+                    },
+                ),
+                timeout=min(OFFERS_RESOLVE_INTERNAL_SKU_EXACT_QUERY_TIMEOUT_SECONDS, 0.5),
+            )
+
+        first_row = _row_to_dict(rows[0]) if rows else {}
+        merchant_id = str(first_row.get("merchant_id") or "").strip() or None
+        platform = str(first_row.get("platform") or "").strip() or None
+        product_data = first_row.get("product_data")
+        if isinstance(product_data, str):
+            try:
+                product_data = json.loads(product_data)
+            except Exception:
+                product_data = None
+        if not isinstance(product_data, dict):
+            product_data = {}
+        canonical_product_id = (
+            str(
+                product_data.get("id")
+                or product_data.get("product_id")
+                or first_row.get("platform_product_id")
+                or ""
+            ).strip()
+            or None
+        )
+        if not merchant_id or not canonical_product_id:
+            return None
+
+        variant_aliases: List[str] = []
+        variants = product_data.get("variants") if isinstance(product_data.get("variants"), list) else []
+        for variant in variants[:12]:
+            if not isinstance(variant, dict):
+                continue
+            variant_id = str(
+                variant.get("variant_id")
+                or variant.get("id")
+                or variant.get("sku")
+                or variant.get("sku_id")
+                or ""
+            ).strip()
+            if variant_id and variant_id not in variant_aliases:
+                variant_aliases.append(variant_id)
+
+        return {
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "product_id": canonical_product_id,
+            "variant_aliases": variant_aliases,
+        }
+
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         for row in seed_rows:
             row_dict = _row_to_dict(row)
@@ -2098,6 +2203,29 @@ async def _handle_offers_resolve(
             )
             if seed_rows:
                 query_label = "external_seed_by_attached_ref"
+
+        if not seed_rows:
+            prefetched_internal = await _prefetch_canonical_internal_context()
+            if prefetched_internal:
+                retry_variant_aliases = [
+                    str(alias or "").strip()
+                    for alias in (
+                        [sku_id]
+                        + list(prefetched_internal.get("variant_aliases") or [])
+                        + sku_id_aliases
+                    )
+                    if str(alias or "").strip()
+                ]
+                seed_rows = await _fetch_attached_seed_rows(
+                    merchant_id=str(prefetched_internal.get("merchant_id") or "").strip() or None,
+                    platform=str(prefetched_internal.get("platform") or "").strip() or None,
+                    product_aliases=[
+                        str(prefetched_internal.get("product_id") or "").strip() or None
+                    ] + product_id_aliases,
+                    variant_aliases=retry_variant_aliases,
+                )
+                if seed_rows:
+                    query_label = "external_seed_by_canonical_attached_prefetch"
 
         if not seed_rows and product_id_aliases:
             pid_clause: List[str] = []

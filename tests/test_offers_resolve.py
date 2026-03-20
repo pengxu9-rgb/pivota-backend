@@ -218,7 +218,97 @@ def test_offers_resolve_recovers_attached_seed_after_broad_seed_timeout(
     metadata = body.get("metadata") or {}
     assert metadata.get("has_external") is True
     assert any(
-        str(source.get("source")) == "external_product_seeds_attached_retry"
+        str(source.get("source")) in {"external_product_seeds_attached_retry", "external_product_seeds"}
         and str(source.get("status")) == "ok"
+        for source in (metadata.get("sources") or [])
+    )
+
+
+def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "attached_product_key IS NOT NULL" in q:
+            return [
+                {
+                    "id": "eps_prefetch_1",
+                    "external_product_id": "ext_prefetch_1",
+                    "market": "EU-DE",
+                    "tool": "*",
+                    "destination_url": "https://merchant.example/products/prod-internal-prefetch",
+                    "canonical_url": "https://merchant.example/products/prod-internal-prefetch",
+                    "domain": "merchant.example",
+                    "title": "Prefetch Offer",
+                    "price_amount": 31.0,
+                    "price_currency": "EUR",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "attached_product_key": "merch_9|shopify|prod_internal_prefetch",
+                    "attached_variant_id": "SKU_PREFETCH_1",
+                    "seed_data": {
+                        "brand": "Merchant Example",
+                        "variants": [
+                            {
+                                "variant_id": "SKU_PREFETCH_1",
+                                "title": "Attached Variant",
+                                "price_amount": 31.0,
+                                "price_currency": "EUR",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                }
+            ]
+        if "FROM external_product_seeds" in q:
+            raise AssertionError("broad external seed query should be skipped when attached prefetch succeeds")
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_9",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_internal_prefetch",
+                    "product_data": {
+                        "id": "prod_internal_prefetch",
+                        "title": "Internal Product Prefetch",
+                        "currency": "EUR",
+                        "price": 31.0,
+                        "inventory_quantity": 5,
+                        "variants": [{"id": "SKU_PREFETCH_1", "price": 31.0, "inventory_quantity": 5}],
+                        "merchant_name": "Internal Store",
+                    },
+                }
+            ]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=prefetch"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "prod_internal_prefetch"}, "limit": 10, "market": "EU-DE", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert len(offers) >= 2
+    assert any(offer.get("purchase_route") == "affiliate_outbound" for offer in offers)
+    metadata = body.get("metadata") or {}
+    assert metadata.get("failure_breakdown") in ({}, None)
+    assert any(
+        str(source.get("source")) == "external_product_seeds"
+        and str(source.get("status")) == "ok"
+        and str(source.get("query")) == "external_seed_by_canonical_attached_prefetch"
         for source in (metadata.get("sources") or [])
     )
