@@ -202,23 +202,102 @@ def _build_action_catalog(payload: MerchantReadinessOptimizationPayload) -> dict
     return actions
 
 
+def _canonical_target_scope(target: dict[str, Any]) -> str:
+    return str(target.get("scope") or "product").strip() or "product"
+
+
+def _canonical_target_platform(target: dict[str, Any]) -> str:
+    return str(target.get("platform") or "").strip().lower()
+
+
+def _canonical_target_identifiers(target: dict[str, Any]) -> set[str]:
+    identifiers = {
+        str(target.get("platform_product_id") or "").strip(),
+        str(target.get("product_id") or "").strip(),
+        str(target.get("queue_item_id") or "").strip(),
+    }
+    return {identifier for identifier in identifiers if identifier}
+
+
+def _targets_match(catalog_target: dict[str, Any], request_target: dict[str, Any]) -> bool:
+    if _canonical_target_scope(catalog_target) != _canonical_target_scope(request_target):
+        return False
+
+    catalog_platform = _canonical_target_platform(catalog_target)
+    request_platform = _canonical_target_platform(request_target)
+    if catalog_platform and request_platform and catalog_platform != request_platform:
+        return False
+
+    catalog_identifiers = _canonical_target_identifiers(catalog_target)
+    request_identifiers = _canonical_target_identifiers(request_target)
+    if not catalog_identifiers or not request_identifiers:
+        return False
+    return not catalog_identifiers.isdisjoint(request_identifiers)
+
+
+def _find_catalog_target_action(
+    catalog: dict[str, RemediationAction],
+    target: dict[str, Any],
+) -> tuple[RemediationAction, dict[str, Any]] | None:
+    for action in catalog.values():
+        for catalog_target in action.targets:
+            if _targets_match(catalog_target, target):
+                return action, catalog_target
+    return None
+
+
 def _action_from_request(
     *,
     plan_id: str,
     action_type: str,
     targets: list[dict[str, Any]],
+    catalog: dict[str, RemediationAction],
 ) -> RemediationAction:
     if not targets:
         raise ActionNotFoundError("No action targets provided")
-    action_id = _action_id_for_target(action_type, targets[0])
+
+    matched_targets: list[dict[str, Any]] = []
+    matched_actions: list[RemediationAction] = []
+
+    for target in targets:
+        match = _find_catalog_target_action(catalog, target)
+        if match is None:
+            raise ActionNotFoundError(
+                f"No suggested remediation action found for target: {target!r}"
+            )
+
+        matched_action, matched_target = match
+        if matched_action.action_type != action_type:
+            target_label = (
+                str(matched_target.get("platform_product_id") or "")
+                or str(matched_target.get("product_id") or "")
+                or str(matched_target.get("queue_item_id") or "target")
+            )
+            raise ActionNotExecutableError(
+                f"Requested action '{action_type}' is not executable for {target_label}. "
+                f"Use '{matched_action.action_type}' instead."
+            )
+
+        matched_actions.append(matched_action)
+        matched_targets.append(dict(matched_target))
+
+    if len(matched_actions) == 1:
+        return matched_actions[0]
+
+    first_action = matched_actions[0]
+    action_id = _action_id_for_target(action_type, matched_targets[0])
     return RemediationAction(
         action_id=action_id,
         plan_id=plan_id,
-        action_type=action_type,
-        surface=str(targets[0].get("surface") or "product_content"),
-        scope=str(targets[0].get("scope") or "product"),
-        targets=targets,
-        reason=str(targets[0].get("reason") or ""),
+        action_type=first_action.action_type,
+        surface=first_action.surface,
+        scope=first_action.scope,
+        targets=matched_targets,
+        fixability=first_action.fixability,
+        priority_score=first_action.priority_score,
+        priority_reason=first_action.priority_reason,
+        reason=first_action.reason,
+        status="suggested",
     )
 
 
@@ -236,7 +315,12 @@ async def _resolve_action(
             raise ActionNotFoundError(f"Unknown action_id: {action_id}")
         return action
     if action_type and targets:
-        return _action_from_request(plan_id=payload.plan.plan_id, action_type=action_type, targets=targets)
+        return _action_from_request(
+            plan_id=payload.plan.plan_id,
+            action_type=action_type,
+            targets=targets,
+            catalog=catalog,
+        )
     raise ActionNotFoundError("No action_id or action_type/targets provided")
 
 

@@ -824,6 +824,8 @@ async def preview_readiness_action(
                 "current_snapshot_id": exc.current_snapshot_id,
             },
         )
+    except ActionNotExecutableError as exc:
+        raise HTTPException(status_code=409, detail={"code": "OPTIMIZATION_ACTION_NOT_EXECUTABLE", "message": str(exc)})
     except ActionNotFoundError as exc:
         raise HTTPException(status_code=404, detail={"code": "OPTIMIZATION_ACTION_NOT_FOUND", "message": str(exc)})
     except Exception as e:

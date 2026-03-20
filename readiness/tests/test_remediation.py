@@ -250,6 +250,43 @@ async def test_preview_remediation_action_rejects_superseded_plan(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_preview_remediation_action_rejects_non_executable_manual_target(monkeypatch):
+    from readiness import remediation
+
+    payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
+    payload.product_queue[0].top_issues[0].code = "out_of_stock"
+    payload.product_queue[0].top_issues[0].label = "Out of stock"
+    payload.product_queue[0].primary_action = "Review this product in your source catalog."
+    payload.product_queue[0].priority_reason = "This product needs source-data fixes before it can be surfaced."
+    payload.product_queue[0].recommended_action_type = "review_catalog_data"
+
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        assert channel == "ucp"
+        return payload, _snapshot()
+
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
+
+    with pytest.raises(ActionNotExecutableError):
+        await preview_remediation_action(
+            "merch_efbc46b4619cfbdf",
+            plan_id="rdplan_current",
+            action_type="run_product_enrichment",
+            targets=[
+                {
+                    "scope": "product",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_1",
+                    "product_id": "prod_1",
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_remediation_action_executes_pipeline_and_returns_verification(monkeypatch):
     from readiness import remediation
 

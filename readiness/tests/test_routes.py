@@ -516,6 +516,38 @@ def test_merchant_readiness_action_preview_route_rejects_superseded_plan(monkeyp
     assert detail["current_plan_id"] == "rdplan_latest"
 
 
+def test_merchant_readiness_action_preview_route_rejects_non_executable_action(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+    from readiness.remediation import ActionNotExecutableError
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_preview_remediation_action(_merchant_id: str, **_kwargs):
+        raise ActionNotExecutableError("Requested action is not executable for this product.")
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "preview_remediation_action", fake_preview_remediation_action)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.post(
+        "/merchant/readiness/actions/preview",
+        json={"plan_id": "rdplan_test", "action_type": "run_product_enrichment", "targets": []},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "OPTIMIZATION_ACTION_NOT_EXECUTABLE"
+
+
 def test_merchant_readiness_action_run_and_job_routes(monkeypatch):
     from routes import merchant_api_extensions as merchant_api_extensions
 
