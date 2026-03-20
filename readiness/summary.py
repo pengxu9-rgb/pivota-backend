@@ -8,18 +8,15 @@ from typing import Any, Dict, Iterable, Optional
 
 from db.database import database
 from db.product_enrichment import get_enrichments_for_products
-from db.product_quality import product_quality_snapshot
 from db.product_quality_backfill_jobs import get_active_quality_backfill_job
 from db.products import products_cache
-import time
-from sqlalchemy import select
 from readiness.flags import (
     readiness_alpha_merchant_id,
     readiness_real_merchant_alpha_enabled,
     readiness_router_enabled,
 )
 from readiness.models import (
-    DashboardSnapshot,
+    AgentPushSummary,
     MerchantReadinessAction,
     MerchantReadinessOptimizationPayload,
     MerchantReadinessSnapshot,
@@ -32,6 +29,11 @@ from readiness.models import (
     ScoreBundle,
 )
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
+from services.product_exposure_service import (
+    AGENT_PUSH_STATUS_EXCLUDED,
+    build_agent_push_projection_from_ready_product,
+    summarize_agent_push_projections,
+)
 from services.product_quality_service import (
     QUALITY_SOURCE_NONE,
     build_quality_payload_from_cache_row,
@@ -46,20 +48,6 @@ logger = logging.getLogger(__name__)
 _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
 _PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
 _PLAN_TTL_HOURS = 6
-_PAID_PAYMENT_STATUSES_SQL = "('paid','completed','succeeded','success','settled','partially_refunded')"
-_OPTIMIZATION_CACHE_TTL_SECONDS = 60.0
-
-
-_OPTIMIZATION_CACHE: dict[str, tuple[float, MerchantReadinessOptimizationPayload]] = {}
-_OPTIMIZATION_CACHE_METRICS: dict[str, int] = {
-    "hits": 0,
-    "misses": 0,
-    "stores": 0,
-    "expired": 0,
-    "refreshes": 0,
-    "invalidations": 0,
-    "invalidated_entries": 0,
-}
 
 
 _BUCKET_DEFINITIONS: dict[str, dict[str, str]] = {
@@ -353,111 +341,6 @@ def _bucket_code_for_reason(code: str) -> str:
     return _CODE_TO_BUCKET.get(code, "other")
 
 
-def _optimization_cache_key(merchant_id: str, channel: str) -> str:
-    return f"{merchant_id}|{channel}"
-
-
-def invalidate_readiness_optimization_cache(
-    merchant_id: Optional[str] = None,
-    *,
-    channel: Optional[str] = None,
-) -> int:
-    if merchant_id is None and channel is None:
-        removed = len(_OPTIMIZATION_CACHE)
-        _OPTIMIZATION_CACHE.clear()
-        if removed:
-            _OPTIMIZATION_CACHE_METRICS["invalidations"] += 1
-            _OPTIMIZATION_CACHE_METRICS["invalidated_entries"] += removed
-        return removed
-
-    keys_to_drop = []
-    for key in _OPTIMIZATION_CACHE:
-        cached_merchant_id, cached_channel = key.split("|", 1)
-        if merchant_id is not None and cached_merchant_id != merchant_id:
-            continue
-        if channel is not None and cached_channel != channel:
-            continue
-        keys_to_drop.append(key)
-    for key in keys_to_drop:
-        _OPTIMIZATION_CACHE.pop(key, None)
-    if keys_to_drop:
-        _OPTIMIZATION_CACHE_METRICS["invalidations"] += 1
-        _OPTIMIZATION_CACHE_METRICS["invalidated_entries"] += len(keys_to_drop)
-    return len(keys_to_drop)
-
-
-def reset_readiness_optimization_cache_observability() -> None:
-    _OPTIMIZATION_CACHE.clear()
-    for key in list(_OPTIMIZATION_CACHE_METRICS.keys()):
-        _OPTIMIZATION_CACHE_METRICS[key] = 0
-
-
-def get_readiness_optimization_cache_metrics() -> dict[str, Any]:
-    total_requests = _OPTIMIZATION_CACHE_METRICS["hits"] + _OPTIMIZATION_CACHE_METRICS["misses"]
-    hit_rate = (_OPTIMIZATION_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
-    now_mono = time.monotonic()
-    entries = []
-    for key, (cached_at, payload) in sorted(_OPTIMIZATION_CACHE.items()):
-        merchant_id, channel = key.split("|", 1)
-        age_seconds = max(0.0, now_mono - cached_at)
-        entries.append(
-            {
-                "merchant_id": merchant_id,
-                "channel": channel,
-                "plan_id": payload.plan.plan_id,
-                "snapshot_id": payload.plan.snapshot_id,
-                "age_seconds": round(age_seconds, 3),
-                "expires_in_seconds": round(max(0.0, _OPTIMIZATION_CACHE_TTL_SECONDS - age_seconds), 3),
-            }
-        )
-    return {
-        "hits": _OPTIMIZATION_CACHE_METRICS["hits"],
-        "misses": _OPTIMIZATION_CACHE_METRICS["misses"],
-        "stores": _OPTIMIZATION_CACHE_METRICS["stores"],
-        "expired": _OPTIMIZATION_CACHE_METRICS["expired"],
-        "refreshes": _OPTIMIZATION_CACHE_METRICS["refreshes"],
-        "invalidations": _OPTIMIZATION_CACHE_METRICS["invalidations"],
-        "invalidated_entries": _OPTIMIZATION_CACHE_METRICS["invalidated_entries"],
-        "total_requests": total_requests,
-        "hit_rate": round(hit_rate, 2),
-        "entries": len(_OPTIMIZATION_CACHE),
-        "ttl_seconds": _OPTIMIZATION_CACHE_TTL_SECONDS,
-        "active_keys": entries,
-    }
-
-
-def _cached_optimization_payload(
-    merchant_id: str,
-    *,
-    channel: str,
-) -> Optional[MerchantReadinessOptimizationPayload]:
-    cache_key = _optimization_cache_key(merchant_id, channel)
-    entry = _OPTIMIZATION_CACHE.get(cache_key)
-    if not entry:
-        _OPTIMIZATION_CACHE_METRICS["misses"] += 1
-        return None
-    cached_at, payload = entry
-    if time.monotonic() - cached_at > _OPTIMIZATION_CACHE_TTL_SECONDS:
-        _OPTIMIZATION_CACHE.pop(cache_key, None)
-        _OPTIMIZATION_CACHE_METRICS["misses"] += 1
-        _OPTIMIZATION_CACHE_METRICS["expired"] += 1
-        return None
-    _OPTIMIZATION_CACHE_METRICS["hits"] += 1
-    return payload.model_copy(deep=True)
-
-
-def _store_optimization_payload(
-    merchant_id: str,
-    *,
-    channel: str,
-    payload: MerchantReadinessOptimizationPayload,
-) -> MerchantReadinessOptimizationPayload:
-    cache_key = _optimization_cache_key(merchant_id, channel)
-    _OPTIMIZATION_CACHE[cache_key] = (time.monotonic(), payload.model_copy(deep=True))
-    _OPTIMIZATION_CACHE_METRICS["stores"] += 1
-    return payload
-
-
 def _severity_for_bucket(bucket_code: str, affected_count: int) -> str:
     if bucket_code in {"checkout_payment_setup", "shipping_returns_setup", "order_sync_operations"}:
         return "high"
@@ -494,145 +377,7 @@ def _variant_impact(variant: Any) -> str:
     return "discovery_only"
 
 
-async def _load_latest_quality_map(merchant_id: str) -> dict[str, dict[str, Any]]:
-    query = (
-        select(
-            product_quality_snapshot.c.platform,
-            product_quality_snapshot.c.platform_product_id,
-            product_quality_snapshot.c.snapshot_date,
-            product_quality_snapshot.c.content_quality_score,
-            product_quality_snapshot.c.model_readiness_score,
-            product_quality_snapshot.c.conversion_potential_score,
-        )
-        .where(product_quality_snapshot.c.merchant_id == merchant_id)
-        .order_by(
-            product_quality_snapshot.c.platform,
-            product_quality_snapshot.c.platform_product_id,
-            product_quality_snapshot.c.snapshot_date.desc(),
-        )
-    )
-    rows = await database.fetch_all(query)
-    latest: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        payload = dict(row)
-        key = f"{payload.get('platform') or 'unknown'}|{payload.get('platform_product_id') or ''}"
-        if key in latest:
-            continue
-        snapshot_date = payload.get("snapshot_date")
-        latest[key] = {
-            "content_quality_score": payload.get("content_quality_score"),
-            "model_readiness_score": payload.get("model_readiness_score"),
-            "conversion_potential_score": payload.get("conversion_potential_score"),
-            "quality_last_evaluated_at": snapshot_date.isoformat() if snapshot_date else None,
-        }
-    return latest
-
-
-async def _load_dashboard_snapshot(merchant_id: str) -> DashboardSnapshot:
-    analytics_query = """
-        SELECT
-            COUNT(*) as total_orders_all_time,
-            COALESCE(SUM(total), 0) as gmv_all_time,
-            COALESCE(SUM(CASE WHEN payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_all_time,
-            SUM(CASE WHEN payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_all_time,
-            COUNT(DISTINCT customer_email) as total_customers,
-            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
-            SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_last_30_days,
-            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_last_30_days
-        FROM orders
-        WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
-    """
-    growth_query = """
-        SELECT
-            COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
-                      AND created_at < CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as orders_prev_30,
-            COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '60 days'
-                    AND created_at < CURRENT_DATE - INTERVAL '30 days'
-                    AND payment_status IN """ + _PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_prev_30
-        FROM orders
-        WHERE merchant_id = :merchant_id AND (is_deleted IS NULL OR is_deleted = FALSE)
-    """
-    products_query = """
-        SELECT COUNT(*) as count
-        FROM products_cache
-        WHERE merchant_id = :merchant_id
-          AND (expires_at IS NULL OR expires_at > NOW())
-    """
-
-    def _to_int(value: Any) -> int:
-        try:
-            if value is None:
-                return 0
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-
-    try:
-        analytics = await database.fetch_one(analytics_query, {"merchant_id": merchant_id})
-        growth = await database.fetch_one(growth_query, {"merchant_id": merchant_id})
-        products = await database.fetch_one(products_query, {"merchant_id": merchant_id})
-
-        total_orders = _to_int(analytics["orders_last_30_days"]) if analytics else 0
-        paid_orders = _to_int(analytics["paid_orders_last_30_days"]) if analytics else 0
-        total_revenue = float(analytics["confirmed_revenue_last_30_days"] or 0) if analytics else 0.0
-        total_customers = _to_int(analytics["total_customers"]) if analytics else 0
-        total_products = _to_int(products["count"]) if products else 0
-
-        orders_prev_30 = _to_int(growth["orders_prev_30"]) if growth else 0
-        confirmed_revenue_prev_30 = float(growth["confirmed_revenue_prev_30"] or 0) if growth else 0.0
-
-        order_growth = 0.0
-        revenue_growth = 0.0
-        if orders_prev_30 > 0:
-            order_growth = round(((total_orders - orders_prev_30) / orders_prev_30) * 100, 1)
-        elif total_orders > 0:
-            order_growth = 100.0
-
-        if confirmed_revenue_prev_30 > 0:
-            revenue_growth = round(((total_revenue - confirmed_revenue_prev_30) / confirmed_revenue_prev_30) * 100, 1)
-        elif total_revenue > 0:
-            revenue_growth = 100.0
-
-        return DashboardSnapshot(
-            total_orders=total_orders,
-            paid_orders=paid_orders,
-            total_revenue=total_revenue,
-            total_customers=total_customers,
-            total_products=total_products,
-            order_growth=order_growth,
-            revenue_growth=revenue_growth,
-        )
-    except Exception:
-        try:
-            products = await database.fetch_one(products_query, {"merchant_id": merchant_id})
-            total_products = _to_int(products["count"]) if products else 0
-        except Exception:
-            total_products = 0
-        return DashboardSnapshot(total_products=total_products)
-
-
-def _queue_price(product: Any) -> tuple[Optional[float], Optional[str]]:
-    for variant in product.variants:
-        price = variant.price or {}
-        raw_value = price.get("amount")
-        if raw_value is None:
-            raw_value = price.get("value")
-        currency = str(price.get("currency") or "USD").strip() or "USD"
-        if raw_value is None:
-            continue
-        try:
-            return float(raw_value), currency
-        except (TypeError, ValueError):
-            continue
-    return None, None
-
-
-def _product_queue_item(
-    product: Any,
-    channel: str,
-    *,
-    quality_by_product: Optional[dict[str, dict[str, Any]]] = None,
-) -> ProductReadinessQueueItem:
+def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem:
     issue_counts = _product_issue_counts(product, channel)
     blocked_variant_count = sum(1 for variant in product.variants if variant.channel_coverage.get(channel) != "ready")
     ready_variant_count = max(0, len(product.variants) - blocked_variant_count)
@@ -682,10 +427,6 @@ def _product_queue_item(
         blocked_variant_count=blocked_variant_count,
         impact=impact,
     )
-    price_value, price_currency = _queue_price(product)
-    quality = (quality_by_product or {}).get(
-        f"{product.platform or 'unknown'}|{product.product_id}"
-    ) or {}
 
     return ProductReadinessQueueItem(
         queue_item_scope="product",
@@ -697,12 +438,6 @@ def _product_queue_item(
         image_url=product.default_image_url,
         brand=product.brand,
         category=product.category,
-        price_value=price_value,
-        price_currency=price_currency,
-        content_quality_score=quality.get("content_quality_score"),
-        model_readiness_score=quality.get("model_readiness_score"),
-        conversion_potential_score=quality.get("conversion_potential_score"),
-        quality_last_evaluated_at=quality.get("quality_last_evaluated_at"),
         blocked_variant_count=blocked_variant_count,
         ready_variant_count=ready_variant_count,
         top_issues=top_issues,
@@ -715,6 +450,71 @@ def _product_queue_item(
         recommended_action_id=f"act_product:{product.platform or 'unknown'}:{product.product_id}",
         recommended_action_type="run_product_enrichment" if primary_bucket["fix_surface"] == "product_content" else "review_catalog_data",
     )
+
+
+def _apply_agent_push_projection(
+    *,
+    snapshot_products: list[Any],
+    product_queue: list[ProductReadinessQueueItem],
+    checked_at: Optional[str],
+) -> tuple[list[ProductReadinessQueueItem], AgentPushSummary]:
+    if not product_queue:
+        return product_queue, AgentPushSummary()
+
+    projections_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for product in snapshot_products:
+        key = make_product_key(product.platform or "unknown", product.product_id)
+        if key is None:
+            continue
+        projections_by_key[key] = build_agent_push_projection_from_ready_product(
+            product,
+            checked_at=checked_at,
+        )
+
+    updated_queue: list[ProductReadinessQueueItem] = []
+    active_blocked_variants = 0
+    for item in product_queue:
+        key = make_product_key(item.platform, item.platform_product_id or item.product_id)
+        projection = projections_by_key.get(key or ("", ""), {})
+        excluded_variant_count = int(projection.get("excluded_variant_count") or 0)
+        active_blocked_count = max(0, int(item.blocked_variant_count or 0) - excluded_variant_count)
+        active_blocked_variants += active_blocked_count
+
+        item.blocked_variant_count = active_blocked_count
+        item.agent_push_status = projection.get("agent_push_status", item.agent_push_status)
+        item.agent_push_reason_codes = list(projection.get("agent_push_reason_codes") or [])
+        item.eligible_variant_count = int(
+            projection.get("eligible_variant_count")
+            if projection.get("eligible_variant_count") is not None
+            else item.ready_variant_count
+        )
+        item.excluded_variant_count = excluded_variant_count
+        item.store_data_last_checked_at = projection.get(
+            "store_data_last_checked_at",
+            item.store_data_last_checked_at,
+        )
+
+        if item.agent_push_status == AGENT_PUSH_STATUS_EXCLUDED and active_blocked_count == 0:
+            item.priority_score = max(1.0, float(item.priority_score or 0.0) * 0.3)
+            item.primary_action = (
+                "Pivota is excluding this product from agent push until the store platform sends an in-stock variant with valid pricing."
+            )
+            item.priority_reason = (
+                "This product is still visible here for diagnosis, but it is no longer treated as an active agent-exposure blocker."
+            )
+        elif item.excluded_variant_count > 0 and active_blocked_count == 0:
+            item.priority_score = max(1.0, float(item.priority_score or 0.0) * 0.55)
+            item.priority_reason = (
+                "Some variants are auto-excluded from agent push, but the remaining sellable variants can still be exposed."
+            )
+
+        updated_queue.append(item)
+
+    summary_payload = summarize_agent_push_projections(
+        projections_by_key.values(),
+        active_blocked_variants=active_blocked_variants,
+    )
+    return updated_queue, AgentPushSummary(**summary_payload)
 
 
 async def _load_cache_rows_for_product_keys(
@@ -1182,11 +982,7 @@ def _fallback_summary(
     )
 
 
-def _fallback_optimization_payload(
-    summary: ReadinessSummary,
-    *,
-    dashboard_snapshot: Optional[DashboardSnapshot] = None,
-) -> MerchantReadinessOptimizationPayload:
+def _fallback_optimization_payload(summary: ReadinessSummary) -> MerchantReadinessOptimizationPayload:
     snapshot_id = _build_snapshot_id(
         MerchantReadinessSnapshot(
             merchant_id="unknown",
@@ -1251,7 +1047,6 @@ def _fallback_optimization_payload(
         plan=plan,
         score_bundle=ScoreBundle(readiness_score=summary.score),
         readiness_summary=summary,
-        dashboard_snapshot=dashboard_snapshot,
         issue_buckets=issue_buckets,
         merchant_actions=actions,
         product_queue=[],
@@ -1317,34 +1112,28 @@ async def build_readiness_optimization(
     merchant_id: str,
     *,
     channel: str = "ucp",
-    force_refresh: bool = False,
 ) -> MerchantReadinessOptimizationPayload:
-    if force_refresh:
-        _OPTIMIZATION_CACHE_METRICS["refreshes"] += 1
-    else:
-        cached_payload = _cached_optimization_payload(merchant_id, channel=channel)
-        if cached_payload is not None:
-            return cached_payload
-
-    dashboard_snapshot = await _load_dashboard_snapshot(merchant_id)
     snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
     if fallback is not None or snapshot is None:
-        payload = _fallback_optimization_payload(
+        return _fallback_optimization_payload(
             fallback
             or _fallback_summary(
                 assessment_state="assessed",
                 blocker="readiness_summary_unavailable",
                 channel=channel,
                 merchant_alpha_mode="assessment_error",
-            ),
-            dashboard_snapshot=dashboard_snapshot,
+            )
         )
-        return _store_optimization_payload(merchant_id, channel=channel, payload=payload)
 
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
     issue_buckets = _build_issue_buckets(snapshot)
     merchant_actions = _build_merchant_actions(summary, issue_buckets)
     product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
+    product_queue, agent_push_summary = _apply_agent_push_projection(
+        snapshot_products=snapshot.products,
+        product_queue=product_queue,
+        checked_at=snapshot.generated_at,
+    )
     product_queue, quality_coverage = await _apply_quality_projection(
         merchant_id,
         snapshot_products=snapshot.products,
@@ -1374,15 +1163,14 @@ async def build_readiness_optimization(
         can_apply_actions=summary.assessment_state == "assessed",
         last_successful_rescore_at=summary.generated_at,
     )
-    payload = MerchantReadinessOptimizationPayload(
+    return MerchantReadinessOptimizationPayload(
         plan=plan,
         score_bundle=ScoreBundle(readiness_score=summary.score),
         readiness_summary=summary,
-        dashboard_snapshot=dashboard_snapshot,
         issue_buckets=issue_buckets,
         merchant_actions=merchant_actions,
         product_queue=product_queue,
         quality_coverage=quality_coverage,
+        agent_push_summary=agent_push_summary,
         last_generated_at=summary.generated_at,
     )
-    return _store_optimization_payload(merchant_id, channel=channel, payload=payload)

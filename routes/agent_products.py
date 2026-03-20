@@ -15,6 +15,10 @@ from services.agent_ranking_service import (
     compute_agent_ranking_score,
     serialize_features_for_log,
 )
+from services.product_exposure_service import (
+    AGENT_PUSH_STATUS_EXCLUDED,
+    build_agent_push_projection_from_standard_product,
+)
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -540,6 +544,13 @@ async def get_merchant_products(
         # then apply quality-based gating + ranking helpers.
         enriched_list: List[Dict[str, Any]] = []
         for product in products:
+            exposure_projection = build_agent_push_projection_from_standard_product(
+                product,
+                checked_at=getattr(product, "updated_at", None),
+            )
+            if exposure_projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+                continue
+
             # Try to build an enriched view; fall back to StandardProduct if needed
             enriched = await get_agent_product_view(
                 merchant_id=merchant_id,
@@ -573,7 +584,10 @@ async def get_merchant_products(
                         "inventory_quantity": variant.inventory_quantity,
                         "available": variant.inventory_quantity > 0,
                         "image_url": variant.image_url or image_url,
-                        "currency": product.currency
+                        "currency": product.currency,
+                        "agent_push_status": exposure_projection.get("agent_push_status"),
+                        "eligible_variant_count": exposure_projection.get("eligible_variant_count"),
+                        "excluded_variant_count": exposure_projection.get("excluded_variant_count"),
                     })
             else:
                 # No variants - single product
@@ -590,7 +604,10 @@ async def get_merchant_products(
                     "inventory_quantity": product.inventory_quantity,
                     "available": product.inventory_quantity > 0,
                     "image_url": image_url,
-                    "currency": product.currency
+                    "currency": product.currency,
+                    "agent_push_status": exposure_projection.get("agent_push_status"),
+                    "eligible_variant_count": exposure_projection.get("eligible_variant_count"),
+                    "excluded_variant_count": exposure_projection.get("excluded_variant_count"),
                 })
         # Quality-aware ranking using the same helper as /agent/v1/products/search
         ranked_candidates: List[Dict[str, Any]] = []
@@ -778,6 +795,16 @@ async def get_product_details(
             except Exception:
                 prod = product_data
 
+            exposure_projection = build_agent_push_projection_from_standard_product(
+                prod,
+                checked_at=cache_row.get("cached_at"),
+            )
+            if exposure_projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Product is currently excluded from agent exposure",
+                )
+
             product_id_out = str(prod.get("product_id") or prod.get("id") or product_id)
             title = prod.get("title") or prod.get("name") or ""
             description = prod.get("description") or ""
@@ -934,6 +961,31 @@ async def get_product_details(
                     "weight_unit": variant.get("weight_unit"),
                     "options": option_map,
                 }
+            )
+
+        exposure_projection = build_agent_push_projection_from_standard_product(
+            {
+                "id": str(product.get("id") or product_id),
+                "platform": "shopify",
+                "merchant_id": merchant_id,
+                "title": product.get("title"),
+                "currency": (variants[0].get("currency") if variants else None) or "USD",
+                "variants": [
+                    {
+                        "id": item.get("variant_id"),
+                        "price": item.get("price"),
+                        "currency": "USD",
+                        "inventory_quantity": item.get("inventory_quantity"),
+                        "available": item.get("available"),
+                    }
+                    for item in variants
+                ],
+            }
+        )
+        if exposure_projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+            raise HTTPException(
+                status_code=404,
+                detail="Product is currently excluded from agent exposure",
             )
 
         background_tasks.add_task(

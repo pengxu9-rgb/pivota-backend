@@ -10,10 +10,9 @@ They are intended to power the Merchant Portal "Product Optimization"
 experience, not the public Agent API.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
-import os
+from datetime import datetime
 
 from pydantic import BaseModel
 
@@ -25,13 +24,14 @@ from db.product_enrichment import (
     upsert_enrichment,
 )
 from db.product_quality_backfill_jobs import (
-    complete_quality_backfill_job,
     create_quality_backfill_job,
     get_active_quality_backfill_job,
     get_quality_backfill_job,
 )
 from models.standard_product import StandardProduct
 from services.product_enrichment_pipeline import run_enrichment_for_product
+from services.product_exposure_service import build_agent_push_projection_from_cache_row
+from services.product_quality_backfill_service import process_quality_backfill_job
 from services.product_quality_service import (
     build_quality_payload_from_cache_row,
     build_quality_projection,
@@ -56,45 +56,6 @@ class QualityBackfillRequest(BaseModel):
     missing_only: bool = True
 
 
-def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        normalized = str(value).replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _is_stale_backfill_job(job: Optional[Dict[str, Any]], *, stale_after_seconds: int = 120) -> bool:
-    if not job:
-        return False
-    if str(job.get("status") or "") != "running":
-        return False
-    started_at = _parse_iso_datetime(job.get("started_at"))
-    if started_at is None:
-        return False
-    age_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
-    progress_total = sum(int(job.get(field) or 0) for field in ("processed", "skipped", "failed"))
-    total_candidates = int(job.get("total_candidates") or 0)
-    if total_candidates > 0 and progress_total >= total_candidates:
-        return False
-    return age_seconds >= stale_after_seconds
-
-
-def _quality_backfill_stale_after_seconds() -> int:
-    raw = os.getenv("QUALITY_BACKFILL_STALE_AFTER_SECONDS")
-    try:
-        if raw is not None:
-            return max(60, int(raw))
-    except Exception:
-        pass
-    return 180
-
-
 def _quality_response(projection: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "content_quality_score": projection.get("content_quality_score"),
@@ -102,6 +63,16 @@ def _quality_response(projection: Dict[str, Any]) -> Dict[str, Any]:
         "conversion_potential_score": projection.get("conversion_potential_score"),
         "last_evaluated_at": projection.get("last_evaluated_at"),
         "quality_source": projection.get("quality_source", "none"),
+    }
+
+
+def _agent_push_response(projection: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "agent_push_status": projection.get("agent_push_status", "eligible_for_agent_push"),
+        "agent_push_reason_codes": projection.get("agent_push_reason_codes", []),
+        "eligible_variant_count": projection.get("eligible_variant_count", 0),
+        "excluded_variant_count": projection.get("excluded_variant_count", 0),
+        "store_data_last_checked_at": projection.get("store_data_last_checked_at"),
     }
 
 
@@ -261,6 +232,7 @@ async def list_merchant_products(
         standard = _build_standard_summary(cache_row)
         enrichment = quality_bundle["enrichments_by_key"].get(product_key or ("", ""), {})
         projection = quality_bundle["projections_by_key"].get(product_key or ("", ""), {})
+        agent_push = build_agent_push_projection_from_cache_row(cache_row)
 
         items.append({
             "merchant_id": merchant_id,
@@ -269,6 +241,7 @@ async def list_merchant_products(
             "standard": standard,
             "enrichment": enrichment or {},
             "quality": _quality_response(projection),
+            "agent_push": _agent_push_response(agent_push),
         })
 
     return {
@@ -360,6 +333,7 @@ async def get_product_quality_summary(
 @router.post("/quality/backfill", status_code=202)
 async def queue_quality_backfill(
     body: QualityBackfillRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
 ):
     if current_user.get("role") != "merchant":
@@ -379,25 +353,6 @@ async def queue_quality_backfill(
         merchant_id,
         platform=body.platform,
     )
-    if _is_stale_backfill_job(
-        active_job,
-        stale_after_seconds=_quality_backfill_stale_after_seconds(),
-    ):
-        await complete_quality_backfill_job(
-            str(active_job.get("job_id") or ""),
-            status="failed",
-            total_candidates=int(active_job.get("total_candidates") or 0),
-            processed=int(active_job.get("processed") or 0),
-            skipped=int(active_job.get("skipped") or 0),
-            failed=max(int(active_job.get("failed") or 0), 1),
-            errors_sample=[
-                {
-                    "error": "stale_backfill_job_reset",
-                    "message": "Previous quality backfill job did not make progress and was reset automatically.",
-                }
-            ],
-        )
-        active_job = None
     if active_job is not None:
         return {
             "status": "queued",
@@ -414,6 +369,7 @@ async def queue_quality_backfill(
         force_refresh=body.force_refresh,
         missing_only=body.missing_only,
     )
+    background_tasks.add_task(process_quality_backfill_job, job.get("job_id"))
 
     return {
         "status": "queued",
@@ -495,6 +451,7 @@ async def get_merchant_product_detail(
         make_product_key(platform, platform_product_id) or ("", ""),
         {},
     )
+    agent_push = build_agent_push_projection_from_cache_row(cache_row)
 
     return {
         "merchant_id": merchant_id,
@@ -503,6 +460,7 @@ async def get_merchant_product_detail(
         "standard": standard_full,
         "enrichment": enrichment or {},
         "quality": _quality_response(projection),
+        "agent_push": _agent_push_response(agent_push),
     }
 
 

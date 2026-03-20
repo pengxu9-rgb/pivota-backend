@@ -50,6 +50,17 @@ async def test_list_merchant_products_reports_true_total(
         "_build_quality_projection_bundle",
         fake_build_quality_projection_bundle,
     )
+    monkeypatch.setattr(
+        module,
+        "build_agent_push_projection_from_cache_row",
+        lambda _cache_row: {
+            "agent_push_status": "eligible_for_agent_push",
+            "agent_push_reason_codes": [],
+            "eligible_variant_count": 1,
+            "excluded_variant_count": 0,
+            "store_data_last_checked_at": "2026-03-19T00:00:00Z",
+        },
+    )
 
     response = await module.list_merchant_products(
         page=1,
@@ -62,6 +73,7 @@ async def test_list_merchant_products_reports_true_total(
     assert response["total"] == 740
     assert len(response["items"]) == 1
     assert response["items"][0]["platform_product_id"] == "9859804856648"
+    assert response["items"][0]["agent_push"]["agent_push_status"] == "eligible_for_agent_push"
 
 
 @pytest.mark.asyncio

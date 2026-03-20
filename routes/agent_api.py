@@ -37,14 +37,12 @@ from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
-    is_destination_domain_allowed,
     make_redirect_token,
 )
 from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
-from services.external_referral_readiness import should_block_external_referral_runtime
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -52,6 +50,10 @@ from services.agent_ranking_service import (
     passes_agent_gating,
     compute_agent_ranking_score,
     serialize_features_for_log,
+)
+from services.product_exposure_service import (
+    AGENT_PUSH_STATUS_EXCLUDED,
+    build_agent_push_projection_from_standard_product,
 )
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
@@ -199,6 +201,19 @@ def _row_as_dict(row: Any) -> Dict[str, Any]:
         return dict(row)
     except Exception:
         return {}
+
+
+def _build_agent_push_projection(product: Dict[str, Any], *, checked_at: Any = None) -> Dict[str, Any]:
+    projection = build_agent_push_projection_from_standard_product(
+        product,
+        checked_at=checked_at,
+    )
+    product["agent_push_status"] = projection.get("agent_push_status")
+    product["agent_push_reason_codes"] = projection.get("agent_push_reason_codes") or []
+    product["eligible_variant_count"] = projection.get("eligible_variant_count", 0)
+    product["excluded_variant_count"] = projection.get("excluded_variant_count", 0)
+    product["store_data_last_checked_at"] = projection.get("store_data_last_checked_at")
+    return projection
 
 
 def _classify_db_reason_code(exc: Exception) -> str:
@@ -2272,6 +2287,12 @@ async def _search_products_fast_mode(
         product["merchant_name"] = row_data.get("merchant_name") or product.get("merchant_name") or "Unknown"
         if not product["merchant_id"]:
             continue
+        projection = _build_agent_push_projection(
+            product,
+            checked_at=row_data.get("cached_at") or row_data.get("expires_at"),
+        )
+        if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+            continue
         if not _matches_catalog_surface(product, catalog_surface):
             continue
         if not _passes_retrieval_profile_filter(product, query_semantic_class):
@@ -2451,20 +2472,6 @@ async def _build_external_seed_product(
         or _stable_external_product_id(canonical_url or destination_url)
     )
     if not external_product_id:
-        return None
-
-    blocked, gate_status = await should_block_external_referral_runtime(
-        seed_row,
-        matched_via="agent_api",
-        allowed_domains=allowed_domains,
-    )
-    if blocked:
-        if isinstance(metrics_out, dict):
-            metrics_out["blocked_by_referral_gate"] = metrics_out.get("blocked_by_referral_gate", 0) + 1
-            metrics_out.setdefault("blocked_referral_reasons", [])
-            for reason in gate_status.blocker_anomaly_types:
-                if reason not in metrics_out["blocked_referral_reasons"]:
-                    metrics_out["blocked_referral_reasons"].append(reason)
         return None
 
     disclosure_text = (
@@ -3782,6 +3789,12 @@ async def agent_search_products(
                         continue
                     pdata["merchant_id"] = str(row_data.get("merchant_id") or pdata.get("merchant_id") or "")
                     pdata["merchant_name"] = row_data.get("merchant_name") or pdata.get("merchant_name") or "Unknown"
+                    projection = _build_agent_push_projection(
+                        pdata,
+                        checked_at=row_data.get("cached_at") or row_data.get("expires_at"),
+                    )
+                    if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+                        continue
                     pdata.setdefault("relevance_score", 1.0)
                     pdata.setdefault("ranking_score", 1.0)
                     pdata.setdefault("ranking_features", {"mode": "browse_fastpath"})
@@ -4428,6 +4441,9 @@ async def agent_search_products(
                         prod_dict["merchant_id"] = mid
                         prod_dict["merchant_name"] = merchant_name or prod_dict.get("merchant_name") or "Unknown"
                         prod_dict["query_source"] = query_source
+                        projection = _build_agent_push_projection(prod_dict)
+                        if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+                            continue
                         out.append(prod_dict)
                     return out
                 except Exception as e:
@@ -4535,6 +4551,14 @@ async def agent_search_products(
             browse_internal: List[Dict[str, Any]] = []
             browse_external: List[Dict[str, Any]] = []
             for product in all_products:
+                is_external_seed_product = _is_external_seed_product(product)
+                if not is_external_seed_product:
+                    projection = _build_agent_push_projection(
+                        product,
+                        checked_at=product.get("store_data_last_checked_at"),
+                    )
+                    if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+                        continue
                 if in_stock_only and not product.get("in_stock", True):
                     continue
                 if not _matches_catalog_surface(product, normalized_catalog_surface):
@@ -4729,6 +4753,17 @@ async def agent_search_products(
 
         filter_stage_started = time.perf_counter()
         for product in all_products:
+            is_external_seed = (
+                product.get("source") == "external_seed"
+                or product.get("merchant_id") == EXTERNAL_SEED_MERCHANT_ID
+            )
+            if not is_external_seed:
+                projection = _build_agent_push_projection(
+                    product,
+                    checked_at=product.get("store_data_last_checked_at"),
+                )
+                if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
+                    continue
             if in_stock_only and not product.get("in_stock", True):
                 continue
             if not _matches_catalog_surface(product, normalized_catalog_surface):
@@ -4761,10 +4796,6 @@ async def agent_search_products(
             )
             product["_brand_relevant"] = bool(brand_relevant)
 
-            is_external_seed = (
-                product.get("source") == "external_seed"
-                or product.get("merchant_id") == EXTERNAL_SEED_MERCHANT_ID
-            )
             relevance_score = 1.0
             if normalized_query:
                 query_lower = normalized_query.lower()
@@ -6459,7 +6490,7 @@ async def agent_create_order(
 
     # STEP 1: Governance validation (before main logic)
     from services.agent_governance import agent_governance
-    await agent_governance.validate_request(context.agent_id)
+    await agent_governance.validate_request(context.agent_id, fail_closed=True)
 
     # MVP measurement scaffolding: record checkout attempt (order creation stage).
     try:
@@ -7298,6 +7329,7 @@ async def agent_confirm_payment(
 ):
     """确认支付并触发 Shopify 订单创建（Agent 调用）"""
     try:
+        from services.agent_governance import agent_governance
         from routes.order_routes import create_shopify_order, get_order, log_order_event, mark_order_paid
         from services.merchant_store_service import get_primary_store
         from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
@@ -7308,6 +7340,8 @@ async def agent_confirm_payment(
 
         if not context.can_access_merchant(order["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        await agent_governance.validate_request(context.agent_id, fail_closed=True)
 
         store_info = await get_primary_store(order["merchant_id"])
         can_shopify_sync = bool(store_info) and str((store_info or {}).get("platform") or "").strip().lower() == "shopify" and bool(

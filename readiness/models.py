@@ -149,16 +149,6 @@ class ScoreBundle(BaseModel):
     conversion_score: Optional[int] = None
 
 
-class DashboardSnapshot(BaseModel):
-    total_orders: int = 0
-    paid_orders: int = 0
-    total_revenue: float = 0.0
-    total_customers: int = 0
-    total_products: int = 0
-    order_growth: float = 0.0
-    revenue_growth: float = 0.0
-
-
 class OptimizationPlan(BaseModel):
     plan_id: str
     snapshot_id: str
@@ -220,12 +210,6 @@ class ProductReadinessQueueItem(BaseModel):
     image_url: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
-    price_value: Optional[float] = None
-    price_currency: Optional[str] = None
-    content_quality_score: Optional[float] = None
-    model_readiness_score: Optional[float] = None
-    conversion_potential_score: Optional[float] = None
-    quality_last_evaluated_at: Optional[str] = None
     blocked_variant_count: int = 0
     ready_variant_count: int = 0
     top_issues: List[ProductQueueIssue] = Field(default_factory=list)
@@ -242,6 +226,11 @@ class ProductReadinessQueueItem(BaseModel):
     conversion_potential_score: Optional[float] = None
     quality_last_evaluated_at: Optional[str] = None
     quality_source: str = "none"
+    agent_push_status: str = "eligible_for_agent_push"
+    agent_push_reason_codes: List[str] = Field(default_factory=list)
+    eligible_variant_count: int = 0
+    excluded_variant_count: int = 0
+    store_data_last_checked_at: Optional[str] = None
 
 
 class QualityCoverageSummary(BaseModel):
@@ -256,15 +245,26 @@ class QualityCoverageSummary(BaseModel):
     active_backfill_job: Optional[Dict[str, Any]] = None
 
 
+class AgentPushSummary(BaseModel):
+    total_products: int = 0
+    eligible_products: int = 0
+    excluded_products: int = 0
+    eligible_variants: int = 0
+    excluded_variants: int = 0
+    active_blocked_variants: int = 0
+    top_reason_codes: List[Dict[str, Any]] = Field(default_factory=list)
+    last_checked_at: Optional[str] = None
+
+
 class MerchantReadinessOptimizationPayload(BaseModel):
     plan: OptimizationPlan
     score_bundle: ScoreBundle = Field(default_factory=ScoreBundle)
     readiness_summary: ReadinessSummary
-    dashboard_snapshot: Optional[DashboardSnapshot] = None
     issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
     quality_coverage: QualityCoverageSummary = Field(default_factory=QualityCoverageSummary)
+    agent_push_summary: AgentPushSummary = Field(default_factory=AgentPushSummary)
     last_generated_at: Optional[str] = None
 
 

@@ -5,7 +5,6 @@ import pytest
 from readiness.models import (
     CapabilityStatus,
     ChannelCoverageStatus,
-    DashboardSnapshot,
     MerchantReadinessSnapshot,
     QualityCoverageSummary,
     ReadyProduct,
@@ -14,18 +13,8 @@ from readiness.models import (
 from readiness.summary import (
     build_readiness_optimization,
     build_readiness_summary,
-    get_readiness_optimization_cache_metrics,
-    invalidate_readiness_optimization_cache,
-    reset_readiness_optimization_cache_observability,
     summarize_readiness_snapshot,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_optimization_cache():
-    reset_readiness_optimization_cache_observability()
-    yield
-    reset_readiness_optimization_cache_observability()
 
 
 def _snapshot(
@@ -201,37 +190,6 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
 
     monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
 
-    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
-        product_queue[0].content_quality_score = 62.5
-        product_queue[0].model_readiness_score = 71.0
-        product_queue[0].conversion_potential_score = 55.0
-        product_queue[0].quality_last_evaluated_at = "2026-03-18T01:00:00+00:00"
-        product_queue[0].quality_source = "snapshot"
-        return product_queue, QualityCoverageSummary(
-            total_products=1,
-            snapshot_scored_products=1,
-            effective_scored_products=1,
-            preview_only_products=0,
-            unscored_products=0,
-            coverage_state="full",
-            latest_snapshot_at="2026-03-18T01:00:00+00:00",
-            backfill_recommended=False,
-        )
-
-    monkeypatch.setattr("readiness.summary._apply_quality_projection", fake_apply_quality_projection)
-    async def fake_dashboard_snapshot(_merchant_id: str):
-        return DashboardSnapshot(
-            total_orders=12,
-            paid_orders=9,
-            total_revenue=321.5,
-            total_customers=7,
-            total_products=42,
-            order_growth=20.0,
-            revenue_growth=12.5,
-        )
-
-    monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
-
     payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
 
     assert payload.plan.snapshot_id.startswith("rdsnap_")
@@ -245,19 +203,15 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
     assert payload.product_queue[0].platform == "shopify"
     assert payload.product_queue[0].queue_item_scope == "product"
     assert payload.product_queue[0].queue_item_id.startswith("product:shopify:")
-    assert payload.product_queue[0].blocked_variant_count == 1
+    assert payload.product_queue[0].blocked_variant_count == 0
+    assert payload.product_queue[0].agent_push_status == "eligible_for_agent_push"
+    assert payload.product_queue[0].eligible_variant_count == 1
+    assert payload.product_queue[0].excluded_variant_count == 1
     assert payload.product_queue[0].priority_score > 0
     assert payload.product_queue[0].top_issues
-    assert payload.product_queue[0].price_value == 10.0
-    assert payload.product_queue[0].price_currency == "USD"
-    assert payload.product_queue[0].content_quality_score == 62.5
-    assert payload.product_queue[0].model_readiness_score == 71.0
-    assert payload.product_queue[0].conversion_potential_score == 55.0
-    assert payload.dashboard_snapshot is not None
-    assert payload.dashboard_snapshot.total_orders == 12
-    assert payload.dashboard_snapshot.paid_orders == 9
-    assert payload.dashboard_snapshot.total_products == 42
     assert payload.merchant_actions
+    assert payload.agent_push_summary.eligible_products == 1
+    assert payload.agent_push_summary.excluded_variants == 1
 
 
 @pytest.mark.asyncio
@@ -340,157 +294,3 @@ async def test_build_readiness_optimization_projects_quality_coverage(monkeypatc
     assert payload.quality_coverage.effective_scored_products == 1
     assert payload.quality_coverage.preview_only_products == 1
     assert payload.quality_coverage.coverage_state == "full"
-
-
-@pytest.mark.asyncio
-async def test_build_readiness_optimization_uses_ttl_cache_until_force_refresh(monkeypatch):
-    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
-    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
-    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
-
-    call_counts = {
-        "snapshot": 0,
-        "quality": 0,
-        "dashboard": 0,
-    }
-
-    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
-        call_counts["snapshot"] += 1
-        return MerchantReadinessSnapshot(
-            merchant_id="merch_efbc46b4619cfbdf",
-            merchant_name="Alpha Merchant",
-            channel=channel,
-            generated_at="2026-03-18T00:00:00Z",
-            merchant_alpha_mode="real_merchant_alpha",
-            readiness_score=77,
-            domain_scores={},
-            capability_status={
-                "checkout_execution": "ready",
-                "order_writeback_state_sync": "ready",
-            },
-            blockers=[],
-            warnings=[],
-            merchant_capabilities=[],
-            channel_coverage=[
-                ChannelCoverageStatus(
-                    channel="ucp",
-                    status="ready",
-                    ready_variant_count=1,
-                    blocked_variant_count=0,
-                )
-            ],
-            source_of_truth={},
-            stubbed_capabilities=[],
-            audit_notes=[],
-            products=[
-                ReadyProduct(
-                    product_id="prod_1",
-                    platform="shopify",
-                    title="Alpha Product",
-                    variants=[
-                        ReadyVariant(
-                            variant_id="var_1",
-                            title="Default",
-                            price={"amount": 10, "currency": "USD"},
-                            inventory={"quantity": 5, "availability": "in_stock"},
-                            freshness={},
-                            provenance=[],
-                            source_of_truth={},
-                            blockers={"discovery": [], "checkout": []},
-                            warnings={"discovery": [], "checkout": []},
-                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
-                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
-                            channel_coverage={"ucp": "ready"},
-                        )
-                    ],
-                )
-            ],
-        )
-
-    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
-        call_counts["quality"] += 1
-        return product_queue, QualityCoverageSummary(total_products=1)
-
-    async def fake_dashboard_snapshot(_merchant_id: str):
-        call_counts["dashboard"] += 1
-        return DashboardSnapshot(total_products=1)
-
-    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
-    monkeypatch.setattr("readiness.summary._apply_quality_projection", fake_apply_quality_projection)
-    monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
-
-    first = await build_readiness_optimization("merch_efbc46b4619cfbdf")
-    second = await build_readiness_optimization("merch_efbc46b4619cfbdf")
-    refreshed = await build_readiness_optimization("merch_efbc46b4619cfbdf", force_refresh=True)
-
-    assert first.plan.plan_id == second.plan.plan_id
-    assert second.plan.plan_id == refreshed.plan.plan_id
-    assert call_counts == {
-        "snapshot": 2,
-        "quality": 2,
-        "dashboard": 2,
-    }
-    metrics = get_readiness_optimization_cache_metrics()
-    assert metrics["hits"] == 1
-    assert metrics["misses"] == 1
-    assert metrics["refreshes"] == 1
-    assert metrics["stores"] == 2
-    assert metrics["entries"] == 1
-    assert metrics["active_keys"][0]["merchant_id"] == "merch_efbc46b4619cfbdf"
-    assert metrics["active_keys"][0]["channel"] == "ucp"
-
-
-@pytest.mark.asyncio
-async def test_invalidate_readiness_optimization_cache_returns_removed_entry_count(monkeypatch):
-    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
-    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
-    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
-
-    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
-        return MerchantReadinessSnapshot(
-            merchant_id="merch_efbc46b4619cfbdf",
-            merchant_name="Alpha Merchant",
-            channel=channel,
-            generated_at="2026-03-18T00:00:00Z",
-            merchant_alpha_mode="real_merchant_alpha",
-            readiness_score=77,
-            domain_scores={},
-            capability_status={
-                "checkout_execution": "ready",
-                "order_writeback_state_sync": "ready",
-            },
-            blockers=[],
-            warnings=[],
-            merchant_capabilities=[],
-            channel_coverage=[
-                ChannelCoverageStatus(
-                    channel="ucp",
-                    status="ready",
-                    ready_variant_count=1,
-                    blocked_variant_count=0,
-                )
-            ],
-            source_of_truth={},
-            stubbed_capabilities=[],
-            audit_notes=[],
-            products=[],
-        )
-
-    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
-        return product_queue, QualityCoverageSummary(total_products=0)
-
-    async def fake_dashboard_snapshot(_merchant_id: str):
-        return DashboardSnapshot(total_products=1)
-
-    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
-    monkeypatch.setattr("readiness.summary._apply_quality_projection", fake_apply_quality_projection)
-    monkeypatch.setattr("readiness.summary._load_dashboard_snapshot", fake_dashboard_snapshot)
-
-    await build_readiness_optimization("merch_efbc46b4619cfbdf")
-    removed = invalidate_readiness_optimization_cache("merch_efbc46b4619cfbdf", channel="ucp")
-
-    assert removed == 1
-    metrics = get_readiness_optimization_cache_metrics()
-    assert metrics["entries"] == 0
-    assert metrics["invalidations"] == 1
-    assert metrics["invalidated_entries"] == 1
