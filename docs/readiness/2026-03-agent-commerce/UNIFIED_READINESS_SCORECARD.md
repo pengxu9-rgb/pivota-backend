@@ -2,7 +2,9 @@
 
 ## Audit Anchor
 
-Audit date: `2026-03-19`
+Initial dual-track framing date: `2026-03-19`
+
+Latest rollout verification update: `2026-03-20`
 
 Anchor merchant:
 
@@ -23,11 +25,35 @@ This document upgrades the current readiness framing from a checkout-heavy alpha
 
 Evidence used here is intentionally limited to:
 
-- verified production facts observed on or before `2026-03-19`
+- verified production facts observed on or before `2026-03-20`
 - repo and runtime facts in the live backend codebase
 - existing readiness alpha artifacts under `docs/readiness/2026-03-agent-commerce/`
 
 No public API or portal behavior changes are introduced in this phase.
+
+## March 20 Update
+
+On `2026-03-20`, production was re-audited after external-referral governance, employee referral health surfaces, runtime hard gating, and two runtime latency fixes were already live.
+
+The additional audit facts are:
+
+- merchant universe checked: `17`
+- merchants with any active referral seeds: `1`
+- merchants with any attached referral seeds: `1`
+- anchor merchant external-referral summary:
+  - `status=green`
+  - `total_active_seeds=50`
+  - `attached_seed_count=50`
+  - `healthy_seed_count=50`
+  - `blocked_seed_count=0`
+  - `review_seed_count=0`
+- anchor merchant runtime probe:
+  - `50 / 50` attached products returned `affiliate_outbound`
+  - `0` runtime errors
+  - median latency `870.5ms`
+  - p95 latency `1574ms`
+
+See `MULTI_MERCHANT_EXTERNAL_REFERRAL_AUDIT.md` for the full production readout.
 
 ## Unified Framing
 
@@ -45,9 +71,9 @@ This scorecard therefore enforces two rules:
 
 | Layer | Internal Commerce | External Referral | Overall Agent Surface |
 | --- | --- | --- | --- |
-| `System readiness` | `Green` - first-class readiness snapshot, optimization plan, merchant workspace, employee ops, and live one-merchant checkout/order/refund/return alpha are in place. | `Yellow` - external seeds, tracked redirects, and affiliate outbound runtime are live, but referral is not yet a first-class readiness contract. | `Yellow` - both surfaces exist in production, but only internal commerce is fully modeled and operatorized. |
-| `Merchant readiness` | `Yellow` - live merchant portal still shows `Needs Attention`, `score=77`, `2098 ready / 265 blocked`; checkout, order-sync, and reviews are ready, but blocked variants remain dominated by `out_of_stock` and `missing_price`. | `Yellow` - the merchant can be represented through referral-capable runtime surfaces, but no dedicated referral score, redirect-health score, or seed-health diagnostics exist for this merchant today. | `Yellow` - the merchant is usable in alpha, but is not green across both transaction and referral surfaces. |
-| `Rollout readiness` | `Yellow` - one-merchant production alpha is operational, but broader multi-merchant internal-commerce rollout is still unproven. | `Red` - referral runtime exists, but seed freshness, redirect integrity, landing integrity, and attribution are not yet normalized into a shared readiness contract. | `Red` - broad rollout should not claim unified agent-commerce readiness until referral becomes first-class. |
+| `System readiness` | `Green` - first-class readiness snapshot, optimization plan, merchant workspace, employee ops, and live one-merchant checkout/order/refund/return alpha are in place. | `Yellow` - external seeds, tracked redirects, employee-safe referral health, and affiliate outbound runtime are live, but referral is still not yet a merchant-facing first-class readiness contract. | `Yellow` - both surfaces exist in production, but only internal commerce is fully modeled for merchants. |
+| `Merchant readiness` | `Yellow` - live merchant portal still shows `Needs Attention`, `score=77`, `2098 ready / 265 blocked`; checkout, order-sync, and reviews are ready, but blocked variants remain dominated by `out_of_stock` and `missing_price`. | `Green` - the anchor merchant now has `50` healthy attached referral seeds, `0` blocked or review seeds, and `50 / 50` live runtime `affiliate_outbound` coverage in production. | `Yellow` - the anchor merchant is green for referral but still yellow overall because internal-commerce blockers remain. |
+| `Rollout readiness` | `Yellow` - one-merchant production alpha is operational, but broader multi-merchant internal-commerce rollout is still unproven. | `Red` - the March 20 production audit found only `1 / 17` live merchants with any active attached referral inventory, so fleet coverage is still the dominant bottleneck. | `Red` - broad rollout should not claim unified agent-commerce readiness until referral coverage extends beyond the anchor merchant. |
 
 ## Why These Ratings Are Correct
 
@@ -64,17 +90,20 @@ This is why `system readiness` for internal commerce is `Green` even though the 
 
 ### External Referral
 
-External referral is operationally present, but still under-modeled:
+External referral is operationally present, and the anchor merchant is now runtime-healthy, but the fleet is still under-covered:
 
 - employee-managed external seed curation exists under `routes/employee_products.py`
+- employee-safe referral summary now exists through `GET /employee/referral-readiness/summary`
 - tracked redirect generation exists in `_make_redirect_url()` in `routes/employee_products.py`
 - agent runtime redirect and external-offer handling exists in:
   - `routes/agent_api.py`
   - `routes/agent_sdk_fixed.py`
   - `routes/agent_shop_gateway.py`
 - the gateway explicitly emits `purchase_route=affiliate_outbound` and `affiliate_url` for external-seed offers
+- the anchor merchant's attached referral products now return `affiliate_outbound` for `50 / 50` live probes
+- the March 20 fleet audit found only `1 / 17` live merchants with any active attached referral inventory
 
-What is missing is not runtime capability. What is missing is a first-class readiness contract for referral quality, freshness, landing integrity, and attribution. That is why referral is `Yellow` at the system level and `Red` for broad rollout.
+What is now missing is primarily merchant coverage, plus a merchant-facing readiness contract for referral quality, freshness, landing integrity, and attribution. That is why referral is `Yellow` at the system level, `Green` for the anchor merchant, and still `Red` for broad rollout.
 
 ## Shared Blockers And Track-Specific Problems
 
@@ -147,13 +176,33 @@ This merchant is therefore `Yellow`, not `Red`, for internal commerce.
 
 ### External referral
 
-For the same merchant, external-referral readiness cannot yet be scored from a dedicated contract:
+For the same merchant, the latest production employee summary now shows:
 
-- the live platform can represent referral-capable offers through external seeds and tracked redirects
-- the runtime can emit outbound purchase routes
-- but the merchant does not yet receive a first-class referral score, referral issue buckets, or redirect/landing health diagnostics
+- `status=green`
+- `total_active_seeds=50`
+- `attached_seed_count=50`
+- `healthy_seed_count=50`
+- `blocked_seed_count=0`
+- `review_seed_count=0`
 
-This merchant is therefore `Yellow`, not `Green`, for external referral. The system has the runtime pieces, but not a merchant-safe referral readiness model.
+Live runtime probes against `https://agent.pivota.cc/api/gateway` also showed:
+
+- `50 / 50` attached referral products returned `affiliate_outbound`
+- `0` runtime errors
+- `0` failure breakdowns
+
+This merchant is therefore now `Green`, not `Yellow`, for external referral.
+
+## Multi-Merchant Rollout Update
+
+The `2026-03-20` production fleet audit changed the rollout interpretation:
+
+- total live merchants checked: `17`
+- merchants with any active referral inventory: `1`
+- merchants with any attached referral inventory: `1`
+- merchants with blocked referral seeds: `0`
+
+So the external-referral rollout problem is no longer best described as runtime instability. It is better described as `merchant inventory coverage remains sparse outside the anchor merchant`.
 
 ## What This Audit Changes In The Framing
 
@@ -189,10 +238,10 @@ Recommended follow-on rule:
 
 ## Final Verdict
 
-As of `2026-03-19`:
+As of `2026-03-20`:
 
 - `Internal commerce readiness`: `system=Green`, `merchant=Yellow`, `rollout=Yellow`
-- `External referral readiness`: `system=Yellow`, `merchant=Yellow`, `rollout=Red`
+- `External referral readiness`: `system=Yellow`, `merchant=Green`, `rollout=Red`
 - `Overall agent surface readiness`: `system=Yellow`, `merchant=Yellow`, `rollout=Red`
 
-The platform is ready for a supervised one-merchant alpha across agent-compatible commerce surfaces, but it is not yet ready to claim broad unified readiness across both internal checkout and external referral.
+The platform is now ready for a supervised one-merchant alpha across both internal checkout and external referral surfaces, but it is still not ready to claim broad unified readiness because referral coverage does not yet extend across the fleet.

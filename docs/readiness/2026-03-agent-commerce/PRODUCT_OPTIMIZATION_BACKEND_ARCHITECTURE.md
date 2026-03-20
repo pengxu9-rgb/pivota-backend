@@ -19,7 +19,7 @@ In one sentence:
 
 That is good enough for a merchant-facing workspace v1. It is not yet sufficient as the long-term product and engineering control plane.
 
-This document is primarily about the merchant-facing optimization workspace for `internal commerce`. As of March 19, 2026, production also supports `external referral` surfaces through employee-managed external seeds and tracked outbound redirects, but those surfaces are not yet first-class in the optimization plan contract. See `UNIFIED_READINESS_SCORECARD.md` for the dual-track audit that combines internal commerce and external referral into one readiness framing.
+This document is primarily about the merchant-facing optimization workspace for `internal commerce`. As of March 20, 2026, production also supports `external referral` surfaces through employee-managed external seeds and tracked outbound redirects, and the anchor merchant now has healthy live referral runtime coverage. Those surfaces are still not yet first-class in the optimization plan contract, and fleet-wide referral coverage remains sparse. See `UNIFIED_READINESS_SCORECARD.md` and `MULTI_MERCHANT_EXTERNAL_REFERRAL_AUDIT.md` for the latest dual-track production audit.
 
 ## Initial Landing State
 
