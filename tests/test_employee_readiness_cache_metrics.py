@@ -190,6 +190,150 @@ def test_employee_merchant_analytics_route(monkeypatch):
     app.dependency_overrides.clear()
 
 
+def test_summarize_employee_merchant_commerce_readiness_red_when_core_prereqs_missing():
+    from routes import employee_dashboard_routes as module
+
+    summary = module._summarize_employee_merchant_commerce_readiness(
+        "merch_red",
+        stores=[],
+        psps=[],
+        analytics={"total_products": 0},
+    )
+
+    assert summary["status"] == "red"
+    assert summary["merchant_valid"] is False
+    assert summary["rollout_ready"] is False
+    assert "missing_connected_store_domain" in summary["invalid_reasons"]
+    assert "missing_catalog_sync" in summary["invalid_reasons"]
+    assert "missing_psp_or_checkout" in summary["invalid_reasons"]
+    assert summary["checklist"][3]["state"] == "unproven"
+
+
+def test_summarize_employee_merchant_commerce_readiness_yellow_when_loop_unproven():
+    from routes import employee_dashboard_routes as module
+
+    summary = module._summarize_employee_merchant_commerce_readiness(
+        "merch_yellow",
+        stores=[
+            {
+                "domain": "shop.example.com",
+                "is_connected": True,
+                "status": "active",
+                "api_key_present": True,
+            }
+        ],
+        psps=[
+            {
+                "provider": "stripe",
+                "status": "active",
+                "configured": True,
+            }
+        ],
+        analytics={
+            "total_products": 24,
+            "order_breakdown": {"total": 0, "paid": 0, "all_time_paid": 0},
+            "revenue_breakdown": {"confirmed": 0, "all_time_confirmed": 0},
+        },
+    )
+
+    assert summary["status"] == "yellow"
+    assert summary["merchant_valid"] is True
+    assert summary["rollout_ready"] is False
+    assert summary["invalid_reasons"] == []
+    assert summary["checklist"][0]["state"] == "ready"
+    assert summary["checklist"][1]["state"] == "ready"
+    assert summary["checklist"][2]["state"] == "ready"
+    assert summary["checklist"][3]["state"] == "unproven"
+
+
+def test_summarize_employee_merchant_commerce_readiness_green_when_loop_observed():
+    from routes import employee_dashboard_routes as module
+
+    summary = module._summarize_employee_merchant_commerce_readiness(
+        "merch_green",
+        stores=[
+            {
+                "domain": "shop.example.com",
+                "is_connected": True,
+                "status": "active",
+                "api_key_present": True,
+            }
+        ],
+        psps=[
+            {
+                "provider": "stripe",
+                "status": "active",
+                "configured": True,
+            }
+        ],
+        analytics={
+            "total_products": 24,
+            "order_breakdown": {"total": 6, "paid": 4, "all_time_paid": 12},
+            "revenue_breakdown": {"confirmed": 120.0, "all_time_confirmed": 420.0},
+            "total_orders": 6,
+            "total_payments_succeeded": 4,
+            "confirmed_revenue": 120.0,
+        },
+    )
+
+    assert summary["status"] == "green"
+    assert summary["merchant_valid"] is True
+    assert summary["rollout_ready"] is True
+    assert summary["paid_orders_last_30_days"] == 4
+    assert summary["all_time_paid_orders"] == 12
+    assert summary["checklist"][3]["state"] == "ready"
+
+
+def test_employee_merchant_commerce_readiness_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_build(merchant_id: str):
+        assert merchant_id == "merch_1"
+        return {
+            "merchant_id": merchant_id,
+            "generated_at": "2026-03-20T00:00:00+00:00",
+            "status": "yellow",
+            "merchant_valid": True,
+            "rollout_ready": False,
+            "operator_action": "Run a real order and verify payment completion before rollout.",
+            "invalid_reasons": [],
+            "connected_store_count": 1,
+            "connected_store_domain_count": 1,
+            "connected_store_domains": ["shop.example.com"],
+            "catalog_product_count": 24,
+            "psp_connected": True,
+            "psp_provider_count": 1,
+            "psp_providers": ["stripe"],
+            "orders_last_30_days": 0,
+            "paid_orders_last_30_days": 0,
+            "confirmed_revenue_last_30_days": 0.0,
+            "all_time_paid_orders": 0,
+            "all_time_confirmed_revenue": 0.0,
+            "checklist": [
+                {"key": "store_domain_connected", "label": "Connected store domain", "state": "ready", "detail": "1 connected domains in scope."},
+                {"key": "catalog_synced", "label": "Catalog synced", "state": "ready", "detail": "24 active catalog products in products_cache."},
+                {"key": "psp_or_checkout_connected", "label": "PSP or checkout connected", "state": "ready", "detail": "1 configured PSP connections: stripe."},
+                {"key": "order_payment_loop_observed", "label": "Order/payment loop observed", "state": "unproven", "detail": "No paid order or confirmed revenue evidence observed yet."},
+            ],
+        }
+
+    monkeypatch.setattr(module, "build_employee_merchant_commerce_readiness", fake_build)
+
+    response = client.get(
+        "/employee/merchant/merch_1/commerce-readiness",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["status"] == "yellow"
+    assert payload["data"]["merchant_valid"] is True
+    assert payload["data"]["checklist"][3]["state"] == "unproven"
+
+    app.dependency_overrides.clear()
+
+
 def test_employee_referral_readiness_summary_route(monkeypatch):
     module, app, client = _build_client_with_employee_override()
 

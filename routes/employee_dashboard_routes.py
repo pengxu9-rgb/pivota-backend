@@ -2,6 +2,8 @@
 Employee Dashboard Routes
 Provides analytics and management endpoints for employee portal
 """
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -287,6 +289,188 @@ async def _fetch_employee_merchant_analytics(merchant_id: str) -> Dict[str, Any]
         "gmv": gmv_last_30,
     }
 
+
+def _to_int(value: Any) -> int:
+    try:
+        if value is None:
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _to_float(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_connected_store(store: Dict[str, Any]) -> bool:
+    if bool(store.get("is_connected")):
+        return True
+    status = str(store.get("status") or "").strip().lower()
+    return status == "active" and bool(store.get("api_key_present"))
+
+
+def _is_connected_psp(psp: Dict[str, Any]) -> bool:
+    if not bool(psp.get("configured")):
+        return False
+    status = str(psp.get("status") or "").strip().lower()
+    return status not in {"pending_setup", "rejected", "inactive", "disabled", "error"}
+
+
+def _summarize_employee_merchant_commerce_readiness(
+    merchant_id: str,
+    stores: List[Dict[str, Any]],
+    psps: List[Dict[str, Any]],
+    analytics: Dict[str, Any],
+) -> Dict[str, Any]:
+    connected_stores = [store for store in stores if _is_connected_store(store)]
+    connected_store_domains = sorted(
+        {
+            str(store.get("domain") or "").strip().lower()
+            for store in connected_stores
+            if str(store.get("domain") or "").strip()
+        }
+    )
+    connected_psps = [psp for psp in psps if _is_connected_psp(psp)]
+    psp_providers = sorted(
+        {
+            str(psp.get("provider") or psp.get("name") or "").strip()
+            for psp in connected_psps
+            if str(psp.get("provider") or psp.get("name") or "").strip()
+        }
+    )
+
+    catalog_product_count = _to_int(analytics.get("total_products"))
+    orders_last_30_days = _to_int(
+        analytics.get("total_orders") or (analytics.get("order_breakdown") or {}).get("total")
+    )
+    paid_orders_last_30_days = _to_int(
+        analytics.get("total_payments_succeeded") or (analytics.get("order_breakdown") or {}).get("paid")
+    )
+    confirmed_revenue_last_30_days = _to_float(
+        analytics.get("confirmed_revenue")
+        or analytics.get("total_revenue")
+        or (analytics.get("revenue_breakdown") or {}).get("confirmed")
+    )
+    all_time_paid_orders = _to_int((analytics.get("order_breakdown") or {}).get("all_time_paid"))
+    all_time_confirmed_revenue = _to_float(
+        (analytics.get("revenue_breakdown") or {}).get("all_time_confirmed")
+    )
+
+    store_domain_connected = bool(connected_store_domains)
+    catalog_synced = catalog_product_count > 0
+    psp_or_checkout_connected = bool(connected_psps)
+    order_payment_loop_observed = (
+        paid_orders_last_30_days > 0
+        or confirmed_revenue_last_30_days > 0
+        or all_time_paid_orders > 0
+        or all_time_confirmed_revenue > 0
+    )
+
+    merchant_valid = store_domain_connected and catalog_synced and psp_or_checkout_connected
+    rollout_ready = merchant_valid and order_payment_loop_observed
+
+    invalid_reasons: List[str] = []
+    if not store_domain_connected:
+        invalid_reasons.append("missing_connected_store_domain")
+    if not catalog_synced:
+        invalid_reasons.append("missing_catalog_sync")
+    if not psp_or_checkout_connected:
+        invalid_reasons.append("missing_psp_or_checkout")
+
+    if not store_domain_connected:
+        operator_action = "Connect a real merchant store domain before treating this merchant as rollout-valid."
+    elif not catalog_synced:
+        operator_action = "Run catalog sync and verify active products are present in products_cache."
+    elif not psp_or_checkout_connected:
+        operator_action = "Connect and configure a live PSP or checkout path before rollout."
+    elif not order_payment_loop_observed:
+        operator_action = "Run a real order and verify paid order / confirmed revenue signals before rollout."
+    else:
+        operator_action = "Merchant has the core commerce prerequisites and a live payment loop."
+
+    checklist = [
+        {
+            "key": "store_domain_connected",
+            "label": "Connected store domain",
+            "state": "ready" if store_domain_connected else "missing",
+            "detail": (
+                f"{len(connected_store_domains)} connected domains in scope."
+                if store_domain_connected
+                else "No active connected store domain found."
+            ),
+        },
+        {
+            "key": "catalog_synced",
+            "label": "Catalog synced",
+            "state": "ready" if catalog_synced else "missing",
+            "detail": (
+                f"{catalog_product_count} active catalog products in products_cache."
+                if catalog_synced
+                else "No active catalog products found in products_cache."
+            ),
+        },
+        {
+            "key": "psp_or_checkout_connected",
+            "label": "PSP or checkout connected",
+            "state": "ready" if psp_or_checkout_connected else "missing",
+            "detail": (
+                f"{len(connected_psps)} configured PSP connections: {', '.join(psp_providers) or 'configured'}."
+                if psp_or_checkout_connected
+                else "No configured PSP or live checkout path found."
+            ),
+        },
+        {
+            "key": "order_payment_loop_observed",
+            "label": "Order/payment loop observed",
+            "state": "ready" if order_payment_loop_observed else "unproven",
+            "detail": (
+                f"{all_time_paid_orders} paid orders observed all-time."
+                if order_payment_loop_observed
+                else "No paid order or confirmed revenue evidence observed yet."
+            ),
+        },
+    ]
+
+    status = "green" if rollout_ready else "yellow" if merchant_valid else "red"
+
+    return {
+        "merchant_id": merchant_id,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "status": status,
+        "merchant_valid": merchant_valid,
+        "rollout_ready": rollout_ready,
+        "operator_action": operator_action,
+        "invalid_reasons": invalid_reasons,
+        "connected_store_count": len(connected_stores),
+        "connected_store_domain_count": len(connected_store_domains),
+        "connected_store_domains": connected_store_domains,
+        "catalog_product_count": catalog_product_count,
+        "psp_connected": psp_or_checkout_connected,
+        "psp_provider_count": len(psp_providers),
+        "psp_providers": psp_providers,
+        "orders_last_30_days": orders_last_30_days,
+        "paid_orders_last_30_days": paid_orders_last_30_days,
+        "confirmed_revenue_last_30_days": confirmed_revenue_last_30_days,
+        "all_time_paid_orders": all_time_paid_orders,
+        "all_time_confirmed_revenue": all_time_confirmed_revenue,
+        "checklist": checklist,
+    }
+
+
+async def build_employee_merchant_commerce_readiness(merchant_id: str) -> Dict[str, Any]:
+    stores, psps, analytics = await asyncio.gather(
+        _fetch_employee_merchant_stores(merchant_id),
+        _fetch_employee_merchant_psps(merchant_id),
+        _fetch_employee_merchant_analytics(merchant_id),
+    )
+    return _summarize_employee_merchant_commerce_readiness(merchant_id, stores, psps, analytics or {})
+
 @router.get("/analytics/dashboard")
 async def get_analytics_dashboard(
     time_range: str = Query("30d", description="Time range: 1d, 7d, 30d, 90d"),
@@ -561,6 +745,71 @@ async def get_employee_merchant_analytics(
                 "revenue_breakdown": {"confirmed": 0.0, "gmv": 0.0, "all_time_confirmed": 0.0, "all_time_gmv": 0.0},
                 "confirmed_revenue": 0.0,
                 "gmv": 0.0,
+            },
+        }
+
+
+@router.get("/employee/merchant/{merchant_id}/commerce-readiness")
+async def get_employee_merchant_commerce_readiness(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe checklist for merchant-valid commerce rollout."""
+    try:
+        summary = await build_employee_merchant_commerce_readiness(merchant_id)
+        return {"status": "success", "data": summary}
+    except Exception as e:
+        print(f"Error fetching employee merchant commerce readiness for {merchant_id}: {e}")
+        return {
+            "status": "success",
+            "data": {
+                "merchant_id": merchant_id,
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "status": "red",
+                "merchant_valid": False,
+                "rollout_ready": False,
+                "operator_action": "Review store connection, catalog sync, PSP setup, and paid order evidence.",
+                "invalid_reasons": [
+                    "merchant_commerce_readiness_unavailable",
+                ],
+                "connected_store_count": 0,
+                "connected_store_domain_count": 0,
+                "connected_store_domains": [],
+                "catalog_product_count": 0,
+                "psp_connected": False,
+                "psp_provider_count": 0,
+                "psp_providers": [],
+                "orders_last_30_days": 0,
+                "paid_orders_last_30_days": 0,
+                "confirmed_revenue_last_30_days": 0.0,
+                "all_time_paid_orders": 0,
+                "all_time_confirmed_revenue": 0.0,
+                "checklist": [
+                    {
+                        "key": "store_domain_connected",
+                        "label": "Connected store domain",
+                        "state": "missing",
+                        "detail": "Merchant commerce readiness unavailable.",
+                    },
+                    {
+                        "key": "catalog_synced",
+                        "label": "Catalog synced",
+                        "state": "missing",
+                        "detail": "Merchant commerce readiness unavailable.",
+                    },
+                    {
+                        "key": "psp_or_checkout_connected",
+                        "label": "PSP or checkout connected",
+                        "state": "missing",
+                        "detail": "Merchant commerce readiness unavailable.",
+                    },
+                    {
+                        "key": "order_payment_loop_observed",
+                        "label": "Order/payment loop observed",
+                        "state": "unproven",
+                        "detail": "Merchant commerce readiness unavailable.",
+                    },
+                ],
             },
         }
 
