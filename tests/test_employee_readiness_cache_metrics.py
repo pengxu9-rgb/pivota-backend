@@ -227,3 +227,45 @@ def test_employee_referral_readiness_summary_route(monkeypatch):
     assert payload["data"]["blocked_seed_count"] == 1
 
     app.dependency_overrides.clear()
+
+
+def test_employee_referral_readiness_fleet_summary_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_build():
+        return {
+            "status": "red",
+            "generated_at": "2026-03-20T00:00:00+00:00",
+            "gating_policy_version": "external_referral_v1",
+            "total_merchants": 17,
+            "merchants_with_catalog_products": 1,
+            "merchants_needing_catalog_sync": 16,
+            "merchants_with_store_domains": 1,
+            "merchants_missing_store_domains": 16,
+            "merchants_with_any_referral_inventory": 1,
+            "merchants_with_attached_referral_seeds": 1,
+            "merchants_with_green_referral_coverage": 1,
+            "merchants_with_blocked_referrals": 0,
+            "merchants_with_review_referrals": 0,
+            "merchants_backfill_ready": 0,
+            "merchants_without_referral_coverage": 16,
+            "coverage_rate_pct": 5.9,
+            "actionable_merchants": [{"merchant_id": "merch_2", "coverage_state": "needs_catalog_sync"}],
+            "covered_merchants_sample": [{"merchant_id": "merch_1", "coverage_state": "covered"}],
+        }
+
+    monkeypatch.setattr(module, "build_external_referral_fleet_summary", fake_build)
+
+    response = client.get(
+        "/employee/referral-readiness/fleet-summary",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["status"] == "red"
+    assert payload["data"]["total_merchants"] == 17
+    assert payload["data"]["actionable_merchants"][0]["merchant_id"] == "merch_2"
+
+    app.dependency_overrides.clear()

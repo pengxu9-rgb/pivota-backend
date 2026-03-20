@@ -212,3 +212,85 @@ async def test_run_external_referral_refresh_batch_uses_candidate_order(monkeypa
     assert summary["candidate_count"] == 2
     assert summary["refreshed"] == 2
     assert refreshed == ["eps_attached", "eps_domain"]
+
+
+@pytest.mark.asyncio
+async def test_build_external_referral_fleet_summary_classifies_coverage(monkeypatch):
+    from services import external_referral_readiness as module
+
+    async def fake_get_all_merchant_onboardings(include_deleted: bool = False):
+        assert include_deleted is False
+        return [
+            {"merchant_id": "merch_covered", "business_name": "Covered Merchant"},
+            {"merchant_id": "merch_backfill", "business_name": "Backfill Merchant"},
+            {"merchant_id": "merch_sync", "business_name": "Sync Merchant"},
+        ]
+
+    async def fake_fetch_catalog_counts():
+        return {
+            "merch_covered": 740,
+            "merch_backfill": 120,
+            "merch_sync": 0,
+        }
+
+    async def fake_fetch_store_domains():
+        return {
+            "merch_covered": ["covered.example"],
+            "merch_backfill": ["backfill.example"],
+        }
+
+    async def fake_build_summary(merchant_id: str):
+        if merchant_id == "merch_covered":
+            return {
+                "merchant_id": merchant_id,
+                "status": "green",
+                "matched_domains": ["covered.example"],
+                "total_active_seeds": 50,
+                "attached_seed_count": 50,
+                "healthy_seed_count": 50,
+                "blocked_seed_count": 0,
+                "review_seed_count": 0,
+            }
+        if merchant_id == "merch_backfill":
+            return {
+                "merchant_id": merchant_id,
+                "status": "red",
+                "matched_domains": ["backfill.example"],
+                "total_active_seeds": 0,
+                "attached_seed_count": 0,
+                "healthy_seed_count": 0,
+                "blocked_seed_count": 0,
+                "review_seed_count": 0,
+            }
+        return {
+            "merchant_id": merchant_id,
+            "status": "red",
+            "matched_domains": [],
+            "total_active_seeds": 0,
+            "attached_seed_count": 0,
+            "healthy_seed_count": 0,
+            "blocked_seed_count": 0,
+            "review_seed_count": 0,
+        }
+
+    async def fake_backfill_count(merchant_id: str, *, limit: int = 50):
+        assert limit == 50
+        return 18 if merchant_id == "merch_backfill" else 0
+
+    monkeypatch.setattr(module, "get_all_merchant_onboardings", fake_get_all_merchant_onboardings)
+    monkeypatch.setattr(module, "_fetch_catalog_product_counts_by_merchant", fake_fetch_catalog_counts)
+    monkeypatch.setattr(module, "_fetch_store_domains_by_merchant", fake_fetch_store_domains)
+    monkeypatch.setattr(module, "build_external_referral_summary", fake_build_summary)
+    monkeypatch.setattr(module, "estimate_storefront_backfill_candidate_count", fake_backfill_count)
+
+    summary = await module.build_external_referral_fleet_summary()
+
+    assert summary["status"] == "red"
+    assert summary["total_merchants"] == 3
+    assert summary["merchants_with_attached_referral_seeds"] == 1
+    assert summary["merchants_backfill_ready"] == 1
+    assert summary["merchants_needing_catalog_sync"] == 1
+    assert summary["coverage_rate_pct"] == pytest.approx(33.3, abs=0.1)
+    assert summary["actionable_merchants"][0]["merchant_id"] == "merch_backfill"
+    assert summary["actionable_merchants"][0]["coverage_state"] == "backfill_ready"
+    assert summary["covered_merchants_sample"][0]["merchant_id"] == "merch_covered"

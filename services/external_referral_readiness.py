@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -10,6 +11,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from urllib.parse import urlparse
 
 from db.database import database
+from db.merchant_onboarding import get_all_merchant_onboardings
 from services.external_seed_audit import (
     audit_external_seed_row,
     get_last_extracted_at,
@@ -93,6 +95,46 @@ class ExternalReferralSummary:
     sample_blocked_seeds: List[Dict[str, Any]]
     last_extracted_at_oldest: Optional[str]
     last_extracted_at_newest: Optional[str]
+
+
+@dataclass(frozen=True)
+class ExternalReferralFleetMerchant:
+    merchant_id: str
+    business_name: str
+    referral_status: str
+    coverage_state: str
+    operator_action: str
+    catalog_product_count: int
+    store_count: int
+    matched_domains: List[str]
+    total_active_seeds: int
+    attached_seed_count: int
+    healthy_seed_count: int
+    blocked_seed_count: int
+    review_seed_count: int
+    backfill_candidate_count: int
+
+
+@dataclass(frozen=True)
+class ExternalReferralFleetSummary:
+    status: str
+    generated_at: str
+    gating_policy_version: str
+    total_merchants: int
+    merchants_with_catalog_products: int
+    merchants_needing_catalog_sync: int
+    merchants_with_store_domains: int
+    merchants_missing_store_domains: int
+    merchants_with_any_referral_inventory: int
+    merchants_with_attached_referral_seeds: int
+    merchants_with_green_referral_coverage: int
+    merchants_with_blocked_referrals: int
+    merchants_with_review_referrals: int
+    merchants_backfill_ready: int
+    merchants_without_referral_coverage: int
+    coverage_rate_pct: float
+    actionable_merchants: List[Dict[str, Any]]
+    covered_merchants_sample: List[Dict[str, Any]]
 
 
 def _record_metric(name: str, delta: int = 1) -> None:
@@ -198,12 +240,78 @@ def _to_iso(value: Any) -> Optional[str]:
     return parsed.isoformat() if parsed else None
 
 
+def _product_data_to_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _extract_storefront_handle_from_product_data(product_data: Dict[str, Any]) -> Optional[str]:
+    raw = _product_data_to_dict(product_data.get("raw"))
+    platform_metadata = _product_data_to_dict(product_data.get("platform_metadata"))
+    for candidate in (
+        product_data.get("handle"),
+        raw.get("handle"),
+        platform_metadata.get("handle"),
+    ):
+        value = str(candidate or "").strip().strip("/")
+        if value:
+            return value
+    return None
+
+
+def _product_has_storefront_backfill_candidate(product_data: Dict[str, Any]) -> bool:
+    handle = _extract_storefront_handle_from_product_data(product_data)
+    if not handle:
+        return False
+    if product_data.get("price") is not None:
+        return True
+    variants = product_data.get("variants")
+    if isinstance(variants, list) and variants:
+        return True
+    raw = _product_data_to_dict(product_data.get("raw"))
+    raw_variants = raw.get("variants")
+    if isinstance(raw_variants, list) and raw_variants:
+        return True
+    return False
+
+
 def _status_from_counts(*, total_active_seeds: int, blocked_seed_count: int, review_seed_count: int) -> str:
     if total_active_seeds <= 0:
         return "red"
     if blocked_seed_count > 0:
         return "red"
     if review_seed_count > 0:
+        return "yellow"
+    return "green"
+
+
+def _fleet_status_from_counts(
+    *,
+    total_merchants: int,
+    merchants_with_attached_referral_seeds: int,
+    merchants_with_blocked_referrals: int,
+    merchants_with_review_referrals: int,
+) -> str:
+    if total_merchants <= 0:
+        return "red"
+    coverage_rate = merchants_with_attached_referral_seeds / float(total_merchants)
+    if merchants_with_attached_referral_seeds <= 0 or coverage_rate < 0.5:
+        return "red"
+    if (
+        merchants_with_attached_referral_seeds < total_merchants
+        or merchants_with_blocked_referrals > 0
+        or merchants_with_review_referrals > 0
+    ):
         return "yellow"
     return "green"
 
@@ -228,6 +336,88 @@ async def get_merchant_referral_domains(merchant_id: str) -> List[str]:
             seen.add(normalized)
             domains.append(normalized)
     return domains
+
+
+async def _fetch_catalog_product_counts_by_merchant() -> Dict[str, int]:
+    rows = await database.fetch_all(
+        """
+        SELECT merchant_id, COUNT(DISTINCT (platform || '|' || platform_product_id)) AS product_count
+        FROM products_cache
+        WHERE platform_product_id IS NOT NULL
+          AND (expires_at IS NULL OR expires_at > NOW())
+        GROUP BY merchant_id
+        """
+    )
+    counts: Dict[str, int] = {}
+    for row in rows or []:
+        row_dict = _row_to_dict(row)
+        merchant_id = str(row_dict.get("merchant_id") or "").strip()
+        if not merchant_id:
+            continue
+        counts[merchant_id] = int(row_dict.get("product_count") or 0)
+    return counts
+
+
+async def _fetch_store_domains_by_merchant() -> Dict[str, List[str]]:
+    rows = await database.fetch_all(
+        """
+        SELECT merchant_id, domain
+        FROM merchant_stores
+        WHERE domain IS NOT NULL
+          AND TRIM(domain) != ''
+        ORDER BY merchant_id ASC, connected_at DESC NULLS LAST, store_id ASC
+        """
+    )
+    domains_by_merchant: Dict[str, List[str]] = {}
+    seen_pairs: set[Tuple[str, str]] = set()
+    for row in rows or []:
+        row_dict = _row_to_dict(row)
+        merchant_id = str(row_dict.get("merchant_id") or "").strip()
+        domain = normalize_referral_domain(row_dict.get("domain"))
+        if not merchant_id or not domain:
+            continue
+        pair = (merchant_id, domain)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        domains_by_merchant.setdefault(merchant_id, []).append(domain)
+    return domains_by_merchant
+
+
+async def estimate_storefront_backfill_candidate_count(
+    merchant_id: str,
+    *,
+    limit: int = 50,
+) -> int:
+    row_limit = max(int(limit or 50) * 8, 200)
+    rows = await database.fetch_all(
+        """
+        SELECT product_data
+        FROM (
+          SELECT DISTINCT ON (platform, platform_product_id)
+            platform,
+            platform_product_id,
+            product_data,
+            cached_at,
+            id
+          FROM products_cache
+          WHERE merchant_id = :merchant_id
+            AND platform = 'shopify'
+          ORDER BY platform, platform_product_id, cached_at DESC NULLS LAST, id DESC NULLS LAST
+        ) latest
+        LIMIT :limit
+        """,
+        {"merchant_id": merchant_id, "limit": row_limit},
+    )
+    candidate_count = 0
+    for row in rows or []:
+        product_data = _product_data_to_dict(_row_to_dict(row).get("product_data"))
+        if not _product_has_storefront_backfill_candidate(product_data):
+            continue
+        candidate_count += 1
+        if candidate_count >= int(limit or 50):
+            break
+    return candidate_count
 
 
 def _build_domain_filter_sql(domains: Sequence[str], *, param_prefix: str) -> Tuple[str, Dict[str, Any]]:
@@ -609,6 +799,215 @@ async def build_external_referral_summary(merchant_id: str) -> Dict[str, Any]:
         last_extracted_at_newest=extracted_timestamps[-1].isoformat() if extracted_timestamps else None,
     )
     return asdict(summary)
+
+
+def _coverage_state_for_merchant(
+    *,
+    summary: Dict[str, Any],
+    product_count: int,
+    matched_domains: Sequence[str],
+    backfill_candidate_count: int,
+) -> Tuple[str, str]:
+    attached_seed_count = int(summary.get("attached_seed_count") or 0)
+    blocked_seed_count = int(summary.get("blocked_seed_count") or 0)
+    review_seed_count = int(summary.get("review_seed_count") or 0)
+    if attached_seed_count > 0:
+        if blocked_seed_count > 0 or review_seed_count > 0:
+            return (
+                "covered_needs_review",
+                "Open the merchant-scoped audit queue and clear referral findings before broader rollout.",
+            )
+        return (
+            "covered",
+            "Referral coverage is live. Monitor refresh cadence and runtime health.",
+        )
+    if backfill_candidate_count > 0:
+        return (
+            "backfill_ready",
+            "Run storefront referral seed backfill for this merchant.",
+        )
+    if product_count <= 0:
+        return (
+            "needs_catalog_sync",
+            "Sync merchant catalog into products_cache before attempting referral backfill.",
+        )
+    if not matched_domains:
+        return (
+            "missing_store_domain",
+            "Connect or repair merchant store domain metadata before referral backfill.",
+        )
+    return (
+        "no_referral_candidates",
+        "Inspect Shopify storefront handles and product metadata for backfill eligibility.",
+    )
+
+
+def _fleet_action_sort_key(row: Dict[str, Any]) -> Tuple[int, int, str]:
+    priority = {
+        "backfill_ready": 0,
+        "needs_catalog_sync": 1,
+        "missing_store_domain": 2,
+        "covered_needs_review": 3,
+        "no_referral_candidates": 4,
+        "covered": 5,
+    }
+    return (
+        priority.get(str(row.get("coverage_state") or ""), 99),
+        -int(row.get("catalog_product_count") or 0),
+        str(row.get("business_name") or row.get("merchant_id") or ""),
+    )
+
+
+async def build_external_referral_fleet_summary() -> Dict[str, Any]:
+    merchants = await get_all_merchant_onboardings(include_deleted=False)
+    if not merchants:
+        return asdict(
+            ExternalReferralFleetSummary(
+                status="red",
+                generated_at=datetime.now(timezone.utc).isoformat(),
+                gating_policy_version=EXTERNAL_REFERRAL_GATING_POLICY_VERSION,
+                total_merchants=0,
+                merchants_with_catalog_products=0,
+                merchants_needing_catalog_sync=0,
+                merchants_with_store_domains=0,
+                merchants_missing_store_domains=0,
+                merchants_with_any_referral_inventory=0,
+                merchants_with_attached_referral_seeds=0,
+                merchants_with_green_referral_coverage=0,
+                merchants_with_blocked_referrals=0,
+                merchants_with_review_referrals=0,
+                merchants_backfill_ready=0,
+                merchants_without_referral_coverage=0,
+                coverage_rate_pct=0.0,
+                actionable_merchants=[],
+                covered_merchants_sample=[],
+            )
+        )
+
+    product_counts_by_merchant, domains_by_merchant = await asyncio.gather(
+        _fetch_catalog_product_counts_by_merchant(),
+        _fetch_store_domains_by_merchant(),
+    )
+    merchant_ids = [str(merchant.get("merchant_id") or "").strip() for merchant in merchants]
+    merchant_ids = [merchant_id for merchant_id in merchant_ids if merchant_id]
+
+    summaries = await asyncio.gather(
+        *[build_external_referral_summary(merchant_id) for merchant_id in merchant_ids]
+    )
+
+    summary_by_merchant = {
+        str(summary.get("merchant_id") or "").strip(): summary for summary in summaries if summary.get("merchant_id")
+    }
+    backfill_candidates_by_merchant: Dict[str, int] = {}
+    backfill_candidate_merchants = [
+        merchant_id
+        for merchant_id in merchant_ids
+        if int(product_counts_by_merchant.get(merchant_id) or 0) > 0
+        and bool(domains_by_merchant.get(merchant_id))
+        and int(summary_by_merchant.get(merchant_id, {}).get("attached_seed_count") or 0) <= 0
+    ]
+    if backfill_candidate_merchants:
+        counts = await asyncio.gather(
+            *[estimate_storefront_backfill_candidate_count(merchant_id) for merchant_id in backfill_candidate_merchants]
+        )
+        backfill_candidates_by_merchant = {
+            merchant_id: count for merchant_id, count in zip(backfill_candidate_merchants, counts)
+        }
+
+    merchant_rows: List[Dict[str, Any]] = []
+    for merchant in merchants:
+        merchant_id = str(merchant.get("merchant_id") or "").strip()
+        if not merchant_id:
+            continue
+        summary = summary_by_merchant.get(merchant_id) or {
+            "status": "red",
+            "matched_domains": [],
+            "total_active_seeds": 0,
+            "attached_seed_count": 0,
+            "healthy_seed_count": 0,
+            "blocked_seed_count": 0,
+            "review_seed_count": 0,
+        }
+        product_count = int(product_counts_by_merchant.get(merchant_id) or 0)
+        matched_domains = list(summary.get("matched_domains") or domains_by_merchant.get(merchant_id) or [])
+        backfill_candidate_count = int(backfill_candidates_by_merchant.get(merchant_id) or 0)
+        coverage_state, operator_action = _coverage_state_for_merchant(
+            summary=summary,
+            product_count=product_count,
+            matched_domains=matched_domains,
+            backfill_candidate_count=backfill_candidate_count,
+        )
+        merchant_rows.append(
+            asdict(
+                ExternalReferralFleetMerchant(
+                    merchant_id=merchant_id,
+                    business_name=str(merchant.get("business_name") or merchant_id),
+                    referral_status=str(summary.get("status") or "red"),
+                    coverage_state=coverage_state,
+                    operator_action=operator_action,
+                    catalog_product_count=product_count,
+                    store_count=len(domains_by_merchant.get(merchant_id) or []),
+                    matched_domains=matched_domains,
+                    total_active_seeds=int(summary.get("total_active_seeds") or 0),
+                    attached_seed_count=int(summary.get("attached_seed_count") or 0),
+                    healthy_seed_count=int(summary.get("healthy_seed_count") or 0),
+                    blocked_seed_count=int(summary.get("blocked_seed_count") or 0),
+                    review_seed_count=int(summary.get("review_seed_count") or 0),
+                    backfill_candidate_count=backfill_candidate_count,
+                )
+            )
+        )
+
+    total_merchants = len(merchant_rows)
+    merchants_with_catalog_products = sum(1 for row in merchant_rows if int(row.get("catalog_product_count") or 0) > 0)
+    merchants_needing_catalog_sync = sum(1 for row in merchant_rows if row.get("coverage_state") == "needs_catalog_sync")
+    merchants_with_store_domains = sum(1 for row in merchant_rows if int(row.get("store_count") or 0) > 0)
+    merchants_missing_store_domains = sum(1 for row in merchant_rows if int(row.get("store_count") or 0) <= 0)
+    merchants_with_any_referral_inventory = sum(1 for row in merchant_rows if int(row.get("total_active_seeds") or 0) > 0)
+    merchants_with_attached_referral_seeds = sum(1 for row in merchant_rows if int(row.get("attached_seed_count") or 0) > 0)
+    merchants_with_green_referral_coverage = sum(
+        1 for row in merchant_rows if row.get("referral_status") == "green" and int(row.get("attached_seed_count") or 0) > 0
+    )
+    merchants_with_blocked_referrals = sum(1 for row in merchant_rows if int(row.get("blocked_seed_count") or 0) > 0)
+    merchants_with_review_referrals = sum(1 for row in merchant_rows if int(row.get("review_seed_count") or 0) > 0)
+    merchants_backfill_ready = sum(1 for row in merchant_rows if row.get("coverage_state") == "backfill_ready")
+    merchants_without_referral_coverage = sum(1 for row in merchant_rows if int(row.get("attached_seed_count") or 0) <= 0)
+    coverage_rate_pct = round((merchants_with_attached_referral_seeds / total_merchants) * 100, 1) if total_merchants > 0 else 0.0
+
+    actionable_merchants = [
+        row for row in sorted(merchant_rows, key=_fleet_action_sort_key) if row.get("coverage_state") != "covered"
+    ][:8]
+    covered_merchants_sample = [
+        row for row in sorted(merchant_rows, key=_fleet_action_sort_key) if row.get("coverage_state") == "covered"
+    ][:5]
+
+    return asdict(
+        ExternalReferralFleetSummary(
+            status=_fleet_status_from_counts(
+                total_merchants=total_merchants,
+                merchants_with_attached_referral_seeds=merchants_with_attached_referral_seeds,
+                merchants_with_blocked_referrals=merchants_with_blocked_referrals,
+                merchants_with_review_referrals=merchants_with_review_referrals,
+            ),
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            gating_policy_version=EXTERNAL_REFERRAL_GATING_POLICY_VERSION,
+            total_merchants=total_merchants,
+            merchants_with_catalog_products=merchants_with_catalog_products,
+            merchants_needing_catalog_sync=merchants_needing_catalog_sync,
+            merchants_with_store_domains=merchants_with_store_domains,
+            merchants_missing_store_domains=merchants_missing_store_domains,
+            merchants_with_any_referral_inventory=merchants_with_any_referral_inventory,
+            merchants_with_attached_referral_seeds=merchants_with_attached_referral_seeds,
+            merchants_with_green_referral_coverage=merchants_with_green_referral_coverage,
+            merchants_with_blocked_referrals=merchants_with_blocked_referrals,
+            merchants_with_review_referrals=merchants_with_review_referrals,
+            merchants_backfill_ready=merchants_backfill_ready,
+            merchants_without_referral_coverage=merchants_without_referral_coverage,
+            coverage_rate_pct=coverage_rate_pct,
+            actionable_merchants=actionable_merchants,
+            covered_merchants_sample=covered_merchants_sample,
+        )
+    )
 
 
 async def should_block_external_referral_runtime(

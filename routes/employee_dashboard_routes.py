@@ -12,7 +12,10 @@ from readiness.summary import (
     get_readiness_optimization_cache_metrics,
     invalidate_readiness_optimization_cache,
 )
-from services.external_referral_readiness import build_external_referral_summary
+from services.external_referral_readiness import (
+    build_external_referral_fleet_summary,
+    build_external_referral_summary,
+)
 import random
 
 router = APIRouter()
@@ -588,6 +591,41 @@ async def get_employee_referral_readiness_summary(
                 "sample_blocked_seeds": [],
                 "last_extracted_at_oldest": None,
                 "last_extracted_at_newest": None,
+            },
+        }
+
+
+@router.get("/employee/referral-readiness/fleet-summary")
+async def get_employee_referral_readiness_fleet_summary(
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe aggregate referral coverage summary for the merchant fleet."""
+    try:
+        summary = await build_external_referral_fleet_summary()
+        return {"status": "success", "data": summary}
+    except Exception as e:
+        print(f"Error fetching employee referral readiness fleet summary: {e}")
+        return {
+            "status": "success",
+            "data": {
+                "status": "red",
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "gating_policy_version": "external_referral_v1",
+                "total_merchants": 0,
+                "merchants_with_catalog_products": 0,
+                "merchants_needing_catalog_sync": 0,
+                "merchants_with_store_domains": 0,
+                "merchants_missing_store_domains": 0,
+                "merchants_with_any_referral_inventory": 0,
+                "merchants_with_attached_referral_seeds": 0,
+                "merchants_with_green_referral_coverage": 0,
+                "merchants_with_blocked_referrals": 0,
+                "merchants_with_review_referrals": 0,
+                "merchants_backfill_ready": 0,
+                "merchants_without_referral_coverage": 0,
+                "coverage_rate_pct": 0.0,
+                "actionable_merchants": [],
+                "covered_merchants_sample": [],
             },
         }
 
