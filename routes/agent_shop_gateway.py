@@ -1817,6 +1817,7 @@ async def _handle_offers_resolve(
     market_hint = str(payload.market or "").strip() or None
     tool_hint = str(payload.tool or "").strip() or None
     limit = int(payload.limit or 10)
+    attached_seed_limit = min(max(limit * 6, 40), 240)
     merchant_scope = _resolve_offers_merchant_scope(
         payload=payload,
         request_metadata=request_metadata,
@@ -1835,6 +1836,7 @@ async def _handle_offers_resolve(
     mapping_candidates: List[Dict[str, Any]] = []
     offers: List[Dict[str, Any]] = []
     source_status: List[Dict[str, Any]] = []
+    seen_external_offer_ids: set[str] = set()
 
     def _public_reason_code(raw_code: Optional[str]) -> str:
         code = str(raw_code or "").strip().lower()
@@ -1878,65 +1880,65 @@ async def _handle_offers_resolve(
             entry["query"] = query
         source_status.append(entry)
 
-    # 1) External offers from external seeds (affiliate outbound)
-    external_offers: List[Dict[str, Any]] = []
-    external_started = time.perf_counter()
-    try:
-        seed_limit = min(max(limit * 6, 40), 240)
-        where_clauses = ["status = 'active'"]
-        params: Dict[str, Any] = {"limit": seed_limit}
+    async def _fetch_attached_seed_rows(
+        *,
+        merchant_id: Optional[str],
+        platform: Optional[str] = None,
+        product_aliases: Optional[List[str]] = None,
+        variant_aliases: Optional[List[str]] = None,
+    ) -> List[Any]:
+        attached_merchant_id = str(merchant_id or "").strip() or None
+        if not attached_merchant_id:
+            return []
 
-        if product_id_aliases:
-            pid_clause: List[str] = []
-            for idx, pid_alias in enumerate(product_id_aliases[:8]):
-                pid_key = f"pid_{idx}"
-                like_key = f"pid_like_{idx}"
-                params[pid_key] = pid_alias
-                params[like_key] = f"%{_safe_lower(pid_alias)}%"
-                pid_clause.append(
-                    "("
-                    f"external_product_id = :{pid_key}"
-                    f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
-                    ")"
-                )
-            where_clauses.append("(" + " OR ".join(pid_clause) + ")")
+        pid_aliases = [str(alias or "").strip() for alias in (product_aliases or []) if str(alias or "").strip()]
+        sku_aliases = [str(alias or "").strip() for alias in (variant_aliases or []) if str(alias or "").strip()]
+        if not pid_aliases and not sku_aliases:
+            return []
 
-        if sku_id_aliases:
-            sku_clause: List[str] = []
-            for idx, sku_alias in enumerate(sku_id_aliases[:8]):
-                key = f"sku_like_{idx}"
-                params[key] = f"%{_safe_lower(sku_alias)}%"
-                sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
-            where_clauses.append("(" + " OR ".join(sku_clause) + ")")
+        attached_platform = str(platform or "").strip() or None
+        params: Dict[str, Any] = {
+            "limit": attached_seed_limit,
+            "attached_prefix": f"{attached_merchant_id}|%",
+        }
+        match_clauses: List[str] = []
 
-        if len(where_clauses) == 1:
-            # No input: return empty (caller must provide sku_id or product_id).
-            return {
-                "status": "error",
-                "error": {
-                    "code": "MISSING_PRODUCT_REF",
-                    "message": "offers.resolve requires product.sku_id or product.product_id",
-                },
-            }
+        for idx, pid_alias in enumerate(pid_aliases[:8]):
+            pid_key = f"attached_pid_{idx}"
+            if attached_platform:
+                params[pid_key] = f"{attached_merchant_id}|{attached_platform}|{pid_alias}"
+                match_clauses.append(f"attached_product_key = :{pid_key}")
+            else:
+                params[pid_key] = f"{attached_merchant_id}|%|{pid_alias}"
+                match_clauses.append(f"attached_product_key LIKE :{pid_key}")
 
-        seed_rows = await asyncio.wait_for(
+        for idx, sku_alias in enumerate(sku_aliases[:8]):
+            sku_key = f"attached_sku_{idx}"
+            params[sku_key] = sku_alias
+            match_clauses.append(f"attached_variant_id = :{sku_key}")
+
+        if not match_clauses:
+            return []
+
+        rows = await asyncio.wait_for(
             database.fetch_all(
                 f"""
                 SELECT *
                 FROM external_product_seeds
-                WHERE {" AND ".join(where_clauses)}
+                WHERE status = 'active'
+                  AND attached_product_key IS NOT NULL
+                  AND attached_product_key LIKE :attached_prefix
+                  AND ({' OR '.join(match_clauses)})
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :limit
                 """,
                 params,
             ),
-            timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+            timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
         )
+        return list(rows or [])
 
-        seen_offer_ids: set[str] = set()
+    async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         for row in seed_rows:
             row_dict = _row_to_dict(row)
             blocked, gate_status = await should_block_external_referral_runtime(
@@ -1969,7 +1971,6 @@ async def _handle_offers_resolve(
                 matched_variants = variants[: min(12, max(1, limit))]
 
             if not matched_variants:
-                # If variant list missing, still allow a single fallback offer based on seed row.
                 matched_variants = [{}]
 
             destination_url = row_dict.get("destination_url") or seed_data.get("destination_url") or ""
@@ -1987,9 +1988,9 @@ async def _handle_offers_resolve(
             for v in matched_variants:
                 vid = _seed_offer_variant_id(v) or (sku_id or "∅")
                 offer_id = f"of:external_seed:{seed_id}:{vid}"
-                if offer_id in seen_offer_ids:
+                if offer_id in seen_external_offer_ids:
                     continue
-                seen_offer_ids.add(offer_id)
+                seen_external_offer_ids.add(offer_id)
 
                 price_amount, currency = _extract_price_currency_from_variant(
                     v,
@@ -2008,8 +2009,6 @@ async def _handle_offers_resolve(
                 if isinstance(availability, str):
                     in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
 
-                # Generate tracked affiliate redirect URL (domain allowlist applies).
-                # We set ctx.eventType so downstream click logs can be grouped as outbound_opened.
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
                     tool=used_tool,
@@ -2080,16 +2079,85 @@ async def _handle_offers_resolve(
                     }
                 )
                 if len(external_offers) >= limit:
-                    break
-            if len(external_offers) >= limit:
-                break
+                    return
+
+    # 1) External offers from external seeds (affiliate outbound)
+    external_offers: List[Dict[str, Any]] = []
+    external_started = time.perf_counter()
+    try:
+        query_label = "external_seed_by_ref"
+        where_clauses = ["status = 'active'"]
+        params: Dict[str, Any] = {"limit": attached_seed_limit}
+        seed_rows: List[Any] = []
+
+        if merchant_scope and (product_id_aliases or sku_id_aliases):
+            seed_rows = await _fetch_attached_seed_rows(
+                merchant_id=merchant_scope,
+                product_aliases=product_id_aliases,
+                variant_aliases=sku_id_aliases,
+            )
+            if seed_rows:
+                query_label = "external_seed_by_attached_ref"
+
+        if not seed_rows and product_id_aliases:
+            pid_clause: List[str] = []
+            for idx, pid_alias in enumerate(product_id_aliases[:8]):
+                pid_key = f"pid_{idx}"
+                like_key = f"pid_like_{idx}"
+                params[pid_key] = pid_alias
+                params[like_key] = f"%{_safe_lower(pid_alias)}%"
+                pid_clause.append(
+                    "("
+                    f"external_product_id = :{pid_key}"
+                    f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
+                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
+                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
+                    f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
+                    ")"
+                )
+            where_clauses.append("(" + " OR ".join(pid_clause) + ")")
+
+        if not seed_rows and sku_id_aliases:
+            sku_clause: List[str] = []
+            for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+                key = f"sku_like_{idx}"
+                params[key] = f"%{_safe_lower(sku_alias)}%"
+                sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
+            where_clauses.append("(" + " OR ".join(sku_clause) + ")")
+
+        if not seed_rows and len(where_clauses) == 1:
+            # No input: return empty (caller must provide sku_id or product_id).
+            return {
+                "status": "error",
+                "error": {
+                    "code": "MISSING_PRODUCT_REF",
+                    "message": "offers.resolve requires product.sku_id or product.product_id",
+                },
+            }
+
+        if not seed_rows:
+            seed_rows = await asyncio.wait_for(
+                database.fetch_all(
+                    f"""
+                    SELECT *
+                    FROM external_product_seeds
+                    WHERE {" AND ".join(where_clauses)}
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT :limit
+                    """,
+                    params,
+                ),
+                timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+            )
+
+        await _append_external_offers_from_seed_rows(list(seed_rows or []))
         _record_source(
             source="external_product_seeds",
             status="ok",
             reason_code="ok",
             source_started=external_started,
             row_count=len(seed_rows or []),
-            query="external_seed_by_ref",
+            query=query_label,
         )
     except Exception as e:
         logger.info("offers.resolve.external.failed", extra={"error": str(e)})
@@ -2098,7 +2166,7 @@ async def _handle_offers_resolve(
             status="error",
             reason_code=_classify_db_reason_code(e),
             source_started=external_started,
-            error=type(e).__name__,
+                error=type(e).__name__,
             query="external_seed_by_ref",
         )
 
@@ -2477,6 +2545,65 @@ async def _handle_offers_resolve(
                 query="products_cache_by_alias",
             )
 
+    canonical_product: Optional[Dict[str, Any]] = None
+    if canonical_member:
+        canonical_product = {
+            "merchant_id": str(canonical_member.get("merchant_id") or "").strip() or None,
+            "platform": str(canonical_member.get("platform") or "").strip() or None,
+            "product_id": str(canonical_member.get("platform_product_id") or "").strip() or None,
+            "product_group_id": canonical_group_id,
+        }
+    elif internal_offers:
+        src = (internal_offers[0].get("source") or {}) if isinstance(internal_offers[0], dict) else {}
+        if isinstance(src, dict):
+            canonical_product = {
+                "merchant_id": src.get("merchant_id"),
+                "platform": src.get("platform"),
+                "product_id": src.get("product_id"),
+                "product_group_id": canonical_group_id,
+            }
+
+    if not external_offers and canonical_product:
+        attached_retry_started = time.perf_counter()
+        try:
+            retry_variant_aliases = [
+                str(alias or "").strip()
+                for alias in (
+                    [sku_id]
+                    + [
+                        ((offer.get("source") or {}).get("variant_id"))
+                        for offer in internal_offers
+                        if isinstance(offer, dict)
+                    ]
+                )
+                if str(alias or "").strip()
+            ]
+            retry_rows = await _fetch_attached_seed_rows(
+                merchant_id=str(canonical_product.get("merchant_id") or "").strip() or None,
+                platform=str(canonical_product.get("platform") or "").strip() or None,
+                product_aliases=[str(canonical_product.get("product_id") or "").strip() or None] + product_id_aliases,
+                variant_aliases=retry_variant_aliases + sku_id_aliases,
+            )
+            await _append_external_offers_from_seed_rows(retry_rows)
+            _record_source(
+                source="external_product_seeds_attached_retry",
+                status="ok" if retry_rows else "empty",
+                reason_code="ok" if retry_rows else "no_candidates",
+                source_started=attached_retry_started,
+                row_count=len(retry_rows or []),
+                query="external_seed_by_canonical_attached_ref",
+            )
+        except Exception as e:
+            logger.info("offers.resolve.external.attached_retry.failed", extra={"error": str(e)})
+            _record_source(
+                source="external_product_seeds_attached_retry",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=attached_retry_started,
+                error=type(e).__name__,
+                query="external_seed_by_canonical_attached_ref",
+            )
+
     # Internal offers always come first for checkout.
     offers = internal_offers + external_offers
     offers = offers[:limit]
@@ -2496,15 +2623,14 @@ async def _handle_offers_resolve(
                 if mid and pid:
                     canonical_ref = f"pc:{mid}:{plat}:{pid}"
 
-    canonical_product: Optional[Dict[str, Any]] = None
-    if canonical_member:
+    if canonical_product is None and canonical_member:
         canonical_product = {
             "merchant_id": str(canonical_member.get("merchant_id") or "").strip() or None,
             "platform": str(canonical_member.get("platform") or "").strip() or None,
             "product_id": str(canonical_member.get("platform_product_id") or "").strip() or None,
             "product_group_id": canonical_group_id,
         }
-    elif internal_offers:
+    elif canonical_product is None and internal_offers:
         src = (internal_offers[0].get("source") or {}) if isinstance(internal_offers[0], dict) else {}
         if isinstance(src, dict):
             canonical_product = {
