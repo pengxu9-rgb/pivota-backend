@@ -229,29 +229,85 @@ def test_employee_referral_readiness_summary_route(monkeypatch):
     app.dependency_overrides.clear()
 
 
-def test_employee_referral_readiness_fleet_summary_route(monkeypatch):
+def test_employee_referral_program_summary_route(monkeypatch):
     module, app, client = _build_client_with_employee_override()
 
     async def fake_build():
         return {
-            "status": "red",
+            "status": "yellow",
             "generated_at": "2026-03-20T00:00:00+00:00",
             "gating_policy_version": "external_referral_v1",
-            "total_merchants": 17,
-            "merchants_with_catalog_products": 1,
-            "merchants_needing_catalog_sync": 16,
-            "merchants_with_store_domains": 1,
-            "merchants_missing_store_domains": 16,
-            "merchants_with_any_referral_inventory": 1,
-            "merchants_with_attached_referral_seeds": 1,
-            "merchants_with_green_referral_coverage": 1,
-            "merchants_with_blocked_referrals": 0,
-            "merchants_with_review_referrals": 0,
-            "merchants_backfill_ready": 0,
-            "merchants_without_referral_coverage": 16,
-            "coverage_rate_pct": 5.9,
-            "actionable_merchants": [{"merchant_id": "merch_2", "coverage_state": "needs_catalog_sync"}],
-            "covered_merchants_sample": [{"merchant_id": "merch_1", "coverage_state": "covered"}],
+            "total_active_seeds": 50,
+            "healthy_seed_count": 45,
+            "blocked_seed_count": 3,
+            "review_seed_count": 2,
+            "attached_seed_count": 30,
+            "unattached_seed_count": 20,
+            "issue_buckets": [{"issue_type": "stale_snapshot", "severity": "blocker", "count": 3}],
+            "top_domains": [{"domain": "example.com", "count": 25}],
+            "top_blocked_domains": [{"domain": "blocked.example", "count": 2}],
+            "runtime_surface_coverage_summary": {"surface_eligible_rate_pct": 94.0},
+        }
+
+    monkeypatch.setattr(module, "build_platform_fallback_program_summary", fake_build)
+
+    response = client.get(
+        "/employee/referral-readiness/program-summary",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["status"] == "yellow"
+    assert payload["data"]["total_active_seeds"] == 50
+    assert payload["data"]["top_domains"][0]["domain"] == "example.com"
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_merchant_commerce_cohort_summary_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_build():
+        return {
+            "generated_at": "2026-03-20T00:00:00+00:00",
+            "total_registered_merchants": 17,
+            "store_connected_merchants": 1,
+            "store_connected_with_psp_merchants": 1,
+            "merchant_valid_count": 1,
+            "merchant_invalid_count": 16,
+            "top_invalid_merchants": [{"merchant_id": "merch_2", "invalid_reasons": ["missing_catalog_sync"]}],
+        }
+
+    monkeypatch.setattr(module, "build_merchant_commerce_cohort_summary", fake_build)
+
+    response = client.get(
+        "/employee/referral-readiness/merchant-commerce-cohort",
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["data"]["merchant_valid_count"] == 1
+    assert payload["data"]["top_invalid_merchants"][0]["merchant_id"] == "merch_2"
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_referral_readiness_fleet_summary_route_alias(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_build():
+        return {
+            "generated_at": "2026-03-20T00:00:00+00:00",
+            "total_registered_merchants": 17,
+            "store_connected_merchants": 1,
+            "store_connected_with_psp_merchants": 1,
+            "merchant_valid_count": 1,
+            "merchant_invalid_count": 16,
+            "top_invalid_merchants": [{"merchant_id": "merch_2", "invalid_reasons": ["missing_store_domain"]}],
         }
 
     monkeypatch.setattr(module, "build_external_referral_fleet_summary", fake_build)
@@ -264,8 +320,7 @@ def test_employee_referral_readiness_fleet_summary_route(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "success"
-    assert payload["data"]["status"] == "red"
-    assert payload["data"]["total_merchants"] == 17
-    assert payload["data"]["actionable_merchants"][0]["merchant_id"] == "merch_2"
+    assert payload["data"]["merchant_invalid_count"] == 16
+    assert payload["data"]["top_invalid_merchants"][0]["merchant_id"] == "merch_2"
 
     app.dependency_overrides.clear()

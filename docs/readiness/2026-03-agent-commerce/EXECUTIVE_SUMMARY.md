@@ -14,7 +14,12 @@ The live codebase has several meaningful building blocks:
 
 But the system still fails the readiness-infra bar because the current implementation is fragmented across repos, mixes cache with source-of-truth, still lacks Google Merchant Center support, and still relies on brittle legacy checkout/order/webhook code paths outside the readiness-owned alpha path. The stricter gap is no longer "reviews or payment do not exist"; it is that those platform capabilities are still only partially converged into one canonical readiness contract.
 
-This summary is still strongest on `internal commerce` readiness. A unified scorecard now lives in `UNIFIED_READINESS_SCORECARD.md`, and its latest production update on `2026-03-20` includes a full multi-merchant external-referral audit. That scorecard is the correct top-level framing when discussing agent-compatible commerce surfaces instead of checkout-only readiness.
+This summary is still strongest on `merchant-valid commerce` readiness. The latest scorecard now lives in `UNIFIED_READINESS_SCORECARD.md`, and it explicitly separates:
+
+- `Merchant Commerce Readiness`
+- `Platform Fallback Referral Readiness`
+
+That distinction matters. External referral is a Pivota-managed fallback program, not merchant-owned readiness.
 
 ## Why It Fails Today
 
@@ -46,7 +51,7 @@ This summary is still strongest on `internal commerce` readiness. A unified scor
 - Checkout/payment/order execution is not yet fully converged onto one readiness-owned canonical PSP path.
 - Legacy checkout/payment/order paths remain fragmented and partially admin-gated.
 - Observability is table-heavy but not productized into merchant/SKU readiness diagnostics.
-- External referral surfaces (`external_product_seeds`, tracked redirects, outbound affiliate offers) now have real employee-safe governance and runtime health on the anchor merchant, but fleet-wide coverage remains sparse.
+- External referral surfaces (`external_product_seeds`, tracked redirects, outbound affiliate offers) now have real employee-safe governance and runtime health, but they should be treated as platform fallback inventory, not as merchant-valid commerce.
 
 ## Recommended Next Step
 
@@ -58,10 +63,10 @@ Use the implemented thin slice as the bootstrap path:
 - stubbed checkout session
 - stubbed order-sync journal
 
-Then finish converging the real-merchant alpha path: keep the current one-merchant Shopify adapter, wire Reviews Center more deeply into readiness ranking/diagnostics, collapse payment execution onto one explicit readiness-owned contract, and expand referral inventory coverage before attempting broader cross-merchant external-referral claims.
+Then finish converging the real-merchant alpha path: keep the current one-merchant Shopify adapter, wire Reviews Center more deeply into readiness ranking/diagnostics, collapse payment execution onto one explicit readiness-owned contract, and keep fallback referral clearly separated as employee-operated platform inventory instead of using it to mask missing merchant commerce prerequisites.
 
 ## Related Architecture
 
 - See `PRODUCT_OPTIMIZATION_BACKEND_ARCHITECTURE.md` for the backend design of the merchant-facing `Agent Commerce Readiness & Optimization Workspace`, including the funnel model, remediation object model, action APIs, and the boundary between deterministic execution and future LLM-assisted optimization.
-- See `UNIFIED_READINESS_SCORECARD.md` for the latest dual-track audit covering `Internal Commerce` and `External Referral` as one unified readiness scorecard.
-- See `MULTI_MERCHANT_EXTERNAL_REFERRAL_AUDIT.md` for the March 20, 2026 production audit showing that external-referral runtime is healthy where coverage exists, while merchant-fleet coverage remains the rollout bottleneck.
+- See `UNIFIED_READINESS_SCORECARD.md` for the latest production framing separating `Merchant Commerce Readiness` from `Platform Fallback Referral Readiness`.
+- See `MULTI_MERCHANT_EXTERNAL_REFERRAL_AUDIT.md` for the March 20, 2026 production audit showing that fallback runtime is healthy where inventory exists, and why fallback must not be treated as merchant readiness.

@@ -14,7 +14,9 @@ from readiness.summary import (
 )
 from services.external_referral_readiness import (
     build_external_referral_fleet_summary,
+    build_merchant_commerce_cohort_summary,
     build_external_referral_summary,
+    build_platform_fallback_program_summary,
 )
 import random
 
@@ -568,7 +570,7 @@ async def get_employee_referral_readiness_summary(
     merchant_id: str = Query(..., min_length=1),
     current_user: dict = Depends(get_current_employee),
 ):
-    """Employee-safe external referral summary for one merchant."""
+    """Employee-safe attached fallback seed summary for one merchant."""
     try:
         summary = await build_external_referral_summary(merchant_id)
         return {"status": "success", "data": summary}
@@ -595,11 +597,71 @@ async def get_employee_referral_readiness_summary(
         }
 
 
+@router.get("/employee/referral-readiness/program-summary")
+async def get_employee_referral_program_summary(
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe summary of the Pivota-managed fallback referral program."""
+    try:
+        summary = await build_platform_fallback_program_summary()
+        return {"status": "success", "data": summary}
+    except Exception as e:
+        print(f"Error fetching employee referral program summary: {e}")
+        return {
+            "status": "success",
+            "data": {
+                "status": "red",
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "gating_policy_version": "external_referral_v1",
+                "total_active_seeds": 0,
+                "healthy_seed_count": 0,
+                "blocked_seed_count": 0,
+                "review_seed_count": 0,
+                "attached_seed_count": 0,
+                "unattached_seed_count": 0,
+                "issue_buckets": [],
+                "top_domains": [],
+                "top_blocked_domains": [],
+                "runtime_surface_coverage_summary": {
+                    "total_surface_eligible_seeds": 0,
+                    "total_surface_blocked_seeds": 0,
+                    "surface_eligible_rate_pct": 0.0,
+                    "attached_surface_eligible_seed_count": 0,
+                    "attached_surface_blocked_seed_count": 0,
+                },
+            },
+        }
+
+
+@router.get("/employee/referral-readiness/merchant-commerce-cohort")
+async def get_employee_merchant_commerce_cohort_summary(
+    current_user: dict = Depends(get_current_employee),
+):
+    """Employee-safe background summary of merchant-valid commerce prerequisites."""
+    try:
+        summary = await build_merchant_commerce_cohort_summary()
+        return {"status": "success", "data": summary}
+    except Exception as e:
+        print(f"Error fetching employee merchant commerce cohort summary: {e}")
+        return {
+            "status": "success",
+            "data": {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "total_registered_merchants": 0,
+                "store_connected_merchants": 0,
+                "store_connected_with_psp_merchants": 0,
+                "merchant_valid_count": 0,
+                "merchant_invalid_count": 0,
+                "top_invalid_merchants": [],
+            },
+        }
+
+
 @router.get("/employee/referral-readiness/fleet-summary")
 async def get_employee_referral_readiness_fleet_summary(
     current_user: dict = Depends(get_current_employee),
 ):
-    """Employee-safe aggregate referral coverage summary for the merchant fleet."""
+    """Deprecated compatibility alias for merchant-commerce cohort summary."""
     try:
         summary = await build_external_referral_fleet_summary()
         return {"status": "success", "data": summary}
@@ -608,24 +670,13 @@ async def get_employee_referral_readiness_fleet_summary(
         return {
             "status": "success",
             "data": {
-                "status": "red",
                 "generated_at": datetime.utcnow().isoformat() + "Z",
-                "gating_policy_version": "external_referral_v1",
-                "total_merchants": 0,
-                "merchants_with_catalog_products": 0,
-                "merchants_needing_catalog_sync": 0,
-                "merchants_with_store_domains": 0,
-                "merchants_missing_store_domains": 0,
-                "merchants_with_any_referral_inventory": 0,
-                "merchants_with_attached_referral_seeds": 0,
-                "merchants_with_green_referral_coverage": 0,
-                "merchants_with_blocked_referrals": 0,
-                "merchants_with_review_referrals": 0,
-                "merchants_backfill_ready": 0,
-                "merchants_without_referral_coverage": 0,
-                "coverage_rate_pct": 0.0,
-                "actionable_merchants": [],
-                "covered_merchants_sample": [],
+                "total_registered_merchants": 0,
+                "store_connected_merchants": 0,
+                "store_connected_with_psp_merchants": 0,
+                "merchant_valid_count": 0,
+                "merchant_invalid_count": 0,
+                "top_invalid_merchants": [],
             },
         }
 

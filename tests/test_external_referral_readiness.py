@@ -215,82 +215,160 @@ async def test_run_external_referral_refresh_batch_uses_candidate_order(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_build_external_referral_fleet_summary_classifies_coverage(monkeypatch):
+async def test_build_platform_fallback_program_summary_counts_global_seed_health(monkeypatch):
+    from services import external_referral_readiness as module
+
+    blocked = _seed_row(
+        id="eps_blocked",
+        attached_product_key="merch_1|shopify|prod_1",
+        domain="blocked.example",
+        seed_data={
+            "title": "Blocked referral",
+            "snapshot": {
+                "canonical_url": "https://blocked.example/product/blocked",
+                "title": "Blocked referral",
+                "description": "Blocked referral",
+                "extracted_at": "2026-03-01T00:00:00+00:00",
+            },
+            "variants": [],
+        },
+    )
+    review = _seed_row(
+        id="eps_review",
+        attached_product_key=None,
+        domain="review.example",
+        image_url=None,
+        canonical_url="https://review.example/product/review",
+        destination_url="https://review.example/product/review",
+        seed_data={
+            "title": "Review referral",
+            "description": "Experience the ultimate luxury with Review referral.",
+            "snapshot": {
+                "canonical_url": "https://review.example/product/review",
+                "title": "Review referral",
+                "description": "Experience the ultimate luxury with Review referral.",
+                "extracted_at": "2026-03-19T00:00:00+00:00",
+            },
+            "variants": [
+                {
+                    "variant_id": "v-1",
+                    "sku": "SKU-2",
+                    "title": "One size",
+                    "price_amount": 22.0,
+                    "currency": "USD",
+                    "availability": "in_stock",
+                }
+            ],
+        },
+    )
+    healthy = _seed_row(
+        id="eps_healthy",
+        attached_product_key="merch_2|shopify|prod_2",
+        domain="healthy.example",
+        canonical_url="https://healthy.example/product/healthy",
+        destination_url="https://healthy.example/product/healthy",
+        seed_data={
+            "title": "Healthy referral",
+            "description": "A helpful daily serum.",
+            "snapshot": {
+                "canonical_url": "https://healthy.example/product/healthy",
+                "title": "Healthy referral",
+                "description": "A helpful daily serum.",
+                "extracted_at": "2026-03-19T00:00:00+00:00",
+            },
+            "variants": [
+                {
+                    "variant_id": "v-healthy",
+                    "sku": "SKU-3",
+                    "title": "Standard",
+                    "price_amount": 25.0,
+                    "currency": "USD",
+                    "availability": "in_stock",
+                }
+            ],
+        },
+    )
+
+    async def fake_rows():
+        return [blocked, review, healthy]
+
+    async def fake_allowed_domains(*, market: str):
+        return ["blocked.example", "review.example", "healthy.example"]
+
+    monkeypatch.setattr(module, "_fetch_all_active_referral_seed_rows", fake_rows)
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+
+    summary = await module.build_platform_fallback_program_summary()
+
+    assert summary["status"] == "red"
+    assert summary["total_active_seeds"] == 3
+    assert summary["attached_seed_count"] == 2
+    assert summary["unattached_seed_count"] == 1
+    assert summary["blocked_seed_count"] == 1
+    assert summary["review_seed_count"] == 1
+    assert summary["runtime_surface_coverage_summary"]["total_surface_eligible_seeds"] == 2
+    assert summary["top_domains"][0]["domain"] in {"blocked.example", "healthy.example", "review.example"}
+    assert any(bucket["issue_type"] == "stale_snapshot" for bucket in summary["issue_buckets"])
+
+
+@pytest.mark.asyncio
+async def test_build_merchant_commerce_cohort_summary_uses_store_catalog_and_psp_prereqs(monkeypatch):
     from services import external_referral_readiness as module
 
     async def fake_get_all_merchant_onboardings(include_deleted: bool = False):
         assert include_deleted is False
         return [
-            {"merchant_id": "merch_covered", "business_name": "Covered Merchant"},
-            {"merchant_id": "merch_backfill", "business_name": "Backfill Merchant"},
-            {"merchant_id": "merch_sync", "business_name": "Sync Merchant"},
+            {
+                "merchant_id": "merch_valid",
+                "business_name": "Valid Merchant",
+                "psp_connected": True,
+                "psp_type": "stripe",
+            },
+            {
+                "merchant_id": "merch_missing_psp",
+                "business_name": "Needs PSP",
+                "psp_connected": False,
+                "psp_type": None,
+            },
+            {
+                "merchant_id": "merch_missing_catalog",
+                "business_name": "Needs Catalog",
+                "psp_connected": True,
+                "psp_type": "checkout",
+            },
         ]
 
     async def fake_fetch_catalog_counts():
         return {
-            "merch_covered": 740,
-            "merch_backfill": 120,
-            "merch_sync": 0,
+            "merch_valid": 740,
+            "merch_missing_psp": 120,
+            "merch_missing_catalog": 0,
         }
 
     async def fake_fetch_store_domains():
         return {
-            "merch_covered": ["covered.example"],
-            "merch_backfill": ["backfill.example"],
+            "merch_valid": ["valid.example"],
+            "merch_missing_psp": ["needs-psp.example"],
+            "merch_missing_catalog": ["needs-catalog.example"],
         }
 
-    async def fake_build_summary(merchant_id: str):
-        if merchant_id == "merch_covered":
-            return {
-                "merchant_id": merchant_id,
-                "status": "green",
-                "matched_domains": ["covered.example"],
-                "total_active_seeds": 50,
-                "attached_seed_count": 50,
-                "healthy_seed_count": 50,
-                "blocked_seed_count": 0,
-                "review_seed_count": 0,
-            }
-        if merchant_id == "merch_backfill":
-            return {
-                "merchant_id": merchant_id,
-                "status": "red",
-                "matched_domains": ["backfill.example"],
-                "total_active_seeds": 0,
-                "attached_seed_count": 0,
-                "healthy_seed_count": 0,
-                "blocked_seed_count": 0,
-                "review_seed_count": 0,
-            }
+    async def fake_fetch_psps():
         return {
-            "merchant_id": merchant_id,
-            "status": "red",
-            "matched_domains": [],
-            "total_active_seeds": 0,
-            "attached_seed_count": 0,
-            "healthy_seed_count": 0,
-            "blocked_seed_count": 0,
-            "review_seed_count": 0,
+            "merch_valid": ["stripe"],
+            "merch_missing_catalog": ["checkout"],
         }
-
-    async def fake_backfill_count(merchant_id: str, *, limit: int = 50):
-        assert limit == 50
-        return 18 if merchant_id == "merch_backfill" else 0
 
     monkeypatch.setattr(module, "get_all_merchant_onboardings", fake_get_all_merchant_onboardings)
     monkeypatch.setattr(module, "_fetch_catalog_product_counts_by_merchant", fake_fetch_catalog_counts)
     monkeypatch.setattr(module, "_fetch_store_domains_by_merchant", fake_fetch_store_domains)
-    monkeypatch.setattr(module, "build_external_referral_summary", fake_build_summary)
-    monkeypatch.setattr(module, "estimate_storefront_backfill_candidate_count", fake_backfill_count)
+    monkeypatch.setattr(module, "_fetch_active_psp_providers_by_merchant", fake_fetch_psps)
 
-    summary = await module.build_external_referral_fleet_summary()
+    summary = await module.build_merchant_commerce_cohort_summary()
 
-    assert summary["status"] == "red"
-    assert summary["total_merchants"] == 3
-    assert summary["merchants_with_attached_referral_seeds"] == 1
-    assert summary["merchants_backfill_ready"] == 1
-    assert summary["merchants_needing_catalog_sync"] == 1
-    assert summary["coverage_rate_pct"] == pytest.approx(33.3, abs=0.1)
-    assert summary["actionable_merchants"][0]["merchant_id"] == "merch_backfill"
-    assert summary["actionable_merchants"][0]["coverage_state"] == "backfill_ready"
-    assert summary["covered_merchants_sample"][0]["merchant_id"] == "merch_covered"
+    assert summary["total_registered_merchants"] == 3
+    assert summary["store_connected_merchants"] == 3
+    assert summary["store_connected_with_psp_merchants"] == 2
+    assert summary["merchant_valid_count"] == 1
+    assert summary["merchant_invalid_count"] == 2
+    assert summary["top_invalid_merchants"][0]["merchant_id"] == "merch_missing_psp"
+    assert "missing_psp_or_checkout" in summary["top_invalid_merchants"][0]["invalid_reasons"]

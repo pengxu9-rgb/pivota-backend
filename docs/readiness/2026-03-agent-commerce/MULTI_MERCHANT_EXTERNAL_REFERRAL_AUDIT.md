@@ -1,154 +1,150 @@
-# Multi-Merchant External Referral Audit
+# Platform Fallback Referral Program Audit
 
 ## Audit Anchor
 
-Audit date: `2026-03-20`
+- audit date: `2026-03-20`
+- authenticated through the live employee flow
+- anchor merchant: `merch_efbc46b4619cfbdf`
 
-Merchant universe audited:
-
-- source: production `GET /merchant/onboarding/all`
-- authenticated through the live employee auth flow
-- total live merchants returned: `17`
-
-Runtime and operator surfaces verified in production:
+Verified production surfaces:
 
 - `GET /employee/referral-readiness/summary?merchant_id=...`
+- `GET /employee/referral-readiness/program-summary`
+- `GET /employee/referral-readiness/merchant-commerce-cohort`
 - `GET /employee/products/external-seeds?merchant_id=...&status=active&attached=true&limit=200`
 - `POST https://agent.pivota.cc/api/gateway` with `operation=offers.resolve`
 
-This audit was run after the following production changes were already live:
+## Subject Correction
 
-- backend referral governance and hard gating
-- employee referral health and merchant-scoped seed tools
-- backend attached-seed prefetch optimization for `offers.resolve`
-- gateway-side `subject_resolve` skip for direct product-id referral lookups
+This audit no longer treats external referral as merchant-owned readiness.
 
-## Executive Result
+The correct subject is:
 
-The strongest conclusion is:
+- `platform fallback referral program`
 
-`external referral is now runtime-healthy where seed coverage exists, but rollout remains red because merchant-level seed coverage is still sparse.`
+The wrong subject was:
 
-That means the current external-referral bottleneck is no longer runtime correctness. It is coverage and merchant attribution.
+- `merchant fleet external referral coverage`
 
-## Merchant-Level Summary
+External seeds are employee-uploaded and employee-governed fallback inventory. Attachment to a merchant/product graph is useful for runtime routing and operator remediation, but it is not merchant ownership and it is not merchant-valid commerce readiness.
 
-Across all `17` live merchants:
+## Important Denominator Correction
 
-- `1 / 17` merchants had any active referral seeds
-- `1 / 17` merchants had any attached referral seeds
-- `0 / 17` merchants had blocked referral seeds
-- `0 / 17` merchants had review-only referral seeds
+The production `merchant/onboarding` list contains many test or non-production merchants.
 
-Referral status distribution from `GET /employee/referral-readiness/summary`:
+Per product truth:
 
-- `green`: `1`
-- `red`: `16`
+- only merchants with real synced catalog + connected store/domain + PSP/checkout count toward merchant-valid commerce
+- external fallback program health should be measured against active seed inventory and runtime quality, not against all registered merchants
 
-Interpretation:
+So metrics like `1 / 17 merchants covered` are background context only. They are not the primary denominator for fallback program readiness.
 
-- the referral governance and summary system is functioning
-- the runtime hard gate is not currently masking large numbers of bad seeds
-- the dominant rollout problem is simply that most merchants do not yet have referral inventory
+## Program-Level Result
 
-## Anchor Merchant: `merch_efbc46b4619cfbdf`
+The strongest current conclusion is:
 
-Production employee summary for the anchor merchant returned:
+`platform fallback referral is runtime-healthy and governed where inventory exists, and should now be measured as a program, not as merchant readiness.`
+
+What is now proven:
+
+- employee-safe attached fallback seed health is live
+- employee-safe program summary is live
+- runtime hard gating is live
+- redirect allowlist enforcement is live
+- the anchor merchant graph has healthy attached fallback inventory
+
+## Anchor Merchant Operational Readout
+
+For `merch_efbc46b4619cfbdf`, production showed:
 
 - `status=green`
-- `gating_policy_version=external_referral_v1`
-- `matched_domains=["jwx893-fz.myshopify.com"]`
 - `total_active_seeds=50`
 - `attached_seed_count=50`
 - `healthy_seed_count=50`
 - `blocked_seed_count=0`
 - `review_seed_count=0`
 
-This merchant is therefore no longer merely `referral-capable in theory`. It is `referral-healthy in production`.
+This is an operator/debug confirmation that the attached fallback inventory is healthy for that merchant graph.
 
-## Runtime Probe Result For The Anchor Merchant
+It is **not** a statement that the merchant is fallback-ready as a business-valid commerce path.
 
-The anchor merchant's `50` attached referral products were re-probed against the live gateway:
+## Runtime Probe Result
 
-- probe target: `https://agent.pivota.cc/api/gateway`
-- operation: `offers.resolve`
-- market: `EU-DE`
-- input shape: direct `product_id`
-
-Observed result:
+The anchor merchant's attached fallback products were re-probed against the live gateway:
 
 - `50 / 50` returned `affiliate_outbound`
-- `0` probe errors
-- `0` runtime failure breakdown entries
+- `0` runtime errors
+- `0` failure breakdown entries
 - median total latency: `870.5ms`
 - p95 total latency: `1574ms`
 - median `time_to_pdp_ms`: `396ms`
 
 Observed source markers:
 
-- `subject_resolve:skipped_direct_lookup` -> `50`
-- `cache_search` -> `50`
+- `subject_resolve:skipped_direct_lookup`
+- `cache_search:ok`
 
-This means the anchor merchant's external-referral path is now both:
+This proves the fallback runtime path is operationally healthy where attached inventory exists.
 
-- operationally healthy
-- materially faster than before the March 20 gateway optimization
+## Merchant Commerce Cohort Context
+
+A separate employee-only cohort view now exists for merchant-valid commerce prerequisites:
+
+- `total_registered_merchants`
+- `store_connected_merchants`
+- `store_connected_with_psp_merchants`
+- `merchant_valid_count`
+- `merchant_invalid_count`
+
+This is intentionally separate from fallback program health.
+
+It exists to answer:
+
+- which merchants are real commerce candidates
+- which merchants still fail basic commerce prerequisites
+
+It does **not** define fallback program readiness.
 
 ## What This Audit Proves
 
 ### Proven
 
-- employee-safe referral summary is live and usable across the merchant fleet
-- hard-gated referral runtime is live
-- the anchor merchant has real referral inventory and real outbound runtime coverage
-- the previously observed `db_query_timeout` slow path is no longer present on the anchor merchant runtime audit
-- the gateway no longer spends unnecessary time in `subject_resolve` for direct-id referral lookups
+- fallback governance is live
+- fallback runtime gating is live
+- fallback runtime latency is materially improved
+- attached fallback inventory for the anchor merchant is healthy
+- employee ops now has the right split:
+  - `Attached Fallback Seed Health`
+  - `Platform Fallback Referral Program`
+  - `Merchant Commerce Cohort`
 
-### Not Yet Proven
+### Not Proven
 
-- multi-merchant referral coverage
-- domain-match fallback quality for merchants without attached seeds
-- merchant-facing referral diagnostics
-- broad referral rollout readiness beyond the anchor merchant
+- broad merchant-valid rollout beyond the one real connected merchant
+- a merchant-facing fallback contract
+- that fallback should be exposed to merchants as a self-serve readiness surface
 
-## The Actual Bottleneck Now
-
-The current external-referral constraint is:
-
-`seed coverage and merchant attribution coverage`
-
-It is no longer best described as:
-
-- runtime instability
-- broad blocker-grade seed corruption
-- redirect path unreliability for the anchor merchant
-
-The key unanswered rollout question is:
-
-`how quickly can active merchants be given healthy attached or domain-matched referral inventory?`
-
-## Recommended Next Steps
-
-1. Backfill or attach referral seeds for the remaining live merchants before changing the rollout score.
-2. Add a merchant-fleet coverage metric to employee ops:
-   - merchants with active seeds
-   - merchants with attached seeds
-   - merchants with zero referral inventory
-3. Extend the merchant readiness contract later with:
-   - `external_referral_status`
-   - `external_referral_issue_buckets`
-   - `agent_surface_status`
-4. Keep using runtime hard gating, but prioritize coverage expansion over further micro-optimizations.
-
-## Updated Rollout Interpretation
+## Correct Interpretation
 
 As of `2026-03-20`:
 
-- `system readiness` for external referral remains `Yellow`
-  - because referral is live, governed, observable, and healthy where coverage exists
-- `anchor merchant readiness` for external referral is now `Green`
-  - because the anchor merchant has healthy attached seeds and `50 / 50` live runtime coverage
-- `rollout readiness` for external referral remains `Red`
-  - because only `1 / 17` live merchants currently has active attached referral inventory
+- fallback is no longer best described as `merchant coverage is sparse`
+- fallback is better described as:
+  - a `Pivota-managed fallback program`
+  - with healthy runtime where inventory exists
+  - still employee-operated
+  - still not equivalent to merchant-valid commerce
 
-This is the correct production interpretation after the March 20 verification pass.
+## Recommended Next Steps
+
+1. Keep fallback program reporting separate from merchant-valid readiness.
+2. Keep per-merchant attached fallback health as an operator/debug surface only.
+3. Do not add merchant-facing fallback readiness until there is an explicit product decision for how fallback should be presented.
+4. Continue improving merchant-valid commerce separately:
+   - store/domain connectivity
+   - catalog sync
+   - PSP/checkout connection
+
+## Final Audit Verdict
+
+`Platform fallback referral is now a governed runtime program, not a merchant readiness track.`

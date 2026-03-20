@@ -19,7 +19,7 @@ In one sentence:
 
 That is good enough for a merchant-facing workspace v1. It is not yet sufficient as the long-term product and engineering control plane.
 
-This document is primarily about the merchant-facing optimization workspace for `internal commerce`. As of March 20, 2026, production also supports `external referral` surfaces through employee-managed external seeds and tracked outbound redirects, and the anchor merchant now has healthy live referral runtime coverage. Those surfaces are still not yet first-class in the optimization plan contract, and fleet-wide referral coverage remains sparse. See `UNIFIED_READINESS_SCORECARD.md` and `MULTI_MERCHANT_EXTERNAL_REFERRAL_AUDIT.md` for the latest dual-track production audit.
+This document is primarily about the merchant-facing optimization workspace for `merchant-valid internal commerce`. As of March 20, 2026, production also supports `platform fallback referral` surfaces through employee-managed external seeds and tracked outbound redirects. Those fallback surfaces are real, but they are not merchant readiness and they are not modeled as merchant-facing optimization plan state in this document. See `UNIFIED_READINESS_SCORECARD.md` and `MULTI_MERCHANT_EXTERNAL_REFERRAL_AUDIT.md` for the corrected production framing.
 
 ## Initial Landing State
 
@@ -136,23 +136,23 @@ This distinction matters because most current readiness logic is strongest in st
 
 ## Dual-Track Scope Note
 
-The funnel model above is still most mature for `internal commerce`, where Pivota owns the product, checkout, and operational loop.
+The funnel model above is still most mature for `merchant-valid internal commerce`, where Pivota owns the product, checkout, and operational loop.
 
 Production also has a second agent-compatible surface:
 
-- `External Referral`
+- `Platform Fallback Referral`
   - employee-managed external seeds
   - tracked redirects
   - no-checkout handoff to merchant or partner destinations
 
-That external referral track is already real in runtime code, but it is not yet represented as a first-class merchant-safe readiness contract. The current `OptimizationPlan` and `MerchantReadinessOptimizationPayload` should therefore be treated as `internal-commerce-first` until referral-specific status and issue buckets are added.
+That fallback track is already real in runtime code, but it is not represented as merchant-valid readiness and should not be treated as merchant-owned optimization state. The current `OptimizationPlan` and `MerchantReadinessOptimizationPayload` should therefore be treated as `internal-commerce-first` until there is an explicit product decision about whether fallback belongs in any merchant-facing contract at all.
 
 ## Goals
 
 - Keep the dashboard compact and decision-light.
 - Project internal readiness findings into a merchant-safe optimization plan.
 - Separate eligibility fixing from exposure and conversion lifting.
-- Avoid conflating `referral-ready` with `checkout-ready`.
+- Avoid conflating `platform fallback` with `merchant-valid checkout readiness`.
 - Make optimization work explainable, auditable, and attributable.
 - Reuse the current product enrichment and quality machinery while introducing a cleaner orchestration boundary.
 - Create a controlled insertion point for future LLM-powered optimization.
@@ -163,7 +163,7 @@ That external referral track is already real in runtime code, but it is not yet 
 - Exposing raw internal readiness reports directly to merchants.
 - Letting LLM mutate canonical price, inventory, checkout, policy, or order state.
 - Treating the product optimization workspace as the public contract for order execution.
-- Fully specifying the external referral readiness contract in this document.
+- Fully specifying the platform fallback referral contract in this document.
 
 ## Architecture Principles
 
