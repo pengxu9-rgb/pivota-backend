@@ -33,6 +33,7 @@ from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
 from services.quote_service import QuoteError
+from services.agent_governance import validate_request_compat
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
@@ -6490,7 +6491,7 @@ async def agent_create_order(
 
     # STEP 1: Governance validation (before main logic)
     from services.agent_governance import agent_governance
-    await agent_governance.validate_request(context.agent_id, fail_closed=True)
+    await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
 
     # MVP measurement scaffolding: record checkout attempt (order creation stage).
     try:
@@ -7341,7 +7342,7 @@ async def agent_confirm_payment(
         if not context.can_access_merchant(order["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized for this order")
 
-        await agent_governance.validate_request(context.agent_id, fail_closed=True)
+        await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
 
         store_info = await get_primary_store(order["merchant_id"])
         can_shopify_sync = bool(store_info) and str((store_info or {}).get("platform") or "").strip().lower() == "shopify" and bool(
