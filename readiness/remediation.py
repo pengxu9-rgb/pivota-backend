@@ -16,6 +16,9 @@ from readiness.models import (
     ProductBlockerSubject,
     ProductBlockerVariant,
     RemediationAction,
+    SourceDataTriagePayload,
+    SourceDataTriageRow,
+    SourceDataTriageSummaryBucket,
     VerificationResult,
 )
 from readiness.summary import get_readiness_optimization_context
@@ -52,6 +55,20 @@ class JobNotFoundError(Exception):
 
 
 _JOB_STORE: dict[str, ExecutionJob] = {}
+_SOURCE_DATA_TRIAGE_REASON_DEFS: dict[str, dict[str, str]] = {
+    "missing_price": {
+        "label": "Missing price or currency",
+        "scope": "variant",
+    },
+    "out_of_stock": {
+        "label": "Out of stock",
+        "scope": "variant",
+    },
+    "missing_primary_image": {
+        "label": "Missing primary image",
+        "scope": "product",
+    },
+}
 
 
 def _now_iso() -> str:
@@ -511,6 +528,252 @@ def _variant_agent_push_projection(variant: Any) -> dict[str, Any]:
         "agent_push_status": "eligible_for_agent_push",
         "agent_push_reason_codes": [],
     }
+
+
+def _normalize_source_data_reason_code(reason_code: Optional[str]) -> Optional[str]:
+    normalized = str(reason_code or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized not in _SOURCE_DATA_TRIAGE_REASON_DEFS:
+        supported = ", ".join(sorted(_SOURCE_DATA_TRIAGE_REASON_DEFS))
+        raise ActionNotFoundError(
+            f"Unsupported source-data reason code: {normalized}. Expected one of: {supported}"
+        )
+    return normalized
+
+
+def _queue_product_key(platform: Optional[str], platform_product_id: Optional[str], product_id: Optional[str]) -> str:
+    return f"{str(platform or '').strip().lower()}|{str(platform_product_id or product_id or '').strip()}"
+
+
+def _variant_matches_source_data_reason(
+    reason_code: str,
+    *,
+    readiness_blocker_codes: list[str],
+    agent_push_reason_codes: list[str],
+) -> bool:
+    blocker_codes = set(readiness_blocker_codes)
+    push_codes = set(agent_push_reason_codes)
+
+    if reason_code == "missing_price":
+        return bool(
+            blocker_codes.intersection({"missing_price", "missing_currency"})
+            or push_codes.intersection({"missing_price", "missing_currency"})
+        )
+    if reason_code == "out_of_stock":
+        return "out_of_stock" in blocker_codes or "out_of_stock" in push_codes
+    return False
+
+
+def _product_matches_source_data_reason(reason_code: str, *, queue_item: Any) -> tuple[bool, int]:
+    if reason_code != "missing_primary_image":
+        return False, 0
+
+    def _issue_value(issue: Any, field: str) -> Any:
+        if isinstance(issue, dict):
+            return issue.get(field)
+        return getattr(issue, field, None)
+
+    affected_variants = sum(
+        int(_issue_value(issue, "affected_variant_count") or 0)
+        for issue in (queue_item.top_issues or [])
+        if _issue_value(issue, "code") == "missing_primary_image"
+    )
+    if affected_variants <= 0:
+        affected_variants = (
+            int(queue_item.blocked_variant_count or 0)
+            or int(queue_item.excluded_variant_count or 0)
+        )
+
+    has_issue = any(
+        _issue_value(issue, "code") == "missing_primary_image"
+        for issue in (queue_item.top_issues or [])
+    )
+    return has_issue, affected_variants
+
+
+async def get_source_data_triage(
+    merchant_id: str,
+    *,
+    plan_id: str,
+    reason_code: Optional[str] = None,
+    limit: int = 500,
+    channel: str = "ucp",
+) -> dict[str, Any]:
+    normalized_reason_code = _normalize_source_data_reason_code(reason_code)
+    payload, snapshot = await _latest_context_or_raise(
+        merchant_id,
+        channel=channel,
+        plan_id=plan_id,
+    )
+
+    queue_by_key = {
+        _queue_product_key(item.platform, item.platform_product_id, item.product_id): item
+        for item in payload.product_queue
+    }
+    queue_index_by_key = {
+        _queue_product_key(item.platform, item.platform_product_id, item.product_id): index
+        for index, item in enumerate(payload.product_queue)
+    }
+
+    summary_products: dict[str, set[str]] = {
+        code: set() for code in _SOURCE_DATA_TRIAGE_REASON_DEFS
+    }
+    summary_variant_keys: dict[str, set[str]] = {
+        code: set() for code in _SOURCE_DATA_TRIAGE_REASON_DEFS
+    }
+    summary_variant_counts: dict[str, int] = {
+        code: 0 for code in _SOURCE_DATA_TRIAGE_REASON_DEFS
+    }
+
+    row_records: list[tuple[tuple[Any, ...], SourceDataTriageRow]] = []
+
+    for snapshot_product in snapshot.products:
+        product_key = _queue_product_key(
+            snapshot_product.platform,
+            snapshot_product.product_id,
+            snapshot_product.product_id,
+        )
+        queue_item = queue_by_key.get(product_key)
+        if queue_item is None:
+            continue
+
+        platform = queue_item.platform
+        platform_product_id = queue_item.platform_product_id or queue_item.product_id
+        product_id = queue_item.product_id
+        product_title = queue_item.title or snapshot_product.title
+        sort_index = queue_index_by_key.get(product_key, 10**9)
+
+        image_match, image_affected_variants = _product_matches_source_data_reason(
+            "missing_primary_image",
+            queue_item=queue_item,
+        )
+        if image_match:
+            summary_products["missing_primary_image"].add(product_key)
+            summary_variant_counts["missing_primary_image"] += max(
+                image_affected_variants,
+                0,
+            )
+            if normalized_reason_code in (None, "missing_primary_image"):
+                row_records.append(
+                    (
+                        (sort_index, 0, product_title.lower(), product_id),
+                        SourceDataTriageRow(
+                            scope="product",
+                            reason_code="missing_primary_image",
+                            reason_label=_SOURCE_DATA_TRIAGE_REASON_DEFS["missing_primary_image"]["label"],
+                            platform=platform,
+                            platform_product_id=platform_product_id,
+                            product_id=product_id,
+                            product_title=product_title,
+                            blocked_variant_count=int(queue_item.blocked_variant_count or 0),
+                            excluded_variant_count=int(queue_item.excluded_variant_count or 0),
+                            readiness_blocker_codes=["missing_primary_image"],
+                            readiness_warning_codes=[],
+                            agent_push_status=str(
+                                queue_item.agent_push_status or "eligible_for_agent_push"
+                            ),
+                            agent_push_reason_codes=list(queue_item.agent_push_reason_codes or []),
+                            recommended_action_type=queue_item.recommended_action_type,
+                            fix_surface=queue_item.fix_surface,
+                        ),
+                    )
+                )
+
+        for variant in snapshot_product.variants:
+            readiness_blocker_codes = _dedupe_codes(
+                variant.blockers.get("discovery", []),
+                variant.blockers.get("checkout", []),
+            )
+            readiness_warning_codes = _dedupe_codes(
+                variant.warnings.get("discovery", []),
+                variant.warnings.get("checkout", []),
+            )
+            push_projection = _variant_agent_push_projection(variant)
+            agent_push_reason_codes = list(
+                push_projection.get("agent_push_reason_codes") or []
+            )
+            agent_push_status = str(
+                push_projection.get("agent_push_status") or "eligible_for_agent_push"
+            )
+
+            variant_id = str(variant.variant_id or "").strip()
+            variant_title = str(variant.title or variant_id or "Variant")
+
+            for candidate_reason_code in ("missing_price", "out_of_stock"):
+                if not _variant_matches_source_data_reason(
+                    candidate_reason_code,
+                    readiness_blocker_codes=readiness_blocker_codes,
+                    agent_push_reason_codes=agent_push_reason_codes,
+                ):
+                    continue
+
+                variant_key = f"{product_key}|{variant_id}|{candidate_reason_code}"
+                summary_products[candidate_reason_code].add(product_key)
+                summary_variant_keys[candidate_reason_code].add(variant_key)
+
+                if normalized_reason_code not in (None, candidate_reason_code):
+                    continue
+
+                row_records.append(
+                    (
+                        (sort_index, 1, product_title.lower(), variant_title.lower(), variant_id),
+                        SourceDataTriageRow(
+                            scope="variant",
+                            reason_code=candidate_reason_code,
+                            reason_label=_SOURCE_DATA_TRIAGE_REASON_DEFS[candidate_reason_code]["label"],
+                            platform=platform,
+                            platform_product_id=platform_product_id,
+                            product_id=product_id,
+                            product_title=product_title,
+                            variant_id=variant_id,
+                            variant_title=variant_title,
+                            sku=variant.sku,
+                            price_value=_coerce_price_value((variant.price or {}).get("amount")),
+                            price_currency=str((variant.price or {}).get("currency") or "").strip() or None,
+                            inventory_quantity=_coerce_inventory_quantity(
+                                (variant.inventory or {}).get("quantity")
+                            ),
+                            blocked_variant_count=int(queue_item.blocked_variant_count or 0),
+                            excluded_variant_count=int(queue_item.excluded_variant_count or 0),
+                            readiness_blocker_codes=readiness_blocker_codes,
+                            readiness_warning_codes=readiness_warning_codes,
+                            agent_push_status=agent_push_status,
+                            agent_push_reason_codes=agent_push_reason_codes,
+                            recommended_action_type=queue_item.recommended_action_type,
+                            fix_surface=queue_item.fix_surface,
+                        ),
+                    )
+                )
+
+    for code, variant_keys in summary_variant_keys.items():
+        if code == "missing_primary_image":
+            continue
+        summary_variant_counts[code] = len(variant_keys)
+
+    sorted_rows = [row for _, row in sorted(row_records, key=lambda item: item[0])]
+    limited_rows = sorted_rows[: max(1, int(limit or 500))]
+
+    summary = [
+        SourceDataTriageSummaryBucket(
+            code=code,
+            label=definition["label"],
+            scope=definition["scope"],
+            affected_products=len(summary_products[code]),
+            affected_variants=summary_variant_counts[code],
+        ).model_dump()
+        for code, definition in _SOURCE_DATA_TRIAGE_REASON_DEFS.items()
+    ]
+
+    payload_model = SourceDataTriagePayload(
+        plan_id=payload.plan.plan_id,
+        snapshot_id=payload.plan.snapshot_id,
+        reason_code=normalized_reason_code,
+        summary=[SourceDataTriageSummaryBucket.model_validate(item) for item in summary],
+        rows=limited_rows,
+        total_rows=len(sorted_rows),
+    )
+    return payload_model.model_dump()
 
 
 async def get_product_blocker_detail(

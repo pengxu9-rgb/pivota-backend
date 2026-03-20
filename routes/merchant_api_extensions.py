@@ -1,5 +1,8 @@
 """Extended Merchant API Routes for Dashboard Features"""
-from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
+import csv
+import io
+
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Query, Response
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
@@ -30,6 +33,7 @@ from readiness.remediation import (
     PlanSupersededError,
     get_execution_job,
     get_product_blocker_detail,
+    get_source_data_triage,
     preview_remediation_action,
     run_remediation_action,
 )
@@ -933,6 +937,173 @@ async def get_readiness_product_blockers(
         raise HTTPException(
             status_code=500,
             detail=f"Readiness blocker detail failed: {str(e)}",
+        )
+
+
+@router.get("/merchant/readiness/optimization/source-data-triage")
+async def get_readiness_source_data_triage(
+    plan_id: str = Query(...),
+    reason_code: Optional[str] = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a merchant-safe batch triage view for source-data blockers."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        data = await get_source_data_triage(
+            merchant_id,
+            plan_id=plan_id,
+            reason_code=reason_code,
+            limit=limit,
+        )
+        return {
+            "status": "success",
+            "data": data,
+        }
+    except PlanSupersededError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
+                "current_plan_id": exc.current_plan_id,
+                "current_snapshot_id": exc.current_snapshot_id,
+            },
+        )
+    except ActionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "OPTIMIZATION_SOURCE_DATA_TRIAGE_UNAVAILABLE",
+                "message": str(exc),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Readiness source-data triage error for merchant %s: %s",
+            merchant_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness source-data triage failed: {str(e)}",
+        )
+
+
+@router.get("/merchant/readiness/optimization/source-data-triage/export.csv")
+async def export_readiness_source_data_triage(
+    plan_id: str = Query(...),
+    reason_code: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Export the current merchant source-data triage lane as CSV."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        data = await get_source_data_triage(
+            merchant_id,
+            plan_id=plan_id,
+            reason_code=reason_code,
+            limit=5000,
+        )
+        buffer = io.StringIO()
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=[
+                "scope",
+                "reason_code",
+                "reason_label",
+                "platform",
+                "platform_product_id",
+                "product_id",
+                "product_title",
+                "variant_id",
+                "variant_title",
+                "sku",
+                "price_value",
+                "price_currency",
+                "inventory_quantity",
+                "blocked_variant_count",
+                "excluded_variant_count",
+                "readiness_blocker_codes",
+                "readiness_warning_codes",
+                "agent_push_status",
+                "agent_push_reason_codes",
+                "recommended_action_type",
+                "fix_surface",
+            ],
+        )
+        writer.writeheader()
+        for row in data.get("rows") or []:
+            writer.writerow(
+                {
+                    "scope": row.get("scope"),
+                    "reason_code": row.get("reason_code"),
+                    "reason_label": row.get("reason_label"),
+                    "platform": row.get("platform"),
+                    "platform_product_id": row.get("platform_product_id"),
+                    "product_id": row.get("product_id"),
+                    "product_title": row.get("product_title"),
+                    "variant_id": row.get("variant_id"),
+                    "variant_title": row.get("variant_title"),
+                    "sku": row.get("sku"),
+                    "price_value": row.get("price_value"),
+                    "price_currency": row.get("price_currency"),
+                    "inventory_quantity": row.get("inventory_quantity"),
+                    "blocked_variant_count": row.get("blocked_variant_count"),
+                    "excluded_variant_count": row.get("excluded_variant_count"),
+                    "readiness_blocker_codes": "|".join(row.get("readiness_blocker_codes") or []),
+                    "readiness_warning_codes": "|".join(row.get("readiness_warning_codes") or []),
+                    "agent_push_status": row.get("agent_push_status"),
+                    "agent_push_reason_codes": "|".join(row.get("agent_push_reason_codes") or []),
+                    "recommended_action_type": row.get("recommended_action_type"),
+                    "fix_surface": row.get("fix_surface"),
+                }
+            )
+
+        normalized_reason = str(reason_code or "all").strip().lower() or "all"
+        filename = (
+            f"readiness-source-data-triage-{normalized_reason}-{merchant_id}-{int(time.time())}.csv"
+        )
+        return Response(
+            content=buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+    except PlanSupersededError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
+                "current_plan_id": exc.current_plan_id,
+                "current_snapshot_id": exc.current_snapshot_id,
+            },
+        )
+    except ActionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "OPTIMIZATION_SOURCE_DATA_TRIAGE_UNAVAILABLE",
+                "message": str(exc),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Readiness source-data triage export error for merchant %s: %s",
+            merchant_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness source-data triage export failed: {str(e)}",
         )
 
 

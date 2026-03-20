@@ -292,6 +292,47 @@ class ProductBlockerDetail(BaseModel):
     variants: List[ProductBlockerVariant] = Field(default_factory=list)
 
 
+class SourceDataTriageSummaryBucket(BaseModel):
+    code: str
+    label: str
+    scope: str
+    affected_products: int = 0
+    affected_variants: int = 0
+
+
+class SourceDataTriageRow(BaseModel):
+    scope: str = "variant"
+    reason_code: str
+    reason_label: str
+    platform: str
+    platform_product_id: str
+    product_id: str
+    product_title: str
+    variant_id: Optional[str] = None
+    variant_title: Optional[str] = None
+    sku: Optional[str] = None
+    price_value: Optional[float] = None
+    price_currency: Optional[str] = None
+    inventory_quantity: Optional[int] = None
+    blocked_variant_count: int = 0
+    excluded_variant_count: int = 0
+    readiness_blocker_codes: List[str] = Field(default_factory=list)
+    readiness_warning_codes: List[str] = Field(default_factory=list)
+    agent_push_status: str = "eligible_for_agent_push"
+    agent_push_reason_codes: List[str] = Field(default_factory=list)
+    recommended_action_type: Optional[str] = None
+    fix_surface: Optional[str] = None
+
+
+class SourceDataTriagePayload(BaseModel):
+    plan_id: str
+    snapshot_id: str
+    reason_code: Optional[str] = None
+    summary: List[SourceDataTriageSummaryBucket] = Field(default_factory=list)
+    rows: List[SourceDataTriageRow] = Field(default_factory=list)
+    total_rows: int = 0
+
+
 class MerchantReadinessOptimizationPayload(BaseModel):
     plan: OptimizationPlan
     score_bundle: ScoreBundle = Field(default_factory=ScoreBundle)

@@ -678,6 +678,166 @@ def test_merchant_readiness_product_blockers_route_returns_variant_detail(monkey
     assert body["data"]["variants"][0]["agent_push_status"] == "excluded_from_agent_push"
 
 
+def test_merchant_readiness_source_data_triage_route_returns_rows(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_get_source_data_triage(
+        _merchant_id: str,
+        *,
+        plan_id: str,
+        reason_code: str | None = None,
+        limit: int = 500,
+        channel: str = "ucp",
+    ):
+        assert plan_id == "rdplan_test"
+        assert reason_code == "out_of_stock"
+        assert limit == 200
+        assert channel == "ucp"
+        return {
+            "plan_id": "rdplan_test",
+            "snapshot_id": "rdsnap_test",
+            "reason_code": "out_of_stock",
+            "summary": [
+                {
+                    "code": "out_of_stock",
+                    "label": "Out of stock",
+                    "scope": "variant",
+                    "affected_products": 1,
+                    "affected_variants": 2,
+                }
+            ],
+            "rows": [
+                {
+                    "scope": "variant",
+                    "reason_code": "out_of_stock",
+                    "reason_label": "Out of stock",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_1",
+                    "product_id": "prod_1",
+                    "product_title": "Alpha Product",
+                    "variant_id": "var_1",
+                    "variant_title": "Blue / Small",
+                    "sku": "SKU-1",
+                    "price_value": 24.0,
+                    "price_currency": "USD",
+                    "inventory_quantity": 0,
+                    "blocked_variant_count": 1,
+                    "excluded_variant_count": 1,
+                    "readiness_blocker_codes": ["out_of_stock"],
+                    "readiness_warning_codes": [],
+                    "agent_push_status": "excluded_from_agent_push",
+                    "agent_push_reason_codes": ["out_of_stock"],
+                    "recommended_action_type": "review_catalog_data",
+                    "fix_surface": "catalog_data",
+                }
+            ],
+            "total_rows": 1,
+        }
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "get_source_data_triage", fake_get_source_data_triage)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.get(
+        "/merchant/readiness/optimization/source-data-triage",
+        params={"plan_id": "rdplan_test", "reason_code": "out_of_stock", "limit": 200},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["rows"][0]["reason_code"] == "out_of_stock"
+    assert body["data"]["rows"][0]["variant_id"] == "var_1"
+
+
+def test_merchant_readiness_source_data_triage_export_route_returns_csv(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_get_source_data_triage(
+        _merchant_id: str,
+        *,
+        plan_id: str,
+        reason_code: str | None = None,
+        limit: int = 5000,
+        channel: str = "ucp",
+    ):
+        assert plan_id == "rdplan_test"
+        assert reason_code == "missing_price"
+        assert limit == 5000
+        assert channel == "ucp"
+        return {
+            "plan_id": "rdplan_test",
+            "snapshot_id": "rdsnap_test",
+            "reason_code": "missing_price",
+            "summary": [],
+            "rows": [
+                {
+                    "scope": "variant",
+                    "reason_code": "missing_price",
+                    "reason_label": "Missing price or currency",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_1",
+                    "product_id": "prod_1",
+                    "product_title": "Alpha Product",
+                    "variant_id": "var_1",
+                    "variant_title": "Blue / Small",
+                    "sku": "SKU-1",
+                    "price_value": None,
+                    "price_currency": "USD",
+                    "inventory_quantity": 0,
+                    "blocked_variant_count": 1,
+                    "excluded_variant_count": 1,
+                    "readiness_blocker_codes": ["missing_price"],
+                    "readiness_warning_codes": [],
+                    "agent_push_status": "excluded_from_agent_push",
+                    "agent_push_reason_codes": ["missing_price"],
+                    "recommended_action_type": "review_catalog_data",
+                    "fix_surface": "catalog_data",
+                }
+            ],
+            "total_rows": 1,
+        }
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "get_source_data_triage", fake_get_source_data_triage)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.get(
+        "/merchant/readiness/optimization/source-data-triage/export.csv",
+        params={"plan_id": "rdplan_test", "reason_code": "missing_price"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "attachment;" in response.headers["content-disposition"]
+    text = response.text
+    assert "reason_code" in text
+    assert "missing_price" in text
+    assert "Alpha Product" in text
+
+
 def test_checkout_blocked_when_capability_missing(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=False)
 

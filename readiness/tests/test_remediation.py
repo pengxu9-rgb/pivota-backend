@@ -14,6 +14,7 @@ from readiness.remediation import (
     ActionNotExecutableError,
     PlanSupersededError,
     get_product_blocker_detail,
+    get_source_data_triage,
     preview_remediation_action,
     run_remediation_action,
 )
@@ -468,3 +469,61 @@ async def test_get_product_blocker_detail_returns_variant_cross_reference(monkey
     assert first_variant["readiness_status"] == "blocked"
     assert "missing_price" in first_variant["readiness_blocker_codes"]
     assert first_variant["agent_push_status"] == "excluded_from_agent_push"
+
+
+@pytest.mark.asyncio
+async def test_get_source_data_triage_returns_summary_and_rows(monkeypatch):
+    from readiness import remediation
+
+    payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
+    payload.product_queue[0].blocked_variant_count = 1
+    payload.product_queue[0].ready_variant_count = 1
+    payload.product_queue[0].eligible_variant_count = 1
+    payload.product_queue[0].excluded_variant_count = 1
+    payload.product_queue[0].agent_push_status = "excluded_from_agent_push"
+    payload.product_queue[0].agent_push_reason_codes = ["missing_price", "out_of_stock"]
+    payload.product_queue[0].fix_surface = "catalog_data"
+    payload.product_queue[0].recommended_action_type = "review_catalog_data"
+    payload.product_queue[0].top_issues = [
+        {
+            "code": "missing_primary_image",
+            "label": "Missing primary image",
+            "impact": "discovery_only",
+            "affected_variant_count": 2,
+        }
+    ]
+
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        assert channel == "ucp"
+        return payload, _snapshot()
+
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
+
+    triage = await get_source_data_triage(
+        "merch_efbc46b4619cfbdf",
+        plan_id="rdplan_current",
+    )
+
+    assert triage["plan_id"] == "rdplan_current"
+    summary_by_code = {item["code"]: item for item in triage["summary"]}
+    assert summary_by_code["missing_price"]["affected_products"] == 1
+    assert summary_by_code["missing_price"]["affected_variants"] == 1
+    assert summary_by_code["out_of_stock"]["affected_variants"] == 1
+    assert summary_by_code["missing_primary_image"]["affected_products"] == 1
+    assert summary_by_code["missing_primary_image"]["affected_variants"] == 2
+
+    rows_by_reason = {row["reason_code"] for row in triage["rows"]}
+    assert {"missing_price", "out_of_stock", "missing_primary_image"} <= rows_by_reason
+
+    missing_price_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_price")
+    assert missing_price_row["scope"] == "variant"
+    assert missing_price_row["variant_id"] == "var_1"
+    assert missing_price_row["agent_push_status"] == "excluded_from_agent_push"
+
+    image_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_primary_image")
+    assert image_row["scope"] == "product"
+    assert image_row["platform_product_id"] == "prod_1"
