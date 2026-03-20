@@ -13,8 +13,14 @@ from readiness.models import (
 from readiness.summary import (
     build_readiness_optimization,
     build_readiness_summary,
+    reset_readiness_optimization_cache_observability,
     summarize_readiness_snapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_optimization_cache():
+    reset_readiness_optimization_cache_observability()
 
 
 def _snapshot(

@@ -4,6 +4,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
+import time
 from typing import Any, Dict, Iterable, Optional
 
 from db.database import database
@@ -48,6 +49,19 @@ logger = logging.getLogger(__name__)
 _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
 _PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
 _PLAN_TTL_HOURS = 6
+_OPTIMIZATION_CACHE_TTL_SECONDS = 60.0
+
+
+_OPTIMIZATION_CACHE: dict[str, tuple[float, MerchantReadinessOptimizationPayload]] = {}
+_OPTIMIZATION_CACHE_METRICS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "stores": 0,
+    "expired": 0,
+    "refreshes": 0,
+    "invalidations": 0,
+    "invalidated_entries": 0,
+}
 
 
 _BUCKET_DEFINITIONS: dict[str, dict[str, str]] = {
@@ -339,6 +353,114 @@ def _variant_blocker_counts(snapshot: MerchantReadinessSnapshot) -> Counter[str]
 
 def _bucket_code_for_reason(code: str) -> str:
     return _CODE_TO_BUCKET.get(code, "other")
+
+
+def _optimization_cache_key(merchant_id: str, channel: str) -> str:
+    return f"{merchant_id}|{channel}"
+
+
+def invalidate_readiness_optimization_cache(
+    merchant_id: Optional[str] = None,
+    *,
+    channel: Optional[str] = None,
+) -> int:
+    if merchant_id is None and channel is None:
+        removed = len(_OPTIMIZATION_CACHE)
+        _OPTIMIZATION_CACHE.clear()
+        if removed:
+            _OPTIMIZATION_CACHE_METRICS["invalidations"] += 1
+            _OPTIMIZATION_CACHE_METRICS["invalidated_entries"] += removed
+        return removed
+
+    keys_to_drop: list[str] = []
+    for key in list(_OPTIMIZATION_CACHE.keys()):
+        cached_merchant_id, cached_channel = key.split("|", 1)
+        if merchant_id is not None and cached_merchant_id != merchant_id:
+            continue
+        if channel is not None and cached_channel != channel:
+            continue
+        keys_to_drop.append(key)
+
+    for key in keys_to_drop:
+        _OPTIMIZATION_CACHE.pop(key, None)
+
+    if keys_to_drop:
+        _OPTIMIZATION_CACHE_METRICS["invalidations"] += 1
+        _OPTIMIZATION_CACHE_METRICS["invalidated_entries"] += len(keys_to_drop)
+    return len(keys_to_drop)
+
+
+def reset_readiness_optimization_cache_observability() -> None:
+    _OPTIMIZATION_CACHE.clear()
+    for key in list(_OPTIMIZATION_CACHE_METRICS.keys()):
+        _OPTIMIZATION_CACHE_METRICS[key] = 0
+
+
+def get_readiness_optimization_cache_metrics() -> dict[str, Any]:
+    total_requests = _OPTIMIZATION_CACHE_METRICS["hits"] + _OPTIMIZATION_CACHE_METRICS["misses"]
+    hit_rate = (_OPTIMIZATION_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
+    now_mono = time.monotonic()
+    entries = []
+    for key, (cached_at, payload) in sorted(_OPTIMIZATION_CACHE.items()):
+        merchant_id, cached_channel = key.split("|", 1)
+        age_seconds = max(0.0, now_mono - cached_at)
+        entries.append(
+            {
+                "merchant_id": merchant_id,
+                "channel": cached_channel,
+                "plan_id": payload.plan.plan_id,
+                "snapshot_id": payload.plan.snapshot_id,
+                "age_seconds": round(age_seconds, 3),
+                "expires_in_seconds": round(max(0.0, _OPTIMIZATION_CACHE_TTL_SECONDS - age_seconds), 3),
+            }
+        )
+
+    return {
+        "hits": _OPTIMIZATION_CACHE_METRICS["hits"],
+        "misses": _OPTIMIZATION_CACHE_METRICS["misses"],
+        "stores": _OPTIMIZATION_CACHE_METRICS["stores"],
+        "expired": _OPTIMIZATION_CACHE_METRICS["expired"],
+        "refreshes": _OPTIMIZATION_CACHE_METRICS["refreshes"],
+        "invalidations": _OPTIMIZATION_CACHE_METRICS["invalidations"],
+        "invalidated_entries": _OPTIMIZATION_CACHE_METRICS["invalidated_entries"],
+        "total_requests": total_requests,
+        "hit_rate": round(hit_rate, 2),
+        "entries": len(_OPTIMIZATION_CACHE),
+        "ttl_seconds": _OPTIMIZATION_CACHE_TTL_SECONDS,
+        "active_keys": entries,
+    }
+
+
+def _cached_optimization_payload(
+    merchant_id: str,
+    *,
+    channel: str,
+) -> Optional[MerchantReadinessOptimizationPayload]:
+    cache_key = _optimization_cache_key(merchant_id, channel)
+    entry = _OPTIMIZATION_CACHE.get(cache_key)
+    if not entry:
+        _OPTIMIZATION_CACHE_METRICS["misses"] += 1
+        return None
+    cached_at, payload = entry
+    if time.monotonic() - cached_at > _OPTIMIZATION_CACHE_TTL_SECONDS:
+        _OPTIMIZATION_CACHE.pop(cache_key, None)
+        _OPTIMIZATION_CACHE_METRICS["misses"] += 1
+        _OPTIMIZATION_CACHE_METRICS["expired"] += 1
+        return None
+    _OPTIMIZATION_CACHE_METRICS["hits"] += 1
+    return payload.model_copy(deep=True)
+
+
+def _store_optimization_payload(
+    merchant_id: str,
+    *,
+    channel: str,
+    payload: MerchantReadinessOptimizationPayload,
+) -> MerchantReadinessOptimizationPayload:
+    cache_key = _optimization_cache_key(merchant_id, channel)
+    _OPTIMIZATION_CACHE[cache_key] = (time.monotonic(), payload.model_copy(deep=True))
+    _OPTIMIZATION_CACHE_METRICS["stores"] += 1
+    return payload
 
 
 def _severity_for_bucket(bucket_code: str, affected_count: int) -> str:
@@ -1113,6 +1235,10 @@ async def build_readiness_optimization(
     *,
     channel: str = "ucp",
 ) -> MerchantReadinessOptimizationPayload:
+    cached_payload = _cached_optimization_payload(merchant_id, channel=channel)
+    if cached_payload is not None:
+        return cached_payload
+
     snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
     if fallback is not None or snapshot is None:
         return _fallback_optimization_payload(
@@ -1163,14 +1289,18 @@ async def build_readiness_optimization(
         can_apply_actions=summary.assessment_state == "assessed",
         last_successful_rescore_at=summary.generated_at,
     )
-    return MerchantReadinessOptimizationPayload(
-        plan=plan,
-        score_bundle=ScoreBundle(readiness_score=summary.score),
-        readiness_summary=summary,
-        issue_buckets=issue_buckets,
-        merchant_actions=merchant_actions,
-        product_queue=product_queue,
-        quality_coverage=quality_coverage,
-        agent_push_summary=agent_push_summary,
-        last_generated_at=summary.generated_at,
+    return _store_optimization_payload(
+        merchant_id,
+        channel=channel,
+        payload=MerchantReadinessOptimizationPayload(
+            plan=plan,
+            score_bundle=ScoreBundle(readiness_score=summary.score),
+            readiness_summary=summary,
+            issue_buckets=issue_buckets,
+            merchant_actions=merchant_actions,
+            product_queue=product_queue,
+            quality_coverage=quality_coverage,
+            agent_push_summary=agent_push_summary,
+            last_generated_at=summary.generated_at,
+        ),
     )
