@@ -11,10 +11,14 @@ from readiness.models import (
     ExecutionJob,
     MerchantReadinessOptimizationPayload,
     PatchCandidate,
+    ProductBlockerCounts,
+    ProductBlockerDetail,
+    ProductBlockerSubject,
+    ProductBlockerVariant,
     RemediationAction,
     VerificationResult,
 )
-from readiness.summary import build_readiness_optimization
+from readiness.summary import get_readiness_optimization_context
 from services.product_enrichment_ai import (
     build_context_from_standard_product,
     classify_audience_tags,
@@ -80,6 +84,8 @@ def _default_disclaimer(context_text: str) -> str:
     if "鞋" in context_text or "shoe" in context_text.lower():
         return "本产品为运动鞋，不具备医疗功效，具体体验因人而异。"
     return "本产品为日常消费品，不提供任何医疗或金融收益承诺。"
+
+
 def _generated_enrichment(product: StandardProduct) -> dict[str, Any]:
     context = build_context_from_standard_product(product)
     summary = generate_summary(context)
@@ -109,13 +115,36 @@ async def _latest_plan_or_raise(
     channel: str,
     plan_id: str,
 ) -> MerchantReadinessOptimizationPayload:
-    payload = await build_readiness_optimization(merchant_id, channel=channel)
+    payload, _snapshot = await get_readiness_optimization_context(
+        merchant_id,
+        channel=channel,
+    )
     if payload.plan.plan_id != plan_id:
         raise PlanSupersededError(
             current_plan_id=payload.plan.plan_id,
             current_snapshot_id=payload.plan.snapshot_id,
         )
     return payload
+
+
+async def _latest_context_or_raise(
+    merchant_id: str,
+    *,
+    channel: str,
+    plan_id: str,
+) -> tuple[MerchantReadinessOptimizationPayload, Any]:
+    payload, snapshot = await get_readiness_optimization_context(
+        merchant_id,
+        channel=channel,
+    )
+    if payload.plan.plan_id != plan_id:
+        raise PlanSupersededError(
+            current_plan_id=payload.plan.plan_id,
+            current_snapshot_id=payload.plan.snapshot_id,
+        )
+    if snapshot is None:
+        raise ActionNotFoundError("Readiness snapshot unavailable for this plan")
+    return payload, snapshot
 
 
 def _build_action_catalog(payload: MerchantReadinessOptimizationPayload) -> dict[str, RemediationAction]:
@@ -271,8 +300,8 @@ async def preview_remediation_action(
     for target in action.targets:
         platform, platform_product_id, product, enrichment = await _load_product_target(merchant_id, target)
         generated = _generated_enrichment(product)
-        current_preview = preview_quality(_build_quality_payload(product, enrichment))
-        expected_preview = preview_quality(_build_quality_payload(product, generated))
+        current_preview = preview_quality(build_quality_payload(product, enrichment))
+        expected_preview = preview_quality(build_quality_payload(product, generated))
 
         for field_name, after_value in generated.items():
             before_value = enrichment.get(field_name)
@@ -328,6 +357,225 @@ async def preview_remediation_action(
     }
 
 
+def _dedupe_codes(*groups: list[str]) -> list[str]:
+    codes: list[str] = []
+    for group in groups:
+        for code in group:
+            normalized = str(code or "").strip()
+            if not normalized or normalized in codes:
+                continue
+            codes.append(normalized)
+    return codes
+
+
+def _coerce_price_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _coerce_inventory_quantity(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _variant_agent_push_projection(variant: Any) -> dict[str, Any]:
+    blocker_codes = set(
+        _dedupe_codes(
+            variant.blockers.get("discovery", []),
+            variant.blockers.get("checkout", []),
+        )
+    )
+    price_data = variant.price or {}
+    inventory_data = variant.inventory or {}
+    price_amount = _coerce_price_value(price_data.get("amount"))
+    currency = str(price_data.get("currency") or "").strip().upper() or None
+    availability = str(inventory_data.get("availability") or "").strip().lower()
+    inventory_quantity = _coerce_inventory_quantity(inventory_data.get("quantity"))
+
+    in_stock = availability not in {
+        "out_of_stock",
+        "outofstock",
+        "sold_out",
+        "soldout",
+        "unavailable",
+    }
+    if inventory_quantity is not None:
+        in_stock = in_stock and inventory_quantity > 0
+
+    reason_codes: list[str] = []
+    if "out_of_stock" in blocker_codes or not in_stock:
+        reason_codes.append("out_of_stock")
+    if "missing_price" in blocker_codes or price_amount is None:
+        reason_codes.append("missing_price")
+    if "missing_currency" in blocker_codes or currency is None:
+        reason_codes.append("missing_currency")
+
+    if reason_codes:
+        return {
+            "agent_push_status": "excluded_from_agent_push",
+            "agent_push_reason_codes": _dedupe_codes(reason_codes),
+        }
+    return {
+        "agent_push_status": "eligible_for_agent_push",
+        "agent_push_reason_codes": [],
+    }
+
+
+async def get_product_blocker_detail(
+    merchant_id: str,
+    *,
+    plan_id: str,
+    platform: str,
+    platform_product_id: str,
+    channel: str = "ucp",
+) -> dict[str, Any]:
+    payload, snapshot = await _latest_context_or_raise(
+        merchant_id,
+        channel=channel,
+        plan_id=plan_id,
+    )
+
+    snapshot_product = next(
+        (
+            product
+            for product in snapshot.products
+            if (product.platform or "unknown") == platform
+            and product.product_id == platform_product_id
+        ),
+        None,
+    )
+    if snapshot_product is None:
+        raise ActionNotFoundError(
+            f"Product not found in readiness snapshot: {platform}/{platform_product_id}"
+        )
+
+    queue_item = next(
+        (
+            item
+            for item in payload.product_queue
+            if item.platform == platform
+            and (item.platform_product_id or item.product_id) == platform_product_id
+        ),
+        None,
+    )
+    if queue_item is None:
+        raise ActionNotFoundError(
+            f"Product not found in optimization queue: {platform}/{platform_product_id}"
+        )
+
+    _, _, standard_product, _enrichment = await _load_product_target(
+        merchant_id,
+        {
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+        },
+    )
+
+    standard_variants_by_id: dict[str, Any] = {}
+    for variant in standard_product.variants or []:
+        variant_id = str(
+            getattr(variant, "variant_id", None) or getattr(variant, "id", "")
+        ).strip()
+        if variant_id:
+            standard_variants_by_id[variant_id] = variant
+
+    variants: list[ProductBlockerVariant] = []
+    for variant in snapshot_product.variants:
+        readiness_status = (
+            "ready" if variant.channel_coverage.get(channel) == "ready" else "blocked"
+        )
+        standard_variant = standard_variants_by_id.get(variant.variant_id)
+        push_projection = _variant_agent_push_projection(variant)
+
+        price_value = None
+        price_currency = None
+        inventory_quantity = None
+
+        if standard_variant is not None:
+            price_value = _coerce_price_value(getattr(standard_variant, "price", None))
+            price_currency = str(getattr(standard_product, "currency", None) or "").strip() or None
+            inventory_quantity = _coerce_inventory_quantity(
+                getattr(standard_variant, "inventory_quantity", None)
+            )
+
+        if price_value is None:
+            price_value = _coerce_price_value((variant.price or {}).get("amount"))
+        if not price_currency:
+            price_currency = str((variant.price or {}).get("currency") or "").strip() or None
+        if inventory_quantity is None:
+            inventory_quantity = _coerce_inventory_quantity(
+                (variant.inventory or {}).get("quantity")
+            )
+
+        variants.append(
+            ProductBlockerVariant(
+                variant_id=variant.variant_id,
+                title=str(
+                    getattr(standard_variant, "title", None)
+                    or variant.title
+                    or variant.variant_id
+                ),
+                sku=getattr(standard_variant, "sku", None) or variant.sku,
+                price_value=price_value,
+                price_currency=price_currency,
+                inventory_quantity=inventory_quantity,
+                readiness_status=readiness_status,
+                readiness_blocker_codes=_dedupe_codes(
+                    variant.blockers.get("discovery", []),
+                    variant.blockers.get("checkout", []),
+                ),
+                readiness_warning_codes=_dedupe_codes(
+                    variant.warnings.get("discovery", []),
+                    variant.warnings.get("checkout", []),
+                ),
+                agent_push_status=str(
+                    push_projection.get("agent_push_status")
+                    or "eligible_for_agent_push"
+                ),
+                agent_push_reason_codes=list(
+                    push_projection.get("agent_push_reason_codes") or []
+                ),
+            )
+        )
+
+    variants.sort(
+        key=lambda item: (
+            0 if item.readiness_status == "blocked" else 1,
+            0 if item.agent_push_status == "excluded_from_agent_push" else 1,
+            item.title.lower(),
+            item.variant_id,
+        )
+    )
+
+    detail = ProductBlockerDetail(
+        plan_id=payload.plan.plan_id,
+        snapshot_id=payload.plan.snapshot_id,
+        product=ProductBlockerSubject(
+            platform=platform,
+            platform_product_id=platform_product_id,
+            product_id=snapshot_product.product_id,
+            title=snapshot_product.title,
+        ),
+        summary=ProductBlockerCounts(
+            ready_variant_count=queue_item.ready_variant_count,
+            blocked_variant_count=queue_item.blocked_variant_count,
+            eligible_variant_count=queue_item.eligible_variant_count
+            or queue_item.ready_variant_count,
+            excluded_variant_count=queue_item.excluded_variant_count or 0,
+        ),
+        variants=variants,
+    )
+    return detail.model_dump()
+
+
 async def run_remediation_action(
     merchant_id: str,
     *,
@@ -381,7 +629,7 @@ async def run_remediation_action(
                 }
             )
 
-    after_payload = await build_readiness_optimization(
+    after_payload, _after_snapshot = await get_readiness_optimization_context(
         merchant_id,
         channel=channel,
         force_refresh=True,

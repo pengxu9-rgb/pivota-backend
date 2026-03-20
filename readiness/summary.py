@@ -52,7 +52,14 @@ _PLAN_TTL_HOURS = 6
 _OPTIMIZATION_CACHE_TTL_SECONDS = 60.0
 
 
-_OPTIMIZATION_CACHE: dict[str, tuple[float, MerchantReadinessOptimizationPayload]] = {}
+_OPTIMIZATION_CACHE: dict[
+    str,
+    tuple[
+        float,
+        MerchantReadinessOptimizationPayload,
+        Optional[MerchantReadinessSnapshot],
+    ],
+] = {}
 _OPTIMIZATION_CACHE_METRICS: dict[str, int] = {
     "hits": 0,
     "misses": 0,
@@ -146,6 +153,19 @@ _CODE_TO_BUCKET = {
     "merchant_not_assessed_for_readiness_alpha": "other",
     "readiness_assessment_disabled": "other",
     "readiness_summary_unavailable": "other",
+}
+
+_EXECUTABLE_PRODUCT_CONTENT_REASON_CODES = {
+    "missing_title",
+    "missing_description",
+}
+
+_CATALOG_REVIEW_REASON_CODES = {
+    "missing_primary_image",
+    "missing_price",
+    "missing_currency",
+    "out_of_stock",
+    "inventory_stale",
 }
 
 
@@ -401,7 +421,7 @@ def get_readiness_optimization_cache_metrics() -> dict[str, Any]:
     hit_rate = (_OPTIMIZATION_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
     now_mono = time.monotonic()
     entries = []
-    for key, (cached_at, payload) in sorted(_OPTIMIZATION_CACHE.items()):
+    for key, (cached_at, payload, _snapshot) in sorted(_OPTIMIZATION_CACHE.items()):
         merchant_id, cached_channel = key.split("|", 1)
         age_seconds = max(0.0, now_mono - cached_at)
         entries.append(
@@ -436,19 +456,31 @@ def _cached_optimization_payload(
     *,
     channel: str,
 ) -> Optional[MerchantReadinessOptimizationPayload]:
+    context = _cached_optimization_context(merchant_id, channel=channel)
+    if context is None:
+        return None
+    payload, _snapshot = context
+    return payload
+
+
+def _cached_optimization_context(
+    merchant_id: str,
+    *,
+    channel: str,
+) -> Optional[tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot]]]:
     cache_key = _optimization_cache_key(merchant_id, channel)
     entry = _OPTIMIZATION_CACHE.get(cache_key)
     if not entry:
         _OPTIMIZATION_CACHE_METRICS["misses"] += 1
         return None
-    cached_at, payload = entry
+    cached_at, payload, snapshot = entry
     if time.monotonic() - cached_at > _OPTIMIZATION_CACHE_TTL_SECONDS:
         _OPTIMIZATION_CACHE.pop(cache_key, None)
         _OPTIMIZATION_CACHE_METRICS["misses"] += 1
         _OPTIMIZATION_CACHE_METRICS["expired"] += 1
         return None
     _OPTIMIZATION_CACHE_METRICS["hits"] += 1
-    return payload.model_copy(deep=True)
+    return payload.model_copy(deep=True), snapshot.model_copy(deep=True) if snapshot is not None else None
 
 
 def _store_optimization_payload(
@@ -456,9 +488,14 @@ def _store_optimization_payload(
     *,
     channel: str,
     payload: MerchantReadinessOptimizationPayload,
+    snapshot: Optional[MerchantReadinessSnapshot] = None,
 ) -> MerchantReadinessOptimizationPayload:
     cache_key = _optimization_cache_key(merchant_id, channel)
-    _OPTIMIZATION_CACHE[cache_key] = (time.monotonic(), payload.model_copy(deep=True))
+    _OPTIMIZATION_CACHE[cache_key] = (
+        time.monotonic(),
+        payload.model_copy(deep=True),
+        snapshot.model_copy(deep=True) if snapshot is not None else None,
+    )
     _OPTIMIZATION_CACHE_METRICS["stores"] += 1
     return payload
 
@@ -517,6 +554,9 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
 
     primary_code = top_codes[0] if top_codes else ""
     primary_bucket = _BUCKET_DEFINITIONS[_bucket_code_for_reason(primary_code)] if primary_code else _BUCKET_DEFINITIONS["catalog_content"]
+    item_fix_surface = primary_bucket["fix_surface"]
+    if primary_code in _CATALOG_REVIEW_REASON_CODES:
+        item_fix_surface = "catalog_data"
     primary_action = None
     if primary_code == "missing_price":
         primary_action = "Fix missing prices for this product before enabling AI checkout."
@@ -538,17 +578,24 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
         impact = "checkout"
 
     affected_variant_count = sum(issue.affected_variant_count for issue in top_issues)
-    fixability = _fixability_for_surface(primary_bucket["fix_surface"])
+    fixability = _fixability_for_surface(item_fix_surface)
     priority_score = _product_priority_score(
         blocked_variant_count=blocked_variant_count,
         impact=impact,
-        fix_surface=primary_bucket["fix_surface"],
+        fix_surface=item_fix_surface,
         affected_variant_count=affected_variant_count,
     )
     priority_reason = _product_priority_reason(
         blocked_variant_count=blocked_variant_count,
         impact=impact,
     )
+
+    recommended_action_type = "review_catalog_data"
+    if (
+        item_fix_surface == "product_content"
+        and primary_code in _EXECUTABLE_PRODUCT_CONTENT_REASON_CODES
+    ):
+        recommended_action_type = "run_product_enrichment"
 
     return ProductReadinessQueueItem(
         queue_item_scope="product",
@@ -564,13 +611,13 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
         ready_variant_count=ready_variant_count,
         top_issues=top_issues,
         primary_action=primary_action,
-        fix_surface=primary_bucket["fix_surface"],
+        fix_surface=item_fix_surface,
         fixability=fixability,
         impact=impact,
         priority_score=priority_score,
         priority_reason=priority_reason,
         recommended_action_id=f"act_product:{product.platform or 'unknown'}:{product.product_id}",
-        recommended_action_type="run_product_enrichment" if primary_bucket["fix_surface"] == "product_content" else "review_catalog_data",
+        recommended_action_type=recommended_action_type,
     )
 
 
@@ -1233,22 +1280,44 @@ async def build_readiness_summary(
 async def build_readiness_optimization(
     merchant_id: str,
     *,
+    force_refresh: bool = False,
     channel: str = "ucp",
 ) -> MerchantReadinessOptimizationPayload:
-    cached_payload = _cached_optimization_payload(merchant_id, channel=channel)
-    if cached_payload is not None:
-        return cached_payload
+    payload, _snapshot = await get_readiness_optimization_context(
+        merchant_id,
+        channel=channel,
+        force_refresh=force_refresh,
+    )
+    return payload
+
+
+async def get_readiness_optimization_context(
+    merchant_id: str,
+    *,
+    force_refresh: bool = False,
+    channel: str = "ucp",
+) -> tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot]]:
+    if force_refresh:
+        invalidate_readiness_optimization_cache(merchant_id, channel=channel)
+        _OPTIMIZATION_CACHE_METRICS["refreshes"] += 1
+
+    cached_context = _cached_optimization_context(merchant_id, channel=channel)
+    if cached_context is not None:
+        return cached_context
 
     snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
     if fallback is not None or snapshot is None:
-        return _fallback_optimization_payload(
-            fallback
-            or _fallback_summary(
-                assessment_state="assessed",
-                blocker="readiness_summary_unavailable",
-                channel=channel,
-                merchant_alpha_mode="assessment_error",
-            )
+        return (
+            _fallback_optimization_payload(
+                fallback
+                or _fallback_summary(
+                    assessment_state="assessed",
+                    blocker="readiness_summary_unavailable",
+                    channel=channel,
+                    merchant_alpha_mode="assessment_error",
+                )
+            ),
+            None,
         )
 
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
@@ -1289,9 +1358,10 @@ async def build_readiness_optimization(
         can_apply_actions=summary.assessment_state == "assessed",
         last_successful_rescore_at=summary.generated_at,
     )
-    return _store_optimization_payload(
+    payload = _store_optimization_payload(
         merchant_id,
         channel=channel,
+        snapshot=snapshot,
         payload=MerchantReadinessOptimizationPayload(
             plan=plan,
             score_bundle=ScoreBundle(readiness_score=summary.score),
@@ -1304,3 +1374,4 @@ async def build_readiness_optimization(
             last_generated_at=summary.generated_at,
         ),
     )
+    return payload, snapshot

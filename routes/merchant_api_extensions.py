@@ -29,6 +29,7 @@ from readiness.remediation import (
     JobNotFoundError,
     PlanSupersededError,
     get_execution_job,
+    get_product_blocker_detail,
     preview_remediation_action,
     run_remediation_action,
 )
@@ -876,6 +877,61 @@ async def run_readiness_action(
     except Exception as e:
         logger.error(f"❌ Readiness action run error for merchant {merchant_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Readiness action run failed: {str(e)}")
+
+
+@router.get("/merchant/readiness/optimization/products/{platform}/{platform_product_id}/blockers")
+async def get_readiness_product_blockers(
+    platform: str,
+    platform_product_id: str,
+    plan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return merchant-safe blocker and exclusion detail for one selected product."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        detail = await get_product_blocker_detail(
+            merchant_id,
+            plan_id=plan_id,
+            platform=platform,
+            platform_product_id=platform_product_id,
+        )
+        return {
+            "status": "success",
+            "data": detail,
+        }
+    except PlanSupersededError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
+                "current_plan_id": exc.current_plan_id,
+                "current_snapshot_id": exc.current_snapshot_id,
+            },
+        )
+    except ActionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "OPTIMIZATION_PRODUCT_BLOCKERS_NOT_FOUND",
+                "message": str(exc),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Readiness blocker detail error for merchant %s product %s/%s: %s",
+            merchant_id,
+            platform,
+            platform_product_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness blocker detail failed: {str(e)}",
+        )
 
 
 @router.get("/merchant/readiness/jobs/{job_id}")

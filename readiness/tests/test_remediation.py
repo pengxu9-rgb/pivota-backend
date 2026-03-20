@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from readiness.models import MerchantReadinessOptimizationPayload
+from readiness.models import (
+    CapabilityStatus,
+    ChannelCoverageStatus,
+    MerchantReadinessOptimizationPayload,
+    MerchantReadinessSnapshot,
+    ReadyProduct,
+    ReadyVariant,
+)
 from readiness.remediation import (
     ActionNotExecutableError,
     PlanSupersededError,
+    get_product_blocker_detail,
     preview_remediation_action,
     run_remediation_action,
 )
@@ -88,20 +96,91 @@ def _optimization_payload(*, plan_id: str, snapshot_id: str, score: int) -> Merc
     )
 
 
+def _snapshot() -> MerchantReadinessSnapshot:
+    return MerchantReadinessSnapshot(
+        merchant_id="merch_efbc46b4619cfbdf",
+        merchant_name="Alpha Merchant",
+        channel="ucp",
+        generated_at="2026-03-19T00:00:00Z",
+        merchant_alpha_mode="real_merchant_alpha",
+        readiness_score=77,
+        domain_scores={},
+        capability_status={
+            "checkout_execution": "ready",
+            "order_writeback_state_sync": "ready",
+        },
+        blockers=[],
+        warnings=[],
+        merchant_capabilities=[],
+        channel_coverage=[
+            ChannelCoverageStatus(
+                channel="ucp",
+                status="partial",
+                ready_variant_count=1,
+                blocked_variant_count=1,
+            )
+        ],
+        source_of_truth={},
+        stubbed_capabilities=[],
+        audit_notes=[],
+        products=[
+            ReadyProduct(
+                product_id="prod_1",
+                platform="shopify",
+                title="Alpha Product",
+                default_image_url="https://example.com/product.jpg",
+                variants=[
+                    ReadyVariant(
+                        variant_id="var_1",
+                        title="Blue / Small",
+                        sku="ALPHA-BL-S",
+                        price={"amount": None, "currency": "USD"},
+                        inventory={"quantity": 0, "availability": "out_of_stock"},
+                        freshness={},
+                        provenance=[],
+                        source_of_truth={},
+                        blockers={"discovery": [], "checkout": ["missing_price", "out_of_stock"]},
+                        warnings={"discovery": [], "checkout": []},
+                        discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                        checkout=CapabilityStatus(
+                            capability="checkout",
+                            status="blocked",
+                            score=20,
+                            blockers=["missing_price", "out_of_stock"],
+                        ),
+                        channel_coverage={"ucp": "blocked"},
+                    ),
+                    ReadyVariant(
+                        variant_id="var_2",
+                        title="Green / Medium",
+                        sku="ALPHA-GR-M",
+                        price={"amount": 24.0, "currency": "USD"},
+                        inventory={"quantity": 5, "availability": "in_stock"},
+                        freshness={},
+                        provenance=[],
+                        source_of_truth={},
+                        blockers={"discovery": [], "checkout": []},
+                        warnings={"discovery": [], "checkout": ["inventory_stale"]},
+                        discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                        checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                        channel_coverage={"ucp": "ready"},
+                    ),
+                ],
+            )
+        ],
+    )
+
+
 @pytest.mark.asyncio
 async def test_preview_remediation_action_returns_candidate_patches(monkeypatch):
     from readiness import remediation
 
     payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
+    snapshot = _snapshot()
 
-    async def fake_build_readiness_optimization(
-        _merchant_id: str,
-        *,
-        channel: str = "ucp",
-        force_refresh: bool = False,
-    ):
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
         assert channel == "ucp"
-        return payload
+        return payload, snapshot
 
     async def fake_get_product_cache_row(**_kwargs):
         return {
@@ -127,7 +206,11 @@ async def test_preview_remediation_action_returns_candidate_patches(monkeypatch)
     async def fake_get_enrichment(**_kwargs):
         return {}
 
-    monkeypatch.setattr(remediation, "build_readiness_optimization", fake_build_readiness_optimization)
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
     monkeypatch.setattr(remediation, "get_product_cache_row", fake_get_product_cache_row)
     monkeypatch.setattr(remediation, "get_enrichment", fake_get_enrichment)
 
@@ -149,15 +232,14 @@ async def test_preview_remediation_action_rejects_superseded_plan(monkeypatch):
 
     payload = _optimization_payload(plan_id="rdplan_latest", snapshot_id="rdsnap_latest", score=77)
 
-    async def fake_build_readiness_optimization(
-        _merchant_id: str,
-        *,
-        channel: str = "ucp",
-        force_refresh: bool = False,
-    ):
-        return payload
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        return payload, _snapshot()
 
-    monkeypatch.setattr(remediation, "build_readiness_optimization", fake_build_readiness_optimization)
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
 
     with pytest.raises(PlanSupersededError):
         await preview_remediation_action(
@@ -179,7 +261,7 @@ async def test_run_remediation_action_executes_pipeline_and_returns_verification
 
     call_count = {"count": 0}
 
-    async def fake_build_readiness_optimization(
+    async def fake_get_readiness_optimization_context(
         _merchant_id: str,
         *,
         channel: str = "ucp",
@@ -188,14 +270,22 @@ async def test_run_remediation_action_executes_pipeline_and_returns_verification
         call_count["count"] += 1
         if call_count["count"] == 2:
             assert force_refresh is True
-        return before_payload if call_count["count"] == 1 else after_payload
+        return (
+            (before_payload, _snapshot())
+            if call_count["count"] == 1
+            else (after_payload, _snapshot())
+        )
 
     async def fake_run_enrichment_for_product(**kwargs):
         assert kwargs["platform"] == "shopify"
         assert kwargs["platform_product_id"] == "prod_1"
         return {"status": "ok"}
 
-    monkeypatch.setattr(remediation, "build_readiness_optimization", fake_build_readiness_optimization)
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
     monkeypatch.setattr(remediation, "run_enrichment_for_product", fake_run_enrichment_for_product)
 
     result = await run_remediation_action(
@@ -243,15 +333,14 @@ async def test_run_remediation_action_rejects_non_executable_action(monkeypatch)
         }
     )
 
-    async def fake_build_readiness_optimization(
-        _merchant_id: str,
-        *,
-        channel: str = "ucp",
-        force_refresh: bool = False,
-    ):
-        return payload
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        return payload, _snapshot()
 
-    monkeypatch.setattr(remediation, "build_readiness_optimization", fake_build_readiness_optimization)
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
 
     with pytest.raises(ActionNotExecutableError):
         await run_remediation_action(
@@ -259,3 +348,86 @@ async def test_run_remediation_action_rejects_non_executable_action(monkeypatch)
             plan_id="rdplan_current",
             action_id="act_review_integrations",
         )
+
+
+@pytest.mark.asyncio
+async def test_get_product_blocker_detail_returns_variant_cross_reference(monkeypatch):
+    from readiness import remediation
+
+    payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
+    payload.product_queue[0].eligible_variant_count = 1
+    payload.product_queue[0].excluded_variant_count = 1
+    payload.product_queue[0].agent_push_status = "excluded_from_agent_push"
+    payload.product_queue[0].agent_push_reason_codes = ["missing_price"]
+
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        assert channel == "ucp"
+        return payload, _snapshot()
+
+    async def fake_get_product_cache_row(**_kwargs):
+        return {
+            "product_data": {
+                "id": "prod_1",
+                "platform": "shopify",
+                "merchant_id": "merch_efbc46b4619cfbdf",
+                "title": "Alpha Product",
+                "description": "Alpha product description",
+                "vendor": "Alpha Brand",
+                "product_type": "Serum",
+                "tags": ["hydrating"],
+                "price": 24.0,
+                "currency": "USD",
+                "inventory_quantity": 5,
+                "image_url": "https://example.com/product.jpg",
+                "images": ["https://example.com/product.jpg"],
+                "variants": [
+                    {
+                        "id": "var_1",
+                        "variant_id": "var_1",
+                        "title": "Blue / Small",
+                        "sku": "ALPHA-BL-S",
+                        "price": 0.0,
+                        "inventory_quantity": 0,
+                    },
+                    {
+                        "id": "var_2",
+                        "variant_id": "var_2",
+                        "title": "Green / Medium",
+                        "sku": "ALPHA-GR-M",
+                        "price": 24.0,
+                        "inventory_quantity": 5,
+                    },
+                ],
+                "orderable": True,
+            }
+        }
+
+    async def fake_get_enrichment(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
+    monkeypatch.setattr(remediation, "get_product_cache_row", fake_get_product_cache_row)
+    monkeypatch.setattr(remediation, "get_enrichment", fake_get_enrichment)
+
+    detail = await get_product_blocker_detail(
+        "merch_efbc46b4619cfbdf",
+        plan_id="rdplan_current",
+        platform="shopify",
+        platform_product_id="prod_1",
+    )
+
+    assert detail["product"]["platform"] == "shopify"
+    assert detail["summary"]["blocked_variant_count"] == 1
+    assert detail["summary"]["excluded_variant_count"] == 1
+    assert len(detail["variants"]) == 2
+    first_variant = detail["variants"][0]
+    assert first_variant["variant_id"] == "var_1"
+    assert first_variant["sku"] == "ALPHA-BL-S"
+    assert first_variant["inventory_quantity"] == 0
+    assert first_variant["readiness_status"] == "blocked"
+    assert "missing_price" in first_variant["readiness_blocker_codes"]
+    assert first_variant["agent_push_status"] == "excluded_from_agent_push"

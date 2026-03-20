@@ -573,6 +573,79 @@ def test_merchant_readiness_action_run_and_job_routes(monkeypatch):
     assert job_response.json()["data"]["status"] == "completed"
 
 
+def test_merchant_readiness_product_blockers_route_returns_variant_detail(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_get_product_blocker_detail(
+        _merchant_id: str,
+        *,
+        plan_id: str,
+        platform: str,
+        platform_product_id: str,
+    ):
+        assert plan_id == "rdplan_test"
+        assert platform == "shopify"
+        assert platform_product_id == "prod_1"
+        return {
+            "plan_id": "rdplan_test",
+            "snapshot_id": "rdsnap_test",
+            "product": {
+                "platform": "shopify",
+                "platform_product_id": "prod_1",
+                "product_id": "prod_1",
+                "title": "Alpha Product",
+            },
+            "summary": {
+                "ready_variant_count": 1,
+                "blocked_variant_count": 1,
+                "eligible_variant_count": 1,
+                "excluded_variant_count": 1,
+            },
+            "variants": [
+                {
+                    "variant_id": "var_1",
+                    "title": "Default",
+                    "sku": "SKU-1",
+                    "price_value": None,
+                    "price_currency": "USD",
+                    "inventory_quantity": 0,
+                    "readiness_status": "blocked",
+                    "readiness_blocker_codes": ["missing_price"],
+                    "readiness_warning_codes": [],
+                    "agent_push_status": "excluded_from_agent_push",
+                    "agent_push_reason_codes": ["missing_price"],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "get_product_blocker_detail", fake_get_product_blocker_detail)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.get(
+        "/merchant/readiness/optimization/products/shopify/prod_1/blockers",
+        params={"plan_id": "rdplan_test"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["product"]["platform_product_id"] == "prod_1"
+    assert body["data"]["variants"][0]["variant_id"] == "var_1"
+    assert body["data"]["variants"][0]["agent_push_status"] == "excluded_from_agent_push"
+
+
 def test_checkout_blocked_when_capability_missing(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=False)
 

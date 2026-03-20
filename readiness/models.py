@@ -256,6 +256,42 @@ class AgentPushSummary(BaseModel):
     last_checked_at: Optional[str] = None
 
 
+class ProductBlockerSubject(BaseModel):
+    platform: str
+    platform_product_id: str
+    product_id: str
+    title: str
+
+
+class ProductBlockerCounts(BaseModel):
+    ready_variant_count: int = 0
+    blocked_variant_count: int = 0
+    eligible_variant_count: int = 0
+    excluded_variant_count: int = 0
+
+
+class ProductBlockerVariant(BaseModel):
+    variant_id: str
+    title: str
+    sku: Optional[str] = None
+    price_value: Optional[float] = None
+    price_currency: Optional[str] = None
+    inventory_quantity: Optional[int] = None
+    readiness_status: str = "ready"
+    readiness_blocker_codes: List[str] = Field(default_factory=list)
+    readiness_warning_codes: List[str] = Field(default_factory=list)
+    agent_push_status: str = "eligible_for_agent_push"
+    agent_push_reason_codes: List[str] = Field(default_factory=list)
+
+
+class ProductBlockerDetail(BaseModel):
+    plan_id: str
+    snapshot_id: str
+    product: ProductBlockerSubject
+    summary: ProductBlockerCounts
+    variants: List[ProductBlockerVariant] = Field(default_factory=list)
+
+
 class MerchantReadinessOptimizationPayload(BaseModel):
     plan: OptimizationPlan
     score_bundle: ScoreBundle = Field(default_factory=ScoreBundle)
