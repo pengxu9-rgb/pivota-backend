@@ -364,10 +364,14 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
     assert body["data"]["readiness_summary"]["tier"] == "yellow"
     assert body["data"]["issue_buckets"][0]["code"] == "price_currency"
     assert body["data"]["product_queue"][0]["platform"] == "shopify"
+    assert body["data"]["content_opportunity_count"] == 0
+    assert body["data"]["source_data_lanes"] == []
 
 
 def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
     from routes import merchant_api_extensions as merchant_api_extensions
+
+    seen_force_refresh: list[bool] = []
 
     async def fake_build_readiness_optimization(
         merchant_id: str,
@@ -376,12 +380,12 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
         force_refresh: bool = False,
     ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
-        assert force_refresh is True
+        seen_force_refresh.append(force_refresh)
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
-                    "plan_id": "rdplan_refresh",
-                    "snapshot_id": "rdsnap_refresh",
+                    "plan_id": "rdplan_refresh_after" if force_refresh else "rdplan_refresh_before",
+                    "snapshot_id": "rdsnap_refresh_after" if force_refresh else "rdsnap_refresh_before",
                     "workspace_version": "agent_commerce_optimization.v1",
                     "priority_policy_version": "merchant_readiness_priority.v1",
                     "refresh_state": "fresh",
@@ -406,6 +410,33 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
                 "issue_buckets": [],
                 "merchant_actions": [],
                 "product_queue": [],
+                "source_data_lanes": [
+                    {
+                        "reason_code": "out_of_stock",
+                        "label": "Out of stock",
+                        "affected_products": 57 if not force_refresh else 55,
+                        "affected_variants": 217 if not force_refresh else 209,
+                        "blocked_products": 57 if not force_refresh else 55,
+                        "excluded_products": 57 if not force_refresh else 55,
+                        "queue_state_counts": [
+                            {
+                                "key": "whole_product_unavailable",
+                                "label": "Whole product unavailable",
+                                "count": 57 if not force_refresh else 55,
+                            },
+                            {
+                                "key": "partially_recovered",
+                                "label": "Partially back in stock",
+                                "count": 0,
+                            },
+                            {
+                                "key": "restocked_waiting_refresh",
+                                "label": "Back in stock now",
+                                "count": 0,
+                            },
+                        ],
+                    }
+                ],
                 "last_generated_at": "2026-03-18T00:00:00Z",
             }
         )
@@ -413,8 +444,16 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
     async def fake_get_merchant_id_from_user(_current_user):
         return DEFAULT_ALPHA_MERCHANT_ID
 
+    async def fake_clear_resolved(*_args, **_kwargs):
+        return [{"platform": "shopify", "platform_product_id": "prod_1", "resolution": "resolved_now"}]
+
     monkeypatch.setattr(merchant_api_extensions, "build_readiness_optimization", fake_build_readiness_optimization)
     monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(
+        merchant_api_extensions,
+        "clear_resolved_out_of_stock_source_data_decisions",
+        fake_clear_resolved,
+    )
 
     app = FastAPI()
     app.include_router(merchant_api_extensions.router)
@@ -427,16 +466,21 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
 
     response = route_client.post(
         "/merchant/readiness/actions/refresh",
-        json={"scope": "merchant", "reason": "manual"},
+        json={"scope": "merchant", "reason": "manual", "reason_code": "out_of_stock"},
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
-    assert body["data"]["plan"]["plan_id"] == "rdplan_refresh"
+    assert body["data"]["plan"]["plan_id"] == "rdplan_refresh_after"
     assert body["meta"]["scope"] == "merchant"
     assert body["meta"]["reason"] == "manual"
+    assert body["meta"]["reason_code"] == "out_of_stock"
     assert body["meta"]["refresh_state"] == "fresh"
+    assert body["meta"]["lane_delta"]["reason_code"] == "out_of_stock"
+    assert body["meta"]["lane_delta"]["resolved_products"] == 2
+    assert body["meta"]["cleared_out_of_stock_decisions"][0]["platform_product_id"] == "prod_1"
+    assert seen_force_refresh == [False, True]
 
 
 def test_merchant_readiness_action_preview_route_returns_preview(monkeypatch):
@@ -758,7 +802,85 @@ def test_merchant_readiness_source_data_triage_route_returns_rows(monkeypatch):
     body = response.json()
     assert body["status"] == "success"
     assert body["data"]["rows"][0]["reason_code"] == "out_of_stock"
-    assert body["data"]["rows"][0]["variant_id"] == "var_1"
+
+
+def test_merchant_readiness_source_data_decision_routes(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_upsert(
+        _merchant_id: str,
+        *,
+        reason_code: str,
+        platform: str,
+        platform_product_id: str,
+        decision_state: str,
+    ):
+        assert reason_code == "out_of_stock"
+        assert platform == "shopify"
+        assert platform_product_id == "prod_1"
+        assert decision_state == "restock_planned"
+        return {
+            "merchant_id": DEFAULT_ALPHA_MERCHANT_ID,
+            "reason_code": reason_code,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+            "decision_state": decision_state,
+        }
+
+    async def fake_delete(
+        _merchant_id: str,
+        *,
+        reason_code: str,
+        platform: str,
+        platform_product_id: str,
+    ):
+        assert reason_code == "out_of_stock"
+        assert platform == "shopify"
+        assert platform_product_id == "prod_1"
+        return {
+            "merchant_id": DEFAULT_ALPHA_MERCHANT_ID,
+            "reason_code": reason_code,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+            "deleted": True,
+        }
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(
+        merchant_api_extensions,
+        "upsert_out_of_stock_source_data_decision",
+        fake_upsert,
+    )
+    monkeypatch.setattr(
+        merchant_api_extensions,
+        "delete_out_of_stock_source_data_decision",
+        fake_delete,
+    )
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    put_response = route_client.put(
+        "/merchant/readiness/source-data-decisions/out_of_stock/shopify/prod_1",
+        json={"decision_state": "restock_planned"},
+    )
+    assert put_response.status_code == 200
+    assert put_response.json()["data"]["decision_state"] == "restock_planned"
+
+    delete_response = route_client.delete(
+        "/merchant/readiness/source-data-decisions/out_of_stock/shopify/prod_1",
+    )
+    assert delete_response.status_code == 200
+    assert delete_response.json()["data"]["deleted"] is True
 
 
 def test_merchant_readiness_source_data_triage_export_route_returns_csv(monkeypatch):

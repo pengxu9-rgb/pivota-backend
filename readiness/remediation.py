@@ -6,6 +6,11 @@ from typing import Any, Optional
 
 from db.product_enrichment import get_enrichment
 from db.products import get_product_cache_row
+from db.readiness_source_data_decisions import (
+    delete_source_data_decision,
+    list_source_data_decisions,
+    upsert_source_data_decision,
+)
 from models.standard_product import StandardProduct
 from readiness.models import (
     ExecutionJob,
@@ -68,6 +73,11 @@ _SOURCE_DATA_TRIAGE_REASON_DEFS: dict[str, dict[str, str]] = {
         "label": "Missing primary image",
         "scope": "product",
     },
+}
+_OUT_OF_STOCK_DECISION_STATES = {
+    "restock_planned",
+    "archive_planned",
+    "manual_review",
 }
 
 
@@ -592,6 +602,209 @@ def _product_matches_source_data_reason(reason_code: str, *, queue_item: Any) ->
     return has_issue, affected_variants
 
 
+def _current_product_data_from_cache_row(cache_row: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not cache_row:
+        return {}
+    payload = cache_row.get("product_data") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _current_variant_lookup(current_product: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for variant in current_product.get("variants") or []:
+        variant_id = str(variant.get("variant_id") or variant.get("id") or "").strip()
+        if not variant_id or variant_id in lookup:
+            continue
+        lookup[variant_id] = variant
+    return lookup
+
+
+def _current_variant_inventory(variant: Optional[dict[str, Any]]) -> Optional[int]:
+    if not variant:
+        return None
+    return _coerce_inventory_quantity(
+        variant.get("inventory_quantity", variant.get("stock", variant.get("inventory")))
+    )
+
+
+def _current_out_of_stock_batch_state(
+    rows: list[SourceDataTriageRow],
+    current_product: dict[str, Any],
+) -> str:
+    if not rows:
+        return "unknown"
+
+    variant_lookup = _current_variant_lookup(current_product)
+    pending = 0
+    resolved = 0
+    for row in rows:
+        current_variant = variant_lookup.get(str(row.variant_id or "").strip())
+        inventory_quantity = _current_variant_inventory(current_variant)
+        if inventory_quantity is not None and inventory_quantity > 0:
+            resolved += 1
+        else:
+            pending += 1
+
+    if pending <= 0:
+        return "restocked_waiting_refresh"
+    if resolved > 0:
+        return "partially_recovered"
+    return "whole_product_unavailable"
+
+
+async def upsert_out_of_stock_source_data_decision(
+    merchant_id: str,
+    *,
+    reason_code: str,
+    platform: str,
+    platform_product_id: str,
+    decision_state: str,
+) -> dict[str, Any]:
+    normalized_reason_code = _normalize_source_data_reason_code(reason_code)
+    if normalized_reason_code != "out_of_stock":
+        raise ActionNotExecutableError(
+            "Persistent merchant decision tracking is only supported for out_of_stock in v1."
+        )
+
+    normalized_state = str(decision_state or "").strip().lower()
+    if normalized_state not in _OUT_OF_STOCK_DECISION_STATES:
+        supported_states = ", ".join(sorted(_OUT_OF_STOCK_DECISION_STATES))
+        raise ActionNotFoundError(
+            f"Unsupported source-data decision state: {decision_state}. "
+            f"Expected one of: {supported_states}"
+        )
+
+    row = await upsert_source_data_decision(
+        merchant_id,
+        reason_code=normalized_reason_code,
+        platform=platform,
+        platform_product_id=platform_product_id,
+        decision_state=normalized_state,
+    )
+    return {
+        "merchant_id": merchant_id,
+        "reason_code": normalized_reason_code,
+        "platform": str(row.get("platform") or platform).strip().lower(),
+        "platform_product_id": str(
+            row.get("platform_product_id") or platform_product_id
+        ).strip(),
+        "decision_state": str(row.get("decision_state") or normalized_state).strip(),
+        "updated_at": row.get("updated_at"),
+        "created_at": row.get("created_at"),
+    }
+
+
+async def delete_out_of_stock_source_data_decision(
+    merchant_id: str,
+    *,
+    reason_code: str,
+    platform: str,
+    platform_product_id: str,
+) -> dict[str, Any]:
+    normalized_reason_code = _normalize_source_data_reason_code(reason_code)
+    if normalized_reason_code != "out_of_stock":
+        raise ActionNotExecutableError(
+            "Persistent merchant decision tracking is only supported for out_of_stock in v1."
+        )
+
+    deleted = await delete_source_data_decision(
+        merchant_id,
+        reason_code=normalized_reason_code,
+        platform=platform,
+        platform_product_id=platform_product_id,
+    )
+    return {
+        "merchant_id": merchant_id,
+        "reason_code": normalized_reason_code,
+        "platform": str(platform or "").strip().lower(),
+        "platform_product_id": str(platform_product_id or "").strip(),
+        "deleted": bool(deleted),
+    }
+
+
+async def clear_resolved_out_of_stock_source_data_decisions(
+    merchant_id: str,
+    *,
+    plan_id: str,
+    channel: str = "ucp",
+) -> list[dict[str, Any]]:
+    decision_rows_by_key = await list_source_data_decisions(
+        merchant_id,
+        reason_code="out_of_stock",
+    )
+    if not decision_rows_by_key:
+        return []
+
+    triage_payload = SourceDataTriagePayload.model_validate(
+        await get_source_data_triage(
+            merchant_id,
+            plan_id=plan_id,
+            reason_code="out_of_stock",
+            limit=5000,
+            channel=channel,
+        )
+    )
+    triage_rows_by_key: dict[str, list[SourceDataTriageRow]] = {}
+    for row in triage_payload.rows:
+        row_key = _queue_product_key(
+            row.platform,
+            row.platform_product_id or row.product_id,
+            row.product_id,
+        )
+        triage_rows_by_key.setdefault(row_key, []).append(row)
+
+    cleared: list[dict[str, Any]] = []
+    for decision_key, row in decision_rows_by_key.items():
+        platform = str(row.get("platform") or "").strip().lower()
+        platform_product_id = str(row.get("platform_product_id") or "").strip()
+        matching_rows = triage_rows_by_key.get(decision_key) or []
+
+        if not matching_rows:
+            await delete_source_data_decision(
+                merchant_id,
+                reason_code="out_of_stock",
+                platform=platform,
+                platform_product_id=platform_product_id,
+            )
+            cleared.append(
+                {
+                    "platform": platform,
+                    "platform_product_id": platform_product_id,
+                    "decision_state": str(row.get("decision_state") or "").strip() or None,
+                    "resolution": "resolved_removed_from_queue",
+                }
+            )
+            continue
+
+        cache_row = await get_product_cache_row(
+            merchant_id=merchant_id,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            include_expired=False,
+        )
+        current_product = _current_product_data_from_cache_row(cache_row)
+        batch_state = _current_out_of_stock_batch_state(matching_rows, current_product)
+        if batch_state != "restocked_waiting_refresh":
+            continue
+
+        await delete_source_data_decision(
+            merchant_id,
+            reason_code="out_of_stock",
+            platform=platform,
+            platform_product_id=platform_product_id,
+        )
+        cleared.append(
+            {
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+                "decision_state": str(row.get("decision_state") or "").strip() or None,
+                "resolution": "resolved_now",
+            }
+        )
+
+    return cleared
+
+
 async def get_source_data_triage(
     merchant_id: str,
     *,
@@ -625,6 +838,10 @@ async def get_source_data_triage(
     summary_variant_counts: dict[str, int] = {
         code: 0 for code in _SOURCE_DATA_TRIAGE_REASON_DEFS
     }
+    decision_rows_by_key = await list_source_data_decisions(
+        merchant_id,
+        reason_code="out_of_stock",
+    )
 
     row_records: list[tuple[tuple[Any, ...], SourceDataTriageRow]] = []
 
@@ -643,6 +860,10 @@ async def get_source_data_triage(
         product_id = queue_item.product_id
         product_title = queue_item.title or snapshot_product.title
         sort_index = queue_index_by_key.get(product_key, 10**9)
+        decision_key = _queue_product_key(platform, platform_product_id, product_id)
+        persisted_decision_state = str(
+            (decision_rows_by_key.get(decision_key) or {}).get("decision_state") or ""
+        ).strip() or None
 
         image_match, image_affected_variants = _product_matches_source_data_reason(
             "missing_primary_image",
@@ -676,6 +897,7 @@ async def get_source_data_triage(
                             agent_push_reason_codes=list(queue_item.agent_push_reason_codes or []),
                             recommended_action_type=queue_item.recommended_action_type,
                             fix_surface=queue_item.fix_surface,
+                            decision_state=None,
                         ),
                     )
                 )
@@ -742,6 +964,11 @@ async def get_source_data_triage(
                             agent_push_reason_codes=agent_push_reason_codes,
                             recommended_action_type=queue_item.recommended_action_type,
                             fix_surface=queue_item.fix_surface,
+                            decision_state=(
+                                persisted_decision_state
+                                if candidate_reason_code == "out_of_stock"
+                                else None
+                            ),
                         ),
                     )
                 )

@@ -19,8 +19,17 @@ from readiness.summary import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_optimization_cache():
+def _reset_optimization_cache(monkeypatch):
     reset_readiness_optimization_cache_observability()
+
+    async def _no_decisions(*_args, **_kwargs):
+        return {}
+
+    async def _no_cache_rows(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr("readiness.summary.list_source_data_decisions", _no_decisions)
+    monkeypatch.setattr("readiness.summary._load_cache_rows_for_product_keys", _no_cache_rows)
 
 
 def _snapshot(
@@ -216,6 +225,18 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
     assert payload.product_queue[0].priority_score > 0
     assert payload.product_queue[0].top_issues
     assert payload.merchant_actions
+    assert payload.content_opportunity_count == 0
+    assert {lane.reason_code for lane in payload.source_data_lanes} == {
+        "missing_price",
+        "out_of_stock",
+        "missing_primary_image",
+    }
+    lanes_by_code = {lane.reason_code: lane for lane in payload.source_data_lanes}
+    assert lanes_by_code["missing_price"].affected_products == 1
+    assert lanes_by_code["missing_price"].affected_variants == 1
+    assert lanes_by_code["out_of_stock"].affected_products == 1
+    assert lanes_by_code["out_of_stock"].affected_variants == 1
+    assert lanes_by_code["missing_primary_image"].affected_products == 0
     assert payload.agent_push_summary.eligible_products == 1
     assert payload.agent_push_summary.excluded_variants == 1
 
@@ -403,3 +424,87 @@ async def test_build_readiness_optimization_projects_quality_coverage(monkeypatc
     assert payload.quality_coverage.effective_scored_products == 1
     assert payload.quality_coverage.preview_only_products == 1
     assert payload.quality_coverage.coverage_state == "full"
+
+
+@pytest.mark.asyncio
+async def test_build_readiness_optimization_filters_content_only_queue_items(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=77,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="partial",
+                    ready_variant_count=1,
+                    blocked_variant_count=1,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_blocked",
+                    platform="shopify",
+                    title="Blocked Product",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_blocked",
+                            title="Default",
+                            price={"amount": 10, "currency": "USD"},
+                            inventory={"quantity": 0, "availability": "out_of_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": ["out_of_stock"]},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="blocked", score=25),
+                            channel_coverage={"ucp": "blocked"},
+                        )
+                    ],
+                ),
+                ReadyProduct(
+                    product_id="prod_content_only",
+                    platform="shopify",
+                    title="Content Opportunity",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_ready",
+                            title="Default",
+                            price={"amount": 10, "currency": "USD"},
+                            inventory={"quantity": 5, "availability": "in_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": []},
+                            warnings={"discovery": ["missing_description"], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                            channel_coverage={"ucp": "ready"},
+                        )
+                    ],
+                ),
+            ],
+        )
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+
+    payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+
+    assert [item.product_id for item in payload.product_queue] == ["prod_blocked"]
+    assert payload.content_opportunity_count == 1

@@ -31,13 +31,20 @@ from readiness.remediation import (
     ActionNotFoundError,
     JobNotFoundError,
     PlanSupersededError,
+    clear_resolved_out_of_stock_source_data_decisions,
+    delete_out_of_stock_source_data_decision,
     get_execution_job,
     get_product_blocker_detail,
     get_source_data_triage,
     preview_remediation_action,
     run_remediation_action,
+    upsert_out_of_stock_source_data_decision,
 )
-from readiness.summary import build_readiness_optimization, build_readiness_summary
+from readiness.summary import (
+    build_lane_delta,
+    build_readiness_optimization,
+    build_readiness_summary,
+)
 
 router = APIRouter()
 
@@ -52,6 +59,11 @@ class RefundRequest(BaseModel):
 class ReadinessRefreshRequest(BaseModel):
     scope: str = "merchant"
     reason: str = "manual"
+    reason_code: Optional[str] = None
+
+
+class SourceDataDecisionRequest(BaseModel):
+    decision_state: str
 
 
 class ReadinessActionPreviewRequest(BaseModel):
@@ -775,16 +787,37 @@ async def refresh_readiness_optimization(
     merchant_id = await get_merchant_id_from_user(current_user)
 
     try:
+        before_payload = await build_readiness_optimization(merchant_id, force_refresh=False)
         payload = await build_readiness_optimization(merchant_id, force_refresh=True)
+        lane_delta = (
+            build_lane_delta(
+                reason_code=body.reason_code,
+                before_payload=before_payload,
+                after_payload=payload,
+            )
+            if body.reason_code
+            else None
+        )
+        cleared_decisions = (
+            await clear_resolved_out_of_stock_source_data_decisions(
+                merchant_id,
+                plan_id=payload.plan.plan_id,
+            )
+            if body.reason_code in (None, "out_of_stock")
+            else []
+        )
         return {
             "status": "success",
             "data": payload.model_dump(),
             "meta": {
                 "scope": body.scope,
                 "reason": body.reason,
+                "reason_code": body.reason_code,
                 "refresh_state": payload.plan.refresh_state,
                 "plan_id": payload.plan.plan_id,
                 "snapshot_id": payload.plan.snapshot_id,
+                "lane_delta": lane_delta.model_dump() if lane_delta else None,
+                "cleared_out_of_stock_decisions": cleared_decisions,
             },
         }
     except Exception as e:
@@ -883,6 +916,118 @@ async def run_readiness_action(
     except Exception as e:
         logger.error(f"❌ Readiness action run error for merchant {merchant_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Readiness action run failed: {str(e)}")
+
+
+@router.put("/merchant/readiness/source-data-decisions/{reason_code}/{platform}/{platform_product_id}")
+async def put_readiness_source_data_decision(
+    reason_code: str,
+    platform: str,
+    platform_product_id: str,
+    body: SourceDataDecisionRequest = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist a merchant advisory decision for a source-data queue item."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        decision = await upsert_out_of_stock_source_data_decision(
+            merchant_id,
+            reason_code=reason_code,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            decision_state=body.decision_state,
+        )
+        return {
+            "status": "success",
+            "data": decision,
+        }
+    except ActionNotExecutableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_NOT_SUPPORTED",
+                "message": str(exc),
+            },
+        )
+    except ActionNotFoundError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_INVALID",
+                "message": str(exc),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Readiness source-data decision upsert error for merchant %s %s/%s (%s): %s",
+            merchant_id,
+            platform,
+            platform_product_id,
+            reason_code,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness source-data decision upsert failed: {str(e)}",
+        )
+
+
+@router.delete("/merchant/readiness/source-data-decisions/{reason_code}/{platform}/{platform_product_id}")
+async def delete_readiness_source_data_decision_route(
+    reason_code: str,
+    platform: str,
+    platform_product_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Clear a merchant advisory decision for a source-data queue item."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        result = await delete_out_of_stock_source_data_decision(
+            merchant_id,
+            reason_code=reason_code,
+            platform=platform,
+            platform_product_id=platform_product_id,
+        )
+        return {
+            "status": "success",
+            "data": result,
+        }
+    except ActionNotExecutableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_NOT_SUPPORTED",
+                "message": str(exc),
+            },
+        )
+    except ActionNotFoundError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_INVALID",
+                "message": str(exc),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Readiness source-data decision delete error for merchant %s %s/%s (%s): %s",
+            merchant_id,
+            platform,
+            platform_product_id,
+            reason_code,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness source-data decision delete failed: {str(e)}",
+        )
 
 
 @router.get("/merchant/readiness/optimization/products/{platform}/{platform_product_id}/blockers")
@@ -1037,6 +1182,7 @@ async def export_readiness_source_data_triage(
                 "agent_push_reason_codes",
                 "recommended_action_type",
                 "fix_surface",
+                "decision_state",
             ],
         )
         writer.writeheader()
@@ -1064,6 +1210,7 @@ async def export_readiness_source_data_triage(
                     "agent_push_reason_codes": "|".join(row.get("agent_push_reason_codes") or []),
                     "recommended_action_type": row.get("recommended_action_type"),
                     "fix_surface": row.get("fix_surface"),
+                    "decision_state": row.get("decision_state"),
                 }
             )
 

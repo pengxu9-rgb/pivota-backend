@@ -231,6 +231,7 @@ class ProductReadinessQueueItem(BaseModel):
     eligible_variant_count: int = 0
     excluded_variant_count: int = 0
     store_data_last_checked_at: Optional[str] = None
+    decision_state: Optional[str] = None
 
 
 class QualityCoverageSummary(BaseModel):
@@ -322,6 +323,53 @@ class SourceDataTriageRow(BaseModel):
     agent_push_reason_codes: List[str] = Field(default_factory=list)
     recommended_action_type: Optional[str] = None
     fix_surface: Optional[str] = None
+    decision_state: Optional[str] = None
+
+
+class SourceDataLaneStateCount(BaseModel):
+    key: str
+    label: str
+    count: int = 0
+
+
+class SourceDataLaneDecisionCount(BaseModel):
+    key: str
+    label: str
+    count: int = 0
+
+
+class SourceDataLaneNextProduct(BaseModel):
+    platform: str
+    platform_product_id: str
+    product_id: str
+    title: str
+    blocked_variant_count: int = 0
+    excluded_variant_count: int = 0
+    sample_variant_id: Optional[str] = None
+
+
+class SourceDataLaneSummary(BaseModel):
+    reason_code: str
+    label: str
+    affected_products: int = 0
+    affected_variants: int = 0
+    blocked_products: int = 0
+    excluded_products: int = 0
+    next_product: Optional[SourceDataLaneNextProduct] = None
+    queue_state_counts: List[SourceDataLaneStateCount] = Field(default_factory=list)
+    decision_counts: List[SourceDataLaneDecisionCount] = Field(default_factory=list)
+
+
+class ReadinessLaneDelta(BaseModel):
+    reason_code: str
+    before_products: int = 0
+    after_products: int = 0
+    before_variants: int = 0
+    after_variants: int = 0
+    resolved_products: int = 0
+    resolved_variants: int = 0
+    state_counts_before: List[SourceDataLaneStateCount] = Field(default_factory=list)
+    state_counts_after: List[SourceDataLaneStateCount] = Field(default_factory=list)
 
 
 class SourceDataTriagePayload(BaseModel):
@@ -340,6 +388,8 @@ class MerchantReadinessOptimizationPayload(BaseModel):
     issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
+    content_opportunity_count: int = 0
+    source_data_lanes: List[SourceDataLaneSummary] = Field(default_factory=list)
     quality_coverage: QualityCoverageSummary = Field(default_factory=QualityCoverageSummary)
     agent_push_summary: AgentPushSummary = Field(default_factory=AgentPushSummary)
     last_generated_at: Optional[str] = None

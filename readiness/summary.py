@@ -11,6 +11,7 @@ from db.database import database
 from db.product_enrichment import get_enrichments_for_products
 from db.product_quality_backfill_jobs import get_active_quality_backfill_job
 from db.products import products_cache
+from db.readiness_source_data_decisions import list_source_data_decisions
 from readiness.flags import (
     readiness_alpha_merchant_id,
     readiness_real_merchant_alpha_enabled,
@@ -26,8 +27,13 @@ from readiness.models import (
     ProductReadinessQueueItem,
     QualityCoverageSummary,
     ReadinessIssueBucket,
+    ReadinessLaneDelta,
     ReadinessSummary,
     ScoreBundle,
+    SourceDataLaneDecisionCount,
+    SourceDataLaneNextProduct,
+    SourceDataLaneStateCount,
+    SourceDataLaneSummary,
 )
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
 from services.product_exposure_service import (
@@ -168,6 +174,326 @@ _CATALOG_REVIEW_REASON_CODES = {
     "inventory_stale",
 }
 
+_SOURCE_DATA_LANE_DEFS: dict[str, dict[str, str]] = {
+    "missing_price": {
+        "label": "Missing price",
+        "scope": "variant",
+    },
+    "out_of_stock": {
+        "label": "Out of stock",
+        "scope": "variant",
+    },
+    "missing_primary_image": {
+        "label": "Missing primary image",
+        "scope": "product",
+    },
+}
+
+_SOURCE_DATA_LANE_STATE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "missing_price": [
+        ("whole_product_missing_price", "Whole product still missing price"),
+        ("partially_priced", "Partially priced"),
+        ("priced_waiting_refresh", "Price visible now"),
+    ],
+    "out_of_stock": [
+        ("whole_product_unavailable", "Whole product unavailable"),
+        ("partially_recovered", "Partially back in stock"),
+        ("restocked_waiting_refresh", "Back in stock now"),
+    ],
+    "missing_primary_image": [
+        ("hero_image_missing", "Hero image still missing"),
+        ("image_visible_now", "Primary image visible now"),
+    ],
+}
+
+_OUT_OF_STOCK_DECISION_LABELS: dict[str, str] = {
+    "restock_planned": "Restock planned",
+    "archive_planned": "Archive / discontinue",
+    "manual_review": "Manual review",
+}
+
+
+def _dedupe_codes(*groups: Iterable[str]) -> list[str]:
+    codes: list[str] = []
+    for group in groups:
+        for code in group:
+            normalized = str(code or "").strip()
+            if not normalized or normalized in codes:
+                continue
+            codes.append(normalized)
+    return codes
+
+
+def _coerce_price_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return _coerce_price_value(value.get("value") if "value" in value else value.get("amount"))
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _coerce_inventory_quantity(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _snapshot_variant_agent_push_projection(variant: Any) -> dict[str, Any]:
+    blocker_codes = set(
+        _dedupe_codes(
+            variant.blockers.get("discovery", []),
+            variant.blockers.get("checkout", []),
+        )
+    )
+    price_data = variant.price or {}
+    inventory_data = variant.inventory or {}
+    price_amount = _coerce_price_value(price_data.get("amount"))
+    currency = str(price_data.get("currency") or "").strip().upper() or None
+    availability = str(inventory_data.get("availability") or "").strip().lower()
+    inventory_quantity = _coerce_inventory_quantity(inventory_data.get("quantity"))
+
+    in_stock = availability not in {
+        "out_of_stock",
+        "outofstock",
+        "sold_out",
+        "soldout",
+        "unavailable",
+    }
+    if inventory_quantity is not None:
+        in_stock = in_stock and inventory_quantity > 0
+
+    reason_codes: list[str] = []
+    if "out_of_stock" in blocker_codes or not in_stock:
+        reason_codes.append("out_of_stock")
+    if "missing_price" in blocker_codes or price_amount is None:
+        reason_codes.append("missing_price")
+    if "missing_currency" in blocker_codes or currency is None:
+        reason_codes.append("missing_currency")
+
+    if reason_codes:
+        return {
+            "agent_push_status": AGENT_PUSH_STATUS_EXCLUDED,
+            "agent_push_reason_codes": _dedupe_codes(reason_codes),
+        }
+    return {
+        "agent_push_status": "eligible_for_agent_push",
+        "agent_push_reason_codes": [],
+    }
+
+
+def _variant_matches_source_data_reason(
+    reason_code: str,
+    *,
+    readiness_blocker_codes: list[str],
+    agent_push_reason_codes: list[str],
+) -> bool:
+    blocker_codes = set(readiness_blocker_codes)
+    push_codes = set(agent_push_reason_codes)
+
+    if reason_code == "missing_price":
+        return bool(
+            blocker_codes.intersection({"missing_price", "missing_currency"})
+            or push_codes.intersection({"missing_price", "missing_currency"})
+        )
+    if reason_code == "out_of_stock":
+        return "out_of_stock" in blocker_codes or "out_of_stock" in push_codes
+    return False
+
+
+def _product_matches_source_data_reason(reason_code: str, *, queue_item: ProductReadinessQueueItem) -> tuple[bool, int]:
+    if reason_code != "missing_primary_image":
+        return False, 0
+
+    affected_variants = sum(
+        int(issue.affected_variant_count or 0)
+        for issue in (queue_item.top_issues or [])
+        if issue.code == "missing_primary_image"
+    )
+    if affected_variants <= 0:
+        affected_variants = int(queue_item.blocked_variant_count or 0) or int(
+            queue_item.excluded_variant_count or 0
+        )
+
+    has_issue = any(issue.code == "missing_primary_image" for issue in (queue_item.top_issues or []))
+    return has_issue, affected_variants
+
+
+def _current_product_data(cache_row: Optional[Dict[tuple[str, str], Dict[str, Any]] | Dict[str, Any]]):
+    if not cache_row:
+        return {}
+    if isinstance(cache_row, dict) and "product_data" in cache_row:
+        payload = cache_row.get("product_data") or {}
+        if isinstance(payload, dict):
+            return payload
+    if isinstance(cache_row, dict):
+        return cache_row
+    return {}
+
+
+def _current_variant_lookup(current_product: Dict[str, Any]) -> dict[str, Dict[str, Any]]:
+    lookup: dict[str, Dict[str, Any]] = {}
+    for variant in current_product.get("variants") or []:
+        variant_id = str(variant.get("variant_id") or variant.get("id") or "").strip()
+        if not variant_id or variant_id in lookup:
+            continue
+        lookup[variant_id] = variant
+    return lookup
+
+
+def _current_variant_price(variant: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not variant:
+        return None
+    return _coerce_price_value(variant.get("price"))
+
+
+def _current_variant_currency(variant: Optional[Dict[str, Any]], current_product: Dict[str, Any]) -> Optional[str]:
+    if variant and isinstance(variant.get("price"), dict):
+        currency = str(variant["price"].get("currency") or "").strip().upper()
+        if currency:
+            return currency
+    if variant and str(variant.get("currency") or "").strip():
+        return str(variant.get("currency")).strip().upper()
+    currency = str(current_product.get("currency") or "").strip().upper()
+    return currency or None
+
+
+def _current_variant_inventory(variant: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not variant:
+        return None
+    return _coerce_inventory_quantity(
+        variant.get("inventory_quantity", variant.get("stock", variant.get("inventory")))
+    )
+
+
+def _current_product_has_visible_image(current_product: Dict[str, Any]) -> bool:
+    if current_product.get("image_url"):
+        return True
+    images = current_product.get("images") or []
+    return bool(images and images[0])
+
+
+def _is_current_product_sellable(current_product: Dict[str, Any]) -> bool:
+    explicit = current_product.get("sellable")
+    if isinstance(explicit, bool):
+        return explicit
+
+    orderable = current_product.get("orderable")
+    if isinstance(orderable, bool):
+        if not orderable:
+            return False
+
+    raw_status = str(current_product.get("status") or "").strip().lower()
+    if raw_status and raw_status != "active":
+        return False
+
+    if isinstance(orderable, bool):
+        return orderable and raw_status in {"", "active"}
+    return raw_status in {"", "active"}
+
+
+def _default_out_of_stock_decision_state(current_product: Dict[str, Any]) -> str:
+    raw_status = str(current_product.get("status") or "").strip().lower()
+    if raw_status and raw_status != "active":
+        return "archive_planned"
+
+    if current_product.get("orderable") is False:
+        return "archive_planned"
+
+    variants = current_product.get("variants") or []
+    has_any_priced_variant = any((_current_variant_price(variant) or 0) > 0 for variant in variants)
+    if not has_any_priced_variant:
+        has_any_priced_variant = (_coerce_price_value(current_product.get("price")) or 0) > 0
+
+    if _is_current_product_sellable(current_product) and has_any_priced_variant and (
+        _current_product_has_visible_image(current_product)
+        or bool(str(current_product.get("description") or "").strip())
+    ):
+        return "restock_planned"
+
+    return "manual_review"
+
+
+def _build_source_data_variant_matches(
+    reason_code: str,
+    *,
+    snapshot_product: Any,
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for variant in snapshot_product.variants:
+        readiness_blocker_codes = _dedupe_codes(
+            variant.blockers.get("discovery", []),
+            variant.blockers.get("checkout", []),
+        )
+        agent_push_reason_codes = list(
+            _snapshot_variant_agent_push_projection(variant).get("agent_push_reason_codes") or []
+        )
+        if not _variant_matches_source_data_reason(
+            reason_code,
+            readiness_blocker_codes=readiness_blocker_codes,
+            agent_push_reason_codes=agent_push_reason_codes,
+        ):
+            continue
+        matches.append(
+            {
+                "variant_id": str(variant.variant_id or "").strip(),
+                "title": str(variant.title or variant.variant_id or "Variant"),
+            }
+        )
+    return matches
+
+
+def _missing_price_batch_state(
+    matches: list[dict[str, Any]],
+    current_product: Dict[str, Any],
+) -> str:
+    if not matches:
+        return "whole_product_missing_price"
+    variant_lookup = _current_variant_lookup(current_product)
+    pending = 0
+    resolved = 0
+    for match in matches:
+        current_variant = variant_lookup.get(match["variant_id"])
+        price_value = _current_variant_price(current_variant)
+        price_currency = _current_variant_currency(current_variant, current_product)
+        if (price_value or 0) > 0 and price_currency:
+            resolved += 1
+        else:
+            pending += 1
+    if pending <= 0:
+        return "priced_waiting_refresh"
+    if resolved > 0:
+        return "partially_priced"
+    return "whole_product_missing_price"
+
+
+def _out_of_stock_batch_state(
+    matches: list[dict[str, Any]],
+    current_product: Dict[str, Any],
+) -> str:
+    if not matches:
+        return "whole_product_unavailable"
+    variant_lookup = _current_variant_lookup(current_product)
+    pending = 0
+    resolved = 0
+    for match in matches:
+        current_variant = variant_lookup.get(match["variant_id"])
+        inventory_quantity = _current_variant_inventory(current_variant)
+        if inventory_quantity is not None and inventory_quantity > 0:
+            resolved += 1
+        else:
+            pending += 1
+    if pending <= 0:
+        return "restocked_waiting_refresh"
+    if resolved > 0:
+        return "partially_recovered"
+    return "whole_product_unavailable"
+
 
 def _dedupe(values: Iterable[str], *, limit: int = 3) -> list[str]:
     seen: list[str] = []
@@ -253,6 +579,8 @@ def _build_plan_id(
     summary: ReadinessSummary,
     issue_buckets: list[ReadinessIssueBucket],
     product_queue: list[ProductReadinessQueueItem],
+    content_opportunity_count: int = 0,
+    source_data_lanes: Optional[list[SourceDataLaneSummary]] = None,
 ) -> str:
     raw = "|".join(
         [
@@ -263,6 +591,11 @@ def _build_plan_id(
             str(summary.blocked_variant_count),
             ",".join(bucket.code for bucket in issue_buckets[:5]),
             ",".join(item.queue_item_id for item in product_queue[:10]),
+            str(content_opportunity_count),
+            ",".join(
+                f"{lane.reason_code}:{lane.affected_products}:{lane.affected_variants}"
+                for lane in (source_data_lanes or [])
+            ),
         ]
     )
     return f"rdplan_{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
@@ -780,6 +1113,209 @@ async def _apply_quality_projection(
     except Exception as exc:
         logger.warning("Failed to project quality coverage into readiness payload: %s", str(exc)[:200])
         return product_queue, QualityCoverageSummary()
+
+
+async def _build_source_data_lanes(
+    merchant_id: str,
+    *,
+    snapshot_products: list[Any],
+    product_queue: list[ProductReadinessQueueItem],
+) -> list[SourceDataLaneSummary]:
+    snapshot_products_by_key: dict[tuple[str, str], Any] = {}
+    for product in snapshot_products:
+        key = make_product_key(product.platform or "unknown", product.product_id)
+        if key is not None:
+            snapshot_products_by_key[key] = product
+
+    product_keys = [
+        key
+        for key in (
+            make_product_key(item.platform, item.platform_product_id or item.product_id)
+            for item in product_queue
+        )
+        if key is not None
+    ]
+    cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
+    decisions_by_key = await list_source_data_decisions(
+        merchant_id,
+        reason_code="out_of_stock",
+        product_keys=product_keys,
+    )
+
+    lane_stats: dict[str, dict[str, Any]] = {
+        reason_code: {
+            "label": definition["label"],
+            "affected_products": 0,
+            "affected_variants": 0,
+            "blocked_products": 0,
+            "excluded_products": 0,
+            "next_product": None,
+            "state_counts": Counter(),
+            "decision_counts": Counter(),
+        }
+        for reason_code, definition in _SOURCE_DATA_LANE_DEFS.items()
+    }
+
+    for item in product_queue:
+        product_key = make_product_key(item.platform, item.platform_product_id or item.product_id)
+        if product_key is None:
+            continue
+        snapshot_product = snapshot_products_by_key.get(product_key)
+        if snapshot_product is None:
+            continue
+        current_product = _current_product_data(cache_rows_by_key.get(product_key))
+        decisions_key = f"{product_key[0]}|{product_key[1]}"
+
+        for reason_code in _SOURCE_DATA_LANE_DEFS:
+            lane = lane_stats[reason_code]
+            sample_variant_id: Optional[str] = None
+            affected_variants = 0
+            queue_state_key: Optional[str] = None
+
+            if reason_code == "missing_primary_image":
+                matched, affected_variants = _product_matches_source_data_reason(
+                    reason_code,
+                    queue_item=item,
+                )
+                if not matched:
+                    continue
+                affected_variants = max(1, affected_variants)
+                queue_state_key = (
+                    "image_visible_now"
+                    if _current_product_has_visible_image(current_product)
+                    else "hero_image_missing"
+                )
+            else:
+                matches = _build_source_data_variant_matches(
+                    reason_code,
+                    snapshot_product=snapshot_product,
+                )
+                if not matches:
+                    continue
+                affected_variants = len(matches)
+                sample_variant_id = matches[0]["variant_id"] if matches else None
+                if reason_code == "missing_price":
+                    queue_state_key = _missing_price_batch_state(matches, current_product)
+                else:
+                    queue_state_key = _out_of_stock_batch_state(matches, current_product)
+                    persisted_decision = str(
+                        (decisions_by_key.get(decisions_key) or {}).get("decision_state") or ""
+                    ).strip()
+                    effective_decision = persisted_decision or (
+                        _default_out_of_stock_decision_state(current_product)
+                        if queue_state_key == "whole_product_unavailable"
+                        else ""
+                    )
+                    if queue_state_key == "whole_product_unavailable" and effective_decision:
+                        item.decision_state = effective_decision
+                        lane["decision_counts"][effective_decision] += 1
+
+            lane["affected_products"] += 1
+            lane["affected_variants"] += affected_variants
+            lane["blocked_products"] += 1 if int(item.blocked_variant_count or 0) > 0 else 0
+            lane["excluded_products"] += 1 if int(item.excluded_variant_count or 0) > 0 else 0
+            if lane["next_product"] is None:
+                lane["next_product"] = SourceDataLaneNextProduct(
+                    platform=item.platform,
+                    platform_product_id=item.platform_product_id or item.product_id or "",
+                    product_id=item.product_id,
+                    title=item.title,
+                    blocked_variant_count=int(item.blocked_variant_count or 0),
+                    excluded_variant_count=int(item.excluded_variant_count or 0),
+                    sample_variant_id=sample_variant_id,
+                )
+            if queue_state_key:
+                lane["state_counts"][queue_state_key] += 1
+
+    summaries: list[SourceDataLaneSummary] = []
+    for reason_code, definition in _SOURCE_DATA_LANE_DEFS.items():
+        lane = lane_stats[reason_code]
+        summaries.append(
+            SourceDataLaneSummary(
+                reason_code=reason_code,
+                label=definition["label"],
+                affected_products=int(lane["affected_products"]),
+                affected_variants=int(lane["affected_variants"]),
+                blocked_products=int(lane["blocked_products"]),
+                excluded_products=int(lane["excluded_products"]),
+                next_product=lane["next_product"],
+                queue_state_counts=[
+                    SourceDataLaneStateCount(
+                        key=state_key,
+                        label=state_label,
+                        count=int(lane["state_counts"].get(state_key, 0)),
+                    )
+                    for state_key, state_label in _SOURCE_DATA_LANE_STATE_LABELS[reason_code]
+                ],
+                decision_counts=[
+                    SourceDataLaneDecisionCount(
+                        key=decision_key,
+                        label=decision_label,
+                        count=int(lane["decision_counts"].get(decision_key, 0)),
+                    )
+                    for decision_key, decision_label in _OUT_OF_STOCK_DECISION_LABELS.items()
+                ]
+                if reason_code == "out_of_stock"
+                else [],
+            )
+        )
+    return summaries
+
+
+def build_lane_delta(
+    *,
+    reason_code: str,
+    before_payload: MerchantReadinessOptimizationPayload,
+    after_payload: MerchantReadinessOptimizationPayload,
+) -> Optional[ReadinessLaneDelta]:
+    if reason_code not in _SOURCE_DATA_LANE_DEFS:
+        return None
+
+    before_lane = next(
+        (lane for lane in before_payload.source_data_lanes if lane.reason_code == reason_code),
+        None,
+    )
+    after_lane = next(
+        (lane for lane in after_payload.source_data_lanes if lane.reason_code == reason_code),
+        None,
+    )
+    if before_lane is None and after_lane is None:
+        return None
+
+    before_counts = {item.key: item.count for item in (before_lane.queue_state_counts if before_lane else [])}
+    after_counts = {item.key: item.count for item in (after_lane.queue_state_counts if after_lane else [])}
+
+    return ReadinessLaneDelta(
+        reason_code=reason_code,
+        before_products=int(before_lane.affected_products if before_lane else 0),
+        after_products=int(after_lane.affected_products if after_lane else 0),
+        before_variants=int(before_lane.affected_variants if before_lane else 0),
+        after_variants=int(after_lane.affected_variants if after_lane else 0),
+        resolved_products=max(
+            0,
+            int((before_lane.affected_products if before_lane else 0) - (after_lane.affected_products if after_lane else 0)),
+        ),
+        resolved_variants=max(
+            0,
+            int((before_lane.affected_variants if before_lane else 0) - (after_lane.affected_variants if after_lane else 0)),
+        ),
+        state_counts_before=[
+            SourceDataLaneStateCount(
+                key=state_key,
+                label=state_label,
+                count=int(before_counts.get(state_key, 0)),
+            )
+            for state_key, state_label in _SOURCE_DATA_LANE_STATE_LABELS[reason_code]
+        ],
+        state_counts_after=[
+            SourceDataLaneStateCount(
+                key=state_key,
+                label=state_label,
+                count=int(after_counts.get(state_key, 0)),
+            )
+            for state_key, state_label in _SOURCE_DATA_LANE_STATE_LABELS[reason_code]
+        ],
+    )
 
 
 def _build_issue_buckets(snapshot: MerchantReadinessSnapshot) -> list[ReadinessIssueBucket]:
@@ -1323,23 +1859,34 @@ async def get_readiness_optimization_context(
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
     issue_buckets = _build_issue_buckets(snapshot)
     merchant_actions = _build_merchant_actions(summary, issue_buckets)
-    product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
-    product_queue, agent_push_summary = _apply_agent_push_projection(
+    full_product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
+    full_product_queue, agent_push_summary = _apply_agent_push_projection(
         snapshot_products=snapshot.products,
-        product_queue=product_queue,
+        product_queue=full_product_queue,
         checked_at=snapshot.generated_at,
     )
-    product_queue, quality_coverage = await _apply_quality_projection(
+    full_product_queue, quality_coverage = await _apply_quality_projection(
         merchant_id,
         snapshot_products=snapshot.products,
-        product_queue=product_queue,
+        product_queue=full_product_queue,
     )
+    product_queue = [
+        item
+        for item in full_product_queue
+        if int(item.blocked_variant_count or 0) > 0 or int(item.excluded_variant_count or 0) > 0
+    ]
+    content_opportunity_count = max(0, len(full_product_queue) - len(product_queue))
     product_queue.sort(
         key=lambda item: (
             -item.priority_score,
             -item.blocked_variant_count,
             item.title.lower(),
         )
+    )
+    source_data_lanes = await _build_source_data_lanes(
+        merchant_id,
+        snapshot_products=snapshot.products,
+        product_queue=product_queue,
     )
     snapshot_id = _build_snapshot_id(snapshot)
     plan = OptimizationPlan(
@@ -1348,6 +1895,8 @@ async def get_readiness_optimization_context(
             summary=summary,
             issue_buckets=issue_buckets,
             product_queue=product_queue,
+            content_opportunity_count=content_opportunity_count,
+            source_data_lanes=source_data_lanes,
         ),
         snapshot_id=snapshot_id,
         workspace_version=_WORKSPACE_VERSION,
@@ -1369,6 +1918,8 @@ async def get_readiness_optimization_context(
             issue_buckets=issue_buckets,
             merchant_actions=merchant_actions,
             product_queue=product_queue,
+            content_opportunity_count=content_opportunity_count,
+            source_data_lanes=source_data_lanes,
             quality_coverage=quality_coverage,
             agent_push_summary=agent_push_summary,
             last_generated_at=summary.generated_at,
