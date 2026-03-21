@@ -44,6 +44,7 @@ from readiness.summary import (
     build_lane_delta,
     build_readiness_optimization,
     build_readiness_summary,
+    invalidate_readiness_optimization_cache,
 )
 
 router = APIRouter()
@@ -940,6 +941,7 @@ async def put_readiness_source_data_decision(
             platform_product_id=platform_product_id,
             decision_state=body.decision_state,
         )
+        invalidate_readiness_optimization_cache(merchant_id, channel="ucp")
         return {
             "status": "success",
             "data": decision,
@@ -995,6 +997,7 @@ async def delete_readiness_source_data_decision_route(
             platform=platform,
             platform_product_id=platform_product_id,
         )
+        invalidate_readiness_optimization_cache(merchant_id, channel="ucp")
         return {
             "status": "success",
             "data": result,

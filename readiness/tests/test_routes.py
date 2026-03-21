@@ -807,6 +807,8 @@ def test_merchant_readiness_source_data_triage_route_returns_rows(monkeypatch):
 def test_merchant_readiness_source_data_decision_routes(monkeypatch):
     from routes import merchant_api_extensions as merchant_api_extensions
 
+    invalidations: list[tuple[str | None, str | None]] = []
+
     async def fake_get_merchant_id_from_user(_current_user):
         return DEFAULT_ALPHA_MERCHANT_ID
 
@@ -859,6 +861,11 @@ def test_merchant_readiness_source_data_decision_routes(monkeypatch):
         "delete_out_of_stock_source_data_decision",
         fake_delete,
     )
+    monkeypatch.setattr(
+        merchant_api_extensions,
+        "invalidate_readiness_optimization_cache",
+        lambda merchant_id=None, *, channel=None: invalidations.append((merchant_id, channel)) or 1,
+    )
 
     app = FastAPI()
     app.include_router(merchant_api_extensions.router)
@@ -875,12 +882,17 @@ def test_merchant_readiness_source_data_decision_routes(monkeypatch):
     )
     assert put_response.status_code == 200
     assert put_response.json()["data"]["decision_state"] == "restock_planned"
+    assert invalidations == [(DEFAULT_ALPHA_MERCHANT_ID, "ucp")]
 
     delete_response = route_client.delete(
         "/merchant/readiness/source-data-decisions/out_of_stock/shopify/prod_1",
     )
     assert delete_response.status_code == 200
     assert delete_response.json()["data"]["deleted"] is True
+    assert invalidations == [
+        (DEFAULT_ALPHA_MERCHANT_ID, "ucp"),
+        (DEFAULT_ALPHA_MERCHANT_ID, "ucp"),
+    ]
 
 
 def test_merchant_readiness_source_data_triage_export_route_returns_csv(monkeypatch):
