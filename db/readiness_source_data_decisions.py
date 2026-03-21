@@ -131,6 +131,14 @@ async def delete_source_data_decision(
     await ensure_source_data_decisions_table()
     normalized_platform = str(platform or "").strip().lower()
     normalized_product_id = str(platform_product_id or "").strip()
+    key = _decision_key(normalized_platform, normalized_product_id)
+    existing = await list_source_data_decisions(
+        merchant_id,
+        reason_code=reason_code,
+        product_keys=[(normalized_platform, normalized_product_id)],
+    )
+    if key not in existing:
+        return False
     query = f"""
         DELETE FROM {_TABLE_NAME}
         WHERE merchant_id = :merchant_id
@@ -148,7 +156,14 @@ async def delete_source_data_decision(
         },
     )
     try:
-        return int(result or 0) > 0
+        if result is not None:
+            return int(result or 0) > 0
     except Exception:
-        return True
+        pass
 
+    remaining = await list_source_data_decisions(
+        merchant_id,
+        reason_code=reason_code,
+        product_keys=[(normalized_platform, normalized_product_id)],
+    )
+    return key not in remaining
