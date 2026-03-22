@@ -6047,6 +6047,59 @@ async def _handle_find_products_multi(
                 extra={"query": q, "error": str(e)},
             )
 
+    strict_live_query_fallback_used = False
+    if (
+        strict_serving_mode
+        and is_shopping_surface
+        and q
+        and merchant_map
+        and not merchant_products
+    ):
+        strict_live_query_fallback_used = True
+        fallback_merchant_items = list(merchant_map.items())
+        merchants_scanned = max(merchants_scanned, len(fallback_merchant_items))
+        semaphore = asyncio.Semaphore(max(1, MULTI_SEARCH_MERCHANT_CONCURRENCY))
+
+        async def _fetch_strict_query_fallback_candidates(
+            mid: str,
+            name: str,
+        ) -> list[tuple[StandardProduct, str, str]]:
+            async with semaphore:
+                try:
+                    products, _source, _error = await asyncio.wait_for(
+                        get_products_hybrid(
+                            merchant_id=mid,
+                            limit=per_merchant_limit,
+                            agent_id="shopping_ai_multi_strict_query_fallback",
+                            background_tasks=background_tasks,
+                            force_cache_only=True,
+                        ),
+                        timeout=MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    return []
+
+                shop_currency = _get_cached_merchant_shopify_currency(mid)
+                out: list[tuple[StandardProduct, str, str]] = []
+                for p in products:
+                    if shop_currency and (p.platform or "").lower() == "shopify":
+                        p.currency = shop_currency
+                    out.append((p, name, mid))
+                return out
+
+        gathered = await asyncio.gather(
+            *[
+                _fetch_strict_query_fallback_candidates(mid, name)
+                for mid, name in fallback_merchant_items
+            ],
+            return_exceptions=True,
+        )
+        for chunk in gathered:
+            if not isinstance(chunk, list):
+                continue
+            for prod, name, mid in chunk:
+                _append_merchant_candidate(prod, name, mid)
+
     # In-memory filtering and simple relevance scoring (reuse Agent API logic)
     filtered_products: list[dict[str, Any]] = []
 
@@ -6697,6 +6750,7 @@ async def _handle_find_products_multi(
                 "shopping_recall_boost_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST
                 ),
+                "strict_live_query_fallback_used": strict_live_query_fallback_used,
                 "shopping_sku_json_scan_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN
                 ),
