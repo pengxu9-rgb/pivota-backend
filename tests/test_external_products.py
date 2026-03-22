@@ -828,6 +828,248 @@ async def test_shop_gateway_find_products_multi_visible_category_intent_fails_cl
     assert metadata.get("visible_category_intents") == ["hoodie"]
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_query_budget_max_keeps_matching_product(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        serum = agent_shop_gateway_module.StandardProduct(
+            id="prod_serum_1",
+            product_id="prod_serum_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Winona Soothing Repair Serum",
+            description="Hydrating serum for sensitive skin.",
+            product_type="Serum",
+            price=29.0,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [serum], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="winona serum under €30",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_serum_1"
+    metadata = result.get("metadata") or {}
+    assert metadata.get("budget_price_max") == 30.0
+    assert metadata.get("budget_currency") == "EUR"
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_query_budget_max_fails_closed_when_no_product_meets_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        serum = agent_shop_gateway_module.StandardProduct(
+            id="prod_serum_1",
+            product_id="prod_serum_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Winona Soothing Repair Serum",
+            description="Hydrating serum for sensitive skin.",
+            product_type="Serum",
+            price=29.0,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [serum], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="winona serum below 20",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("total") == 0
+    assert result.get("products") == []
+    metadata = result.get("metadata") or {}
+    assert metadata.get("budget_price_max") == 20.0
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_query_budget_filters_visible_category_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        vest_a = agent_shop_gateway_module.StandardProduct(
+            id="prod_vest_1",
+            product_id="prod_vest_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Padded Winter Vest for Dogs & Cats",
+            description="Warm pet vest.",
+            product_type="Padded Vest",
+            price=22.93,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        vest_b = agent_shop_gateway_module.StandardProduct(
+            id="prod_vest_2",
+            product_id="prod_vest_2",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Color-Block Padded Winter Vest for Dogs & Cats",
+            description="Warm pet vest.",
+            product_type="Padded Vest",
+            price=25.85,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [vest_a, vest_b], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="dog vest under 25",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_vest_1"
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_category_intents") == ["vest"]
+    assert metadata.get("budget_price_max") == 25.0
+
+
 def test_agent_cart_validate_rejects_external_seed_merchant(client: TestClient) -> None:
     res = client.post(
         "/agent/v1/cart/validate?merchant_id=external_seed&shipping_country=US",

@@ -581,6 +581,87 @@ def _build_fragrance_semantic_retry_query(query: Optional[str]) -> Optional[str]
     return expanded_query if expanded_query and expanded_query != q else None
 
 
+def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
+    token = str(raw or "").strip().lower()
+    if not token:
+        return None
+    if token in {"€", "eur", "euro", "euros"}:
+        return "EUR"
+    if token in {"$", "usd", "dollar", "dollars"}:
+        return "USD"
+    if token in {"£", "gbp", "pound", "pounds"}:
+        return "GBP"
+    return None
+
+
+def _extract_query_budget_constraints(query: Optional[str]) -> Dict[str, Any]:
+    text = str(query or "").strip()
+    if not text:
+        return {
+            "clean_query": "",
+            "price_min": None,
+            "price_max": None,
+            "currency": None,
+        }
+
+    patterns = [
+        (
+            "price_max",
+            re.compile(
+                r"(?P<full>\b(?:under|below|less than|up to|max(?:imum)?)\s*"
+                r"(?:(?P<currency1>[$€£]|usd|eur|gbp|dollars?|euros?|pounds?)\s*)?"
+                r"(?P<amount>\d+(?:\.\d{1,2})?)"
+                r"(?:\s*(?P<currency2>[$€£]|usd|eur|gbp|dollars?|euros?|pounds?))?)",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            "price_min",
+            re.compile(
+                r"(?P<full>\b(?:over|above|more than|at least|min(?:imum)?)\s*"
+                r"(?:(?P<currency1>[$€£]|usd|eur|gbp|dollars?|euros?|pounds?)\s*)?"
+                r"(?P<amount>\d+(?:\.\d{1,2})?)"
+                r"(?:\s*(?P<currency2>[$€£]|usd|eur|gbp|dollars?|euros?|pounds?))?)",
+                re.IGNORECASE,
+            ),
+        ),
+    ]
+
+    clean_text = text
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    currency: Optional[str] = None
+
+    for field_name, pattern in patterns:
+        match = pattern.search(clean_text)
+        if not match:
+            continue
+        try:
+            amount = float(match.group("amount"))
+        except Exception:
+            continue
+        normalized_currency = _normalize_budget_currency(
+            match.group("currency1") or match.group("currency2")
+        )
+        if field_name == "price_max":
+            price_max = amount if price_max is None else min(price_max, amount)
+        else:
+            price_min = amount if price_min is None else max(price_min, amount)
+        if normalized_currency and not currency:
+            currency = normalized_currency
+        full_text = str(match.group("full") or "").strip()
+        if full_text:
+            clean_text = re.sub(re.escape(full_text), " ", clean_text, count=1, flags=re.IGNORECASE)
+
+    clean_text = re.sub(r"\s+", " ", clean_text).strip()
+    return {
+        "clean_query": clean_text,
+        "price_min": price_min,
+        "price_max": price_max,
+        "currency": currency,
+    }
+
+
 def _normalize_gateway_route_health(
     metadata: Optional[Dict[str, Any]],
     *,
@@ -4972,7 +5053,27 @@ async def _handle_find_products_multi(
 
     # Cold start & intent detection.
     q_raw = filters.query or ""
-    q = q_raw.strip()
+    parsed_budget = _extract_query_budget_constraints(q_raw)
+    q = str(parsed_budget.get("clean_query") or q_raw or "").strip()
+    explicit_price_min = filters.price_min
+    explicit_price_max = filters.price_max
+    parsed_price_min = parsed_budget.get("price_min")
+    parsed_price_max = parsed_budget.get("price_max")
+    effective_price_min = explicit_price_min
+    effective_price_max = explicit_price_max
+    if parsed_price_min is not None:
+        effective_price_min = (
+            parsed_price_min
+            if effective_price_min is None
+            else max(float(effective_price_min), float(parsed_price_min))
+        )
+    if parsed_price_max is not None:
+        effective_price_max = (
+            parsed_price_max
+            if effective_price_max is None
+            else min(float(effective_price_max), float(parsed_price_max))
+        )
+    budget_currency = str(parsed_budget.get("currency") or "").strip().upper() or None
     q_lower = q.lower()
     q_ascii = _strip_accents(q_lower)
     query_semantic_class = _classify_query_semantic_class(q_ascii or q_lower)
@@ -5536,9 +5637,16 @@ async def _handle_find_products_multi(
                 score = 0.15
 
             price_amount = row_dict.get("price_amount") or seed_data.get("price_amount")
-            if filters.price_min is not None and price_amount is not None and price_amount < filters.price_min:
+            price_currency = str(
+                row_dict.get("price_currency")
+                or seed_data.get("price_currency")
+                or "USD"
+            ).upper()
+            if budget_currency and price_currency != budget_currency:
                 continue
-            if filters.price_max is not None and price_amount is not None and price_amount > filters.price_max:
+            if effective_price_min is not None and price_amount is not None and price_amount < effective_price_min:
+                continue
+            if effective_price_max is not None and price_amount is not None and price_amount > effective_price_max:
                 continue
 
             availability = row_dict.get("availability") or seed_data.get("availability") or "unknown"
@@ -6179,9 +6287,12 @@ async def _handle_find_products_multi(
             continue
 
         # Price filter
-        if filters.price_min is not None and product.price < filters.price_min:
+        product_currency = str(product.currency or "").strip().upper()
+        if budget_currency and product_currency and product_currency != budget_currency:
             continue
-        if filters.price_max is not None and product.price > filters.price_max:
+        if effective_price_min is not None and product.price < effective_price_min:
+            continue
+        if effective_price_max is not None and product.price > effective_price_max:
             continue
 
         # Category filter
@@ -6788,8 +6899,8 @@ async def _handle_find_products_multi(
                 search=MultiSearchFilters(
                     query=retry_query,
                     category=filters.category,
-                    price_min=filters.price_min,
-                    price_max=filters.price_max,
+                    price_min=effective_price_min,
+                    price_max=effective_price_max,
                     page=filters.page,
                     limit=limit,
                     in_stock_only=filters.in_stock_only,
@@ -6864,6 +6975,9 @@ async def _handle_find_products_multi(
                 "query_semantic_class": query_semantic_class,
                 "pet_accessory_intent_query": pet_accessory_intent_query,
                 "visible_category_intents": active_visible_category_labels,
+                "budget_price_min": effective_price_min,
+                "budget_price_max": effective_price_max,
+                "budget_currency": budget_currency,
                 "semantic_retry_applied": semantic_retry_applied,
                 "semantic_retry_query": semantic_retry_query,
                 "semantic_retry_hits": semantic_retry_hits,
