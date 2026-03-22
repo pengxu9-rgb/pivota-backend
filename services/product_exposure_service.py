@@ -308,6 +308,11 @@ def build_agent_push_projection_from_ready_variant(variant: Any) -> Dict[str, An
         ),
         "agent_push_reason_codes": reason_codes,
     }
+<<<<<<< HEAD
+=======
+
+
+>>>>>>> 616ffba (Add backend commerce serving support modules)
 def summarize_agent_push_projections(
     projections: Iterable[Dict[str, Any]],
     *,
