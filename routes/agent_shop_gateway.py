@@ -6193,8 +6193,15 @@ async def _handle_find_products_multi(
             "kitten",
             "kittens",
         ]
-        has_pet_accessory_marker = any(tok in blob_for_filters for tok in pet_accessory_markers)
-        has_pet_subject_marker = any(tok in blob_for_filters for tok in pet_subject_markers)
+        pet_accessory_blob = " ".join(
+            [
+                (product.title or "").lower(),
+                (product.product_type or "").lower(),
+                " ".join(getattr(product, "tags", None) or []),
+            ]
+        ).strip()
+        has_pet_accessory_marker = any(tok in pet_accessory_blob for tok in pet_accessory_markers)
+        has_pet_subject_marker = any(tok in pet_accessory_blob for tok in pet_subject_markers)
 
         if pet_accessory_intent_query and not has_pet_accessory_marker:
             continue

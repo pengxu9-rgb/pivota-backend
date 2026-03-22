@@ -499,7 +499,7 @@ async def test_shop_gateway_find_products_multi_strict_surface_uses_live_query_f
 
 
 @pytest.mark.asyncio
-async def test_shop_gateway_find_products_multi_pet_accessory_query_fails_closed_without_accessory_candidates(
+async def test_shop_gateway_find_products_multi_pet_accessory_query_fails_closed_when_only_description_mentions_accessory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_shop_gateway as agent_shop_gateway_module
@@ -533,7 +533,7 @@ async def test_shop_gateway_find_products_multi_pet_accessory_query_fails_closed
             platform="shopify",
             merchant_id=merchant_id,
             title="Warm Fall/Winter Padded Winter Vest for Dogs & Cats",
-            description="Pet apparel only",
+            description="Leash-friendly detail for hassle-free walks (works with most harnesses).",
             price=24.0,
             currency="USD",
             inventory_quantity=8,
