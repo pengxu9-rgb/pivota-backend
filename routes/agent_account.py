@@ -4,7 +4,7 @@ Simplified and adapted to actual database schema
 """
 
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional
 from datetime import datetime, timedelta
 import secrets
@@ -14,6 +14,12 @@ from db.database import database
 from utils.auth import hash_password, verify_password, create_access_token, get_current_user
 
 router = APIRouter(prefix="/agent/account", tags=["agent-account"])
+
+
+def _validate_agent_password(value: str) -> str:
+    if len(value) < 8:
+        raise ValueError('Password must be at least 8 characters long')
+    return value
 
 
 async def _resolve_agent_key_table() -> Optional[str]:
@@ -102,6 +108,133 @@ async def _sync_new_agent_api_key(
     return "legacy"
 
 
+async def _ensure_agent_api_key_on_auth_path(
+    *,
+    agent_id: str,
+    api_key: str,
+    api_key_hash: str,
+) -> str:
+    """
+    Ensure a login-returned key is present on the current auth lookup path.
+    This keeps `/agent/account/login` aligned with `/agent/v1/orders*` auth.
+    """
+    key_table = await _resolve_agent_key_table()
+
+    if key_table == "api_keys":
+        existing = await database.fetch_one(
+            """
+            SELECT id, status
+            FROM api_keys
+            WHERE key_hash = :key_hash
+            LIMIT 1
+            """,
+            {"key_hash": api_key_hash},
+        )
+
+        if existing:
+            existing_dict = dict(existing)
+            if existing_dict.get("status") != "active":
+                await database.execute(
+                    """
+                    UPDATE api_keys
+                    SET agent_id = :agent_id,
+                        name = :name,
+                        key_prefix = :key_prefix,
+                        status = 'active'
+                    WHERE id = :id
+                    """,
+                    {
+                        "id": existing_dict["id"],
+                        "agent_id": agent_id,
+                        "name": "Primary Key",
+                        "key_prefix": api_key[:10],
+                    },
+                )
+            return "api_keys"
+
+        await database.execute(
+            """
+            INSERT INTO api_keys (agent_id, name, key_hash, key_prefix, status)
+            VALUES (:agent_id, :name, :key_hash, :key_prefix, 'active')
+            """,
+            {
+                "agent_id": agent_id,
+                "name": "Primary Key",
+                "key_hash": api_key_hash,
+                "key_prefix": api_key[:10],
+            },
+        )
+        return "api_keys"
+
+    if key_table == "agent_api_keys":
+        api_key_hash_md5 = hashlib.md5(api_key.encode("utf-8")).hexdigest()
+        existing = await database.fetch_one(
+            """
+            SELECT key_id, COALESCE(is_active, TRUE) AS is_active
+            FROM agent_api_keys
+            WHERE key_hash = :key_hash_sha256 OR key_hash = :key_hash_md5
+            ORDER BY CASE WHEN key_hash = :key_hash_sha256 THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            {
+                "key_hash_sha256": api_key_hash,
+                "key_hash_md5": api_key_hash_md5,
+            },
+        )
+
+        if existing:
+            existing_dict = dict(existing)
+            if not bool(existing_dict.get("is_active", True)):
+                await database.execute(
+                    """
+                    UPDATE agent_api_keys
+                    SET agent_id = :agent_id,
+                        key_prefix = :key_prefix,
+                        is_active = TRUE
+                    WHERE key_id = :key_id
+                    """,
+                    {
+                        "key_id": existing_dict["key_id"],
+                        "agent_id": agent_id,
+                        "key_prefix": api_key[:12] + "...",
+                    },
+                )
+            return "agent_api_keys"
+
+        await database.execute(
+            """
+            INSERT INTO agent_api_keys (
+                key_id,
+                agent_id,
+                key_hash,
+                key_prefix,
+                is_active,
+                created_by,
+                created_at
+            )
+            VALUES (
+                :key_id,
+                :agent_id,
+                :key_hash,
+                :key_prefix,
+                TRUE,
+                :created_by,
+                NOW()
+            )
+            """,
+            {
+                "key_id": f"key_{secrets.token_hex(8)}",
+                "agent_id": agent_id,
+                "key_hash": api_key_hash,
+                "key_prefix": api_key[:12] + "...",
+                "created_by": "agent_login_sync",
+            },
+        )
+        return "agent_api_keys"
+
+    return "legacy"
+
+
 # ============================================================================
 # Models
 # ============================================================================
@@ -114,11 +247,10 @@ class AgentRegisterRequest(BaseModel):
     description: Optional[str] = None
     phone: Optional[str] = None
     
-    @validator('password')
-    def validate_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-        return v
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return _validate_agent_password(value)
 
 class AgentLoginRequest(BaseModel):
     email: EmailStr
@@ -309,7 +441,17 @@ async def login_agent(data: AgentLoginRequest):
         
         # databases.Record → plain dict for safe .get() usage
         agent_dict = dict(agent)
-        
+
+        if not agent_dict.get("api_key"):
+            raise HTTPException(status_code=403, detail="Agent API key is unavailable")
+
+        api_key_hash = hashlib.sha256(agent_dict["api_key"].encode("utf-8")).hexdigest()
+        await _ensure_agent_api_key_on_auth_path(
+            agent_id=agent_dict["agent_id"],
+            api_key=agent_dict["api_key"],
+            api_key_hash=api_key_hash,
+        )
+
         # 4. Update last login
         await database.execute(
             "UPDATE users SET last_login = :last_login WHERE email = :email",

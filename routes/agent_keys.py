@@ -77,20 +77,39 @@ async def get_agent_api_keys(
         if not keys:
             legacy = await database.fetch_one(
                 """
-                SELECT api_key, name, created_at 
+                SELECT agent_id, agent_name, owner_email, api_key, api_key_hash, created_at
                 FROM agents 
-                WHERE agent_id = :agent_or_email OR email = :agent_or_email
+                WHERE agent_id = :agent_or_email OR owner_email = :agent_or_email
                 LIMIT 1
                 """,
                 {"agent_or_email": agent_id}
             )
             if legacy and legacy["api_key"]:
+                legacy_dict = dict(legacy)
+                legacy_hash = legacy_dict.get("api_key_hash") or hashlib.sha256(legacy_dict["api_key"].encode("utf-8")).hexdigest()
+                try:
+                    await database.execute(
+                        """
+                        INSERT INTO api_keys (agent_id, name, key_hash, key_prefix, status)
+                        VALUES (:agent_id, :name, :key_hash, :key_prefix, 'active')
+                        ON CONFLICT (key_hash) DO NOTHING
+                        """,
+                        {
+                            "agent_id": legacy_dict.get("agent_id") or agent_id,
+                            "name": legacy_dict.get("agent_name") or "Primary Key",
+                            "key_hash": legacy_hash,
+                            "key_prefix": legacy_dict["api_key"][:10],
+                        },
+                    )
+                except Exception:
+                    pass
+
                 masked = f"{legacy['api_key'][:10]}****"
                 formatted_keys.append({
                     "id": "legacy",
-                    "name": legacy.get("name") or "Primary Key",
+                    "name": legacy_dict.get("agent_name") or "Primary Key",
                     "key": masked,
-                    "created_at": (legacy.get("created_at") or datetime.utcnow()).isoformat(),
+                    "created_at": (legacy_dict.get("created_at") or datetime.utcnow()).isoformat(),
                     "last_used": None,
                     "status": "active",
                     "usage_count": 0,
