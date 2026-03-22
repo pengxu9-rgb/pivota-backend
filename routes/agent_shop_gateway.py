@@ -5197,6 +5197,46 @@ async def _handle_find_products_multi(
         if any(term in q_ascii for term in group["query_terms"])
     ]
     active_visible_category_labels = [str(group["label"]) for group in active_visible_category_intents]
+    visible_attribute_intent_groups = [
+        {
+            "label": "fragrance_free",
+            "query_terms": [
+                "fragrance free",
+                "fragrance-free",
+                "free fragrance",
+                "sin fragancia",
+            ],
+            "product_terms": [
+                "fragrance free",
+                "fragrance-free",
+                "free fragrance",
+                "without fragrance",
+                "no fragrance",
+                "sin fragancia",
+            ],
+        },
+        {
+            "label": "sensitive_skin",
+            "query_terms": ["sensitive skin", "sensitive-skin"],
+            "product_terms": ["sensitive skin", "sensitive-skin"],
+        },
+        {
+            "label": "hydrating",
+            "query_terms": ["hydrating", "hydrate", "hydration"],
+            "product_terms": ["hydrating", "hydrate", "hydration"],
+        },
+        {
+            "label": "brightening",
+            "query_terms": ["brightening", "brighten"],
+            "product_terms": ["brightening", "brighten"],
+        },
+    ]
+    active_visible_attribute_intents = [
+        group
+        for group in visible_attribute_intent_groups
+        if any(term in q_ascii for term in group["query_terms"])
+    ]
+    active_visible_attribute_labels = [str(group["label"]) for group in active_visible_attribute_intents]
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -6355,6 +6395,13 @@ async def _handle_find_products_multi(
                 (product.product_type or "").lower(),
             ]
         ).strip()
+        visible_attribute_blob = " ".join(
+            [
+                (product.title or "").lower(),
+                (product.product_type or "").lower(),
+                " ".join(str(tag).lower() for tag in (getattr(product, "tags", None) or []) if tag),
+            ]
+        ).strip()
         visible_category_blob = pet_accessory_blob
         has_pet_accessory_marker = any(tok in pet_accessory_blob for tok in pet_accessory_markers)
         has_pet_subject_marker = any(tok in pet_accessory_blob for tok in pet_subject_markers)
@@ -6368,6 +6415,15 @@ async def _handle_find_products_multi(
             if any(term in visible_category_blob for term in group["product_terms"])
         ]
         if active_visible_category_intents and not matched_visible_category_labels:
+            continue
+        matched_visible_attribute_labels = [
+            str(group["label"])
+            for group in active_visible_attribute_intents
+            if any(term in visible_attribute_blob for term in group["product_terms"])
+        ]
+        if active_visible_attribute_intents and (
+            len(matched_visible_attribute_labels) < len(active_visible_attribute_intents)
+        ):
             continue
 
         if exclude_lingerie or exclude_hoodies or exclude_joggers or exclude_underwear:
@@ -6646,6 +6702,8 @@ async def _handle_find_products_multi(
 
         if matched_visible_category_labels:
             relevance_score += 0.35
+        if matched_visible_attribute_labels:
+            relevance_score += min(0.3, 0.12 * len(matched_visible_attribute_labels))
 
         filtered_products.append(
             {
@@ -6955,6 +7013,12 @@ async def _handle_find_products_multi(
             "I couldn’t find an eligible pet accessory match for that query right now. "
             "I’m only showing products that are currently purchasable."
         )
+    if not out_products and active_visible_attribute_labels:
+        attribute_descriptor = active_visible_category_labels[0] if active_visible_category_labels else "product"
+        reply_text = reply_text or (
+            f"I couldn’t find an eligible {attribute_descriptor} match with those visible attributes right now. "
+            "I’m only showing products whose visible catalog labels support the requested attributes."
+        )
     if not out_products and active_visible_category_labels:
         reply_text = reply_text or (
             f"I couldn’t find an eligible {active_visible_category_labels[0]} match for that query right now. "
@@ -6975,6 +7039,7 @@ async def _handle_find_products_multi(
                 "query_semantic_class": query_semantic_class,
                 "pet_accessory_intent_query": pet_accessory_intent_query,
                 "visible_category_intents": active_visible_category_labels,
+                "visible_attribute_intents": active_visible_attribute_labels,
                 "budget_price_min": effective_price_min,
                 "budget_price_max": effective_price_max,
                 "budget_currency": budget_currency,
