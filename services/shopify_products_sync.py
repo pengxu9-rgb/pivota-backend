@@ -19,6 +19,9 @@ from adapters.product_adapters import (
     SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE,
     fetch_merchant_products,
 )
+from services.attached_seed_runtime_evidence import (
+    hydrate_product_payloads_from_attached_seed_runtime_evidence,
+)
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from utils.rich_text import rich_text_to_plain_text
 
@@ -166,6 +169,7 @@ async def sync_shopify_products_for_merchant(
                 break
             continue
 
+        payloads = []
         for sp in products:
             # StandardProduct provides product_id; fall back to id if needed.
             # Ensure JSON-serializable payload for products_cache JSONB.
@@ -175,6 +179,23 @@ async def sync_shopify_products_for_merchant(
             # normalize anything JSON can't encode into strings.
             prod = json.loads(json.dumps(prod, default=str))
             prod = _inject_description_text_fields(prod)
+            payloads.append(prod)
+
+        if not payloads:
+            fetched += len(products)
+            page_token = next_token
+            next_page_token = next_token
+            if not page_token:
+                break
+            continue
+
+        hydrated_payloads = await hydrate_product_payloads_from_attached_seed_runtime_evidence(
+            merchant_id=merchant_id,
+            platform="shopify",
+            product_payloads=payloads,
+        )
+
+        for prod in hydrated_payloads:
             platform_product_id = str(
                 prod.get("product_id") or prod.get("id") or ""
             ).strip()

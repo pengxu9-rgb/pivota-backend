@@ -110,9 +110,15 @@ async def test_sync_injects_description_text_for_html_descriptions(
         captured.append(kwargs)
         return None
 
+    async def fake_hydrate(**kwargs):
+        payloads = kwargs["product_payloads"]
+        payloads[0]["platform_metadata"] = {"reviewed_ingredient_ids": ["Niacinamide"]}
+        return payloads
+
     monkeypatch.setattr(module, "_get_shopify_store_credentials", fake_creds)
     monkeypatch.setattr(module, "fetch_merchant_products", fake_fetch)
     monkeypatch.setattr(module, "upsert_product_cache", fake_upsert)
+    monkeypatch.setattr(module, "hydrate_product_payloads_from_attached_seed_runtime_evidence", fake_hydrate)
 
     await module.sync_shopify_products_for_merchant(
         merchant_id="merch_1",
@@ -126,3 +132,4 @@ async def test_sync_injects_description_text_for_html_descriptions(
     product_data = captured[0]["product_data"]
     assert product_data["description_text"] == "Clean lines\n- Soft mesh\n- Light feel"
     assert product_data["raw"]["description_text"] == "Clean lines\n- Soft mesh\n- Light feel"
+    assert product_data["platform_metadata"]["reviewed_ingredient_ids"] == ["Niacinamide"]

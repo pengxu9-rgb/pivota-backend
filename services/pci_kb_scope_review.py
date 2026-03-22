@@ -131,6 +131,42 @@ def fetch_pci_kb_rows_sync() -> List[Dict[str, Any]]:
             return [dict(item) for item in cur.fetchall() or []]
 
 
+def fetch_pci_kb_runtime_evidence_rows_by_source_refs_sync(source_refs: List[str]) -> List[Dict[str, Any]]:
+    normalized = [normalize_url_like(item) for item in source_refs if normalize_url_like(item)]
+    if not normalized:
+        return []
+    with _connect_pci_kb() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('pci_kb.sku_ingredients') AS table_name")
+            row = cur.fetchone() or {}
+            if not row.get("table_name"):
+                raise RuntimeError("pci_kb.sku_ingredients table is not available")
+            cur.execute(
+                """
+                SELECT sku_key,
+                       market,
+                       brand,
+                       product_name,
+                       category,
+                       source_ref,
+                       source_type,
+                       review_status,
+                       audit_status,
+                       ingest_allowed,
+                       inci_list,
+                       inci_list_json
+                FROM pci_kb.sku_ingredients
+                WHERE source_ref = ANY(%s)
+                  AND COALESCE(review_status, '') = 'APPROVED'
+                  AND COALESCE(audit_status, '') = 'PASS'
+                  AND COALESCE(ingest_allowed, FALSE) = TRUE
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, sku_key ASC
+                """,
+                (normalized,),
+            )
+            return [dict(item) for item in cur.fetchall() or []]
+
+
 def delete_pci_kb_rows_sync(sku_keys: List[str]) -> Dict[str, Any]:
     normalized = [normalize_non_empty_string(key) for key in sku_keys if normalize_non_empty_string(key)]
     if not normalized:
