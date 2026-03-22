@@ -285,6 +285,7 @@ def _build_variant_readiness(
         sku=variant.sku,
         title=variant.title,
         attributes={str(k): str(v) for k, v in (variant.options or {}).items()},
+        visible_option_labels=list(getattr(variant, "visible_option_labels", None) or []),
         price={
             "amount": float(variant.price or 0),
             "currency": product.currency,
@@ -389,6 +390,7 @@ def build_merchant_snapshot(dataset: MerchantSourceDataset, channel: str = "ucp"
                 category=product.product_type,
                 default_image_url=product.image_url or (product.images[0] if product.images else None),
                 visible_attributes=dict(product.visible_attributes or {}),
+                ingredient_ids=list(getattr(product, "ingredient_ids", None) or []),
                 reviews=ReviewSummary(**dataset.product_review_summaries[product.id])
                 if dataset.product_review_summaries.get(product.id)
                 else None,

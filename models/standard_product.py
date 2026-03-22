@@ -41,6 +41,58 @@ _VISIBLE_BEAUTY_ATTRIBUTE_RULES: Dict[str, List[Dict[str, Any]]] = {
     ],
 }
 
+_SIZE_OPTION_PATTERNS: List[Tuple[str, List[str]]] = [
+    ("size_xs", ["xs", "x-small", "extra small"]),
+    ("size_s", ["s", "small"]),
+    ("size_m", ["m", "medium"]),
+    ("size_l", ["l", "large"]),
+    ("size_xl", ["xl", "x-large", "extra large"]),
+    ("size_xxl", ["xxl", "2xl", "xx-large", "extra extra large"]),
+]
+
+_COLOR_OPTION_PATTERNS: List[Tuple[str, List[str]]] = [
+    ("color_red", ["red"]),
+    ("color_black", ["black"]),
+    ("color_blue", ["blue"]),
+    ("color_pink", ["pink"]),
+    ("color_white", ["white"]),
+    ("color_gray", ["gray", "grey"]),
+]
+
+_INGREDIENT_CANONICAL_ALIASES: Dict[str, str] = {
+    "ascorbic acid": "ascorbic_acid",
+    "azelaic acid": "azelaic_acid",
+    "benzoyl peroxide": "benzoyl_peroxide",
+    "ceramides": "ceramide_np",
+    "ceramide np": "ceramide_np",
+    "glycerin": "glycerin",
+    "glycerine": "glycerin",
+    "hyaluronic acid": "hyaluronic_acid",
+    "niacinamide": "niacinamide",
+    "panthenol": "panthenol",
+    "retinol": "retinol",
+    "salicylic acid": "salicylic_acid",
+    "vitamin c": "ascorbic_acid",
+    "zinc pca": "zinc_pca",
+}
+
+_SHADE_FIELD_NAMES = {
+    "shade",
+    "shade_name",
+    "shade_name_text",
+    "shadename",
+    "shade_code",
+    "shade_hex",
+    "shade_label",
+}
+
+_COSMETIC_SHADE_CATEGORY_RULES: List[Tuple[str, List[str]]] = [
+    ("foundation", ["foundation", "foundations"]),
+    ("lipstick", ["lipstick", "lipsticks"]),
+    ("blush", ["blush", "blushes"]),
+    ("gloss", ["gloss", "glosses", "lip gloss", "lip glosses"]),
+]
+
 
 def _normalize_visible_attribute_text(value: Optional[str]) -> str:
     text = str(value or "").strip().lower()
@@ -86,6 +138,233 @@ def _normalize_visible_attribute_labels(raw: Optional[Dict[str, Any]]) -> Dict[s
         if deduped:
             normalized[bucket_name] = deduped
     return normalized
+
+
+def _coerce_string_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = re.split(r"[;,|]", raw)
+        return [str(part or "").strip() for part in parts if str(part or "").strip()]
+    if isinstance(raw, (list, tuple, set)):
+        values: List[str] = []
+        for item in raw:
+            if isinstance(item, dict):
+                for key in ("id", "ingredient_id", "canonical_id", "name", "label", "value"):
+                    candidate = str(item.get(key) or "").strip()
+                    if candidate:
+                        values.append(candidate)
+                        break
+            else:
+                candidate = str(item or "").strip()
+                if candidate:
+                    values.append(candidate)
+        return values
+    if isinstance(raw, dict):
+        values: List[str] = []
+        for key in (
+            "ingredient_ids",
+            "ingredientIds",
+            "canonical_ingredient_ids",
+            "canonicalIngredientIds",
+            "canonical_ingredients",
+            "canonicalIngredients",
+            "reviewed_ingredient_ids",
+            "reviewedIngredientIds",
+        ):
+            if key in raw:
+                values.extend(_coerce_string_list(raw.get(key)))
+        return values
+    return []
+
+
+def _normalize_ingredient_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized_text = _normalize_visible_attribute_text(raw)
+    if not normalized_text:
+        return ""
+    alias_match = _INGREDIENT_CANONICAL_ALIASES.get(normalized_text)
+    if alias_match:
+        return alias_match
+    return normalized_text.replace(" ", "_")
+
+
+def _normalize_ingredient_ids(raw: Any) -> List[str]:
+    deduped: List[str] = []
+    for value in _coerce_string_list(raw):
+        normalized = _normalize_ingredient_id(value)
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def _normalize_visible_option_labels(raw: Any) -> List[str]:
+    deduped: List[str] = []
+    for value in _coerce_string_list(raw):
+        label = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        label = re.sub(r"[^a-z0-9_]+", "_", label)
+        label = re.sub(r"_+", "_", label).strip("_")
+        if label and label not in deduped:
+            deduped.append(label)
+    return deduped
+
+
+def _extract_metadata_value(raw: Any, key_candidates: List[str]) -> Any:
+    if not isinstance(raw, dict):
+        return None
+    for key in key_candidates:
+        if key in raw and raw.get(key) is not None:
+            return raw.get(key)
+    for nested_key in ("beauty_meta", "beautyMeta", "catalog_meta", "catalogMeta"):
+        nested = raw.get(nested_key)
+        if isinstance(nested, dict):
+            for key in key_candidates:
+                if key in nested and nested.get(key) is not None:
+                    return nested.get(key)
+    return None
+
+
+def _infer_size_option_label(value: Any) -> str:
+    normalized = _normalize_visible_attribute_text(value)
+    if not normalized:
+        return ""
+    for label, terms in _SIZE_OPTION_PATTERNS:
+        if any(_normalized_visible_term_matches(normalized, term) for term in terms):
+            return label
+    numeric_match = re.search(r"(?<![a-z0-9])(\d{2,3})(?![a-z0-9])", normalized)
+    if numeric_match:
+        return f"size_{numeric_match.group(1)}"
+    return ""
+
+
+def _infer_color_option_labels(value: Any) -> List[str]:
+    normalized = _normalize_visible_attribute_text(value)
+    if not normalized:
+        return []
+    labels: List[str] = []
+    for label, terms in _COLOR_OPTION_PATTERNS:
+        if any(_normalized_visible_term_matches(normalized, term) for term in terms):
+            if label not in labels:
+                labels.append(label)
+    return labels
+
+
+def _normalize_shade_label(value: Any) -> str:
+    normalized = _normalize_visible_attribute_text(value)
+    if not normalized:
+        return ""
+    tokens = [token for token in re.split(r"\s+", normalized) if token]
+    if not tokens:
+        return ""
+    return f"shade_{'_'.join(tokens)}"
+
+
+def _extract_explicit_shade_labels(
+    *,
+    title: Optional[str],
+    options: Optional[Dict[str, str]],
+    platform_metadata: Optional[Dict[str, Any]],
+) -> List[str]:
+    labels: List[str] = []
+
+    if isinstance(options, dict):
+        for name, value in options.items():
+            option_name = _normalize_visible_attribute_text(name)
+            option_value = str(value or "").strip()
+            if not option_value:
+                continue
+            if option_name and any(hint in option_name for hint in ("shade", "tone")):
+                label = _normalize_shade_label(option_value)
+                if label and label not in labels:
+                    labels.append(label)
+
+    metadata_value = _extract_metadata_value(
+        platform_metadata,
+        list(_SHADE_FIELD_NAMES),
+    )
+    for value in _coerce_string_list(metadata_value):
+        label = _normalize_shade_label(value)
+        if label and label not in labels:
+            labels.append(label)
+
+    title_text = _normalize_visible_attribute_text(title)
+    if title_text:
+        for match in re.finditer(r"(?<![a-z0-9])shade\s+([a-z0-9][a-z0-9 ]{0,30})(?![a-z0-9])", title_text):
+            label = _normalize_shade_label(match.group(1))
+            if label and label not in labels:
+                labels.append(label)
+
+    return labels
+
+
+def _derive_variant_visible_option_labels(
+    *,
+    title: Optional[str],
+    options: Optional[Dict[str, str]],
+    platform_metadata: Optional[Dict[str, Any]],
+) -> List[str]:
+    labels: List[str] = []
+
+    if isinstance(options, dict):
+        for name, value in options.items():
+            option_name = _normalize_visible_attribute_text(name)
+            option_value = str(value or "").strip()
+            if not option_value:
+                continue
+            if any(hint in option_name for hint in ("size",)):
+                size_label = _infer_size_option_label(option_value)
+                if size_label and size_label not in labels:
+                    labels.append(size_label)
+            if any(hint in option_name for hint in ("color", "colour")):
+                for color_label in _infer_color_option_labels(option_value):
+                    if color_label not in labels:
+                        labels.append(color_label)
+
+    title_text = _normalize_visible_attribute_text(title)
+    for label, terms in _SIZE_OPTION_PATTERNS:
+        if any(_normalized_visible_term_matches(title_text, term) for term in terms):
+            if label not in labels:
+                labels.append(label)
+    numeric_match = re.search(r"(?<![a-z0-9])(\d{2,3})(?![a-z0-9])", title_text)
+    if numeric_match:
+        numeric_label = f"size_{numeric_match.group(1)}"
+        if numeric_label not in labels:
+            labels.append(numeric_label)
+    for color_label in _infer_color_option_labels(title_text):
+        if color_label not in labels:
+            labels.append(color_label)
+    for shade_label in _extract_explicit_shade_labels(
+        title=title,
+        options=options,
+        platform_metadata=platform_metadata,
+    ):
+        if shade_label not in labels:
+            labels.append(shade_label)
+
+    return labels
+
+
+def _derive_cosmetic_shade_categories(
+    *,
+    title: Optional[str],
+    product_type: Optional[str],
+    tags: Optional[List[str]],
+) -> List[str]:
+    sources: List[str] = []
+    for candidate in [title, product_type, *(tags or [])]:
+        text = str(candidate or "").strip()
+        if text:
+            sources.append(text)
+    if not sources:
+        return []
+    matched: List[str] = []
+    for label, terms in _COSMETIC_SHADE_CATEGORY_RULES:
+        if any(_normalized_visible_term_matches(source, term) for source in sources for term in terms):
+            if label not in matched:
+                matched.append(label)
+    return matched
 
 
 def _derive_beauty_visible_attributes(
@@ -157,11 +436,32 @@ class StandardProductVariant(BaseModel):
     weight_unit: Optional[str] = None  # kg, lb, g, oz
     options: Optional[Dict[str, str]] = None  # {"Size": "Small", "Color": "Red"}
     image_url: Optional[str] = None  # 变体专属图片
+    visible_option_labels: List[str] = Field(default_factory=list)
+    platform_metadata: Optional[Dict[str, Any]] = None
     
     @validator('variant_id', always=True)
     def set_variant_id(cls, v, values):
         """Ensure variant_id always equals id for backward compatibility"""
         return values.get('id', v)
+
+    @field_validator("visible_option_labels", mode="before")
+    @classmethod
+    def normalize_visible_option_labels(cls, v):
+        return _normalize_visible_option_labels(v)
+
+    @model_validator(mode="after")
+    def derive_visible_option_labels(self):
+        explicit_labels = _normalize_visible_option_labels(self.visible_option_labels)
+        derived_labels = _derive_variant_visible_option_labels(
+            title=self.title,
+            options=self.options,
+            platform_metadata=self.platform_metadata,
+        )
+        self.visible_option_labels = [*explicit_labels]
+        for label in derived_labels:
+            if label not in self.visible_option_labels:
+                self.visible_option_labels.append(label)
+        return self
 
 
 class StandardProduct(BaseModel):
@@ -185,6 +485,7 @@ class StandardProduct(BaseModel):
     product_type: Optional[str] = None  # 产品类型（例如："T-Shirts"）
     tags: List[str] = []  # 标签
     visible_attributes: Dict[str, List[str]] = Field(default_factory=dict)
+    ingredient_ids: List[str] = Field(default_factory=list)
     
     # 价格和库存（默认变体）
     price: float
@@ -223,6 +524,11 @@ class StandardProduct(BaseModel):
     def set_product_id(cls, v, values):
         """Ensure product_id always equals id for backward compatibility"""
         return values.get('id', v)
+
+    @field_validator("ingredient_ids", mode="before")
+    @classmethod
+    def normalize_ingredient_ids(cls, v):
+        return _normalize_ingredient_ids(v)
     
     @field_validator("inventory_quantity", mode="before")
     @classmethod
@@ -264,6 +570,22 @@ class StandardProduct(BaseModel):
             self.description_text or self.description or ""
         ) or None
         normalized_visible_attributes = _normalize_visible_attribute_labels(self.visible_attributes)
+        normalized_ingredient_ids = _normalize_ingredient_ids(self.ingredient_ids)
+        metadata_ingredient_ids = _normalize_ingredient_ids(
+            _extract_metadata_value(
+                self.platform_metadata,
+                [
+                    "ingredient_ids",
+                    "ingredientIds",
+                    "reviewed_ingredient_ids",
+                    "reviewedIngredientIds",
+                    "canonical_ingredient_ids",
+                    "canonicalIngredientIds",
+                    "canonical_ingredients",
+                    "canonicalIngredients",
+                ],
+            )
+        )
         derived_visible_attributes = _derive_beauty_visible_attributes(
             title=self.title,
             product_type=self.product_type,
@@ -273,6 +595,33 @@ class StandardProduct(BaseModel):
             normalized_visible_attributes,
             derived_visible_attributes,
         )
+        self.ingredient_ids = [*normalized_ingredient_ids]
+        for ingredient_id in metadata_ingredient_ids:
+            if ingredient_id not in self.ingredient_ids:
+                self.ingredient_ids.append(ingredient_id)
+
+        cosmetic_shade_categories = _derive_cosmetic_shade_categories(
+            title=self.title,
+            product_type=self.product_type,
+            tags=self.tags,
+        )
+        if cosmetic_shade_categories:
+            for variant in self.variants:
+                for option_label in list(variant.visible_option_labels or []):
+                    if not option_label.startswith("color_"):
+                        continue
+                    shade_label = f"shade_{option_label[len('color_'):]}"
+                    if shade_label not in variant.visible_option_labels:
+                        variant.visible_option_labels.append(shade_label)
+                has_explicit_shade_label = any(
+                    str(option_label or "").startswith("shade_")
+                    for option_label in (variant.visible_option_labels or [])
+                )
+                variant_title_text = _normalize_visible_attribute_text(variant.title)
+                if not has_explicit_shade_label and variant_title_text not in {"", "default", "default title"}:
+                    shade_label = _normalize_shade_label(variant.title)
+                    if shade_label and shade_label not in variant.visible_option_labels:
+                        variant.visible_option_labels.append(shade_label)
         if self.in_stock is None:
             inv = self.inventory_quantity or 0
             self.in_stock = bool(inv > 0 and self.orderable is True)

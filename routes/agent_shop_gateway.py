@@ -52,7 +52,6 @@ from services.outbound_links_service import (
     is_destination_domain_allowed,
     make_redirect_token,
 )
-from services.external_referral_readiness import should_block_external_referral_runtime
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 from services.agent_task_manager import AgentTaskManager
 from services.commerce_surface_service import (
@@ -666,6 +665,129 @@ def _record_matched_visible_attribute(
     bucket_values = matched_visible_attributes.setdefault(bucket_name, [])
     if target_label not in bucket_values:
         bucket_values.append(target_label)
+
+
+_SKINCARE_INGREDIENT_CANONICAL_ALIASES: Dict[str, str] = {
+    "ascorbic acid": "ascorbic_acid",
+    "azelaic acid": "azelaic_acid",
+    "benzoyl peroxide": "benzoyl_peroxide",
+    "ceramide": "ceramide_np",
+    "ceramides": "ceramide_np",
+    "ceramide np": "ceramide_np",
+    "glycerin": "glycerin",
+    "glycerine": "glycerin",
+    "hyaluronic acid": "hyaluronic_acid",
+    "niacinamide": "niacinamide",
+    "panthenol": "panthenol",
+    "retinol": "retinol",
+    "salicylic acid": "salicylic_acid",
+    "vitamin c": "ascorbic_acid",
+    "zinc pca": "zinc_pca",
+}
+
+_SKINCARE_INGREDIENT_DISPLAY_NAMES: Dict[str, str] = {
+    "ascorbic_acid": "Vitamin C",
+    "azelaic_acid": "Azelaic Acid",
+    "benzoyl_peroxide": "Benzoyl Peroxide",
+    "ceramide_np": "Ceramide NP",
+    "glycerin": "Glycerin",
+    "hyaluronic_acid": "Hyaluronic Acid",
+    "niacinamide": "Niacinamide",
+    "panthenol": "Panthenol",
+    "retinol": "Retinol",
+    "salicylic_acid": "Salicylic Acid",
+    "zinc_pca": "Zinc PCA",
+}
+
+_SKINCARE_INGREDIENT_CATEGORY_LABELS = {"serum", "moisturizer", "cleanser", "toner"}
+_COSMETIC_SHADE_CATEGORY_LABELS = {"foundation", "lipstick", "blush", "gloss"}
+
+
+def _normalize_serving_token(value: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", _strip_accents(str(value or "").lower())).strip("_")
+
+
+def _normalize_product_ingredient_ids(product: StandardProduct) -> List[str]:
+    ingredient_ids = getattr(product, "ingredient_ids", None) or []
+    if isinstance(ingredient_ids, str):
+        ingredient_ids = [ingredient_ids]
+    deduped: List[str] = []
+    for value in ingredient_ids if isinstance(ingredient_ids, list) else []:
+        normalized = _normalize_serving_token(str(value or "").replace("_", " "))
+        if not normalized:
+            continue
+        canonical = _SKINCARE_INGREDIENT_CANONICAL_ALIASES.get(normalized.replace("_", " "), normalized)
+        if canonical not in deduped:
+            deduped.append(canonical)
+    return deduped
+
+
+def _collect_product_visible_option_labels(product: StandardProduct) -> List[str]:
+    deduped: List[str] = []
+    for variant in getattr(product, "variants", None) or []:
+        for label in getattr(variant, "visible_option_labels", None) or []:
+            normalized = _normalize_serving_token(label)
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+    return deduped
+
+
+def _extract_skin_care_ingredient_intents(
+    query: Optional[str],
+    *,
+    query_semantic_class: str,
+) -> List[Dict[str, Any]]:
+    q = _strip_accents(str(query or "").lower())
+    if not q:
+        return []
+    if query_semantic_class not in {"beauty", "unknown"}:
+        return []
+
+    active: List[Dict[str, Any]] = []
+    for term, canonical_id in _SKINCARE_INGREDIENT_CANONICAL_ALIASES.items():
+        if not _normalized_intent_term_match(q, term):
+            continue
+        if any(item.get("ingredient_id") == canonical_id for item in active):
+            continue
+        active.append(
+            {
+                "label": canonical_id,
+                "ingredient_id": canonical_id,
+                "display_name": _SKINCARE_INGREDIENT_DISPLAY_NAMES.get(canonical_id, canonical_id.replace("_", " ").title()),
+                "query_terms": [term],
+            }
+        )
+    return active
+
+
+def _extract_visible_shade_option_intents(
+    query: Optional[str],
+    *,
+    active_category_labels: list[str],
+) -> List[Dict[str, Any]]:
+    q = _strip_accents(str(query or "").lower())
+    if not q:
+        return []
+    if not any(label in _COSMETIC_SHADE_CATEGORY_LABELS for label in active_category_labels):
+        return []
+
+    active: List[Dict[str, Any]] = []
+    for match in re.finditer(r"\bshade\s+(?P<value>[a-z0-9][a-z0-9 -]{0,30})", q):
+        raw_value = str(match.group("value") or "").strip(" -")
+        normalized = _normalize_serving_token(raw_value)
+        if not normalized:
+            continue
+        label = f"shade_{normalized}"
+        if any(item.get("label") == label for item in active):
+            continue
+        active.append(
+            {
+                "label": label,
+                "product_terms": [raw_value],
+                "structured_only": True,
+            }
+        )
+    return active
 
 
 def _extract_visible_size_option_intents(query: Optional[str]) -> List[Dict[str, Any]]:
@@ -5372,6 +5494,30 @@ async def _handle_find_products_multi(
             "visible_attribute_bucket": "product_category",
         },
         {
+            "label": "foundation",
+            "query_terms": ["foundation", "foundations"],
+            "product_terms": ["foundation", "foundations"],
+            "semantic_classes": ["beauty"],
+        },
+        {
+            "label": "lipstick",
+            "query_terms": ["lipstick", "lipsticks"],
+            "product_terms": ["lipstick", "lipsticks"],
+            "semantic_classes": ["beauty"],
+        },
+        {
+            "label": "blush",
+            "query_terms": ["blush", "blushes"],
+            "product_terms": ["blush", "blushes"],
+            "semantic_classes": ["beauty"],
+        },
+        {
+            "label": "gloss",
+            "query_terms": ["gloss", "glosses", "lip gloss", "lip glosses"],
+            "product_terms": ["gloss", "glosses", "lip gloss", "lip glosses"],
+            "semantic_classes": ["beauty"],
+        },
+        {
             "label": "hoodie",
             "query_terms": ["hoodie", "hoodies", "sudadera", "sudaderas"],
             "product_terms": ["hoodie", "hoodies", "sudadera", "sudaderas"],
@@ -5408,20 +5554,12 @@ async def _handle_find_products_multi(
     active_visible_category_labels = [str(group["label"]) for group in active_visible_category_intents]
     unsupported_beauty_category_intent_groups = [
         {
-            "label": "foundation",
-            "query_terms": ["foundation", "foundations"],
+            "label": "skincare",
+            "query_terms": ["skincare", "skin care", "skin-care"],
         },
         {
-            "label": "lipstick",
-            "query_terms": ["lipstick", "lipsticks"],
-        },
-        {
-            "label": "blush",
-            "query_terms": ["blush", "blushes"],
-        },
-        {
-            "label": "gloss",
-            "query_terms": ["gloss", "glosses", "lip gloss", "lip glosses"],
+            "label": "cosmetics",
+            "query_terms": ["cosmetics", "makeup", "make-up"],
         },
     ]
     active_unsupported_beauty_category_labels = [
@@ -5542,8 +5680,22 @@ async def _handle_find_products_multi(
             q_ascii,
             active_category_labels=active_visible_category_labels,
         ),
+        *_extract_visible_shade_option_intents(
+            q_ascii,
+            active_category_labels=active_visible_category_labels,
+        ),
     ]
     active_visible_option_labels = [str(group["label"]) for group in active_visible_option_intents]
+    cosmetic_shade_category_intents = [
+        label for label in active_visible_category_labels if label in _COSMETIC_SHADE_CATEGORY_LABELS
+    ]
+    requires_explicit_shade_query = bool(cosmetic_shade_category_intents)
+    has_active_shade_option_intent = any(label.startswith("shade_") for label in active_visible_option_labels)
+    active_ingredient_intents = _extract_skin_care_ingredient_intents(
+        q_ascii,
+        query_semantic_class=query_semantic_class,
+    )
+    active_ingredient_labels = [str(group["ingredient_id"]) for group in active_ingredient_intents]
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -6629,7 +6781,11 @@ async def _handle_find_products_multi(
     filtered_products: list[dict[str, Any]] = []
 
     for product, merchant_name in merchant_products:
-        if active_unsupported_beauty_category_labels:
+        if active_unsupported_beauty_category_labels and not (
+            active_visible_category_intents or active_ingredient_intents
+        ):
+            continue
+        if requires_explicit_shade_query and not has_active_shade_option_intent:
             continue
         # Visibility: only surface sellable products to the agent front-end.
         if not _is_product_sellable(product):
@@ -6712,6 +6868,8 @@ async def _handle_find_products_multi(
             ]
         ).strip()
         product_visible_attributes = _normalize_product_visible_attributes(product)
+        product_ingredient_ids = _normalize_product_ingredient_ids(product)
+        structured_visible_option_labels = _collect_product_visible_option_labels(product)
         matched_visible_attributes: Dict[str, List[str]] = {}
         visible_option_blob = " ".join(
             [
@@ -6782,13 +6940,34 @@ async def _handle_find_products_multi(
             len(matched_visible_attribute_labels) < len(active_visible_attribute_intents)
         ):
             continue
-        matched_visible_option_labels = [
-            str(group["label"])
-            for group in active_visible_option_intents
-            if _normalized_intent_terms_match(visible_option_blob, list(group["product_terms"]))
-        ]
+        matched_visible_option_labels = []
+        for group in active_visible_option_intents:
+            label = str(group["label"])
+            structured_match = label in structured_visible_option_labels
+            fallback_match = False
+            if not structured_match and not bool(group.get("structured_only")):
+                fallback_match = _normalized_intent_terms_match(visible_option_blob, list(group["product_terms"]))
+            if structured_match or fallback_match:
+                matched_visible_option_labels.append(label)
         if active_visible_option_intents and len(matched_visible_option_labels) < len(active_visible_option_intents):
             continue
+        matched_ingredient_ids = []
+        matched_ingredient_labels = []
+        if active_ingredient_intents:
+            product_skin_care_categories = {
+                label
+                for label in product_visible_attributes.get("product_category", [])
+                if label in _SKINCARE_INGREDIENT_CATEGORY_LABELS
+            }
+            if not product_skin_care_categories:
+                continue
+            for group in active_ingredient_intents:
+                ingredient_id = str(group.get("ingredient_id") or "").strip()
+                if ingredient_id and ingredient_id in product_ingredient_ids:
+                    matched_ingredient_ids.append(ingredient_id)
+                    matched_ingredient_labels.append(str(group.get("display_name") or ingredient_id))
+            if len(matched_ingredient_ids) < len(active_ingredient_intents):
+                continue
 
         if exclude_lingerie or exclude_hoodies or exclude_joggers or exclude_underwear:
             if exclude_lingerie:
@@ -7070,6 +7249,8 @@ async def _handle_find_products_multi(
             relevance_score += min(0.3, 0.12 * len(matched_visible_attribute_labels))
         if matched_visible_option_labels:
             relevance_score += min(0.2, 0.1 * len(matched_visible_option_labels))
+        if matched_ingredient_ids:
+            relevance_score += min(0.25, 0.12 * len(matched_ingredient_ids))
 
         filtered_products.append(
             {
@@ -7080,6 +7261,8 @@ async def _handle_find_products_multi(
                 "matched_visible_category_labels": list(matched_visible_category_labels),
                 "matched_visible_attribute_labels": list(matched_visible_attribute_labels),
                 "matched_visible_option_labels": list(matched_visible_option_labels),
+                "matched_ingredient_ids": list(matched_ingredient_ids),
+                "matched_ingredient_labels": list(matched_ingredient_labels),
                 "matched_visible_attributes": matched_visible_attributes,
             }
         )
@@ -7118,6 +7301,8 @@ async def _handle_find_products_multi(
     matched_visible_category_summary: List[str] = []
     matched_visible_attribute_summary: List[str] = []
     matched_visible_option_summary: List[str] = []
+    matched_ingredient_id_summary: List[str] = []
+    matched_ingredient_label_summary: List[str] = []
     matched_visible_attributes_summary: Dict[str, List[str]] = {}
     for item_wrapper in page_items:
         product_item = item_wrapper.get("product")
@@ -7154,6 +7339,14 @@ async def _handle_find_products_multi(
             label_text = str(label or "").strip()
             if label_text and label_text not in matched_visible_option_summary:
                 matched_visible_option_summary.append(label_text)
+        for label in item_wrapper.get("matched_ingredient_ids") or []:
+            label_text = str(label or "").strip()
+            if label_text and label_text not in matched_ingredient_id_summary:
+                matched_ingredient_id_summary.append(label_text)
+        for label in item_wrapper.get("matched_ingredient_labels") or []:
+            label_text = str(label or "").strip()
+            if label_text and label_text not in matched_ingredient_label_summary:
+                matched_ingredient_label_summary.append(label_text)
         wrapper_matched_visible_attributes = item_wrapper.get("matched_visible_attributes")
         if isinstance(wrapper_matched_visible_attributes, dict):
             for bucket, labels in wrapper_matched_visible_attributes.items():
@@ -7410,10 +7603,26 @@ async def _handle_find_products_multi(
             "I couldn’t find an eligible pet accessory match for that query right now. "
             "I’m only showing products that are currently purchasable."
         )
-    if not out_products and active_unsupported_beauty_category_labels:
+    if (
+        not out_products
+        and active_unsupported_beauty_category_labels
+        and not (active_visible_category_intents or active_ingredient_intents)
+    ):
         reply_text = reply_text or (
             f"I couldn’t find an eligible {active_unsupported_beauty_category_labels[0]} match for that query right now. "
-            "I’m only showing skin-care products whose visible catalog labels support the requested category."
+            "I’m only showing products whose visible catalog labels support the requested beauty category."
+        )
+    if not out_products and requires_explicit_shade_query and not has_active_shade_option_intent:
+        descriptor = cosmetic_shade_category_intents[0] if cosmetic_shade_category_intents else "cosmetic product"
+        reply_text = reply_text or (
+            f"I couldn’t find an eligible {descriptor} shade match for that query right now. "
+            "I’m only showing cosmetic products when an explicit purchasable shade is available."
+        )
+    if not out_products and active_ingredient_intents:
+        descriptor = active_visible_category_labels[0] if active_visible_category_labels else "skin-care product"
+        reply_text = reply_text or (
+            f"I couldn’t find an eligible {descriptor} match with those reviewed ingredients right now. "
+            "I’m only showing products whose structured ingredient evidence supports the requested constraints."
         )
     if not out_products and active_visible_attribute_labels and active_visible_option_labels:
         descriptor = active_visible_category_labels[0] if active_visible_category_labels else "product"
@@ -7455,10 +7664,13 @@ async def _handle_find_products_multi(
                 "visible_category_intents": active_visible_category_labels,
                 "visible_attribute_intents": active_visible_attribute_labels,
                 "visible_option_intents": active_visible_option_labels,
+                "ingredient_intents": active_ingredient_labels,
                 "unsupported_beauty_category_intents": active_unsupported_beauty_category_labels,
                 "matched_visible_categories": matched_visible_category_summary,
                 "matched_visible_attribute_labels": matched_visible_attribute_summary,
                 "matched_visible_option_labels": matched_visible_option_summary,
+                "matched_ingredient_ids": matched_ingredient_id_summary,
+                "matched_ingredient_labels": matched_ingredient_label_summary,
                 "matched_visible_attributes": matched_visible_attributes_summary,
                 "budget_price_min": effective_price_min,
                 "budget_price_max": effective_price_max,

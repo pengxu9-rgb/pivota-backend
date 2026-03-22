@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from readiness.models import CapabilityStatus, MerchantReadinessSnapshot, ReadyProduct, ReadyVariant
 from readiness.service import build_channel_export, build_export_summary_response, build_readiness_snapshot
 
 
@@ -65,3 +66,59 @@ async def test_export_summary_includes_visible_attribute_coverage() -> None:
     assert summary["servable_product_count_by_category"]["serum"] >= 1
     assert summary["visible_attribute_coverage"]["product_category"]["cleanser"] >= 1
     assert summary["visible_attribute_coverage"]["skin_concern"]["hydrating"] >= 1
+    assert "ingredient_coverage_by_category" in summary
+    assert "shade_coverage_by_category" in summary
+    assert set(summary["ingredient_coverage_by_category"].keys()) == {"serum", "moisturizer", "cleanser", "toner"}
+    assert set(summary["shade_coverage_by_category"].keys()) == {"foundation", "lipstick", "blush", "gloss"}
+
+
+def test_export_summary_tracks_structured_ingredient_and_shade_coverage() -> None:
+    snapshot = MerchantReadinessSnapshot(
+        merchant_id="merch_test_1",
+        merchant_name="Merchant Test",
+        channel="ucp",
+        generated_at="2026-03-22T00:00:00Z",
+        readiness_score=80,
+        products=[
+            ReadyProduct(
+                product_id="prod_serum_1",
+                title="Niacinamide Serum",
+                category="Serum",
+                visible_attributes={"product_category": ["serum"]},
+                ingredient_ids=["niacinamide"],
+                variants=[
+                    ReadyVariant(
+                        variant_id="var_serum_1",
+                        title="Default",
+                        price={"amount": 29.0, "currency": "USD"},
+                        inventory={"quantity": 8, "availability": "in_stock"},
+                        discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                        checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                        channel_coverage={"ucp": "ready"},
+                    )
+                ],
+            ),
+            ReadyProduct(
+                product_id="prod_foundation_1",
+                title="Soft Focus Foundation",
+                category="Foundation",
+                variants=[
+                    ReadyVariant(
+                        variant_id="var_foundation_1",
+                        title="Shade 210",
+                        visible_option_labels=["shade_210"],
+                        price={"amount": 39.0, "currency": "USD"},
+                        inventory={"quantity": 6, "availability": "in_stock"},
+                        discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                        checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                        channel_coverage={"ucp": "ready"},
+                    )
+                ],
+            ),
+        ],
+    )
+
+    summary = build_export_summary_response(snapshot, channel="ucp")
+
+    assert summary["ingredient_coverage_by_category"]["serum"] == 1
+    assert summary["shade_coverage_by_category"]["foundation"] == 1
