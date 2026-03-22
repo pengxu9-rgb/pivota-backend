@@ -3,6 +3,7 @@ Configuration settings for Pivota Infrastructure
 """
 import os
 from typing import Optional
+from urllib.parse import urlparse
 from pydantic_settings import BaseSettings
 
 DEFAULT_PUBLIC_API_BASE_URL = "https://api.pivota.cc"
@@ -12,17 +13,24 @@ def _normalize_public_url(value: Optional[str]) -> str:
     return str(value or "").strip().rstrip("/")
 
 
+def _is_local_public_host(value: str) -> bool:
+    try:
+        host = (urlparse(value).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "0.0.0.0", "localhost"}
+
+
 def resolve_public_api_base_url() -> str:
     for candidate in (
         os.getenv("PUBLIC_API_BASE_URL"),
         os.getenv("PUBLIC_BASE_URL"),
         os.getenv("APP_URL"),
         os.getenv("BASE_URL"),
-        os.getenv("AGENT_API_BASE"),
         DEFAULT_PUBLIC_API_BASE_URL,
     ):
         normalized = _normalize_public_url(candidate)
-        if normalized:
+        if normalized and not _is_local_public_host(normalized):
             return normalized
     return DEFAULT_PUBLIC_API_BASE_URL
 
