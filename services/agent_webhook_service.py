@@ -97,6 +97,31 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
     return None
 
 
+def _db_datetime(value: Any) -> Optional[datetime]:
+    coerced = _coerce_datetime(value)
+    if not coerced:
+        return None
+    return coerced.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _db_now() -> datetime:
+    now = _db_datetime(_utcnow())
+    if now is None:
+        raise RuntimeError("Failed to generate a database timestamp")
+    return now
+
+
+def _record_to_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        return dict(value)
+    except Exception:
+        return {}
+
+
 def _coerce_json(value: Any, fallback: Any) -> Any:
     if value is None:
         return fallback
@@ -273,7 +298,7 @@ async def _activate_pending_secret_if_due(agent_id: str) -> None:
         {
             "agent_id": agent_id,
             "signing_secret": pending_secret,
-            "updated_at": _utcnow(),
+            "updated_at": _db_now(),
         },
     )
 
@@ -302,10 +327,10 @@ async def _get_or_create_raw_config(agent_id: str) -> Dict[str, Any]:
         """,
         {"agent_id": agent_id},
     )
-    legacy_url = str((legacy or {}).get("webhook_url") or "").strip()
+    legacy_url = str(_record_to_dict(legacy).get("webhook_url") or "").strip()
     if legacy_url:
         secret = _generate_signing_secret()
-        now = _utcnow()
+        now = _db_now()
         await database.execute(
             """
             INSERT INTO agent_webhook_configs (
@@ -369,7 +394,7 @@ async def _get_or_create_raw_config(agent_id: str) -> Dict[str, Any]:
 
 async def get_delivery_summary(agent_id: str) -> Dict[str, Any]:
     await ensure_agent_webhook_tables()
-    since = _utcnow() - timedelta(hours=24)
+    since = _db_datetime(_utcnow() - timedelta(hours=24))
     row = await database.fetch_one(
         """
         SELECT
@@ -384,12 +409,13 @@ async def get_delivery_summary(agent_id: str) -> Dict[str, Any]:
         """,
         {"agent_id": agent_id, "since": since},
     )
-    total = int((row or {}).get("total") or 0)
-    succeeded = int((row or {}).get("succeeded") or 0)
-    failed = int((row or {}).get("failed") or 0)
-    retrying = int((row or {}).get("retrying") or 0)
+    row_data = _record_to_dict(row)
+    total = int(row_data.get("total") or 0)
+    succeeded = int(row_data.get("succeeded") or 0)
+    failed = int(row_data.get("failed") or 0)
+    retrying = int(row_data.get("retrying") or 0)
     success_rate = round((succeeded / total) * 100, 2) if total > 0 else 0.0
-    last_delivery_at = _coerce_datetime((row or {}).get("last_delivery_at"))
+    last_delivery_at = _coerce_datetime(row_data.get("last_delivery_at"))
     return {
         "total": total,
         "succeeded": succeeded,
@@ -425,7 +451,7 @@ async def update_webhook_config(
     subscribed_events: Optional[Iterable[str]],
 ) -> Dict[str, Any]:
     current = await _get_or_create_raw_config(agent_id)
-    now = _utcnow()
+    now = _db_now()
     next_url = str(destination_url or "").strip() or None
     next_enabled = bool(enabled and next_url)
     next_events = _normalize_events(subscribed_events)
@@ -546,9 +572,9 @@ async def _persist_delivery_attempt(
         "http_status": http_status,
         "attempt_count": attempt_count,
         "latency_ms": latency_ms,
-        "created_at": created_at,
-        "delivered_at": delivered_at,
-        "next_retry_at": next_retry_at,
+        "created_at": _db_datetime(created_at),
+        "delivered_at": _db_datetime(delivered_at),
+        "next_retry_at": _db_datetime(next_retry_at),
         "request_id": request_id,
         "destination_url": destination_url,
         "payload": json.dumps(payload),
@@ -750,8 +776,8 @@ async def emit_agent_webhook_event(
                 "agent_id": agent_id,
                 "signing_secret": signing_secret,
                 "subscribed_events": json.dumps(subscribed_events),
-                "created_at": _utcnow(),
-                "updated_at": _utcnow(),
+                "created_at": _db_now(),
+                "updated_at": _db_now(),
             },
         )
 
@@ -805,9 +831,9 @@ async def send_test_webhook(agent_id: str, *, request_id: Optional[str] = None) 
         """,
         {
             "agent_id": agent_id,
-            "last_test_at": _utcnow(),
+            "last_test_at": _db_now(),
             "last_test_status": result.get("status"),
-            "updated_at": _utcnow(),
+            "updated_at": _db_now(),
         },
     )
     return result
@@ -912,7 +938,7 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
     current_secret = str(current.get("signing_secret") or "").strip() or _generate_signing_secret()
     new_secret = _generate_signing_secret()
     activates_at = _utcnow() + timedelta(hours=24)
-    now = _utcnow()
+    now = _db_now()
 
     if current.get("created_at") is None:
         await database.execute(
@@ -947,7 +973,7 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
                 "subscribed_events": json.dumps(DEFAULT_WEBHOOK_EVENTS),
                 "signing_secret": current_secret,
                 "pending_signing_secret": new_secret,
-                "pending_secret_activates_at": activates_at,
+                "pending_secret_activates_at": _db_datetime(activates_at),
                 "created_at": now,
                 "updated_at": now,
             },
@@ -966,7 +992,7 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
                 "agent_id": agent_id,
                 "current_signing_secret": current_secret,
                 "pending_signing_secret": new_secret,
-                "pending_secret_activates_at": activates_at,
+                "pending_secret_activates_at": _db_datetime(activates_at),
                 "updated_at": now,
             },
         )
@@ -992,7 +1018,7 @@ async def process_due_retries(limit: int = 20) -> int:
         ORDER BY next_retry_at ASC
         LIMIT :limit
         """,
-        {"now": _utcnow(), "limit": limit},
+        {"now": _db_now(), "limit": limit},
     )
     processed = 0
     for row in rows:
