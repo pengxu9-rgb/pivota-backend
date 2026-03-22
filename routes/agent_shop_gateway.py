@@ -5027,6 +5027,31 @@ async def _handle_find_products_multi(
         )
     )
 
+    pet_accessory_query_terms = (
+        "harness",
+        "harnesses",
+        "leash",
+        "leashes",
+        "collar",
+        "collars",
+        "lead",
+        "leads",
+    )
+    pet_subject_query_terms = (
+        "dog",
+        "dogs",
+        "cat",
+        "cats",
+        "pet",
+        "pets",
+        "puppy",
+        "puppies",
+        "kitten",
+        "kittens",
+    )
+    pet_accessory_intent_query = any(term in q_ascii for term in pet_accessory_query_terms)
+    pet_subject_intent_query = any(term in q_ascii for term in pet_subject_query_terms)
+
     # Detect special intents for downstream filtering/UX.
     look_intent = False
     if "nina studio" in q_lower and any(
@@ -6146,6 +6171,33 @@ async def _handle_find_products_multi(
             ]
         )
         blob_for_filters_ascii = _strip_accents(blob_for_filters)
+        pet_accessory_markers = [
+            "harness",
+            "harnesses",
+            "leash",
+            "leashes",
+            "collar",
+            "collars",
+            "lead",
+            "leads",
+        ]
+        pet_subject_markers = [
+            "dog",
+            "dogs",
+            "cat",
+            "cats",
+            "pet",
+            "pets",
+            "puppy",
+            "puppies",
+            "kitten",
+            "kittens",
+        ]
+        has_pet_accessory_marker = any(tok in blob_for_filters for tok in pet_accessory_markers)
+        has_pet_subject_marker = any(tok in blob_for_filters for tok in pet_subject_markers)
+
+        if pet_accessory_intent_query and not has_pet_accessory_marker:
+            continue
 
         if exclude_lingerie or exclude_hoodies or exclude_joggers or exclude_underwear:
             if exclude_lingerie:
@@ -6415,6 +6467,11 @@ async def _handle_find_products_multi(
                 is_toy_like = False
             if is_toy_like:
                 relevance_score += 0.45
+
+        if pet_accessory_intent_query and has_pet_accessory_marker:
+            relevance_score += 0.45
+            if pet_subject_intent_query and has_pet_subject_marker:
+                relevance_score += 0.15
 
         filtered_products.append(
             {
@@ -6719,6 +6776,11 @@ async def _handle_find_products_multi(
             "I couldn’t find toy items in the current shop catalog for that query. "
             "If you share a brand or character name (for example: Labubu), I can narrow it down."
         )
+    if not out_products and pet_accessory_intent_query:
+        reply_text = reply_text or (
+            "I couldn’t find an eligible pet accessory match for that query right now. "
+            "I’m only showing products that are currently purchasable."
+        )
 
     history_used = bool(history_product_ids or history_terms)
 
@@ -6732,6 +6794,7 @@ async def _handle_find_products_multi(
             "metadata": {
                 "query_source": "cache_multi_intent",
                 "query_semantic_class": query_semantic_class,
+                "pet_accessory_intent_query": pet_accessory_intent_query,
                 "semantic_retry_applied": semantic_retry_applied,
                 "semantic_retry_query": semantic_retry_query,
                 "semantic_retry_hits": semantic_retry_hits,

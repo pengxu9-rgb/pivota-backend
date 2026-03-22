@@ -498,6 +498,171 @@ async def test_shop_gateway_find_products_multi_strict_surface_uses_live_query_f
     assert metadata.get("serving_mode") == "eligible_only"
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_pet_accessory_query_fails_closed_without_accessory_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        product = agent_shop_gateway_module.StandardProduct(
+            id="prod_vest_1",
+            product_id="prod_vest_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Padded Winter Vest for Dogs & Cats",
+            description="Pet apparel only",
+            price=24.0,
+            currency="USD",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [product], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="cat harness",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("total") == 0
+    assert result.get("page_size") == 0
+    assert result.get("products") == []
+    assert "eligible pet accessory" in str(result.get("reply") or "").lower()
+    metadata = result.get("metadata") or {}
+    assert metadata.get("pet_accessory_intent_query") is True
+    assert metadata.get("strict_live_query_fallback_used") is True
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_pet_accessory_query_prefers_actual_accessory_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        vest = agent_shop_gateway_module.StandardProduct(
+            id="prod_vest_1",
+            product_id="prod_vest_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Padded Winter Vest for Dogs & Cats",
+            description="Pet apparel only",
+            price=24.0,
+            currency="USD",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        harness = agent_shop_gateway_module.StandardProduct(
+            id="prod_harness_1",
+            product_id="prod_harness_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Reflective Escape-Proof Cat Harness",
+            description="Secure walking harness for cats",
+            price=31.0,
+            currency="USD",
+            inventory_quantity=6,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [vest, harness], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="cat harness",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_harness_1"
+    assert "harness" in str(products[0]["title"] or "").lower()
+    metadata = result.get("metadata") or {}
+    assert metadata.get("pet_accessory_intent_query") is True
+
+
 def test_agent_cart_validate_rejects_external_seed_merchant(client: TestClient) -> None:
     res = client.post(
         "/agent/v1/cart/validate?merchant_id=external_seed&shipping_country=US",
