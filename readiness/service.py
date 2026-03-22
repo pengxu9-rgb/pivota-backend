@@ -428,6 +428,60 @@ def _count_servable_products_and_variants(snapshot: MerchantReadinessSnapshot, c
     }
 
 
+def _build_visible_attribute_coverage(snapshot: MerchantReadinessSnapshot, channel: str) -> Dict[str, Any]:
+    tracked_categories = ["serum", "moisturizer", "cleanser", "toner"]
+    tracked_skin_concerns = ["sensitive_skin", "brightening", "hydrating"]
+    tracked_formula_constraints = ["fragrance_free"]
+
+    product_category_coverage: Counter[str] = Counter()
+    skin_concern_coverage: Counter[str] = Counter()
+    formula_constraint_coverage: Counter[str] = Counter()
+    servable_product_count_by_category: Counter[str] = Counter()
+
+    for product in snapshot.products:
+        product_visible_attributes = dict(getattr(product, "visible_attributes", None) or {})
+        ready_for_channel = any(variant.channel_coverage.get(channel) == "ready" for variant in product.variants)
+
+        product_categories = [
+            label
+            for label in product_visible_attributes.get("product_category", [])
+            if label in tracked_categories
+        ]
+        for label in product_categories:
+            product_category_coverage.update([label])
+            if ready_for_channel:
+                servable_product_count_by_category.update([label])
+
+        for label in product_visible_attributes.get("skin_concern", []):
+            if label in tracked_skin_concerns:
+                skin_concern_coverage.update([label])
+
+        for label in product_visible_attributes.get("formula_constraint", []):
+            if label in tracked_formula_constraints:
+                formula_constraint_coverage.update([label])
+
+    return {
+        "servable_product_count_by_category": {
+            label: int(servable_product_count_by_category.get(label, 0))
+            for label in tracked_categories
+        },
+        "visible_attribute_coverage": {
+            "product_category": {
+                label: int(product_category_coverage.get(label, 0))
+                for label in tracked_categories
+            },
+            "skin_concern": {
+                label: int(skin_concern_coverage.get(label, 0))
+                for label in tracked_skin_concerns
+            },
+            "formula_constraint": {
+                label: int(formula_constraint_coverage.get(label, 0))
+                for label in tracked_formula_constraints
+            },
+        },
+    }
+
+
 def build_export_summary_response(
     snapshot: MerchantReadinessSnapshot,
     *,
@@ -467,6 +521,7 @@ def build_export_summary_response(
         0,
     )
     servable_counts = _count_servable_products_and_variants(snapshot, export_channel)
+    visible_attribute_summary = _build_visible_attribute_coverage(snapshot, export_channel)
     validation_warnings = list(snapshot.warnings)
     if snapshot.capability_status.get("reviews_confidence") == "blocked":
         validation_warnings.append("review summaries are unavailable for the readiness model")
@@ -491,6 +546,7 @@ def build_export_summary_response(
         "validation_warnings": validation_warnings,
         "stubbed_capabilities": snapshot.stubbed_capabilities,
         **servable_counts,
+        **visible_attribute_summary,
         "offers": [],
         "summary": {
             "offer_count": offer_count,

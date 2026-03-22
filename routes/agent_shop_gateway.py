@@ -511,7 +511,11 @@ def _classify_query_semantic_class(query: Optional[str]) -> str:
     ):
         return "lingerie"
     if re.search(
-        r"\b(beauty|skincare|skin care|cosmetic|cosmetics|makeup|serum|toner|moisturizer|cleanser)\b",
+        r"\b("
+        r"beauty|skincare|skin care|cosmetic|cosmetics|makeup|"
+        r"serum|toner|moisturizer|moisturiser|cleanser|"
+        r"foundation|lipstick|blush|gloss"
+        r")\b",
         q,
     ):
         return "beauty"
@@ -609,6 +613,59 @@ def _normalized_intent_term_match(text: Optional[str], term: Optional[str]) -> b
 
 def _normalized_intent_terms_match(text: Optional[str], terms: list[str]) -> bool:
     return any(_normalized_intent_term_match(text, term) for term in terms if term)
+
+
+def _normalize_product_visible_attributes(product: StandardProduct) -> Dict[str, List[str]]:
+    raw = getattr(product, "visible_attributes", None) or {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized: Dict[str, List[str]] = {}
+    for bucket, values in raw.items():
+        bucket_name = str(bucket or "").strip()
+        if not bucket_name:
+            continue
+        if isinstance(values, str):
+            items = [values]
+        elif isinstance(values, list):
+            items = values
+        else:
+            continue
+        deduped: List[str] = []
+        for value in items:
+            label = str(value or "").strip()
+            if label and label not in deduped:
+                deduped.append(label)
+        if deduped:
+            normalized[bucket_name] = deduped
+    return normalized
+
+
+def _product_visible_attribute_label_matches(
+    product_visible_attributes: Dict[str, List[str]],
+    *,
+    bucket: Optional[str],
+    label: Optional[str],
+) -> bool:
+    bucket_name = str(bucket or "").strip()
+    target_label = str(label or "").strip()
+    if not bucket_name or not target_label:
+        return False
+    return target_label in (product_visible_attributes.get(bucket_name) or [])
+
+
+def _record_matched_visible_attribute(
+    matched_visible_attributes: Dict[str, List[str]],
+    *,
+    bucket: Optional[str],
+    label: Optional[str],
+) -> None:
+    bucket_name = str(bucket or "").strip()
+    target_label = str(label or "").strip()
+    if not bucket_name or not target_label:
+        return
+    bucket_values = matched_visible_attributes.setdefault(bucket_name, [])
+    if target_label not in bucket_values:
+        bucket_values.append(target_label)
 
 
 def _extract_visible_size_option_intents(query: Optional[str]) -> List[Dict[str, Any]]:
@@ -5290,6 +5347,29 @@ async def _handle_find_products_multi(
             "label": "serum",
             "query_terms": ["serum", "serums"],
             "product_terms": ["serum", "serums"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
+        },
+        {
+            "label": "moisturizer",
+            "query_terms": ["moisturizer", "moisturizers", "moisturiser", "moisturisers"],
+            "product_terms": ["moisturizer", "moisturizers", "moisturiser", "moisturisers"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
+        },
+        {
+            "label": "cleanser",
+            "query_terms": ["cleanser", "cleansers"],
+            "product_terms": ["cleanser", "cleansers"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
+        },
+        {
+            "label": "toner",
+            "query_terms": ["toner", "toners"],
+            "product_terms": ["toner", "toners"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
         },
         {
             "label": "hoodie",
@@ -5317,12 +5397,38 @@ async def _handle_find_products_multi(
             "product_terms": ["dress", "dresses", "vestido", "vestidos"],
         },
     ]
-    active_visible_category_intents = [
-        group
-        for group in visible_category_intent_groups
-        if any(term in q_ascii for term in group["query_terms"])
-    ]
+    active_visible_category_intents = []
+    for group in visible_category_intent_groups:
+        if not _normalized_intent_terms_match(q_ascii, list(group["query_terms"])):
+            continue
+        allowed_semantic_classes = {str(item) for item in (group.get("semantic_classes") or []) if item}
+        if allowed_semantic_classes and query_semantic_class not in allowed_semantic_classes:
+            continue
+        active_visible_category_intents.append(group)
     active_visible_category_labels = [str(group["label"]) for group in active_visible_category_intents]
+    unsupported_beauty_category_intent_groups = [
+        {
+            "label": "foundation",
+            "query_terms": ["foundation", "foundations"],
+        },
+        {
+            "label": "lipstick",
+            "query_terms": ["lipstick", "lipsticks"],
+        },
+        {
+            "label": "blush",
+            "query_terms": ["blush", "blushes"],
+        },
+        {
+            "label": "gloss",
+            "query_terms": ["gloss", "glosses", "lip gloss", "lip glosses"],
+        },
+    ]
+    active_unsupported_beauty_category_labels = [
+        str(group["label"])
+        for group in unsupported_beauty_category_intent_groups
+        if _normalized_intent_terms_match(q_ascii, list(group["query_terms"]))
+    ]
     apparel_visible_category_labels = {"hoodie", "sweater", "vest", "skirt", "dress"}
     visible_attribute_intent_groups = [
         {
@@ -5343,6 +5449,7 @@ async def _handle_find_products_multi(
             ],
             "semantic_classes": ["beauty"],
             "category_labels": ["serum"],
+            "visible_attribute_bucket": "formula_constraint",
         },
         {
             "label": "sensitive_skin",
@@ -5350,6 +5457,7 @@ async def _handle_find_products_multi(
             "product_terms": ["sensitive skin", "sensitive-skin"],
             "semantic_classes": ["beauty"],
             "category_labels": ["serum"],
+            "visible_attribute_bucket": "skin_concern",
         },
         {
             "label": "hydrating",
@@ -5357,6 +5465,7 @@ async def _handle_find_products_multi(
             "product_terms": ["hydrating", "hydrate", "hydration"],
             "semantic_classes": ["beauty"],
             "category_labels": ["serum"],
+            "visible_attribute_bucket": "skin_concern",
         },
         {
             "label": "brightening",
@@ -5364,6 +5473,7 @@ async def _handle_find_products_multi(
             "product_terms": ["brightening", "brighten"],
             "semantic_classes": ["beauty"],
             "category_labels": ["serum"],
+            "visible_attribute_bucket": "skin_concern",
         },
         {
             "label": "waterproof",
@@ -6519,6 +6629,8 @@ async def _handle_find_products_multi(
     filtered_products: list[dict[str, Any]] = []
 
     for product, merchant_name in merchant_products:
+        if active_unsupported_beauty_category_labels:
+            continue
         # Visibility: only surface sellable products to the agent front-end.
         if not _is_product_sellable(product):
             continue
@@ -6599,6 +6711,8 @@ async def _handle_find_products_multi(
                 " ".join(str(tag).lower() for tag in (getattr(product, "tags", None) or []) if tag),
             ]
         ).strip()
+        product_visible_attributes = _normalize_product_visible_attributes(product)
+        matched_visible_attributes: Dict[str, List[str]] = {}
         visible_option_blob = " ".join(
             [
                 str(getattr(variant, "title", "") or "").lower()
@@ -6620,18 +6734,50 @@ async def _handle_find_products_multi(
         if pet_accessory_intent_query and not has_pet_accessory_marker:
             continue
 
-        matched_visible_category_labels = [
-            str(group["label"])
-            for group in active_visible_category_intents
-            if any(term in visible_category_blob for term in group["product_terms"])
-        ]
+        matched_visible_category_labels = []
+        for group in active_visible_category_intents:
+            label = str(group["label"])
+            visible_attribute_bucket = str(group.get("visible_attribute_bucket") or "").strip()
+            matched = False
+            if visible_attribute_bucket:
+                matched = _product_visible_attribute_label_matches(
+                    product_visible_attributes,
+                    bucket=visible_attribute_bucket,
+                    label=label,
+                )
+                if matched:
+                    _record_matched_visible_attribute(
+                        matched_visible_attributes,
+                        bucket=visible_attribute_bucket,
+                        label=label,
+                    )
+            else:
+                matched = _normalized_intent_terms_match(visible_category_blob, list(group["product_terms"]))
+            if matched:
+                matched_visible_category_labels.append(label)
         if active_visible_category_intents and not matched_visible_category_labels:
             continue
-        matched_visible_attribute_labels = [
-            str(group["label"])
-            for group in active_visible_attribute_intents
-            if _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
-        ]
+        matched_visible_attribute_labels = []
+        for group in active_visible_attribute_intents:
+            label = str(group["label"])
+            visible_attribute_bucket = str(group.get("visible_attribute_bucket") or "").strip()
+            matched = False
+            if visible_attribute_bucket:
+                matched = _product_visible_attribute_label_matches(
+                    product_visible_attributes,
+                    bucket=visible_attribute_bucket,
+                    label=label,
+                )
+                if matched:
+                    _record_matched_visible_attribute(
+                        matched_visible_attributes,
+                        bucket=visible_attribute_bucket,
+                        label=label,
+                    )
+            else:
+                matched = _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
+            if matched:
+                matched_visible_attribute_labels.append(label)
         if active_visible_attribute_intents and (
             len(matched_visible_attribute_labels) < len(active_visible_attribute_intents)
         ):
@@ -6931,6 +7077,7 @@ async def _handle_find_products_multi(
                 "merchant_name": merchant_name,
                 "relevance_score": relevance_score,
                 "is_toy_like": is_toy_like if toys_intent_query else False,
+                "matched_visible_attributes": matched_visible_attributes,
             }
         )
 
@@ -6965,6 +7112,7 @@ async def _handle_find_products_multi(
 
     # Map to Shopping contract; inject merchant_id into result
     out_products = []
+    matched_visible_attributes_summary: Dict[str, List[str]] = {}
     for item_wrapper in page_items:
         product_item = item_wrapper.get("product")
         merchant_name = item_wrapper.get("merchant_name")
@@ -6988,6 +7136,17 @@ async def _handle_find_products_multi(
 
         if merchant_name and not item.get("merchant_name"):
             item["merchant_name"] = merchant_name
+        wrapper_matched_visible_attributes = item_wrapper.get("matched_visible_attributes")
+        if isinstance(wrapper_matched_visible_attributes, dict):
+            for bucket, labels in wrapper_matched_visible_attributes.items():
+                bucket_name = str(bucket or "").strip()
+                if not bucket_name:
+                    continue
+                summary_labels = matched_visible_attributes_summary.setdefault(bucket_name, [])
+                for label in labels if isinstance(labels, list) else [labels]:
+                    label_text = str(label or "").strip()
+                    if label_text and label_text not in summary_labels:
+                        summary_labels.append(label_text)
         out_products.append(item)
 
     if strict_serving_mode:
@@ -7233,6 +7392,11 @@ async def _handle_find_products_multi(
             "I couldn’t find an eligible pet accessory match for that query right now. "
             "I’m only showing products that are currently purchasable."
         )
+    if not out_products and active_unsupported_beauty_category_labels:
+        reply_text = reply_text or (
+            f"I couldn’t find an eligible {active_unsupported_beauty_category_labels[0]} match for that query right now. "
+            "I’m only showing skin-care products whose visible catalog labels support the requested category."
+        )
     if not out_products and active_visible_attribute_labels:
         attribute_descriptor = active_visible_category_labels[0] if active_visible_category_labels else "product"
         reply_text = reply_text or (
@@ -7267,6 +7431,8 @@ async def _handle_find_products_multi(
                 "visible_category_intents": active_visible_category_labels,
                 "visible_attribute_intents": active_visible_attribute_labels,
                 "visible_option_intents": active_visible_option_labels,
+                "unsupported_beauty_category_intents": active_unsupported_beauty_category_labels,
+                "matched_visible_attributes": matched_visible_attributes_summary,
                 "budget_price_min": effective_price_min,
                 "budget_price_max": effective_price_max,
                 "budget_currency": budget_currency,

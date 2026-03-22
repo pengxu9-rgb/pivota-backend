@@ -388,6 +388,7 @@ def build_merchant_snapshot(dataset: MerchantSourceDataset, channel: str = "ucp"
                 brand=product.vendor,
                 category=product.product_type,
                 default_image_url=product.image_url or (product.images[0] if product.images else None),
+                visible_attributes=dict(product.visible_attributes or {}),
                 reviews=ReviewSummary(**dataset.product_review_summaries[product.id])
                 if dataset.product_review_summaries.get(product.id)
                 else None,

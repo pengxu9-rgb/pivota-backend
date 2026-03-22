@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from readiness.service import build_channel_export
+from readiness.service import build_channel_export, build_export_summary_response, build_readiness_snapshot
 
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -55,3 +55,13 @@ async def test_acp_export_filters_blocked_variants() -> None:
     assert report.servable_variant_count >= 1
     offer_ids = {offer["offer_id"] for offer in report.offers}
     assert "acp:synthetic-demo-merchant:prod_peptide_serum:var_serum_refill" not in offer_ids
+
+
+@pytest.mark.asyncio
+async def test_export_summary_includes_visible_attribute_coverage() -> None:
+    snapshot = await build_readiness_snapshot("synthetic-demo-merchant", channel="ucp")
+    summary = build_export_summary_response(snapshot, channel="ucp")
+
+    assert summary["servable_product_count_by_category"]["serum"] >= 1
+    assert summary["visible_attribute_coverage"]["product_category"]["cleanser"] >= 1
+    assert summary["visible_attribute_coverage"]["skin_concern"]["hydrating"] >= 1

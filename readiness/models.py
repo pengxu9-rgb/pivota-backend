@@ -98,6 +98,7 @@ class ReadyProduct(BaseModel):
     brand: Optional[str] = None
     category: Optional[str] = None
     default_image_url: Optional[str] = None
+    visible_attributes: Dict[str, List[str]] = Field(default_factory=dict)
     reviews: Optional[ReviewSummary] = None
     variants: List[ReadyVariant] = Field(default_factory=list)
 

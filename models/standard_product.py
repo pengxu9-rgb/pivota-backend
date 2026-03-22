@@ -6,10 +6,132 @@ Pivota 的核心价值：将多平台产品数据转换为统一标准格式
 
 from datetime import datetime
 from enum import Enum
+import re
 from typing import Optional, List, Dict, Any, Tuple
+import unicodedata
 
 from pydantic import BaseModel, Field, validator, field_validator, model_validator
 from utils.rich_text import rich_text_to_plain_text
+
+
+_VISIBLE_BEAUTY_ATTRIBUTE_RULES: Dict[str, List[Dict[str, Any]]] = {
+    "product_category": [
+        {"label": "serum", "terms": ["serum", "serums"]},
+        {"label": "moisturizer", "terms": ["moisturizer", "moisturizers", "moisturiser", "moisturisers"]},
+        {"label": "cleanser", "terms": ["cleanser", "cleansers"]},
+        {"label": "toner", "terms": ["toner", "toners"]},
+    ],
+    "skin_concern": [
+        {"label": "sensitive_skin", "terms": ["sensitive skin", "sensitive-skin"]},
+        {"label": "brightening", "terms": ["brightening", "brighten"]},
+        {"label": "hydrating", "terms": ["hydrating", "hydrate", "hydration"]},
+    ],
+    "formula_constraint": [
+        {
+            "label": "fragrance_free",
+            "terms": [
+                "fragrance free",
+                "fragrance-free",
+                "free fragrance",
+                "without fragrance",
+                "no fragrance",
+                "sin fragancia",
+            ],
+        },
+    ],
+}
+
+
+def _normalize_visible_attribute_text(value: Optional[str]) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
+
+
+def _normalized_visible_term_matches(text: str, term: str) -> bool:
+    source = _normalize_visible_attribute_text(text)
+    target = _normalize_visible_attribute_text(term)
+    if not source or not target:
+        return False
+    parts = [re.escape(part) for part in re.split(r"\s+", target) if part]
+    if not parts:
+        return False
+    pattern = r"\s+".join(parts)
+    return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", source) is not None
+
+
+def _normalize_visible_attribute_labels(raw: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
+    if not isinstance(raw, dict):
+        return {}
+
+    normalized: Dict[str, List[str]] = {}
+    for bucket, values in raw.items():
+        bucket_name = str(bucket or "").strip()
+        if not bucket_name:
+            continue
+        if isinstance(values, str):
+            items = [values]
+        elif isinstance(values, list):
+            items = values
+        else:
+            continue
+        deduped: List[str] = []
+        for value in items:
+            label = str(value or "").strip()
+            if label and label not in deduped:
+                deduped.append(label)
+        if deduped:
+            normalized[bucket_name] = deduped
+    return normalized
+
+
+def _derive_beauty_visible_attributes(
+    *,
+    title: Optional[str],
+    product_type: Optional[str],
+    tags: Optional[List[str]],
+) -> Dict[str, List[str]]:
+    sources: List[str] = []
+    for candidate in [title, product_type, *(tags or [])]:
+        text = str(candidate or "").strip()
+        if text:
+            sources.append(text)
+
+    if not sources:
+        return {}
+
+    visible_attributes: Dict[str, List[str]] = {}
+    for bucket, rules in _VISIBLE_BEAUTY_ATTRIBUTE_RULES.items():
+        matched_labels: List[str] = []
+        for rule in rules:
+            label = str(rule.get("label") or "").strip()
+            terms = [str(term or "").strip() for term in (rule.get("terms") or []) if str(term or "").strip()]
+            if not label or not terms:
+                continue
+            if any(_normalized_visible_term_matches(source, term) for source in sources for term in terms):
+                if label not in matched_labels:
+                    matched_labels.append(label)
+        if matched_labels:
+            visible_attributes[bucket] = matched_labels
+    return visible_attributes
+
+
+def _merge_visible_attribute_maps(
+    primary: Dict[str, List[str]],
+    secondary: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    merged: Dict[str, List[str]] = {}
+    for bucket in list(primary.keys()) + [bucket for bucket in secondary.keys() if bucket not in primary]:
+        deduped: List[str] = []
+        for label in [*(primary.get(bucket) or []), *(secondary.get(bucket) or [])]:
+            if label and label not in deduped:
+                deduped.append(label)
+        if deduped:
+            merged[bucket] = deduped
+    return merged
 
 
 class ProductStatus(str, Enum):
@@ -62,6 +184,7 @@ class StandardProduct(BaseModel):
     vendor: Optional[str] = None  # 品牌/供应商
     product_type: Optional[str] = None  # 产品类型（例如："T-Shirts"）
     tags: List[str] = []  # 标签
+    visible_attributes: Dict[str, List[str]] = Field(default_factory=dict)
     
     # 价格和库存（默认变体）
     price: float
@@ -140,6 +263,16 @@ class StandardProduct(BaseModel):
         self.description_text = rich_text_to_plain_text(
             self.description_text or self.description or ""
         ) or None
+        normalized_visible_attributes = _normalize_visible_attribute_labels(self.visible_attributes)
+        derived_visible_attributes = _derive_beauty_visible_attributes(
+            title=self.title,
+            product_type=self.product_type,
+            tags=self.tags,
+        )
+        self.visible_attributes = _merge_visible_attribute_maps(
+            normalized_visible_attributes,
+            derived_visible_attributes,
+        )
         if self.in_stock is None:
             inv = self.inventory_quantity or 0
             self.in_stock = bool(inv > 0 and self.orderable is True)
