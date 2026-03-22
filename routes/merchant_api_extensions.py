@@ -2735,9 +2735,15 @@ async def change_password(
         "message": "Password changed successfully"
     }
 
-@router.post("/merchant/security/enable-2fa")
+@router.post("/merchant/security/enable-2fa", deprecated=True)
 async def enable_2fa(current_user: dict = Depends(get_current_user)):
-    """Enable two-factor authentication"""
+    """
+    Deprecated internal stub.
+
+    This endpoint does not persist enrollment state, verify the OTP seed, or
+    integrate with login challenge / recovery flows yet. Keep it out of the
+    merchant-facing UI until a full implementation exists.
+    """
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
     

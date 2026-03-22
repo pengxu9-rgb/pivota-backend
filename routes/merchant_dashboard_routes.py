@@ -8,12 +8,25 @@ import httpx
 import string
 import json
 import asyncio
+from pydantic import BaseModel
 from utils.auth import get_current_user
 from db.database import database
+from db.merchant_portal_preferences import (
+    DEFAULT_MERCHANT_PORTAL_PREFERENCES,
+    get_merchant_portal_preferences,
+    upsert_merchant_portal_preferences,
+)
 from models.order_response import format_order_for_response
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+class MerchantPortalPreferencesRequest(BaseModel):
+    email_orders: bool = True
+    email_payments: bool = True
+    email_inventory: bool = False
+    email_weekly: bool = False
 
 # Payment status normalization:
 # - "status" is the order lifecycle (pending/completed/fulfilled/etc.)
@@ -190,6 +203,65 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
         if merchant_data:
             return {"status": "success", "data": merchant_data["profile"]}
         raise HTTPException(status_code=500, detail="Failed to fetch profile")
+
+
+@router.get("/merchant/settings/preferences")
+async def get_merchant_settings_preferences(current_user: dict = Depends(get_current_user)):
+    """Get merchant portal notification preferences."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+
+    preferences = await get_merchant_portal_preferences(merchant_id)
+    return {
+        "status": "success",
+        "data": {
+            "merchant_id": merchant_id,
+            "email_orders": preferences.get("email_orders", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_orders"]),
+            "email_payments": preferences.get("email_payments", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_payments"]),
+            "email_inventory": preferences.get("email_inventory", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_inventory"]),
+            "email_weekly": preferences.get("email_weekly", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_weekly"]),
+            "updated_at": preferences.get("updated_at"),
+        },
+    }
+
+
+@router.put("/merchant/settings/preferences")
+async def update_merchant_settings_preferences(
+    payload: MerchantPortalPreferencesRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist merchant portal notification preferences."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+
+    preferences = await upsert_merchant_portal_preferences(
+        merchant_id,
+        {
+            "email_orders": payload.email_orders,
+            "email_payments": payload.email_payments,
+            "email_inventory": payload.email_inventory,
+            "email_weekly": payload.email_weekly,
+        },
+    )
+    return {
+        "status": "success",
+        "data": {
+            "merchant_id": merchant_id,
+            "email_orders": preferences["email_orders"],
+            "email_payments": preferences["email_payments"],
+            "email_inventory": preferences["email_inventory"],
+            "email_weekly": preferences["email_weekly"],
+            "updated_at": preferences.get("updated_at"),
+        },
+    }
 
 @router.get("/merchant/{merchant_id}/integrations")
 async def get_merchant_stores(
