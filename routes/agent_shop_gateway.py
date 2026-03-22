@@ -2113,6 +2113,25 @@ def _attach_eligible_serving_fields(
     return attached
 
 
+def _attach_eligible_serving_fields_to_items(
+    items: List[Dict[str, Any]],
+    *,
+    commerce_surface: str,
+) -> List[Dict[str, Any]]:
+    attached_items: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        attached = _attach_eligible_serving_fields(
+            item,
+            item,
+            commerce_surface=commerce_surface,
+        )
+        if attached is not None:
+            attached_items.append(attached)
+    return attached_items
+
+
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -5723,6 +5742,12 @@ async def _handle_find_products_multi(
                 external_products = [w["product"] for w in external_seed_wrappers]
                 mapped = external_products + mapped
 
+        if strict_serving_mode:
+            mapped = _attach_eligible_serving_fields_to_items(
+                mapped,
+                commerce_surface=commerce_surface,
+            )
+
         start_idx = (page - 1) * limit
         page_items = mapped[start_idx : start_idx + limit]
         return _maybe_attach_eval_debug(
@@ -5738,6 +5763,14 @@ async def _handle_find_products_multi(
                     "merchants_searched": len(merchant_map),
                     "creator_id": creator_id,
                     "creator_name": creator_name,
+                    **(
+                        {
+                            "commerce_surface": commerce_surface,
+                            "serving_mode": "eligible_only",
+                        }
+                        if strict_serving_mode
+                        else {}
+                    ),
                 },
             },
             rewritten_query=q_ascii,
@@ -6462,6 +6495,12 @@ async def _handle_find_products_multi(
 
             fallback_items = mapped[start_idx:end_idx]
             if mapped:
+                if strict_serving_mode:
+                    mapped = _attach_eligible_serving_fields_to_items(
+                        mapped,
+                        commerce_surface=commerce_surface,
+                    )
+                    fallback_items = mapped[start_idx:end_idx]
                 return _maybe_attach_eval_debug(
                     {
                         "products": fallback_items,
@@ -6478,6 +6517,14 @@ async def _handle_find_products_multi(
                             "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
                             "creator_id": creator_id,
                             "creator_name": creator_name,
+                            **(
+                                {
+                                    "commerce_surface": commerce_surface,
+                                    "serving_mode": "eligible_only",
+                                }
+                                if strict_serving_mode
+                                else {}
+                            ),
                         },
                     },
                     rewritten_query=q_ascii,
@@ -6517,6 +6564,12 @@ async def _handle_find_products_multi(
 
             fallback_items = mapped[start_idx:end_idx]
             if mapped:
+                if strict_serving_mode:
+                    mapped = _attach_eligible_serving_fields_to_items(
+                        mapped,
+                        commerce_surface=commerce_surface,
+                    )
+                    fallback_items = mapped[start_idx:end_idx]
                 return _maybe_attach_eval_debug(
                     {
                         "products": fallback_items,
@@ -6533,6 +6586,14 @@ async def _handle_find_products_multi(
                             "base_merchant_fanout_enabled": base_merchant_fanout_enabled,
                             "creator_id": creator_id,
                             "creator_name": creator_name,
+                            **(
+                                {
+                                    "commerce_surface": commerce_surface,
+                                    "serving_mode": "eligible_only",
+                                }
+                                if strict_serving_mode
+                                else {}
+                            ),
                         },
                     },
                     rewritten_query=q_ascii,
@@ -6636,7 +6697,14 @@ async def _handle_find_products_multi(
                 "shopping_sku_json_scan_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN
                 ),
-                **({"commerce_surface": commerce_surface} if strict_serving_mode else {}),
+                **(
+                    {
+                        "commerce_surface": commerce_surface,
+                        "serving_mode": "eligible_only",
+                    }
+                    if strict_serving_mode
+                    else {}
+                ),
             },
         },
         rewritten_query=q_ascii,

@@ -220,6 +220,85 @@ async def test_shop_gateway_find_products_multi_strict_surface_returns_only_inte
     assert products[0]["exact_resolution_identifiers"]["variant_id"] == "var_live_1"
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_empty_query_live_fallback_keeps_strict_serving_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_live_1", "business_name": "Live Merchant"}]
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        product = agent_shop_gateway_module.StandardProduct(
+            id="prod_live_1",
+            product_id="prod_live_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Eligible Fallback Product",
+            description="Internal eligible fallback item",
+            price=29.0,
+            currency="USD",
+            inventory_quantity=8,
+            variants=[
+                {
+                    "id": "var_live_1",
+                    "sku": "sku_live_1",
+                    "title": "Default",
+                    "price": 29.0,
+                    "inventory_quantity": 8,
+                }
+            ],
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [product], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-ui"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_live_1"
+    assert products[0].get("commerce_surface") == "agent_api"
+    assert products[0]["top_offer_summary"]["purchase_route"] == "internal_checkout"
+    assert metadata.get("query_source") == "live_merchant_fallback"
+    assert metadata.get("commerce_surface") == "agent_api"
+    assert metadata.get("serving_mode") == "eligible_only"
+
+
 def test_agent_cart_validate_rejects_external_seed_merchant(client: TestClient) -> None:
     res = client.post(
         "/agent/v1/cart/validate?merchant_id=external_seed&shipping_country=US",
