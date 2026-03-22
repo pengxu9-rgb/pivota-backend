@@ -594,6 +594,66 @@ def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
     return None
 
 
+def _normalized_intent_term_match(text: Optional[str], term: Optional[str]) -> bool:
+    source = _strip_accents(str(text or "").lower()).strip()
+    target = _strip_accents(str(term or "").lower()).strip()
+    if not source or not target:
+        return False
+    parts = [re.escape(part) for part in re.split(r"\s+", target) if part]
+    if not parts:
+        return False
+    pattern = r"\s+".join(parts)
+    return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", source) is not None
+
+
+def _normalized_intent_terms_match(text: Optional[str], terms: list[str]) -> bool:
+    return any(_normalized_intent_term_match(text, term) for term in terms if term)
+
+
+def _extract_visible_size_option_intents(query: Optional[str]) -> List[Dict[str, Any]]:
+    q = _strip_accents(str(query or "").lower())
+    if not q:
+        return []
+
+    groups = [
+        {
+            "label": "size_xs",
+            "patterns": [r"\bsize\s*(?:xs|x-small|extra small)\b"],
+            "product_terms": ["xs", "x-small", "extra small"],
+        },
+        {
+            "label": "size_s",
+            "patterns": [r"\bsize\s*(?:s|small)\b"],
+            "product_terms": ["s", "small"],
+        },
+        {
+            "label": "size_m",
+            "patterns": [r"\bsize\s*(?:m|medium)\b"],
+            "product_terms": ["m", "medium"],
+        },
+        {
+            "label": "size_l",
+            "patterns": [r"\bsize\s*(?:l|large)\b"],
+            "product_terms": ["l", "large"],
+        },
+        {
+            "label": "size_xl",
+            "patterns": [r"\bsize\s*(?:xl|x-large|extra large)\b"],
+            "product_terms": ["xl", "x-large", "extra large"],
+        },
+        {
+            "label": "size_xxl",
+            "patterns": [r"\bsize\s*(?:xxl|2xl|xx-large|extra extra large)\b"],
+            "product_terms": ["xxl", "2xl", "xx-large", "extra extra large"],
+        },
+    ]
+    active: List[Dict[str, Any]] = []
+    for group in groups:
+        if any(re.search(pattern, q) for pattern in group["patterns"]):
+            active.append(group)
+    return active
+
+
 def _extract_query_budget_constraints(query: Optional[str]) -> Dict[str, Any]:
     text = str(query or "").strip()
     if not text:
@@ -5197,6 +5257,7 @@ async def _handle_find_products_multi(
         if any(term in q_ascii for term in group["query_terms"])
     ]
     active_visible_category_labels = [str(group["label"]) for group in active_visible_category_intents]
+    apparel_visible_category_labels = {"hoodie", "sweater", "vest", "skirt", "dress"}
     visible_attribute_intent_groups = [
         {
             "label": "fragrance_free",
@@ -5214,29 +5275,75 @@ async def _handle_find_products_multi(
                 "no fragrance",
                 "sin fragancia",
             ],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
         },
         {
             "label": "sensitive_skin",
             "query_terms": ["sensitive skin", "sensitive-skin"],
             "product_terms": ["sensitive skin", "sensitive-skin"],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
         },
         {
             "label": "hydrating",
             "query_terms": ["hydrating", "hydrate", "hydration"],
             "product_terms": ["hydrating", "hydrate", "hydration"],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
         },
         {
             "label": "brightening",
             "query_terms": ["brightening", "brighten"],
             "product_terms": ["brightening", "brighten"],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
+        },
+        {
+            "label": "waterproof",
+            "query_terms": ["waterproof", "water-resistant", "water resistant"],
+            "product_terms": ["waterproof", "water-resistant", "water resistant"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "cotton",
+            "query_terms": ["cotton"],
+            "product_terms": ["cotton"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "wool",
+            "query_terms": ["wool", "woolen", "woollen"],
+            "product_terms": ["wool", "woolen", "woollen"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "red",
+            "query_terms": ["red"],
+            "product_terms": ["red"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "black",
+            "query_terms": ["black"],
+            "product_terms": ["black"],
+            "category_labels": sorted(apparel_visible_category_labels),
         },
     ]
-    active_visible_attribute_intents = [
-        group
-        for group in visible_attribute_intent_groups
-        if any(term in q_ascii for term in group["query_terms"])
-    ]
+    active_visible_attribute_intents = []
+    for group in visible_attribute_intent_groups:
+        if not _normalized_intent_terms_match(q_ascii, list(group["query_terms"])):
+            continue
+        allowed_semantic_classes = {str(item) for item in (group.get("semantic_classes") or []) if item}
+        if allowed_semantic_classes and query_semantic_class not in allowed_semantic_classes:
+            continue
+        allowed_category_labels = {str(item) for item in (group.get("category_labels") or []) if item}
+        if allowed_category_labels and not any(label in allowed_category_labels for label in active_visible_category_labels):
+            continue
+        active_visible_attribute_intents.append(group)
     active_visible_attribute_labels = [str(group["label"]) for group in active_visible_attribute_intents]
+    active_visible_option_intents = _extract_visible_size_option_intents(q_ascii)
+    active_visible_option_labels = [str(group["label"]) for group in active_visible_option_intents]
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -6402,6 +6509,20 @@ async def _handle_find_products_multi(
                 " ".join(str(tag).lower() for tag in (getattr(product, "tags", None) or []) if tag),
             ]
         ).strip()
+        visible_option_blob = " ".join(
+            [
+                str(getattr(variant, "title", "") or "").lower()
+                + " "
+                + " ".join(
+                    [
+                        str(name).lower(),
+                        str(value).lower(),
+                    ]
+                )
+                for variant in (getattr(product, "variants", None) or [])
+                for name, value in ((getattr(variant, "options", None) or {}) or {}).items()
+            ]
+        ).strip()
         visible_category_blob = pet_accessory_blob
         has_pet_accessory_marker = any(tok in pet_accessory_blob for tok in pet_accessory_markers)
         has_pet_subject_marker = any(tok in pet_accessory_blob for tok in pet_subject_markers)
@@ -6419,11 +6540,18 @@ async def _handle_find_products_multi(
         matched_visible_attribute_labels = [
             str(group["label"])
             for group in active_visible_attribute_intents
-            if any(term in visible_attribute_blob for term in group["product_terms"])
+            if _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
         ]
         if active_visible_attribute_intents and (
             len(matched_visible_attribute_labels) < len(active_visible_attribute_intents)
         ):
+            continue
+        matched_visible_option_labels = [
+            str(group["label"])
+            for group in active_visible_option_intents
+            if _normalized_intent_terms_match(visible_option_blob, list(group["product_terms"]))
+        ]
+        if active_visible_option_intents and len(matched_visible_option_labels) < len(active_visible_option_intents):
             continue
 
         if exclude_lingerie or exclude_hoodies or exclude_joggers or exclude_underwear:
@@ -6704,6 +6832,8 @@ async def _handle_find_products_multi(
             relevance_score += 0.35
         if matched_visible_attribute_labels:
             relevance_score += min(0.3, 0.12 * len(matched_visible_attribute_labels))
+        if matched_visible_option_labels:
+            relevance_score += min(0.2, 0.1 * len(matched_visible_option_labels))
 
         filtered_products.append(
             {
@@ -7019,6 +7149,12 @@ async def _handle_find_products_multi(
             f"I couldn’t find an eligible {attribute_descriptor} match with those visible attributes right now. "
             "I’m only showing products whose visible catalog labels support the requested attributes."
         )
+    if not out_products and active_visible_option_labels:
+        option_descriptor = active_visible_category_labels[0] if active_visible_category_labels else "product"
+        reply_text = reply_text or (
+            f"I couldn’t find an eligible {option_descriptor} match with those visible options right now. "
+            "I’m only showing products whose variant options support the requested constraints."
+        )
     if not out_products and active_visible_category_labels:
         reply_text = reply_text or (
             f"I couldn’t find an eligible {active_visible_category_labels[0]} match for that query right now. "
@@ -7040,6 +7176,7 @@ async def _handle_find_products_multi(
                 "pet_accessory_intent_query": pet_accessory_intent_query,
                 "visible_category_intents": active_visible_category_labels,
                 "visible_attribute_intents": active_visible_attribute_labels,
+                "visible_option_intents": active_visible_option_labels,
                 "budget_price_min": effective_price_min,
                 "budget_price_max": effective_price_max,
                 "budget_currency": budget_currency,

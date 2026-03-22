@@ -831,6 +831,175 @@ async def test_shop_gateway_find_products_multi_visible_attribute_intent_fails_c
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_visible_apparel_attribute_intent_fails_closed_without_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        sweater = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_1",
+            product_id="prod_sweater_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Striped Knitted Sweater for Dogs & Cats",
+            description="Classic knit sweater.",
+            product_type="Knit Sweater",
+            price=27.65,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [sweater], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="wool sweater",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("total") == 0
+    assert result.get("products") == []
+    assert "visible attributes" in str(result.get("reply") or "").lower()
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_category_intents") == ["sweater"]
+    assert metadata.get("visible_attribute_intents") == ["wool"]
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_visible_size_option_intent_keeps_matching_variant_product(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        hoodie = agent_shop_gateway_module.StandardProduct(
+            id="prod_hoodie_1",
+            product_id="prod_hoodie_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Winona Cozy Hoodie",
+            description="Cozy hoodie.",
+            product_type="Hoodie",
+            price=39.0,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_m_1",
+                    title="Medium / Black",
+                    price=39.0,
+                    inventory_quantity=4,
+                    options={"Size": "Medium", "Color": "Black"},
+                ),
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_l_1",
+                    title="Large / Black",
+                    price=39.0,
+                    inventory_quantity=4,
+                    options={"Size": "Large", "Color": "Black"},
+                ),
+            ],
+        )
+        return [hoodie], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="hoodie size m",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_hoodie_1"
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_category_intents") == ["hoodie"]
+    assert metadata.get("visible_option_intents") == ["size_m"]
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_visible_category_intent_fails_closed_on_brand_only_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
