@@ -5322,12 +5322,14 @@ async def _handle_find_products_multi(
             "query_terms": ["red"],
             "product_terms": ["red"],
             "category_labels": sorted(apparel_visible_category_labels),
+            "allow_option_match": True,
         },
         {
             "label": "black",
             "query_terms": ["black"],
             "product_terms": ["black"],
             "category_labels": sorted(apparel_visible_category_labels),
+            "allow_option_match": True,
         },
     ]
     active_visible_attribute_intents = []
@@ -6540,7 +6542,13 @@ async def _handle_find_products_multi(
         matched_visible_attribute_labels = [
             str(group["label"])
             for group in active_visible_attribute_intents
-            if _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
+            if (
+                _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
+                or (
+                    bool(group.get("allow_option_match"))
+                    and _normalized_intent_terms_match(visible_option_blob, list(group["product_terms"]))
+                )
+            )
         ]
         if active_visible_attribute_intents and (
             len(matched_visible_attribute_labels) < len(active_visible_attribute_intents)
