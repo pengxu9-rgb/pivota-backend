@@ -474,6 +474,13 @@ def _classify_query_semantic_class(query: Optional[str]) -> str:
     if not q:
         return "default"
     q_compact = re.sub(r"[^a-z0-9]+", "", q)
+    if (
+        "fragrance free" in q
+        or "fragrance-free" in q
+        or "free fragrance" in q
+        or "sin fragancia" in q
+    ):
+        return "beauty"
     if re.search(
         r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist)\b",
         q,
@@ -5051,6 +5058,44 @@ async def _handle_find_products_multi(
     )
     pet_accessory_intent_query = any(term in q_ascii for term in pet_accessory_query_terms)
     pet_subject_intent_query = any(term in q_ascii for term in pet_subject_query_terms)
+    visible_category_intent_groups = [
+        {
+            "label": "serum",
+            "query_terms": ["serum", "serums"],
+            "product_terms": ["serum", "serums"],
+        },
+        {
+            "label": "hoodie",
+            "query_terms": ["hoodie", "hoodies", "sudadera", "sudaderas"],
+            "product_terms": ["hoodie", "hoodies", "sudadera", "sudaderas"],
+        },
+        {
+            "label": "sweater",
+            "query_terms": ["sweater", "sweaters", "jumper", "jumpers"],
+            "product_terms": ["sweater", "sweaters", "jumper", "jumpers", "knit sweater", "knitted sweater"],
+        },
+        {
+            "label": "vest",
+            "query_terms": ["vest", "vests"],
+            "product_terms": ["vest", "vests"],
+        },
+        {
+            "label": "skirt",
+            "query_terms": ["skirt", "skirts", "falda", "faldas"],
+            "product_terms": ["skirt", "skirts", "falda", "faldas"],
+        },
+        {
+            "label": "dress",
+            "query_terms": ["dress", "dresses", "vestido", "vestidos"],
+            "product_terms": ["dress", "dresses", "vestido", "vestidos"],
+        },
+    ]
+    active_visible_category_intents = [
+        group
+        for group in visible_category_intent_groups
+        if any(term in q_ascii for term in group["query_terms"])
+    ]
+    active_visible_category_labels = [str(group["label"]) for group in active_visible_category_intents]
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -6199,10 +6244,19 @@ async def _handle_find_products_multi(
                 (product.product_type or "").lower(),
             ]
         ).strip()
+        visible_category_blob = pet_accessory_blob
         has_pet_accessory_marker = any(tok in pet_accessory_blob for tok in pet_accessory_markers)
         has_pet_subject_marker = any(tok in pet_accessory_blob for tok in pet_subject_markers)
 
         if pet_accessory_intent_query and not has_pet_accessory_marker:
+            continue
+
+        matched_visible_category_labels = [
+            str(group["label"])
+            for group in active_visible_category_intents
+            if any(term in visible_category_blob for term in group["product_terms"])
+        ]
+        if active_visible_category_intents and not matched_visible_category_labels:
             continue
 
         if exclude_lingerie or exclude_hoodies or exclude_joggers or exclude_underwear:
@@ -6478,6 +6532,9 @@ async def _handle_find_products_multi(
             relevance_score += 0.45
             if pet_subject_intent_query and has_pet_subject_marker:
                 relevance_score += 0.15
+
+        if matched_visible_category_labels:
+            relevance_score += 0.35
 
         filtered_products.append(
             {
@@ -6787,6 +6844,11 @@ async def _handle_find_products_multi(
             "I couldn’t find an eligible pet accessory match for that query right now. "
             "I’m only showing products that are currently purchasable."
         )
+    if not out_products and active_visible_category_labels:
+        reply_text = reply_text or (
+            f"I couldn’t find an eligible {active_visible_category_labels[0]} match for that query right now. "
+            "I’m only showing products that are currently purchasable."
+        )
 
     history_used = bool(history_product_ids or history_terms)
 
@@ -6801,6 +6863,7 @@ async def _handle_find_products_multi(
                 "query_source": "cache_multi_intent",
                 "query_semantic_class": query_semantic_class,
                 "pet_accessory_intent_query": pet_accessory_intent_query,
+                "visible_category_intents": active_visible_category_labels,
                 "semantic_retry_applied": semantic_retry_applied,
                 "semantic_retry_query": semantic_retry_query,
                 "semantic_retry_hits": semantic_retry_hits,
