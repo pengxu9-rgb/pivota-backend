@@ -4,10 +4,12 @@ Pivota 的核心价值：将多平台产品数据转换为统一标准格式
 供 AI Agent 调用，无需关心底层平台差异
 """
 
-from pydantic import BaseModel, Field, validator, field_validator, model_validator
-from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
+from typing import Optional, List, Dict, Any, Tuple
+
+from pydantic import BaseModel, Field, validator, field_validator, model_validator
+from utils.rich_text import rich_text_to_plain_text
 
 
 class ProductStatus(str, Enum):
@@ -56,6 +58,7 @@ class StandardProduct(BaseModel):
     # 产品详情
     title: str
     description: Optional[str] = None
+    description_text: Optional[str] = None
     vendor: Optional[str] = None  # 品牌/供应商
     product_type: Optional[str] = None  # 产品类型（例如："T-Shirts"）
     tags: List[str] = []  # 标签
@@ -134,6 +137,9 @@ class StandardProduct(BaseModel):
 
         Run as a model-level validator so `orderable` is available.
         """
+        self.description_text = rich_text_to_plain_text(
+            self.description_text or self.description or ""
+        ) or None
         if self.in_stock is None:
             inv = self.inventory_quantity or 0
             self.in_stock = bool(inv > 0 and self.orderable is True)

@@ -20,6 +20,7 @@ from adapters.product_adapters import (
     fetch_merchant_products,
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from utils.rich_text import rich_text_to_plain_text
 
 
 class ShopifyProductsSyncError(Exception):
@@ -36,6 +37,26 @@ class ShopifyProductsSyncAuthError(ShopifyProductsSyncError):
 
 class ShopifyProductsSyncRateLimitError(ShopifyProductsSyncError):
     """Shopify rate limiting."""
+
+
+def _inject_description_text_fields(product_payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = product_payload.get("raw") if isinstance(product_payload.get("raw"), dict) else {}
+    description_text = rich_text_to_plain_text(
+        product_payload.get("description_text")
+        or product_payload.get("description")
+        or product_payload.get("body_html")
+        or raw.get("description_text")
+        or raw.get("body_html")
+        or raw.get("description")
+        or raw.get("description_html")
+        or ""
+    )
+    if description_text:
+        product_payload["description_text"] = description_text
+        if raw:
+            raw.setdefault("description_text", description_text)
+            product_payload["raw"] = raw
+    return product_payload
 
 
 async def _get_shopify_store_credentials(merchant_id: str) -> Dict[str, str]:
@@ -153,6 +174,7 @@ async def sync_shopify_products_for_merchant(
             # Defensive: some nested/raw fields may still contain datetimes;
             # normalize anything JSON can't encode into strings.
             prod = json.loads(json.dumps(prod, default=str))
+            prod = _inject_description_text_fields(prod)
             platform_product_id = str(
                 prod.get("product_id") or prod.get("id") or ""
             ).strip()

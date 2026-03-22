@@ -152,3 +152,76 @@ async def test_product_quality_summary_includes_effective_coverage(
     assert response["data"]["snapshot_scored_products"] == 1
     assert response["data"]["preview_only_products"] == 1
     assert response["data"]["coverage_state"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_list_merchant_products_includes_description_text_from_html(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.merchant_products as module
+
+    async def fake_fetch_one(query, values=None):
+        return {"total": 1}
+
+    async def fake_fetch_all(query, values=None):
+        return [
+            {
+                "platform": "shopify",
+                "platform_product_id": "prod_html",
+                "product_data": {
+                    "title": "Mesh Set",
+                    "description": "<p>Clean lines</p><ul><li>Soft mesh</li></ul>",
+                    "price": 23.5,
+                    "currency": "EUR",
+                    "image_url": "https://example.com/product.jpg",
+                },
+                "cached_at": "2026-03-19T00:00:00Z",
+            }
+        ]
+
+    async def fake_build_quality_projection_bundle(_merchant_id, _cache_rows):
+        return {
+            "enrichments_by_key": {},
+            "snapshot_rows_by_key": {},
+            "projections_by_key": {},
+            "coverage": {
+                "total_products": 1,
+                "snapshot_scored_products": 0,
+                "effective_scored_products": 0,
+                "preview_only_products": 0,
+                "unscored_products": 1,
+                "coverage_state": "empty",
+                "latest_snapshot_at": None,
+                "backfill_recommended": False,
+                "active_backfill_job": None,
+            },
+        }
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        module,
+        "_build_quality_projection_bundle",
+        fake_build_quality_projection_bundle,
+    )
+    monkeypatch.setattr(
+        module,
+        "build_agent_push_projection_from_cache_row",
+        lambda _cache_row: {
+            "agent_push_status": "eligible_for_agent_push",
+            "agent_push_reason_codes": [],
+            "eligible_variant_count": 1,
+            "excluded_variant_count": 0,
+            "store_data_last_checked_at": "2026-03-19T00:00:00Z",
+        },
+    )
+
+    response = await module.list_merchant_products(
+        page=1,
+        page_size=20,
+        current_user={"role": "merchant", "merchant_id": "merch_test"},
+    )
+
+    standard = response["items"][0]["standard"]
+    assert standard["description"] == "<p>Clean lines</p><ul><li>Soft mesh</li></ul>"
+    assert standard["description_text"] == "Clean lines\n- Soft mesh"

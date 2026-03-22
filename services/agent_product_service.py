@@ -17,6 +17,7 @@ from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment
 from models.standard_product import StandardProduct
+from utils.rich_text import rich_text_to_plain_text
 
 
 async def get_agent_product_view(
@@ -64,10 +65,14 @@ async def get_agent_product_view(
     if not summary:
         # Fallback: use description truncated
         desc = (
-            product_json.get("description")
+            (standard.description_text if standard else None)
+            or product_json.get("description_text")
+            or product_json.get("description")
             or product_json.get("description_html")
+            or product_json.get("body_html")
             or ""
         )
+        desc = rich_text_to_plain_text(desc)
         summary = (desc or "")[:120]
 
     # Images
@@ -96,4 +101,3 @@ async def get_agent_product_view(
         "images": merged_images,
         "enrichment": enrichment,
     }
-

@@ -4801,7 +4801,9 @@ async def agent_search_products(
             if normalized_query:
                 query_lower = normalized_query.lower()
                 title = str(product.get("title") or "").lower()
-                description = str(product.get("description") or "").lower()
+                description = str(
+                    product.get("description_text") or product.get("description") or ""
+                ).lower()
                 tags = " ".join(product.get("tags") or []).lower()
                 product_type = str(product.get("product_type") or "").lower()
                 if is_external_seed:

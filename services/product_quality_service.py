@@ -21,6 +21,7 @@ from sqlalchemy import func, select
 from db.database import database
 from db.product_quality import product_quality_snapshot
 from models.standard_product import StandardProduct
+from utils.rich_text import rich_text_to_plain_text
 
 ProductKey = Tuple[str, str]
 
@@ -218,7 +219,7 @@ def build_quality_payload(
     if isinstance(product, StandardProduct):
         product_data: Dict[str, Any] = product.dict()
         title = product.title
-        description = product.description or ""
+        description = product.description_text or product.description or ""
         price_value = product.price
         main_image_url = product.image_url or (product.images[0] if product.images else None)
         brand = product.vendor or None
@@ -226,8 +227,9 @@ def build_quality_payload(
     else:
         product_data = dict(product or {})
         title = _as_text(_first_non_empty(product_data.get("title"), product_data.get("name")))
-        description = _as_text(
+        description = rich_text_to_plain_text(
             _first_non_empty(
+                product_data.get("description_text"),
                 product_data.get("description"),
                 product_data.get("body_html"),
                 product_data.get("description_local"),

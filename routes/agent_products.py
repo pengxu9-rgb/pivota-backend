@@ -1024,6 +1024,7 @@ async def get_product_details(
                 "merchant_id": merchant_id,
                 "title": product["title"],
                 "description": product.get("body_html", ""),
+                "description_text": product.get("description_text", ""),
                 "vendor": product.get("vendor"),
                 "product_type": product.get("product_type"),
                 "variants": variants,

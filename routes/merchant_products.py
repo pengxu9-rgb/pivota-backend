@@ -40,6 +40,7 @@ from services.product_quality_service import (
     summarize_quality_coverage,
 )
 from utils.auth import get_current_user
+from utils.rich_text import rich_text_to_plain_text
 from sqlalchemy import func, or_, select
 
 router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
@@ -140,6 +141,8 @@ def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
     product_json = cache_row.get("product_data") or {}
     status = None
     orderable = None
+    description = None
+    description_text = None
     try:
         # Validate via StandardProduct for safety, but don't raise on errors
         product = StandardProduct.parse_obj(product_json)
@@ -151,6 +154,8 @@ def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
         main_image_url = product.image_url or (product.images[0] if product.images else None)
         status = getattr(product, "status", None)
         orderable = getattr(product, "orderable", None)
+        description = getattr(product, "description", None)
+        description_text = getattr(product, "description_text", None)
     except Exception:
         title = product_json.get("title")
         price_value = product_json.get("price")
@@ -159,15 +164,42 @@ def _build_standard_summary(cache_row: Dict[str, Any]) -> Dict[str, Any]:
         main_image_url = product_json.get("image_url")
         status = product_json.get("status")
         orderable = product_json.get("orderable")
+        description = (
+            product_json.get("description")
+            or product_json.get("body_html")
+            or None
+        )
+        description_text = rich_text_to_plain_text(
+            product_json.get("description_text")
+            or description
+            or ""
+        ) or None
 
     return {
         "title": title,
+        "description": description,
+        "description_text": description_text,
         "price": price,
         "main_image_url": main_image_url,
         "status": status,
         "orderable": orderable,
         "last_synced_at": cache_row.get("cached_at"),
     }
+
+
+def _build_standard_full(product_json: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        product = StandardProduct.parse_obj(product_json)
+        return product.dict()
+    except Exception:
+        standard_full = dict(product_json or {})
+        standard_full["description_text"] = rich_text_to_plain_text(
+            standard_full.get("description_text")
+            or standard_full.get("description")
+            or standard_full.get("body_html")
+            or ""
+        ) or None
+        return standard_full
 
 
 @router.get("")
@@ -433,12 +465,7 @@ async def get_merchant_product_detail(
 
     cache_row = dict(cache_row)
     product_json = cache_row.get("product_data") or {}
-    standard_full: Dict[str, Any]
-    try:
-        product = StandardProduct.parse_obj(product_json)
-        standard_full = product.dict()
-    except Exception:
-        standard_full = product_json
+    standard_full = _build_standard_full(product_json)
 
     enrichment = await get_enrichment(
         merchant_id=merchant_id,
@@ -646,11 +673,7 @@ async def run_product_enrichment(
     # Build updated detail view (same shape as GET /merchant/products/{platform}/{platform_product_id})
     cache_row = dict(exists)
     product_json = cache_row.get("product_data") or {}
-    try:
-        product = StandardProduct.parse_obj(product_json)
-        standard_full: Dict[str, Any] = product.dict()
-    except Exception:
-        standard_full = product_json
+    standard_full = _build_standard_full(product_json)
 
     enrichment = await get_enrichment(
         merchant_id=merchant_id,
