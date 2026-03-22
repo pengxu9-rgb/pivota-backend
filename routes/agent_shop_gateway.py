@@ -5821,9 +5821,12 @@ async def _handle_find_products_multi(
         and q
         and merchant_map
     ):
-        merchant_ids_for_search = list(merchant_map.keys())[
-            : max(1, int(MULTI_SEARCH_SHOPPING_FAST_MERCHANT_SEED_LIMIT))
-        ]
+        if strict_serving_mode:
+            merchant_ids_for_search = list(merchant_map.keys())
+        else:
+            merchant_ids_for_search = list(merchant_map.keys())[
+                : max(1, int(MULTI_SEARCH_SHOPPING_FAST_MERCHANT_SEED_LIMIT))
+            ]
 
     # Fast path: perform one cache-wide SQL search across eligible merchants first.
     # This avoids N-per-merchant round trips in the common non-empty query path.
