@@ -185,7 +185,7 @@ async def get_readiness_report(
     x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
 ) -> Dict[str, Any]:
     _require_internal_access(request, x_pivota_internal_key)
-    if channel != "ucp":
+    if channel not in {"ucp", "acp"}:
         raise _readiness_http_exception(
             400,
             "UNSUPPORTED_CHANNEL",
@@ -212,13 +212,29 @@ async def get_ucp_export(
     try:
         if summary_only:
             snapshot = await readiness_service.build_readiness_snapshot(merchant_id, channel="ucp")
-            return readiness_service.build_export_summary_response(snapshot, sample_limit=sample_limit)
+            return readiness_service.build_export_summary_response(snapshot, sample_limit=sample_limit, channel="ucp")
         export = await readiness_service.build_channel_export(merchant_id, channel="ucp")
     except readiness_service.UnsupportedMerchantError:
         raise _unsupported_merchant(merchant_id)
     return _model_dump(export)
 
-
+@router.get("/merchants/{merchant_id}/exports/acp")
+async def get_acp_export(
+    merchant_id: str,
+    request: Request,
+    summary_only: bool = Query(False),
+    sample_limit: int = Query(25, ge=1, le=100),
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+    try:
+        if summary_only:
+            snapshot = await readiness_service.build_readiness_snapshot(merchant_id, channel="acp")
+            return readiness_service.build_export_summary_response(snapshot, sample_limit=sample_limit, channel="acp")
+        export = await readiness_service.build_channel_export(merchant_id, channel="acp")
+    except readiness_service.UnsupportedMerchantError:
+        raise _unsupported_merchant(merchant_id)
+    return _model_dump(export)
 @router.get("/cache/optimization/metrics")
 async def get_optimization_cache_metrics(
     request: Request,

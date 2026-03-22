@@ -14,6 +14,7 @@ from adapters.psp_adapter import get_psp_adapter
 from db.orders import create_order, get_order, mark_order_paid, update_fulfillment_info, update_order, update_payment_info
 from jobs.catalog_import_worker import _get_shopify_config_for_merchant
 from db.products import log_order_event
+from readiness.channel_exports.acp import build_acp_export
 from readiness.channel_exports.ucp import build_ucp_export
 from readiness.flags import readiness_alpha_merchant_id
 from readiness.models import ChannelReadinessReport, CheckoutSessionRecord, MerchantReadinessSnapshot, ReadyProduct, ReadyVariant
@@ -398,11 +399,42 @@ def build_snapshot_summary_response(
     }
 
 
+def _count_servable_products_and_variants(snapshot: MerchantReadinessSnapshot, channel: str) -> Dict[str, int]:
+    servable_product_ids = set()
+    excluded_product_ids = set()
+    servable_variant_count = 0
+    excluded_variant_count = 0
+
+    for product in snapshot.products:
+        product_has_servable = False
+        product_has_excluded = False
+        for variant in product.variants:
+            if variant.channel_coverage.get(channel) == "ready":
+                servable_variant_count += 1
+                product_has_servable = True
+            else:
+                excluded_variant_count += 1
+                product_has_excluded = True
+        if product_has_servable:
+            servable_product_ids.add(product.product_id)
+        if product_has_excluded:
+            excluded_product_ids.add(product.product_id)
+
+    return {
+        "servable_product_count": len(servable_product_ids),
+        "servable_variant_count": servable_variant_count,
+        "excluded_product_count": len(excluded_product_ids),
+        "excluded_variant_count": excluded_variant_count,
+    }
+
+
 def build_export_summary_response(
     snapshot: MerchantReadinessSnapshot,
     *,
     sample_limit: int = 25,
+    channel: Optional[str] = None,
 ) -> Dict[str, Any]:
+    export_channel = str(channel or snapshot.channel or "ucp").strip().lower() or "ucp"
     offer_ids_sample: List[str] = []
     product_ids_sample: List[str] = []
     availability_counts: Counter[str] = Counter()
@@ -412,13 +444,13 @@ def build_export_summary_response(
 
     for product in snapshot.products:
         for variant in product.variants:
-            if variant.channel_coverage.get("ucp") != "ready":
+            if variant.channel_coverage.get(export_channel) != "ready":
                 continue
             offer_count += 1
             _append_sample(product_ids_sample, product.product_id, sample_limit=sample_limit)
             _append_sample(
                 offer_ids_sample,
-                f"ucp:{snapshot.merchant_id}:{product.product_id}:{variant.variant_id}",
+                f"{export_channel}:{snapshot.merchant_id}:{product.product_id}:{variant.variant_id}",
                 sample_limit=sample_limit,
             )
             availability_counts.update([str(variant.inventory.get("availability") or "unknown")])
@@ -430,10 +462,11 @@ def build_export_summary_response(
         (
             coverage.ready_variant_count * 100 // max(1, coverage.ready_variant_count + coverage.blocked_variant_count)
             for coverage in snapshot.channel_coverage
-            if coverage.channel == "ucp"
+            if coverage.channel == export_channel
         ),
         0,
     )
+    servable_counts = _count_servable_products_and_variants(snapshot, export_channel)
     validation_warnings = list(snapshot.warnings)
     if snapshot.capability_status.get("reviews_confidence") == "blocked":
         validation_warnings.append("review summaries are unavailable for the readiness model")
@@ -444,9 +477,9 @@ def build_export_summary_response(
         validation_warnings.append("merchant write-back is stubbed for this thin slice")
 
     return {
-        "export_version": "readiness_ucp_export.v1",
+        "export_version": f"readiness_{export_channel}_export.v1",
         "merchant_id": snapshot.merchant_id,
-        "channel": "ucp",
+        "channel": export_channel,
         "generated_at": snapshot.generated_at,
         "merchant_alpha_mode": snapshot.merchant_alpha_mode,
         "response_mode": "summary",
@@ -457,6 +490,7 @@ def build_export_summary_response(
         "source_of_truth": snapshot.source_of_truth,
         "validation_warnings": validation_warnings,
         "stubbed_capabilities": snapshot.stubbed_capabilities,
+        **servable_counts,
         "offers": [],
         "summary": {
             "offer_count": offer_count,
@@ -480,9 +514,13 @@ async def build_readiness_snapshot(merchant_id: str, channel: str = "ucp") -> Me
 
 async def build_channel_export(merchant_id: str, channel: str = "ucp") -> ChannelReadinessReport:
     snapshot = await build_readiness_snapshot(merchant_id, channel=channel)
-    if channel != "ucp":
+    if channel == "ucp":
+        return build_ucp_export(snapshot)
+    if channel == "acp":
+        return build_acp_export(snapshot)
+    if channel not in {"ucp", "acp"}:
         raise ValueError(f"Unsupported channel export: {channel}")
-    return build_ucp_export(snapshot)
+    raise ValueError(f"Unsupported channel export: {channel}")
 
 
 def supported_merchants() -> list[str]:

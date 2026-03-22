@@ -24,6 +24,14 @@ class SyntheticMerchantSource:
         products = [StandardProduct(**product) for product in raw_products]
         source_of_truth = dict(merchant.get("source_of_truth") or {})
         source_of_truth.setdefault("reviews_confidence", "readiness.synthetic_reviews.none.v1")
+        payment_capabilities = dict(merchant.get("payment_capabilities") or {})
+        stub_checkout_supported = bool(
+            payment_capabilities.get("ucp_checkout_stub_supported")
+            or payment_capabilities.get("merchant_native_checkout_supported")
+        )
+        payment_capabilities.setdefault("ucp_checkout_supported", stub_checkout_supported)
+        payment_capabilities.setdefault("acp_checkout_supported", stub_checkout_supported)
+        payment_capabilities.setdefault("merchant_platform_writeback_supported", False)
 
         product_diagnostics: Dict[str, Dict[str, Any]] = {}
         variant_diagnostics: Dict[str, Dict[str, Any]] = {}
@@ -58,7 +66,7 @@ class SyntheticMerchantSource:
             merchant_warnings=["synthetic_fixture_mode"],
             stubbed_capabilities=merchant.get("stubbed_capabilities") or [],
             merchant_policy=merchant.get("merchant_policy") or {},
-            payment_capabilities=merchant.get("payment_capabilities") or {},
+            payment_capabilities=payment_capabilities,
             review_diagnostics={
                 "integration_status": "blocked",
                 "observed_at": None,

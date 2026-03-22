@@ -129,6 +129,97 @@ async def test_shop_gateway_make_external_redirect_url_without_allowlist_gate(
     assert "/r?token=" in redirect
 
 
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_strict_surface_returns_only_internal_eligible_products(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_live_1", "business_name": "Live Merchant"}]
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "seed_live_1",
+                    "external_product_id": "ext_live_1",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://example.com/product/1",
+                    "canonical_url": "https://example.com/product/1",
+                    "domain": "example.com",
+                    "title": "External Product",
+                    "price_amount": 19.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "seed_data": {},
+                    "status": "active",
+                }
+            ]
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_live_1",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_live_1",
+                    "product_data": {
+                        "id": "prod_live_1",
+                        "platform": "shopify",
+                        "merchant_id": "merch_live_1",
+                        "title": "Eligible Internal Product",
+                        "description": "Internal item",
+                        "vendor": "Pivota",
+                        "product_type": "serum",
+                        "tags": [],
+                        "price": 29.0,
+                        "currency": "USD",
+                        "inventory_quantity": 8,
+                        "image_url": "https://cdn.example.com/internal.jpg",
+                        "status": "active",
+                        "orderable": True,
+                        "variants": [
+                            {
+                                "id": "var_live_1",
+                                "sku": "sku_live_1",
+                                "title": "Default",
+                                "price": 29.0,
+                                "inventory_quantity": 8,
+                            }
+                        ],
+                    },
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="serum",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-ui"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_live_1"
+    assert products[0].get("commerce_surface") == "agent_api"
+    assert products[0]["top_offer_summary"]["purchase_route"] == "internal_checkout"
+    assert products[0]["exact_resolution_identifiers"]["variant_id"] == "var_live_1"
+
+
 def test_agent_cart_validate_rejects_external_seed_merchant(client: TestClient) -> None:
     res = client.post(
         "/agent/v1/cart/validate?merchant_id=external_seed&shipping_country=US",

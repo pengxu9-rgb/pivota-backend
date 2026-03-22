@@ -43,3 +43,15 @@ async def test_ucp_export_matches_golden_fixture() -> None:
     golden = json.loads((_FIXTURES / "golden_ucp_export.json").read_text(encoding="utf-8"))
 
     assert _summary(report) == golden
+
+
+@pytest.mark.asyncio
+async def test_acp_export_filters_blocked_variants() -> None:
+    report = await build_channel_export("synthetic-demo-merchant", channel="acp")
+
+    assert report.channel == "acp"
+    assert report.export_version == "readiness_acp_export.v1"
+    assert report.servable_product_count >= 1
+    assert report.servable_variant_count >= 1
+    offer_ids = {offer["offer_id"] for offer in report.offers}
+    assert "acp:synthetic-demo-merchant:prod_peptide_serum:var_serum_refill" not in offer_ids

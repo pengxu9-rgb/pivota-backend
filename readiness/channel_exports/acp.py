@@ -3,7 +3,7 @@ from __future__ import annotations
 from readiness.models import ChannelReadinessReport, MerchantReadinessSnapshot
 
 
-def build_ucp_export(snapshot: MerchantReadinessSnapshot) -> ChannelReadinessReport:
+def build_acp_export(snapshot: MerchantReadinessSnapshot) -> ChannelReadinessReport:
     offers = []
     servable_product_ids = set()
     excluded_product_ids = set()
@@ -13,7 +13,7 @@ def build_ucp_export(snapshot: MerchantReadinessSnapshot) -> ChannelReadinessRep
         product_has_servable = False
         product_has_excluded = False
         for variant in product.variants:
-            if variant.channel_coverage.get("ucp") != "ready":
+            if variant.channel_coverage.get("acp") != "ready":
                 excluded_variant_count += 1
                 product_has_excluded = True
                 continue
@@ -38,7 +38,7 @@ def build_ucp_export(snapshot: MerchantReadinessSnapshot) -> ChannelReadinessRep
             )
             offers.append(
                 {
-                    "offer_id": f"ucp:{snapshot.merchant_id}:{product.product_id}:{variant.variant_id}",
+                    "offer_id": f"acp:{snapshot.merchant_id}:{product.product_id}:{variant.variant_id}",
                     "merchant_id": snapshot.merchant_id,
                     "product_id": product.product_id,
                     "variant_id": variant.variant_id,
@@ -58,7 +58,7 @@ def build_ucp_export(snapshot: MerchantReadinessSnapshot) -> ChannelReadinessRep
                     "shipping_summary": shipping_policy,
                     "returns_summary": returns_policy,
                     "checkout_capability": {
-                        "mode": "merchant_native_alpha" if snapshot.merchant_alpha_mode == "real_merchant_alpha" else "stubbed",
+                        "mode": "acp" if snapshot.merchant_alpha_mode == "real_merchant_alpha" else "stubbed",
                         "supported": variant.checkout.status == "ready",
                     },
                     "readiness": {
@@ -96,13 +96,17 @@ def build_ucp_export(snapshot: MerchantReadinessSnapshot) -> ChannelReadinessRep
         validation_warnings.append("merchant write-back is stubbed for this thin slice")
 
     return ChannelReadinessReport(
+        export_version="readiness_acp_export.v1",
         merchant_id=snapshot.merchant_id,
-        channel="ucp",
+        channel="acp",
         generated_at=snapshot.generated_at,
         merchant_alpha_mode=snapshot.merchant_alpha_mode,
         readiness_score=next(
-            (coverage.ready_variant_count * 100 // max(1, coverage.ready_variant_count + coverage.blocked_variant_count)
-             for coverage in snapshot.channel_coverage if coverage.channel == "ucp"),
+            (
+                coverage.ready_variant_count * 100 // max(1, coverage.ready_variant_count + coverage.blocked_variant_count)
+                for coverage in snapshot.channel_coverage
+                if coverage.channel == "acp"
+            ),
             0,
         ),
         capability_status=snapshot.capability_status,
