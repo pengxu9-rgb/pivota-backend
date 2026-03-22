@@ -652,6 +652,20 @@ def _extract_visible_size_option_intents(query: Optional[str]) -> List[Dict[str,
     for group in groups:
         if any(re.search(pattern, q) for pattern in group["patterns"]):
             active.append(group)
+    for match in re.finditer(r"\bsize\s*(?P<num>\d{2,3})\b", q):
+        raw_value = str(match.group("num") or "").strip()
+        if not raw_value:
+            continue
+        label = f"size_{raw_value}"
+        if any(existing.get("label") == label for existing in active):
+            continue
+        active.append(
+            {
+                "label": label,
+                "patterns": [],
+                "product_terms": [raw_value],
+            }
+        )
     return active
 
 
@@ -677,6 +691,26 @@ def _extract_visible_color_option_intents(
             "label": "color_black",
             "query_terms": ["black"],
             "product_terms": ["black"],
+        },
+        {
+            "label": "color_blue",
+            "query_terms": ["blue"],
+            "product_terms": ["blue"],
+        },
+        {
+            "label": "color_pink",
+            "query_terms": ["pink"],
+            "product_terms": ["pink"],
+        },
+        {
+            "label": "color_white",
+            "query_terms": ["white"],
+            "product_terms": ["white"],
+        },
+        {
+            "label": "color_gray",
+            "query_terms": ["gray", "grey"],
+            "product_terms": ["gray", "grey"],
         },
     ]
     return [
