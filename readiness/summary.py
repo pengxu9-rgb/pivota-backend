@@ -212,6 +212,16 @@ _OUT_OF_STOCK_DECISION_LABELS: dict[str, str] = {
     "manual_review": "Manual review",
 }
 
+_SOURCE_DATA_DECISION_LABELS: dict[str, dict[str, str]] = {
+    "out_of_stock": _OUT_OF_STOCK_DECISION_LABELS,
+    "missing_price": {
+        "pricing_fix_saved": "Saved for pricing fix",
+    },
+    "missing_primary_image": {
+        "image_fix_saved": "Saved for image repair",
+    },
+}
+
 
 def _dedupe_codes(*groups: Iterable[str]) -> list[str]:
     codes: list[str] = []
@@ -1136,11 +1146,13 @@ async def _build_source_data_lanes(
         if key is not None
     ]
     cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
-    decisions_by_key = await list_source_data_decisions(
-        merchant_id,
-        reason_code="out_of_stock",
-        product_keys=product_keys,
-    )
+    decisions_by_reason_key: dict[str, dict[str, dict[str, Any]]] = {}
+    for reason_code in _SOURCE_DATA_DECISION_LABELS:
+        decisions_by_reason_key[reason_code] = await list_source_data_decisions(
+            merchant_id,
+            reason_code=reason_code,
+            product_keys=product_keys,
+        )
 
     lane_stats: dict[str, dict[str, Any]] = {
         reason_code: {
@@ -1185,6 +1197,17 @@ async def _build_source_data_lanes(
                     if _current_product_has_visible_image(current_product)
                     else "hero_image_missing"
                 )
+                persisted_decision = str(
+                    (
+                        decisions_by_reason_key
+                        .get("missing_primary_image", {})
+                        .get(decisions_key, {})
+                        .get("decision_state")
+                    )
+                    or ""
+                ).strip()
+                if queue_state_key == "hero_image_missing" and persisted_decision:
+                    lane["decision_counts"][persisted_decision] += 1
             else:
                 matches = _build_source_data_variant_matches(
                     reason_code,
@@ -1196,10 +1219,27 @@ async def _build_source_data_lanes(
                 sample_variant_id = matches[0]["variant_id"] if matches else None
                 if reason_code == "missing_price":
                     queue_state_key = _missing_price_batch_state(matches, current_product)
+                    persisted_decision = str(
+                        (
+                            decisions_by_reason_key
+                            .get("missing_price", {})
+                            .get(decisions_key, {})
+                            .get("decision_state")
+                        )
+                        or ""
+                    ).strip()
+                    if queue_state_key in {"whole_product_missing_price", "partially_priced"} and persisted_decision:
+                        lane["decision_counts"][persisted_decision] += 1
                 else:
                     queue_state_key = _out_of_stock_batch_state(matches, current_product)
                     persisted_decision = str(
-                        (decisions_by_key.get(decisions_key) or {}).get("decision_state") or ""
+                        (
+                            decisions_by_reason_key
+                            .get("out_of_stock", {})
+                            .get(decisions_key, {})
+                            .get("decision_state")
+                        )
+                        or ""
                     ).strip()
                     effective_decision = persisted_decision or (
                         _default_out_of_stock_decision_state(current_product)
@@ -1253,9 +1293,9 @@ async def _build_source_data_lanes(
                         label=decision_label,
                         count=int(lane["decision_counts"].get(decision_key, 0)),
                     )
-                    for decision_key, decision_label in _OUT_OF_STOCK_DECISION_LABELS.items()
+                    for decision_key, decision_label in _SOURCE_DATA_DECISION_LABELS[reason_code].items()
                 ]
-                if reason_code == "out_of_stock"
+                if reason_code in _SOURCE_DATA_DECISION_LABELS
                 else [],
             )
         )

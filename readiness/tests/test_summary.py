@@ -345,6 +345,116 @@ async def test_build_readiness_optimization_uses_truthful_action_mapping(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_build_readiness_optimization_includes_saved_source_data_progress(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=77,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="partial",
+                    ready_variant_count=0,
+                    blocked_variant_count=2,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_saved",
+                    platform="shopify",
+                    title="Saved Progress Product",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_saved",
+                            title="Default",
+                            price={"amount": None, "currency": "USD"},
+                            inventory={"quantity": 0, "availability": "out_of_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": ["missing_primary_image"], "checkout": ["missing_price", "out_of_stock"]},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(
+                                capability="discovery",
+                                status="blocked",
+                                score=20,
+                                blockers=["missing_primary_image"],
+                            ),
+                            checkout=CapabilityStatus(
+                                capability="checkout",
+                                status="blocked",
+                                score=20,
+                                blockers=["missing_price", "out_of_stock"],
+                            ),
+                            channel_coverage={"ucp": "blocked"},
+                        )
+                    ],
+                )
+            ],
+        )
+
+    async def fake_list_source_data_decisions(_merchant_id: str, *, reason_code: str | None = None, product_keys=None):
+        if reason_code == "missing_price":
+            return {"shopify|prod_saved": {"decision_state": "pricing_fix_saved"}}
+        if reason_code == "missing_primary_image":
+            return {"shopify|prod_saved": {"decision_state": "image_fix_saved"}}
+        if reason_code == "out_of_stock":
+            return {"shopify|prod_saved": {"decision_state": "restock_planned"}}
+        return {}
+
+    async def fake_load_cache_rows(_merchant_id: str, product_keys):
+        return {
+            ("shopify", "prod_saved"): {
+                "product_data": {
+                    "platform": "shopify",
+                    "product_id": "prod_saved",
+                    "title": "Saved Progress Product",
+                    "image_url": "",
+                    "variants": [
+                        {
+                            "variant_id": "var_saved",
+                            "price": 0,
+                            "currency": "USD",
+                            "inventory_quantity": 0,
+                        }
+                    ],
+                    "status": "active",
+                    "orderable": True,
+                }
+            }
+        }
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    monkeypatch.setattr("readiness.summary.list_source_data_decisions", fake_list_source_data_decisions)
+    monkeypatch.setattr("readiness.summary._load_cache_rows_for_product_keys", fake_load_cache_rows)
+
+    payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+
+    lanes_by_code = {lane.reason_code: lane for lane in payload.source_data_lanes}
+    assert lanes_by_code["missing_price"].decision_counts[0].count == 1
+    assert lanes_by_code["missing_price"].decision_counts[0].key == "pricing_fix_saved"
+    assert lanes_by_code["missing_primary_image"].decision_counts[0].count == 1
+    assert lanes_by_code["missing_primary_image"].decision_counts[0].key == "image_fix_saved"
+    assert lanes_by_code["out_of_stock"].decision_counts[0].count == 1
+
+
+@pytest.mark.asyncio
 async def test_build_readiness_optimization_projects_quality_coverage(monkeypatch):
     monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
     monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")

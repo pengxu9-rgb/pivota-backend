@@ -31,14 +31,14 @@ from readiness.remediation import (
     ActionNotFoundError,
     JobNotFoundError,
     PlanSupersededError,
-    clear_resolved_out_of_stock_source_data_decisions,
-    delete_out_of_stock_source_data_decision,
+    clear_resolved_source_data_decisions,
+    delete_source_data_decision_state,
     get_execution_job,
     get_product_blocker_detail,
     get_source_data_triage,
     preview_remediation_action,
     run_remediation_action,
-    upsert_out_of_stock_source_data_decision,
+    upsert_source_data_decision_state,
 )
 from readiness.summary import (
     build_lane_delta,
@@ -800,13 +800,17 @@ async def refresh_readiness_optimization(
             else None
         )
         cleared_decisions = (
-            await clear_resolved_out_of_stock_source_data_decisions(
+            await clear_resolved_source_data_decisions(
                 merchant_id,
                 plan_id=payload.plan.plan_id,
+                reason_code=body.reason_code,
             )
-            if body.reason_code in (None, "out_of_stock")
+            if body.reason_code in (None, "out_of_stock", "missing_price", "missing_primary_image")
             else []
         )
+        cleared_out_of_stock_decisions = [
+            item for item in cleared_decisions if item.get("reason_code") == "out_of_stock"
+        ]
         return {
             "status": "success",
             "data": payload.model_dump(),
@@ -818,7 +822,8 @@ async def refresh_readiness_optimization(
                 "plan_id": payload.plan.plan_id,
                 "snapshot_id": payload.plan.snapshot_id,
                 "lane_delta": lane_delta.model_dump() if lane_delta else None,
-                "cleared_out_of_stock_decisions": cleared_decisions,
+                "cleared_source_data_decisions": cleared_decisions,
+                "cleared_out_of_stock_decisions": cleared_out_of_stock_decisions,
             },
         }
     except Exception as e:
@@ -934,7 +939,7 @@ async def put_readiness_source_data_decision(
     merchant_id = await get_merchant_id_from_user(current_user)
 
     try:
-        decision = await upsert_out_of_stock_source_data_decision(
+        decision = await upsert_source_data_decision_state(
             merchant_id,
             reason_code=reason_code,
             platform=platform,
@@ -991,7 +996,7 @@ async def delete_readiness_source_data_decision_route(
     merchant_id = await get_merchant_id_from_user(current_user)
 
     try:
-        result = await delete_out_of_stock_source_data_decision(
+        result = await delete_source_data_decision_state(
             merchant_id,
             reason_code=reason_code,
             platform=platform,

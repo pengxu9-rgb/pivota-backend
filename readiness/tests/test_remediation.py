@@ -265,6 +265,9 @@ async def test_preview_remediation_action_rejects_non_executable_manual_target(m
         assert channel == "ucp"
         return payload, _snapshot()
 
+    async def fake_list_source_data_decisions(*_args, **_kwargs):
+        return {}
+
     monkeypatch.setattr(
         remediation,
         "get_readiness_optimization_context",
@@ -497,10 +500,18 @@ async def test_get_source_data_triage_returns_summary_and_rows(monkeypatch):
         assert channel == "ucp"
         return payload, _snapshot()
 
+    async def fake_list_source_data_decisions(*_args, **_kwargs):
+        return {}
+
     monkeypatch.setattr(
         remediation,
         "get_readiness_optimization_context",
         fake_get_readiness_optimization_context,
+    )
+    monkeypatch.setattr(
+        remediation,
+        "list_source_data_decisions",
+        fake_list_source_data_decisions,
     )
 
     triage = await get_source_data_triage(
@@ -527,3 +538,71 @@ async def test_get_source_data_triage_returns_summary_and_rows(monkeypatch):
     image_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_primary_image")
     assert image_row["scope"] == "product"
     assert image_row["platform_product_id"] == "prod_1"
+
+
+@pytest.mark.asyncio
+async def test_get_source_data_triage_hydrates_saved_decision_states(monkeypatch):
+    from readiness import remediation
+
+    payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
+    payload.product_queue[0].blocked_variant_count = 1
+    payload.product_queue[0].ready_variant_count = 1
+    payload.product_queue[0].eligible_variant_count = 1
+    payload.product_queue[0].excluded_variant_count = 1
+    payload.product_queue[0].agent_push_status = "excluded_from_agent_push"
+    payload.product_queue[0].agent_push_reason_codes = ["missing_price", "out_of_stock"]
+    payload.product_queue[0].fix_surface = "catalog_data"
+    payload.product_queue[0].recommended_action_type = "review_catalog_data"
+    payload.product_queue[0].top_issues = [
+        {
+            "code": "missing_primary_image",
+            "label": "Missing primary image",
+            "impact": "discovery_only",
+            "affected_variant_count": 2,
+        }
+    ]
+
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        assert channel == "ucp"
+        return payload, _snapshot()
+
+    async def fake_list_source_data_decisions(
+        _merchant_id: str,
+        *,
+        reason_code: str | None = None,
+        product_keys=None,
+    ):
+        if reason_code == "missing_price":
+            return {
+                "shopify|prod_1": {
+                    "decision_state": "pricing_fix_saved",
+                }
+            }
+        if reason_code == "missing_primary_image":
+            return {
+                "shopify|prod_1": {
+                    "decision_state": "image_fix_saved",
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
+    monkeypatch.setattr(
+        remediation,
+        "list_source_data_decisions",
+        fake_list_source_data_decisions,
+    )
+
+    triage = await get_source_data_triage(
+        "merch_efbc46b4619cfbdf",
+        plan_id="rdplan_current",
+    )
+
+    missing_price_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_price")
+    image_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_primary_image")
+    assert missing_price_row["decision_state"] == "pricing_fix_saved"
+    assert image_row["decision_state"] == "image_fix_saved"

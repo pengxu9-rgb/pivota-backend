@@ -445,13 +445,20 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
         return DEFAULT_ALPHA_MERCHANT_ID
 
     async def fake_clear_resolved(*_args, **_kwargs):
-        return [{"platform": "shopify", "platform_product_id": "prod_1", "resolution": "resolved_now"}]
+        return [
+            {
+                "reason_code": "out_of_stock",
+                "platform": "shopify",
+                "platform_product_id": "prod_1",
+                "resolution": "resolved_now",
+            }
+        ]
 
     monkeypatch.setattr(merchant_api_extensions, "build_readiness_optimization", fake_build_readiness_optimization)
     monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
     monkeypatch.setattr(
         merchant_api_extensions,
-        "clear_resolved_out_of_stock_source_data_decisions",
+        "clear_resolved_source_data_decisions",
         fake_clear_resolved,
     )
 
@@ -479,6 +486,7 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
     assert body["meta"]["refresh_state"] == "fresh"
     assert body["meta"]["lane_delta"]["reason_code"] == "out_of_stock"
     assert body["meta"]["lane_delta"]["resolved_products"] == 2
+    assert body["meta"]["cleared_source_data_decisions"][0]["reason_code"] == "out_of_stock"
     assert body["meta"]["cleared_out_of_stock_decisions"][0]["platform_product_id"] == "prod_1"
     assert seen_force_refresh == [False, True]
 
@@ -808,6 +816,8 @@ def test_merchant_readiness_source_data_decision_routes(monkeypatch):
     from routes import merchant_api_extensions as merchant_api_extensions
 
     invalidations: list[tuple[str | None, str | None]] = []
+    upsert_calls: list[tuple[str, str]] = []
+    delete_calls: list[str] = []
 
     async def fake_get_merchant_id_from_user(_current_user):
         return DEFAULT_ALPHA_MERCHANT_ID
@@ -820,10 +830,9 @@ def test_merchant_readiness_source_data_decision_routes(monkeypatch):
         platform_product_id: str,
         decision_state: str,
     ):
-        assert reason_code == "out_of_stock"
         assert platform == "shopify"
         assert platform_product_id == "prod_1"
-        assert decision_state == "restock_planned"
+        upsert_calls.append((reason_code, decision_state))
         return {
             "merchant_id": DEFAULT_ALPHA_MERCHANT_ID,
             "reason_code": reason_code,
@@ -839,9 +848,9 @@ def test_merchant_readiness_source_data_decision_routes(monkeypatch):
         platform: str,
         platform_product_id: str,
     ):
-        assert reason_code == "out_of_stock"
         assert platform == "shopify"
         assert platform_product_id == "prod_1"
+        delete_calls.append(reason_code)
         return {
             "merchant_id": DEFAULT_ALPHA_MERCHANT_ID,
             "reason_code": reason_code,
@@ -853,12 +862,12 @@ def test_merchant_readiness_source_data_decision_routes(monkeypatch):
     monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
     monkeypatch.setattr(
         merchant_api_extensions,
-        "upsert_out_of_stock_source_data_decision",
+        "upsert_source_data_decision_state",
         fake_upsert,
     )
     monkeypatch.setattr(
         merchant_api_extensions,
-        "delete_out_of_stock_source_data_decision",
+        "delete_source_data_decision_state",
         fake_delete,
     )
     monkeypatch.setattr(
@@ -883,13 +892,35 @@ def test_merchant_readiness_source_data_decision_routes(monkeypatch):
     assert put_response.status_code == 200
     assert put_response.json()["data"]["decision_state"] == "restock_planned"
     assert invalidations == [(DEFAULT_ALPHA_MERCHANT_ID, "ucp")]
+    assert upsert_calls == [("out_of_stock", "restock_planned")]
+
+    missing_price_put = route_client.put(
+        "/merchant/readiness/source-data-decisions/missing_price/shopify/prod_1",
+        json={"decision_state": "pricing_fix_saved"},
+    )
+    assert missing_price_put.status_code == 200
+    assert missing_price_put.json()["data"]["decision_state"] == "pricing_fix_saved"
+    assert upsert_calls == [
+        ("out_of_stock", "restock_planned"),
+        ("missing_price", "pricing_fix_saved"),
+    ]
 
     delete_response = route_client.delete(
         "/merchant/readiness/source-data-decisions/out_of_stock/shopify/prod_1",
     )
     assert delete_response.status_code == 200
     assert delete_response.json()["data"]["deleted"] is True
+    assert delete_calls == ["out_of_stock"]
+
+    missing_image_delete = route_client.delete(
+        "/merchant/readiness/source-data-decisions/missing_primary_image/shopify/prod_1",
+    )
+    assert missing_image_delete.status_code == 200
+    assert missing_image_delete.json()["data"]["deleted"] is True
+    assert delete_calls == ["out_of_stock", "missing_primary_image"]
     assert invalidations == [
+        (DEFAULT_ALPHA_MERCHANT_ID, "ucp"),
+        (DEFAULT_ALPHA_MERCHANT_ID, "ucp"),
         (DEFAULT_ALPHA_MERCHANT_ID, "ucp"),
         (DEFAULT_ALPHA_MERCHANT_ID, "ucp"),
     ]
