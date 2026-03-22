@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from config.settings import resolve_public_api_base_url
 from db.database import database
 
 
@@ -167,21 +168,12 @@ def _build_signature(secret: str, timestamp: str, raw_body: str) -> str:
 
 
 def _resolve_managed_receiver_base_url() -> str:
-    for candidate in (
-        os.getenv("PUBLIC_BASE_URL"),
-        os.getenv("APP_URL"),
-        os.getenv("BASE_URL"),
-        os.getenv("AGENT_API_BASE"),
-        "https://web-production-fedb.up.railway.app",
-    ):
-        value = str(candidate or "").strip().rstrip("/")
-        if value:
-            parsed = urlparse(value)
-            host = (parsed.hostname or "").strip().lower()
-            if host in {"127.0.0.1", "0.0.0.0", "localhost"}:
-                continue
-            return value
-    return "https://web-production-fedb.up.railway.app"
+    value = resolve_public_api_base_url()
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").strip().lower()
+    if host in {"127.0.0.1", "0.0.0.0", "localhost"}:
+        return "https://api.pivota.cc"
+    return value
 
 
 def get_managed_receiver_url(agent_id: str) -> str:

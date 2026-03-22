@@ -1,6 +1,8 @@
 """Custom OpenAPI schema generator used during FastAPI startup."""
 from typing import Any, Dict
 
+from config.settings import resolve_public_api_base_url
+
 
 def get_custom_openapi_schema() -> Dict[str, Any]:
     """Return the minimal structure expected by main.py.
@@ -20,7 +22,7 @@ def get_custom_openapi_schema() -> Dict[str, Any]:
             },
         },
         "servers": [
-            {"url": "https://web-production-fedb.up.railway.app", "description": "Production"},
+            {"url": resolve_public_api_base_url(), "description": "Production"},
         ],
         "security": [],
         "components": {},

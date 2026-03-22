@@ -34,6 +34,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 
+from config.settings import resolve_public_api_base_url
 from db.database import database
 from models.reviews_refs import SkuRef as ReviewsSkuRef
 from services.product_query_service import get_products_hybrid
@@ -3968,7 +3969,7 @@ async def _make_external_redirect_url(
             "ctx": ctx,
         }
     )
-    base = (os.getenv("PUBLIC_BASE_URL") or os.getenv("BASE_URL") or AGENT_API_BASE).rstrip("/")
+    base = resolve_public_api_base_url()
     return f"{base}/r?token={token}"
 
 

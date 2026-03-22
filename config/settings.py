@@ -5,6 +5,27 @@ import os
 from typing import Optional
 from pydantic_settings import BaseSettings
 
+DEFAULT_PUBLIC_API_BASE_URL = "https://api.pivota.cc"
+
+
+def _normalize_public_url(value: Optional[str]) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def resolve_public_api_base_url() -> str:
+    for candidate in (
+        os.getenv("PUBLIC_API_BASE_URL"),
+        os.getenv("PUBLIC_BASE_URL"),
+        os.getenv("APP_URL"),
+        os.getenv("BASE_URL"),
+        os.getenv("AGENT_API_BASE"),
+        DEFAULT_PUBLIC_API_BASE_URL,
+    ):
+        normalized = _normalize_public_url(candidate)
+        if normalized:
+            return normalized
+    return DEFAULT_PUBLIC_API_BASE_URL
+
 class Settings(BaseSettings):
     """Application settings"""
     
@@ -93,6 +114,8 @@ class Settings(BaseSettings):
     # Agent/Developer Portal base URL (used for password reset links)
     # Note: developer portal is the canonical hostname (e.g., https://developer.pivota.cc)
     agent_portal_base_url: str = os.getenv("AGENT_PORTAL_BASE_URL", "https://developer.pivota.cc")
+    # Canonical public backend/API hostname for developer-facing contracts.
+    public_api_base_url: str = os.getenv("PUBLIC_API_BASE_URL", "")
     
     # AP2 Protocol (Phase 4++)
     enable_ap2_routes: bool = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"

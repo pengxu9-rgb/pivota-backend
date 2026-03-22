@@ -2,14 +2,14 @@
 
 Base URL:
 
-`https://web-production-fedb.up.railway.app/agent/v1`
+`https://api.pivota.cc/agent/v1`
 
 Auth:
 
 `X-API-Key: ak_live_...`
 
 Notes:
-- The canonical machine-readable API spec is `GET https://web-production-fedb.up.railway.app/openapi.json`.
+- The canonical machine-readable API spec is `GET https://api.pivota.cc/openapi.json`.
 - Promotions/discounts are best-effort previews; the final amount is confirmed at checkout.
 - Shopify marketing rules (e.g. buy-X-get-Y / order discounts) are synced into Pivota’s promotions table best-effort; first-time previews may take longer while the sync warms.
 

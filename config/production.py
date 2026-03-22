@@ -17,6 +17,7 @@ class ProductionSettings(BaseSettings):
     debug: bool = False
     app_url: str = Field(..., env="APP_URL")
     frontend_url: str = Field(..., env="FRONTEND_URL")
+    public_api_base_url: str = Field("https://api.pivota.cc", env="PUBLIC_API_BASE_URL")
     
     # Database
     database_url: str = Field(..., env="DATABASE_URL")
@@ -175,4 +176,3 @@ LOGGING_CONFIG = {
         }
     }
 }
-
