@@ -148,6 +148,21 @@ def _standard_variant_reason_codes(variant: Dict[str, Any], *, product_currency:
     return reasons
 
 
+def build_agent_push_projection_from_standard_variant(
+    variant: Dict[str, Any],
+    *,
+    product_currency: Any,
+    checked_at: Any = None,
+) -> Dict[str, Any]:
+    reason_codes = _standard_variant_reason_codes(variant, product_currency=product_currency)
+    status = AGENT_PUSH_STATUS_EXCLUDED if reason_codes else AGENT_PUSH_STATUS_ELIGIBLE
+    return {
+        "agent_push_status": status,
+        "agent_push_reason_codes": list(reason_codes),
+        "eligible_variant_count": 0 if reason_codes else 1,
+        "excluded_variant_count": 1 if reason_codes else 0,
+        "store_data_last_checked_at": _format_timestamp(checked_at),
+    }
 def build_agent_push_projection_from_standard_product(
     product: Any,
     *,
@@ -190,6 +205,21 @@ def build_agent_push_projection_from_standard_product(
     }
 
 
+def pick_first_eligible_variant_from_standard_product(product: Any) -> Optional[Dict[str, Any]]:
+    payload = _coerce_product_payload(product)
+    product_currency = payload.get("currency")
+    for variant in _build_standard_variant_fallback(payload):
+        projection = build_agent_push_projection_from_standard_variant(
+            variant,
+            product_currency=product_currency,
+            checked_at=payload.get("updated_at") or payload.get("published_at") or payload.get("created_at"),
+        )
+        if projection.get("agent_push_status") == AGENT_PUSH_STATUS_ELIGIBLE:
+            return {
+                "variant": dict(variant),
+                "projection": projection,
+            }
+    return None
 def build_agent_push_projection_from_cache_row(cache_row: Dict[str, Any]) -> Dict[str, Any]:
     payload = cache_row.get("product_data") or {}
     return build_agent_push_projection_from_standard_product(
@@ -270,6 +300,14 @@ def build_agent_push_projection_from_ready_product(
     }
 
 
+def build_agent_push_projection_from_ready_variant(variant: Any) -> Dict[str, Any]:
+    reason_codes = _ready_variant_reason_codes(variant)
+    return {
+        "agent_push_status": (
+            AGENT_PUSH_STATUS_EXCLUDED if reason_codes else AGENT_PUSH_STATUS_ELIGIBLE
+        ),
+        "agent_push_reason_codes": reason_codes,
+    }
 def summarize_agent_push_projections(
     projections: Iterable[Dict[str, Any]],
     *,

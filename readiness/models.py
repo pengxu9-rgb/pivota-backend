@@ -462,6 +462,10 @@ class ChannelReadinessReport(BaseModel):
     source_of_truth: Dict[str, str] = Field(default_factory=dict)
     validation_warnings: List[str] = Field(default_factory=list)
     stubbed_capabilities: List[str] = Field(default_factory=list)
+    servable_product_count: int = 0
+    servable_variant_count: int = 0
+    excluded_product_count: int = 0
+    excluded_variant_count: int = 0
     offers: List[Dict[str, Any]] = Field(default_factory=list)
 
 

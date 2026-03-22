@@ -24,6 +24,7 @@ import time
 import unicodedata
 import mimetypes
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -51,8 +52,17 @@ from services.outbound_links_service import (
     make_redirect_token,
 )
 from services.external_referral_readiness import should_block_external_referral_runtime
-from models.standard_product import StandardProduct, ProductStatus
+from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 from services.agent_task_manager import AgentTaskManager
+from services.commerce_surface_service import (
+    COMMERCE_SURFACE_AGENT_API,
+    normalize_commerce_surface,
+    payment_capabilities_support_surface,
+)
+from services.product_exposure_service import (
+    build_agent_push_projection_from_standard_variant,
+    pick_first_eligible_variant_from_standard_product,
+)
 from observability.reliability_metrics import (
     record_catalog_search,
     record_catalog_upstream_fallback,
@@ -73,6 +83,29 @@ AGENT_API_BASE = _resolve_default_agent_api_base()
 AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API_KEY") or os.getenv("AGENT_API_KEY")
 
 logger = logging.getLogger(__name__)
+
+try:
+    from services.external_referral_readiness import should_block_external_referral_runtime
+except ModuleNotFoundError:
+    class _FallbackExternalReferralStatus:
+        def __init__(self, *, seed_id: Optional[str] = None, matched_via: str = "runtime") -> None:
+            self.seed_id = seed_id
+            self.status = "healthy"
+            self.gating_policy_version = "external_referral_fallback"
+            self.matched_via = matched_via
+            self.blocker_anomaly_types: List[str] = []
+            self.review_anomaly_types: List[str] = []
+
+    async def should_block_external_referral_runtime(
+        row: Dict[str, Any],
+        *,
+        matched_via: str = "runtime",
+        allowed_domains: Optional[List[str]] = None,
+    ) -> tuple[bool, _FallbackExternalReferralStatus]:
+        return False, _FallbackExternalReferralStatus(
+            seed_id=str((row or {}).get("id") or "").strip() or None,
+            matched_via=matched_via,
+        )
 
 
 def _bootstrap_env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -345,11 +378,6 @@ async def _resolve_shopify_currency_for_merchant(merchant_id: str) -> Optional[s
     except Exception:
         return None
 
-router = APIRouter(prefix="/agent/shop/v1", tags=["Shopping Gateway"])
-DEV_MODE = os.getenv("APP_ENV", "dev") != "production"
-
-
-@router.on_event("shutdown")
 async def _close_shared_upstream_http_client() -> None:
     global _SHARED_UPSTREAM_HTTP_CLIENT
     client = _SHARED_UPSTREAM_HTTP_CLIENT
@@ -362,12 +390,23 @@ async def _close_shared_upstream_http_client() -> None:
         logger.debug("failed to close shared upstream http client", exc_info=True)
 
 
-@router.on_event("startup")
-async def _warm_shared_upstream_http_client_on_startup() -> None:
-    if not _UPSTREAM_HTTP_WARMUP_ENABLED:
-        return
-    # Fire-and-forget warmup so deploy healthchecks are not blocked.
-    asyncio.create_task(_warm_shared_upstream_http_client())
+@asynccontextmanager
+async def _shopping_gateway_router_lifespan(_: Any):
+    if _UPSTREAM_HTTP_WARMUP_ENABLED:
+        # Fire-and-forget warmup so deploy healthchecks are not blocked.
+        asyncio.create_task(_warm_shared_upstream_http_client())
+    try:
+        yield
+    finally:
+        await _close_shared_upstream_http_client()
+
+
+router = APIRouter(
+    prefix="/agent/shop/v1",
+    tags=["Shopping Gateway"],
+    lifespan=_shopping_gateway_router_lifespan,
+)
+DEV_MODE = os.getenv("APP_ENV", "dev") != "production"
 
 # Bounded queue + worker pool for heavy agent work.
 agent_task_manager = AgentTaskManager.from_env()
@@ -1475,6 +1514,13 @@ class MultiSearchFilters(BaseModel):
     # Front-ends may request above 200; we clamp internally to 200.
     limit: int = Field(20, ge=1, description="Page size (internally clamped to max 200)")
     in_stock_only: bool = Field(False, description="Return only in-stock products when true")
+    commerce_surface: Optional[str] = Field(
+        None,
+        alias="commerceSurface",
+        description="Serving surface eligibility policy (agent_api | ucp | acp)",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class UserIntent(BaseModel):
@@ -1488,6 +1534,11 @@ class RequestMetadata(BaseModel):
     creator_name: Optional[str] = Field(None, alias="creatorName", description="Human friendly creator name")
     source: Optional[str] = Field(None, description="Calling surface (e.g. creator-agent-ui)")
     trace_id: Optional[str] = Field(None, alias="traceId", description="Optional trace id for observability")
+    commerce_surface: Optional[str] = Field(
+        None,
+        alias="commerceSurface",
+        description="Serving surface eligibility policy (agent_api | ucp | acp)",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -1542,6 +1593,13 @@ class OffersResolvePayload(BaseModel):
     limit: int = Field(10, ge=1, le=30, description="Max offers to return")
     market: Optional[str] = Field(None, description="Market for outbound allowlist and UTM")
     tool: Optional[str] = Field(None, description="Tool identifier for outbound allowlist and UTM")
+    commerce_surface: Optional[str] = Field(
+        None,
+        alias="commerceSurface",
+        description="Serving surface eligibility policy (agent_api | ucp | acp)",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 def _normalize_find_products_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1569,6 +1627,8 @@ def _normalize_find_products_multi_payload(raw_payload: Dict[str, Any]) -> Dict[
             "page",
             "limit",
             "in_stock_only",
+            "commerce_surface",
+            "commerceSurface",
         ):
             if key in payload:
                 search[key] = payload.get(key)
@@ -1592,7 +1652,7 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
             product[key] = payload.get(key)
 
     normalized: Dict[str, Any] = {"product": product}
-    for key in ("limit", "market", "tool"):
+    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -1798,6 +1858,261 @@ def _resolve_offers_merchant_scope(
     return None
 
 
+def _extract_raw_commerce_surface(
+    *,
+    payload_surface: Optional[str],
+    request_metadata: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    raw = str(payload_surface or "").strip()
+    if raw:
+        return raw
+    meta = request_metadata if isinstance(request_metadata, dict) else {}
+    for key in ("commerce_surface", "commerceSurface"):
+        value = str(meta.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _resolve_commerce_surface(
+    *,
+    payload_surface: Optional[str],
+    request_metadata: Optional[Dict[str, Any]],
+) -> tuple[str, bool]:
+    raw = _extract_raw_commerce_surface(
+        payload_surface=payload_surface,
+        request_metadata=request_metadata,
+    )
+    return normalize_commerce_surface(raw), bool(raw)
+
+
+def _coerce_product_payload_dict(product: Any) -> Dict[str, Any]:
+    if isinstance(product, StandardProduct):
+        return product.model_dump()
+    if hasattr(product, "model_dump"):
+        try:
+            dumped = product.model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    if isinstance(product, dict):
+        return dict(product)
+    try:
+        return dict(product)
+    except Exception:
+        return {}
+
+
+def _coerce_variant_payload_dict(variant: Any) -> Dict[str, Any]:
+    if isinstance(variant, dict):
+        return dict(variant)
+    if hasattr(variant, "model_dump"):
+        try:
+            dumped = variant.model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    try:
+        return dict(variant)
+    except Exception:
+        return {}
+
+
+def _variant_ref_from_payload(variant: Dict[str, Any]) -> Optional[str]:
+    return (
+        str(
+            variant.get("variant_id")
+            or variant.get("id")
+            or variant.get("sku")
+            or variant.get("sku_id")
+            or ""
+        ).strip()
+        or None
+    )
+
+
+def _variant_sku_from_payload(variant: Dict[str, Any]) -> Optional[str]:
+    return str(variant.get("sku") or variant.get("sku_id") or "").strip() or None
+
+
+def _product_payment_capabilities(product_payload: Dict[str, Any]) -> Dict[str, Any]:
+    direct = product_payload.get("payment_capabilities")
+    if isinstance(direct, dict):
+        return dict(direct)
+    platform_metadata = product_payload.get("platform_metadata")
+    if isinstance(platform_metadata, dict):
+        nested = platform_metadata.get("payment_capabilities")
+        if isinstance(nested, dict):
+            return dict(nested)
+    return {}
+
+
+def _product_supports_commerce_surface(
+    product_payload: Dict[str, Any],
+    commerce_surface: str,
+) -> bool:
+    if not _is_dict_sellable(product_payload):
+        return False
+    if commerce_surface == COMMERCE_SURFACE_AGENT_API:
+        return True
+
+    payment_capabilities = _product_payment_capabilities(product_payload)
+    if payment_capabilities:
+        return payment_capabilities_support_surface(payment_capabilities, commerce_surface)
+
+    return product_payload.get("orderable") is not False
+
+
+def _build_internal_offer_summary(
+    *,
+    merchant_id: str,
+    platform: str,
+    product_payload: Dict[str, Any],
+    variant_payload: Dict[str, Any],
+    confidence: float,
+    canonical_ref: Optional[str],
+    canonical_group_id: Optional[str],
+) -> Dict[str, Any]:
+    product_id = str(
+        product_payload.get("id")
+        or product_payload.get("product_id")
+        or ""
+    ).strip()
+    variant_id = _variant_ref_from_payload(variant_payload)
+    price_amount = _coerce_float(
+        variant_payload.get("price")
+        if variant_payload.get("price") is not None
+        else product_payload.get("price")
+    ) or 0.0
+    currency = str(
+        variant_payload.get("currency")
+        or product_payload.get("currency")
+        or product_payload.get("currency_code")
+        or "USD"
+    ).upper()
+    original_price = _coerce_float(
+        variant_payload.get("compare_at_price")
+        or product_payload.get("compare_at_price")
+    )
+    inventory_quantity = _coerce_int(
+        variant_payload.get("inventory_quantity")
+        if variant_payload.get("inventory_quantity") is not None
+        else product_payload.get("inventory_quantity")
+    )
+    in_stock = True
+    if inventory_quantity is not None:
+        in_stock = inventory_quantity > 0
+    elif isinstance(product_payload.get("in_stock"), bool):
+        in_stock = bool(product_payload.get("in_stock"))
+
+    seller = (
+        str(
+            product_payload.get("merchant_name")
+            or product_payload.get("store_name")
+            or merchant_id
+        ).strip()
+        or merchant_id
+    )
+    offer_id = f"of:internal_checkout:{merchant_id}:{product_id}:{variant_id or '∅'}"
+    return {
+        "offer_id": offer_id,
+        "seller": seller,
+        "price": price_amount,
+        "currency": currency,
+        **({"original_price": original_price} if original_price is not None else {}),
+        "in_stock": bool(in_stock),
+        "purchase_route": "internal_checkout",
+        "affiliate_url": None,
+        "internal_checkout_items": [
+            {
+                "merchant_id": merchant_id,
+                "product_id": product_id,
+                **({"variant_id": variant_id} if variant_id else {}),
+                "quantity": 1,
+            }
+        ],
+        "confidence": confidence,
+        "source": {
+            "type": "internal_product",
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "canonical_ref": canonical_ref,
+            "product_group_id": canonical_group_id,
+        },
+    }
+
+
+def _build_shop_top_offer_summary(
+    *,
+    merchant_id: str,
+    product_payload: Dict[str, Any],
+    variant_payload: Dict[str, Any],
+    commerce_surface: str,
+) -> Dict[str, Any]:
+    product_id = str(product_payload.get("product_id") or product_payload.get("id") or "").strip()
+    variant_id = _variant_ref_from_payload(variant_payload)
+    sku = _variant_sku_from_payload(variant_payload)
+    price_amount = _coerce_float(
+        variant_payload.get("price")
+        if variant_payload.get("price") is not None
+        else product_payload.get("price")
+    ) or 0.0
+    currency = str(
+        variant_payload.get("currency")
+        or product_payload.get("currency")
+        or "USD"
+    ).upper()
+    return {
+        "purchase_route": "internal_checkout",
+        "merchant_id": merchant_id,
+        "product_id": product_id,
+        **({"variant_id": variant_id} if variant_id else {}),
+        **({"sku_id": sku} if sku else {}),
+        "price": price_amount,
+        "currency": currency,
+        "commerce_surface": commerce_surface,
+    }
+
+
+def _attach_eligible_serving_fields(
+    item: Dict[str, Any],
+    product: Any,
+    *,
+    commerce_surface: str,
+) -> Optional[Dict[str, Any]]:
+    product_payload = _coerce_product_payload_dict(product)
+    merchant_id = str(item.get("merchant_id") or product_payload.get("merchant_id") or "").strip()
+    if not merchant_id:
+        return None
+    if not _product_supports_commerce_surface(product_payload, commerce_surface):
+        return None
+    first_eligible = pick_first_eligible_variant_from_standard_product(product_payload)
+    if not first_eligible:
+        return None
+    variant_payload = _coerce_variant_payload_dict(first_eligible.get("variant") or {})
+    variant_id = _variant_ref_from_payload(variant_payload)
+    sku_id = _variant_sku_from_payload(variant_payload)
+    attached = dict(item)
+    attached["commerce_surface"] = commerce_surface
+    attached["top_offer_summary"] = _build_shop_top_offer_summary(
+        merchant_id=merchant_id,
+        product_payload=product_payload,
+        variant_payload=variant_payload,
+        commerce_surface=commerce_surface,
+    )
+    attached["exact_resolution_identifiers"] = {
+        "merchant_id": merchant_id,
+        "product_id": str(item.get("product_id") or product_payload.get("product_id") or product_payload.get("id") or "").strip(),
+        **({"variant_id": variant_id} if variant_id else {}),
+        **({"sku_id": sku_id} if sku_id else {}),
+    }
+    return attached
+
+
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -1822,6 +2137,12 @@ async def _handle_offers_resolve(
         payload=payload,
         request_metadata=request_metadata,
     )
+    commerce_surface, commerce_surface_explicit = _resolve_commerce_surface(
+        payload_surface=payload.commerce_surface,
+        request_metadata=request_metadata,
+    )
+    strict_serving_mode = bool(commerce_surface_explicit)
+    allow_external_fallback = not strict_serving_mode
     product_id_aliases = _expand_ref_aliases(product_id)
     sku_id_aliases = _expand_ref_aliases(sku_id)
 
@@ -1837,6 +2158,16 @@ async def _handle_offers_resolve(
     offers: List[Dict[str, Any]] = []
     source_status: List[Dict[str, Any]] = []
     seen_external_offer_ids: set[str] = set()
+    resolution_mode = "not_servable" if strict_serving_mode else "exact_match"
+    requested_target: Dict[str, Any] = {
+        **({"product_id": product_id} if product_id else {}),
+        **({"sku_id": sku_id} if sku_id else {}),
+        **({"merchant_id": merchant_scope} if merchant_scope else {}),
+    }
+    resolved_target: Optional[Dict[str, Any]] = None
+    substitution_reason_codes: List[str] = []
+    exact_target_matched = False
+    surface_not_servable_reason_codes: List[str] = []
 
     def _public_reason_code(raw_code: Optional[str]) -> str:
         code = str(raw_code or "").strip().lower()
@@ -2188,115 +2519,115 @@ async def _handle_offers_resolve(
 
     # 1) External offers from external seeds (affiliate outbound)
     external_offers: List[Dict[str, Any]] = []
-    external_started = time.perf_counter()
-    try:
-        query_label = "external_seed_by_ref"
-        where_clauses = ["status = 'active'"]
-        params: Dict[str, Any] = {"limit": attached_seed_limit}
-        seed_rows: List[Any] = []
+    if allow_external_fallback:
+        external_started = time.perf_counter()
+        try:
+            query_label = "external_seed_by_ref"
+            where_clauses = ["status = 'active'"]
+            params: Dict[str, Any] = {"limit": attached_seed_limit}
+            seed_rows: List[Any] = []
 
-        if merchant_scope and (product_id_aliases or sku_id_aliases):
-            seed_rows = await _fetch_attached_seed_rows(
-                merchant_id=merchant_scope,
-                product_aliases=product_id_aliases,
-                variant_aliases=sku_id_aliases,
-            )
-            if seed_rows:
-                query_label = "external_seed_by_attached_ref"
-
-        if not seed_rows:
-            prefetched_internal = await _prefetch_canonical_internal_context()
-            if prefetched_internal:
-                retry_variant_aliases = [
-                    str(alias or "").strip()
-                    for alias in (
-                        [sku_id]
-                        + list(prefetched_internal.get("variant_aliases") or [])
-                        + sku_id_aliases
-                    )
-                    if str(alias or "").strip()
-                ]
+            if merchant_scope and (product_id_aliases or sku_id_aliases):
                 seed_rows = await _fetch_attached_seed_rows(
-                    merchant_id=str(prefetched_internal.get("merchant_id") or "").strip() or None,
-                    platform=str(prefetched_internal.get("platform") or "").strip() or None,
-                    product_aliases=[
-                        str(prefetched_internal.get("product_id") or "").strip() or None
-                    ] + product_id_aliases,
-                    variant_aliases=retry_variant_aliases,
+                    merchant_id=merchant_scope,
+                    product_aliases=product_id_aliases,
+                    variant_aliases=sku_id_aliases,
                 )
                 if seed_rows:
-                    query_label = "external_seed_by_canonical_attached_prefetch"
+                    query_label = "external_seed_by_attached_ref"
 
-        if not seed_rows and product_id_aliases:
-            pid_clause: List[str] = []
-            for idx, pid_alias in enumerate(product_id_aliases[:8]):
-                pid_key = f"pid_{idx}"
-                like_key = f"pid_like_{idx}"
-                params[pid_key] = pid_alias
-                params[like_key] = f"%{_safe_lower(pid_alias)}%"
-                pid_clause.append(
-                    "("
-                    f"external_product_id = :{pid_key}"
-                    f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
-                    ")"
+            if not seed_rows:
+                prefetched_internal = await _prefetch_canonical_internal_context()
+                if prefetched_internal:
+                    retry_variant_aliases = [
+                        str(alias or "").strip()
+                        for alias in (
+                            [sku_id]
+                            + list(prefetched_internal.get("variant_aliases") or [])
+                            + sku_id_aliases
+                        )
+                        if str(alias or "").strip()
+                    ]
+                    seed_rows = await _fetch_attached_seed_rows(
+                        merchant_id=str(prefetched_internal.get("merchant_id") or "").strip() or None,
+                        platform=str(prefetched_internal.get("platform") or "").strip() or None,
+                        product_aliases=[
+                            str(prefetched_internal.get("product_id") or "").strip() or None
+                        ] + product_id_aliases,
+                        variant_aliases=retry_variant_aliases,
+                    )
+                    if seed_rows:
+                        query_label = "external_seed_by_canonical_attached_prefetch"
+
+            if not seed_rows and product_id_aliases:
+                pid_clause: List[str] = []
+                for idx, pid_alias in enumerate(product_id_aliases[:8]):
+                    pid_key = f"pid_{idx}"
+                    like_key = f"pid_like_{idx}"
+                    params[pid_key] = pid_alias
+                    params[like_key] = f"%{_safe_lower(pid_alias)}%"
+                    pid_clause.append(
+                        "("
+                        f"external_product_id = :{pid_key}"
+                        f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
+                        f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
+                        f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
+                        f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
+                        ")"
+                    )
+                where_clauses.append("(" + " OR ".join(pid_clause) + ")")
+
+            if not seed_rows and sku_id_aliases:
+                sku_clause: List[str] = []
+                for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+                    key = f"sku_like_{idx}"
+                    params[key] = f"%{_safe_lower(sku_alias)}%"
+                    sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
+                where_clauses.append("(" + " OR ".join(sku_clause) + ")")
+
+            if not seed_rows and len(where_clauses) == 1:
+                return {
+                    "status": "error",
+                    "error": {
+                        "code": "MISSING_PRODUCT_REF",
+                        "message": "offers.resolve requires product.sku_id or product.product_id",
+                    },
+                }
+
+            if not seed_rows:
+                seed_rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        f"""
+                        SELECT *
+                        FROM external_product_seeds
+                        WHERE {" AND ".join(where_clauses)}
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT :limit
+                        """,
+                        params,
+                    ),
+                    timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
                 )
-            where_clauses.append("(" + " OR ".join(pid_clause) + ")")
 
-        if not seed_rows and sku_id_aliases:
-            sku_clause: List[str] = []
-            for idx, sku_alias in enumerate(sku_id_aliases[:8]):
-                key = f"sku_like_{idx}"
-                params[key] = f"%{_safe_lower(sku_alias)}%"
-                sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
-            where_clauses.append("(" + " OR ".join(sku_clause) + ")")
-
-        if not seed_rows and len(where_clauses) == 1:
-            # No input: return empty (caller must provide sku_id or product_id).
-            return {
-                "status": "error",
-                "error": {
-                    "code": "MISSING_PRODUCT_REF",
-                    "message": "offers.resolve requires product.sku_id or product.product_id",
-                },
-            }
-
-        if not seed_rows:
-            seed_rows = await asyncio.wait_for(
-                database.fetch_all(
-                    f"""
-                    SELECT *
-                    FROM external_product_seeds
-                    WHERE {" AND ".join(where_clauses)}
-                    ORDER BY updated_at DESC, created_at DESC
-                    LIMIT :limit
-                    """,
-                    params,
-                ),
-                timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+            await _append_external_offers_from_seed_rows(list(seed_rows or []))
+            _record_source(
+                source="external_product_seeds",
+                status="ok",
+                reason_code="ok",
+                source_started=external_started,
+                row_count=len(seed_rows or []),
+                query=query_label,
             )
-
-        await _append_external_offers_from_seed_rows(list(seed_rows or []))
-        _record_source(
-            source="external_product_seeds",
-            status="ok",
-            reason_code="ok",
-            source_started=external_started,
-            row_count=len(seed_rows or []),
-            query=query_label,
-        )
-    except Exception as e:
-        logger.info("offers.resolve.external.failed", extra={"error": str(e)})
-        _record_source(
-            source="external_product_seeds",
-            status="error",
-            reason_code=_classify_db_reason_code(e),
-            source_started=external_started,
+        except Exception as e:
+            logger.info("offers.resolve.external.failed", extra={"error": str(e)})
+            _record_source(
+                source="external_product_seeds",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=external_started,
                 error=type(e).__name__,
-            query="external_seed_by_ref",
-        )
+                query="external_seed_by_ref",
+            )
 
     # 2) Internal checkout offers (primary)
     internal_offers: List[Dict[str, Any]] = []
@@ -2540,58 +2871,94 @@ async def _handle_offers_resolve(
                 if not pid or not merchant_id:
                     continue
 
-                variants = product_data.get("variants") if isinstance(product_data.get("variants"), list) else []
-                chosen_variant: Dict[str, Any] = {}
+                product_payload = dict(product_data)
+                exact_pid_match = bool(product_id_aliases and pid in product_id_aliases)
+                variants = product_payload.get("variants") if isinstance(product_payload.get("variants"), list) else []
+                exact_variant: Optional[Dict[str, Any]] = None
+                exact_variant_projection: Optional[Dict[str, Any]] = None
                 if sku_id_aliases and isinstance(variants, list):
-                    for v in variants:
-                        if not isinstance(v, dict):
-                            continue
-                        vid = str(v.get("variant_id") or v.get("id") or v.get("sku") or v.get("sku_id") or "").strip()
+                    for raw_variant in variants:
+                        variant_payload = _coerce_variant_payload_dict(raw_variant)
+                        vid = _variant_ref_from_payload(variant_payload)
                         if vid and vid in sku_id_aliases:
-                            chosen_variant = v
+                            exact_variant = variant_payload
+                            exact_variant_projection = build_agent_push_projection_from_standard_variant(
+                                variant_payload,
+                                product_currency=product_payload.get("currency") or product_payload.get("currency_code"),
+                                checked_at=product_payload.get("updated_at")
+                                or product_payload.get("published_at")
+                                or product_payload.get("created_at"),
+                            )
                             break
-                if not chosen_variant and isinstance(variants, list) and variants:
-                    first = variants[0] if isinstance(variants[0], dict) else None
-                    chosen_variant = first or {}
 
-                variant_id = str(
-                    chosen_variant.get("variant_id")
-                    or chosen_variant.get("id")
-                    or chosen_variant.get("sku")
-                    or chosen_variant.get("sku_id")
-                    or ""
-                ).strip() or (sku_id or None)
+                surface_product_eligible = _product_supports_commerce_surface(
+                    product_payload,
+                    commerce_surface,
+                )
+                if exact_variant is not None or exact_pid_match or not sku_id_aliases:
+                    exact_target_matched = True
+
+                chosen_bundle = (
+                    pick_first_eligible_variant_from_standard_product(product_payload)
+                    if surface_product_eligible
+                    else None
+                )
+                chosen_variant = _coerce_variant_payload_dict(chosen_bundle.get("variant") or {}) if chosen_bundle else {}
+                chosen_projection = dict(chosen_bundle.get("projection") or {}) if chosen_bundle else {}
+                chosen_variant_id = _variant_ref_from_payload(chosen_variant)
+
+                variant_id = chosen_variant_id or (sku_id or None)
                 offer_id = f"of:internal_checkout:{merchant_id}:{pid}:{variant_id or '∅'}"
                 if offer_id in seen_internal_offer_ids:
                     continue
-                seen_internal_offer_ids.add(offer_id)
 
-                price = (
-                    chosen_variant.get("price")
-                    if chosen_variant.get("price") is not None
-                    else product_data.get("price")
-                )
-                currency = product_data.get("currency") or product_data.get("currency_code") or "USD"
-                price_amount = _coerce_float(price) or 0.0
+                if strict_serving_mode:
+                    if not surface_product_eligible:
+                        if not surface_not_servable_reason_codes:
+                            surface_not_servable_reason_codes = ["surface_not_enabled"]
+                        mapping_candidates.append(
+                            _conf(
+                                "internal_product",
+                                0.0,
+                                "surface_not_enabled",
+                                {
+                                    "merchant_id": merchant_id,
+                                    "platform": platform,
+                                    "product_id": pid,
+                                    "commerce_surface": commerce_surface,
+                                },
+                            )
+                        )
+                        continue
+                    if not chosen_variant:
+                        if exact_variant_projection and not surface_not_servable_reason_codes:
+                            surface_not_servable_reason_codes = list(
+                                exact_variant_projection.get("agent_push_reason_codes") or []
+                            )
+                        elif not surface_not_servable_reason_codes:
+                            surface_not_servable_reason_codes = ["not_servable"]
+                        mapping_candidates.append(
+                            _conf(
+                                "internal_product",
+                                0.0,
+                                "matched_but_not_servable",
+                                {
+                                    "merchant_id": merchant_id,
+                                    "platform": platform,
+                                    "product_id": pid,
+                                    "requested_variant_id": _variant_ref_from_payload(exact_variant or {}),
+                                    "commerce_surface": commerce_surface,
+                                    "reason_codes": list(surface_not_servable_reason_codes),
+                                },
+                            )
+                        )
+                        continue
+                else:
+                    if not chosen_variant and isinstance(variants, list) and variants:
+                        first = variants[0]
+                        chosen_variant = _coerce_variant_payload_dict(first if isinstance(first, dict) else {})
 
-                original_price = _coerce_float(
-                    chosen_variant.get("compare_at_price")
-                    or product_data.get("compare_at_price")
-                )
-
-                in_stock = True
-                inv = _coerce_int(chosen_variant.get("inventory_quantity") or product_data.get("inventory_quantity"))
-                if inv is not None:
-                    in_stock = inv > 0
-                if isinstance(product_data.get("in_stock"), bool):
-                    in_stock = product_data.get("in_stock")
-
-                seller = (
-                    str(product_data.get("merchant_name") or product_data.get("store_name") or "").strip()
-                    or str(merchant_id)
-                )
-                exact_pid_match = bool(product_id_aliases and pid in product_id_aliases)
-                exact_sku_match = bool(sku_id_aliases and variant_id and variant_id in sku_id_aliases)
+                exact_sku_match = bool(sku_id_aliases and exact_variant and _variant_ref_from_payload(exact_variant) in sku_id_aliases)
                 confidence = 0.95 if (exact_pid_match or exact_sku_match) else 0.8 if sku_id else 0.7
                 canonical_ref = (
                     f"pg:{canonical_group_id}"
@@ -2614,36 +2981,39 @@ async def _handle_offers_resolve(
                     )
                 )
 
+                seen_internal_offer_ids.add(offer_id)
                 internal_offers.append(
-                    {
-                        "offer_id": offer_id,
-                        "seller": seller,
-                        "price": price_amount,
-                        "currency": str(currency).upper(),
-                        **({"original_price": original_price} if original_price is not None else {}),
-                        "in_stock": bool(in_stock),
-                        "purchase_route": "internal_checkout",
-                        "affiliate_url": None,
-                        "internal_checkout_items": [
-                            {
-                                "merchant_id": merchant_id,
-                                "product_id": pid,
-                                **({"variant_id": variant_id} if variant_id else {}),
-                                "quantity": 1,
-                            }
-                        ],
-                        "confidence": confidence,
-                        "source": {
-                            "type": "internal_product",
-                            "merchant_id": merchant_id,
-                            "platform": platform,
-                            "product_id": pid,
-                            "variant_id": variant_id,
-                            "canonical_ref": canonical_ref,
-                            "product_group_id": canonical_group_id,
-                        },
-                    }
+                    _build_internal_offer_summary(
+                        merchant_id=str(merchant_id),
+                        platform=str(platform),
+                        product_payload=product_payload,
+                        variant_payload=chosen_variant,
+                        confidence=confidence,
+                        canonical_ref=canonical_ref,
+                        canonical_group_id=canonical_group_id,
+                    )
                 )
+                resolved_target = {
+                    "merchant_id": str(merchant_id),
+                    "platform": str(platform),
+                    "product_id": pid,
+                    **({"variant_id": chosen_variant_id} if chosen_variant_id else {}),
+                    **({"sku_id": _variant_sku_from_payload(chosen_variant)} if _variant_sku_from_payload(chosen_variant) else {}),
+                }
+                if strict_serving_mode:
+                    requested_variant_id = _variant_ref_from_payload(exact_variant or {})
+                    if requested_variant_id:
+                        if chosen_variant_id == requested_variant_id:
+                            resolution_mode = "exact_match"
+                        else:
+                            resolution_mode = "same_product_substitution"
+                            substitution_reason_codes = list(
+                                (exact_variant_projection or {}).get("agent_push_reason_codes") or []
+                            )
+                            if "requested_variant_not_servable" not in substitution_reason_codes:
+                                substitution_reason_codes.append("requested_variant_not_servable")
+                    else:
+                        resolution_mode = "exact_match"
                 if len(internal_offers) >= min(3, limit):
                     break
             internal_status = "ok" if rows else "empty"
@@ -2691,7 +3061,7 @@ async def _handle_offers_resolve(
                 "product_group_id": canonical_group_id,
             }
 
-    if not external_offers and canonical_product:
+    if allow_external_fallback and not external_offers and canonical_product:
         attached_retry_started = time.perf_counter()
         try:
             retry_variant_aliases = [
@@ -2780,6 +3150,9 @@ async def _handle_offers_resolve(
     if offers:
         reason_code = "OK"
         reason = "resolved"
+    elif strict_serving_mode and exact_target_matched:
+        reason_code = "NOT_SERVABLE"
+        reason = "not_servable"
     elif cache_failed:
         reason_code = "DB_ERROR"
         reason = "products_cache_failed"
@@ -2814,6 +3187,11 @@ async def _handle_offers_resolve(
     return {
         "status": "success",
         "input": {"product_id": product_id, "sku_id": sku_id},
+        "commerce_surface": commerce_surface,
+        "resolution_mode": resolution_mode,
+        "requested_target": requested_target,
+        "resolved_target": resolved_target,
+        "substitution_reason_codes": substitution_reason_codes,
         "offers": offers,
         "offers_count": len(offers),
         **({"canonical_product_ref": canonical_ref} if canonical_ref else {}),
@@ -2821,10 +3199,15 @@ async def _handle_offers_resolve(
             "canonical_ref": canonical_ref,
             "canonical_product_group_id": canonical_group_id,
             "canonical_product": canonical_product,
+            "requested_target": requested_target,
+            "resolved_target": resolved_target,
+            "resolution_mode": resolution_mode,
+            "substitution_reason_codes": substitution_reason_codes,
             "candidates": mapping_candidates[:50],
         },
         "metadata": {
             "source": "offers.resolve",
+            "commerce_surface": commerce_surface,
             "has_external": bool(external_offers),
             "has_internal": bool(internal_offers),
             "merchant_scope": merchant_scope,
@@ -2833,6 +3216,11 @@ async def _handle_offers_resolve(
             "latency_ms": latency_ms,
             "sources": source_status,
             "failure_breakdown": failure_breakdown,
+            "requested_target": requested_target,
+            "resolved_target": resolved_target,
+            "resolution_mode": resolution_mode,
+            "substitution_reason_codes": substitution_reason_codes,
+            "servable_reason_codes": surface_not_servable_reason_codes,
         },
     }
 
@@ -3877,6 +4265,11 @@ async def _handle_find_products_multi(
         source_normalized,
         is_creator_surface,
     )
+    commerce_surface, commerce_surface_explicit = _resolve_commerce_surface(
+        payload_surface=filters.commerce_surface,
+        request_metadata=request_metadata,
+    )
+    strict_serving_mode = bool(commerce_surface_explicit)
     page = filters.page or 1
     limit = _clamp_search_limit(filters.limit, fallback=20)
 
@@ -5943,7 +6336,7 @@ async def _handle_find_products_multi(
             }
         )
 
-    if external_seed_wrappers:
+    if external_seed_wrappers and not strict_serving_mode:
         internal_products = []
         for wrapper in filtered_products:
             product_item = wrapper.get("product") if isinstance(wrapper, dict) else None
@@ -5985,9 +6378,22 @@ async def _handle_find_products_multi(
         else:
             continue
 
+        if strict_serving_mode:
+            attached = _attach_eligible_serving_fields(
+                item,
+                product_item,
+                commerce_surface=commerce_surface,
+            )
+            if attached is None:
+                continue
+            item = attached
+
         if merchant_name and not item.get("merchant_name"):
             item["merchant_name"] = merchant_name
         out_products.append(item)
+
+    if strict_serving_mode:
+        total = len(out_products)
 
     semantic_retry_applied = False
     semantic_retry_query: Optional[str] = None
@@ -6230,6 +6636,7 @@ async def _handle_find_products_multi(
                 "shopping_sku_json_scan_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN
                 ),
+                **({"commerce_surface": commerce_surface} if strict_serving_mode else {}),
             },
         },
         rewritten_query=q_ascii,

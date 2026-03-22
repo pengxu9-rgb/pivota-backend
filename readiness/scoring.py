@@ -262,7 +262,23 @@ def _build_variant_readiness(
 
     discovery_status = "ready" if not discovery_blockers else "blocked"
     checkout_status = "ready" if not checkout_blockers else "blocked"
-    channel_status = "ready" if channel == "ucp" and discovery_status == "ready" and checkout_status == "ready" else "blocked"
+    protocol_checkout_supported = False
+    if channel == "ucp":
+        protocol_checkout_supported = bool(
+            dataset.payment_capabilities.get("ucp_checkout_supported")
+            or dataset.payment_capabilities.get("merchant_native_checkout_supported")
+        )
+    elif channel == "acp":
+        protocol_checkout_supported = bool(
+            dataset.payment_capabilities.get("acp_checkout_supported")
+            or dataset.payment_capabilities.get("merchant_native_checkout_supported")
+        )
+
+    channel_status = (
+        "ready"
+        if channel in {"ucp", "acp"} and protocol_checkout_supported and discovery_status == "ready" and checkout_status == "ready"
+        else "blocked"
+    )
 
     return ReadyVariant(
         variant_id=variant.id,

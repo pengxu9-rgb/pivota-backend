@@ -428,6 +428,7 @@ class ShopifyLiveMerchantSource:
             "merchant_native_checkout_supported": bool(shopify_connected and psp_config),
             "merchant_platform_writeback_supported": bool(shopify_connected),
             "ucp_checkout_supported": bool(shopify_connected and psp_config),
+            "acp_checkout_supported": bool(shopify_connected and psp_config),
             "payment_mode": "merchant_psp" if psp_config else "blocked",
             "psp_provider": (psp_config or {}).get("provider"),
             "psp_id": (psp_config or {}).get("psp_id"),

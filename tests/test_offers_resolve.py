@@ -312,3 +312,122 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
         and str(source.get("query")) == "external_seed_by_canonical_attached_prefetch"
         for source in (metadata.get("sources") or [])
     )
+def test_offers_resolve_strict_surface_substitutes_same_product_variant(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            raise AssertionError("strict serving should not query external seeds")
+        if "FROM product_group_members" in q:
+            return []
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_strict_1",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_strict_1",
+                    "product_data": {
+                        "id": "prod_strict_1",
+                        "title": "Strict Product",
+                        "currency": "USD",
+                        "price": 29.0,
+                        "inventory_quantity": 0,
+                        "orderable": True,
+                        "variants": [
+                            {"id": "sku_blocked", "sku": "sku_blocked", "price": 29.0, "inventory_quantity": 0},
+                            {"id": "sku_ok", "sku": "sku_ok", "price": 31.0, "inventory_quantity": 8},
+                        ],
+                    },
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"sku_id": "sku_blocked"},
+                "limit": 10,
+                "commerce_surface": "agent_api",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["resolution_mode"] == "same_product_substitution"
+    assert body["requested_target"]["sku_id"] == "sku_blocked"
+    assert body["resolved_target"]["variant_id"] == "sku_ok"
+    assert "requested_variant_not_servable" in (body.get("substitution_reason_codes") or [])
+    offers = body.get("offers") or []
+    assert len(offers) == 1
+    assert offers[0]["purchase_route"] == "internal_checkout"
+    assert offers[0]["source"]["variant_id"] == "sku_ok"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("has_external") is False
+    assert metadata.get("commerce_surface") == "agent_api"
+
+
+def test_offers_resolve_strict_surface_fails_closed_without_eligible_variant(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            raise AssertionError("strict serving should not query external seeds")
+        if "FROM product_group_members" in q:
+            return []
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_strict_2",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_strict_2",
+                    "product_data": {
+                        "id": "prod_strict_2",
+                        "title": "Strict Product 2",
+                        "currency": "USD",
+                        "price": 20.0,
+                        "inventory_quantity": 0,
+                        "orderable": True,
+                        "variants": [
+                            {"id": "sku_none", "sku": "sku_none", "price": 20.0, "inventory_quantity": 0},
+                        ],
+                    },
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"sku_id": "sku_none"},
+                "limit": 10,
+                "commerceSurface": "agent_api",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["resolution_mode"] == "not_servable"
+    assert body["resolved_target"] is None
+    assert body.get("offers") == []
+    metadata = body.get("metadata") or {}
+    assert metadata.get("reason_code") == "NOT_SERVABLE"
+    assert metadata.get("reason") == "not_servable"
+    assert "out_of_stock" in (metadata.get("servable_reason_codes") or [])
