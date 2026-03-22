@@ -8,6 +8,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request, Response
@@ -23,6 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
+import db.merchant_portal_preferences  # noqa: F401  (register merchant portal preferences table in metadata)
 import subprocess
 import os
 from pathlib import Path
@@ -129,7 +131,6 @@ from routes.merchant_store_connections import router as merchant_store_connectio
 from routes.ops_shopify_integration_routes import router as ops_shopify_integration_router
 from routes.ops_pcs_reducer_routes import router as ops_pcs_reducer_router
 from routes.merchant_onboarding_shopify_verify_routes import router as merchant_onboarding_shopify_verify_router
-from routes.admin_cleanup import router as admin_cleanup_router
 from routes.admin_simple_fix import router as admin_simple_fix_router
 from routes.admin_cleanup_rebuild import router as admin_cleanup_rebuild_router
 from routes.admin_cleanup_stores import router as admin_cleanup_stores_router
@@ -230,6 +231,7 @@ from routes.merchant_agent_bank import router as merchant_agent_bank_router  # M
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
+from routes.agent_v2 import router as agent_v2_router
 from routes.after_sales_cases import router as after_sales_cases_router
 from routes.agent_events import router as agent_events_router
 from routes.agent_management import router as agent_management_router
@@ -242,6 +244,7 @@ from routes.agent_recommendations import router as agent_recommendations_router
 from routes.fix_orders_table import router as fix_orders_table_router
 from routes.agent_metrics import router as agent_metrics_router
 from routes.agent_keys import router as agent_keys_router
+from routes.agent_webhooks import router as agent_webhooks_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.merchant_products import router as merchant_products_router
 from routes.product_quality_routes import router as product_quality_router
@@ -273,7 +276,6 @@ from routes.external_offers import router as external_offers_router
 from routes.prometheus_metrics import router as prometheus_metrics_router
 from routes.employee_reviews import router as employee_reviews_router
 from routes.readiness_internal import router as readiness_internal_router
-from routes.employee_products import router as employee_products_router
 from routes.buyer_reviews import router as buyer_reviews_router
 from routes.questions_api import router as questions_router
 from routes.reviews_invitation_issuer import router as reviews_invitation_issuer_router
@@ -307,9 +309,15 @@ except ImportError:
 # Utils
 from utils.logger import logger
 from config.settings import settings
+from services.agent_governance import agent_governance, governance_runtime_contract
 
 from openapi_config import get_custom_openapi_schema
 from services.promotions_service import ensure_promotions_table
+from services.agent_webhook_service import (
+    ensure_agent_webhook_tables,
+    start_agent_webhook_retry_worker,
+    stop_agent_webhook_retry_worker,
+)
 from services.webhook_service import WebhookService
 
 app = FastAPI(
@@ -320,6 +328,96 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
+
+
+@lru_cache(maxsize=1)
+def _runtime_build_payload() -> dict:
+    commit_sha = (
+        os.getenv("RAILWAY_GIT_COMMIT_SHA")
+        or os.getenv("GIT_COMMIT_SHA")
+        or os.getenv("VERCEL_GIT_COMMIT_SHA")
+        or None
+    )
+    branch = os.getenv("RAILWAY_GIT_BRANCH") or os.getenv("GIT_BRANCH") or None
+    deployment_id = os.getenv("RAILWAY_DEPLOYMENT_ID") or None
+
+    if commit_sha is None:
+        try:
+            commit_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=os.path.dirname(__file__),
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8").strip()
+        except Exception:
+            commit_sha = None
+    if branch is None:
+        try:
+            branch = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=os.path.dirname(__file__),
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8").strip()
+        except Exception:
+            branch = None
+
+    return {
+        "service": "pivota-backend",
+        "git": {
+            "commit_sha": commit_sha,
+            "branch": branch,
+        },
+        "railway": {
+            "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
+            "deployment_id": deployment_id,
+            "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
+        },
+    }
+
+
+def _is_route_mounted(path: str, method: str) -> bool:
+    for route in app.routes:
+        route_path = getattr(route, "path", "") or ""
+        methods = getattr(route, "methods", set()) or set()
+        if route_path == path and method in methods:
+            return True
+    return False
+
+
+def _settings_contract_payload() -> dict:
+    rate_limit_rpm = getattr(settings, "rate_limit_rpm", None)
+    return {
+        "rate_limit_rpm_present": hasattr(settings, "rate_limit_rpm"),
+        "rate_limit_rpm": rate_limit_rpm,
+        "rate_limit_rpm_source": "settings" if rate_limit_rpm is not None else "default",
+    }
+
+
+def _runtime_contracts_payload() -> dict:
+    return {
+        "agent_governance": governance_runtime_contract(agent_governance),
+        "canonical_mutating_routes": {
+            "agent_v1_orders_create": {
+                "path": "/agent/v1/orders/create",
+                "method": "POST",
+                "mounted": _is_route_mounted("/agent/v1/orders/create", "POST"),
+            },
+            "agent_v1_confirm_payment": {
+                "path": "/agent/v1/orders/{order_id}/confirm-payment",
+                "method": "POST",
+                "mounted": _is_route_mounted("/agent/v1/orders/{order_id}/confirm-payment", "POST"),
+            },
+            "agent_v2_orders": {
+                "path": "/agent/v2/orders",
+                "method": "POST",
+                "mounted": _is_route_mounted("/agent/v2/orders", "POST"),
+            },
+            "agent_v2_checkout_sessions": {
+                "path": "/agent/v2/payments/checkout-sessions",
+                "method": "POST",
+                "mounted": _is_route_mounted("/agent/v2/payments/checkout-sessions", "POST"),
+            },
+        },
+    }
 
 # Override OpenAPI schema with our custom, investor-ready version
 def custom_openapi():
@@ -399,6 +497,8 @@ async def startup_event():
 
     # Ensure webhook audit/idempotency table exists (best-effort; does not raise)
     await WebhookService.ensure_webhook_events_table()
+    await ensure_agent_webhook_tables()
+    await start_agent_webhook_retry_worker()
 
     # Optional: background photo TTL cleanup (non-blocking).
     try:
@@ -408,6 +508,7 @@ async def startup_event():
 
 
 async def shutdown_event():
+    await stop_agent_webhook_retry_worker()
     await database.disconnect()
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
@@ -452,7 +553,10 @@ else:
 app.add_middleware(UsageLoggerMiddleware)
 
 # Add rate limiting middleware for agent API (env-configurable)
-app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_rpm)
+app.add_middleware(
+    RateLimitMiddleware,
+    requests_per_minute=int(getattr(settings, "rate_limit_rpm", 1000) or 1000),
+)
 
 # Add structured logging middleware (logs all requests in JSON format)
 app.add_middleware(StructuredLoggingMiddleware)
@@ -532,7 +636,6 @@ app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify toke
 # Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
 app.include_router(employee_agent_mgmt_router)
 app.include_router(employee_settlement_router)
-app.include_router(employee_products_router)
 app.include_router(employee_content_router)
 # TEMPORARILY DISABLED - causing "Failed to fetch agents: get" error
 # app.include_router(employee_agents_management_router)  # Employee agents management
@@ -633,7 +736,6 @@ app.include_router(merchant_store_connections_router)  # Merchant store connecti
 app.include_router(ops_shopify_integration_router)  # Internal ops: Shopify integration verify/report
 app.include_router(ops_pcs_reducer_router)  # Internal ops: PCS reducer replay
 app.include_router(merchant_onboarding_shopify_verify_router)  # Merchant onboarding facade: Shopify verify/report
-app.include_router(admin_cleanup_router)  # Admin cleanup utilities
 app.include_router(admin_simple_fix_router)  # Admin simple fix
 app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
@@ -671,6 +773,7 @@ app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-fa
 app.include_router(buyer_router)  # Buyer Vault API (unified buyer account)
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
+app.include_router(agent_v2_router)  # Canonical Agent v2 middleware contract
 app.include_router(subject_resolve_router)  # Stable subject resolution contract (/v1/subject/resolve)
 app.include_router(after_sales_cases_router)  # After-sales Case API (refund/return_refund)
 app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
@@ -684,6 +787,7 @@ app.include_router(agent_docs_router)  # Agent developer docs
 app.include_router(fix_orders_table_router)  # Fix orders table structure
 app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
+app.include_router(agent_webhooks_router)  # Agent webhook management and deliveries
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
 app.include_router(merchant_promotions_router)  # Merchant/agent promotions API (DB-backed)
@@ -786,6 +890,14 @@ async def get_version():
 async def startup():
     """Initialize services on startup"""
     logger.info("🚀 Starting Pivota Infrastructure Dashboard...")
+    logger.info(
+        "🧭 Agent runtime contract: %s",
+        {
+            "build": _runtime_build_payload(),
+            "runtime_contracts": _runtime_contracts_payload(),
+            "settings_contract": _settings_contract_payload(),
+        },
+    )
     
     # Initialize Sentry error tracking (optional)
     try:
@@ -1384,6 +1496,9 @@ async def health_check():
             "db_ok": db_ok,
             "missing_columns": missing,
             "error": db_error,
+            "build": _runtime_build_payload(),
+            "runtime_contracts": _runtime_contracts_payload(),
+            "settings_contract": _settings_contract_payload(),
         },
     )
 
@@ -1394,20 +1509,8 @@ async def build_info():
     Useful to confirm which git SHA / deployment is running in prod.
     """
     return {
-        "service": "pivota-backend",
+        **_runtime_build_payload(),
         "timestamp": time.time(),
-        "git": {
-            "commit_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA")
-            or os.getenv("GIT_COMMIT_SHA")
-            or os.getenv("VERCEL_GIT_COMMIT_SHA")
-            or None,
-            "branch": os.getenv("RAILWAY_GIT_BRANCH") or os.getenv("GIT_BRANCH") or None,
-        },
-        "railway": {
-            "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
-            "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID") or None,
-            "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
-        },
     }
 
 # Catch-all OPTIONS to satisfy permissive CORS preflight checks (even when Access-Control-Request-Method is missing).

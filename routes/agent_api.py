@@ -7156,6 +7156,24 @@ async def agent_create_order(
                 await idem.put(scope="order_create", key=order_request.idempotency_key, value=response)
             except Exception:
                 pass
+
+        try:
+            from services.agent_webhook_service import emit_agent_webhook_event
+
+            background_tasks.add_task(
+                emit_agent_webhook_event,
+                context.agent_id,
+                event_type="order.created",
+                payload={
+                    "order_id": order_response.order_id,
+                    "merchant_id": order_request.merchant_id,
+                    "total_amount": float(order_response.total),
+                    "currency": order_response.currency,
+                    "payment_intent_id": order_response.payment_intent_id,
+                },
+            )
+        except Exception:
+            pass
         
         return response
         
@@ -7439,6 +7457,24 @@ async def agent_confirm_payment(
 
         if can_shopify_sync:
             background_tasks.add_task(create_shopify_order, order_id)
+
+        try:
+            from services.agent_webhook_service import emit_agent_webhook_event
+
+            background_tasks.add_task(
+                emit_agent_webhook_event,
+                context.agent_id,
+                event_type="order.payment_succeeded",
+                payload={
+                    "order_id": order_id,
+                    "merchant_id": order["merchant_id"],
+                    "total_amount": float(order["total"]),
+                    "currency": order["currency"],
+                    "payment_intent_id": order.get("payment_intent_id"),
+                },
+            )
+        except Exception:
+            pass
         
         # 记录请求
         background_tasks.add_task(
@@ -7733,6 +7769,7 @@ async def agent_list_order_events(
     limit: int = Query(default=50, ge=1, le=200),
     wait_ms: int = Query(default=0, ge=0, le=25_000),
     merchant_id: Optional[str] = None,
+    order_id: Optional[str] = None,
     buyer_ref: Optional[str] = None,
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
@@ -7780,6 +7817,9 @@ async def agent_list_order_events(
         if merchant_id:
             query += " AND e.merchant_id = :merchant_id"
             params["merchant_id"] = merchant_id
+        if order_id:
+            query += " AND e.order_id = :order_id"
+            params["order_id"] = order_id
 
         buyer_filter_sql = None
         buyer_filter_params: Dict[str, Any] = {}
@@ -7897,6 +7937,24 @@ async def agent_refund_order(
 
         req = _Req(order_id=order_id, amount=None, reason="Agent requested refund", restore_inventory=True)
         result = await process_refund(order_id, req, background_tasks, current_user={"role": "admin"})
+        try:
+            if str((result or {}).get("status") or "").lower() == "success":
+                from services.agent_webhook_service import emit_agent_webhook_event
+
+                background_tasks.add_task(
+                    emit_agent_webhook_event,
+                    context.agent_id,
+                    event_type="order.refunded",
+                    payload={
+                        "order_id": order_id,
+                        "merchant_id": order["merchant_id"],
+                        "total_amount": float(order.get("total") or 0),
+                        "currency": order.get("currency") or "USD",
+                        "reason": "Agent requested refund",
+                    },
+                )
+        except Exception:
+            pass
         return result
     except HTTPException:
         raise
@@ -7908,6 +7966,7 @@ async def agent_refund_order(
 @router.post("/orders/{order_id}/cancel")
 async def agent_cancel_order(
     order_id: str,
+    background_tasks: BackgroundTasks,
     buyer_ref: Optional[str] = None,
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
@@ -7963,6 +8022,33 @@ async def agent_cancel_order(
             raise HTTPException(status_code=500, detail="Cancel verification failed")
         if str(after.get("status") or "").lower() != "cancelled":
             raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+        try:
+            await log_order_event(
+                event_type="order_cancelled",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                status="cancelled",
+                metadata={"cancelled_by": "agent"},
+            )
+        except Exception:
+            pass
+
+        try:
+            from services.agent_webhook_service import emit_agent_webhook_event
+
+            background_tasks.add_task(
+                emit_agent_webhook_event,
+                context.agent_id,
+                event_type="order.cancelled",
+                payload={
+                    "order_id": order_id,
+                    "merchant_id": order["merchant_id"],
+                    "status": "cancelled",
+                },
+            )
+        except Exception:
+            pass
 
         return {"status": "success", "order_id": order_id}
     except HTTPException:

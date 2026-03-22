@@ -31,6 +31,28 @@ async def _insert_usage_log(payload):
         logger.warning("Failed to log usage: %s", e)
 
 
+async def _emit_request_failure_event(payload):
+    try:
+        from services.agent_webhook_service import emit_agent_webhook_event
+
+        status_code = int(payload.get("status_code") or 0)
+        event_type = "api.rate_limited" if status_code == 429 else "api.request_failed"
+        await emit_agent_webhook_event(
+            str(payload["agent_id"]),
+            event_type=event_type,
+            request_id=str(payload.get("request_id") or ""),
+            payload={
+                "path": payload.get("endpoint"),
+                "method": payload.get("method"),
+                "status_code": status_code,
+                "response_time_ms": payload.get("response_time"),
+                "timestamp": str(payload.get("timestamp").isoformat() if payload.get("timestamp") else ""),
+            },
+        )
+    except Exception as e:
+        logger.warning("Failed to emit agent webhook event: %s", e)
+
+
 class UsageLoggerMiddleware(BaseHTTPMiddleware):
     """Log Agent API usage for analytics"""
     
@@ -74,4 +96,6 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
 
         # Fire-and-forget to avoid extending request latency.
         asyncio.create_task(_insert_usage_log(payload))
+        if response.status_code >= 400:
+            asyncio.create_task(_emit_request_failure_event(payload))
         return response

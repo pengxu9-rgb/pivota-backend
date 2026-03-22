@@ -262,6 +262,11 @@ async def get_agent_context(
             status_code=403,
             detail="Agent is deactivated"
         )
+
+    try:
+        request.state.agent_id = agent["agent_id"]
+    except Exception:
+        pass
     
     # 5. 检查速率限制（内部 trusted key 走服务间链路，跳过此路径）
     if not internal_trusted_api_key:

@@ -131,7 +131,7 @@ async def get_agent_details(
 async def update_agent(
     agent_id: str,
     request: UpdateAgentRequest,
-    admin_user: dict = Depends(get_current_employee)
+    current_user: dict = Depends(get_current_user)
 ):
     """更新 Agent 配置"""
     try:
@@ -139,6 +139,11 @@ async def update_agent(
         agent = await get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+
+        current_role = current_user.get("role")
+        current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
+        if current_role not in ("admin", "employee", "super_admin") and str(current_agent_id or "") != str(agent_id):
+            raise HTTPException(status_code=403, detail="Not authorized")
         
         # 构建更新数据
         update_data = {}
@@ -165,7 +170,7 @@ async def update_agent(
         query = agents.update().where(agents.c.agent_id == agent_id).values(**update_data)
         await database.execute(query)
         
-        logger.info(f"Agent {agent_id} updated by admin {admin_user['user_id']}")
+        logger.info(f"Agent {agent_id} updated by {current_user.get('email') or current_user.get('user_id')}")
         
         return {
             "status": "success",
@@ -350,7 +355,7 @@ async def list_agents(
 async def get_agent_analytics_endpoint(
     agent_id: str,
     days: int = Query(default=30, le=365),
-    admin_user: dict = Depends(get_current_user)  # Allow authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """
     获取 Agent 分析数据
@@ -367,6 +372,11 @@ async def get_agent_analytics_endpoint(
         agent = await get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+
+        if current_user.get("role") not in ["admin", "employee", "super_admin"]:
+            user_agent_id = current_user.get("agent_id") or current_user.get("email")
+            if str(user_agent_id or "") != str(agent_id):
+                raise HTTPException(status_code=403, detail="Not authorized")
         
         # 获取分析数据
         start_date = datetime.utcnow() - timedelta(days=days)
@@ -395,7 +405,7 @@ async def get_agent_usage(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     limit: int = Query(default=100, le=1000),
-    admin_user: dict = Depends(get_current_employee)
+    current_user: dict = Depends(get_current_user)
 ):
     """
     获取 Agent 使用日志
@@ -403,6 +413,11 @@ async def get_agent_usage(
     详细的 API 调用记录
     """
     try:
+        if current_user.get("role") not in ["admin", "employee", "super_admin"]:
+            user_agent_id = current_user.get("agent_id") or current_user.get("email")
+            if str(user_agent_id or "") != str(agent_id):
+                raise HTTPException(status_code=403, detail="Not authorized")
+
         # 默认时间范围
         if not end_date:
             end_date = datetime.utcnow()
@@ -644,19 +659,20 @@ async def get_agent_query_analytics(
         raise
     except Exception as e:
         logger.error(f"Failed to get query analytics: {e}")
-        # Return mock data if error
+        # Return an honest unavailable state instead of fabricated analytics.
         return {
-            "status": "success",
+            "status": "error",
             "agent_id": agent_id,
-            "product_searches": 892,
-            "product_searches_trend": "up",
-            "product_searches_change": 12,
-            "inventory_checks": 456,
+            "product_searches": 0,
+            "product_searches_trend": "stable",
+            "product_searches_change": 0,
+            "inventory_checks": 0,
             "inventory_checks_trend": "stable",
             "inventory_checks_change": 0,
-            "price_queries": 234,
+            "price_queries": 0,
             "price_queries_trend": "stable",
-            "price_queries_change": 0
+            "price_queries_change": 0,
+            "error": str(e),
         }
 
 
