@@ -181,6 +181,24 @@ def get_managed_receiver_url(agent_id: str) -> str:
     return f"{base}/agents/{agent_id}/webhooks/managed-inbox"
 
 
+def _normalize_destination_url(agent_id: str, destination_url: Optional[str]) -> Optional[str]:
+    raw = str(destination_url or "").strip()
+    if not raw:
+        return None
+
+    managed_url = get_managed_receiver_url(agent_id)
+    try:
+        parsed = urlparse(raw)
+        managed = urlparse(managed_url)
+    except Exception:
+        return raw
+
+    if parsed.path == managed.path and parsed.path.endswith("/webhooks/managed-inbox"):
+        return managed_url
+
+    return raw
+
+
 def _build_event_payload(
     *,
     event_id: str,
@@ -470,12 +488,13 @@ async def get_delivery_summary(agent_id: str) -> Dict[str, Any]:
 async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
     config = await _get_or_create_raw_config(agent_id)
     summary = await get_delivery_summary(agent_id)
-    destination_url = str(config.get("destination_url") or "").strip() or None
+    managed_receiver_url = get_managed_receiver_url(agent_id)
+    destination_url = _normalize_destination_url(agent_id, config.get("destination_url"))
     current_secret = str(config.get("signing_secret") or "").strip() or None
     return {
         "enabled": bool(config.get("enabled") and destination_url),
         "destination_url": destination_url,
-        "managed_receiver_url": get_managed_receiver_url(agent_id),
+        "managed_receiver_url": managed_receiver_url,
         "subscribed_events": _normalize_events(_coerce_json(config.get("subscribed_events"), [])),
         "signing_secret_last4": _last4(current_secret),
         "last_test_at": (_coerce_datetime(config.get("last_test_at")) or None).isoformat() if _coerce_datetime(config.get("last_test_at")) else None,
@@ -494,7 +513,7 @@ async def update_webhook_config(
 ) -> Dict[str, Any]:
     current = await _get_or_create_raw_config(agent_id)
     now = _db_now()
-    next_url = str(destination_url or "").strip() or None
+    next_url = _normalize_destination_url(agent_id, destination_url)
     next_enabled = bool(enabled and next_url)
     next_events = _normalize_events(subscribed_events)
     current_secret = str(current.get("signing_secret") or "").strip() or _generate_signing_secret()
