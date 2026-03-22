@@ -996,7 +996,8 @@ async def test_shop_gateway_find_products_multi_visible_color_intent_keeps_match
     assert products[0]["product_id"] == "prod_sweater_1"
     metadata = result.get("metadata") or {}
     assert metadata.get("visible_category_intents") == ["sweater"]
-    assert metadata.get("visible_attribute_intents") == ["red"]
+    assert metadata.get("visible_attribute_intents") == []
+    assert metadata.get("visible_option_intents") == ["color_red"]
 
 
 @pytest.mark.asyncio

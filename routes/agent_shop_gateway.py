@@ -655,6 +655,37 @@ def _extract_visible_size_option_intents(query: Optional[str]) -> List[Dict[str,
     return active
 
 
+def _extract_visible_color_option_intents(
+    query: Optional[str],
+    *,
+    active_category_labels: list[str],
+) -> List[Dict[str, Any]]:
+    q = _strip_accents(str(query or "").lower())
+    if not q:
+        return []
+    apparel_category_labels = {"hoodie", "sweater", "vest", "skirt", "dress"}
+    if not any(label in apparel_category_labels for label in active_category_labels):
+        return []
+
+    groups = [
+        {
+            "label": "color_red",
+            "query_terms": ["red"],
+            "product_terms": ["red"],
+        },
+        {
+            "label": "color_black",
+            "query_terms": ["black"],
+            "product_terms": ["black"],
+        },
+    ]
+    return [
+        group
+        for group in groups
+        if _normalized_intent_terms_match(q, list(group["query_terms"]))
+    ]
+
+
 def _extract_query_budget_constraints(query: Optional[str]) -> Dict[str, Any]:
     text = str(query or "").strip()
     if not text:
@@ -5318,20 +5349,6 @@ async def _handle_find_products_multi(
             "product_terms": ["wool", "woolen", "woollen"],
             "category_labels": sorted(apparel_visible_category_labels),
         },
-        {
-            "label": "red",
-            "query_terms": ["red"],
-            "product_terms": ["red"],
-            "category_labels": sorted(apparel_visible_category_labels),
-            "allow_option_match": True,
-        },
-        {
-            "label": "black",
-            "query_terms": ["black"],
-            "product_terms": ["black"],
-            "category_labels": sorted(apparel_visible_category_labels),
-            "allow_option_match": True,
-        },
     ]
     active_visible_attribute_intents = []
     for group in visible_attribute_intent_groups:
@@ -5345,7 +5362,13 @@ async def _handle_find_products_multi(
             continue
         active_visible_attribute_intents.append(group)
     active_visible_attribute_labels = [str(group["label"]) for group in active_visible_attribute_intents]
-    active_visible_option_intents = _extract_visible_size_option_intents(q_ascii)
+    active_visible_option_intents = [
+        *_extract_visible_size_option_intents(q_ascii),
+        *_extract_visible_color_option_intents(
+            q_ascii,
+            active_category_labels=active_visible_category_labels,
+        ),
+    ]
     active_visible_option_labels = [str(group["label"]) for group in active_visible_option_intents]
 
     # Detect special intents for downstream filtering/UX.
@@ -6543,13 +6566,7 @@ async def _handle_find_products_multi(
         matched_visible_attribute_labels = [
             str(group["label"])
             for group in active_visible_attribute_intents
-            if (
-                _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
-                or (
-                    bool(group.get("allow_option_match"))
-                    and _normalized_intent_terms_match(visible_option_blob, list(group["product_terms"]))
-                )
-            )
+            if _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
         ]
         if active_visible_attribute_intents and (
             len(matched_visible_attribute_labels) < len(active_visible_attribute_intents)
