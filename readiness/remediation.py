@@ -26,7 +26,10 @@ from readiness.models import (
     SourceDataTriageSummaryBucket,
     VerificationResult,
 )
-from readiness.summary import get_readiness_optimization_context
+from readiness.summary import (
+    _default_out_of_stock_decision_state,
+    get_readiness_optimization_context,
+)
 from services.product_enrichment_ai import (
     build_context_from_standard_product,
     classify_audience_tags,
@@ -1010,6 +1013,21 @@ async def get_source_data_triage(
         product_title = queue_item.title or snapshot_product.title
         sort_index = queue_index_by_key.get(product_key, 10**9)
         decision_key = _queue_product_key(platform, platform_product_id, product_id)
+        current_product_for_decisions: Optional[dict[str, Any]] = None
+
+        async def _load_current_product_for_decisions() -> dict[str, Any]:
+            nonlocal current_product_for_decisions
+            if current_product_for_decisions is not None:
+                return current_product_for_decisions
+
+            cache_row = await get_product_cache_row(
+                merchant_id=merchant_id,
+                platform=platform,
+                platform_product_id=platform_product_id,
+                include_expired=False,
+            )
+            current_product_for_decisions = _current_product_data_from_cache_row(cache_row)
+            return current_product_for_decisions
 
         image_match, image_affected_variants = _product_matches_source_data_reason(
             "missing_primary_image",
@@ -1101,6 +1119,12 @@ async def get_source_data_triage(
                     )
                     or ""
                 ).strip() or None
+                effective_decision_state = persisted_decision_state
+                if candidate_reason_code == "out_of_stock" and not effective_decision_state:
+                    current_product = await _load_current_product_for_decisions()
+                    effective_decision_state = _default_out_of_stock_decision_state(
+                        current_product
+                    )
 
                 row_records.append(
                     (
@@ -1129,7 +1153,7 @@ async def get_source_data_triage(
                             agent_push_reason_codes=agent_push_reason_codes,
                             recommended_action_type=queue_item.recommended_action_type,
                             fix_surface=queue_item.fix_surface,
-                            decision_state=persisted_decision_state,
+                            decision_state=effective_decision_state,
                         ),
                     )
                 )

@@ -503,6 +503,9 @@ async def test_get_source_data_triage_returns_summary_and_rows(monkeypatch):
     async def fake_list_source_data_decisions(*_args, **_kwargs):
         return {}
 
+    async def fake_get_product_cache_row(**_kwargs):
+        return None
+
     monkeypatch.setattr(
         remediation,
         "get_readiness_optimization_context",
@@ -512,6 +515,11 @@ async def test_get_source_data_triage_returns_summary_and_rows(monkeypatch):
         remediation,
         "list_source_data_decisions",
         fake_list_source_data_decisions,
+    )
+    monkeypatch.setattr(
+        remediation,
+        "get_product_cache_row",
+        fake_get_product_cache_row,
     )
 
     triage = await get_source_data_triage(
@@ -586,6 +594,9 @@ async def test_get_source_data_triage_hydrates_saved_decision_states(monkeypatch
             }
         return {}
 
+    async def fake_get_product_cache_row(**_kwargs):
+        return None
+
     monkeypatch.setattr(
         remediation,
         "get_readiness_optimization_context",
@@ -595,6 +606,11 @@ async def test_get_source_data_triage_hydrates_saved_decision_states(monkeypatch
         remediation,
         "list_source_data_decisions",
         fake_list_source_data_decisions,
+    )
+    monkeypatch.setattr(
+        remediation,
+        "get_product_cache_row",
+        fake_get_product_cache_row,
     )
 
     triage = await get_source_data_triage(
@@ -606,3 +622,94 @@ async def test_get_source_data_triage_hydrates_saved_decision_states(monkeypatch
     image_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_primary_image")
     assert missing_price_row["decision_state"] == "pricing_fix_saved"
     assert image_row["decision_state"] == "image_fix_saved"
+
+
+@pytest.mark.asyncio
+async def test_get_source_data_triage_defaults_out_of_stock_decision_state(monkeypatch):
+    from readiness import remediation
+
+    payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
+    payload.product_queue[0].blocked_variant_count = 0
+    payload.product_queue[0].ready_variant_count = 1
+    payload.product_queue[0].eligible_variant_count = 1
+    payload.product_queue[0].excluded_variant_count = 1
+    payload.product_queue[0].agent_push_status = "excluded_from_agent_push"
+    payload.product_queue[0].agent_push_reason_codes = ["out_of_stock"]
+    payload.product_queue[0].fix_surface = "catalog_data"
+    payload.product_queue[0].recommended_action_type = "review_catalog_data"
+    payload.product_queue[0].top_issues = [
+        {
+            "code": "out_of_stock",
+            "label": "Out of stock",
+            "impact": "checkout",
+            "affected_variant_count": 1,
+        }
+    ]
+
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        assert channel == "ucp"
+        return payload, _snapshot()
+
+    async def fake_list_source_data_decisions(
+        _merchant_id: str,
+        *,
+        reason_code: str | None = None,
+        product_keys=None,
+    ):
+        return {}
+
+    async def fake_get_product_cache_row(
+        *,
+        merchant_id: str,
+        platform: str,
+        platform_product_id: str,
+        include_expired: bool = False,
+    ):
+        assert merchant_id == "merch_efbc46b4619cfbdf"
+        assert platform == "shopify"
+        assert platform_product_id == "prod_1"
+        assert include_expired is False
+        return {
+            "product_data": {
+                "status": "active",
+                "orderable": True,
+                "image_url": "https://example.com/product.jpg",
+                "variants": [
+                    {
+                        "variant_id": "var_1",
+                        "inventory_quantity": 0,
+                        "price": {"amount": 24.0, "currency": "USD"},
+                    },
+                    {
+                        "variant_id": "var_2",
+                        "inventory_quantity": 5,
+                        "price": {"amount": 24.0, "currency": "USD"},
+                    },
+                ],
+            }
+        }
+
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
+    monkeypatch.setattr(
+        remediation,
+        "list_source_data_decisions",
+        fake_list_source_data_decisions,
+    )
+    monkeypatch.setattr(
+        remediation,
+        "get_product_cache_row",
+        fake_get_product_cache_row,
+    )
+
+    triage = await get_source_data_triage(
+        "merch_efbc46b4619cfbdf",
+        plan_id="rdplan_current",
+        reason_code="out_of_stock",
+    )
+
+    out_of_stock_row = next(row for row in triage["rows"] if row["reason_code"] == "out_of_stock")
+    assert out_of_stock_row["decision_state"] == "restock_planned"
