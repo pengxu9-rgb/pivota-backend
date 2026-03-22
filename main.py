@@ -24,7 +24,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
-import db.merchant_portal_preferences  # noqa: F401  (register merchant portal preferences table in metadata)
+try:
+    import db.merchant_portal_preferences  # noqa: F401  (register merchant portal preferences table in metadata)
+except ModuleNotFoundError:
+    logging.getLogger(__name__).warning(
+        "db.merchant_portal_preferences is unavailable; continuing without merchant portal preferences metadata"
+    )
 import subprocess
 import os
 from pathlib import Path
@@ -231,7 +236,13 @@ from routes.merchant_agent_bank import router as merchant_agent_bank_router  # M
 from routes.order_routes import router as order_router
 from routes.webhook_routes import router as webhook_router
 from routes.agent_api import router as agent_api_router
-from routes.agent_v2 import router as agent_v2_router
+try:
+    from routes.agent_v2 import router as agent_v2_router
+except ModuleNotFoundError:
+    agent_v2_router = None
+    logging.getLogger(__name__).warning(
+        "routes.agent_v2 is unavailable; skipping agent_v2 router registration"
+    )
 from routes.after_sales_cases import router as after_sales_cases_router
 from routes.agent_events import router as agent_events_router
 from routes.agent_management import router as agent_management_router
@@ -773,7 +784,8 @@ app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-fa
 app.include_router(buyer_router)  # Buyer Vault API (unified buyer account)
 app.include_router(webhook_router)  # Webhook handlers
 app.include_router(agent_api_router)  # Agent API endpoints
-app.include_router(agent_v2_router)  # Canonical Agent v2 middleware contract
+if agent_v2_router is not None:
+    app.include_router(agent_v2_router)  # Canonical Agent v2 middleware contract
 app.include_router(subject_resolve_router)  # Stable subject resolution contract (/v1/subject/resolve)
 app.include_router(after_sales_cases_router)  # After-sales Case API (refund/return_refund)
 app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
