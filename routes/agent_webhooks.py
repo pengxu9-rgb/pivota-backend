@@ -10,6 +10,7 @@ from services.agent_webhook_service import (
     get_webhook_config,
     list_deliveries,
     list_webhook_events_catalog,
+    receive_managed_inbox_delivery,
     retry_delivery,
     rotate_signing_secret,
     send_test_webhook,
@@ -34,6 +35,32 @@ def _authorize_agent_scope(agent_id: str, current_user: dict) -> None:
     user_agent_id = current_user.get("agent_id") or current_user.get("user_id")
     if str(user_agent_id or "") != str(agent_id):
         raise HTTPException(status_code=403, detail="Not authorized")
+
+
+@router.post("/{agent_id}/webhooks/managed-inbox")
+async def post_agent_managed_webhook_inbox(
+    agent_id: str,
+    request: Request,
+):
+    try:
+        body = (await request.body()).decode("utf-8")
+        result = await receive_managed_inbox_delivery(
+            agent_id,
+            raw_body=body,
+            headers=request.headers,
+            source_ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+        return {
+            "status": "success",
+            "delivery": result,
+        }
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to receive managed webhook event: {exc}")
 
 
 @router.get("/{agent_id}/webhooks/config")

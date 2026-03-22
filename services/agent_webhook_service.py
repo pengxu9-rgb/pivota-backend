@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -164,6 +165,25 @@ def _build_signature(secret: str, timestamp: str, raw_body: str) -> str:
     return f"v1={digest}"
 
 
+def _resolve_managed_receiver_base_url() -> str:
+    for candidate in (
+        os.getenv("PUBLIC_BASE_URL"),
+        os.getenv("APP_URL"),
+        os.getenv("BASE_URL"),
+        os.getenv("AGENT_API_BASE"),
+        "https://web-production-fedb.up.railway.app",
+    ):
+        value = str(candidate or "").strip().rstrip("/")
+        if value:
+            return value
+    return "https://web-production-fedb.up.railway.app"
+
+
+def get_managed_receiver_url(agent_id: str) -> str:
+    base = _resolve_managed_receiver_base_url()
+    return f"{base}/agents/{agent_id}/webhooks/managed-inbox"
+
+
 def _build_event_payload(
     *,
     event_id: str,
@@ -250,6 +270,30 @@ async def ensure_agent_webhook_tables() -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_agent_webhook_deliveries_retry
         ON agent_webhook_deliveries(status, next_retry_at)
+        """
+    )
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_webhook_managed_inbox_events (
+            id SERIAL PRIMARY KEY,
+            delivery_id VARCHAR(255) NOT NULL UNIQUE,
+            agent_id VARCHAR(255) NOT NULL,
+            event_id VARCHAR(255),
+            event_type VARCHAR(255),
+            signature_valid BOOLEAN NOT NULL DEFAULT FALSE,
+            received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            source_ip VARCHAR(255),
+            user_agent TEXT,
+            request_headers JSON NOT NULL DEFAULT '{}',
+            payload JSON NOT NULL DEFAULT '{}',
+            raw_body TEXT
+        )
+        """
+    )
+    await database.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_webhook_managed_inbox_agent_received
+        ON agent_webhook_managed_inbox_events(agent_id, received_at DESC)
         """
     )
 
@@ -434,6 +478,7 @@ async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
     return {
         "enabled": bool(config.get("enabled") and destination_url),
         "destination_url": destination_url,
+        "managed_receiver_url": get_managed_receiver_url(agent_id),
         "subscribed_events": _normalize_events(_coerce_json(config.get("subscribed_events"), [])),
         "signing_secret_last4": _last4(current_secret),
         "last_test_at": (_coerce_datetime(config.get("last_test_at")) or None).isoformat() if _coerce_datetime(config.get("last_test_at")) else None,
@@ -534,6 +579,129 @@ def list_webhook_events_catalog() -> Dict[str, Any]:
                 "description": "Manual test delivery issued from the developer portal.",
             },
         ],
+    }
+
+
+def _headers_to_dict(headers: Any) -> Dict[str, str]:
+    lowered: Dict[str, str] = {}
+    if not headers:
+        return lowered
+    for key, value in headers.items():
+        lowered[str(key).lower()] = str(value)
+    return lowered
+
+
+def _parse_json_body(raw_body: str) -> Dict[str, Any]:
+    if not raw_body.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_body)
+        return parsed if isinstance(parsed, dict) else {"data": parsed}
+    except Exception:
+        return {}
+
+
+def _extract_signing_secrets(config: Dict[str, Any]) -> List[str]:
+    secrets_to_try: List[str] = []
+    current_secret = str(config.get("signing_secret") or "").strip()
+    pending_secret = str(config.get("pending_signing_secret") or "").strip()
+    if current_secret:
+        secrets_to_try.append(current_secret)
+    if pending_secret and pending_secret not in secrets_to_try:
+        secrets_to_try.append(pending_secret)
+    return secrets_to_try
+
+
+async def receive_managed_inbox_delivery(
+    agent_id: str,
+    *,
+    raw_body: str,
+    headers: Any,
+    source_ip: Optional[str] = None,
+    user_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_agent_webhook_tables()
+    config = await _get_or_create_raw_config(agent_id)
+
+    header_map = _headers_to_dict(headers)
+    delivery_id = header_map.get("x-pivota-delivery") or f"managed_{uuid.uuid4().hex[:24]}"
+    event_type = header_map.get("x-pivota-event") or "unknown"
+    timestamp = header_map.get("x-pivota-timestamp")
+    signature = header_map.get("x-pivota-signature")
+    payload = _parse_json_body(raw_body)
+    event_id = str(payload.get("id") or "").strip() or None
+
+    if not timestamp or not signature:
+        raise ValueError("Missing webhook signature headers.")
+
+    valid_signature = False
+    for signing_secret in _extract_signing_secrets(config):
+        expected = _build_signature(signing_secret, timestamp, raw_body)
+        if hmac.compare_digest(expected, signature):
+            valid_signature = True
+            break
+
+    await database.execute(
+        """
+        INSERT INTO agent_webhook_managed_inbox_events (
+            delivery_id,
+            agent_id,
+            event_id,
+            event_type,
+            signature_valid,
+            received_at,
+            source_ip,
+            user_agent,
+            request_headers,
+            payload,
+            raw_body
+        )
+        VALUES (
+            :delivery_id,
+            :agent_id,
+            :event_id,
+            :event_type,
+            :signature_valid,
+            :received_at,
+            :source_ip,
+            :user_agent,
+            :request_headers,
+            :payload,
+            :raw_body
+        )
+        ON CONFLICT (delivery_id) DO UPDATE
+        SET signature_valid = EXCLUDED.signature_valid,
+            received_at = EXCLUDED.received_at,
+            source_ip = EXCLUDED.source_ip,
+            user_agent = EXCLUDED.user_agent,
+            request_headers = EXCLUDED.request_headers,
+            payload = EXCLUDED.payload,
+            raw_body = EXCLUDED.raw_body
+        """,
+        {
+            "delivery_id": delivery_id,
+            "agent_id": agent_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "signature_valid": valid_signature,
+            "received_at": _db_now(),
+            "source_ip": source_ip,
+            "user_agent": user_agent,
+            "request_headers": json.dumps(header_map),
+            "payload": json.dumps(payload),
+            "raw_body": raw_body,
+        },
+    )
+
+    if not valid_signature:
+        raise PermissionError("Invalid webhook signature.")
+
+    return {
+        "delivery_id": delivery_id,
+        "event_id": event_id,
+        "event_type": event_type,
+        "signature_valid": True,
+        "managed_receiver_url": get_managed_receiver_url(agent_id),
     }
 
 
