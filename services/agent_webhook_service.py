@@ -491,12 +491,16 @@ async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
     managed_receiver_url = get_managed_receiver_url(agent_id)
     destination_url = _normalize_destination_url(agent_id, config.get("destination_url"))
     current_secret = str(config.get("signing_secret") or "").strip() or None
+    pending_secret = str(config.get("pending_signing_secret") or "").strip() or None
+    pending_activates_at = _coerce_datetime(config.get("pending_secret_activates_at"))
     return {
         "enabled": bool(config.get("enabled") and destination_url),
         "destination_url": destination_url,
         "managed_receiver_url": managed_receiver_url,
         "subscribed_events": _normalize_events(_coerce_json(config.get("subscribed_events"), [])),
         "signing_secret_last4": _last4(current_secret),
+        "pending_signing_secret_last4": _last4(pending_secret),
+        "pending_secret_activates_at": pending_activates_at.isoformat() if pending_activates_at else None,
         "last_test_at": (_coerce_datetime(config.get("last_test_at")) or None).isoformat() if _coerce_datetime(config.get("last_test_at")) else None,
         "last_test_status": config.get("last_test_status"),
         "delivery_summary_24h": summary,
@@ -1187,6 +1191,8 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
         "activates_at": activates_at.isoformat(),
         "overlap_ends_at": activates_at.isoformat(),
         "signing_secret_last4": _last4(current_secret),
+        "current_signing_secret_last4": _last4(current_secret),
+        "pending_signing_secret_last4": _last4(new_secret),
     }
 
 
