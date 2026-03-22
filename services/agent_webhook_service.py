@@ -10,6 +10,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -175,6 +176,10 @@ def _resolve_managed_receiver_base_url() -> str:
     ):
         value = str(candidate or "").strip().rstrip("/")
         if value:
+            parsed = urlparse(value)
+            host = (parsed.hostname or "").strip().lower()
+            if host in {"127.0.0.1", "0.0.0.0", "localhost"}:
+                continue
             return value
     return "https://web-production-fedb.up.railway.app"
 
