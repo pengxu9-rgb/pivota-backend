@@ -596,8 +596,8 @@ def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
 
 
 def _normalized_intent_term_match(text: Optional[str], term: Optional[str]) -> bool:
-    source = _strip_accents(str(text or "").lower()).strip()
-    target = _strip_accents(str(term or "").lower()).strip()
+    source = re.sub(r"[^a-z0-9]+", " ", _strip_accents(str(text or "").lower())).strip()
+    target = re.sub(r"[^a-z0-9]+", " ", _strip_accents(str(term or "").lower())).strip()
     if not source or not target:
         return False
     parts = [re.escape(part) for part in re.split(r"\s+", target) if part]
@@ -5381,6 +5381,36 @@ async def _handle_find_products_multi(
             "label": "wool",
             "query_terms": ["wool", "woolen", "woollen"],
             "product_terms": ["wool", "woolen", "woollen"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "fleece",
+            "query_terms": ["fleece", "polar fleece"],
+            "product_terms": ["fleece", "polar fleece"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "sleeveless",
+            "query_terms": ["sleeveless"],
+            "product_terms": ["sleeveless"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "striped",
+            "query_terms": ["striped", "stripe"],
+            "product_terms": ["striped", "stripe"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "color_block",
+            "query_terms": ["color block", "color-block", "colour block", "colour-block"],
+            "product_terms": ["color block", "color-block", "colour block", "colour-block"],
+            "category_labels": sorted(apparel_visible_category_labels),
+        },
+        {
+            "label": "knitted",
+            "query_terms": ["knitted", "knit"],
+            "product_terms": ["knitted", "knit"],
             "category_labels": sorted(apparel_visible_category_labels),
         },
     ]

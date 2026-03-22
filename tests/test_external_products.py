@@ -907,6 +907,184 @@ async def test_shop_gateway_find_products_multi_visible_apparel_attribute_intent
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_visible_style_intent_keeps_matching_product(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        striped = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_striped_1",
+            product_id="prod_sweater_striped_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Striped Knitted Sweater for Dogs & Cats – Striped",
+            description="Classic knit sweater.",
+            product_type="Knit Sweater",
+            price=27.65,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        color_block = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_color_block_1",
+            product_id="prod_sweater_color_block_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Color-Block Sleeveless Knitted Sweater for Dogs & Cats – Color-Block",
+            description="Sleeveless knit sweater.",
+            product_type="Sleeveless Knit Sweater",
+            price=29.12,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [striped, color_block], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="striped sweater",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_sweater_striped_1"
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_attribute_intents") == ["striped"]
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_visible_style_intent_supports_hyphenated_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        color_block = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_color_block_1",
+            product_id="prod_sweater_color_block_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Color-Block Sleeveless Knitted Sweater for Dogs & Cats – Color-Block",
+            description="Sleeveless knit sweater.",
+            product_type="Sleeveless Knit Sweater",
+            price=29.12,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        plain = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_plain_1",
+            product_id="prod_sweater_plain_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Striped Knitted Sweater for Dogs & Cats – Striped",
+            description="Classic knit sweater.",
+            product_type="Knit Sweater",
+            price=27.65,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [color_block, plain], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="color block sweater",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_sweater_color_block_1"
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_attribute_intents") == ["color_block"]
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_visible_color_intent_keeps_matching_variant_product(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
