@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import PlainTextResponse
 from typing import Any, Dict, List
+from config.settings import resolve_public_api_base_url
 
 router = APIRouter(prefix="/agent/docs", tags=["Agent Docs"])
 
@@ -123,7 +124,7 @@ async def sdks_info() -> Dict[str, Any]:
 
 @router.get("/openapi.json")
 async def agent_openapi_spec(request: Request) -> Dict[str, Any]:
-    return build_agent_openapi_schema(request.app, base_url=str(request.base_url))
+    return build_agent_openapi_schema(request.app, base_url=resolve_public_api_base_url())
 
 
 @router.get("/examples/python", response_class=PlainTextResponse)
@@ -188,11 +189,10 @@ def _derive_agent_routes(request: Request) -> List[Dict[str, Any]]:
 @router.get("/endpoints")
 async def endpoints_summary(request: Request) -> Dict[str, Any]:
     return {
-        "base_url": f"{str(request.base_url).rstrip('/')}/agent/v1",
+        "base_url": f"{resolve_public_api_base_url()}/agent/v1",
         "auth": {"header": "X-API-Key", "example": "ak_live_xxx"},
         "endpoints": _derive_agent_routes(request),
     }
-
 
 
 
