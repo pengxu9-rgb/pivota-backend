@@ -1693,6 +1693,390 @@ async def test_shop_gateway_find_products_multi_visible_size_option_intent_keeps
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_combined_style_color_constraint_keeps_exact_sweater(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        striped_blue = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_blue_striped_1",
+            product_id="prod_sweater_blue_striped_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Striped Knitted Sweater for Dogs & Cats – Striped",
+            description="Classic knit sweater.",
+            product_type="Knit Sweater",
+            price=27.65,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_blue_1",
+                    title="Medium / Blue",
+                    price=27.65,
+                    inventory_quantity=4,
+                    options={"Size": "Medium", "Color": "Blue"},
+                ),
+            ],
+        )
+        striped_red = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_red_striped_1",
+            product_id="prod_sweater_red_striped_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Striped Knitted Sweater for Dogs & Cats – Striped",
+            description="Classic knit sweater.",
+            product_type="Knit Sweater",
+            price=27.65,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_red_1",
+                    title="Medium / Red",
+                    price=27.65,
+                    inventory_quantity=4,
+                    options={"Size": "Medium", "Color": "Red"},
+                ),
+            ],
+        )
+        plain_blue = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_blue_plain_1",
+            product_id="prod_sweater_blue_plain_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Knitted Sweater for Dogs & Cats",
+            description="Classic knit sweater.",
+            product_type="Knit Sweater",
+            price=27.65,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_blue_plain_1",
+                    title="Medium / Blue",
+                    price=27.65,
+                    inventory_quantity=4,
+                    options={"Size": "Medium", "Color": "Blue"},
+                ),
+            ],
+        )
+        return [striped_red, plain_blue, striped_blue], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="blue striped sweater",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_sweater_blue_striped_1"
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_category_intents") == ["sweater"]
+    assert metadata.get("visible_attribute_intents") == ["striped"]
+    assert metadata.get("visible_option_intents") == ["color_blue"]
+    assert metadata.get("matched_visible_categories") == ["sweater"]
+    assert metadata.get("matched_visible_attribute_labels") == ["striped"]
+    assert metadata.get("matched_visible_option_labels") == ["color_blue"]
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_combined_style_color_size_constraint_fails_closed_without_full_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        sleeveless_pink_large = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_pink_large_1",
+            product_id="prod_sweater_pink_large_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Color-Block Sleeveless Knitted Sweater for Dogs & Cats – Sleeveless",
+            description="Sleeveless knit sweater.",
+            product_type="Sleeveless Knit Sweater",
+            price=29.12,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_large_pink_1",
+                    title="Large / Pink",
+                    price=29.12,
+                    inventory_quantity=4,
+                    options={"Size": "Large", "Color": "Pink"},
+                ),
+            ],
+        )
+        sleeveless_blue_medium = agent_shop_gateway_module.StandardProduct(
+            id="prod_sweater_blue_medium_1",
+            product_id="prod_sweater_blue_medium_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Color-Block Sleeveless Knitted Sweater for Dogs & Cats – Sleeveless",
+            description="Sleeveless knit sweater.",
+            product_type="Sleeveless Knit Sweater",
+            price=29.12,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_medium_blue_1",
+                    title="Medium / Blue",
+                    price=29.12,
+                    inventory_quantity=4,
+                    options={"Size": "Medium", "Color": "Blue"},
+                ),
+            ],
+        )
+        return [sleeveless_pink_large, sleeveless_blue_medium], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="pink sleeveless sweater size m",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("total") == 0
+    assert result.get("products") == []
+    assert "visible attributes and options" in str(result.get("reply") or "").lower()
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_category_intents") == ["sweater"]
+    assert metadata.get("visible_attribute_intents") == ["sleeveless"]
+    assert metadata.get("visible_option_intents") == ["size_m", "color_pink"]
+    assert metadata.get("matched_visible_categories") == []
+    assert metadata.get("matched_visible_attribute_labels") == []
+    assert metadata.get("matched_visible_option_labels") == []
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_combined_style_size_constraint_keeps_exact_vest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        fleece_xl = agent_shop_gateway_module.StandardProduct(
+            id="prod_vest_fleece_xl_1",
+            product_id="prod_vest_fleece_xl_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Color-Block Padded Winter Vest for Dogs & Cats – Color-Block, Polar Fleece",
+            description="Polar fleece vest.",
+            product_type="Polar Fleece Vest",
+            price=25.85,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_xl_black_1",
+                    title="XL / Black",
+                    price=25.85,
+                    inventory_quantity=4,
+                    options={"Size": "XL", "Color": "Black"},
+                ),
+            ],
+        )
+        fleece_medium = agent_shop_gateway_module.StandardProduct(
+            id="prod_vest_fleece_m_1",
+            product_id="prod_vest_fleece_m_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Color-Block Padded Winter Vest for Dogs & Cats – Color-Block, Polar Fleece",
+            description="Polar fleece vest.",
+            product_type="Polar Fleece Vest",
+            price=25.85,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_m_black_1",
+                    title="Medium / Black",
+                    price=25.85,
+                    inventory_quantity=4,
+                    options={"Size": "Medium", "Color": "Black"},
+                ),
+            ],
+        )
+        padded_xl = agent_shop_gateway_module.StandardProduct(
+            id="prod_vest_plain_xl_1",
+            product_id="prod_vest_plain_xl_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Padded Winter Vest for Dogs & Cats",
+            description="Warm vest.",
+            product_type="Padded Vest",
+            price=22.93,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_xl_plain_1",
+                    title="XL / Black",
+                    price=22.93,
+                    inventory_quantity=4,
+                    options={"Size": "XL", "Color": "Black"},
+                ),
+            ],
+        )
+        return [fleece_medium, padded_xl, fleece_xl], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="polar fleece vest size xl",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_vest_fleece_xl_1"
+    metadata = result.get("metadata") or {}
+    assert metadata.get("visible_category_intents") == ["vest"]
+    assert metadata.get("visible_attribute_intents") == ["fleece"]
+    assert metadata.get("visible_option_intents") == ["size_xl"]
+    assert metadata.get("matched_visible_categories") == ["vest"]
+    assert metadata.get("matched_visible_attribute_labels") == ["fleece"]
+    assert metadata.get("matched_visible_option_labels") == ["size_xl"]
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_visible_numeric_size_option_intent_keeps_matching_variant_product(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

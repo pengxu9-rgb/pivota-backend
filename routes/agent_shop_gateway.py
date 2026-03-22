@@ -7077,6 +7077,9 @@ async def _handle_find_products_multi(
                 "merchant_name": merchant_name,
                 "relevance_score": relevance_score,
                 "is_toy_like": is_toy_like if toys_intent_query else False,
+                "matched_visible_category_labels": list(matched_visible_category_labels),
+                "matched_visible_attribute_labels": list(matched_visible_attribute_labels),
+                "matched_visible_option_labels": list(matched_visible_option_labels),
                 "matched_visible_attributes": matched_visible_attributes,
             }
         )
@@ -7112,6 +7115,9 @@ async def _handle_find_products_multi(
 
     # Map to Shopping contract; inject merchant_id into result
     out_products = []
+    matched_visible_category_summary: List[str] = []
+    matched_visible_attribute_summary: List[str] = []
+    matched_visible_option_summary: List[str] = []
     matched_visible_attributes_summary: Dict[str, List[str]] = {}
     for item_wrapper in page_items:
         product_item = item_wrapper.get("product")
@@ -7136,6 +7142,18 @@ async def _handle_find_products_multi(
 
         if merchant_name and not item.get("merchant_name"):
             item["merchant_name"] = merchant_name
+        for label in item_wrapper.get("matched_visible_category_labels") or []:
+            label_text = str(label or "").strip()
+            if label_text and label_text not in matched_visible_category_summary:
+                matched_visible_category_summary.append(label_text)
+        for label in item_wrapper.get("matched_visible_attribute_labels") or []:
+            label_text = str(label or "").strip()
+            if label_text and label_text not in matched_visible_attribute_summary:
+                matched_visible_attribute_summary.append(label_text)
+        for label in item_wrapper.get("matched_visible_option_labels") or []:
+            label_text = str(label or "").strip()
+            if label_text and label_text not in matched_visible_option_summary:
+                matched_visible_option_summary.append(label_text)
         wrapper_matched_visible_attributes = item_wrapper.get("matched_visible_attributes")
         if isinstance(wrapper_matched_visible_attributes, dict):
             for bucket, labels in wrapper_matched_visible_attributes.items():
@@ -7397,6 +7415,12 @@ async def _handle_find_products_multi(
             f"I couldn’t find an eligible {active_unsupported_beauty_category_labels[0]} match for that query right now. "
             "I’m only showing skin-care products whose visible catalog labels support the requested category."
         )
+    if not out_products and active_visible_attribute_labels and active_visible_option_labels:
+        descriptor = active_visible_category_labels[0] if active_visible_category_labels else "product"
+        reply_text = reply_text or (
+            f"I couldn’t find an eligible {descriptor} match with those visible attributes and options right now. "
+            "I’m only showing products whose visible catalog labels and variant options support the requested constraints."
+        )
     if not out_products and active_visible_attribute_labels:
         attribute_descriptor = active_visible_category_labels[0] if active_visible_category_labels else "product"
         reply_text = reply_text or (
@@ -7432,6 +7456,9 @@ async def _handle_find_products_multi(
                 "visible_attribute_intents": active_visible_attribute_labels,
                 "visible_option_intents": active_visible_option_labels,
                 "unsupported_beauty_category_intents": active_unsupported_beauty_category_labels,
+                "matched_visible_categories": matched_visible_category_summary,
+                "matched_visible_attribute_labels": matched_visible_attribute_summary,
+                "matched_visible_option_labels": matched_visible_option_summary,
                 "matched_visible_attributes": matched_visible_attributes_summary,
                 "budget_price_min": effective_price_min,
                 "budget_price_max": effective_price_max,
