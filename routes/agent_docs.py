@@ -1,16 +1,55 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Request
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import PlainTextResponse
-from typing import Any, Dict
-import os
-import json
+from typing import Any, Dict, List
 
 router = APIRouter(prefix="/agent/docs", tags=["Agent Docs"])
+
+AGENT_DOC_PATH_PREFIXES = (
+    "/agent/v1",
+    "/agent/v2",
+    "/agent/shop/v1",
+)
+
+
+def _is_documented_agent_path(path: str) -> bool:
+    return any(path.startswith(prefix) for prefix in AGENT_DOC_PATH_PREFIXES)
+
+
+def _documented_agent_routes(app: Any) -> List[Any]:
+    routes: List[Any] = []
+    for route in app.routes:
+        path = getattr(route, "path", "") or ""
+        methods = getattr(route, "methods", set()) or set()
+        if not path or not methods or not _is_documented_agent_path(path):
+            continue
+        routes.append(route)
+    return routes
+
+
+def build_agent_openapi_schema(app: Any, *, base_url: str = "") -> Dict[str, Any]:
+    schema = get_openapi(
+        title="Pivota Agent API",
+        version="1.0.0",
+        description="Production-ready API for agent integrations",
+        routes=_documented_agent_routes(app),
+    )
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})["ApiKeyAuth"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+    }
+    schema["security"] = [{"ApiKeyAuth": []}]
+    server_url = str(base_url or "").rstrip("/")
+    if server_url:
+        schema["servers"] = [{"url": server_url}]
+    return schema
 
 
 @router.get("/overview")
 async def docs_overview() -> Dict[str, Any]:
     return {
-        "title": "Pivota Agent SDK Docs",
+        "title": "Pivota Agent Developer Docs",
         "version": "1.0",
         "sections": [
             {"id": "quickstart", "title": "Quickstart", "path": "/agent/docs/quickstart.md"},
@@ -26,16 +65,17 @@ async def docs_overview() -> Dict[str, Any]:
 @router.get("/quickstart.md", response_class=PlainTextResponse)
 async def quickstart_markdown() -> str:
     return (
-        "# Pivota Agent SDK Quickstart\n\n"
+        "# Pivota Agent Developer Quickstart\n\n"
         "## Install\n\n"
         "Python:\n\n"
         "```bash\n"
-        "pip install pivota-agent-sdk\n"
+        "pip install pivota-agent\n"
         "```\n\n"
         "TypeScript:\n\n"
         "```bash\n"
-        "npm install @pivota/agent-sdk\n"
+        "npm install pivota-agent\n"
         "```\n\n"
+        "These SDK packages are convenience wrappers over the same production REST API and API key flow.\n\n"
         "## Usage (Python)\n\n"
         "```python\n"
         "from pivota_agent import PivotaAgentClient\n"
@@ -46,7 +86,7 @@ async def quickstart_markdown() -> str:
         "```\n\n"
         "## Usage (TypeScript)\n\n"
         "```ts\n"
-        "import { PivotaAgentClient } from '@pivota/agent-sdk'\n"
+        "import { PivotaAgentClient } from 'pivota-agent'\n"
         "const client = new PivotaAgentClient({ apiKey: process.env.PIVOTA_AGENT_API_KEY })\n"
         "const health = await client.healthCheck()\n"
         "```\n"
@@ -57,7 +97,10 @@ async def quickstart_markdown() -> str:
 async def sdks_info() -> Dict[str, Any]:
     return {
         "python": {
-            "install": "pip install pivota-agent-sdk",
+            "install": "pip install pivota-agent",
+            "package_name": "pivota-agent",
+            "status": "published",
+            "note": "Official Python SDK package published as pivota-agent.",
             "example": (
                 "from pivota_agent import PivotaAgentClient\n"
                 "client = PivotaAgentClient(api_key='YOUR_API_KEY')\n"
@@ -65,9 +108,12 @@ async def sdks_info() -> Dict[str, Any]:
             ),
         },
         "typescript": {
-            "install": "npm install @pivota/agent-sdk",
+            "install": "npm install pivota-agent",
+            "package_name": "pivota-agent",
+            "status": "published",
+            "note": "Official TypeScript/JavaScript SDK package published as pivota-agent.",
             "example": (
-                "import { PivotaAgentClient } from '@pivota/agent-sdk'\n"
+                "import { PivotaAgentClient } from 'pivota-agent'\n"
                 "const client = new PivotaAgentClient({ apiKey: process.env.PIVOTA_AGENT_API_KEY })\n"
                 "console.log(await client.healthCheck())\n"
             ),
@@ -76,14 +122,8 @@ async def sdks_info() -> Dict[str, Any]:
 
 
 @router.get("/openapi.json")
-async def agent_openapi_spec() -> Dict[str, Any]:
-    try:
-        base_dir = os.path.dirname(os.path.dirname(__file__))
-        spec_path = os.path.join(base_dir, "generated-sdks", "agent-api-spec.json")
-        with open(spec_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"OpenAPI spec not found: {e}")
+async def agent_openapi_spec(request: Request) -> Dict[str, Any]:
+    return build_agent_openapi_schema(request.app, base_url=str(request.base_url))
 
 
 @router.get("/examples/python", response_class=PlainTextResponse)
@@ -107,7 +147,7 @@ async def example_python() -> str:
 @router.get("/examples/typescript", response_class=PlainTextResponse)
 async def example_typescript() -> str:
     return (
-        "import { PivotaAgentClient } from '@pivota/agent-sdk'\n\n"
+        "import { PivotaAgentClient } from 'pivota-agent'\n\n"
         "const client = new PivotaAgentClient({ apiKey: process.env.PIVOTA_AGENT_API_KEY })\n"
         "const merchants = await client.listMerchants({ limit: 5 })\n"
         "const search = await client.searchProducts({ query: 'coffee', limit: 1 } as any)\n"
@@ -121,27 +161,37 @@ async def example_typescript() -> str:
     )
 
 
-@router.get("/endpoints")
-async def endpoints_summary() -> Dict[str, Any]:
-    return {
-        "base_url": "https://web-production-fedb.up.railway.app/agent/v1",
-        "auth": {"header": "X-API-Key", "example": "ak_live_xxx"},
-        "endpoints": [
-            {"method": "GET", "path": "/health", "desc": "Health check"},
-            {"method": "GET", "path": "/merchants", "desc": "List merchants"},
-            {"method": "GET", "path": "/products/search", "desc": "Search products"},
-            {
-                "method": "POST",
-                "path": "/recommendations/roles/normalize",
-                "desc": "Normalize roleHints → roleIds (recommendations)",
-            },
-            {"method": "POST", "path": "/recommendations/feed", "desc": "Get recommendations feed (role → urls/offers)"},
-            {"method": "POST", "path": "/orders/create", "desc": "Create order"},
-            {"method": "GET", "path": "/orders/{order_id}", "desc": "Get order"},
-            {"method": "POST", "path": "/payments", "desc": "Create payment"},
-        ],
-    }
+def _derive_agent_routes(request: Request) -> List[Dict[str, Any]]:
+    endpoints: List[Dict[str, Any]] = []
+    for route in request.app.routes:
+        path = getattr(route, "path", "") or ""
+        methods = sorted(
+            method
+            for method in (getattr(route, "methods", set()) or set())
+            if method not in {"HEAD", "OPTIONS"}
+        )
+        if not methods or not _is_documented_agent_path(path):
+            continue
+        description = ((getattr(route, "endpoint", None).__doc__ or "").strip().splitlines() or [""])[0]
+        for method in methods:
+            endpoints.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "desc": description or getattr(route, "name", "Agent endpoint"),
+                }
+            )
+    endpoints.sort(key=lambda item: (item["path"], item["method"]))
+    return endpoints
 
+
+@router.get("/endpoints")
+async def endpoints_summary(request: Request) -> Dict[str, Any]:
+    return {
+        "base_url": f"{str(request.base_url).rstrip('/')}/agent/v1",
+        "auth": {"header": "X-API-Key", "example": "ak_live_xxx"},
+        "endpoints": _derive_agent_routes(request),
+    }
 
 
 
