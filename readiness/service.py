@@ -432,14 +432,22 @@ def _build_visible_attribute_coverage(snapshot: MerchantReadinessSnapshot, chann
     tracked_categories = ["serum", "moisturizer", "cleanser", "toner"]
     tracked_skin_concerns = ["sensitive_skin", "brightening", "hydrating"]
     tracked_formula_constraints = ["fragrance_free"]
+    tracked_shade_categories = ["foundation", "lipstick", "blush", "gloss"]
 
     product_category_coverage: Counter[str] = Counter()
     skin_concern_coverage: Counter[str] = Counter()
     formula_constraint_coverage: Counter[str] = Counter()
     servable_product_count_by_category: Counter[str] = Counter()
+    ingredient_coverage_by_category: Counter[str] = Counter()
+    shade_coverage_by_category: Counter[str] = Counter()
 
     for product in snapshot.products:
         product_visible_attributes = dict(getattr(product, "visible_attributes", None) or {})
+        product_ingredient_ids = [
+            str(item or "").strip()
+            for item in (getattr(product, "ingredient_ids", None) or [])
+            if str(item or "").strip()
+        ]
         ready_for_channel = any(variant.channel_coverage.get(channel) == "ready" for variant in product.variants)
 
         product_categories = [
@@ -451,6 +459,8 @@ def _build_visible_attribute_coverage(snapshot: MerchantReadinessSnapshot, chann
             product_category_coverage.update([label])
             if ready_for_channel:
                 servable_product_count_by_category.update([label])
+                if product_ingredient_ids:
+                    ingredient_coverage_by_category.update([label])
 
         for label in product_visible_attributes.get("skin_concern", []):
             if label in tracked_skin_concerns:
@@ -459,6 +469,23 @@ def _build_visible_attribute_coverage(snapshot: MerchantReadinessSnapshot, chann
         for label in product_visible_attributes.get("formula_constraint", []):
             if label in tracked_formula_constraints:
                 formula_constraint_coverage.update([label])
+
+        explicit_shade_ready_variant_count = sum(
+            1
+            for variant in product.variants
+            if variant.channel_coverage.get(channel) == "ready"
+            and any(str(label or "").startswith("shade_") for label in (getattr(variant, "visible_option_labels", None) or []))
+        )
+        if explicit_shade_ready_variant_count > 0:
+            category_blob = " ".join(
+                [
+                    str(getattr(product, "title", "") or "").lower(),
+                    str(getattr(product, "category", "") or "").lower(),
+                ]
+            )
+            for label in tracked_shade_categories:
+                if label in category_blob:
+                    shade_coverage_by_category.update([label] * explicit_shade_ready_variant_count)
 
     return {
         "servable_product_count_by_category": {
@@ -478,6 +505,14 @@ def _build_visible_attribute_coverage(snapshot: MerchantReadinessSnapshot, chann
                 label: int(formula_constraint_coverage.get(label, 0))
                 for label in tracked_formula_constraints
             },
+        },
+        "ingredient_coverage_by_category": {
+            label: int(ingredient_coverage_by_category.get(label, 0))
+            for label in tracked_categories
+        },
+        "shade_coverage_by_category": {
+            label: int(shade_coverage_by_category.get(label, 0))
+            for label in tracked_shade_categories
         },
     }
 

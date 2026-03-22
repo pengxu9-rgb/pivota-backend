@@ -77,6 +77,7 @@ class ReadyVariant(BaseModel):
     sku: Optional[str] = None
     title: str
     attributes: Dict[str, str] = Field(default_factory=dict)
+    visible_option_labels: List[str] = Field(default_factory=list)
     price: Dict[str, Any] = Field(default_factory=dict)
     inventory: Dict[str, Any] = Field(default_factory=dict)
     freshness: Dict[str, FieldFreshness] = Field(default_factory=dict)
@@ -99,6 +100,7 @@ class ReadyProduct(BaseModel):
     category: Optional[str] = None
     default_image_url: Optional[str] = None
     visible_attributes: Dict[str, List[str]] = Field(default_factory=dict)
+    ingredient_ids: List[str] = Field(default_factory=list)
     reviews: Optional[ReviewSummary] = None
     variants: List[ReadyVariant] = Field(default_factory=list)
 
