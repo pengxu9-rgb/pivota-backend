@@ -6197,7 +6197,6 @@ async def _handle_find_products_multi(
             [
                 (product.title or "").lower(),
                 (product.product_type or "").lower(),
-                " ".join(getattr(product, "tags", None) or []),
             ]
         ).strip()
         has_pet_accessory_marker = any(tok in pet_accessory_blob for tok in pet_accessory_markers)
