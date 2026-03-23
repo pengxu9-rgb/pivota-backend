@@ -104,6 +104,9 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
     proxy_search_fallback = metadata.get("proxy_search_fallback")
     if not isinstance(proxy_search_fallback, dict):
         proxy_search_fallback = {}
+    contract_bridge = metadata.get("contract_bridge")
+    if not isinstance(contract_bridge, dict):
+        contract_bridge = {}
 
     products = body.get("products") if isinstance(body, dict) else []
     product_count = len(products) if isinstance(products, list) else 0
@@ -425,6 +428,14 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
         "route_health_contract_missing_count": len(missing_route_health_fields),
         "route_health_contract_missing_fields": missing_route_health_fields,
         "fallback_reason_sync_ok": metadata.get("fallback_reason") == route_health.get("fallback_reason"),
+        "resolved_contract": str(contract_bridge.get("resolved_contract") or ""),
+        "attempted_contract": str(contract_bridge.get("attempted_contract") or ""),
+        "strict_constraint_query": bool(metadata.get("strict_constraint_query") or False),
+        "strict_constraint_reason": str(metadata.get("strict_constraint_reason") or ""),
+        "ingredient_intents": list(metadata.get("ingredient_intents") or []),
+        "matched_ingredient_ids": list(metadata.get("matched_ingredient_ids") or []),
+        "visible_option_intents": list(metadata.get("visible_option_intents") or []),
+        "matched_visible_option_labels": list(metadata.get("matched_visible_option_labels") or []),
     }
 
 

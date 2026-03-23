@@ -848,6 +848,34 @@ def _extract_visible_size_option_intents(query: Optional[str]) -> List[Dict[str,
     return active
 
 
+def _resolve_strict_constraint_reason(
+    *,
+    strict_serving_mode: bool,
+    ingredient_labels: list[str],
+    visible_option_labels: list[str],
+    visible_attribute_labels: list[str],
+    price_min: Optional[float],
+    price_max: Optional[float],
+) -> Optional[str]:
+    if not strict_serving_mode:
+        return None
+    has_ingredient_constraint = bool(ingredient_labels)
+    has_shade_constraint = any(str(label).startswith("shade_") for label in visible_option_labels)
+    if not has_ingredient_constraint and not has_shade_constraint:
+        return None
+    has_additional_constraint = (
+        bool(visible_attribute_labels)
+        or price_min is not None
+        or price_max is not None
+        or (has_ingredient_constraint and has_shade_constraint)
+    )
+    if has_additional_constraint:
+        return "multi_constraint"
+    if has_ingredient_constraint:
+        return "ingredient"
+    return "shade"
+
+
 def _extract_visible_color_option_intents(
     query: Optional[str],
     *,
@@ -7649,6 +7677,15 @@ async def _handle_find_products_multi(
         )
 
     history_used = bool(history_product_ids or history_terms)
+    strict_constraint_reason = _resolve_strict_constraint_reason(
+        strict_serving_mode=strict_serving_mode,
+        ingredient_labels=active_ingredient_labels,
+        visible_option_labels=active_visible_option_labels,
+        visible_attribute_labels=active_visible_attribute_labels,
+        price_min=effective_price_min,
+        price_max=effective_price_max,
+    )
+    strict_constraint_query = bool(strict_constraint_reason)
 
     return _maybe_attach_eval_debug(
         {
@@ -7701,6 +7738,8 @@ async def _handle_find_products_multi(
                     {
                         "commerce_surface": commerce_surface,
                         "serving_mode": "eligible_only",
+                        "strict_constraint_query": strict_constraint_query,
+                        "strict_constraint_reason": strict_constraint_reason,
                     }
                     if strict_serving_mode
                     else {}
