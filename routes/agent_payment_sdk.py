@@ -410,6 +410,8 @@ async def create_payment(
                 "idempotency_key": request.idempotency_key,
             },
             preferred_psps=preferred_psps,
+            canonical_psp_required=True,
+            enforce_live_readiness=True,
         )
 
         if not success:

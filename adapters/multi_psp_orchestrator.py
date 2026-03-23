@@ -11,7 +11,10 @@ from datetime import datetime
 from adapters.psp_adapter import PSPAdapter, get_psp_adapter, PaymentIntent
 from db.merchant_onboarding import get_merchant_onboarding
 from db.database import database
-from services.merchant_psp_config_service import build_runtime_adapter_kwargs
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    evaluate_psp_readiness,
+)
 from utils.logger import logger
 import hashlib
 
@@ -28,6 +31,10 @@ class PSPConfig:
     secret_key: Optional[str] = None
     environment: Optional[str] = None
     provider_config: Optional[Dict[str, Any]] = None
+    validation_status: Optional[str] = None
+    validation_error: Optional[str] = None
+    live_charge_ready: bool = False
+    readiness_blockers: Optional[List[str]] = None
 
 
 class MultiPSPOrchestrator:
@@ -45,7 +52,7 @@ class MultiPSPOrchestrator:
         self.merchant_id = merchant_id
         self.psp_configs: List[PSPConfig] = []
         
-    async def load_psp_configs(self):
+    async def load_psp_configs(self, *, canonical_only: bool = False):
         """
         Load all PSP configurations for this merchant.
 
@@ -60,7 +67,8 @@ class MultiPSPOrchestrator:
         try:
             psps = await database.fetch_all(
                 """
-                SELECT provider, api_key, account_id, secret_key, status, connected_at, environment, provider_config
+                SELECT provider, api_key, account_id, secret_key, status, connected_at,
+                       environment, provider_config, validation_status, validation_error
                 FROM merchant_psps
                 WHERE merchant_id = :merchant_id AND status = 'active'
                 ORDER BY connected_at ASC
@@ -85,6 +93,16 @@ class MultiPSPOrchestrator:
 
             provider_config = psp_dict.get("provider_config")
             merchant_account = psp_dict.get("account_id") if provider == "adyen" else None
+            readiness = evaluate_psp_readiness(
+                provider,
+                status=psp_dict.get("status"),
+                api_key=api_key,
+                account_id=psp_dict.get("account_id"),
+                provider_config=provider_config,
+                environment=psp_dict.get("environment"),
+                validation_status=psp_dict.get("validation_status"),
+                validation_error=psp_dict.get("validation_error"),
+            )
 
             self.psp_configs.append(
                 PSPConfig(
@@ -97,11 +115,15 @@ class MultiPSPOrchestrator:
                     secret_key=psp_dict.get("secret_key"),
                     environment=psp_dict.get("environment"),
                     provider_config=provider_config,
+                    validation_status=readiness.get("validation_status"),
+                    validation_error=readiness.get("validation_error"),
+                    live_charge_ready=bool(readiness.get("live_charge_ready")),
+                    readiness_blockers=list(readiness.get("readiness_blockers") or []),
                 )
             )
 
         # 2) Legacy fallback: use merchant_onboarding.psp_* fields
-        if not self.psp_configs:
+        if not self.psp_configs and not canonical_only:
             merchant = await get_merchant_onboarding(self.merchant_id)
             if not merchant:
                 raise ValueError(f"Merchant {self.merchant_id} not found")
@@ -118,6 +140,10 @@ class MultiPSPOrchestrator:
                             merchant_account=merchant.get("adyen_merchant_account"),
                             environment="unknown",
                             provider_config={},
+                            validation_status="unknown",
+                            validation_error=None,
+                            live_charge_ready=False,
+                            readiness_blockers=["Processor validation has not been run", "Environment is unknown"],
                         )
                     )
 
@@ -133,6 +159,10 @@ class MultiPSPOrchestrator:
                             merchant_account=backup.get("merchant_account"),
                             environment="unknown",
                             provider_config={},
+                            validation_status="unknown",
+                            validation_error=None,
+                            live_charge_ready=False,
+                            readiness_blockers=["Processor validation has not been run", "Environment is unknown"],
                         )
                     )
 
@@ -149,13 +179,16 @@ class MultiPSPOrchestrator:
         currency: str,
         metadata: Dict[str, Any],
         preferred_psps: Optional[List[str]] = None,
+        *,
+        canonical_psp_required: bool = False,
+        enforce_live_readiness: bool = False,
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
         """
         Create payment intent with automatic PSP failover
         
         Returns: (success, payment_intent, error, psp_used)
         """
-        await self.load_psp_configs()
+        await self.load_psp_configs(canonical_only=canonical_psp_required)
 
         # Reorder configs based on preferred_psps (from routing UI) if provided
         if preferred_psps:
@@ -257,7 +290,17 @@ class MultiPSPOrchestrator:
 
         # Try each PSP in priority order
         attempt_number = 0
+        blocked_errors: List[str] = []
         for config in self.psp_configs:
+            if enforce_live_readiness and not config.live_charge_ready:
+                blocked_errors.append(
+                    f"{config.psp_type}: {', '.join(config.readiness_blockers or ['not ready for live charge'])}"
+                )
+                logger.warning(
+                    f"Skipping {config.psp_type} for merchant {self.merchant_id}: "
+                    f"{', '.join(config.readiness_blockers or ['not ready for live charge'])}"
+                )
+                continue
             attempt_number += 1
             try:
                 logger.info(f"Attempting payment with {config.psp_type} (priority {config.priority})")
@@ -334,6 +377,8 @@ class MultiPSPOrchestrator:
                 continue
         
         # All PSPs failed
+        if blocked_errors and attempt_number == 0:
+            return False, None, "; ".join(blocked_errors), "none"
         return False, None, "All PSPs failed", "none"
     
     async def _log_psp_attempt(
@@ -392,6 +437,9 @@ async def create_payment_with_failover(
     currency: str,
     metadata: Dict[str, Any],
     preferred_psps: Optional[List[str]] = None,
+    *,
+    canonical_psp_required: bool = False,
+    enforce_live_readiness: bool = False,
 ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
     """
     Convenience function to create payment with multi-PSP support
@@ -406,5 +454,10 @@ async def create_payment_with_failover(
     """
     orchestrator = MultiPSPOrchestrator(merchant_id)
     return await orchestrator.create_payment_intent(
-        amount, currency, metadata, preferred_psps=preferred_psps
+        amount,
+        currency,
+        metadata,
+        preferred_psps=preferred_psps,
+        canonical_psp_required=canonical_psp_required,
+        enforce_live_readiness=enforce_live_readiness,
     )

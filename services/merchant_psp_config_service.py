@@ -56,6 +56,13 @@ def normalize_psp_environment(provider: str, api_key: Optional[str], environment
     return "unknown"
 
 
+def normalize_validation_status(value: Optional[str]) -> str:
+    status_value = str(value or "").strip().lower() or "unknown"
+    if status_value not in {"valid", "invalid", "unknown"}:
+        status_value = "unknown"
+    return status_value
+
+
 def normalize_provider_config(
     provider: str,
     *,
@@ -117,6 +124,7 @@ def normalize_provider_config(
 def build_provider_summary(
     provider: str,
     *,
+    api_key: Optional[str] = None,
     account_id: Optional[str] = None,
     provider_config: Optional[Any] = None,
     environment: Optional[str] = None,
@@ -128,7 +136,7 @@ def build_provider_summary(
         provider_config=provider_config,
         environment=environment,
     )
-    env_value = normalize_psp_environment(provider_norm, None, environment)
+    env_value = normalize_psp_environment(provider_norm, api_key, environment)
 
     if provider_norm == "stripe":
         return {
@@ -178,9 +186,7 @@ def build_provider_connect_record(
         environment=env_value,
     )
 
-    status_value = str(validation_status or "").strip().lower() or "unknown"
-    if status_value not in {"valid", "invalid", "unknown"}:
-        status_value = "unknown"
+    status_value = normalize_validation_status(validation_status)
 
     return {
         "provider": provider_norm,
@@ -242,10 +248,91 @@ def build_runtime_adapter_kwargs(
     return {}
 
 
+def evaluate_psp_readiness(
+    provider: str,
+    *,
+    status: Optional[str] = None,
+    api_key: Optional[str] = None,
+    account_id: Optional[str] = None,
+    provider_config: Optional[Any] = None,
+    environment: Optional[str] = None,
+    validation_status: Optional[str] = None,
+    validation_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    provider_norm = str(provider or "").strip().lower()
+    env_value = normalize_psp_environment(provider_norm, api_key, environment)
+    summary = build_provider_summary(
+        provider_norm,
+        api_key=api_key,
+        account_id=account_id,
+        provider_config=provider_config,
+        environment=env_value,
+    )
+    status_value = str(status or "").strip().lower() or "unknown"
+    validation_value = normalize_validation_status(validation_status)
+    error_text = str(validation_error or "").strip() or None
+    configured = bool(api_key and str(api_key).strip() and str(api_key).strip() != "pending_setup")
+    blockers: List[str] = []
+
+    def add_blocker(message: str) -> None:
+        if message and message not in blockers:
+            blockers.append(message)
+
+    if status_value != "active":
+        add_blocker("Processor is not active")
+    if not configured:
+        add_blocker("Secret/API key is missing")
+
+    if env_value == "unknown":
+        add_blocker("Environment is unknown")
+    elif env_value != "live":
+        add_blocker(f"Processor is configured for {env_value}, not live")
+
+    if provider_norm == "stripe":
+        mode = str(summary.get("mode") or "").strip().lower() or "payment_intent"
+        if mode not in {"payment_intent", "checkout_session"}:
+            add_blocker("Stripe mode is invalid")
+        if error_text:
+            lowered = error_text.lower()
+            if "access to account" in lowered or (
+                "account" in lowered and "access" in lowered
+            ):
+                add_blocker("Stripe connected account does not match the current key")
+
+    elif provider_norm == "adyen":
+        if not summary.get("merchant_account"):
+            add_blocker("Adyen merchant account is missing")
+        if not summary.get("client_key_present"):
+            add_blocker("Adyen client key is missing")
+
+    elif provider_norm == "checkout":
+        if not summary.get("processing_channel_id"):
+            add_blocker("Checkout.com processing channel ID is missing")
+        if not summary.get("public_key_present"):
+            add_blocker("Checkout.com public key is missing")
+
+    if validation_value == "unknown":
+        add_blocker("Processor validation has not been run")
+    elif validation_value == "invalid":
+        if error_text:
+            add_blocker(f"Processor validation failed: {error_text}")
+        else:
+            add_blocker("Processor validation failed")
+
+    return {
+        "provider": provider_norm,
+        "environment": env_value,
+        "provider_summary": summary,
+        "validation_status": validation_value,
+        "validation_error": error_text,
+        "live_charge_ready": len(blockers) == 0,
+        "readiness_blockers": blockers,
+    }
+
+
 def parse_capabilities(raw: Any) -> List[str]:
     if isinstance(raw, list):
         return [str(item).strip() for item in raw if str(item).strip()]
     if isinstance(raw, str):
         return [item.strip() for item in raw.split(",") if item.strip()]
     return []
-

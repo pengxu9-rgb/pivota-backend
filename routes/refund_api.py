@@ -107,6 +107,11 @@ async def _resolve_refund_adapter(order: Dict[str, Any], merchant: Dict[str, Any
                 ),
             )
 
+    if order_psp_type in {"stripe", "adyen", "checkout"}:
+        raise ValueError(
+            f"Canonical merchant_psps configuration is missing for {order_psp_type} refunds"
+        )
+
     merchant_psp_type = str(merchant.get("psp_type") or "").strip().lower() or None
     psp_type = order_psp_type or merchant_psp_type or "stripe"
     psp_key = None

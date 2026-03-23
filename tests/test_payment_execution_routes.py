@@ -81,8 +81,23 @@ async def test_execute_payment_returns_unified_action(monkeypatch: pytest.Monkey
     async def fake_candidates(merchant, payment_request):
         return (
             [
-                {"provider": "adyen", "api_key": "adyen_test_x", "account_id": "AdyenMerchant"},
-                {"provider": "stripe", "api_key": "sk_test_x"},
+                {
+                    "provider": "adyen",
+                    "api_key": "live_adyen_key",
+                    "status": "active",
+                    "account_id": "AdyenMerchant",
+                    "environment": "live",
+                    "provider_config": {"merchant_account": "AdyenMerchant", "client_key": "pub_123"},
+                    "validation_status": "valid",
+                },
+                {
+                    "provider": "stripe",
+                    "api_key": "sk_live_x",
+                    "status": "active",
+                    "environment": "live",
+                    "provider_config": {"mode": "payment_intent"},
+                    "validation_status": "valid",
+                },
             ],
             {"route_id": "route_1", "psp_priority": [{"psp": "adyen", "priority": 1}, {"psp": "stripe", "priority": 2}]},
         )
@@ -184,8 +199,26 @@ async def test_execute_payment_failure_reports_last_attempted_supported_processo
     async def fake_candidates(merchant, payment_request):
         return (
             [
-                {"provider": "stripe", "api_key": "sk_test_x"},
-                {"provider": "checkout", "api_key": "cko_test_x"},
+                {
+                    "provider": "stripe",
+                    "api_key": "sk_live_x",
+                    "status": "active",
+                    "environment": "live",
+                    "provider_config": {"mode": "payment_intent"},
+                    "validation_status": "valid",
+                },
+                {
+                    "provider": "checkout",
+                    "api_key": "sk_live_checkout",
+                    "status": "active",
+                    "environment": "live",
+                    "account_id": "pc_live_123",
+                    "provider_config": {
+                        "processing_channel_id": "pc_live_123",
+                        "public_key": "pk_live_123",
+                    },
+                    "validation_status": "valid",
+                },
             ],
             {"psp_priority": [{"psp": "stripe", "priority": 1}, {"psp": "checkout", "priority": 2}]},
         )
@@ -228,3 +261,50 @@ async def test_execute_payment_failure_reports_last_attempted_supported_processo
     assert response.error_message == "Checkout API error"
     assert response.payment_id.startswith("failed_")
     assert emitted == [("merch_test_payment", "payment.failed", "checkout")]
+
+
+@pytest.mark.asyncio
+async def test_execute_payment_fail_closed_when_processors_are_not_live_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    async def fake_verify(api_key: str):
+        return {
+            "merchant_id": "merch_test_payment",
+            "business_name": "Glow Commerce",
+            "status": "approved",
+        }
+
+    async def fake_candidates(merchant, payment_request):
+        return (
+            [
+                {
+                    "provider": "adyen",
+                    "api_key": "live_adyen_key",
+                    "status": "active",
+                    "account_id": "WoopayECOM",
+                    "provider_config": {"merchant_account": "WoopayECOM"},
+                    "environment": "unknown",
+                    "validation_status": "unknown",
+                }
+            ],
+            {"psp_priority": [{"psp": "adyen", "priority": 1}]},
+        )
+
+    monkeypatch.setattr(module, "verify_merchant_api_key", fake_verify)
+    monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
+
+    with pytest.raises(HTTPException) as exc:
+        await module.execute_payment(
+            module.PaymentExecuteRequest(
+                amount=1000,
+                currency="USD",
+                order_id="ord_blocked",
+            ),
+            x_merchant_api_key="merchant_test_key",
+        )
+
+    assert exc.value.status_code == 400
+    assert "No supported live-ready PSPs" in exc.value.detail
+    assert "Environment is unknown" in exc.value.detail

@@ -1,6 +1,7 @@
 from services.merchant_psp_config_service import (
     build_provider_connect_record,
     build_runtime_adapter_kwargs,
+    evaluate_psp_readiness,
 )
 
 
@@ -31,3 +32,34 @@ def test_build_runtime_adapter_kwargs_checkout_uses_processing_channel() -> None
     assert kwargs["processing_channel_id"] == "pc_123"
     assert kwargs["public_key"] == "pk_123"
     assert kwargs["environment"] == "test"
+
+
+def test_evaluate_psp_readiness_marks_live_valid_stripe_as_ready() -> None:
+    readiness = evaluate_psp_readiness(
+        "stripe",
+        status="active",
+        api_key="sk_live_123",
+        account_id="acct_123",
+        provider_config={"mode": "payment_intent"},
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert readiness["live_charge_ready"] is True
+    assert readiness["readiness_blockers"] == []
+
+
+def test_evaluate_psp_readiness_blocks_missing_adyen_client_key() -> None:
+    readiness = evaluate_psp_readiness(
+        "adyen",
+        status="active",
+        api_key="live_adyen_key",
+        account_id="WoopayECOM",
+        provider_config={"merchant_account": "WoopayECOM"},
+        environment="live",
+        validation_status="unknown",
+    )
+
+    assert readiness["live_charge_ready"] is False
+    assert "Adyen client key is missing" in readiness["readiness_blockers"]
+    assert "Processor validation has not been run" in readiness["readiness_blockers"]

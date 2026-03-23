@@ -200,3 +200,5 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
     assert payload["validation_status"] == "valid"
     assert payload["provider_summary"]["merchant_account"] == "WoopayECOM"
     assert payload["provider_summary"]["client_key_present"] is True
+    assert payload["live_charge_ready"] is True
+    assert payload["readiness_blockers"] == []

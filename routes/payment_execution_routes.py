@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from db.database import database
 from db.merchant_onboarding import get_merchant_by_api_key
 from services.merchant_payment_initiation_service import initiate_merchant_payment
+from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.payment_routing_service import PaymentRoutingService
 
@@ -70,19 +71,14 @@ async def verify_merchant_api_key(api_key: str) -> dict:
             detail=f"Merchant account is {merchant['status']}. Only approved merchants can process payments.",
         )
 
-    if not merchant["psp_connected"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No PSP connected. Please connect a PSP first.",
-        )
-
     return merchant
 
 
 async def _load_active_merchant_psps(merchant_id: str) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
-        SELECT psp_id, provider, api_key, secret_key, account_id, status, connected_at, environment, provider_config
+        SELECT psp_id, provider, api_key, secret_key, account_id, status, connected_at,
+               environment, provider_config, validation_status, validation_error, last_validated_at
         FROM merchant_psps
         WHERE merchant_id = :merchant_id
           AND status = 'active'
@@ -108,6 +104,35 @@ def _normalize_priority_list(route_config: Dict[str, Any]) -> List[str]:
         if provider and provider not in providers:
             providers.append(provider)
     return providers
+
+
+def _build_candidate_readiness(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return evaluate_psp_readiness(
+        str(candidate.get("provider") or ""),
+        status=candidate.get("status"),
+        api_key=candidate.get("api_key"),
+        account_id=candidate.get("account_id"),
+        provider_config=candidate.get("provider_config"),
+        environment=candidate.get("environment"),
+        validation_status=candidate.get("validation_status"),
+        validation_error=candidate.get("validation_error"),
+    )
+
+
+def _describe_blocked_candidates(candidates: List[Dict[str, Any]]) -> str:
+    blocked_descriptions: List[str] = []
+    for candidate in candidates:
+        provider = str(candidate.get("provider") or "").strip().lower()
+        if provider not in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS:
+            continue
+        readiness = candidate.get("readiness") or _build_candidate_readiness(candidate)
+        if readiness.get("live_charge_ready"):
+            continue
+        blockers = readiness.get("readiness_blockers") or []
+        blocked_descriptions.append(
+            f"{provider}: {', '.join(blockers) if blockers else 'not ready for live charge'}"
+        )
+    return "; ".join(blocked_descriptions[:3])
 
 
 async def _resolve_payment_candidates(
@@ -208,12 +233,22 @@ async def execute_payment(
         preferred_psps = [
             str(candidate.get("provider") or "").strip().lower()
             for candidate in candidates
-            if str(candidate.get("provider") or "").strip().lower() in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS
+            if (
+                str(candidate.get("provider") or "").strip().lower() in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS
+                and (
+                    candidate.get("readiness")
+                    or _build_candidate_readiness(candidate)
+                ).get("live_charge_ready")
+            )
         ]
         if not preferred_psps:
+            blocked_detail = _describe_blocked_candidates(candidates)
             raise HTTPException(
                 status_code=400,
-                detail="No supported active PSPs are configured for this merchant",
+                detail=(
+                    "No supported live-ready PSPs are configured for this merchant"
+                    + (f". {blocked_detail}" if blocked_detail else "")
+                ),
             )
 
         result = await initiate_merchant_payment(
@@ -231,6 +266,8 @@ async def execute_payment(
             },
             preferred_psps=preferred_psps,
             candidates=candidates,
+            canonical_psp_required=True,
+            enforce_live_readiness=True,
         )
 
         payment_id = str(result.get("payment_id") or f"failed_{secrets.token_hex(8)}")

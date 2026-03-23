@@ -1419,6 +1419,8 @@ async def create_payment_intent_for_checkout(
         currency=currency,
         metadata=metadata,
         preferred_psps=preferred_psps,
+        canonical_psp_required=True,
+        enforce_live_readiness=True,
     )
     if not success or payment_intent is None:
         raise ValueError(

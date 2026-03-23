@@ -12,7 +12,10 @@ from typing import Any, Dict, List, Optional
 
 from adapters.multi_psp_orchestrator import create_payment_with_failover
 from adapters.psp_adapter import get_psp_adapter
-from services.merchant_psp_config_service import build_runtime_adapter_kwargs
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    evaluate_psp_readiness,
+)
 
 
 def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
@@ -143,7 +146,16 @@ async def initiate_merchant_payment(
     metadata: Dict[str, Any],
     preferred_psps: Optional[List[str]] = None,
     candidates: Optional[List[Dict[str, Any]]] = None,
+    canonical_psp_required: bool = False,
+    enforce_live_readiness: bool = False,
 ) -> Dict[str, Any]:
+    enforce_live_readiness = bool(
+        enforce_live_readiness or metadata.get("enforce_live_readiness")
+    )
+    canonical_psp_required = bool(
+        canonical_psp_required or metadata.get("canonical_psp_required")
+    )
+
     if candidates:
         last_error = "No supported PSP candidates"
         last_psp = "unknown"
@@ -152,6 +164,21 @@ async def initiate_merchant_payment(
             api_key = str(candidate.get("api_key") or "").strip()
             if not provider or not api_key:
                 continue
+            if enforce_live_readiness:
+                readiness = evaluate_psp_readiness(
+                    provider,
+                    status=candidate.get("status"),
+                    api_key=api_key,
+                    account_id=candidate.get("account_id"),
+                    provider_config=candidate.get("provider_config"),
+                    environment=candidate.get("environment"),
+                    validation_status=candidate.get("validation_status"),
+                    validation_error=candidate.get("validation_error"),
+                )
+                if not readiness["live_charge_ready"]:
+                    last_psp = provider
+                    last_error = "; ".join(readiness["readiness_blockers"]) or f"{provider} is not ready for live charge"
+                    continue
             last_psp = provider
             try:
                 adapter = get_psp_adapter(
@@ -201,6 +228,8 @@ async def initiate_merchant_payment(
         currency=currency,
         metadata=metadata,
         preferred_psps=preferred_psps,
+        canonical_psp_required=canonical_psp_required,
+        enforce_live_readiness=enforce_live_readiness,
     )
     return build_payment_initiation_result(
         success=success,

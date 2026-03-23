@@ -29,7 +29,10 @@ from services.merchant_webhook_service import (
     send_test_webhook as send_merchant_test_webhook,
     update_webhook_config as update_merchant_webhook_config,
 )
-from services.merchant_psp_config_service import build_provider_summary, parse_capabilities
+from services.merchant_psp_config_service import (
+    evaluate_psp_readiness,
+    parse_capabilities,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -505,15 +508,16 @@ async def get_merchant_psps(
                 "volume_today": round(stats["total_volume"], 2),  # Now showing actual volume for this PSP
                 "transaction_count": stats["total_orders"],
                 "is_active": (effective_status or "").lower() == "active",
-                "environment": row_dict.get("environment") or "unknown",
-                "provider_summary": build_provider_summary(
+                **evaluate_psp_readiness(
                     provider,
+                    status=effective_status,
+                    api_key=api_key,
                     account_id=row_dict.get("account_id"),
                     provider_config=row_dict.get("provider_config"),
                     environment=row_dict.get("environment"),
+                    validation_status=row_dict.get("validation_status"),
+                    validation_error=row_dict.get("validation_error"),
                 ),
-                "validation_status": row_dict.get("validation_status") or "unknown",
-                "validation_error": row_dict.get("validation_error"),
                 "last_validated_at": row_dict.get("last_validated_at").isoformat() if row_dict.get("last_validated_at") else None,
             })
             print(f"DEBUG: PSP {psp_id} - Volume: ${stats['total_volume']:.2f}, Transactions: {stats['total_orders']}")
@@ -1074,12 +1078,17 @@ async def test_psp_connection(
     psp_row = dict(psp)
     provider = psp_row["provider"]
     api_key = psp_row["api_key"]
-    provider_summary = build_provider_summary(
+    readiness_before = evaluate_psp_readiness(
         provider,
+        status="active",
+        api_key=api_key,
         account_id=psp_row.get("account_id"),
         provider_config=psp_row.get("provider_config"),
         environment=psp_row.get("environment"),
+        validation_status=psp_row.get("validation_status"),
+        validation_error=psp_row.get("validation_error"),
     )
+    provider_summary = readiness_before["provider_summary"]
     
     # Check if API key is configured
     if not api_key or api_key == "pending_setup":
@@ -1088,75 +1097,86 @@ async def test_psp_connection(
             "message": f"PSP not configured yet. Please add API credentials for {provider}.",
             "data": {
                 "provider": provider,
-                "configured": False
+                "configured": False,
+                "live_charge_ready": False,
+                "readiness_blockers": readiness_before["readiness_blockers"],
             }
         }
     
     # Test actual PSP connection
     try:
+        success = False
+        validation_message = ""
+
         if provider == "stripe":
-            # Test Stripe API
-            import httpx
-            response = await httpx.AsyncClient().get(
-                "https://api.stripe.com/v1/balance",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=10.0
-            )
-            success = response.status_code in [200, 403]  # 403 means key is valid but restricted
-            
+            import stripe as stripe_sdk
+
+            stripe_sdk.api_key = api_key
+            account_id = provider_summary.get("account_id")
+            if account_id:
+                stripe_sdk.Balance.retrieve(stripe_account=account_id)
+            else:
+                stripe_sdk.Balance.retrieve()
+            success = True
+            validation_message = "Stripe credentials verified"
+
         elif provider == "adyen":
-            # Test Adyen API
-            import httpx
-            merchant_account = provider_summary.get("merchant_account") or "TEST"
+            merchant_account = provider_summary.get("merchant_account")
+            if not merchant_account:
+                raise ValueError("Adyen merchant account is missing")
+            if not provider_summary.get("client_key_present"):
+                raise ValueError("Adyen client key is missing")
             test_url = (
                 "https://checkout-live.adyen.com/v70/paymentMethods"
                 if provider_summary.get("environment") == "live"
                 else "https://checkout-test.adyen.com/v70/paymentMethods"
             )
-            response = await httpx.AsyncClient().post(
-                test_url,
-                headers={"X-API-Key": api_key, "Content-Type": "application/json"},
-                json={"merchantAccount": merchant_account},
-                timeout=10.0
-            )
-            success = response.status_code in [200, 401, 403, 422]
-            
-        elif provider == "paypal":
-            # Test PayPal API
-            secret_key = psp_row["secret_key"]
-            if not secret_key:
-                return {
-                    "status": "error",
-                    "message": "PayPal requires both Client ID and Client Secret",
-                    "data": {"provider": provider, "configured": False}
-                }
-            # PayPal OAuth token test (simplified)
-            success = len(api_key) > 10 and len(secret_key) > 10
-            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    test_url,
+                    headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                    json={"merchantAccount": merchant_account},
+                    timeout=10.0,
+                )
+            if response.status_code != 200:
+                raise ValueError(f"Adyen validation failed: {response.status_code} {response.text[:240]}")
+            success = True
+            validation_message = "Adyen credentials verified"
+
         elif provider == "checkout":
-            # Test Checkout.com API
             processing_channel = provider_summary.get("processing_channel_id")
             if not processing_channel:
-                return {
-                    "status": "error",
-                    "message": "Checkout.com requires Processing Channel ID",
-                    "data": {"provider": provider, "configured": False}
-                }
-            success = len(api_key) > 10 and len(processing_channel) > 5
-            
+                raise ValueError("Checkout.com processing channel ID is missing")
+            if not provider_summary.get("public_key_present"):
+                raise ValueError("Checkout.com public key is missing")
+            base_url = (
+                "https://api.checkout.com"
+                if provider_summary.get("environment") == "live"
+                else "https://api.sandbox.checkout.com"
+            )
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{base_url}/instruments",
+                    headers={"Authorization": api_key},
+                    timeout=10.0,
+                )
+            if response.status_code != 200:
+                raise ValueError(f"Checkout.com validation failed: {response.status_code} {response.text[:240]}")
+            success = True
+            validation_message = "Checkout.com credentials verified"
+
         else:
-            # Unknown/Custom PSP - can't test without integration
             return {
                 "status": "warning",
-                "message": f"{provider.capitalize()} is a custom PSP. Automatic testing not supported. Please verify manually or configure API credentials.",
+                "message": f"{provider.capitalize()} is not in the wave-1 PSP validation scope.",
                 "data": {
                     "psp_id": psp_id,
                     "provider": provider,
                     "configured": bool(api_key and api_key != "pending_setup"),
-                    "tested_at": datetime.now().isoformat() + "Z"
-                }
+                    "tested_at": datetime.now().isoformat() + "Z",
+                },
             }
-        
+
         await database.execute(
             """
             UPDATE merchant_psps
@@ -1171,20 +1191,39 @@ async def test_psp_connection(
             },
         )
 
+        readiness = evaluate_psp_readiness(
+            provider,
+            status="active",
+            api_key=api_key,
+            account_id=psp_row.get("account_id"),
+            provider_config=psp_row.get("provider_config"),
+            environment=psp_row.get("environment"),
+            validation_status="valid" if success else "invalid",
+            validation_error=None,
+        )
+
         return {
             "status": "success",
-            "message": f"{provider.capitalize()} connection verified successfully",
+            "message": (
+                validation_message
+                if readiness["live_charge_ready"]
+                else f"{validation_message}, but the processor is still blocked for live charge"
+            ),
             "data": {
                 "psp_id": psp_id,
                 "provider": provider,
                 "tested_at": datetime.now().isoformat() + "Z",
                 "configured": True,
-                "environment": provider_summary.get("environment"),
+                "environment": readiness["environment"],
+                "validation_status": readiness["validation_status"],
+                "live_charge_ready": readiness["live_charge_ready"],
+                "readiness_blockers": readiness["readiness_blockers"],
             }
         }
         
     except Exception as e:
         print(f"❌ PSP test error: {e}")
+        error_text = str(e)[:500]
         await database.execute(
             """
             UPDATE merchant_psps
@@ -1193,14 +1232,26 @@ async def test_psp_connection(
                 last_validated_at = NOW()
             WHERE psp_id = :psp_id
             """,
-            {"psp_id": psp_id, "validation_error": str(e)[:500]},
+            {"psp_id": psp_id, "validation_error": error_text},
+        )
+        readiness = evaluate_psp_readiness(
+            provider,
+            status="active",
+            api_key=api_key,
+            account_id=psp_row.get("account_id"),
+            provider_config=psp_row.get("provider_config"),
+            environment=psp_row.get("environment"),
+            validation_status="invalid",
+            validation_error=error_text,
         )
         return {
             "status": "error",
-            "message": f"Failed to test {provider}: {str(e)}",
+            "message": f"Failed to test {provider}: {error_text}",
             "data": {
                 "psp_id": psp_id,
                 "provider": provider,
-                "error": str(e)
+                "error": error_text,
+                "live_charge_ready": readiness["live_charge_ready"],
+                "readiness_blockers": readiness["readiness_blockers"],
             }
         }

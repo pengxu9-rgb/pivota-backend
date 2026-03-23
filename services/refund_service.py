@@ -13,6 +13,7 @@ from db.orders import get_order, update_order
 from db.database import database as db
 from db.merchant_onboarding import get_merchant_onboarding
 from adapters.psp_adapter import get_psp_adapter
+from services.merchant_psp_config_service import build_runtime_adapter_kwargs
 from utils.logger import logger
 from config.settings import settings
 
@@ -259,30 +260,88 @@ class RefundService:
             psp_type = order_psp_type or "stripe"
             merchant_id = str(order.get("merchant_id") or "")
 
-            # Try merchant-scoped credentials first, then fall back to env defaults.
             psp_key: Optional[str] = None
             adapter_kwargs: Dict[str, Any] = {}
-            try:
-                merchant = await get_merchant_onboarding(merchant_id) if merchant_id else None
-                merchant_psp_type = str((merchant or {}).get("psp_type") or "").strip().lower() or None
-                if merchant_psp_type and merchant_psp_type == psp_type:
-                    psp_key = (merchant or {}).get("psp_sandbox_key") or (merchant or {}).get("psp_key")
-            except Exception:
-                merchant = None
+            merchant = None
+
+            merchant_psp_row = None
+            order_psp_id = str(order.get("psp_id") or "").strip()
+            if merchant_id:
+                try:
+                    if order_psp_id:
+                        merchant_psp_row = await self.db.fetch_one(
+                            """
+                            SELECT provider, api_key, account_id, secret_key, environment, provider_config
+                            FROM merchant_psps
+                            WHERE merchant_id = :merchant_id AND psp_id = :psp_id
+                            LIMIT 1
+                            """,
+                            {"merchant_id": merchant_id, "psp_id": order_psp_id},
+                        )
+                    if not merchant_psp_row:
+                        merchant_psp_row = await self.db.fetch_one(
+                            """
+                            SELECT provider, api_key, account_id, secret_key, environment, provider_config
+                            FROM merchant_psps
+                            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+                            ORDER BY connected_at DESC NULLS LAST
+                            LIMIT 1
+                            """,
+                            {"merchant_id": merchant_id, "provider": psp_type},
+                        )
+                except Exception as exc:
+                    logger.warning(f"Canonical merchant_psps lookup failed for refund {refund_id}: {exc}")
+
+            if merchant_psp_row:
+                row_dict = dict(merchant_psp_row)
+                psp_key = row_dict.get("api_key")
+                adapter_kwargs = build_runtime_adapter_kwargs(
+                    psp_type,
+                    account_id=row_dict.get("account_id"),
+                    provider_config=row_dict.get("provider_config"),
+                    environment=row_dict.get("environment"),
+                    secret_key=row_dict.get("secret_key"),
+                )
+
+            if not psp_key and psp_type in {"stripe", "adyen", "checkout"}:
+                raise ValueError(
+                    f"Canonical merchant_psps configuration is missing for {psp_type} refunds"
+                )
+
+            if not psp_key:
+                try:
+                    merchant = await get_merchant_onboarding(merchant_id) if merchant_id else None
+                    merchant_psp_type = str((merchant or {}).get("psp_type") or "").strip().lower() or None
+                    if merchant_psp_type and merchant_psp_type == psp_type:
+                        psp_key = (merchant or {}).get("psp_sandbox_key") or (merchant or {}).get("psp_key")
+                except Exception:
+                    merchant = None
 
             if not psp_key:
                 if psp_type == "stripe":
                     psp_key = settings.stripe_secret_key
                 elif psp_type == "adyen":
                     psp_key = getattr(settings, "adyen_api_key", None)
-                    adapter_kwargs["merchant_account"] = getattr(settings, "adyen_merchant_account", "PivotaTestMerchant")
+                    adapter_kwargs = {
+                        **adapter_kwargs,
+                        "merchant_account": getattr(settings, "adyen_merchant_account", "PivotaTestMerchant"),
+                        "environment": "unknown",
+                    }
                 elif psp_type == "checkout":
                     psp_key = getattr(settings, "checkout_secret_key", None) or getattr(settings, "checkout_api_key", None)
-                    adapter_kwargs["public_key"] = getattr(settings, "checkout_public_key", None)
+                    adapter_kwargs = {
+                        **adapter_kwargs,
+                        "public_key": getattr(settings, "checkout_public_key", None),
+                        "environment": "unknown",
+                    }
                 elif psp_type == "paypal":
                     psp_key = getattr(settings, "paypal_client_id", None) or getattr(settings, "paypal_api_key", None)
-                    adapter_kwargs["client_secret"] = getattr(settings, "paypal_client_secret", None)
-                    adapter_kwargs["is_sandbox"] = bool(getattr(settings, "paypal_sandbox", True))
+                    adapter_kwargs = {
+                        **adapter_kwargs,
+                        "client_secret": getattr(settings, "paypal_client_secret", None),
+                        "is_sandbox": bool(getattr(settings, "paypal_sandbox", True)),
+                        "environment": "test" if bool(getattr(settings, "paypal_sandbox", True)) else "live",
+                    }
 
             if not psp_key:
                 raise ValueError(f"No PSP key configured for {psp_type}")

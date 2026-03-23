@@ -1118,6 +1118,8 @@ async def create_new_order(
                     **({"psp_mode": psp_mode} if psp_mode else {}),
                 },
                 preferred_psps=preferred_psps,
+                canonical_psp_required=True,
+                enforce_live_readiness=True,
             )
             response_ms = int((time.monotonic() - start_ts) * 1000)
 
