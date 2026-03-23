@@ -3,17 +3,20 @@ Phase 3: Unified Payment Execution Router
 Merchants use their API keys to execute payments through their connected PSP
 """
 
+import hmac
+import os
 from datetime import datetime
 import logging
 import secrets
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
+from config.settings import settings
 from db.database import database
-from db.merchant_onboarding import get_merchant_by_api_key
+from db.merchant_onboarding import get_merchant_by_api_key, get_merchant_onboarding
 from services.merchant_payment_initiation_service import initiate_merchant_payment
 from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_webhook_service import emit_merchant_webhook_event
@@ -51,6 +54,10 @@ class PaymentExecuteResponse(BaseModel):
     timestamp: str
 
 
+class InternalPaymentExecuteRequest(PaymentExecuteRequest):
+    emit_merchant_webhook: bool = False
+
+
 async def verify_merchant_api_key(api_key: str) -> dict:
     if not api_key:
         raise HTTPException(
@@ -71,6 +78,46 @@ async def verify_merchant_api_key(api_key: str) -> dict:
             detail=f"Merchant account is {merchant['status']}. Only approved merchants can process payments.",
         )
 
+    return merchant
+
+
+def _extract_internal_key(request: Request, x_pivota_internal_key: Optional[str]) -> str:
+    if x_pivota_internal_key:
+        return x_pivota_internal_key.strip()
+    auth = str(request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _require_internal_canary_access(request: Request, x_pivota_internal_key: Optional[str]) -> None:
+    host = str(request.url.hostname or "").strip().lower()
+    if host in {"localhost", "127.0.0.1", "::1", "testserver"} and os.getenv("DEV_MODE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+
+    secret = (settings.readiness_internal_api_key or "").strip() or (os.getenv("UCP_INTERNAL_API_KEY") or "").strip()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    provided = _extract_internal_key(request, x_pivota_internal_key)
+    if not provided or not hmac.compare_digest(provided, secret):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
+async def _load_canary_merchant(merchant_id: str) -> Dict[str, Any]:
+    merchant = await get_merchant_onboarding(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Merchant not found")
+    if merchant.get("status") != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Merchant account is {merchant.get('status')}. Only approved merchants can process payments.",
+        )
     return merchant
 
 
@@ -133,6 +180,30 @@ def _describe_blocked_candidates(candidates: List[Dict[str, Any]]) -> str:
             f"{provider}: {', '.join(blockers) if blockers else 'not ready for live charge'}"
         )
     return "; ".join(blocked_descriptions[:3])
+
+
+def _build_preferred_psps(
+    candidates: List[Dict[str, Any]],
+    *,
+    enforce_live_readiness: bool,
+) -> List[str]:
+    preferred: List[str] = []
+    for candidate in candidates:
+        provider = str(candidate.get("provider") or "").strip().lower()
+        if provider not in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS or provider in preferred:
+            continue
+
+        if enforce_live_readiness:
+            readiness = candidate.get("readiness") or _build_candidate_readiness(candidate)
+            if readiness.get("live_charge_ready"):
+                preferred.append(provider)
+            continue
+
+        api_key = str(candidate.get("api_key") or "").strip()
+        if api_key:
+            preferred.append(provider)
+
+    return preferred
 
 
 async def _resolve_payment_candidates(
@@ -210,38 +281,34 @@ async def _emit_payment_webhook_best_effort(
         )
 
 
-@router.post("/execute", response_model=PaymentExecuteResponse)
-async def execute_payment(
+async def _execute_payment_for_merchant(
+    *,
+    merchant: Dict[str, Any],
     payment_request: PaymentExecuteRequest,
-    x_merchant_api_key: str = Header(None, alias="X-Merchant-API-Key"),
-):
-    try:
-        merchant = await verify_merchant_api_key(x_merchant_api_key)
-        logger.info(
-            "Payment request from merchant: %s (%s)",
-            merchant["merchant_id"],
-            merchant["business_name"],
+    enforce_live_readiness: bool,
+    emit_merchant_webhook: bool,
+    source: str,
+) -> PaymentExecuteResponse:
+    logger.info(
+        "Payment request from merchant: %s (%s) [%s]",
+        merchant["merchant_id"],
+        merchant.get("business_name") or merchant.get("contact_email") or "unknown",
+        source,
+    )
+
+    candidates, route_config = await _resolve_payment_candidates(merchant, payment_request)
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="Payment routing is not configured for any active processor",
         )
 
-        candidates, route_config = await _resolve_payment_candidates(merchant, payment_request)
-        if not candidates:
-            raise HTTPException(
-                status_code=400,
-                detail="Payment routing is not configured for any active processor",
-            )
-
-        preferred_psps = [
-            str(candidate.get("provider") or "").strip().lower()
-            for candidate in candidates
-            if (
-                str(candidate.get("provider") or "").strip().lower() in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS
-                and (
-                    candidate.get("readiness")
-                    or _build_candidate_readiness(candidate)
-                ).get("live_charge_ready")
-            )
-        ]
-        if not preferred_psps:
+    preferred_psps = _build_preferred_psps(
+        candidates,
+        enforce_live_readiness=enforce_live_readiness,
+    )
+    if not preferred_psps:
+        if enforce_live_readiness:
             blocked_detail = _describe_blocked_candidates(candidates)
             raise HTTPException(
                 status_code=400,
@@ -250,27 +317,34 @@ async def execute_payment(
                     + (f". {blocked_detail}" if blocked_detail else "")
                 ),
             )
-
-        result = await initiate_merchant_payment(
-            merchant_id=str(merchant["merchant_id"]),
-            # Merchant API contract keeps amount in minor units for backward compatibility.
-            amount=(Decimal(str(payment_request.amount)) / Decimal("100")),
-            currency=payment_request.currency,
-            metadata={
-                "order_id": payment_request.order_id,
-                "merchant_id": merchant["merchant_id"],
-                "customer_email": payment_request.customer_email,
-                "description": payment_request.description,
-                "route_id": route_config.get("route_id") if isinstance(route_config, dict) else None,
-                **(payment_request.metadata or {}),
-            },
-            preferred_psps=preferred_psps,
-            candidates=candidates,
-            canonical_psp_required=True,
-            enforce_live_readiness=True,
+        raise HTTPException(
+            status_code=400,
+            detail="No supported PSP candidates are configured for this canary run",
         )
 
-        payment_id = str(result.get("payment_id") or f"failed_{secrets.token_hex(8)}")
+    result = await initiate_merchant_payment(
+        merchant_id=str(merchant["merchant_id"]),
+        # Merchant API contract keeps amount in minor units for backward compatibility.
+        amount=(Decimal(str(payment_request.amount)) / Decimal("100")),
+        currency=payment_request.currency,
+        metadata={
+            "order_id": payment_request.order_id,
+            "merchant_id": merchant["merchant_id"],
+            "customer_email": payment_request.customer_email,
+            "description": payment_request.description,
+            "route_id": route_config.get("route_id") if isinstance(route_config, dict) else None,
+            **(payment_request.metadata or {}),
+            "source": source,
+            "enforce_live_readiness": enforce_live_readiness,
+        },
+        preferred_psps=preferred_psps,
+        candidates=candidates,
+        canonical_psp_required=True,
+        enforce_live_readiness=enforce_live_readiness,
+    )
+
+    payment_id = str(result.get("payment_id") or f"failed_{secrets.token_hex(8)}")
+    if emit_merchant_webhook:
         await _emit_payment_webhook_best_effort(
             merchant["merchant_id"],
             event_type="payment.completed" if result.get("success") else "payment.failed",
@@ -278,21 +352,36 @@ async def execute_payment(
             result={**result, "payment_id": payment_id},
             psp_used=result.get("psp_used") or preferred_psps[0],
         )
-        return PaymentExecuteResponse(
-            success=bool(result.get("success")),
-            payment_id=payment_id,
-            order_id=payment_request.order_id,
-            amount=payment_request.amount,
-            currency=payment_request.currency,
-            psp_used=str(result.get("psp_used") or preferred_psps[0]),
-            status=str(result.get("status") or ("requires_action" if result.get("success") else "failed")),
-            transaction_id=result.get("transaction_id"),
-            requires_customer_action=bool(result.get("requires_customer_action")),
-            payment_action=result.get("payment_action"),
-            error_message=result.get("error_message"),
-            timestamp=datetime.now().isoformat(),
-        )
+    return PaymentExecuteResponse(
+        success=bool(result.get("success")),
+        payment_id=payment_id,
+        order_id=payment_request.order_id,
+        amount=payment_request.amount,
+        currency=payment_request.currency,
+        psp_used=str(result.get("psp_used") or preferred_psps[0]),
+        status=str(result.get("status") or ("requires_action" if result.get("success") else "failed")),
+        transaction_id=result.get("transaction_id"),
+        requires_customer_action=bool(result.get("requires_customer_action")),
+        payment_action=result.get("payment_action"),
+        error_message=result.get("error_message"),
+        timestamp=datetime.now().isoformat(),
+    )
 
+
+@router.post("/execute", response_model=PaymentExecuteResponse)
+async def execute_payment(
+    payment_request: PaymentExecuteRequest,
+    x_merchant_api_key: str = Header(None, alias="X-Merchant-API-Key"),
+):
+    try:
+        merchant = await verify_merchant_api_key(x_merchant_api_key)
+        return await _execute_payment_for_merchant(
+            merchant=merchant,
+            payment_request=payment_request,
+            enforce_live_readiness=True,
+            emit_merchant_webhook=True,
+            source="payment_execute",
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -300,6 +389,37 @@ async def execute_payment(
         raise HTTPException(
             status_code=500,
             detail=f"Payment execution failed: {str(exc)}",
+        )
+
+
+@router.post(
+    "/internal/canary/merchants/{merchant_id}/execute",
+    response_model=PaymentExecuteResponse,
+    include_in_schema=False,
+)
+async def execute_internal_payment_canary(
+    merchant_id: str,
+    payment_request: InternalPaymentExecuteRequest,
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+):
+    try:
+        _require_internal_canary_access(request, x_pivota_internal_key)
+        merchant = await _load_canary_merchant(merchant_id)
+        return await _execute_payment_for_merchant(
+            merchant=merchant,
+            payment_request=payment_request,
+            enforce_live_readiness=False,
+            emit_merchant_webhook=bool(payment_request.emit_merchant_webhook),
+            source="ops_psp_canary_harness",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Internal payment canary failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal payment canary failed: {str(exc)}",
         )
 
 

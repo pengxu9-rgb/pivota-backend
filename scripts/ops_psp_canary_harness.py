@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,11 +19,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--password", required=True, help="Merchant password for authenticated portal APIs.")
     parser.add_argument("--merchant-id", required=True, help="Merchant ID.")
     parser.add_argument("--api-key", help="Existing merchant API key. If omitted, the harness fetches one from /merchant/api-credentials.")
+    parser.add_argument(
+        "--mode",
+        choices=("live", "test"),
+        default="live",
+        help="Use merchant-facing live execution or internal test-mode canary execution.",
+    )
+    parser.add_argument(
+        "--internal-key",
+        default=os.getenv("READINESS_INTERNAL_API_KEY") or os.getenv("UCP_INTERNAL_API_KEY"),
+        help="X-Pivota-Internal-Key for ops-only test canary execution.",
+    )
     parser.add_argument("--provider-order", help="Temporary routing order, e.g. stripe,adyen,checkout")
     parser.add_argument("--amount-minor", type=int, default=100, help="Payment amount in minor units.")
     parser.add_argument("--currency", default="USD", help="Currency code.")
     parser.add_argument("--order-id", help="Explicit order ID for the initiation call.")
     parser.add_argument("--output", help="Write evidence JSON to this file path.")
+    parser.add_argument(
+        "--emit-merchant-webhook",
+        action="store_true",
+        help="Allow the canary execution to emit merchant outbound webhook events.",
+    )
     parser.add_argument(
         "--keep-route",
         action="store_true",
@@ -53,6 +70,7 @@ async def _run(args: argparse.Namespace) -> int:
         "started_at": datetime.now(timezone.utc).isoformat(),
         "merchant_id": args.merchant_id,
         "base_url": args.base_url.rstrip("/"),
+        "mode": args.mode,
     }
 
     async with httpx.AsyncClient(base_url=args.base_url.rstrip("/"), timeout=20.0) as client:
@@ -73,13 +91,15 @@ async def _run(args: argparse.Namespace) -> int:
         credentials_resp = await client.get("/merchant/api-credentials")
         credentials_resp.raise_for_status()
         credentials = credentials_resp.json().get("data") or credentials_resp.json()
-        api_key = args.api_key or credentials.get("api_key")
-        if not api_key:
-            raise RuntimeError("Merchant API key is not issued; issue a key before running the canary harness")
         evidence["api_credentials"] = {
             "issued": credentials.get("issued"),
             "api_key_last4": credentials.get("api_key_last4"),
         }
+        api_key = args.api_key or credentials.get("api_key")
+        if args.mode == "live" and not api_key:
+            raise RuntimeError("Merchant API key is not issued; issue a key before running the live canary harness")
+        if args.mode == "test" and not args.internal_key:
+            raise RuntimeError("READINESS_INTERNAL_API_KEY or --internal-key is required for test canary mode")
 
         original_route = route_before
         requested_route = _parse_provider_order(args.provider_order)
@@ -103,12 +123,24 @@ async def _run(args: argparse.Namespace) -> int:
             },
         }
 
+        execute_headers: Dict[str, str] = {}
+        execute_path = "/payment/execute"
+        execute_body: Dict[str, Any] = dict(payment_request)
+
+        if args.mode == "test":
+            execute_path = f"/payment/internal/canary/merchants/{args.merchant_id}/execute"
+            execute_headers["X-Pivota-Internal-Key"] = str(args.internal_key)
+            execute_body["emit_merchant_webhook"] = bool(args.emit_merchant_webhook)
+        else:
+            execute_headers["X-Merchant-API-Key"] = str(api_key)
+
         execute_resp = await client.post(
-            "/payment/execute",
-            headers={"X-Merchant-API-Key": api_key},
-            json=payment_request,
+            execute_path,
+            headers=execute_headers,
+            json=execute_body,
         )
         evidence["payment_execute"] = {
+            "path": execute_path,
             "status_code": execute_resp.status_code,
             "body": execute_resp.json(),
         }

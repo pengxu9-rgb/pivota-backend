@@ -1,5 +1,7 @@
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
+from typing import List, Optional, Tuple
 
 
 @pytest.mark.asyncio
@@ -308,3 +310,123 @@ async def test_execute_payment_fail_closed_when_processors_are_not_live_ready(
     assert exc.value.status_code == 400
     assert "No supported live-ready PSPs" in exc.value.detail
     assert "Adyen client key is missing" in exc.value.detail
+
+
+def _build_request(path: str, headers: Optional[List[Tuple[bytes, bytes]]] = None) -> Request:
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "https",
+        "path": path,
+        "headers": headers or [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("api.pivota.cc", 443),
+    }
+    return Request(scope)
+
+
+@pytest.mark.asyncio
+async def test_execute_internal_payment_canary_uses_internal_key_and_skips_live_gating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    async def fake_load_merchant(merchant_id: str):
+        assert merchant_id == "merch_test_payment"
+        return {
+            "merchant_id": merchant_id,
+            "business_name": "Glow Commerce",
+            "status": "approved",
+        }
+
+    async def fake_candidates(merchant, payment_request):
+        return (
+            [
+                {
+                    "provider": "adyen",
+                    "api_key": "test_adyen_key",
+                    "status": "active",
+                    "environment": "test",
+                    "account_id": "WoopayTest",
+                    "provider_config": {
+                        "merchant_account": "WoopayTest",
+                        "client_key": "test_client_key",
+                    },
+                    "validation_status": "valid",
+                }
+            ],
+            {"route_id": "route_test", "psp_priority": [{"psp": "adyen", "priority": 1}]},
+        )
+
+    async def fake_initiate(**kwargs):
+        assert kwargs["merchant_id"] == "merch_test_payment"
+        assert kwargs["preferred_psps"] == ["adyen"]
+        assert kwargs["enforce_live_readiness"] is False
+        assert kwargs["metadata"]["source"] == "ops_psp_canary_harness"
+        return {
+            "success": True,
+            "payment_id": "adyen_session_test",
+            "status": "requires_action",
+            "transaction_id": "adyen_txn_test",
+            "psp_used": "adyen",
+            "requires_customer_action": True,
+            "payment_action": {
+                "type": "adyen_session",
+                "client_secret": "session_test",
+                "session_data": "session_test",
+                "client_key": "test_client_key",
+                "raw": {},
+            },
+            "error_message": None,
+        }
+
+    emitted = []
+
+    async def fake_emit(*args, **kwargs):
+        emitted.append((args, kwargs))
+
+    monkeypatch.setattr(module.settings, "readiness_internal_api_key", "internal_test_key", raising=False)
+    monkeypatch.setattr(module, "_load_canary_merchant", fake_load_merchant)
+    monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
+    monkeypatch.setattr(module, "initiate_merchant_payment", fake_initiate)
+    monkeypatch.setattr(module, "_emit_payment_webhook_best_effort", fake_emit)
+
+    response = await module.execute_internal_payment_canary(
+        merchant_id="merch_test_payment",
+        payment_request=module.InternalPaymentExecuteRequest(
+            amount=1000,
+            currency="USD",
+            order_id="ord_canary_test",
+        ),
+        request=_build_request("/payment/internal/canary/merchants/merch_test_payment/execute"),
+        x_pivota_internal_key="internal_test_key",
+    )
+
+    assert response.success is True
+    assert response.psp_used == "adyen"
+    assert response.payment_action["type"] == "adyen_session"
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_execute_internal_payment_canary_requires_internal_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    monkeypatch.setattr(module.settings, "readiness_internal_api_key", "internal_test_key", raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await module.execute_internal_payment_canary(
+            merchant_id="merch_test_payment",
+            payment_request=module.InternalPaymentExecuteRequest(
+                amount=1000,
+                currency="USD",
+                order_id="ord_canary_auth",
+            ),
+            request=_build_request("/payment/internal/canary/merchants/merch_test_payment/execute"),
+            x_pivota_internal_key=None,
+        )
+
+    assert exc.value.status_code == 401

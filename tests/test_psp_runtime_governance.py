@@ -36,6 +36,7 @@ def test_canonical_psp_runtime_routes_remain_mounted() -> None:
     mounted_paths = {getattr(route, "path", None) for route in app.routes}
     required_paths = {
         "/payment/execute",
+        "/payment/internal/canary/merchants/{merchant_id}/execute",
         "/merchant/{merchant_id}/psps",
         "/merchant/psp/{psp_id}/test",
         "/merchant/integrations/psp/connect",
