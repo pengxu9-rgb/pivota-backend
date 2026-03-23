@@ -4722,6 +4722,107 @@ async def test_shop_gateway_find_products_multi_allows_external_seed_strict_ingr
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_accepts_prefetched_external_seed_candidates_for_strict_ingredient_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q or "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        return [], "cache_all_platforms", None
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return "https://api.example/r/ext"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="niacinamide serum",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {
+            "source": "shopping_agent",
+            "external_seed_candidates": [
+                {
+                    "id": "ext_prefetch_1",
+                    "product_id": "ext_prefetch_1",
+                    "external_seed_id": "seed_prefetch_1",
+                    "title": "Watch Ya Tone Niacinamide Dark Spot Serum Refill",
+                    "description": "Prefetched external reviewed serum seed.",
+                    "price": 22.0,
+                    "currency": "USD",
+                    "product_type": "Serum",
+                    "category": "Serum",
+                    "source": "external_seed",
+                    "market": "US",
+                    "tool": "*",
+                    "in_stock": True,
+                    "availability": "in_stock",
+                    "ingredient_ids": ["niacinamide"],
+                    "canonical_url": "https://brand.example/products/watch-ya-tone-refill",
+                    "destination_url": "https://brand.example/products/watch-ya-tone-refill",
+                    "variants": [
+                        {
+                            "id": "ext_prefetch_variant_1",
+                            "variant_id": "ext_prefetch_variant_1",
+                            "title": "Default Title",
+                            "price": 22.0,
+                            "currency": "USD",
+                            "in_stock": True,
+                            "availability": "in_stock",
+                            "options": [],
+                        }
+                    ],
+                }
+            ],
+        },
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    source_breakdown = metadata.get("source_breakdown") or {}
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["source"] == "external_seed"
+    assert products[0]["orderable"] is False
+    assert products[0]["ingredient_ids"] == ["niacinamide"]
+    assert metadata.get("ingredient_intents") == ["niacinamide"]
+    assert metadata.get("matched_ingredient_ids") == ["niacinamide"]
+    assert metadata.get("strict_constraint_query") is True
+    assert metadata.get("strict_constraint_reason") == "ingredient"
+    assert source_breakdown.get("internal_count") == 0
+    assert source_breakdown.get("external_seed_count") == 1
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_mixes_internal_and_external_strict_ingredient_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

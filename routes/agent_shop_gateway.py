@@ -4461,6 +4461,147 @@ def _external_seed_to_shop_product(
     return product
 
 
+def _normalize_prefetched_external_seed_candidates(
+    request_metadata: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not isinstance(request_metadata, dict):
+        return []
+    raw_candidates = request_metadata.get("external_seed_candidates")
+    if not isinstance(raw_candidates, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen_product_ids: set[str] = set()
+    for candidate in raw_candidates:
+        candidate_dict = _coerce_product_payload_dict(candidate)
+        if not candidate_dict:
+            continue
+        product_id = str(
+            candidate_dict.get("product_id")
+            or candidate_dict.get("id")
+            or candidate_dict.get("external_product_id")
+            or ""
+        ).strip()
+        if not product_id or product_id in seen_product_ids:
+            continue
+        seen_product_ids.add(product_id)
+        normalized.append(candidate_dict)
+    return normalized
+
+
+async def _build_prefetched_external_seed_wrappers(
+    request_metadata: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    candidates = _normalize_prefetched_external_seed_candidates(request_metadata)
+    if not candidates:
+        return []
+
+    wrappers: List[Dict[str, Any]] = []
+    redirect_cache: Dict[str, Optional[str]] = {}
+    for candidate in candidates:
+        destination_url = str(
+            candidate.get("destination_url")
+            or candidate.get("url")
+            or candidate.get("canonical_url")
+            or ""
+        ).strip()
+        if not destination_url.startswith(("http://", "https://")):
+            continue
+
+        canonical_url = str(candidate.get("canonical_url") or destination_url).strip() or destination_url
+        market = str(candidate.get("market") or "US").strip() or "US"
+        tool = str(candidate.get("tool") or "*").strip() or "*"
+        utm_template = candidate.get("utm_template")
+        redirect_url = str(candidate.get("external_redirect_url") or "").strip() or None
+        if not redirect_url:
+            redirect_cache_key = "||".join([market, tool, destination_url, str(utm_template or "")])
+            if redirect_cache_key in redirect_cache:
+                redirect_url = redirect_cache[redirect_cache_key]
+            else:
+                redirect_url = await _make_external_redirect_url(
+                    market=market,
+                    tool=tool,
+                    destination_url=destination_url,
+                    utm_template=utm_template,
+                    ctx={"seedId": candidate.get("external_seed_id")},
+                    allowed_domains=None,
+                )
+                redirect_cache[redirect_cache_key] = redirect_url
+        if not redirect_url:
+            continue
+
+        seed_data = _ensure_seed_data_obj(candidate.get("seed_data"))
+        seed_data = dict(seed_data) if isinstance(seed_data, dict) else {}
+        category = (
+            candidate.get("category")
+            or candidate.get("product_type")
+            or seed_data.get("category")
+            or seed_data.get("product_type")
+        )
+        ingredient_ids = candidate.get("ingredient_ids") or seed_data.get("reviewed_ingredient_ids")
+        if candidate.get("title") and not seed_data.get("title"):
+            seed_data["title"] = candidate.get("title")
+        if candidate.get("description") and not seed_data.get("description"):
+            seed_data["description"] = candidate.get("description")
+        if category and not seed_data.get("category"):
+            seed_data["category"] = category
+        if candidate.get("brand") and not seed_data.get("brand"):
+            seed_data["brand"] = candidate.get("brand")
+        if candidate.get("merchant_name") and not seed_data.get("merchant_display_name"):
+            seed_data["merchant_display_name"] = candidate.get("merchant_name")
+        if candidate.get("variants") and not seed_data.get("variants"):
+            seed_data["variants"] = candidate.get("variants")
+        if ingredient_ids and not seed_data.get("reviewed_ingredient_ids"):
+            seed_data["reviewed_ingredient_ids"] = ingredient_ids
+        if canonical_url and not seed_data.get("canonical_url"):
+            seed_data["canonical_url"] = canonical_url
+        if destination_url and not seed_data.get("destination_url"):
+            seed_data["destination_url"] = destination_url
+
+        parsed_dest = urlparse(destination_url)
+        row = {
+            "id": candidate.get("external_seed_id"),
+            "external_product_id": candidate.get("external_product_id") or candidate.get("product_id") or candidate.get("id"),
+            "market": market,
+            "tool": tool,
+            "destination_url": destination_url,
+            "canonical_url": canonical_url,
+            "domain": candidate.get("domain") or parsed_dest.netloc,
+            "title": candidate.get("title"),
+            "image_url": candidate.get("image_url"),
+            "price_amount": candidate.get("price"),
+            "price_currency": candidate.get("currency"),
+            "availability": candidate.get("availability") or ("in_stock" if candidate.get("in_stock") is not False else "out_of_stock"),
+            "attached_product_key": candidate.get("attached_product_key"),
+            "attached_variant_id": candidate.get("attached_variant_id"),
+        }
+        if category:
+            row["category"] = category
+
+        product = _external_seed_to_shop_product(
+            row=row,
+            seed_data=seed_data,
+            redirect_url=redirect_url,
+        )
+        filter_product = _build_external_seed_filter_product(
+            row=row,
+            seed_data=seed_data,
+            external_product=product,
+        )
+        try:
+            relevance_score = float(candidate.get("relevance_score") or 0.8)
+        except Exception:
+            relevance_score = 0.8
+        wrappers.append(
+            {
+                "product": product,
+                "filter_product": filter_product,
+                "merchant_name": product.get("merchant_name"),
+                "relevance_score": relevance_score,
+            }
+        )
+    return wrappers
+
+
 def _is_status_active(status: Any) -> bool:
     """
     Normalize and check product status.
@@ -6400,6 +6541,39 @@ async def _handle_find_products_multi(
                 break
     except Exception as e:
         logger.info("multi.external_seeds.failed", extra={"error": str(e)})
+
+    try:
+        prefetched_external_seed_wrappers = await _build_prefetched_external_seed_wrappers(
+            request_metadata
+        )
+        if prefetched_external_seed_wrappers:
+            existing_external_product_ids = {
+                str(
+                    (
+                        wrapper.get("product") or {}
+                    ).get("product_id")
+                    or (
+                        wrapper.get("product") or {}
+                    ).get("id")
+                    or ""
+                ).strip()
+                for wrapper in external_seed_wrappers
+                if isinstance(wrapper, dict)
+            }
+            for wrapper in prefetched_external_seed_wrappers:
+                product_payload = wrapper.get("product") if isinstance(wrapper, dict) else {}
+                product_id = str(
+                    (product_payload or {}).get("product_id")
+                    or (product_payload or {}).get("id")
+                    or ""
+                ).strip()
+                if product_id and product_id in existing_external_product_ids:
+                    continue
+                if product_id:
+                    existing_external_product_ids.add(product_id)
+                external_seed_wrappers.append(wrapper)
+    except Exception as e:
+        logger.info("multi.external_seeds.prefetch.failed", extra={"error": str(e)})
 
     if not has_merchants and not external_seed_wrappers:
         return _maybe_attach_eval_debug(
