@@ -34,6 +34,19 @@ def test_build_runtime_adapter_kwargs_checkout_uses_processing_channel() -> None
     assert kwargs["environment"] == "test"
 
 
+def test_build_provider_connect_record_infers_environment_from_key_when_row_is_unknown() -> None:
+    record = build_provider_connect_record(
+        "checkout",
+        api_key="sk_live_checkout_secret",
+        account_id="pc_live_123",
+        provider_config={"public_key": "pk_live_123"},
+        environment="unknown",
+        validation_status="unknown",
+    )
+
+    assert record["environment"] == "live"
+
+
 def test_evaluate_psp_readiness_marks_live_valid_stripe_as_ready() -> None:
     readiness = evaluate_psp_readiness(
         "stripe",

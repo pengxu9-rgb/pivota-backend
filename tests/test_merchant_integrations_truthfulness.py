@@ -202,3 +202,62 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
     assert payload["provider_summary"]["client_key_present"] is True
     assert payload["live_charge_ready"] is True
     assert payload["readiness_blockers"] == []
+
+
+def test_test_psp_connection_persists_environment_and_validation_truth(monkeypatch) -> None:
+    client, module = _build_client()
+    executed = []
+    requested_urls = []
+
+    async def fake_fetch_one(query, values=None):
+        assert values["psp_id"] == "psp_checkout_1"
+        return {
+            "provider": "checkout",
+            "api_key": "sk_live_checkout_secret",
+            "secret_key": None,
+            "account_id": "pc_live_123",
+            "merchant_id": "merch_test_integrations",
+            "status": "active",
+            "environment": "unknown",
+            "provider_config": {
+                "processing_channel_id": "pc_live_123",
+                "public_key": "pk_live_123",
+            },
+            "validation_status": "unknown",
+            "validation_error": None,
+        }
+
+    async def fake_execute(query, values=None):
+        executed.append({"query": " ".join(query.split()), "values": dict(values or {})})
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None, timeout=None):
+            requested_urls.append(url)
+            return FakeResponse()
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+
+    response = client.post("/merchant/psp/psp_checkout_1/test")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["environment"] == "live"
+    assert body["data"]["validation_status"] == "valid"
+    assert body["data"]["live_charge_ready"] is True
+    assert requested_urls == ["https://api.checkout.com/instruments"]
+    assert executed
+    assert executed[0]["values"]["environment"] == "live"
+    assert executed[0]["values"]["validation_status"] == "valid"

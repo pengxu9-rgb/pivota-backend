@@ -307,4 +307,4 @@ async def test_execute_payment_fail_closed_when_processors_are_not_live_ready(
 
     assert exc.value.status_code == 400
     assert "No supported live-ready PSPs" in exc.value.detail
-    assert "Environment is unknown" in exc.value.detail
+    assert "Adyen client key is missing" in exc.value.detail

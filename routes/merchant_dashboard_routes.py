@@ -30,6 +30,7 @@ from services.merchant_webhook_service import (
     update_webhook_config as update_merchant_webhook_config,
 )
 from services.merchant_psp_config_service import (
+    build_provider_connect_record,
     evaluate_psp_readiness,
     parse_capabilities,
 )
@@ -1066,7 +1067,8 @@ async def test_psp_connection(
     
     # Get PSP details from database
     psp_query = """
-        SELECT provider, api_key, secret_key, account_id, merchant_id, environment, provider_config
+        SELECT provider, api_key, secret_key, account_id, merchant_id, status,
+               environment, provider_config, validation_status, validation_error
         FROM merchant_psps 
         WHERE psp_id = :psp_id
     """
@@ -1080,7 +1082,7 @@ async def test_psp_connection(
     api_key = psp_row["api_key"]
     readiness_before = evaluate_psp_readiness(
         provider,
-        status="active",
+        status=psp_row.get("status"),
         api_key=api_key,
         account_id=psp_row.get("account_id"),
         provider_config=psp_row.get("provider_config"),
@@ -1177,29 +1179,42 @@ async def test_psp_connection(
                 },
             }
 
+        persisted_record = build_provider_connect_record(
+            provider,
+            api_key=api_key,
+            account_id=psp_row.get("account_id"),
+            provider_config=psp_row.get("provider_config"),
+            environment=provider_summary.get("environment"),
+            validation_status="valid" if success else "invalid",
+            validation_error=None,
+        )
         await database.execute(
             """
             UPDATE merchant_psps
-            SET validation_status = :validation_status,
+            SET environment = :environment,
+                provider_config = CAST(:provider_config AS JSONB),
+                validation_status = :validation_status,
                 validation_error = NULL,
                 last_validated_at = NOW()
             WHERE psp_id = :psp_id
             """,
             {
                 "psp_id": psp_id,
-                "validation_status": "valid" if success else "invalid",
+                "environment": persisted_record["environment"],
+                "provider_config": json.dumps(persisted_record["provider_config"]),
+                "validation_status": persisted_record["validation_status"],
             },
         )
 
         readiness = evaluate_psp_readiness(
             provider,
-            status="active",
+            status=psp_row.get("status"),
             api_key=api_key,
             account_id=psp_row.get("account_id"),
-            provider_config=psp_row.get("provider_config"),
-            environment=psp_row.get("environment"),
-            validation_status="valid" if success else "invalid",
-            validation_error=None,
+            provider_config=persisted_record["provider_config"],
+            environment=persisted_record["environment"],
+            validation_status=persisted_record["validation_status"],
+            validation_error=persisted_record["validation_error"],
         )
 
         return {
@@ -1224,25 +1239,42 @@ async def test_psp_connection(
     except Exception as e:
         print(f"❌ PSP test error: {e}")
         error_text = str(e)[:500]
+        persisted_record = build_provider_connect_record(
+            provider,
+            api_key=api_key,
+            account_id=psp_row.get("account_id"),
+            provider_config=psp_row.get("provider_config"),
+            environment=provider_summary.get("environment"),
+            validation_status="invalid",
+            validation_error=error_text,
+        )
         await database.execute(
             """
             UPDATE merchant_psps
-            SET validation_status = 'invalid',
+            SET environment = :environment,
+                provider_config = CAST(:provider_config AS JSONB),
+                validation_status = :validation_status,
                 validation_error = :validation_error,
                 last_validated_at = NOW()
             WHERE psp_id = :psp_id
             """,
-            {"psp_id": psp_id, "validation_error": error_text},
+            {
+                "psp_id": psp_id,
+                "environment": persisted_record["environment"],
+                "provider_config": json.dumps(persisted_record["provider_config"]),
+                "validation_status": persisted_record["validation_status"],
+                "validation_error": error_text,
+            },
         )
         readiness = evaluate_psp_readiness(
             provider,
-            status="active",
+            status=psp_row.get("status"),
             api_key=api_key,
             account_id=psp_row.get("account_id"),
-            provider_config=psp_row.get("provider_config"),
-            environment=psp_row.get("environment"),
-            validation_status="invalid",
-            validation_error=error_text,
+            provider_config=persisted_record["provider_config"],
+            environment=persisted_record["environment"],
+            validation_status=persisted_record["validation_status"],
+            validation_error=persisted_record["validation_error"],
         )
         return {
             "status": "error",

@@ -31,7 +31,7 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def normalize_psp_environment(provider: str, api_key: Optional[str], environment: Optional[str]) -> str:
     env = str(environment or "").strip().lower()
-    if env in {"live", "test", "unknown"}:
+    if env in {"live", "test"}:
         return env
 
     key = str(api_key or "").strip().lower()

@@ -35,6 +35,11 @@ import os
 from pathlib import Path
 
 
+INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
+    os.getenv("ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES", "false").lower() == "true"
+)
+
+
 def _guard_single_order_routes_py() -> None:
     """
     Governance guardrail: avoid duplicate `order_routes.py` files.
@@ -395,6 +400,35 @@ def _is_route_mounted(path: str, method: str) -> bool:
     return False
 
 
+def _guard_legacy_psp_maintenance_routes() -> None:
+    if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
+        return
+
+    forbidden_paths = {
+        "/debug/insert-adyen",
+        "/debug/check-psps",
+        "/debug/psp/validate/{merchant_id}",
+        "/admin/recover/psps",
+        "/admin/fix/order-psp-associations/{merchant_id}",
+        "/admin/fix-orders-psp-id",
+        "/admin/debug/psp-overview-diagnosis",
+        "/admin/debug/psp-metrics/{merchant_id}",
+        "/admin/simulate/payments/{agent_id}",
+        "/admin/simulate/payments/all",
+    }
+    mounted = sorted(
+        route.path
+        for route in app.routes
+        if getattr(route, "path", None) in forbidden_paths
+    )
+    if mounted:
+        raise RuntimeError(
+            "Legacy PSP maintenance routes are mounted without "
+            "ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES=true:\n- "
+            + "\n- ".join(mounted)
+        )
+
+
 def _settings_contract_payload() -> dict:
     rate_limit_rpm = getattr(settings, "rate_limit_rpm", None)
     return {
@@ -615,8 +649,9 @@ app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
-app.include_router(debug_psp_router)  # Debug PSP insert
-app.include_router(debug_psp_validation_router)  # Debug PSP validation
+if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
+    app.include_router(debug_psp_router)  # Debug PSP insert
+    app.include_router(debug_psp_validation_router)  # Debug PSP validation
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(admin_api_router)  # Admin API endpoints
@@ -643,10 +678,12 @@ else:
     logger.info("⏭️  Readiness audit / UCP thin-slice router disabled")
 app.include_router(products_cache_maintenance_router)  # Products cache maintenance
 app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
-app.include_router(admin_recover_psps_router)  # Admin PSP recovery
+if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
+    app.include_router(admin_recover_psps_router)  # Admin PSP recovery
 app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
-app.include_router(admin_fix_order_psp_router)
-app.include_router(admin_debug_psp_router)  # Admin debug PSP data
+if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
+    app.include_router(admin_fix_order_psp_router)
+    app.include_router(admin_debug_psp_router)  # Admin debug PSP data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
 # Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
 app.include_router(employee_agent_mgmt_router)
@@ -745,8 +782,9 @@ app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing
 app.include_router(psp_overview_router)  # PSP overview and metrics
 app.include_router(admin_fix_router)  # Admin fix utilities
-app.include_router(admin_fix_psp_id_router)  # Admin fix PSP ID
-app.include_router(admin_debug_psp_metrics_router)  # Admin debug PSP metrics
+if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
+    app.include_router(admin_fix_psp_id_router)  # Admin fix PSP ID
+    app.include_router(admin_debug_psp_metrics_router)  # Admin debug PSP metrics
 app.include_router(merchant_store_connections_router)  # Merchant store connections (Shopify, Wix)
 app.include_router(ops_shopify_integration_router)  # Internal ops: Shopify integration verify/report
 app.include_router(ops_pcs_reducer_router)  # Internal ops: PCS reducer replay
@@ -822,7 +860,8 @@ if DEBUG_MODE:
     app.include_router(debug_usage_logs_router)  # Debug usage logs
     app.include_router(debug_query_analytics_router)  # Debug query analytics
     app.include_router(debug_orders_agent_router)  # Debug orders by agent
-app.include_router(simulate_payments_router)  # Simulate payments for testing
+if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
+    app.include_router(simulate_payments_router)  # Simulate payments for testing
 app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
 app.include_router(prometheus_metrics_router)  # /metrics (Prometheus scrape)
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
@@ -851,6 +890,8 @@ if MCP_AVAILABLE:
 if OPERATIONS_AVAILABLE:
     app.include_router(operations_router)
     logger.info("✅ Operations router included")
+
+_guard_legacy_psp_maintenance_routes()
 
 @app.get("/version")
 async def get_version():
