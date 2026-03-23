@@ -81,8 +81,17 @@ class PSPAdapter(ABC):
 class StripeAdapter(PSPAdapter):
     """Stripe PSP 适配器"""
     
-    def __init__(self, api_key: str):
+    def __init__(
+        self,
+        api_key: str,
+        account_id: Optional[str] = None,
+        mode: str = "payment_intent",
+        environment: Optional[str] = None,
+    ):
         self.api_key = api_key
+        self.account_id = account_id
+        self.mode = mode if mode in {"payment_intent", "checkout_session"} else "payment_intent"
+        self.environment = (environment or "").strip().lower() or None
         stripe.api_key = api_key
     
     async def create_payment_intent(
@@ -100,9 +109,13 @@ class StripeAdapter(PSPAdapter):
         """
         try:
             psp_mode = (metadata.get("psp_mode") or "").lower()
+            stripe_mode = "checkout_session" if psp_mode == "stripe_checkout" else self.mode
+            request_kwargs: Dict[str, Any] = {}
+            if self.account_id:
+                request_kwargs["stripe_account"] = self.account_id
 
             # Agent / Checkout 场景：返回可跳转的支付链接
-            if psp_mode == "stripe_checkout":
+            if stripe_mode == "checkout_session":
                 session = stripe.checkout.Session.create(
                     mode="payment",
                     line_items=[
@@ -123,6 +136,7 @@ class StripeAdapter(PSPAdapter):
                     success_url="https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
                     cancel_url="https://merchant.pivota.cc/payment/cancel",
                     metadata=metadata,
+                    **request_kwargs,
                 )
 
                 return (
@@ -148,7 +162,8 @@ class StripeAdapter(PSPAdapter):
                 automatic_payment_methods={
                     "enabled": True,
                     "allow_redirects": "never"  # 避免测试环境强依赖 return_url
-                }
+                },
+                **request_kwargs,
             )
 
             return (
@@ -232,7 +247,13 @@ class StripeAdapter(PSPAdapter):
 class AdyenAdapter(PSPAdapter):
     """Adyen PSP 适配器"""
     
-    def __init__(self, api_key: str, merchant_account: str = "PivotaTestMerchant"):
+    def __init__(
+        self,
+        api_key: str,
+        merchant_account: str = "PivotaTestMerchant",
+        environment: Optional[str] = None,
+        client_key: Optional[str] = None,
+    ):
         # Clean API key to avoid whitespace / newline pollution from DB or env
         key_clean = (api_key or "").replace("\n", "").replace("\r", "").replace(" ", "").strip()
         # If the key length looks wildly off, try to fall back to settings (env)
@@ -246,7 +267,13 @@ class AdyenAdapter(PSPAdapter):
         if acct.startswith("acct_"):
             acct = getattr(settings, "adyen_merchant_account", "PivotaTestMerchant")
         self.merchant_account = acct or "PivotaTestMerchant"
-        self.base_url = "https://checkout-test.adyen.com/v70"  # Test environment
+        self.environment = (environment or "").strip().lower() or "test"
+        self.client_key = (client_key or "").strip() or None
+        self.base_url = (
+            "https://checkout-live.adyen.com/v70"
+            if self.environment == "live"
+            else "https://checkout-test.adyen.com/v70"
+        )
     
     async def create_payment_intent(
         self,
@@ -311,7 +338,11 @@ class AdyenAdapter(PSPAdapter):
                             currency=currency,
                             status="requires_action",
                             psp_type="adyen",
-                            raw_response=data
+                            raw_response={
+                                **data,
+                                "clientKey": self.client_key,
+                                "environment": self.environment,
+                            }
                         ),
                         None
                     )
@@ -439,14 +470,28 @@ def get_psp_adapter(psp_type: str, api_key: str, **kwargs) -> PSPAdapter:
     psp_type = psp_type.lower()
     
     if psp_type == "stripe":
-        return StripeAdapter(api_key)
+        return StripeAdapter(
+            api_key,
+            account_id=kwargs.get("account_id"),
+            mode=kwargs.get("mode", "payment_intent"),
+            environment=kwargs.get("environment"),
+        )
     elif psp_type == "adyen":
         merchant_account = kwargs.get("merchant_account", "PivotaTestMerchant")
-        return AdyenAdapter(api_key, merchant_account)
+        return AdyenAdapter(
+            api_key,
+            merchant_account,
+            environment=kwargs.get("environment"),
+            client_key=kwargs.get("client_key"),
+        )
     elif psp_type == "checkout":
         from adapters.checkout_adapter import CheckoutAdapter
-        public_key = kwargs.get("public_key")
-        return CheckoutAdapter(api_key, public_key)
+        return CheckoutAdapter(
+            api_key,
+            public_key=kwargs.get("public_key"),
+            processing_channel_id=kwargs.get("processing_channel_id"),
+            environment=kwargs.get("environment"),
+        )
     elif psp_type == "paypal":
         from adapters.paypal_adapter import PayPalAdapter
         client_secret = kwargs.get("client_secret", api_key)  # PayPal uses client_id as api_key

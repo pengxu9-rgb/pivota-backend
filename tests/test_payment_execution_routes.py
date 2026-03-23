@@ -37,7 +37,36 @@ async def test_resolve_payment_candidates_respects_route_subset(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_execute_payment_falls_back_to_next_processor(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_resolve_payment_candidates_does_not_fallback_to_legacy_payment_router_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    async def fake_load_active_merchant_psps(merchant_id: str):
+        assert merchant_id == "merch_test_payment"
+        return []
+
+    class FakeRoutingService:
+        def __init__(self, database):
+            self.database = database
+
+        async def select_psp(self, agent_id, merchant_id=None, amount=0, currency="USD"):
+            return (None, {})
+
+    monkeypatch.setattr(module, "_load_active_merchant_psps", fake_load_active_merchant_psps)
+    monkeypatch.setattr(module, "PaymentRoutingService", FakeRoutingService)
+
+    candidates, route_config = await module._resolve_payment_candidates(
+        {"merchant_id": "merch_test_payment"},
+        module.PaymentExecuteRequest(amount=1000, currency="USD", order_id="ord_no_fallback"),
+    )
+
+    assert candidates == []
+    assert route_config == {}
+
+
+@pytest.mark.asyncio
+async def test_execute_payment_returns_unified_action(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.payment_execution_routes as module
 
     async def fake_verify(api_key: str):
@@ -52,40 +81,41 @@ async def test_execute_payment_falls_back_to_next_processor(monkeypatch: pytest.
     async def fake_candidates(merchant, payment_request):
         return (
             [
-                {"provider": "stripe", "api_key": "sk_test_x"},
                 {"provider": "adyen", "api_key": "adyen_test_x", "account_id": "AdyenMerchant"},
+                {"provider": "stripe", "api_key": "sk_test_x"},
             ],
-            {"psp_priority": [{"psp": "stripe", "priority": 1}, {"psp": "adyen", "priority": 2}]},
+            {"route_id": "route_1", "psp_priority": [{"psp": "adyen", "priority": 1}, {"psp": "stripe", "priority": 2}]},
         )
 
-    async def fake_stripe(stripe_key, merchant, payment_data):
-        return {
-            "success": False,
-            "payment_id": "failed_stripe",
-            "status": "failed",
-            "transaction_id": None,
-            "error_message": "Stripe declined",
-        }
-
-    async def fake_adyen(adyen_key, merchant_account, payment_data):
-        assert merchant_account == "AdyenMerchant"
+    async def fake_initiate(**kwargs):
+        assert kwargs["merchant_id"] == "merch_test_payment"
+        assert kwargs["preferred_psps"] == ["adyen", "stripe"]
+        assert kwargs["candidates"][0]["provider"] == "adyen"
         return {
             "success": True,
-            "payment_id": "adyen_payment_1",
-            "status": "completed",
-            "transaction_id": "adyen_payment_1",
+            "payment_id": "adyen_session_1",
+            "status": "requires_action",
+            "transaction_id": "adyen_txn_1",
+            "psp_used": "adyen",
+            "requires_customer_action": True,
+            "payment_action": {
+                "type": "adyen_session",
+                "client_secret": "session_data_1",
+                "session_data": "session_data_1",
+                "client_key": "pub_123",
+                "raw": {},
+            },
             "error_message": None,
         }
 
     emitted = []
 
     async def fake_emit(merchant_id: str, *, event_type: str, payment_request, result, psp_used: str):
-        emitted.append((merchant_id, event_type, psp_used))
+        emitted.append((merchant_id, event_type, psp_used, result["payment_id"]))
 
     monkeypatch.setattr(module, "verify_merchant_api_key", fake_verify)
     monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
-    monkeypatch.setattr(module, "execute_stripe_payment", fake_stripe)
-    monkeypatch.setattr(module, "execute_adyen_payment", fake_adyen)
+    monkeypatch.setattr(module, "initiate_merchant_payment", fake_initiate)
     monkeypatch.setattr(module, "_emit_payment_webhook_best_effort", fake_emit)
 
     response = await module.execute_payment(
@@ -100,8 +130,9 @@ async def test_execute_payment_falls_back_to_next_processor(monkeypatch: pytest.
 
     assert response.success is True
     assert response.psp_used == "adyen"
-    assert response.payment_id == "adyen_payment_1"
-    assert emitted == [("merch_test_payment", "payment.completed", "adyen")]
+    assert response.requires_customer_action is True
+    assert response.payment_action["type"] == "adyen_session"
+    assert emitted == [("merch_test_payment", "payment.completed", "adyen", "adyen_session_1")]
 
 
 @pytest.mark.asyncio
@@ -159,13 +190,17 @@ async def test_execute_payment_failure_reports_last_attempted_supported_processo
             {"psp_priority": [{"psp": "stripe", "priority": 1}, {"psp": "checkout", "priority": 2}]},
         )
 
-    async def fake_stripe(stripe_key, merchant, payment_data):
+    async def fake_initiate(**kwargs):
+        assert kwargs["preferred_psps"] == ["stripe", "checkout"]
         return {
             "success": False,
-            "payment_id": "failed_stripe",
+            "payment_id": "",
             "status": "failed",
             "transaction_id": None,
-            "error_message": "Stripe declined",
+            "psp_used": "checkout",
+            "requires_customer_action": False,
+            "payment_action": None,
+            "error_message": "Checkout API error",
         }
 
     emitted = []
@@ -175,7 +210,7 @@ async def test_execute_payment_failure_reports_last_attempted_supported_processo
 
     monkeypatch.setattr(module, "verify_merchant_api_key", fake_verify)
     monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
-    monkeypatch.setattr(module, "execute_stripe_payment", fake_stripe)
+    monkeypatch.setattr(module, "initiate_merchant_payment", fake_initiate)
     monkeypatch.setattr(module, "_emit_payment_webhook_best_effort", fake_emit)
 
     response = await module.execute_payment(
@@ -189,6 +224,7 @@ async def test_execute_payment_failure_reports_last_attempted_supported_processo
     )
 
     assert response.success is False
-    assert response.psp_used == "stripe"
-    assert response.error_message == "Stripe declined"
-    assert emitted == [("merch_test_payment", "payment.failed", "stripe")]
+    assert response.psp_used == "checkout"
+    assert response.error_message == "Checkout API error"
+    assert response.payment_id.startswith("failed_")
+    assert emitted == [("merch_test_payment", "payment.failed", "checkout")]

@@ -161,3 +161,42 @@ def test_webhook_routes_use_real_service_contract(monkeypatch) -> None:
     assert test_response.json()["data"]["delivery_id"] == "mwh_123"
     assert deliveries_response.status_code == 200
     assert deliveries_response.json()["data"]["deliveries"][0]["event_type"] == "payment.completed"
+
+
+def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch) -> None:
+    client, module = _build_client()
+
+    async def fake_fetch_all(query, values=None):
+        query_norm = " ".join(query.split())
+        if "FROM merchant_psps" in query_norm:
+            return [
+                {
+                    "psp_id": "psp_adyen_1",
+                    "provider": "adyen",
+                    "name": "Adyen Account",
+                    "account_id": "WoopayECOM",
+                    "status": "active",
+                    "connected_at": None,
+                    "capabilities": "card,bank_transfer",
+                    "api_key": "test_adyen_key",
+                    "environment": "live",
+                    "provider_config": {"merchant_account": "WoopayECOM", "client_key": "pub_123"},
+                    "validation_status": "valid",
+                    "validation_error": None,
+                    "last_validated_at": None,
+                }
+            ]
+        if "FROM orders" in query_norm:
+            return []
+        raise AssertionError(f"Unexpected query: {query_norm}")
+
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+
+    response = client.get("/merchant/merch_test_integrations/psps")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]["psps"][0]
+    assert payload["environment"] == "live"
+    assert payload["validation_status"] == "valid"
+    assert payload["provider_summary"]["merchant_account"] == "WoopayECOM"
+    assert payload["provider_summary"]["client_key_present"] is True

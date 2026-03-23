@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime
 
+from db.database import database
 from db.orders import get_order, update_order_status
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
@@ -22,6 +23,8 @@ from services.shopify_transactions_service import (
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.merchant_webhook_service import emit_merchant_webhook_event
+from services.merchant_psp_config_service import build_runtime_adapter_kwargs
+from services.psp_payment_finalizer import finalize_refund_success
 
 
 router = APIRouter(prefix="/orders", tags=["refunds"])
@@ -34,6 +37,89 @@ class RefundRequest(BaseModel):
     reason: Optional[str] = None
     restore_inventory: bool = True  # Whether to restore Shopify inventory
     idempotency_key: Optional[str] = None  # Best-effort duplicate protection
+
+
+async def _resolve_refund_adapter(order: Dict[str, Any], merchant: Dict[str, Any]) -> tuple[str, str, Dict[str, Any]]:
+    order_psp_type = str(order.get("psp_used") or "").strip().lower() or None
+    if not order_psp_type:
+        psp_id = str(order.get("psp_id") or "").strip().lower()
+        if psp_id.startswith("psp_stripe"):
+            order_psp_type = "stripe"
+        elif psp_id.startswith("psp_adyen"):
+            order_psp_type = "adyen"
+        elif psp_id.startswith("psp_checkout"):
+            order_psp_type = "checkout"
+
+    if not order_psp_type:
+        payment_intent_id = str(order.get("payment_intent_id") or "")
+        if payment_intent_id.startswith("pi_"):
+            order_psp_type = "stripe"
+        elif payment_intent_id.startswith("chk_") or payment_intent_id.startswith("pay_"):
+            order_psp_type = "checkout"
+
+    canonical_row = None
+    merchant_id = str(order.get("merchant_id") or "")
+    order_psp_id = str(order.get("psp_id") or "").strip()
+
+    if order_psp_id:
+        canonical_row = await database.fetch_one(
+            """
+            SELECT *,
+                   COALESCE(secret_key, api_key) AS runtime_secret_key
+            FROM merchant_psps
+            WHERE merchant_id = :merchant_id
+              AND psp_id = :psp_id
+              AND status = 'active'
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id, "psp_id": order_psp_id},
+        )
+
+    if canonical_row is None and order_psp_type:
+        canonical_row = await database.fetch_one(
+            """
+            SELECT *,
+                   COALESCE(secret_key, api_key) AS runtime_secret_key
+            FROM merchant_psps
+            WHERE merchant_id = :merchant_id
+              AND LOWER(provider) = :provider
+              AND status = 'active'
+            ORDER BY connected_at DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id, "provider": order_psp_type},
+        )
+
+    if canonical_row is not None:
+        canonical = dict(canonical_row)
+        psp_type = str(canonical.get("provider") or order_psp_type or "").strip().lower()
+        psp_key = str(canonical.get("runtime_secret_key") or "").strip()
+        if psp_type and psp_key:
+            return (
+                psp_type,
+                psp_key,
+                build_runtime_adapter_kwargs(
+                    psp_type,
+                    account_id=canonical.get("account_id"),
+                    provider_config=canonical.get("provider_config"),
+                    environment=canonical.get("environment"),
+                    secret_key=canonical.get("runtime_secret_key"),
+                ),
+            )
+
+    merchant_psp_type = str(merchant.get("psp_type") or "").strip().lower() or None
+    psp_type = order_psp_type or merchant_psp_type or "stripe"
+    psp_key = None
+    if merchant_psp_type and merchant_psp_type == psp_type:
+        psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
+    if not psp_key:
+        if psp_type == "stripe":
+            psp_key = settings.stripe_secret_key
+        elif psp_type == "adyen":
+            psp_key = settings.adyen_api_key
+        else:
+            psp_key = settings.checkout_secret_key
+    return psp_type, psp_key, {}
 
 
 @router.post("/{order_id}/refund")
@@ -186,38 +272,12 @@ async def process_refund(
         except Exception:
             pass
 
-        # Get PSP adapter (refund must match the PSP that actually processed this order)
-        order_psp_type = str(order.get("psp_used") or "").strip().lower() or None
-        if not order_psp_type:
-            psp_id = str(order.get("psp_id") or "").strip().lower()
-            if psp_id.startswith("psp_stripe"):
-                order_psp_type = "stripe"
-            elif psp_id.startswith("psp_adyen"):
-                order_psp_type = "adyen"
-
-        if not order_psp_type:
-            payment_intent_id = str(order.get("payment_intent_id") or "")
-            if payment_intent_id.startswith("pi_"):
-                order_psp_type = "stripe"
-
-        merchant_psp_type = str(merchant.get("psp_type") or "").strip().lower() or None
-        psp_type = order_psp_type or merchant_psp_type or "stripe"
-
-        # Only use merchant-stored PSP keys if they correspond to the same PSP type.
-        psp_key = None
-        if merchant_psp_type and merchant_psp_type == psp_type:
-            psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-
-        if not psp_key:
-            if psp_type == "stripe":
-                psp_key = settings.stripe_secret_key
-            else:
-                psp_key = settings.adyen_api_key
+        psp_type, psp_key, adapter_kwargs = await _resolve_refund_adapter(order, merchant)
         
         if not psp_key:
             raise ValueError(f"No PSP key found for merchant {merchant['merchant_id']}")
         
-        psp_adapter = get_psp_adapter(psp_type, psp_key)
+        psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
         
         # Process refund through PSP
         # For Stripe: passing amount=None refunds the full PaymentIntent amount, which is only safe
@@ -241,54 +301,29 @@ async def process_refund(
         if not success:
             raise HTTPException(status_code=400, detail=f"Refund failed: {error}")
         
-        # Update order status + totals (cumulative)
         next_total_refunded = total_refunded + refund_amount
         new_status = "refunded" if next_total_refunded >= order_total else "partially_refunded"
         is_partial = new_status == "partially_refunded"
         
         try:
-            await update_order_status(
-                order_id=order_id,
-                status=new_status,
-                payment_status=new_status,
-                total_refunded=next_total_refunded,
-                metadata={
-                    **(order.get("metadata") or {}),
-                    "refund_id": refund_id,
-                    "refund_amount": str(refund_amount),
+            await finalize_refund_success(
+                order,
+                psp=psp_type,
+                refund_reference=str(refund_id),
+                refund_amount=str(refund_amount),
+                currency=str(order.get("currency") or "USD"),
+                source_event="refund_processed",
+                metadata_extra={
+                    "refund_id": str(refund_id),
                     "refund_reason": refund_request.reason,
                     "refunded_by": current_user.get("user_id", "admin"),
-                    "refunded_at": datetime.now().isoformat(),
-                    "total_refunded": str(next_total_refunded),
+                    "source_event": "refund_processed",
                 },
+                update_order_status_fn=update_order_status,
+                log_order_event_fn=log_order_event,
             )
         except Exception:
-            # Best-effort schema self-heal for legacy DBs missing total_refunded
-            try:
-                from sqlalchemy import text
-                from db.database import database as _db
-
-                await _db.execute(
-                    text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
-                )
-                await update_order_status(
-                    order_id=order_id,
-                    status=new_status,
-                    payment_status=new_status,
-                    total_refunded=next_total_refunded,
-                    metadata={
-                        **(order.get("metadata") or {}),
-                        "refund_id": refund_id,
-                        "refund_amount": str(refund_amount),
-                        "refund_reason": refund_request.reason,
-                        "refunded_by": current_user.get("user_id", "admin"),
-                        "refunded_at": datetime.now().isoformat(),
-                        "total_refunded": str(next_total_refunded),
-                    },
-                )
-            except Exception:
-                # Do not fail the refund response if persistence fails.
-                pass
+            pass
 
         # PCS v0.2-b (best-effort): internal refund processed fact for reducer replay (no PII).
         try:
@@ -311,19 +346,6 @@ async def process_refund(
         except Exception:
             pass
         
-        # Log refund event
-        await log_order_event(
-            event_type="refund_processed",
-            order_id=order_id,
-            merchant_id=order["merchant_id"],
-            metadata={
-                "refund_id": refund_id,
-                "refund_amount": str(refund_amount),
-                "is_partial": is_partial,
-                "reason": refund_request.reason
-            }
-        )
-
         # MVP ledger event (best-effort): refund completed.
         try:
             from mvp.ledger_events import emit_ledger_event_best_effort

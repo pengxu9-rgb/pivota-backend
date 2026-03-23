@@ -16,12 +16,25 @@ PROCESSING_CHANNEL = "pc_default_channel"
 class CheckoutAdapter(PSPAdapter):
     """Checkout.com payment adapter"""
     
-    def __init__(self, api_key: str, public_key: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: str,
+        public_key: Optional[str] = None,
+        processing_channel_id: Optional[str] = None,
+        environment: Optional[str] = None,
+    ):
         self.api_key = api_key  # Secret key
         self.public_key = public_key
-        self.base_url = "https://api.sandbox.checkout.com"  # Use sandbox for testing
-        if api_key and "sk_" in api_key and "prod" in api_key.lower():
-            self.base_url = "https://api.checkout.com"  # Production
+        self.processing_channel_id = processing_channel_id or PROCESSING_CHANNEL
+        env = (environment or "").strip().lower()
+        if env not in {"live", "test"}:
+            env = "live" if api_key and "live" in api_key.lower() else "test"
+        self.environment = env
+        self.base_url = (
+            "https://api.checkout.com"
+            if self.environment == "live"
+            else "https://api.sandbox.checkout.com"
+        )
     
     async def create_payment_intent(
         self,
@@ -52,7 +65,7 @@ class CheckoutAdapter(PSPAdapter):
             payload = {
                 "amount": int(amount * 100),
                 "currency": currency.upper(),
-                "processing_channel_id": self.public_key if self.public_key else PROCESSING_CHANNEL,
+                "processing_channel_id": self.processing_channel_id,
                 "reference": metadata.get("order_id", "ORDER"),
                 "customer": {"email": metadata.get("customer_email", "customer@example.com")},
                 "billing": {
@@ -92,7 +105,12 @@ class CheckoutAdapter(PSPAdapter):
                         currency=currency,
                         status="pending",
                         psp_type="checkout",
-                        raw_response=data,
+                        raw_response={
+                            **data,
+                            "public_key": self.public_key,
+                            "processing_channel_id": self.processing_channel_id,
+                            "environment": self.environment,
+                        },
                     ),
                     None,
                 )
@@ -256,4 +274,3 @@ class CheckoutAdapter(PSPAdapter):
             return False, "Connection timeout"
         except Exception as e:
             return False, f"Connection error: {str(e)}"
-

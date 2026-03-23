@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from orchestrator.payment_orchestrator import payment_orchestrator, OrchestrationResult
 from dashboard.core import dashboard_core, User
+from services.psp_payment_finalizer import finalize_payment_success
 from utils.auth import get_current_user
 
 logger = logging.getLogger("payment_routes")
@@ -321,6 +322,18 @@ async def checkout_webhook(
                 raise HTTPException(status_code=401, detail="Invalid signature")
         elif webhook_secret:
             logger.warning(f"Checkout webhook signature not provided for event {event_id}")
+            await WebhookService.record_webhook_event(
+                event_id=event_id,
+                event_type=event_type,
+                psp_type="checkout",
+                order_id=order_id,
+                payload=payload,
+                headers=dict(request.headers),
+                signature_verified=False,
+                signature_header=None,
+                status="failed"
+            )
+            raise HTTPException(status_code=401, detail="Missing signature")
         
         # Accept success-like events
         normalized_type = (event_type or "").lower()
@@ -415,35 +428,24 @@ async def checkout_webhook(
                 "message": "Order already marked as paid",
             }
         
-        # Update payment info if transaction id present
         transaction_id = data.get("id") or data.get("payment_id") or payload.get("id")
-        client_secret = order.get("client_secret")
-        
-        await update_payment_info(
-            order_id=order_id,
-            payment_intent_id=transaction_id or order.get("payment_intent_id"),
-            client_secret=client_secret,
-            payment_status="paid",
-            psp_used="checkout",
-        )
-        
-        # Mark as paid
-        await mark_order_paid(order_id)
-        
-        # Log event
-        await log_order_event(
-            event_type="payment_succeeded",
-            order_id=order_id,
-            merchant_id=order["merchant_id"],
-            metadata={
-                "payment_intent_id": transaction_id or order.get("payment_intent_id"),
-                "amount": float(order["total"]),
-                "currency": order["currency"],
+        await finalize_payment_success(
+            order,
+            psp="checkout",
+            payment_reference=transaction_id or order.get("payment_intent_id"),
+            transaction_id=transaction_id or order.get("payment_intent_id"),
+            amount_minor=None,
+            currency=str(order.get("currency") or "USD"),
+            source_event="payment_succeeded",
+            metadata_extra={
                 "psp_type": "checkout",
                 "webhook_type": event_type,
                 "webhook_event_id": event_id,
                 "signature_verified": signature_verified,
             },
+            update_payment_info_fn=update_payment_info,
+            mark_order_paid_fn=mark_order_paid,
+            log_order_event_fn=log_order_event,
         )
         
         # Background: create Shopify order if applicable

@@ -5,7 +5,8 @@ Webhook 处理路由
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
-from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response
+from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 import stripe
@@ -21,8 +22,15 @@ from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from config.settings import settings
 from utils.logger import logger
+from services.dispute_records_service import stripe_dispute_pack_status
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
+from services.psp_payment_finalizer import (
+    finalize_payment_failure,
+    finalize_payment_success,
+    finalize_refund_failure,
+    finalize_refund_success,
+)
 from observability.reviews_metrics import record_shopify_webhook
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
@@ -33,6 +41,7 @@ from routes.reviews_invitation_issuer import (
 )
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+adyen_webhook_security = HTTPBasic()
 
 def _reviews_invitation_auto_send_on_shopify_fulfillment_enabled() -> bool:
     raw = (os.getenv("REVIEWS_INVITATION_AUTO_SEND_ON_SHOPIFY_FULFILLMENT") or "").strip().lower()
@@ -75,6 +84,198 @@ def _stripe_minor_unit_factor(currency: Optional[str]) -> Decimal:
     return Decimal("100")
 
 
+def _stripe_next_refund_status(order_total: Decimal, total_refunded: Decimal) -> str:
+    if total_refunded <= Decimal("0"):
+        return "paid"
+    if order_total > Decimal("0") and total_refunded >= order_total:
+        return "refunded"
+    return "partially_refunded"
+
+
+def _stripe_order_status_lower(order: Optional[Dict[str, Any]]) -> str:
+    return str((order or {}).get("status") or "").strip().lower()
+
+
+def _stripe_payment_status_lower(order: Optional[Dict[str, Any]]) -> str:
+    return str((order or {}).get("payment_status") or "").strip().lower()
+
+
+def _can_apply_stripe_payment_success(order: Optional[Dict[str, Any]]) -> bool:
+    if not order:
+        return False
+
+    payment_status = _stripe_payment_status_lower(order)
+    status = _stripe_order_status_lower(order)
+    if payment_status in {
+        "paid",
+        "completed",
+        "succeeded",
+        "success",
+        "settled",
+        "partially_refunded",
+        "refunded",
+        "cancelled",
+    }:
+        return False
+    if status in {"paid", "completed", "fulfilled", "partially_refunded", "refunded", "cancelled"}:
+        return False
+    try:
+        if Decimal(str(order.get("total_refunded") or "0")) > Decimal("0"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _can_apply_stripe_payment_failure(order: Optional[Dict[str, Any]]) -> bool:
+    if not order:
+        return False
+
+    payment_status = _stripe_payment_status_lower(order)
+    status = _stripe_order_status_lower(order)
+    if payment_status in {
+        "partially_refunded",
+        "refunded",
+        "cancelled",
+    }:
+        return False
+    if status in {"partially_refunded", "refunded", "cancelled"}:
+        return False
+    try:
+        if Decimal(str(order.get("total_refunded") or "0")) > Decimal("0"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+async def _resolve_stripe_order_for_refund(
+    *,
+    payment_intent_id: Optional[str],
+    refund_meta: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
+    from db.database import database
+
+    if payment_intent_id:
+        result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
+        if result:
+            return result
+
+    if isinstance(refund_meta, dict):
+        order_hint = str(refund_meta.get("order_id") or "").strip()
+        if order_hint:
+            return await get_order(order_hint)
+    return None
+
+
+async def _finalize_stripe_payment_success(
+    order: Dict[str, Any],
+    *,
+    payment_intent_id: str,
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    return await finalize_payment_success(
+        order,
+        psp="stripe",
+        payment_reference=payment_intent_id,
+        transaction_id=payment_intent_id,
+        amount_minor=data.get("amount"),
+        currency=data.get("currency"),
+        mark_order_paid_fn=mark_order_paid,
+        log_order_event_fn=log_order_event,
+    )
+
+
+async def _finalize_stripe_payment_failure(
+    order: Dict[str, Any],
+    *,
+    payment_intent_id: str,
+    error_message: str,
+) -> Dict[str, Any]:
+    if not _can_apply_stripe_payment_failure(order):
+        return {"applied": False, "reason": "terminal_state", "order_id": order.get("order_id")}
+    return await finalize_payment_failure(
+        order,
+        psp="stripe",
+        payment_reference=payment_intent_id,
+        error_message=error_message,
+        update_order_status_fn=update_order_status,
+        log_order_event_fn=log_order_event,
+    )
+
+
+async def _finalize_stripe_refund_success(
+    order: Dict[str, Any],
+    *,
+    refund_reference: str,
+    refund_amount_minor: Any,
+    currency: Optional[str],
+    refund_total: Decimal,
+    metadata_extra: Optional[Dict[str, Any]] = None,
+    metadata_patch: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return await finalize_refund_success(
+        order,
+        psp="stripe",
+        refund_reference=refund_reference,
+        refund_amount_minor=refund_amount_minor,
+        refund_total=refund_total,
+        currency=currency,
+        metadata_extra=metadata_extra,
+        metadata_patch=metadata_patch,
+        update_order_status_fn=update_order_status,
+        log_order_event_fn=log_order_event,
+    )
+
+
+async def _finalize_stripe_refund_failure(
+    order: Dict[str, Any],
+    *,
+    refund_reference: str,
+    refund_amount_minor: Any,
+    currency: Optional[str],
+    failure_reason: str,
+    metadata_extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    rollback_amount = _stripe_minor_unit_factor(currency or str(order.get("currency") or ""))
+    try:
+        rollback_total = Decimal(str(refund_amount_minor or "0")) / rollback_amount
+    except Exception:
+        rollback_total = Decimal("0")
+    refund_key = f"stripe:{refund_reference}"
+    existing_metadata = order.get("metadata") or {}
+    if not isinstance(existing_metadata, dict):
+        existing_metadata = {}
+    existing_refs = list(existing_metadata.get("psp_refund_refs") or [])
+    legacy_match = str(existing_metadata.get("refund_id") or "").strip() == str(refund_reference or "").strip()
+    return await finalize_refund_failure(
+        order,
+        psp="stripe",
+        refund_reference=refund_reference,
+        failure_reason=failure_reason,
+        rollback_reference=refund_reference if (refund_key in existing_refs or legacy_match) else None,
+        rollback_amount=rollback_total,
+        metadata_extra={"refund_id": refund_reference, **(metadata_extra or {})},
+        metadata_patch=(
+            {
+                "stripe_last_refund_failure": {
+                    "refund_id": refund_reference,
+                    "amount_minor": refund_amount_minor,
+                    "currency": currency or str(order.get("currency") or ""),
+                    "failure_reason": failure_reason,
+                    "received_at": datetime.now().isoformat(),
+                    **(metadata_extra or {}),
+                }
+            }
+            if (refund_key in existing_refs or legacy_match)
+            else None
+        ),
+        update_order_status_fn=update_order_status,
+        log_order_event_fn=log_order_event,
+    )
+
+
 def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -105,6 +306,7 @@ async def handle_stripe_webhook(
     支持的事件：
     - payment_intent.succeeded: 支付成功
     - payment_intent.payment_failed: 支付失败
+    - refund.created / refund.updated / refund.failed: 退款时间线
     - charge.refunded: 退款成功
     - charge.dispute.*: 争议/拒付（chargeback）信号（best-effort 记录，不自动变更订单状态）
     """
@@ -147,42 +349,41 @@ async def handle_stripe_webhook(
             if result:
                 order_id = result["order_id"]
                 merchant_id = result["merchant_id"]
-                
-                await mark_order_paid(order_id)
-                await log_order_event(
-                    event_type="payment_confirmed_webhook",
-                    order_id=order_id,
-                    merchant_id=merchant_id,
-                    metadata={
-                        "payment_intent_id": payment_intent_id,
-                        "amount": data.get("amount"),
-                        "currency": data.get("currency")
-                    }
+                finalization = await _finalize_stripe_payment_success(
+                    result,
+                    payment_intent_id=payment_intent_id,
+                    data=data,
                 )
-                logger.info(f"Order {order_id} marked as paid via webhook")
+                if finalization.get("applied"):
+                    logger.info(f"Order {order_id} marked as paid via webhook")
 
-                # PCS: freeze order snapshot evidence (best-effort; does not block payment success)
-                try:
-                    await create_order_snapshot_evidence_pack(order_id, triggered_by="stripe_webhook")
-                except Exception as e:
-                    logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
-                
-                # 触发 Shopify 订单创建
-                from routes.merchant_onboarding_routes import get_merchant_onboarding
-                from routes.order_routes import create_shopify_order
-                
-                merchant = await get_merchant_onboarding(merchant_id)
-                store_info = await get_primary_store(merchant_id)
-                if merchant and store_info and store_info.get("platform") == "shopify":
-                    logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
+                    # PCS: freeze order snapshot evidence (best-effort; does not block payment success)
                     try:
-                        success = await create_shopify_order(order_id)
-                        if success:
-                            logger.info(f"✅ Shopify order created via webhook for {order_id}")
-                        else:
-                            logger.error(f"❌ Shopify order creation failed for {order_id}")
-                    except Exception as shop_err:
-                        logger.error(f"❌ Shopify order creation error: {shop_err}")
+                        await create_order_snapshot_evidence_pack(order_id, triggered_by="stripe_webhook")
+                    except Exception as e:
+                        logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
+                    
+                    # 触发 Shopify 订单创建
+                    from routes.merchant_onboarding_routes import get_merchant_onboarding
+                    from routes.order_routes import create_shopify_order
+                    
+                    merchant = await get_merchant_onboarding(merchant_id)
+                    store_info = await get_primary_store(merchant_id)
+                    if merchant and store_info and store_info.get("platform") == "shopify":
+                        logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
+                        try:
+                            success = await create_shopify_order(order_id)
+                            if success:
+                                logger.info(f"✅ Shopify order created via webhook for {order_id}")
+                            else:
+                                logger.error(f"❌ Shopify order creation failed for {order_id}")
+                        except Exception as shop_err:
+                            logger.error(f"❌ Shopify order creation error: {shop_err}")
+                else:
+                    logger.info(
+                        "Stripe payment success replay skipped for order %s due to settled or terminal state",
+                        order_id,
+                    )
                 
         elif event_type == "payment_intent.payment_failed":
             # 支付失败
@@ -195,17 +396,18 @@ async def handle_stripe_webhook(
             
             if result:
                 order_id = result["order_id"]
-                await update_order_status(order_id, "payment_failed")
-                await log_order_event(
-                    event_type="payment_failed_webhook",
-                    order_id=order_id,
-                    merchant_id=result["merchant_id"],
-                    metadata={
-                        "payment_intent_id": payment_intent_id,
-                        "error": error_message
-                    }
+                finalization = await _finalize_stripe_payment_failure(
+                    result,
+                    payment_intent_id=payment_intent_id,
+                    error_message=error_message,
                 )
-                logger.warning(f"Order {order_id} payment failed: {error_message}")
+                if finalization.get("applied"):
+                    logger.warning(f"Order {order_id} payment failed: {error_message}")
+                else:
+                    logger.info(
+                        "Stripe payment failure replay skipped for order %s due to settled or terminal state",
+                        order_id,
+                    )
                 
         elif event_type == "charge.refunded":
             # 退款成功
@@ -220,16 +422,6 @@ async def handle_stripe_webhook(
             
             if result:
                 order_id = result["order_id"]
-                # Stripe's charge.amount_refunded is cumulative (not delta). Use it to converge
-                # order state without double-counting if we also processed the refund internally.
-                try:
-                    order_total = Decimal(str(result.get("total") or "0"))
-                except Exception:
-                    order_total = Decimal("0")
-                try:
-                    existing_total_refunded = Decimal(str(result.get("total_refunded") or "0"))
-                except Exception:
-                    existing_total_refunded = Decimal("0")
                 try:
                     refunded_minor = Decimal(str(refund_amount)) if refund_amount is not None else Decimal("0")
                 except Exception:
@@ -240,47 +432,158 @@ async def handle_stripe_webhook(
                     refunded_total = refunded_minor / factor
                 except Exception:
                     refunded_total = Decimal("0")
+                await _finalize_stripe_refund_success(
+                    result,
+                    refund_reference=charge_id,
+                    refund_amount_minor=refund_amount,
+                    currency=currency or str(result.get("currency") or ""),
+                    refund_total=refunded_total,
+                    metadata_extra={
+                        "charge_id": charge_id,
+                        "refund_amount": refund_amount,
+                        "source_event": "charge.refunded",
+                    },
+                )
+                logger.info(f"Order {order_id} refunded: {refund_amount}")
+        elif event_type == "refund.created":
+            refund_id = data.get("id")
+            refund_status = str(data.get("status") or "").strip().lower()
+            payment_intent_id = data.get("payment_intent")
+            refund_amount = data.get("amount")
+            currency = (data.get("currency") or "").strip().lower() or None
+            refund_meta = data.get("metadata") or {}
 
-                next_total_refunded = max(existing_total_refunded, refunded_total)
-                if order_total > Decimal("0") and next_total_refunded < order_total:
-                    next_status = "partially_refunded"
-                else:
-                    next_status = "refunded"
+            result = await _resolve_stripe_order_for_refund(
+                payment_intent_id=payment_intent_id,
+                refund_meta=refund_meta if isinstance(refund_meta, dict) else None,
+            )
 
+            if result:
+                await log_order_event(
+                    event_type="refund_created_webhook",
+                    order_id=result["order_id"],
+                    merchant_id=result["merchant_id"],
+                    metadata={
+                        "refund_id": refund_id,
+                        "payment_intent_id": payment_intent_id,
+                        "refund_amount": refund_amount,
+                        "currency": currency or str(result.get("currency") or ""),
+                        "status": refund_status or "unknown",
+                    },
+                )
+
+        elif event_type == "refund.updated":
+            refund_id = data.get("id")
+            refund_status = str(data.get("status") or "").strip().lower()
+            payment_intent_id = data.get("payment_intent")
+            refund_amount = data.get("amount")
+            currency = (data.get("currency") or "").strip().lower() or None
+            refund_meta = data.get("metadata") or {}
+            pending_reason = data.get("pending_reason")
+
+            result = await _resolve_stripe_order_for_refund(
+                payment_intent_id=payment_intent_id,
+                refund_meta=refund_meta if isinstance(refund_meta, dict) else None,
+            )
+
+            if result:
+                order_id = result["order_id"]
                 existing_meta = result.get("metadata") or {}
                 if not isinstance(existing_meta, dict):
                     existing_meta = {}
-                await update_order_status(
-                    order_id,
-                    next_status,
-                    payment_status=next_status,
-                    total_refunded=next_total_refunded,
-                    metadata={
-                        **existing_meta,
-                        "stripe_charge_refunded": {
-                            "charge_id": charge_id,
-                            "amount_refunded_minor": refund_amount,
-                            "currency": currency or str(result.get("currency") or ""),
-                            "received_at": datetime.now().isoformat(),
+
+                if refund_status == "succeeded":
+                    try:
+                        refunded_minor = Decimal(str(refund_amount)) if refund_amount is not None else Decimal("0")
+                    except Exception:
+                        refunded_minor = Decimal("0")
+                    factor = _stripe_minor_unit_factor(currency or str(result.get("currency") or ""))
+                    try:
+                        refunded_total = refunded_minor / factor
+                    except Exception:
+                        refunded_total = Decimal("0")
+                    await _finalize_stripe_refund_success(
+                        result,
+                        refund_reference=refund_id,
+                        refund_amount_minor=refund_amount,
+                        currency=currency or str(result.get("currency") or ""),
+                        refund_total=refunded_total,
+                        metadata_extra={
+                            "refund_id": refund_id,
+                            "refund_amount": refund_amount,
+                            "status": refund_status,
+                            "source_event": "refund.updated",
                         },
-                    },
+                        metadata_patch={
+                            "stripe_refund_updated": {
+                                "refund_id": refund_id,
+                                "amount_minor": refund_amount,
+                                "currency": currency or str(result.get("currency") or ""),
+                                "status": refund_status,
+                                "received_at": datetime.now().isoformat(),
+                            }
+                        },
+                    )
+                elif refund_status == "failed":
+                    failure_reason = data.get("failure_reason") or refund_status or "unknown"
+                    await _finalize_stripe_refund_failure(
+                        result,
+                        refund_reference=refund_id,
+                        refund_amount_minor=refund_amount,
+                        currency=currency or str(result.get("currency") or ""),
+                        failure_reason=failure_reason,
+                        metadata_extra={"source_event": "refund.updated"},
+                    )
+                else:
+                    await log_order_event(
+                        event_type="refund_pending_webhook" if refund_status == "pending" else "refund_updated_webhook",
+                        order_id=order_id,
+                        merchant_id=result["merchant_id"],
+                        metadata={
+                            "refund_id": refund_id,
+                            "payment_intent_id": payment_intent_id,
+                            "refund_amount": refund_amount,
+                            "status": refund_status or "unknown",
+                            "pending_reason": pending_reason,
+                        },
+                    )
+
+        elif event_type == "refund.failed":
+            refund_id = data.get("id")
+            payment_intent_id = data.get("payment_intent")
+            refund_amount = data.get("amount")
+            currency = (data.get("currency") or "").strip().lower() or None
+            failure_reason = data.get("failure_reason") or data.get("status") or "unknown"
+
+            refund_meta = data.get("metadata") or {}
+            result = await _resolve_stripe_order_for_refund(
+                payment_intent_id=payment_intent_id,
+                refund_meta=refund_meta if isinstance(refund_meta, dict) else None,
+            )
+
+            if result:
+                finalization = await _finalize_stripe_refund_failure(
+                    result,
+                    refund_reference=refund_id,
+                    refund_amount_minor=refund_amount,
+                    currency=currency or str(result.get("currency") or ""),
+                    failure_reason=failure_reason,
                 )
-                await log_order_event(
-                    event_type="refund_processed_webhook",
-                    order_id=order_id,
-                    merchant_id=result["merchant_id"],
-                    metadata={
-                        "charge_id": charge_id,
-                        "refund_amount": refund_amount
-                    }
+                logger.warning(
+                    "Stripe refund failed for order %s refund_id=%s rollback_applied=%s",
+                    result["order_id"],
+                    refund_id,
+                    finalization.get("rolled_back"),
                 )
-                logger.info(f"Order {order_id} refunded: {refund_amount}")
 
         elif event_type and str(event_type).startswith("charge.dispute."):
             # Stripe dispute/chargeback signals.
             # Do not mutate order state here; treat as risk/ops signal and persist best-effort.
             try:
-                from services.dispute_records_service import upsert_stripe_dispute_record_best_effort
+                from services.dispute_records_service import (
+                    stripe_dispute_status_detail,
+                    upsert_stripe_dispute_record_best_effort,
+                )
                 dispute_payload = {}
                 if isinstance(data, dict):
                     dispute_payload = data
@@ -294,6 +597,31 @@ async def handle_stripe_webhook(
                     dispute_payload,
                     event_type=str(event_type),
                 )
+            except Exception:
+                pass
+            try:
+                from services.pcs_evidence_pack_service import create_dispute_evidence_pack
+
+                dispute_meta = {}
+                if isinstance(dispute_payload, dict):
+                    raw_meta = dispute_payload.get("metadata") or {}
+                    dispute_meta = raw_meta if isinstance(raw_meta, dict) else {}
+                merchant_id = str(dispute_meta.get("merchant_id") or "").strip()
+                order_id = str(dispute_meta.get("order_id") or "").strip() or None
+                dispute_ref = str((dispute_payload or {}).get("id") or "").strip()
+                raw_status = str((dispute_payload or {}).get("status") or "").strip().lower()
+                dispute_status_detail = stripe_dispute_status_detail(raw=raw_status or None, event_type=event_type)
+                if merchant_id and dispute_ref:
+                    await create_dispute_evidence_pack(
+                        merchant_id=merchant_id,
+                        dispute_ref=dispute_ref,
+                        order_id=order_id,
+                        dispute_payload=dict(dispute_payload or {}),
+                        source="stripe",
+                        status=str(dispute_status_detail["pack_status"]),
+                        event_type=str(event_type or "") or None,
+                        triggered_by=f"stripe_webhook:{event_type}",
+                    )
             except Exception:
                 pass
         
@@ -1003,6 +1331,7 @@ async def handle_shopify_webhook(
                     dispute_ref=str(data.get("id") or ""),
                     order_id=str(pivota_order_id) if pivota_order_id else None,
                     dispute_payload=dict(data or {}),
+                    source="shopify",
                     status="frozen" if is_resolved else "draft",
                     triggered_by=f"shopify_webhook:{topic}",
                 )
@@ -1255,9 +1584,15 @@ async def register_shopify_webhooks(
 # ============================================================================
 
 @router.post("/adyen")
-async def handle_adyen_webhook(request: Request):
+async def handle_adyen_webhook(
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(adyen_webhook_security),
+):
     """
-    处理 Adyen 支付事件
-    TODO: 实现 Adyen webhook 处理
+    Canonical Adyen webhook endpoint.
+
+    `/psp/webhook/adyen` remains as a compatibility alias but delegates here.
     """
-    return {"status": "not_implemented", "message": "Adyen webhooks coming soon"}
+    from routes.psp_routes import process_adyen_webhook_request
+
+    return await process_adyen_webhook_request(request, credentials)

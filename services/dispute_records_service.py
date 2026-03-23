@@ -122,25 +122,34 @@ def _stripe_payment_intent_lookup_best_effort(payment_intent_id: str) -> Dict[st
         return {}
 
 
-def _normalize_dispute_status(*, source: str, raw: Optional[str]) -> str:
+def _normalize_dispute_status(*, source: str, raw: Optional[str], event_type: Optional[str] = None) -> str:
     """
     Normalize dispute status to a small set that ops can reason about.
     Never raises.
     """
     s = (raw or "").strip().lower()
+    evt = (event_type or "").strip().lower()
     if not s:
+        if source == "stripe" and evt == "charge.dispute.created":
+            return "needs_response"
+        if source == "stripe" and evt == "charge.dispute.funds_withdrawn":
+            return "under_review"
+        if source == "stripe" and evt == "charge.dispute.closed":
+            return "closed"
         return "open"
 
     if source == "stripe":
         if s in {"needs_response", "warning_needs_response"}:
             return "needs_response"
+        if s in {"funds_withdrawn"} or evt == "charge.dispute.funds_withdrawn":
+            return "under_review"
         if s in {"under_review", "warning_under_review"}:
             return "under_review"
         if s in {"won"}:
             return "won"
         if s in {"lost"}:
             return "lost"
-        if s in {"warning_closed"}:
+        if s in {"warning_closed", "closed", "resolved"} or evt == "charge.dispute.closed":
             return "closed"
         # Fallback: treat unknown statuses as open.
         return "open"
@@ -160,6 +169,175 @@ def _normalize_dispute_status(*, source: str, raw: Optional[str]) -> str:
         return "open"
 
     return "open"
+
+
+def stripe_dispute_phase(*, raw: Optional[str], event_type: Optional[str]) -> str:
+    evt = (event_type or "").strip().lower()
+    status_raw = (raw or "").strip().lower()
+
+    if status_raw in {"won", "lost", "closed", "resolved"} or evt == "charge.dispute.closed":
+        return "closed"
+    if status_raw == "warning_closed":
+        return "warning_closed"
+    if evt == "charge.dispute.funds_withdrawn" or status_raw == "funds_withdrawn":
+        return "funds_withdrawn"
+    if status_raw == "warning_under_review":
+        return "warning_under_review"
+    if status_raw == "under_review":
+        return "under_review"
+    if status_raw == "warning_needs_response":
+        return "warning_needs_response"
+    if status_raw == "needs_response" or evt == "charge.dispute.created":
+        return "needs_response"
+    return "open"
+
+
+def stripe_dispute_outcome(*, raw: Optional[str], event_type: Optional[str]) -> Optional[str]:
+    status_raw = (raw or "").strip().lower()
+    evt = (event_type or "").strip().lower()
+    if status_raw in {"won", "lost"}:
+        return status_raw
+    if evt == "charge.dispute.closed":
+        return "closed"
+    if status_raw in {"closed", "resolved"}:
+        return "closed"
+    return None
+
+
+def _stripe_dispute_timeline_rank(
+    *,
+    raw: Optional[str],
+    event_type: Optional[str],
+    normalized: Optional[str] = None,
+) -> int:
+    status = normalized or _normalize_dispute_status(source="stripe", raw=raw, event_type=event_type)
+    phase = stripe_dispute_phase(raw=raw, event_type=event_type)
+    outcome = stripe_dispute_outcome(raw=raw, event_type=event_type)
+
+    if outcome in {"won", "lost"} or status in {"won", "lost"}:
+        return 40
+    if phase == "closed":
+        return 30
+    if phase == "warning_closed":
+        return 25
+    if phase in {"funds_withdrawn", "warning_under_review", "under_review"}:
+        return 20
+    if phase == "warning_needs_response":
+        return 15
+    if phase in {"needs_response", "open"}:
+        return 10
+    return 0
+
+
+def stripe_dispute_status_detail(*, raw: Optional[str], event_type: Optional[str]) -> Dict[str, Any]:
+    normalized_status = _normalize_dispute_status(source="stripe", raw=raw, event_type=event_type)
+    phase = stripe_dispute_phase(raw=raw, event_type=event_type)
+    outcome = stripe_dispute_outcome(raw=raw, event_type=event_type)
+    timeline_rank = _stripe_dispute_timeline_rank(
+        raw=raw,
+        event_type=event_type,
+        normalized=normalized_status,
+    )
+    return {
+        "normalized_status": normalized_status,
+        "phase": phase,
+        "outcome": outcome,
+        "timeline_rank": timeline_rank,
+        "pack_status": "frozen" if timeline_rank >= 20 else "draft",
+    }
+
+
+def stripe_dispute_pack_status(*, raw: Optional[str], event_type: Optional[str]) -> str:
+    return str(stripe_dispute_status_detail(raw=raw, event_type=event_type)["pack_status"])
+
+
+def _as_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "1", "yes"}:
+            return True
+        if v in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def _as_optional_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def stripe_dispute_evidence_summary(*, dispute: Dict[str, Any], event_type: Optional[str]) -> Dict[str, Any]:
+    dispute = dispute if isinstance(dispute, dict) else {}
+    evidence_details = dispute.get("evidence_details")
+    evidence_details = evidence_details if isinstance(evidence_details, dict) else {}
+
+    detail = stripe_dispute_status_detail(
+        raw=str(dispute.get("status") or "").strip() or None,
+        event_type=event_type,
+    )
+    has_evidence = _as_optional_bool(evidence_details.get("has_evidence"))
+    submission_count = _as_optional_int(evidence_details.get("submission_count"))
+    past_due = _as_optional_bool(evidence_details.get("past_due"))
+    due_by_dt = _utc_from_unix_ts(evidence_details.get("due_by"))
+    due_by = due_by_dt.isoformat() if due_by_dt else None
+    submission_method = str(evidence_details.get("submission_method") or "").strip() or None
+
+    if detail["outcome"] == "won":
+        stage = "closed_won"
+    elif detail["outcome"] == "lost":
+        stage = "closed_lost"
+    elif detail["phase"] in {"closed", "warning_closed"}:
+        stage = detail["phase"]
+    elif detail["phase"] in {"under_review", "warning_under_review", "funds_withdrawn"}:
+        stage = "issuer_review"
+    elif has_evidence or (submission_count or 0) > 0:
+        stage = "evidence_submitted"
+    elif detail["phase"] in {"needs_response", "warning_needs_response", "open"}:
+        stage = "awaiting_submission"
+    else:
+        stage = detail["phase"]
+
+    return {
+        "stage": stage,
+        "has_evidence": has_evidence,
+        "submission_count": submission_count,
+        "submission_method": submission_method,
+        "past_due": past_due,
+        "due_by": due_by,
+    }
+
+
+def _merge_stripe_dispute_state(
+    *,
+    existing_status_raw: Optional[str],
+    existing_status: Optional[str],
+    incoming_status_raw: Optional[str],
+    incoming_status: str,
+    event_type: Optional[str],
+) -> Tuple[Optional[str], str]:
+    existing_rank = _stripe_dispute_timeline_rank(
+        raw=existing_status_raw,
+        event_type=None,
+        normalized=existing_status,
+    )
+    incoming_rank = _stripe_dispute_timeline_rank(
+        raw=incoming_status_raw,
+        event_type=event_type,
+        normalized=incoming_status,
+    )
+    if incoming_rank < existing_rank:
+        return existing_status_raw, existing_status or incoming_status
+    return incoming_status_raw, incoming_status
 
 
 async def _resolve_order_and_merchant_from_stripe_payload(
@@ -229,7 +407,7 @@ async def upsert_stripe_dispute_record_best_effort(
         source_dispute_id = f"sha256:{sha256_json(dispute)}"
 
     raw_status = str(dispute.get("status") or "").strip() or None
-    status = _normalize_dispute_status(source="stripe", raw=raw_status)
+    status = _normalize_dispute_status(source="stripe", raw=raw_status, event_type=event_type)
 
     payment_intent_id = str(dispute.get("payment_intent") or "").strip() or None
     charge_id = str(dispute.get("charge") or "").strip() or None
@@ -263,6 +441,20 @@ async def upsert_stripe_dispute_record_best_effort(
     except Exception:
         order_id, merchant_id = None, None
 
+    existing_row = None
+    try:
+        existing_row = await db.fetch_one(
+            """
+            SELECT status_raw, status, closed_at
+            FROM dispute_records
+            WHERE source = 'stripe' AND source_dispute_id = :source_dispute_id
+            LIMIT 1
+            """,
+            {"source_dispute_id": source_dispute_id},
+        )
+    except Exception:
+        existing_row = None
+
     if not merchant_id:
         logger.warning(
             "Stripe dispute received but merchant_id could not be resolved; skipping persist "
@@ -279,6 +471,14 @@ async def upsert_stripe_dispute_record_best_effort(
     currency = dispute.get("currency")
     reason = dispute.get("reason")
 
+    merged_status_raw, merged_status = _merge_stripe_dispute_state(
+        existing_status_raw=_row_get(existing_row, "status_raw"),
+        existing_status=_row_get(existing_row, "status"),
+        incoming_status_raw=raw_status,
+        incoming_status=status,
+        event_type=event_type,
+    )
+
     evidence_due_by = None
     try:
         evidence_details = dispute.get("evidence_details") or {}
@@ -289,8 +489,8 @@ async def upsert_stripe_dispute_record_best_effort(
 
     opened_at = _utc_from_unix_ts(dispute.get("created"))
     closed_at = None
-    if status in {"won", "lost", "closed"}:
-        closed_at = _utc_from_unix_ts(dispute.get("closed"))
+    if merged_status in {"won", "lost", "closed"}:
+        closed_at = _utc_from_unix_ts(dispute.get("closed")) or _row_get(existing_row, "closed_at")
 
     payload_json = dispute
     try:
@@ -344,8 +544,8 @@ async def upsert_stripe_dispute_record_best_effort(
                 "currency": str(currency).upper() if currency else None,
                 "amount": (float(amount) / 100.0) if isinstance(amount, (int, float)) else None,
                 "reason": str(reason) if reason else None,
-                "status_raw": raw_status,
-                "status": status,
+                "status_raw": merged_status_raw,
+                "status": merged_status,
                 "evidence_due_by": evidence_due_by,
                 "opened_at": opened_at,
                 "closed_at": closed_at,

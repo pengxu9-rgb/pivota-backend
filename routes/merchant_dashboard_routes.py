@@ -29,6 +29,7 @@ from services.merchant_webhook_service import (
     send_test_webhook as send_merchant_test_webhook,
     update_webhook_config as update_merchant_webhook_config,
 )
+from services.merchant_psp_config_service import build_provider_summary, parse_capabilities
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -416,7 +417,8 @@ async def get_merchant_psps(
     # Try to read from database
     try:
         query = """
-            SELECT psp_id, provider, name, account_id, status, connected_at, capabilities, api_key
+            SELECT psp_id, provider, name, account_id, status, connected_at, capabilities, api_key,
+                   environment, provider_config, validation_status, validation_error, last_validated_at
             FROM merchant_psps
             WHERE merchant_id = :merchant_id
             ORDER BY connected_at DESC
@@ -472,15 +474,14 @@ async def get_merchant_psps(
             psp_stats = {}  # Use empty dict if orders table doesn't exist
         
         for row in rows:
-            capabilities = []
-            if row["capabilities"]:
-                capabilities = row["capabilities"].split(',')
+            row_dict = dict(row)
+            capabilities = parse_capabilities(row_dict.get("capabilities"))
 
-            psp_id = row["psp_id"]
-            provider = row["provider"]
-            api_key = row["api_key"]
+            psp_id = row_dict["psp_id"]
+            provider = row_dict["provider"]
+            api_key = row_dict["api_key"]
             configured = bool(api_key and str(api_key).strip() and api_key != "pending_setup")
-            effective_status = row["status"]
+            effective_status = row_dict["status"]
             if not configured and (effective_status or "").lower() == "active":
                 effective_status = "pending"
             # Prefer metrics keyed by provider (psp_used), fall back to legacy psp_id
@@ -493,17 +494,27 @@ async def get_merchant_psps(
             
             psps.append({
                 "id": psp_id,
-                "provider": row["provider"],
-                "name": row["name"],
-                "account_id": row["account_id"],
+                "provider": row_dict["provider"],
+                "name": row_dict["name"],
+                "account_id": row_dict["account_id"],
                 "status": effective_status,
-                "connected_at": row["connected_at"],
+                "connected_at": row_dict["connected_at"],
                 "capabilities": capabilities,
                 "api_key_last4": api_key[-4:] if api_key and len(api_key) >= 4 else "****",
                 "success_rate": stats["success_rate"],
                 "volume_today": round(stats["total_volume"], 2),  # Now showing actual volume for this PSP
                 "transaction_count": stats["total_orders"],
-                "is_active": (effective_status or "").lower() == "active"
+                "is_active": (effective_status or "").lower() == "active",
+                "environment": row_dict.get("environment") or "unknown",
+                "provider_summary": build_provider_summary(
+                    provider,
+                    account_id=row_dict.get("account_id"),
+                    provider_config=row_dict.get("provider_config"),
+                    environment=row_dict.get("environment"),
+                ),
+                "validation_status": row_dict.get("validation_status") or "unknown",
+                "validation_error": row_dict.get("validation_error"),
+                "last_validated_at": row_dict.get("last_validated_at").isoformat() if row_dict.get("last_validated_at") else None,
             })
             print(f"DEBUG: PSP {psp_id} - Volume: ${stats['total_volume']:.2f}, Transactions: {stats['total_orders']}")
     except Exception as e:
@@ -1051,7 +1062,7 @@ async def test_psp_connection(
     
     # Get PSP details from database
     psp_query = """
-        SELECT provider, api_key, secret_key, account_id, merchant_id
+        SELECT provider, api_key, secret_key, account_id, merchant_id, environment, provider_config
         FROM merchant_psps 
         WHERE psp_id = :psp_id
     """
@@ -1060,8 +1071,15 @@ async def test_psp_connection(
     if not psp:
         raise HTTPException(status_code=404, detail="PSP not found")
     
-    provider = psp["provider"]
-    api_key = psp["api_key"]
+    psp_row = dict(psp)
+    provider = psp_row["provider"]
+    api_key = psp_row["api_key"]
+    provider_summary = build_provider_summary(
+        provider,
+        account_id=psp_row.get("account_id"),
+        provider_config=psp_row.get("provider_config"),
+        environment=psp_row.get("environment"),
+    )
     
     # Check if API key is configured
     if not api_key or api_key == "pending_setup":
@@ -1089,9 +1107,14 @@ async def test_psp_connection(
         elif provider == "adyen":
             # Test Adyen API
             import httpx
-            merchant_account = psp["account_id"] or "TEST"
+            merchant_account = provider_summary.get("merchant_account") or "TEST"
+            test_url = (
+                "https://checkout-live.adyen.com/v70/paymentMethods"
+                if provider_summary.get("environment") == "live"
+                else "https://checkout-test.adyen.com/v70/paymentMethods"
+            )
             response = await httpx.AsyncClient().post(
-                "https://checkout-test.adyen.com/v70/paymentMethods",
+                test_url,
                 headers={"X-API-Key": api_key, "Content-Type": "application/json"},
                 json={"merchantAccount": merchant_account},
                 timeout=10.0
@@ -1100,7 +1123,7 @@ async def test_psp_connection(
             
         elif provider == "paypal":
             # Test PayPal API
-            secret_key = psp["secret_key"]
+            secret_key = psp_row["secret_key"]
             if not secret_key:
                 return {
                     "status": "error",
@@ -1112,7 +1135,7 @@ async def test_psp_connection(
             
         elif provider == "checkout":
             # Test Checkout.com API
-            processing_channel = psp["account_id"]
+            processing_channel = provider_summary.get("processing_channel_id")
             if not processing_channel:
                 return {
                     "status": "error",
@@ -1134,7 +1157,20 @@ async def test_psp_connection(
                 }
             }
         
-        # Return success response
+        await database.execute(
+            """
+            UPDATE merchant_psps
+            SET validation_status = :validation_status,
+                validation_error = NULL,
+                last_validated_at = NOW()
+            WHERE psp_id = :psp_id
+            """,
+            {
+                "psp_id": psp_id,
+                "validation_status": "valid" if success else "invalid",
+            },
+        )
+
         return {
             "status": "success",
             "message": f"{provider.capitalize()} connection verified successfully",
@@ -1142,12 +1178,23 @@ async def test_psp_connection(
                 "psp_id": psp_id,
                 "provider": provider,
                 "tested_at": datetime.now().isoformat() + "Z",
-                "configured": True
+                "configured": True,
+                "environment": provider_summary.get("environment"),
             }
         }
         
     except Exception as e:
         print(f"❌ PSP test error: {e}")
+        await database.execute(
+            """
+            UPDATE merchant_psps
+            SET validation_status = 'invalid',
+                validation_error = :validation_error,
+                last_validated_at = NOW()
+            WHERE psp_id = :psp_id
+            """,
+            {"psp_id": psp_id, "validation_error": str(e)[:500]},
+        )
         return {
             "status": "error",
             "message": f"Failed to test {provider}: {str(e)}",

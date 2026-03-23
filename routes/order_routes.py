@@ -37,6 +37,7 @@ from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
 from services.payment_routing_service import PaymentRoutingService
+from services.merchant_payment_initiation_service import build_payment_action
 from services.promotions_service import list_promotions, PromotionStatus
 from services.quote_service import (
     QuoteError,
@@ -1135,41 +1136,7 @@ async def create_new_order(
 
                 # Build unified payment_action for frontend / Agent
                 try:
-                    redirect_url = getattr(payment_intent, "redirect_url", None)
-                    raw = getattr(payment_intent, "raw_response", None)
-
-                    if redirect_url:
-                        payment_action = {
-                            "type": "redirect_url",
-                            "url": redirect_url,
-                            "raw": raw,
-                        }
-                    elif psp_type == "stripe" and client_secret:
-                        payment_action = {
-                            "type": "stripe_client_secret",
-                            "client_secret": client_secret,
-                            "raw": raw,
-                        }
-                    elif psp_type == "adyen" and client_secret:
-                        payment_action = {
-                            "type": "adyen_session",
-                            "client_secret": client_secret,
-                            "raw": raw,
-                        }
-                    elif psp_type in ["checkout", "paypal"] and client_secret and str(
-                        client_secret
-                    ).startswith("http"):
-                        payment_action = {
-                            "type": "redirect_url",
-                            "url": client_secret,
-                            "raw": raw,
-                        }
-                    else:
-                        # Fallback: expose minimal info; frontends can仍然使用 legacy 字段
-                        payment_action = {
-                            "type": None,
-                            "client_secret": client_secret,
-                        }
+                    payment_action = build_payment_action(payment_intent, psp_used=psp_type)
                 except Exception as pa_err:
                     logger.warning(
                         f"⚠️ Failed to build payment_action for order {order_id}: {pa_err}"

@@ -11,6 +11,7 @@ from datetime import datetime
 from adapters.psp_adapter import PSPAdapter, get_psp_adapter, PaymentIntent
 from db.merchant_onboarding import get_merchant_onboarding
 from db.database import database
+from services.merchant_psp_config_service import build_runtime_adapter_kwargs
 from utils.logger import logger
 import hashlib
 
@@ -23,6 +24,10 @@ class PSPConfig:
     priority: int  # 1 = primary, 2 = backup, etc.
     is_active: bool
     merchant_account: Optional[str] = None  # For Adyen
+    account_id: Optional[str] = None
+    secret_key: Optional[str] = None
+    environment: Optional[str] = None
+    provider_config: Optional[Dict[str, Any]] = None
 
 
 class MultiPSPOrchestrator:
@@ -55,7 +60,7 @@ class MultiPSPOrchestrator:
         try:
             psps = await database.fetch_all(
                 """
-                SELECT provider, api_key, account_id, status, connected_at
+                SELECT provider, api_key, account_id, secret_key, status, connected_at, environment, provider_config
                 FROM merchant_psps
                 WHERE merchant_id = :merchant_id AND status = 'active'
                 ORDER BY connected_at ASC
@@ -78,9 +83,8 @@ class MultiPSPOrchestrator:
             base_priority = idx
             priority = 1 if provider == "stripe" else base_priority + 1
 
-            merchant_account = (
-                psp_dict.get("account_id") if provider == "adyen" else None
-            )
+            provider_config = psp_dict.get("provider_config")
+            merchant_account = psp_dict.get("account_id") if provider == "adyen" else None
 
             self.psp_configs.append(
                 PSPConfig(
@@ -89,6 +93,10 @@ class MultiPSPOrchestrator:
                     priority=priority,
                     is_active=True,
                     merchant_account=merchant_account,
+                    account_id=psp_dict.get("account_id"),
+                    secret_key=psp_dict.get("secret_key"),
+                    environment=psp_dict.get("environment"),
+                    provider_config=provider_config,
                 )
             )
 
@@ -108,6 +116,8 @@ class MultiPSPOrchestrator:
                             priority=1,
                             is_active=True,
                             merchant_account=merchant.get("adyen_merchant_account"),
+                            environment="unknown",
+                            provider_config={},
                         )
                     )
 
@@ -121,6 +131,8 @@ class MultiPSPOrchestrator:
                             priority=i,
                             is_active=True,
                             merchant_account=backup.get("merchant_account"),
+                            environment="unknown",
+                            provider_config={},
                         )
                     )
 
@@ -254,7 +266,13 @@ class MultiPSPOrchestrator:
                 psp_adapter = get_psp_adapter(
                     config.psp_type,
                     config.api_key,
-                    merchant_account=config.merchant_account
+                    **build_runtime_adapter_kwargs(
+                        config.psp_type,
+                        account_id=config.account_id,
+                        provider_config=config.provider_config,
+                        environment=config.environment,
+                        secret_key=config.secret_key,
+                    ),
                 )
 
                 # Attempt payment

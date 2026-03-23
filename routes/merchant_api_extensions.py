@@ -11,6 +11,7 @@ from services.refund_service import refund_service
 from pydantic import BaseModel
 from utils.logger import logger
 from config.feature_flags import is_feature_enabled
+from config.settings import settings
 import httpx
 import os
 import random
@@ -20,6 +21,10 @@ import json
 import hashlib
 
 from services.payment_routing_service import PaymentRoutingService
+from services.merchant_psp_config_service import (
+    SUPPORTED_CANONICAL_PSPS,
+    build_provider_connect_record,
+)
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
@@ -1482,50 +1487,65 @@ async def connect_psp(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_id = await get_merchant_id_from_user(current_user)
-    provider = psp_data.get("provider", "").lower()
+    provider = str(psp_data.get("provider", "")).strip().lower()
+    if provider not in SUPPORTED_CANONICAL_PSPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported PSP provider for this phase: {provider or 'unknown'}",
+        )
     
     # Validate API key format
     api_key = psp_data.get("api_key", "")
     if not api_key or len(api_key) < 10:
         raise HTTPException(status_code=400, detail="Invalid API key")
     
-    # Get secret key for PayPal
-    secret_key = psp_data.get("secret_key", "")
-    if provider == "paypal" and (not secret_key or len(secret_key) < 10):
-        raise HTTPException(status_code=400, detail="PayPal requires both Client ID and Client Secret")
-    
-    # Validate provider-specific required fields
-    # Checkout.com requires processing_channel_id (we store in account_id)
-    if provider == "checkout":
-        provided_account_id = (psp_data.get("account_id") or "").strip()
-        if not provided_account_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Checkout.com requires processing_channel_id in account_id field",
-            )
-        account_id = provided_account_id
-    elif provider == "adyen":
-        # For Adyen, account_id should be the merchantAccount.
-        # Prefer explicit value from request, otherwise fall back to env.
-        from config.settings import settings
+    secret_key = str(psp_data.get("secret_key") or "").strip() or None
+    account_id = str(psp_data.get("account_id") or "").strip() or None
+    environment = str(psp_data.get("environment") or "").strip().lower() or None
+    provider_config: Dict[str, Any] = {}
 
-        provided_account_id = (psp_data.get("account_id") or "").strip()
-        if not provided_account_id:
-            provided_account_id = getattr(settings, "adyen_merchant_account", "").strip()
-        if not provided_account_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Adyen requires merchantAccount (account_id) to be provided",
-            )
-        account_id = provided_account_id
-    else:
-        # For Stripe/others, accept optional account_id from request; do NOT generate fake acct_* IDs.
-        account_id = (psp_data.get("account_id") or "").strip() or None
+    if provider == "stripe":
+        provider_config["mode"] = str(psp_data.get("mode") or "payment_intent").strip().lower()
+    elif provider == "adyen":
+        merchant_account = str(psp_data.get("merchant_account") or account_id or "").strip()
+        client_key = str(psp_data.get("client_key") or "").strip()
+        if not merchant_account:
+            merchant_account = getattr(settings, "adyen_merchant_account", "").strip()
+        if not merchant_account:
+            raise HTTPException(status_code=400, detail="Adyen requires merchant_account")
+        if not client_key:
+            raise HTTPException(status_code=400, detail="Adyen requires client_key")
+        account_id = merchant_account
+        provider_config = {
+            "merchant_account": merchant_account,
+            "client_key": client_key,
+        }
+    elif provider == "checkout":
+        processing_channel_id = str(psp_data.get("processing_channel_id") or account_id or "").strip()
+        public_key = str(psp_data.get("public_key") or "").strip()
+        if not processing_channel_id:
+            raise HTTPException(status_code=400, detail="Checkout.com requires processing_channel_id")
+        if not public_key:
+            raise HTTPException(status_code=400, detail="Checkout.com requires public_key")
+        account_id = processing_channel_id
+        provider_config = {
+            "processing_channel_id": processing_channel_id,
+            "public_key": public_key,
+        }
+
+    record = build_provider_connect_record(
+        provider,
+        api_key=api_key,
+        account_id=account_id,
+        provider_config=provider_config,
+        environment=environment,
+        validation_status="unknown",
+        validation_error=None,
+    )
 
     # Save to database
-    # [Phase 6.2 Fix] Include provider in psp_id to match constraint: psp_{provider}_{12chars}
     psp_id = f"psp_{provider}_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen"] else ["card"]
+    capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen", "checkout"] else ["card"]
     
     new_psp = {
         "id": psp_id,
@@ -1535,15 +1555,50 @@ async def connect_psp(
         "connected_at": datetime.now().isoformat() + "Z",
         "account_id": account_id,
         "capabilities": capabilities,
-        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****"
+        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****",
+        "environment": record["environment"],
+        "provider_summary": record["provider_summary"],
+        "validation_status": record["validation_status"],
+        "validation_error": record["validation_error"],
     }
     
     try:
         # Use transaction to ensure data is committed
         async with database.transaction():
-            # Build query dynamically based on whether secret_key is provided
-            base_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
-            base_vals = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
+            base_cols = [
+                "psp_id",
+                "merchant_id",
+                "provider",
+                "name",
+                "api_key",
+                "account_id",
+                "capabilities",
+                "status",
+                "connected_at",
+                "secret_key",
+                "environment",
+                "provider_config",
+                "validation_status",
+                "validation_error",
+                "last_validated_at",
+            ]
+            base_vals = [
+                ":psp_id",
+                ":merchant_id",
+                ":provider",
+                ":name",
+                ":api_key",
+                ":account_id",
+                ":capabilities",
+                ":status",
+                ":connected_at",
+                ":secret_key",
+                ":environment",
+                "CAST(:provider_config AS JSONB)",
+                ":validation_status",
+                ":validation_error",
+                ":last_validated_at",
+            ]
             params = {
                 "psp_id": psp_id,
                 "merchant_id": merchant_id,
@@ -1553,14 +1608,14 @@ async def connect_psp(
                 "account_id": account_id,
                 "capabilities": ','.join(capabilities),
                 "status": 'active',
-                "connected_at": datetime.now()
+                "connected_at": datetime.now(),
+                "secret_key": secret_key,
+                "environment": record["environment"],
+                "provider_config": json.dumps(record["provider_config"]),
+                "validation_status": record["validation_status"],
+                "validation_error": record["validation_error"],
+                "last_validated_at": None,
             }
-            
-            # Add secret_key for PayPal
-            if secret_key:
-                base_cols.append("secret_key")
-                base_vals.append(":secret_key")
-                params["secret_key"] = secret_key
             
             query = f"""
                 INSERT INTO merchant_psps ({', '.join(base_cols)})

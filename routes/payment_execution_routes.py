@@ -6,17 +6,15 @@ Merchants use their API keys to execute payments through their connected PSP
 from datetime import datetime
 import logging
 import secrets
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-import stripe
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel
 
-from config.settings import settings
 from db.database import database
 from db.merchant_onboarding import get_merchant_by_api_key
-from db.payment_router import get_merchant_psp_route
+from services.merchant_payment_initiation_service import initiate_merchant_payment
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.payment_routing_service import PaymentRoutingService
 
@@ -25,7 +23,7 @@ logger = logging.getLogger("payment_execution")
 router = APIRouter(prefix="/payment", tags=["payment-execution"])
 
 
-SUPPORTED_MERCHANT_PAYMENT_PROVIDERS = {"stripe", "adyen"}
+SUPPORTED_MERCHANT_PAYMENT_PROVIDERS = {"stripe", "adyen", "checkout"}
 
 
 class PaymentExecuteRequest(BaseModel):
@@ -46,6 +44,8 @@ class PaymentExecuteResponse(BaseModel):
     psp_used: str
     status: str
     transaction_id: Optional[str] = None
+    requires_customer_action: bool = False
+    payment_action: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     timestamp: str
 
@@ -82,7 +82,7 @@ async def verify_merchant_api_key(api_key: str) -> dict:
 async def _load_active_merchant_psps(merchant_id: str) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
-        SELECT psp_id, provider, api_key, secret_key, account_id, status, connected_at
+        SELECT psp_id, provider, api_key, secret_key, account_id, status, connected_at, environment, provider_config
         FROM merchant_psps
         WHERE merchant_id = :merchant_id
           AND status = 'active'
@@ -150,126 +150,7 @@ async def _resolve_payment_candidates(
     if active_psps:
         return active_psps, route_config
 
-    legacy_route = await get_merchant_psp_route(merchant_id)
-    if legacy_route:
-        legacy_credentials = legacy_route.get("psp_credentials") or {}
-        if isinstance(legacy_credentials, str):
-            try:
-                import json
-
-                legacy_credentials = json.loads(legacy_credentials)
-            except Exception:
-                legacy_credentials = {}
-        return [
-            {
-                "provider": str(legacy_route.get("psp_type") or "").strip().lower(),
-                "api_key": legacy_credentials.get("api_key"),
-                "secret_key": legacy_credentials.get("secret_key"),
-                "account_id": legacy_credentials.get("account_id"),
-                "status": "active",
-                "source": "legacy_payment_router_config",
-            }
-        ], route_config
-
     return [], route_config
-
-
-async def execute_stripe_payment(
-    stripe_key: str,
-    merchant: Dict[str, Any],
-    payment_data: PaymentExecuteRequest,
-) -> Dict[str, Any]:
-    try:
-        stripe.api_key = stripe_key
-        intent = stripe.PaymentIntent.create(
-            amount=int(payment_data.amount),
-            currency=payment_data.currency.lower(),
-            description=payment_data.description or f"Payment for order {payment_data.order_id}",
-            metadata={
-                "order_id": payment_data.order_id,
-                "merchant_id": merchant["merchant_id"],
-                **(payment_data.metadata or {}),
-            },
-            receipt_email=payment_data.customer_email,
-            confirm=True,
-            automatic_payment_methods={"enabled": True, "allow_redirects": "never"},
-        )
-        return {
-            "success": intent.status in ["succeeded", "processing"],
-            "payment_id": intent.id,
-            "status": "completed" if intent.status == "succeeded" else "pending",
-            "transaction_id": intent.id,
-            "error_message": None,
-        }
-    except Exception as exc:
-        logger.error("Stripe payment failed: %s", exc)
-        return {
-            "success": False,
-            "payment_id": f"failed_{secrets.token_hex(8)}",
-            "status": "failed",
-            "transaction_id": None,
-            "error_message": str(exc),
-        }
-
-
-async def execute_adyen_payment(
-    adyen_key: str,
-    merchant_account: str,
-    payment_data: PaymentExecuteRequest,
-) -> Dict[str, Any]:
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://checkout-test.adyen.com/v70/payments",
-                headers={
-                    "X-API-Key": adyen_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "amount": {
-                        "value": int(payment_data.amount),
-                        "currency": payment_data.currency.upper(),
-                    },
-                    "reference": payment_data.order_id,
-                    "merchantAccount": merchant_account,
-                    "paymentMethod": {
-                        "type": "scheme",
-                        "number": "4111111111111111",
-                        "expiryMonth": "03",
-                        "expiryYear": "2030",
-                        "holderName": "Test User",
-                        "cvc": "737",
-                    },
-                    "shopperEmail": payment_data.customer_email,
-                    "metadata": payment_data.metadata or {},
-                },
-                timeout=30.0,
-            )
-            result = response.json()
-            if response.status_code == 200:
-                return {
-                    "success": result.get("resultCode") == "Authorised",
-                    "payment_id": result.get("pspReference", f"adyen_{secrets.token_hex(8)}"),
-                    "status": "completed" if result.get("resultCode") == "Authorised" else "failed",
-                    "transaction_id": result.get("pspReference"),
-                    "error_message": result.get("refusalReason") if result.get("resultCode") != "Authorised" else None,
-                }
-            return {
-                "success": False,
-                "payment_id": f"failed_{secrets.token_hex(8)}",
-                "status": "failed",
-                "transaction_id": None,
-                "error_message": result.get("message", "Adyen payment failed"),
-            }
-    except Exception as exc:
-        logger.error("Adyen payment failed: %s", exc)
-        return {
-            "success": False,
-            "payment_id": f"failed_{secrets.token_hex(8)}",
-            "status": "failed",
-            "transaction_id": None,
-            "error_message": str(exc),
-        }
 
 
 async def _emit_payment_webhook_best_effort(
@@ -324,83 +205,54 @@ async def execute_payment(
                 detail="Payment routing is not configured for any active processor",
             )
 
-        last_result: Optional[Dict[str, Any]] = None
-        last_attempted_provider = "unknown"
-        errors: List[str] = []
-
-        for candidate in candidates:
-            provider = str(candidate.get("provider") or "").strip().lower()
-
-            if provider not in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS:
-                errors.append(f"{provider}: unsupported provider")
-                continue
-
-            if provider == "stripe":
-                api_key = str(candidate.get("api_key") or "").strip()
-                if not api_key:
-                    errors.append("stripe: missing API key")
-                    continue
-                result = await execute_stripe_payment(api_key, merchant, payment_request)
-            else:
-                api_key = str(candidate.get("api_key") or "").strip()
-                merchant_account = (
-                    str(candidate.get("account_id") or "").strip()
-                    or getattr(settings, "adyen_merchant_account", "").strip()
-                    or "WoopayECOM"
-                )
-                if not api_key:
-                    errors.append("adyen: missing API key")
-                    continue
-                result = await execute_adyen_payment(api_key, merchant_account, payment_request)
-
-            last_attempted_provider = provider
-            last_result = result
-            if result.get("success"):
-                await _emit_payment_webhook_best_effort(
-                    merchant["merchant_id"],
-                    event_type="payment.completed",
-                    payment_request=payment_request,
-                    result=result,
-                    psp_used=provider,
-                )
-                return PaymentExecuteResponse(
-                    success=True,
-                    payment_id=result["payment_id"],
-                    order_id=payment_request.order_id,
-                    amount=payment_request.amount,
-                    currency=payment_request.currency,
-                    psp_used=provider,
-                    status=result["status"],
-                    transaction_id=result.get("transaction_id"),
-                    error_message=result.get("error_message"),
-                    timestamp=datetime.now().isoformat(),
-                )
-
-            errors.append(f"{provider}: {result.get('error_message') or 'payment failed'}")
-
-        if last_result is None:
+        preferred_psps = [
+            str(candidate.get("provider") or "").strip().lower()
+            for candidate in candidates
+            if str(candidate.get("provider") or "").strip().lower() in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS
+        ]
+        if not preferred_psps:
             raise HTTPException(
                 status_code=400,
                 detail="No supported active PSPs are configured for this merchant",
             )
 
+        result = await initiate_merchant_payment(
+            merchant_id=str(merchant["merchant_id"]),
+            # Merchant API contract keeps amount in minor units for backward compatibility.
+            amount=(Decimal(str(payment_request.amount)) / Decimal("100")),
+            currency=payment_request.currency,
+            metadata={
+                "order_id": payment_request.order_id,
+                "merchant_id": merchant["merchant_id"],
+                "customer_email": payment_request.customer_email,
+                "description": payment_request.description,
+                "route_id": route_config.get("route_id") if isinstance(route_config, dict) else None,
+                **(payment_request.metadata or {}),
+            },
+            preferred_psps=preferred_psps,
+            candidates=candidates,
+        )
+
+        payment_id = str(result.get("payment_id") or f"failed_{secrets.token_hex(8)}")
         await _emit_payment_webhook_best_effort(
             merchant["merchant_id"],
-            event_type="payment.failed",
+            event_type="payment.completed" if result.get("success") else "payment.failed",
             payment_request=payment_request,
-            result=last_result,
-            psp_used=last_attempted_provider,
+            result={**result, "payment_id": payment_id},
+            psp_used=result.get("psp_used") or preferred_psps[0],
         )
         return PaymentExecuteResponse(
-            success=False,
-            payment_id=last_result["payment_id"],
+            success=bool(result.get("success")),
+            payment_id=payment_id,
             order_id=payment_request.order_id,
             amount=payment_request.amount,
             currency=payment_request.currency,
-            psp_used=last_attempted_provider,
-            status=last_result["status"],
-            transaction_id=last_result.get("transaction_id"),
-            error_message=last_result.get("error_message") or "; ".join(errors),
+            psp_used=str(result.get("psp_used") or preferred_psps[0]),
+            status=str(result.get("status") or ("requires_action" if result.get("success") else "failed")),
+            transaction_id=result.get("transaction_id"),
+            requires_customer_action=bool(result.get("requires_customer_action")),
+            payment_action=result.get("payment_action"),
+            error_message=result.get("error_message"),
             timestamp=datetime.now().isoformat(),
         )
 
