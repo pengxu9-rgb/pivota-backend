@@ -36,6 +36,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--order-id", help="Explicit order ID for the initiation call.")
     parser.add_argument("--output", help="Write evidence JSON to this file path.")
     parser.add_argument(
+        "--stripe-checkout-canary",
+        action="store_true",
+        help=(
+            "Request Stripe hosted checkout by passing metadata.psp_mode=stripe_checkout. "
+            "Intended for ops canary proof only."
+        ),
+    )
+    parser.add_argument(
         "--emit-merchant-webhook",
         action="store_true",
         help="Allow the canary execution to emit merchant outbound webhook events.",
@@ -65,12 +73,30 @@ def _parse_provider_order(raw: Optional[str]) -> Optional[list[dict[str, Any]]]:
     return [{"psp": provider, "priority": index + 1} for index, provider in enumerate(providers)]
 
 
+def _build_payment_request(args: argparse.Namespace, order_id: str) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "source": "ops_psp_canary_harness",
+    }
+    if args.stripe_checkout_canary:
+        metadata["psp_mode"] = "stripe_checkout"
+
+    return {
+        "amount": args.amount_minor,
+        "currency": args.currency,
+        "order_id": order_id,
+        "customer_email": args.email,
+        "description": "ops_psp_canary_harness",
+        "metadata": metadata,
+    }
+
+
 async def _run(args: argparse.Namespace) -> int:
     evidence: Dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "merchant_id": args.merchant_id,
         "base_url": args.base_url.rstrip("/"),
         "mode": args.mode,
+        "stripe_checkout_canary": bool(args.stripe_checkout_canary),
     }
 
     async with httpx.AsyncClient(base_url=args.base_url.rstrip("/"), timeout=20.0) as client:
@@ -112,16 +138,7 @@ async def _run(args: argparse.Namespace) -> int:
             evidence["routing_applied"] = route_update_resp.json().get("data") or route_update_resp.json()
 
         order_id = args.order_id or f"canary_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(4)}"
-        payment_request = {
-            "amount": args.amount_minor,
-            "currency": args.currency,
-            "order_id": order_id,
-            "customer_email": args.email,
-            "description": "ops_psp_canary_harness",
-            "metadata": {
-                "source": "ops_psp_canary_harness",
-            },
-        }
+        payment_request = _build_payment_request(args, order_id)
 
         execute_headers: Dict[str, str] = {}
         execute_path = "/payment/execute"
