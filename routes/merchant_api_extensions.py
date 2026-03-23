@@ -384,6 +384,7 @@ def _normalize_merchant_route_priority(
     active_psps: List[Dict[str, Any]],
     *,
     strict: bool,
+    append_unlisted_active: bool = True,
 ) -> List[Dict[str, Any]]:
     active_order = []
     active_providers: Dict[str, Dict[str, Any]] = {}
@@ -415,11 +416,12 @@ def _normalize_merchant_route_priority(
         seen.add(provider)
         normalized.append({"psp": provider, "priority": len(normalized) + 1})
 
-    for provider in active_order:
-        if provider in seen:
-            continue
-        seen.add(provider)
-        normalized.append({"psp": provider, "priority": len(normalized) + 1})
+    if append_unlisted_active:
+        for provider in active_order:
+            if provider in seen:
+                continue
+            seen.add(provider)
+            normalized.append({"psp": provider, "priority": len(normalized) + 1})
 
     return normalized
 
@@ -1140,6 +1142,7 @@ async def get_merchant_routing_config(
             default_config["psp_priority"],
             active_psps,
             strict=False,
+            append_unlisted_active=True,
         )
         routing_strategy = "priority"
         max_retries = max(0, len(psp_priority) - 1)
@@ -1159,7 +1162,15 @@ async def get_merchant_routing_config(
             raw_psp_priority,
             active_psps,
             strict=False,
+            append_unlisted_active=False,
         )
+        if not psp_priority:
+            psp_priority = _normalize_merchant_route_priority(
+                [],
+                active_psps,
+                strict=False,
+                append_unlisted_active=True,
+            )
         routing_strategy = "priority"
         max_retries = max(0, len(psp_priority) - 1)
         timeout_ms = route_dict.get("timeout_ms", 30000)
@@ -1233,7 +1244,13 @@ async def update_merchant_routing_config(
         update.psp_priority,
         active_psps,
         strict=True,
+        append_unlisted_active=False,
     )
+    if not normalized_priority:
+        raise HTTPException(
+            status_code=400,
+            detail="Routing config must include at least one active PSP",
+        )
     max_retries = max(0, len(normalized_priority) - 1)
     timeout_ms = update.timeout_ms if update.timeout_ms > 0 else 30000
 

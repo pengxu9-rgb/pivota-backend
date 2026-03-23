@@ -141,14 +141,14 @@ async def _resolve_payment_candidates(
             candidate = active_by_provider.get(provider)
             if candidate:
                 ordered_candidates.append(candidate)
-        for provider, candidate in active_by_provider.items():
-            if provider not in [c.get("provider") for c in ordered_candidates]:
-                ordered_candidates.append(candidate)
     except Exception as exc:
         logger.warning("Failed to resolve merchant payment_routes for %s: %s", merchant_id, exc)
 
     if ordered_candidates:
         return ordered_candidates, route_config
+
+    if active_psps:
+        return active_psps, route_config
 
     legacy_route = await get_merchant_psp_route(merchant_id)
     if legacy_route:
@@ -325,12 +325,11 @@ async def execute_payment(
             )
 
         last_result: Optional[Dict[str, Any]] = None
-        last_provider = "unknown"
+        last_attempted_provider = "unknown"
         errors: List[str] = []
 
         for candidate in candidates:
             provider = str(candidate.get("provider") or "").strip().lower()
-            last_provider = provider or last_provider
 
             if provider not in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS:
                 errors.append(f"{provider}: unsupported provider")
@@ -354,6 +353,7 @@ async def execute_payment(
                     continue
                 result = await execute_adyen_payment(api_key, merchant_account, payment_request)
 
+            last_attempted_provider = provider
             last_result = result
             if result.get("success"):
                 await _emit_payment_webhook_best_effort(
@@ -389,7 +389,7 @@ async def execute_payment(
             event_type="payment.failed",
             payment_request=payment_request,
             result=last_result,
-            psp_used=last_provider,
+            psp_used=last_attempted_provider,
         )
         return PaymentExecuteResponse(
             success=False,
@@ -397,7 +397,7 @@ async def execute_payment(
             order_id=payment_request.order_id,
             amount=payment_request.amount,
             currency=payment_request.currency,
-            psp_used=last_provider,
+            psp_used=last_attempted_provider,
             status=last_result["status"],
             transaction_id=last_result.get("transaction_id"),
             error_message=last_result.get("error_message") or "; ".join(errors),
