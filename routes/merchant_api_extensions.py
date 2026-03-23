@@ -1505,7 +1505,9 @@ async def connect_psp(
     provider_config: Dict[str, Any] = {}
 
     if provider == "stripe":
-        provider_config["mode"] = str(psp_data.get("mode") or "payment_intent").strip().lower()
+        # Merchant-facing Stripe setup is always stored as PaymentIntent.
+        # Stripe Checkout remains an internal/runtime override, not a merchant config choice.
+        provider_config["mode"] = "payment_intent"
     elif provider == "adyen":
         merchant_account = str(psp_data.get("merchant_account") or account_id or "").strip()
         client_key = str(psp_data.get("client_key") or "").strip()
