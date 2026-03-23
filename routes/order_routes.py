@@ -32,12 +32,12 @@ from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from db.database import database, IS_POSTGRES
 from utils.auth import require_admin, require_admin_or_key, get_current_user
-from config.settings import settings
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_payment_initiation_service import build_payment_action
+from services.merchant_psp_config_service import build_runtime_adapter_kwargs
 from services.promotions_service import list_promotions, PromotionStatus
 from services.quote_service import (
     QuoteError,
@@ -67,6 +67,7 @@ from services.reviews_invitation_send_jobs_service import (
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 _PG_SHOPIFY_LOCK_SUPPORTED: Optional[bool] = None
+_SUPPORTED_ORDER_PROVIDER_HINTS = {"stripe", "adyen", "checkout", "paypal"}
 
 
 def _shopify_order_lock_key(order_id: str) -> int:
@@ -110,6 +111,118 @@ async def _release_shopify_order_lock(lock_key: Optional[int], *, lock_acquired:
         )
     except Exception:
         pass
+
+
+def _normalize_order_provider_hint(
+    selected_psp: Optional[str], preferred_psp: Optional[str]
+) -> Optional[str]:
+    for candidate in (selected_psp, preferred_psp):
+        provider = str(candidate or "").strip().lower()
+        if provider in _SUPPORTED_ORDER_PROVIDER_HINTS:
+            return provider
+    return None
+
+
+def _finalize_order_psp_used(psp_used: Optional[str], fallback_provider: Optional[str]) -> str:
+    value = str(psp_used or fallback_provider or "unknown").strip().lower()
+    return value or "unknown"
+
+
+async def _resolve_active_order_psp(
+    merchant_id: str, provider_hint: Optional[str]
+) -> Tuple[str, str]:
+    psp_row = None
+    if provider_hint:
+        psp_row = await database.fetch_one(
+            """
+            SELECT provider, psp_id FROM merchant_psps
+            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+            ORDER BY connected_at DESC
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_id,
+                "provider": provider_hint,
+            },
+        )
+
+    if not psp_row:
+        psp_row = await database.fetch_one(
+            """
+            SELECT provider, psp_id FROM merchant_psps
+            WHERE merchant_id = :merchant_id AND status = 'active'
+            ORDER BY connected_at DESC
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id},
+        )
+
+    if not psp_row:
+        raise HTTPException(
+            status_code=400,
+            detail="No active PSP configuration found for this merchant",
+        )
+
+    provider = str(psp_row["provider"] or "").strip().lower()
+    psp_id = str(psp_row["psp_id"] or "").strip()
+    if not provider or not psp_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Active PSP configuration is incomplete for this merchant",
+        )
+    return provider, psp_id
+
+
+async def _resolve_order_psp_adapter(order: Dict[str, Any]) -> Tuple[str, Any]:
+    merchant_id = str(order.get("merchant_id") or "").strip()
+    order_psp_id = str(order.get("psp_id") or "").strip()
+    provider_hint = str(order.get("psp_used") or "").strip().lower() or None
+
+    psp_row = None
+    if merchant_id and order_psp_id:
+        psp_row = await database.fetch_one(
+            """
+            SELECT provider, api_key, account_id, secret_key, environment, provider_config
+            FROM merchant_psps
+            WHERE merchant_id = :merchant_id AND psp_id = :psp_id
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id, "psp_id": order_psp_id},
+        )
+
+    if not psp_row and merchant_id and provider_hint:
+        psp_row = await database.fetch_one(
+            """
+            SELECT provider, api_key, account_id, secret_key, environment, provider_config
+            FROM merchant_psps
+            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
+            ORDER BY connected_at DESC
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id, "provider": provider_hint},
+        )
+
+    if not psp_row:
+        raise ValueError("Canonical merchant_psps configuration is missing for this order")
+
+    row_dict = dict(psp_row)
+    provider = str(row_dict.get("provider") or "").strip().lower()
+    api_key = str(row_dict.get("api_key") or "").strip()
+    if not provider or not api_key:
+        raise ValueError("Canonical merchant_psps configuration is incomplete for this order")
+
+    adapter = get_psp_adapter(
+        provider,
+        api_key,
+        **build_runtime_adapter_kwargs(
+            provider,
+            account_id=row_dict.get("account_id"),
+            provider_config=row_dict.get("provider_config"),
+            environment=row_dict.get("environment"),
+            secret_key=row_dict.get("secret_key"),
+        ),
+    )
+    return provider, adapter
 
 
 # ============================================================================
@@ -847,52 +960,21 @@ async def create_new_order(
             logger.error(f"[OrderRoutes] Routing selection failed, falling back to legacy PSP: {e}")
             selected_psp = None
 
-        # Source of truth is routing config; merchant_onboarding.psp_type and
-        # preferred_psp are legacy hints.
-        psp_type = selected_psp or (order_request.preferred_psp or merchant.get("psp_type")) or None
+        # Source of truth is canonical merchant_psps. Route selection and an explicit
+        # provider preference can hint which active provider row to choose, but we do
+        # not fall back to merchant_onboarding.psp_type for live runtime decisions.
+        provider_hint = _normalize_order_provider_hint(
+            selected_psp,
+            order_request.preferred_psp,
+        )
 
         # Always get psp_id for PSP metrics tracking (even if psp_type is known)
         psp_id_value = None
         try:
-            psp_row = None
-            if psp_type:
-                # Try to get a matching active PSP for the requested type
-                psp_row = await database.fetch_one(
-                    """
-                    SELECT provider, psp_id FROM merchant_psps
-                    WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
-                    ORDER BY connected_at DESC
-                    LIMIT 1
-                    """,
-                    {
-                        "merchant_id": order_request.merchant_id,
-                        "provider": psp_type,
-                    },
-                )
-
-            # If no explicit type or no active PSP for that type, fall back to first active PSP
-            if not psp_row:
-                psp_row = await database.fetch_one(
-                    """
-                    SELECT provider, psp_id FROM merchant_psps
-                    WHERE merchant_id = :merchant_id AND status = 'active'
-                    ORDER BY connected_at DESC
-                    LIMIT 1
-                    """,
-                    {"merchant_id": order_request.merchant_id},
-                )
-
-            if psp_row:
-                psp_type = psp_row["provider"]
-                psp_id_value = psp_row["psp_id"]
-            else:
-                logger.error(
-                    f"No active PSP found for merchant {order_request.merchant_id}"
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail="No active PSP configuration found for this merchant",
-                )
+            psp_type, psp_id_value = await _resolve_active_order_psp(
+                order_request.merchant_id,
+                provider_hint,
+            )
         except HTTPException:
             raise
         except Exception as e:
@@ -1005,68 +1087,6 @@ async def create_new_order(
         payment_action: Dict[str, Any] = {}
         
         try:
-            # PSP type already determined above when creating order_data
-            if not psp_type:
-                psp_type = "stripe"  # Final fallback
-
-            # PSP 密钥查找：优先从 merchant_psps 表
-            psp_key = None
-            psp_account_id = None
-            psp_secret = None  # For PayPal client_secret
-            
-            # 1. 首先尝试从 merchant_psps 表获取对应 PSP 的 key 和 account_id
-            # 数据库配置优先于环境变量！
-            try:
-                psp_row = await database.fetch_one(
-                    """
-                    SELECT api_key, account_id, secret_key FROM merchant_psps
-                    WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
-                    ORDER BY connected_at DESC
-                    LIMIT 1
-                    """,
-                    {"merchant_id": order_request.merchant_id, "provider": psp_type}
-                )
-                if psp_row and psp_row["api_key"]:
-                    psp_key = psp_row["api_key"]
-                    try:
-                        psp_account_id = psp_row["account_id"]
-                        psp_secret = psp_row.get("secret_key") if hasattr(psp_row, 'get') else psp_row["secret_key"]
-                    except Exception:
-                        psp_account_id = None
-                        psp_secret = None
-                    logger.info(f"✅ Found {psp_type} key in DB for merchant {order_request.merchant_id}")
-                    logger.info(f"   API Key length: {len(psp_key)}, Account ID: {psp_account_id}, Has secret: {bool(psp_secret)}")
-                else:
-                    logger.info(f"⚠️  No {psp_type} config in DB for merchant {order_request.merchant_id}")
-            except Exception as e:
-                logger.warning(f"DB PSP key lookup failed: {e}")
-            
-            # 2. 如果数据库没有，且是 Stripe，尝试从 merchant 表获取（兼容旧数据）
-            if not psp_key and psp_type == "stripe":
-                psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-                if psp_key:
-                    logger.info(f"Using legacy Stripe key from merchant table")
-            
-            # 3. 最后回退到环境变量（仅作为开发/测试的备选）
-            # 注意：数据库配置优先！环境变量只用于没有数据库配置的情况
-            if not psp_key:
-                if psp_type == "stripe":
-                    env_key = getattr(settings, "stripe_secret_key", None)
-                    if env_key and len(env_key) > 10:  # Validate key is not empty
-                        psp_key = env_key
-                        logger.info(f"Using Stripe key from environment (fallback)")
-                # 移除 Adyen 环境变量回退 - 强制使用数据库配置
-                # Checkout 和 PayPal 已经只使用数据库配置
-                
-            # 4. If still no key, fail with clear error message
-            if not psp_key:
-                logger.error(f"❌ No {psp_type} API key found for merchant {merchant['merchant_id']}")
-                # Skip payment intent creation but continue with order
-                # This allows the order to be created, but merchant needs to configure PSP
-                logger.warning(f"⚠️  Order will be created without payment intent. Merchant must configure {psp_type} to accept payments.")
-            else:
-                logger.info(f"✅ Using PSP key from database/environment for {psp_type}")
-            
             # Build preferred PSP ordering from routing config (if available)
             preferred_psps: Optional[List[str]] = None
             try:
@@ -1123,8 +1143,7 @@ async def create_new_order(
             )
             response_ms = int((time.monotonic() - start_ts) * 1000)
 
-            # 最终实际使用的 PSP（如果 orchestrator 没返回，则回退到 initial_psp_name）
-            final_psp = (psp_used or initial_psp_name or psp_type or "stripe").lower()
+            final_psp = _finalize_order_psp_used(psp_used, psp_type)
             logger.info(
                 f"[OrderRoutes] Payment intent result via MultiPSPOrchestrator: "
                 f"success={success}, psp_used={final_psp}, has_intent={payment_intent is not None}, error={error}"
@@ -1342,40 +1361,7 @@ async def confirm_payment(
         raise HTTPException(status_code=404, detail="Merchant not found")
     
     try:
-        # 获取商户的 PSP 类型和密钥（带 fallback）
-        psp_type = merchant.get("psp_type")
-        if not psp_type:
-            try:
-                psp_row = await database.fetch_one(
-                    """
-                    SELECT provider FROM merchant_psps
-                    WHERE merchant_id = :merchant_id
-                    ORDER BY connected_at DESC
-                    LIMIT 1
-                    """,
-                    {"merchant_id": order["merchant_id"]}
-                )
-                if psp_row:
-                    psp_type = psp_row["provider"]
-            except Exception:
-                psp_type = None
-        if not psp_type:
-            psp_type = "stripe"
-        # 尝试获取 psp_sandbox_key 或 psp_key (same logic as create_new_order)
-        psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-        
-        # 如果商户没有配置密钥，使用系统默认（开发环境）
-        if not psp_key:
-            if psp_type == "stripe":
-                psp_key = getattr(settings, "stripe_secret_key", None)
-            else:
-                psp_key = getattr(settings, "adyen_api_key", None)
-        
-        if not psp_key:
-            raise ValueError(f"No PSP key found for merchant {merchant['merchant_id']}")
-        
-        # 创建 PSP 适配器
-        psp_adapter = get_psp_adapter(psp_type, psp_key)
+        psp_type, psp_adapter = await _resolve_order_psp_adapter(order)
         
         # 确认支付
         success, status, error = await psp_adapter.confirm_payment(

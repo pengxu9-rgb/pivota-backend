@@ -11,7 +11,6 @@ from databases import Database
 
 from db.orders import get_order, update_order
 from db.database import database as db
-from db.merchant_onboarding import get_merchant_onboarding
 from adapters.psp_adapter import get_psp_adapter
 from services.merchant_psp_config_service import build_runtime_adapter_kwargs
 from utils.logger import logger
@@ -262,7 +261,6 @@ class RefundService:
 
             psp_key: Optional[str] = None
             adapter_kwargs: Dict[str, Any] = {}
-            merchant = None
 
             merchant_psp_row = None
             order_psp_id = str(order.get("psp_id") or "").strip()
@@ -309,32 +307,7 @@ class RefundService:
                 )
 
             if not psp_key:
-                try:
-                    merchant = await get_merchant_onboarding(merchant_id) if merchant_id else None
-                    merchant_psp_type = str((merchant or {}).get("psp_type") or "").strip().lower() or None
-                    if merchant_psp_type and merchant_psp_type == psp_type:
-                        psp_key = (merchant or {}).get("psp_sandbox_key") or (merchant or {}).get("psp_key")
-                except Exception:
-                    merchant = None
-
-            if not psp_key:
-                if psp_type == "stripe":
-                    psp_key = settings.stripe_secret_key
-                elif psp_type == "adyen":
-                    psp_key = getattr(settings, "adyen_api_key", None)
-                    adapter_kwargs = {
-                        **adapter_kwargs,
-                        "merchant_account": getattr(settings, "adyen_merchant_account", "PivotaTestMerchant"),
-                        "environment": "unknown",
-                    }
-                elif psp_type == "checkout":
-                    psp_key = getattr(settings, "checkout_secret_key", None) or getattr(settings, "checkout_api_key", None)
-                    adapter_kwargs = {
-                        **adapter_kwargs,
-                        "public_key": getattr(settings, "checkout_public_key", None),
-                        "environment": "unknown",
-                    }
-                elif psp_type == "paypal":
+                if psp_type == "paypal":
                     psp_key = getattr(settings, "paypal_client_id", None) or getattr(settings, "paypal_api_key", None)
                     adapter_kwargs = {
                         **adapter_kwargs,
