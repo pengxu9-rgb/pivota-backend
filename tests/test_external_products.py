@@ -4562,6 +4562,8 @@ async def test_shop_gateway_find_products_multi_requires_structured_ingredient_m
     assert metadata.get("ingredient_intents") == ["niacinamide"]
     assert metadata.get("matched_ingredient_ids") == ["niacinamide"]
     assert metadata.get("matched_ingredient_labels") == ["Niacinamide"]
+    assert metadata.get("strict_constraint_query") is True
+    assert metadata.get("strict_constraint_reason") == "ingredient"
 
 
 @pytest.mark.asyncio
@@ -4629,6 +4631,8 @@ async def test_shop_gateway_find_products_multi_fails_closed_without_structured_
     assert metadata.get("visible_category_intents") == ["serum"]
     assert metadata.get("ingredient_intents") == ["niacinamide"]
     assert metadata.get("matched_ingredient_ids") == []
+    assert metadata.get("strict_constraint_query") is True
+    assert metadata.get("strict_constraint_reason") == "ingredient"
 
 
 @pytest.mark.asyncio
@@ -4728,3 +4732,74 @@ async def test_shop_gateway_find_products_multi_requires_structured_shade_match_
     assert metadata.get("visible_category_intents") == ["foundation"]
     assert metadata.get("visible_option_intents") == ["shade_210"]
     assert metadata.get("matched_visible_option_labels") == ["shade_210"]
+    assert metadata.get("strict_constraint_query") is True
+    assert metadata.get("strict_constraint_reason") == "shade"
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_marks_ingredient_budget_queries_as_multi_constraint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_live_1", "business_name": "Live Merchant"}]
+        if "FROM external_product_seeds" in q or "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        serum = agent_shop_gateway_module.StandardProduct(
+            id="prod_serum_vitamin_c",
+            product_id="prod_serum_vitamin_c",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Vitamin C Repair Serum",
+            product_type="Serum",
+            ingredient_ids=["ascorbic_acid"],
+            price=29.0,
+            currency="EUR",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [serum], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="vitamin c serum under €30",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    metadata = result.get("metadata") or {}
+    assert result.get("total") == 1
+    assert metadata.get("ingredient_intents") == ["ascorbic_acid"]
+    assert metadata.get("matched_ingredient_ids") == ["ascorbic_acid"]
+    assert metadata.get("budget_price_max") == 30.0
+    assert metadata.get("strict_constraint_query") is True
+    assert metadata.get("strict_constraint_reason") == "multi_constraint"
