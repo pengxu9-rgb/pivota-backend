@@ -45,7 +45,12 @@ def normalize_psp_environment(provider: str, api_key: Optional[str], environment
     elif provider_norm == "checkout":
         if key.startswith("sk_live_") or key.startswith("pk_live_"):
             return "live"
-        if key.startswith("sk_test_") or key.startswith("pk_test_"):
+        if (
+            key.startswith("sk_test_")
+            or key.startswith("pk_test_")
+            or key.startswith("sk_sbox_")
+            or key.startswith("pk_sbox_")
+        ):
             return "test"
     elif provider_norm == "adyen":
         if key.startswith("live_"):

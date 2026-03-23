@@ -47,6 +47,19 @@ def test_build_provider_connect_record_infers_environment_from_key_when_row_is_u
     assert record["environment"] == "live"
 
 
+def test_build_provider_connect_record_infers_test_environment_from_sandbox_checkout_key() -> None:
+    record = build_provider_connect_record(
+        "checkout",
+        api_key="sk_sbox_example_checkout_validation_key",
+        account_id="pc_test_123",
+        provider_config={"public_key": "pk_sbox_123"},
+        environment="unknown",
+        validation_status="unknown",
+    )
+
+    assert record["environment"] == "test"
+
+
 def test_evaluate_psp_readiness_marks_live_valid_stripe_as_ready() -> None:
     readiness = evaluate_psp_readiness(
         "stripe",

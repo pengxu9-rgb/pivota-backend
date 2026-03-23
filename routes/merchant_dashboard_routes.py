@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+from decimal import Decimal
 import logging
 import random
 import httpx
@@ -19,6 +20,7 @@ from db.merchant_portal_preferences import (
     get_merchant_portal_preferences,
     upsert_merchant_portal_preferences,
 )
+from adapters.psp_adapter import get_psp_adapter
 from models.order_response import format_order_for_response
 from services.merchant_webhook_service import (
     get_signing_secret as get_merchant_webhook_signing_secret,
@@ -30,6 +32,7 @@ from services.merchant_webhook_service import (
     update_webhook_config as update_merchant_webhook_config,
 )
 from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
     build_provider_connect_record,
     evaluate_psp_readiness,
     parse_capabilities,
@@ -1151,19 +1154,29 @@ async def test_psp_connection(
                 raise ValueError("Checkout.com processing channel ID is missing")
             if not provider_summary.get("public_key_present"):
                 raise ValueError("Checkout.com public key is missing")
-            base_url = (
-                "https://api.checkout.com"
-                if provider_summary.get("environment") == "live"
-                else "https://api.sandbox.checkout.com"
+            checkout_adapter = get_psp_adapter(
+                provider,
+                api_key,
+                **build_runtime_adapter_kwargs(
+                    provider,
+                    account_id=psp_row.get("account_id"),
+                    provider_config=psp_row.get("provider_config"),
+                    environment=provider_summary.get("environment"),
+                    secret_key=psp_row.get("secret_key"),
+                ),
             )
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"{base_url}/instruments",
-                    headers={"Authorization": api_key},
-                    timeout=10.0,
-                )
-            if response.status_code != 200:
-                raise ValueError(f"Checkout.com validation failed: {response.status_code} {response.text[:240]}")
+            checkout_success, checkout_intent, checkout_error = await checkout_adapter.create_payment_intent(
+                amount=Decimal("0.01"),
+                currency="USD",
+                metadata={
+                    "order_id": f"checkout_validation_{psp_id}",
+                    "source": "merchant_psp_validation",
+                    "merchant_id": psp_row.get("merchant_id"),
+                    "customer_email": current_user.get("email"),
+                },
+            )
+            if not checkout_success or not checkout_intent:
+                raise ValueError(checkout_error or "Checkout.com validation failed")
             success = True
             validation_message = "Checkout.com credentials verified"
 

@@ -207,7 +207,7 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
 def test_test_psp_connection_persists_environment_and_validation_truth(monkeypatch) -> None:
     client, module = _build_client()
     executed = []
-    requested_urls = []
+    adapter_calls = []
 
     async def fake_fetch_one(query, values=None):
         assert values["psp_id"] == "psp_checkout_1"
@@ -230,24 +230,20 @@ def test_test_psp_connection_persists_environment_and_validation_truth(monkeypat
     async def fake_execute(query, values=None):
         executed.append({"query": " ".join(query.split()), "values": dict(values or {})})
 
-    class FakeResponse:
-        status_code = 200
-        text = "ok"
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def get(self, url, headers=None, timeout=None):
-            requested_urls.append(url)
-            return FakeResponse()
+    class FakeCheckoutAdapter:
+        async def create_payment_intent(self, amount, currency, metadata):
+            adapter_calls.append(
+                {
+                    "amount": str(amount),
+                    "currency": currency,
+                    "metadata": dict(metadata),
+                }
+            )
+            return True, object(), None
 
     monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(module.database, "execute", fake_execute)
-    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "get_psp_adapter", lambda provider, api_key, **kwargs: FakeCheckoutAdapter())
 
     response = client.post("/merchant/psp/psp_checkout_1/test")
 
@@ -257,7 +253,10 @@ def test_test_psp_connection_persists_environment_and_validation_truth(monkeypat
     assert body["data"]["environment"] == "live"
     assert body["data"]["validation_status"] == "valid"
     assert body["data"]["live_charge_ready"] is True
-    assert requested_urls == ["https://api.checkout.com/instruments"]
+    assert len(adapter_calls) == 1
+    assert adapter_calls[0]["amount"] == "0.01"
+    assert adapter_calls[0]["currency"] == "USD"
+    assert adapter_calls[0]["metadata"]["order_id"] == "checkout_validation_psp_checkout_1"
     assert executed
     assert executed[0]["values"]["environment"] == "live"
     assert executed[0]["values"]["validation_status"] == "valid"
