@@ -25,6 +25,17 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "agent_scoped_buyer_ref",
         },
     ),
+    RequiredTableColumns(
+        table="merchant_psps",
+        columns={
+            "secret_key",
+            "environment",
+            "provider_config",
+            "validation_status",
+            "validation_error",
+            "last_validated_at",
+        },
+    ),
 )
 
 
@@ -101,6 +112,19 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_psps
+                      ADD COLUMN IF NOT EXISTS secret_key TEXT,
+                      ADD COLUMN IF NOT EXISTS environment VARCHAR(20) DEFAULT 'unknown',
+                      ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb,
+                      ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown',
+                      ADD COLUMN IF NOT EXISTS validation_error TEXT,
+                      ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE;
+                    """
+                )
+            )
             return
 
         if IS_SQLITE:
@@ -111,6 +135,21 @@ async def ensure_required_schema_light() -> None:
                     await database.execute(text(f"ALTER TABLE orders ADD COLUMN {col} TEXT;"))
                 except Exception:
                     # Ignore duplicate-column / unsupported variations.
+                    continue
+            psp_missing = set(missing.get("merchant_psps") or [])
+            sqlite_type = {
+                "provider_config": "TEXT",
+                "last_validated_at": "TEXT",
+            }
+            for col in sorted(psp_missing):
+                try:
+                    await database.execute(
+                        text(
+                            f"ALTER TABLE merchant_psps ADD COLUMN {col} "
+                            f"{sqlite_type.get(col, 'TEXT')};"
+                        )
+                    )
+                except Exception:
                     continue
             return
     except Exception:
