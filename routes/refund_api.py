@@ -21,6 +21,7 @@ from services.shopify_transactions_service import (
     ensure_external_refund_transaction_best_effort,
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.merchant_webhook_service import emit_merchant_webhook_event
 
 
 router = APIRouter(prefix="/orders", tags=["refunds"])
@@ -406,6 +407,27 @@ async def process_refund(
                 logger.error(f"Error updating Shopify order after refund: {e}")
         
         background_tasks.add_task(update_shopify_order_task)
+
+        try:
+            await emit_merchant_webhook_event(
+                str(order.get("merchant_id")),
+                event_type="refund.processed",
+                payload={
+                    "order_id": str(order_id),
+                    "merchant_id": str(order.get("merchant_id")),
+                    "refund_id": str(refund_id),
+                    "amount": float(refund_amount),
+                    "currency": str(order.get("currency") or "USD"),
+                    "is_partial": is_partial,
+                    "status": new_status,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to emit merchant refund.processed webhook for %s: %s",
+                order.get("merchant_id"),
+                exc,
+            )
 
         response = {
             "status": "success",

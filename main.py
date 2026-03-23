@@ -121,10 +121,6 @@ from routes.admin_migrations import router as admin_migrations_router
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
-from jobs.product_quality_backfill_worker import (
-    start_product_quality_backfill_loop,
-    stop_product_quality_backfill_loop,
-)
 from routes.admin_fix_merchant import router as admin_fix_router
 from routes.admin_fix_psp_id import router as admin_fix_psp_id_router
 from routes.admin_debug_psp_metrics import router as admin_debug_psp_metrics_router
@@ -329,6 +325,11 @@ from services.agent_webhook_service import (
     start_agent_webhook_retry_worker,
     stop_agent_webhook_retry_worker,
 )
+from services.merchant_webhook_service import (
+    ensure_merchant_webhook_tables,
+    start_merchant_webhook_retry_worker,
+    stop_merchant_webhook_retry_worker,
+)
 from services.webhook_service import WebhookService
 
 app = FastAPI(
@@ -509,7 +510,9 @@ async def startup_event():
     # Ensure webhook audit/idempotency table exists (best-effort; does not raise)
     await WebhookService.ensure_webhook_events_table()
     await ensure_agent_webhook_tables()
+    await ensure_merchant_webhook_tables()
     await start_agent_webhook_retry_worker()
+    await start_merchant_webhook_retry_worker()
 
     # Optional: background photo TTL cleanup (non-blocking).
     try:
@@ -520,6 +523,7 @@ async def startup_event():
 
 async def shutdown_event():
     await stop_agent_webhook_retry_worker()
+    await stop_merchant_webhook_retry_worker()
     await database.disconnect()
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
@@ -951,11 +955,6 @@ async def startup():
             start_photo_cleanup_loop()
         except Exception:
             pass
-
-        try:
-            start_product_quality_backfill_loop()
-        except Exception as e:
-            logger.warning(f"⚠️ Product quality backfill loop skipped: {e}")
 
         # Minimal schema guard (fast; safe for prod "fast mode").
         # Prevents outages when a deploy accidentally skips SQL migrations.
@@ -1417,7 +1416,6 @@ async def startup():
 async def shutdown():
     """Cleanup on shutdown"""
     try:
-        await stop_product_quality_backfill_loop()
         await database.disconnect()
         logger.info("Database disconnected")
         logger.info("🛑 Application shutdown complete")

@@ -52,6 +52,7 @@ from services.shopify_transactions_service import (
     ensure_external_payment_transaction_best_effort,
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.merchant_webhook_service import emit_merchant_webhook_event
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
     send_invitation_email_from_order,
@@ -962,6 +963,27 @@ async def create_new_order(
             "payment_method": None
         }
         order_id = await create_order(order_data)
+
+        try:
+            await emit_merchant_webhook_event(
+                order_request.merchant_id,
+                event_type="order.created",
+                payload={
+                    "order_id": str(order_id),
+                    "merchant_id": str(order_request.merchant_id),
+                    "customer_email": order_request.customer_email,
+                    "total": float(total),
+                    "currency": order_request.currency,
+                    "item_count": len(order_request.items or []),
+                    "psp_used": psp_type,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to emit merchant order.created webhook for %s: %s",
+                order_request.merchant_id,
+                exc,
+            )
 
         # Consume quote best-effort after order creation succeeds.
         if order_request.quote_id:

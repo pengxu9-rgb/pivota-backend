@@ -176,6 +176,8 @@ class PaymentRoutingService:
         
         # Apply routing strategy
         strategy = route_config.get("routing_strategy", "priority")
+        if merchant_id:
+            strategy = RoutingStrategy.PRIORITY.value
         
         if strategy == RoutingStrategy.COST.value:
             # TODO: Implement cost-based routing

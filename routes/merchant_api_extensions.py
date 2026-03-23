@@ -1,8 +1,5 @@
 """Extended Merchant API Routes for Dashboard Features"""
-import csv
-import io
-
-from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
@@ -31,21 +28,12 @@ from readiness.remediation import (
     ActionNotFoundError,
     JobNotFoundError,
     PlanSupersededError,
-    clear_resolved_source_data_decisions,
-    delete_source_data_decision_state,
     get_execution_job,
     get_product_blocker_detail,
-    get_source_data_triage,
     preview_remediation_action,
     run_remediation_action,
-    upsert_source_data_decision_state,
 )
-from readiness.summary import (
-    build_lane_delta,
-    build_readiness_optimization,
-    build_readiness_summary,
-    invalidate_readiness_optimization_cache,
-)
+from readiness.summary import build_readiness_optimization, build_readiness_summary
 
 router = APIRouter()
 
@@ -60,11 +48,6 @@ class RefundRequest(BaseModel):
 class ReadinessRefreshRequest(BaseModel):
     scope: str = "merchant"
     reason: str = "manual"
-    reason_code: Optional[str] = None
-
-
-class SourceDataDecisionRequest(BaseModel):
-    decision_state: str
 
 
 class ReadinessActionPreviewRequest(BaseModel):
@@ -382,6 +365,65 @@ class MerchantRoutingUpdate(BaseModel):
     timeout_ms: int = 30000
 
 
+async def _get_active_merchant_psps(merchant_id: str) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT psp_id, provider, name, status, connected_at
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id
+          AND status = 'active'
+        ORDER BY connected_at DESC NULLS LAST, psp_id ASC
+        """,
+        {"merchant_id": merchant_id},
+    )
+    return [dict(row) for row in rows or []]
+
+
+def _normalize_merchant_route_priority(
+    requested_priority: Any,
+    active_psps: List[Dict[str, Any]],
+    *,
+    strict: bool,
+) -> List[Dict[str, Any]]:
+    active_order = []
+    active_providers: Dict[str, Dict[str, Any]] = {}
+    for row in active_psps:
+        provider = str(row.get("provider") or "").strip().lower()
+        if provider and provider not in active_providers:
+            active_providers[provider] = row
+            active_order.append(provider)
+
+    if not active_order:
+        raise HTTPException(status_code=400, detail="No active PSPs available for routing")
+
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    requested_list = requested_priority if isinstance(requested_priority, list) else []
+    for entry in requested_list:
+        provider = str((entry or {}).get("psp") or "").strip().lower()
+        if not provider:
+            continue
+        if provider not in active_providers:
+            if strict:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid or inactive PSP in routing config: {provider}",
+                )
+            continue
+        if provider in seen:
+            continue
+        seen.add(provider)
+        normalized.append({"psp": provider, "priority": len(normalized) + 1})
+
+    for provider in active_order:
+        if provider in seen:
+            continue
+        seen.add(provider)
+        normalized.append({"psp": provider, "priority": len(normalized) + 1})
+
+    return normalized
+
+
 class ApproveAfterSalesCaseRequest(BaseModel):
     """Optional override fields for merchant approval."""
     approved_refund_amount: Optional[float] = None
@@ -628,116 +670,6 @@ async def _create_shopify_manual_refund_best_effort(
         except Exception:
             pass
 
-@router.get("/merchant/dashboard/stats")
-async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
-    """Get real dashboard statistics from database"""
-    if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    merchant_id = await get_merchant_id_from_user(current_user)
-    
-    try:
-        # Query orders directly from database
-        orders_query = """
-        SELECT 
-            order_id,
-            total,
-            payment_status as status,
-            customer_email,
-            items,
-            created_at
-        FROM orders
-        WHERE merchant_id = :merchant_id
-        ORDER BY created_at DESC
-        LIMIT 1000
-        """
-        orders = await database.fetch_all(orders_query, {"merchant_id": merchant_id})
-        
-        # Get PSP count
-        psp_query = """
-        SELECT COUNT(*) as count
-        FROM merchant_psps
-        WHERE merchant_id = :merchant_id AND status = 'active'
-        """
-        psp_result = await database.fetch_one(psp_query, {"merchant_id": merchant_id})
-        psp_count = psp_result["count"] if psp_result else 0
-        
-        # Calculate statistics
-        total_orders = len(orders)
-        total_revenue = sum(float(order["total"]) for order in orders if order["total"])
-        paid_orders = [o for o in orders if o["status"] == "paid"]
-        
-        # Get unique customers
-        customers = set()
-        for order in orders:
-            if order.get("customer_email"):
-                customers.add(order["customer_email"])
-        
-        # Parse items and calculate top products
-        import json
-        product_sales = {}
-        for order in orders:
-            try:
-                items = json.loads(order["items"]) if isinstance(order["items"], str) else order["items"]
-                for item in items:
-                    product_id = item.get("product_id")
-                    if product_id:
-                        if product_id not in product_sales:
-                            product_sales[product_id] = {
-                                "id": product_id,
-                                "name": item.get("product_title", "Unknown Product"),
-                                "sales": 0,
-                                "revenue": 0
-                            }
-                        quantity = item.get("quantity", 1)
-                        price = float(item.get("unit_price", 0))
-                        product_sales[product_id]["sales"] += quantity
-                        product_sales[product_id]["revenue"] += price * quantity
-            except:
-                pass
-        
-        top_products = sorted(
-            product_sales.values(),
-            key=lambda x: x["revenue"],
-            reverse=True
-        )[:5]
-        
-        # Format recent orders
-        recent_orders = []
-        for order in orders[:5]:
-            recent_orders.append({
-                "order_id": order["order_id"],
-                "amount": float(order.get("total") or 0),
-                "status": order["status"],
-                "customer": {
-                    "email": order.get("customer_email", "")
-                },
-                "created_at": order["created_at"].isoformat() if order.get("created_at") else None
-            })
-        
-        return {
-            "status": "success",
-            "data": {
-                "total_orders": total_orders,
-                "total_revenue": round(total_revenue, 2),
-                "total_customers": len(customers),
-                "total_products": psp_count,  # Using PSP count for now
-                "average_order_value": round(total_revenue / total_orders, 2) if total_orders > 0 else 0,
-                "conversion_rate": round(len(paid_orders) / total_orders * 100, 2) if total_orders > 0 else 0,
-                "top_products": top_products,
-                "recent_orders": recent_orders,
-                "psp_count": psp_count,  # Add real PSP count
-                "readiness_summary": (await build_readiness_summary(merchant_id)).model_dump(),
-            }
-        }
-    except Exception as e:
-        import traceback
-        logger.error(f"❌ Dashboard stats error for merchant {merchant_id}: {e}")
-        traceback.print_exc()
-        # DON'T catch errors silently - raise them so we can see what's wrong
-        raise HTTPException(status_code=500, detail=f"Dashboard stats failed: {str(e)}")
-
-
 @router.get("/merchant/dashboard/readiness")
 async def get_dashboard_readiness(current_user: dict = Depends(get_current_user)):
     """Get readiness summary independently from heavier dashboard analytics."""
@@ -788,42 +720,16 @@ async def refresh_readiness_optimization(
     merchant_id = await get_merchant_id_from_user(current_user)
 
     try:
-        before_payload = await build_readiness_optimization(merchant_id, force_refresh=False)
-        payload = await build_readiness_optimization(merchant_id, force_refresh=True)
-        lane_delta = (
-            build_lane_delta(
-                reason_code=body.reason_code,
-                before_payload=before_payload,
-                after_payload=payload,
-            )
-            if body.reason_code
-            else None
-        )
-        cleared_decisions = (
-            await clear_resolved_source_data_decisions(
-                merchant_id,
-                plan_id=payload.plan.plan_id,
-                reason_code=body.reason_code,
-            )
-            if body.reason_code in (None, "out_of_stock", "missing_price", "missing_primary_image")
-            else []
-        )
-        cleared_out_of_stock_decisions = [
-            item for item in cleared_decisions if item.get("reason_code") == "out_of_stock"
-        ]
+        payload = await build_readiness_optimization(merchant_id)
         return {
             "status": "success",
             "data": payload.model_dump(),
             "meta": {
                 "scope": body.scope,
                 "reason": body.reason,
-                "reason_code": body.reason_code,
                 "refresh_state": payload.plan.refresh_state,
                 "plan_id": payload.plan.plan_id,
                 "snapshot_id": payload.plan.snapshot_id,
-                "lane_delta": lane_delta.model_dump() if lane_delta else None,
-                "cleared_source_data_decisions": cleared_decisions,
-                "cleared_out_of_stock_decisions": cleared_out_of_stock_decisions,
             },
         }
     except Exception as e:
@@ -867,8 +773,6 @@ async def preview_readiness_action(
                 "current_snapshot_id": exc.current_snapshot_id,
             },
         )
-    except ActionNotExecutableError as exc:
-        raise HTTPException(status_code=409, detail={"code": "OPTIMIZATION_ACTION_NOT_EXECUTABLE", "message": str(exc)})
     except ActionNotFoundError as exc:
         raise HTTPException(status_code=404, detail={"code": "OPTIMIZATION_ACTION_NOT_FOUND", "message": str(exc)})
     except Exception as e:
@@ -924,120 +828,6 @@ async def run_readiness_action(
         raise HTTPException(status_code=500, detail=f"Readiness action run failed: {str(e)}")
 
 
-@router.put("/merchant/readiness/source-data-decisions/{reason_code}/{platform}/{platform_product_id}")
-async def put_readiness_source_data_decision(
-    reason_code: str,
-    platform: str,
-    platform_product_id: str,
-    body: SourceDataDecisionRequest = Body(...),
-    current_user: dict = Depends(get_current_user),
-):
-    """Persist a merchant advisory decision for a source-data queue item."""
-    if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    merchant_id = await get_merchant_id_from_user(current_user)
-
-    try:
-        decision = await upsert_source_data_decision_state(
-            merchant_id,
-            reason_code=reason_code,
-            platform=platform,
-            platform_product_id=platform_product_id,
-            decision_state=body.decision_state,
-        )
-        invalidate_readiness_optimization_cache(merchant_id, channel="ucp")
-        return {
-            "status": "success",
-            "data": decision,
-        }
-    except ActionNotExecutableError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_NOT_SUPPORTED",
-                "message": str(exc),
-            },
-        )
-    except ActionNotFoundError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_INVALID",
-                "message": str(exc),
-            },
-        )
-    except Exception as e:
-        logger.error(
-            "❌ Readiness source-data decision upsert error for merchant %s %s/%s (%s): %s",
-            merchant_id,
-            platform,
-            platform_product_id,
-            reason_code,
-            e,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Readiness source-data decision upsert failed: {str(e)}",
-        )
-
-
-@router.delete("/merchant/readiness/source-data-decisions/{reason_code}/{platform}/{platform_product_id}")
-async def delete_readiness_source_data_decision_route(
-    reason_code: str,
-    platform: str,
-    platform_product_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """Clear a merchant advisory decision for a source-data queue item."""
-    if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    merchant_id = await get_merchant_id_from_user(current_user)
-
-    try:
-        result = await delete_source_data_decision_state(
-            merchant_id,
-            reason_code=reason_code,
-            platform=platform,
-            platform_product_id=platform_product_id,
-        )
-        invalidate_readiness_optimization_cache(merchant_id, channel="ucp")
-        return {
-            "status": "success",
-            "data": result,
-        }
-    except ActionNotExecutableError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_NOT_SUPPORTED",
-                "message": str(exc),
-            },
-        )
-    except ActionNotFoundError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "OPTIMIZATION_SOURCE_DATA_DECISION_INVALID",
-                "message": str(exc),
-            },
-        )
-    except Exception as e:
-        logger.error(
-            "❌ Readiness source-data decision delete error for merchant %s %s/%s (%s): %s",
-            merchant_id,
-            platform,
-            platform_product_id,
-            reason_code,
-            e,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Readiness source-data decision delete failed: {str(e)}",
-        )
-
-
 @router.get("/merchant/readiness/optimization/products/{platform}/{platform_product_id}/blockers")
 async def get_readiness_product_blockers(
     platform: str,
@@ -1045,7 +835,7 @@ async def get_readiness_product_blockers(
     plan_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """Return merchant-safe blocker and exclusion detail for one selected product."""
+    """Return merchant-safe blocker and exclusion details for one selected product."""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -1090,175 +880,6 @@ async def get_readiness_product_blockers(
         raise HTTPException(
             status_code=500,
             detail=f"Readiness blocker detail failed: {str(e)}",
-        )
-
-
-@router.get("/merchant/readiness/optimization/source-data-triage")
-async def get_readiness_source_data_triage(
-    plan_id: str = Query(...),
-    reason_code: Optional[str] = Query(default=None),
-    limit: int = Query(default=500, ge=1, le=5000),
-    current_user: dict = Depends(get_current_user),
-):
-    """Return a merchant-safe batch triage view for source-data blockers."""
-    if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    merchant_id = await get_merchant_id_from_user(current_user)
-
-    try:
-        data = await get_source_data_triage(
-            merchant_id,
-            plan_id=plan_id,
-            reason_code=reason_code,
-            limit=limit,
-        )
-        return {
-            "status": "success",
-            "data": data,
-        }
-    except PlanSupersededError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
-                "current_plan_id": exc.current_plan_id,
-                "current_snapshot_id": exc.current_snapshot_id,
-            },
-        )
-    except ActionNotFoundError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "code": "OPTIMIZATION_SOURCE_DATA_TRIAGE_UNAVAILABLE",
-                "message": str(exc),
-            },
-        )
-    except Exception as e:
-        logger.error(
-            "❌ Readiness source-data triage error for merchant %s: %s",
-            merchant_id,
-            e,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Readiness source-data triage failed: {str(e)}",
-        )
-
-
-@router.get("/merchant/readiness/optimization/source-data-triage/export.csv")
-async def export_readiness_source_data_triage(
-    plan_id: str = Query(...),
-    reason_code: Optional[str] = Query(default=None),
-    current_user: dict = Depends(get_current_user),
-):
-    """Export the current merchant source-data triage lane as CSV."""
-    if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    merchant_id = await get_merchant_id_from_user(current_user)
-
-    try:
-        data = await get_source_data_triage(
-            merchant_id,
-            plan_id=plan_id,
-            reason_code=reason_code,
-            limit=5000,
-        )
-        buffer = io.StringIO()
-        writer = csv.DictWriter(
-            buffer,
-            fieldnames=[
-                "scope",
-                "reason_code",
-                "reason_label",
-                "platform",
-                "platform_product_id",
-                "product_id",
-                "product_title",
-                "variant_id",
-                "variant_title",
-                "sku",
-                "price_value",
-                "price_currency",
-                "inventory_quantity",
-                "blocked_variant_count",
-                "excluded_variant_count",
-                "readiness_blocker_codes",
-                "readiness_warning_codes",
-                "agent_push_status",
-                "agent_push_reason_codes",
-                "recommended_action_type",
-                "fix_surface",
-                "decision_state",
-            ],
-        )
-        writer.writeheader()
-        for row in data.get("rows") or []:
-            writer.writerow(
-                {
-                    "scope": row.get("scope"),
-                    "reason_code": row.get("reason_code"),
-                    "reason_label": row.get("reason_label"),
-                    "platform": row.get("platform"),
-                    "platform_product_id": row.get("platform_product_id"),
-                    "product_id": row.get("product_id"),
-                    "product_title": row.get("product_title"),
-                    "variant_id": row.get("variant_id"),
-                    "variant_title": row.get("variant_title"),
-                    "sku": row.get("sku"),
-                    "price_value": row.get("price_value"),
-                    "price_currency": row.get("price_currency"),
-                    "inventory_quantity": row.get("inventory_quantity"),
-                    "blocked_variant_count": row.get("blocked_variant_count"),
-                    "excluded_variant_count": row.get("excluded_variant_count"),
-                    "readiness_blocker_codes": "|".join(row.get("readiness_blocker_codes") or []),
-                    "readiness_warning_codes": "|".join(row.get("readiness_warning_codes") or []),
-                    "agent_push_status": row.get("agent_push_status"),
-                    "agent_push_reason_codes": "|".join(row.get("agent_push_reason_codes") or []),
-                    "recommended_action_type": row.get("recommended_action_type"),
-                    "fix_surface": row.get("fix_surface"),
-                    "decision_state": row.get("decision_state"),
-                }
-            )
-
-        normalized_reason = str(reason_code or "all").strip().lower() or "all"
-        filename = (
-            f"readiness-source-data-triage-{normalized_reason}-{merchant_id}-{int(time.time())}.csv"
-        )
-        return Response(
-            content=buffer.getvalue(),
-            media_type="text/csv; charset=utf-8",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-            },
-        )
-    except PlanSupersededError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
-                "current_plan_id": exc.current_plan_id,
-                "current_snapshot_id": exc.current_snapshot_id,
-            },
-        )
-    except ActionNotFoundError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "code": "OPTIMIZATION_SOURCE_DATA_TRIAGE_UNAVAILABLE",
-                "message": str(exc),
-            },
-        )
-    except Exception as e:
-        logger.error(
-            "❌ Readiness source-data triage export error for merchant %s: %s",
-            merchant_id,
-            e,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Readiness source-data triage export failed: {str(e)}",
         )
 
 
@@ -1491,6 +1112,7 @@ async def get_merchant_routing_config(
         raise HTTPException(status_code=403, detail="Not authorized")
 
     merchant_id = await get_merchant_id_from_user(current_user)
+    active_psps = await _get_active_merchant_psps(merchant_id)
 
     # Try to load existing route config
     route = await database.fetch_one(
@@ -1514,9 +1136,13 @@ async def get_merchant_routing_config(
             agent_id=None,
             merchant_id=merchant_id,
         )
-        psp_priority = default_config["psp_priority"]
-        routing_strategy = default_config["routing_strategy"]
-        max_retries = default_config.get("max_retries", 2)
+        psp_priority = _normalize_merchant_route_priority(
+            default_config["psp_priority"],
+            active_psps,
+            strict=False,
+        )
+        routing_strategy = "priority"
+        max_retries = max(0, len(psp_priority) - 1)
         timeout_ms = 30000
         route_id = default_config["route_id"]
         metadata_dict: Dict[str, Any] = {}
@@ -1526,11 +1152,16 @@ async def get_merchant_routing_config(
         # databases.fetch_one returns a Record; normalize to dict for .get access
         route_dict = dict(route)
 
-        psp_priority = route_dict["psp_priority"]
-        if isinstance(psp_priority, str):
-            psp_priority = json.loads(psp_priority)
-        routing_strategy = route_dict["routing_strategy"]
-        max_retries = route_dict.get("max_retries", 2)
+        raw_psp_priority = route_dict["psp_priority"]
+        if isinstance(raw_psp_priority, str):
+            raw_psp_priority = json.loads(raw_psp_priority)
+        psp_priority = _normalize_merchant_route_priority(
+            raw_psp_priority,
+            active_psps,
+            strict=False,
+        )
+        routing_strategy = "priority"
+        max_retries = max(0, len(psp_priority) - 1)
         timeout_ms = route_dict.get("timeout_ms", 30000)
         metadata_raw = route_dict.get("metadata") or {}
         metadata_dict = (
@@ -1543,6 +1174,27 @@ async def get_merchant_routing_config(
         route_id = route_dict["route_id"]
         created_at = route_dict.get("created_at")
         updated_at = route_dict.get("updated_at")
+
+        if (
+            route_dict.get("routing_strategy") != "priority"
+            or route_dict.get("max_retries") != max_retries
+            or psp_priority != raw_psp_priority
+        ):
+            await database.execute(
+                """
+                UPDATE payment_routes
+                SET psp_priority = :psp_priority,
+                    routing_strategy = 'priority',
+                    max_retries = :max_retries,
+                    updated_at = NOW()
+                WHERE route_id = :route_id
+                """,
+                {
+                    "route_id": route_id,
+                    "psp_priority": json.dumps(psp_priority),
+                    "max_retries": max_retries,
+                },
+            )
 
     return {
         "status": "success",
@@ -1576,6 +1228,14 @@ async def update_merchant_routing_config(
         raise HTTPException(status_code=403, detail="Not authorized")
 
     merchant_id = await get_merchant_id_from_user(current_user)
+    active_psps = await _get_active_merchant_psps(merchant_id)
+    normalized_priority = _normalize_merchant_route_priority(
+        update.psp_priority,
+        active_psps,
+        strict=True,
+    )
+    max_retries = max(0, len(normalized_priority) - 1)
+    timeout_ms = update.timeout_ms if update.timeout_ms > 0 else 30000
 
     # Find existing route for this merchant, if any
     existing = await database.fetch_one(
@@ -1603,10 +1263,10 @@ async def update_merchant_routing_config(
             """,
             {
                 "route_id": route_id,
-                "psp_priority": json.dumps(update.psp_priority),
-                "routing_strategy": update.routing_strategy,
-                "max_retries": update.max_retries,
-                "timeout_ms": update.timeout_ms,
+                "psp_priority": json.dumps(normalized_priority),
+                "routing_strategy": "priority",
+                "max_retries": max_retries,
+                "timeout_ms": timeout_ms,
             },
         )
     else:
@@ -1624,12 +1284,12 @@ async def update_merchant_routing_config(
             """,
             {
                 "route_id": route_id,
-                "agent_id": merchant_id,
+                "agent_id": None,
                 "merchant_id": merchant_id,
-                "psp_priority": json.dumps(update.psp_priority),
-                "routing_strategy": update.routing_strategy,
-                "max_retries": update.max_retries,
-                "timeout_ms": update.timeout_ms,
+                "psp_priority": json.dumps(normalized_priority),
+                "routing_strategy": "priority",
+                "max_retries": max_retries,
+                "timeout_ms": timeout_ms,
             },
         )
 
@@ -1638,6 +1298,10 @@ async def update_merchant_routing_config(
         "data": {
             "route_id": route_id,
             "merchant_id": merchant_id,
+            "psp_priority": normalized_priority,
+            "routing_strategy": "priority",
+            "max_retries": max_retries,
+            "timeout_ms": timeout_ms,
         },
     }
 

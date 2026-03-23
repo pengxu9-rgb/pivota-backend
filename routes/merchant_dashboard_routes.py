@@ -1,5 +1,5 @@
 """Merchant Dashboard API Routes"""
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import logging
@@ -8,15 +8,27 @@ import httpx
 import string
 import json
 import asyncio
+import hashlib
+import secrets
 from pydantic import BaseModel
 from utils.auth import get_current_user
 from db.database import database
+from db.merchant_onboarding import merchant_onboarding
 from db.merchant_portal_preferences import (
     DEFAULT_MERCHANT_PORTAL_PREFERENCES,
     get_merchant_portal_preferences,
     upsert_merchant_portal_preferences,
 )
 from models.order_response import format_order_for_response
+from services.merchant_webhook_service import (
+    get_signing_secret as get_merchant_webhook_signing_secret,
+    get_webhook_config as get_merchant_webhook_config,
+    list_deliveries as list_merchant_webhook_deliveries,
+    list_webhook_events_catalog as list_merchant_webhook_events_catalog,
+    rotate_signing_secret as rotate_merchant_webhook_signing_secret,
+    send_test_webhook as send_merchant_test_webhook,
+    update_webhook_config as update_merchant_webhook_config,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -27,6 +39,16 @@ class MerchantPortalPreferencesRequest(BaseModel):
     email_payments: bool = True
     email_inventory: bool = False
     email_weekly: bool = False
+
+
+class MerchantWebhookConfigRequest(BaseModel):
+    url: Optional[str] = None
+    events: List[str] = []
+    enabled: bool = False
+
+
+class MerchantWebhookTestRequest(BaseModel):
+    event_type: Optional[str] = "order.created"
 
 # Payment status normalization:
 # - "status" is the order lifecycle (pending/completed/fulfilled/etc.)
@@ -129,6 +151,36 @@ def generate_demo_orders(merchant_id: str, limit: int = 10) -> List[Dict[str, An
 
 # REMOVED: generate_analytics() - was causing random data display
 # All analytics now come from real database queries only
+
+
+async def _resolve_merchant_id(current_user: dict) -> str:
+    merchant_id = current_user.get("merchant_id")
+    if merchant_id:
+        return merchant_id
+
+    email = current_user.get("email")
+    if email:
+        result = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_onboarding
+            WHERE contact_email = :email
+            LIMIT 1
+            """,
+            {"email": email},
+        )
+        if result:
+            row = dict(result)
+            if row.get("merchant_id"):
+                return str(row["merchant_id"])
+
+    raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+
+
+def _generate_merchant_api_key() -> tuple[str, str]:
+    api_key = f"pk_live_{secrets.token_urlsafe(32)}"
+    api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    return api_key, api_key_hash
 
 @router.get("/merchant/profile")
 async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
@@ -786,97 +838,207 @@ async def get_merchant_analytics(
             }
         }
 
+@router.get("/merchant/api-credentials")
+async def get_merchant_api_credentials(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+    merchant = await database.fetch_one(
+        """
+        SELECT merchant_id, api_key, api_key_hash, updated_at, created_at
+        FROM merchant_onboarding
+        WHERE merchant_id = :merchant_id
+        LIMIT 1
+        """,
+        {"merchant_id": merchant_id},
+    )
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+
+    merchant_row = dict(merchant)
+    api_key = str(merchant_row.get("api_key") or "").strip()
+    issued_at = merchant_row.get("updated_at") or merchant_row.get("created_at")
+    return {
+        "status": "success",
+        "data": {
+            "merchant_id": merchant_id,
+            "issued": bool(api_key),
+            "api_key": api_key or None,
+            "api_key_last4": api_key[-4:] if api_key else None,
+            "header_name": "X-Merchant-API-Key",
+            "sample_endpoint": "/payment/execute",
+            "issued_at": issued_at.isoformat() if hasattr(issued_at, "isoformat") else None,
+        },
+    }
+
+
+@router.post("/merchant/api-credentials/rotate")
+async def rotate_merchant_api_credentials(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+    merchant = await database.fetch_one(
+        """
+        SELECT merchant_id
+        FROM merchant_onboarding
+        WHERE merchant_id = :merchant_id
+        LIMIT 1
+        """,
+        {"merchant_id": merchant_id},
+    )
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+
+    api_key, api_key_hash = _generate_merchant_api_key()
+    issued_at = datetime.utcnow()
+    await database.execute(
+        """
+        UPDATE merchant_onboarding
+        SET api_key = :api_key,
+            api_key_hash = :api_key_hash,
+            updated_at = :updated_at
+        WHERE merchant_id = :merchant_id
+        """,
+        {
+            "merchant_id": merchant_id,
+            "api_key": api_key,
+            "api_key_hash": api_key_hash,
+            "updated_at": issued_at,
+        },
+    )
+    return {
+        "status": "success",
+        "data": {
+            "merchant_id": merchant_id,
+            "issued": True,
+            "api_key": api_key,
+            "api_key_last4": api_key[-4:],
+            "header_name": "X-Merchant-API-Key",
+            "sample_endpoint": "/payment/execute",
+            "issued_at": issued_at.isoformat() + "Z",
+        },
+    }
+
+
+@router.get("/merchant/webhooks/events/catalog")
+async def get_merchant_webhook_events_catalog(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+    return list_merchant_webhook_events_catalog()
+
+
 @router.get("/merchant/webhooks/config")
 async def get_webhook_config(current_user: dict = Depends(get_current_user)):
-    """Get webhook configuration from real database"""
-    if current_user["role"] not in ["merchant", "admin", "employee"]:
-        raise HTTPException(status_code=403, detail=f"Not authorized - role: {current_user.get('role', 'unknown')}")
-    
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
     try:
-        # Get merchant_id from JWT token
-        merchant_id = current_user.get("merchant_id")
-        if not merchant_id:
-            raise HTTPException(status_code=400, detail="Merchant ID not found in token")
-        
-        # For now, return a template webhook config
-        # In production, this would be stored in database
+        config = await get_merchant_webhook_config(merchant_id)
         return {
             "status": "success",
-            "data": {
-                "webhook_url": f"https://your-server.com/webhooks/{merchant_id}",
-                "events": [
-                    "order.created",
-                    "order.updated",
-                    "payment.completed",
-                    "payment.failed",
-                    "refund.processed"
-                ],
-                "secret": "whsec_" + merchant_id[-16:],
-                "enabled": True,
-                "created_at": datetime.now().isoformat()
-            }
+            "data": config,
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error fetching webhook config: {e}")
-        # Fallback to demo
-        merchant_id = current_user.get("merchant_id", "merch_208139f7600dbf42")
-        merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
-        if merchant_data:
-            return {"status": "success", "data": merchant_data["webhooks"]}
-        raise HTTPException(status_code=500, detail="Failed to fetch webhook config")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch webhook config: {exc}")
+
+
+@router.put("/merchant/webhooks/config")
+async def put_webhook_config(
+    payload: MerchantWebhookConfigRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+    try:
+        config = await update_merchant_webhook_config(
+            merchant_id,
+            enabled=payload.enabled,
+            destination_url=payload.url,
+            subscribed_events=payload.events,
+        )
+        return {
+            "status": "success",
+            "data": config,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save webhook config: {exc}")
+
+
+@router.get("/merchant/webhooks/secret")
+async def get_webhook_secret(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+    try:
+        return await get_merchant_webhook_signing_secret(merchant_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load webhook secret: {exc}")
+
+
+@router.post("/merchant/webhooks/secret/rotate")
+async def rotate_webhook_secret(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+    try:
+        return await rotate_merchant_webhook_signing_secret(merchant_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to rotate webhook secret: {exc}")
+
 
 @router.get("/merchant/webhooks/deliveries")
 async def get_webhook_deliveries(
     limit: int = Query(default=20, ge=1, le=100),
-    current_user: dict = Depends(get_current_user)
+    status: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Get webhook delivery logs"""
     if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Generate demo delivery logs
-    deliveries = []
-    statuses = ["success", "success", "success", "failed", "pending"]
-    
-    for i in range(limit):
-        delivery_time = datetime.now() - timedelta(minutes=random.randint(0, 1440))
-        deliveries.append({
-            "id": f"del_{i+1000}",
-            "event": random.choice(["order.created", "payment.completed", "order.updated"]),
-            "status": random.choice(statuses),
-            "attempts": 1 if i % 5 != 0 else random.randint(1, 3),
-            "response_code": 200 if i % 5 != 0 else random.choice([200, 400, 500]),
-            "created_at": delivery_time.isoformat() + "Z",
-            "completed_at": (delivery_time + timedelta(seconds=random.uniform(0.1, 2))).isoformat() + "Z"
-        })
-    
-    return {
-        "status": "success",
-        "data": {
-            "deliveries": sorted(deliveries, key=lambda x: x["created_at"], reverse=True)
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+    try:
+        deliveries = await list_merchant_webhook_deliveries(merchant_id, limit=limit, status=status)
+        return {
+            "status": "success",
+            "data": deliveries,
         }
-    }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load webhook deliveries: {exc}")
+
 
 @router.post("/merchant/webhooks/test")
 async def test_webhook(
-    event: str,
-    current_user: dict = Depends(get_current_user)
+    payload: MerchantWebhookTestRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
 ):
-    """Send test webhook"""
     if current_user["role"] != "merchant":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    return {
-        "status": "success",
-        "message": f"Test webhook for event '{event}' sent successfully",
-        "data": {
-            "event": event,
-            "delivery_id": f"del_test_{random.randint(1000, 9999)}",
-            "sent_at": datetime.now().isoformat() + "Z"
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+    try:
+        delivery = await send_merchant_test_webhook(
+            merchant_id,
+            event_type=payload.event_type or "order.created",
+            request_id=request.headers.get("x-request-id"),
+        )
+        return {
+            "status": "success",
+            "data": delivery,
         }
-    }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to send test webhook: {exc}")
 
 @router.post("/merchant/psp/{psp_id}/test")
 async def test_psp_connection(
