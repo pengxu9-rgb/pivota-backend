@@ -1543,16 +1543,36 @@ async def connect_psp(
         validation_error=None,
     )
 
+    existing_rows = await database.fetch_all(
+        """
+        SELECT psp_id, status, connected_at
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id
+          AND provider = :provider
+        ORDER BY
+            CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+            connected_at DESC NULLS LAST,
+            psp_id ASC
+        """,
+        {"merchant_id": merchant_id, "provider": provider},
+    )
+    canonical_existing = dict(existing_rows[0]) if existing_rows else None
+
     # Save to database
-    psp_id = f"psp_{provider}_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    psp_id = (
+        canonical_existing["psp_id"]
+        if canonical_existing and canonical_existing.get("psp_id")
+        else f"psp_{provider}_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    )
     capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen", "checkout"] else ["card"]
+    connected_at = datetime.now()
     
     new_psp = {
         "id": psp_id,
         "provider": provider,
         "name": f"{provider.capitalize()} Account",
         "status": "active",
-        "connected_at": datetime.now().isoformat() + "Z",
+        "connected_at": connected_at.isoformat() + "Z",
         "account_id": account_id,
         "capabilities": capabilities,
         "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****",
@@ -1560,45 +1580,12 @@ async def connect_psp(
         "provider_summary": record["provider_summary"],
         "validation_status": record["validation_status"],
         "validation_error": record["validation_error"],
+        "reused_existing": bool(canonical_existing),
     }
     
     try:
         # Use transaction to ensure data is committed
         async with database.transaction():
-            base_cols = [
-                "psp_id",
-                "merchant_id",
-                "provider",
-                "name",
-                "api_key",
-                "account_id",
-                "capabilities",
-                "status",
-                "connected_at",
-                "secret_key",
-                "environment",
-                "provider_config",
-                "validation_status",
-                "validation_error",
-                "last_validated_at",
-            ]
-            base_vals = [
-                ":psp_id",
-                ":merchant_id",
-                ":provider",
-                ":name",
-                ":api_key",
-                ":account_id",
-                ":capabilities",
-                ":status",
-                ":connected_at",
-                ":secret_key",
-                ":environment",
-                "CAST(:provider_config AS JSONB)",
-                ":validation_status",
-                ":validation_error",
-                ":last_validated_at",
-            ]
             params = {
                 "psp_id": psp_id,
                 "merchant_id": merchant_id,
@@ -1608,7 +1595,7 @@ async def connect_psp(
                 "account_id": account_id,
                 "capabilities": ','.join(capabilities),
                 "status": 'active',
-                "connected_at": datetime.now(),
+                "connected_at": connected_at,
                 "secret_key": secret_key,
                 "environment": record["environment"],
                 "provider_config": json.dumps(record["provider_config"]),
@@ -1616,18 +1603,86 @@ async def connect_psp(
                 "validation_error": record["validation_error"],
                 "last_validated_at": None,
             }
-            
-            query = f"""
-                INSERT INTO merchant_psps ({', '.join(base_cols)})
-                VALUES ({', '.join(base_vals)})
-            """
-            await database.execute(query, params)
+
+            await database.execute(
+                """
+                UPDATE merchant_psps
+                SET status = 'inactive'
+                WHERE merchant_id = :merchant_id
+                  AND provider = :provider
+                  AND status = 'active'
+                  AND psp_id != :psp_id
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "provider": provider,
+                    "psp_id": psp_id,
+                },
+            )
+
+            if canonical_existing:
+                await database.execute(
+                    """
+                    UPDATE merchant_psps
+                    SET merchant_id = :merchant_id,
+                        provider = :provider,
+                        name = :name,
+                        api_key = :api_key,
+                        account_id = :account_id,
+                        capabilities = :capabilities,
+                        status = :status,
+                        connected_at = :connected_at,
+                        secret_key = :secret_key,
+                        environment = :environment,
+                        provider_config = CAST(:provider_config AS JSONB),
+                        validation_status = :validation_status,
+                        validation_error = :validation_error,
+                        last_validated_at = :last_validated_at
+                    WHERE psp_id = :psp_id
+                    """,
+                    params,
+                )
+            else:
+                base_cols = [
+                    "psp_id",
+                    "merchant_id",
+                    "provider",
+                    "name",
+                    "api_key",
+                    "account_id",
+                    "capabilities",
+                    "status",
+                    "connected_at",
+                    "secret_key",
+                    "environment",
+                    "provider_config",
+                    "validation_status",
+                    "validation_error",
+                    "last_validated_at",
+                ]
+                base_vals = [
+                    ":psp_id",
+                    ":merchant_id",
+                    ":provider",
+                    ":name",
+                    ":api_key",
+                    ":account_id",
+                    ":capabilities",
+                    ":status",
+                    ":connected_at",
+                    ":secret_key",
+                    ":environment",
+                    "CAST(:provider_config AS JSONB)",
+                    ":validation_status",
+                    ":validation_error",
+                    ":last_validated_at",
+                ]
+                query = f"""
+                    INSERT INTO merchant_psps ({', '.join(base_cols)})
+                    VALUES ({', '.join(base_vals)})
+                """
+                await database.execute(query, params)
             print(f"✅ PSP saved to DB: {psp_id} for merchant {merchant_id}")
-            
-            # Verify the save within transaction
-            verify_query = "SELECT COUNT(*) as count FROM merchant_psps WHERE merchant_id = :merchant_id"
-            result = await database.fetch_one(verify_query, {"merchant_id": merchant_id})
-            print(f"✅ Total PSPs for merchant {merchant_id} (in transaction): {result['count']}")
 
             # Also set flags on merchant_onboarding for dashboard compatibility
             await database.execute(
@@ -1653,7 +1708,11 @@ async def connect_psp(
     
     return {
         "status": "success",
-        "message": f"{provider.capitalize()} connected successfully",
+        "message": (
+            f"{provider.capitalize()} settings updated successfully"
+            if canonical_existing
+            else f"{provider.capitalize()} connected successfully"
+        ),
         "data": new_psp
     }
 
