@@ -325,12 +325,28 @@ class RefundService:
             if not payment_intent_id:
                 raise ValueError("No payment_intent_id found for order")
 
-            success, psp_refund_id, error = await adapter.refund_payment(
-                payment_intent_id=payment_intent_id,
-                amount=Decimal(str(amount)),
-                reason=reason,
-                idempotency_key=idempotency_key,
-            )
+            refund_amount = Decimal(str(amount))
+            order_total = Decimal(str(order.get("total") or "0"))
+            total_refunded = Decimal(str(order.get("total_refunded") or "0"))
+            remaining = order_total - total_refunded
+            full_refund = remaining > Decimal("0") and refund_amount >= remaining
+
+            if psp_type == "adyen":
+                success, psp_refund_id, error = await adapter.refund_payment(
+                    payment_intent_id=payment_intent_id,
+                    amount=refund_amount,
+                    reason=reason,
+                    idempotency_key=idempotency_key,
+                    currency=str(order.get("currency") or "USD"),
+                    full_refund=full_refund,
+                )
+            else:
+                success, psp_refund_id, error = await adapter.refund_payment(
+                    payment_intent_id=payment_intent_id,
+                    amount=refund_amount,
+                    reason=reason,
+                    idempotency_key=idempotency_key,
+                )
             
             if success:
                 logger.info(f"PSP refund successful: {psp_refund_id}")

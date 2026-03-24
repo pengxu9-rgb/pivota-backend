@@ -73,6 +73,8 @@ class PSPAdapter(ABC):
         amount: Optional[Decimal] = None,
         reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        currency: Optional[str] = None,
+        full_refund: Optional[bool] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """退款"""
         pass
@@ -219,6 +221,8 @@ class StripeAdapter(PSPAdapter):
         amount: Optional[Decimal] = None,
         reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        currency: Optional[str] = None,
+        full_refund: Optional[bool] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Stripe 退款"""
         try:
@@ -426,6 +430,8 @@ class AdyenAdapter(PSPAdapter):
         amount: Optional[Decimal] = None,
         reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        currency: Optional[str] = None,
+        full_refund: Optional[bool] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Adyen 退款"""
         try:
@@ -433,31 +439,41 @@ class AdyenAdapter(PSPAdapter):
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json"
             }
-            
+
+            if idempotency_key:
+                headers["Idempotency-Key"] = str(idempotency_key)[:64]
+
+            reference = str(idempotency_key or reason or f"refund_{payment_intent_id[:16]}")[:80]
             payload = {
                 "merchantAccount": self.merchant_account,
-                "originalReference": payment_intent_id
+                "reference": reference,
             }
-            
-            if amount:
-                payload["modificationAmount"] = {
-                    "value": int(amount * 100),
-                    "currency": "USD"  # TODO: 从原始支付中获取
+
+            # For a full refund right after AUTHORISATION, Adyen recommends using
+            # reversals so the request succeeds whether the payment is only
+            # authorised or has already been captured.
+            if full_refund:
+                endpoint = f"{self.base_url}/payments/{payment_intent_id}/reversals"
+            else:
+                endpoint = f"{self.base_url}/payments/{payment_intent_id}/refunds"
+                payload["amount"] = {
+                    "value": int((amount or Decimal("0")) * 100),
+                    "currency": str(currency or "USD").upper(),
                 }
-            
+
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{self.base_url}/refunds",
+                    endpoint,
                     json=payload,
                     headers=headers,
                     timeout=10.0
                 )
                 
-                if response.status_code == 200:
+                if response.status_code in (200, 201):
                     data = response.json()
                     return True, data.get("pspReference"), None
                 else:
-                    return False, None, f"Adyen refund error: {response.status_code}"
+                    return False, None, f"Adyen refund error: {response.status_code} - {response.text}"
         except Exception as e:
             return False, None, str(e)
 
