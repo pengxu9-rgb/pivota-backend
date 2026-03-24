@@ -91,6 +91,7 @@ _INGREDIENT_CANONICAL_ALIASES: Dict[str, str] = {
     "retinol": "retinol",
     "retinoid": "retinol",
     "vitamin a": "retinol",
+    "salicylic": "salicylic_acid",
     "salicylic acid": "salicylic_acid",
     "bha": "salicylic_acid",
     "vitamin c": "ascorbic_acid",
