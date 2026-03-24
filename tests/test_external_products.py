@@ -5030,6 +5030,10 @@ def test_extract_skin_care_ingredient_intents_supports_registry_parity_aliases()
         "peptide serum",
         query_semantic_class="beauty",
     )
+    salicylic = agent_shop_gateway_module._extract_skin_care_ingredient_intents(
+        "salicylic serum",
+        query_semantic_class="beauty",
+    )
 
     assert hyaluronic == [
         {
@@ -5045,6 +5049,14 @@ def test_extract_skin_care_ingredient_intents_supports_registry_parity_aliases()
             "ingredient_id": "peptides",
             "display_name": "Peptides",
             "query_terms": ["peptide"],
+        }
+    ]
+    assert salicylic == [
+        {
+            "label": "salicylic_acid",
+            "ingredient_id": "salicylic_acid",
+            "display_name": "Salicylic Acid",
+            "query_terms": ["salicylic"],
         }
     ]
 

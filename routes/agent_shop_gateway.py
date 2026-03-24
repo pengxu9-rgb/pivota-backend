@@ -847,7 +847,7 @@ _SKINCARE_INGREDIENT_PROFILES: Dict[str, Dict[str, Any]] = {
     },
     "salicylic_acid": {
         "display_name": "Salicylic Acid",
-        "aliases": ["salicylic acid", "bha"],
+        "aliases": ["salicylic acid", "salicylic", "bha"],
         "expected_step_families": ["serum", "treatment", "cleanser"],
     },
     "zinc_pca": {
