@@ -96,6 +96,25 @@ def test_backend_build_endpoint_exposes_stable_version_surface() -> None:
         assert resp.headers["x-service-deployment-id"] == version["deployment_id"]
 
 
+def test_backend_public_version_service_name_is_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import _runtime_build_payload, _service_version_payload
+
+    monkeypatch.setenv("RAILWAY_SERVICE_NAME", "web")
+    monkeypatch.delenv("PIVOTA_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("SERVICE_NAME", raising=False)
+    _service_version_payload.cache_clear()
+    _runtime_build_payload.cache_clear()
+    try:
+        version = _service_version_payload()
+        build = _runtime_build_payload()
+        assert version["service"] == "pivota-backend"
+        assert build["service"] == "pivota-backend"
+        assert build["railway"]["service_name"] == "web"
+    finally:
+        _service_version_payload.cache_clear()
+        _runtime_build_payload.cache_clear()
+
+
 class _TestAgentContext:
     agent_id = "agent_runtime_drift"
     agent_name = "Agent Runtime Drift"
