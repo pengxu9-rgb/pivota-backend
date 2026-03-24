@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from db.database import database
+from db.orders import create_order, update_order, update_payment_info
 from db.merchant_onboarding import get_merchant_by_api_key, get_merchant_onboarding
 from services.merchant_payment_initiation_service import initiate_merchant_payment
 from services.merchant_psp_config_service import evaluate_psp_readiness
@@ -56,6 +57,12 @@ class PaymentExecuteResponse(BaseModel):
 
 class InternalPaymentExecuteRequest(PaymentExecuteRequest):
     emit_merchant_webhook: bool = False
+
+
+class InternalOrderBackedCanaryRequest(InternalPaymentExecuteRequest):
+    customer_name: Optional[str] = None
+    label: Optional[str] = None
+    enforce_live_readiness: bool = True
 
 
 async def verify_merchant_api_key(api_key: str) -> dict:
@@ -296,6 +303,36 @@ def _resolve_payment_webhook_event_type(result: Dict[str, Any]) -> Optional[str]
     return None
 
 
+def _build_canary_shipping_address(name: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "address_line1": "1 Canary Way",
+        "address_line2": None,
+        "city": "San Francisco",
+        "state": "CA",
+        "postal_code": "94105",
+        "country": "US",
+        "phone": None,
+    }
+
+
+def _build_canary_order_items(provider: str, amount_major: Decimal) -> List[Dict[str, Any]]:
+    provider_label = str(provider or "payment").strip().lower() or "payment"
+    unit_price = Decimal(str(amount_major)).quantize(Decimal("0.01"))
+    return [
+        {
+            "product_id": f"ops_canary_{provider_label}",
+            "product_title": f"Ops {provider_label} canary",
+            "variant_id": None,
+            "variant_title": None,
+            "sku": f"OPS-{provider_label.upper()}-CANARY",
+            "quantity": 1,
+            "unit_price": unit_price,
+            "subtotal": unit_price,
+        }
+    ]
+
+
 async def _execute_payment_for_merchant(
     *,
     merchant: Dict[str, Any],
@@ -385,6 +422,150 @@ async def _execute_payment_for_merchant(
     )
 
 
+async def _execute_order_backed_payment_canary(
+    *,
+    merchant: Dict[str, Any],
+    payment_request: InternalOrderBackedCanaryRequest,
+    source: str,
+) -> PaymentExecuteResponse:
+    candidates, route_config = await _resolve_payment_candidates(merchant, payment_request)
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="Payment routing is not configured for any active processor",
+        )
+
+    preferred_psps = _build_preferred_psps(
+        candidates,
+        enforce_live_readiness=bool(payment_request.enforce_live_readiness),
+    )
+    if not preferred_psps:
+        if payment_request.enforce_live_readiness:
+            blocked_detail = _describe_blocked_candidates(candidates)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No supported live-ready PSPs are configured for this merchant"
+                    + (f". {blocked_detail}" if blocked_detail else "")
+                ),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="No supported PSP candidates are configured for this canary run",
+        )
+
+    selected_provider = preferred_psps[0]
+    selected_candidate = next(
+        (
+            candidate
+            for candidate in candidates
+            if str(candidate.get("provider") or "").strip().lower() == selected_provider
+        ),
+        candidates[0],
+    )
+    amount_major = (Decimal(str(payment_request.amount)) / Decimal("100")).quantize(Decimal("0.01"))
+    customer_name = str(payment_request.customer_name or "Pivota Ops Canary").strip() or "Pivota Ops Canary"
+
+    order_id = await create_order(
+        {
+            "merchant_id": str(merchant["merchant_id"]),
+            "psp_id": selected_candidate.get("psp_id"),
+            "customer_name": customer_name,
+            "customer_email": payment_request.customer_email or merchant.get("contact_email") or "ops-canary@pivota.cc",
+            "shipping_address": _build_canary_shipping_address(customer_name),
+            "items": _build_canary_order_items(selected_provider, amount_major),
+            "subtotal": amount_major,
+            "shipping_fee": Decimal("0.00"),
+            "tax": Decimal("0.00"),
+            "total": amount_major,
+            "currency": payment_request.currency.upper(),
+            "metadata": {
+                "ops_canary": True,
+                "skip_platform_order_creation": True,
+                "source": source,
+                "provider": selected_provider,
+                "requested_order_id": payment_request.order_id,
+                "canary_label": payment_request.label,
+            },
+        }
+    )
+
+    result = await initiate_merchant_payment(
+        merchant_id=str(merchant["merchant_id"]),
+        amount=amount_major,
+        currency=payment_request.currency,
+        metadata={
+            "order_id": order_id,
+            "merchant_id": merchant["merchant_id"],
+            "customer_email": payment_request.customer_email,
+            "description": payment_request.description or "ops_order_backed_canary",
+            "route_id": route_config.get("route_id") if isinstance(route_config, dict) else None,
+            "skip_platform_order_creation": True,
+            "ops_canary": True,
+            **(payment_request.metadata or {}),
+            "source": source,
+            "enforce_live_readiness": bool(payment_request.enforce_live_readiness),
+        },
+        preferred_psps=preferred_psps,
+        candidates=candidates,
+        canonical_psp_required=True,
+        enforce_live_readiness=bool(payment_request.enforce_live_readiness),
+    )
+
+    payment_id = str(result.get("payment_id") or f"failed_{secrets.token_hex(8)}")
+    payment_action = result.get("payment_action") or {}
+    payment_reference = ""
+    if isinstance(payment_action, dict):
+        payment_reference = str(
+            payment_action.get("client_secret")
+            or payment_action.get("url")
+            or ""
+        )
+
+    if result.get("success"):
+        await update_payment_info(
+            order_id=order_id,
+            payment_intent_id=payment_id,
+            client_secret=payment_reference,
+            payment_status="awaiting_payment",
+            psp_used=str(result.get("psp_used") or selected_provider),
+        )
+    else:
+        await update_order(
+            order_id,
+            {
+                "payment_status": "failed",
+                "psp_used": str(result.get("psp_used") or selected_provider),
+            },
+        )
+
+    if payment_request.emit_merchant_webhook:
+        event_type = _resolve_payment_webhook_event_type(result)
+        if event_type:
+            await _emit_payment_webhook_best_effort(
+                merchant["merchant_id"],
+                event_type=event_type,
+                payment_request=payment_request,
+                result={**result, "payment_id": payment_id},
+                psp_used=result.get("psp_used") or selected_provider,
+            )
+
+    return PaymentExecuteResponse(
+        success=bool(result.get("success")),
+        payment_id=payment_id,
+        order_id=order_id,
+        amount=payment_request.amount,
+        currency=payment_request.currency,
+        psp_used=str(result.get("psp_used") or selected_provider),
+        status=str(result.get("status") or ("requires_action" if result.get("success") else "failed")),
+        transaction_id=result.get("transaction_id"),
+        requires_customer_action=bool(result.get("requires_customer_action")),
+        payment_action=result.get("payment_action"),
+        error_message=result.get("error_message"),
+        timestamp=datetime.now().isoformat(),
+    )
+
+
 @router.post("/execute", response_model=PaymentExecuteResponse)
 async def execute_payment(
     payment_request: PaymentExecuteRequest,
@@ -437,6 +618,35 @@ async def execute_internal_payment_canary(
         raise HTTPException(
             status_code=500,
             detail=f"Internal payment canary failed: {str(exc)}",
+        )
+
+
+@router.post(
+    "/internal/canary/merchants/{merchant_id}/order-backed/execute",
+    response_model=PaymentExecuteResponse,
+    include_in_schema=False,
+)
+async def execute_internal_order_backed_canary(
+    merchant_id: str,
+    payment_request: InternalOrderBackedCanaryRequest,
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+):
+    try:
+        _require_internal_canary_access(request, x_pivota_internal_key)
+        merchant = await _load_canary_merchant(merchant_id)
+        return await _execute_order_backed_payment_canary(
+            merchant=merchant,
+            payment_request=payment_request,
+            source="ops_order_backed_canary",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Internal order-backed canary failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal order-backed canary failed: {str(exc)}",
         )
 
 

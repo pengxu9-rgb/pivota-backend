@@ -17,7 +17,7 @@ import socket
 from datetime import datetime
 from decimal import Decimal
 
-from db.orders import get_order, update_order_status, mark_order_paid, mark_order_shipped
+from db.orders import get_order, update_order, update_order_status, mark_order_paid, mark_order_shipped
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from config.settings import settings
@@ -100,6 +100,13 @@ def _stripe_payment_status_lower(order: Optional[Dict[str, Any]]) -> str:
     return str((order or {}).get("payment_status") or "").strip().lower()
 
 
+def _stripe_metadata_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    raw = str(value or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _can_apply_stripe_payment_success(order: Optional[Dict[str, Any]]) -> bool:
     if not order:
         return False
@@ -167,6 +174,48 @@ async def _resolve_stripe_order_for_refund(
         if order_hint:
             return await get_order(order_hint)
     return None
+
+
+async def _resolve_stripe_order_for_payment_event(
+    *,
+    payment_intent_id: Optional[str],
+    payment_meta: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
+    from db.database import database
+
+    if payment_intent_id:
+        result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
+        if result:
+            return result
+
+    order_hint = ""
+    if isinstance(payment_meta, dict):
+        order_hint = str(payment_meta.get("order_id") or "").strip()
+    if not order_hint:
+        return None
+
+    order = await get_order(order_hint)
+    if not order:
+        return None
+
+    current_payment_intent_id = str(order.get("payment_intent_id") or "").strip()
+    if payment_intent_id and current_payment_intent_id != payment_intent_id:
+        try:
+            await update_order(
+                order_hint,
+                {
+                    "payment_intent_id": payment_intent_id,
+                    "psp_used": "stripe",
+                },
+            )
+            refreshed = await get_order(order_hint)
+            if refreshed:
+                return refreshed
+        except Exception:
+            pass
+
+    return order
 
 
 async def _finalize_stripe_payment_success(
@@ -340,11 +389,11 @@ async def handle_stripe_webhook(
         if event_type == "payment_intent.succeeded":
             # 支付成功
             payment_intent_id = data.get("id")
-            
-            # 查找对应的订单
-            query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
-            from db.database import database
-            result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
+            payment_meta = data.get("metadata") or {}
+            result = await _resolve_stripe_order_for_payment_event(
+                payment_intent_id=payment_intent_id,
+                payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+            )
             
             if result:
                 order_id = result["order_id"]
@@ -362,23 +411,34 @@ async def handle_stripe_webhook(
                         await create_order_snapshot_evidence_pack(order_id, triggered_by="stripe_webhook")
                     except Exception as e:
                         logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
-                    
-                    # 触发 Shopify 订单创建
-                    from routes.merchant_onboarding_routes import get_merchant_onboarding
-                    from routes.order_routes import create_shopify_order
-                    
-                    merchant = await get_merchant_onboarding(merchant_id)
-                    store_info = await get_primary_store(merchant_id)
-                    if merchant and store_info and store_info.get("platform") == "shopify":
-                        logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
-                        try:
-                            success = await create_shopify_order(order_id)
-                            if success:
-                                logger.info(f"✅ Shopify order created via webhook for {order_id}")
-                            else:
-                                logger.error(f"❌ Shopify order creation failed for {order_id}")
-                        except Exception as shop_err:
-                            logger.error(f"❌ Shopify order creation error: {shop_err}")
+
+                    order_metadata = result.get("metadata") or {}
+                    if not isinstance(order_metadata, dict):
+                        order_metadata = {}
+                    skip_platform_order_creation = (
+                        _stripe_metadata_flag(order_metadata.get("skip_platform_order_creation"))
+                        or _stripe_metadata_flag(order_metadata.get("ops_canary"))
+                        or _stripe_metadata_flag((payment_meta or {}).get("skip_platform_order_creation"))
+                        or _stripe_metadata_flag((payment_meta or {}).get("ops_canary"))
+                    )
+
+                    if not skip_platform_order_creation:
+                        # 触发 Shopify 订单创建
+                        from routes.merchant_onboarding_routes import get_merchant_onboarding
+                        from routes.order_routes import create_shopify_order
+
+                        merchant = await get_merchant_onboarding(merchant_id)
+                        store_info = await get_primary_store(merchant_id)
+                        if merchant and store_info and store_info.get("platform") == "shopify":
+                            logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
+                            try:
+                                success = await create_shopify_order(order_id)
+                                if success:
+                                    logger.info(f"✅ Shopify order created via webhook for {order_id}")
+                                else:
+                                    logger.error(f"❌ Shopify order creation failed for {order_id}")
+                            except Exception as shop_err:
+                                logger.error(f"❌ Shopify order creation error: {shop_err}")
                 else:
                     logger.info(
                         "Stripe payment success replay skipped for order %s due to settled or terminal state",
@@ -389,10 +449,11 @@ async def handle_stripe_webhook(
             # 支付失败
             payment_intent_id = data.get("id")
             error_message = data.get("last_payment_error", {}).get("message", "Unknown error")
-            
-            query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
-            from db.database import database
-            result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
+            payment_meta = data.get("metadata") or {}
+            result = await _resolve_stripe_order_for_payment_event(
+                payment_intent_id=payment_intent_id,
+                payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+            )
             
             if result:
                 order_id = result["order_id"]

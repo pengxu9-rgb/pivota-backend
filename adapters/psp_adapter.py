@@ -136,6 +136,7 @@ class StripeAdapter(PSPAdapter):
                     success_url="https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
                     cancel_url="https://merchant.pivota.cc/payment/cancel",
                     metadata=metadata,
+                    payment_intent_data={"metadata": metadata},
                     **request_kwargs,
                 )
 

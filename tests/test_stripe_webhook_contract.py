@@ -154,6 +154,111 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
 
 
 @pytest.mark.asyncio
+async def test_stripe_webhook_payment_intent_succeeded_falls_back_to_order_metadata_for_canary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as database_module
+    import routes.merchant_onboarding_routes as merchant_onboarding_module
+    import routes.order_routes as order_routes_module
+    import routes.webhook_routes as webhook_routes_module
+
+    paid_calls: list[str] = []
+    evidence_calls: list[tuple[str, str]] = []
+    order_updates: list[tuple[str, Dict[str, Any]]] = []
+
+    event = _stripe_event(
+        "payment_intent.succeeded",
+        {
+            "id": "pi_canary_metadata_success",
+            "amount": 100,
+            "currency": "usd",
+            "metadata": {
+                "order_id": "ORD_CANARY_METADATA",
+                "ops_canary": "true",
+                "skip_platform_order_creation": "true",
+            },
+        },
+    )
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        assert values["payment_intent_id"] == "pi_canary_metadata_success"
+        return None
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any] | None:
+        assert order_id == "ORD_CANARY_METADATA"
+        return {
+            "order_id": order_id,
+            "merchant_id": "m_stripe",
+            "payment_intent_id": None,
+            "metadata": {
+                "ops_canary": True,
+                "skip_platform_order_creation": True,
+            },
+        }
+
+    async def fake_update_order(order_id: str, update_data: Dict[str, Any]) -> bool:
+        order_updates.append((order_id, dict(update_data)))
+        return True
+
+    async def fake_mark_order_paid(order_id: str) -> None:
+        paid_calls.append(order_id)
+
+    async def fake_log_order_event(**kwargs: Any) -> None:
+        return None
+
+    async def fake_create_order_snapshot_evidence_pack(order_id: str, triggered_by: str) -> None:
+        evidence_calls.append((order_id, triggered_by))
+
+    async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("ops canary webhook must not create Shopify orders")
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
+        return event
+
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+    monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(webhook_routes_module, "get_order", fake_get_order)
+    monkeypatch.setattr(webhook_routes_module, "update_order", fake_update_order)
+    monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fake_mark_order_paid)
+    monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(
+        webhook_routes_module,
+        "create_order_snapshot_evidence_pack",
+        fake_create_order_snapshot_evidence_pack,
+    )
+    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fail_if_called)
+    monkeypatch.setattr(merchant_onboarding_module, "get_merchant_onboarding", fail_if_called)
+    monkeypatch.setattr(order_routes_module, "create_shopify_order", fail_if_called)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe",
+            content=b'{"id":"evt_canary_metadata_success"}',
+            headers={"stripe-signature": "sig_canary_metadata_success"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "event": "payment_intent.succeeded"}
+    assert paid_calls == ["ORD_CANARY_METADATA"]
+    assert evidence_calls == [("ORD_CANARY_METADATA", "stripe_webhook")]
+    assert order_updates == [
+        (
+            "ORD_CANARY_METADATA",
+            {
+                "payment_intent_id": "pi_canary_metadata_success",
+                "psp_used": "stripe",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stripe_webhook_payment_intent_succeeded_does_not_restore_paid_after_refund(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

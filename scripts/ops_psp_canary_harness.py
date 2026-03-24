@@ -53,6 +53,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not restore the original routing after the canary run.",
     )
+    parser.add_argument(
+        "--order-backed",
+        action="store_true",
+        help="Use the internal order-backed canary path so checkout completion reconciles to a real order.",
+    )
     return parser.parse_args()
 
 
@@ -122,9 +127,9 @@ async def _run(args: argparse.Namespace) -> int:
             "api_key_last4": credentials.get("api_key_last4"),
         }
         api_key = args.api_key or credentials.get("api_key")
-        if args.mode == "live" and not api_key:
+        if args.mode == "live" and not args.order_backed and not api_key:
             raise RuntimeError("Merchant API key is not issued; issue a key before running the live canary harness")
-        if args.mode == "test" and not args.internal_key:
+        if (args.mode == "test" or args.order_backed) and not args.internal_key:
             raise RuntimeError("READINESS_INTERNAL_API_KEY or --internal-key is required for test canary mode")
 
         original_route = route_before
@@ -144,7 +149,12 @@ async def _run(args: argparse.Namespace) -> int:
         execute_path = "/payment/execute"
         execute_body: Dict[str, Any] = dict(payment_request)
 
-        if args.mode == "test":
+        if args.order_backed:
+            execute_path = f"/payment/internal/canary/merchants/{args.merchant_id}/order-backed/execute"
+            execute_headers["X-Pivota-Internal-Key"] = str(args.internal_key)
+            execute_body["emit_merchant_webhook"] = bool(args.emit_merchant_webhook)
+            execute_body["enforce_live_readiness"] = args.mode == "live"
+        elif args.mode == "test":
             execute_path = f"/payment/internal/canary/merchants/{args.merchant_id}/execute"
             execute_headers["X-Pivota-Internal-Key"] = str(args.internal_key)
             execute_body["emit_merchant_webhook"] = bool(args.emit_merchant_webhook)

@@ -496,3 +496,122 @@ async def test_execute_internal_payment_canary_requires_internal_key(
         )
 
     assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_execute_internal_order_backed_canary_creates_real_order_before_initiation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    async def fake_load_merchant(merchant_id: str):
+        assert merchant_id == "merch_test_payment"
+        return {
+            "merchant_id": merchant_id,
+            "business_name": "Glow Commerce",
+            "status": "approved",
+            "contact_email": "merchant@example.com",
+        }
+
+    async def fake_candidates(merchant, payment_request):
+        return (
+            [
+                {
+                    "psp_id": "psp_stripe_live",
+                    "provider": "stripe",
+                    "api_key": "sk_live_x",
+                    "status": "active",
+                    "environment": "live",
+                    "provider_config": {"mode": "payment_intent"},
+                    "validation_status": "valid",
+                }
+            ],
+            {"route_id": "route_live_stripe", "psp_priority": [{"psp": "stripe", "priority": 1}]},
+        )
+
+    created_orders = []
+
+    async def fake_create_order(order_data):
+        created_orders.append(order_data)
+        return "ORD_CANARY_LIVE_1"
+
+    async def fake_initiate(**kwargs):
+        assert kwargs["merchant_id"] == "merch_test_payment"
+        assert kwargs["preferred_psps"] == ["stripe"]
+        assert kwargs["metadata"]["order_id"] == "ORD_CANARY_LIVE_1"
+        assert kwargs["metadata"]["ops_canary"] is True
+        assert kwargs["metadata"]["skip_platform_order_creation"] is True
+        assert kwargs["metadata"]["source"] == "ops_order_backed_canary"
+        assert kwargs["enforce_live_readiness"] is True
+        return {
+            "success": True,
+            "payment_id": "cs_live_test_order_backed",
+            "status": "requires_action",
+            "transaction_id": "cs_live_test_order_backed",
+            "psp_used": "stripe",
+            "requires_customer_action": True,
+            "payment_action": {
+                "type": "redirect_url",
+                "url": "https://checkout.stripe.test/session",
+                "raw": {},
+            },
+            "error_message": None,
+        }
+
+    payment_updates = []
+
+    async def fake_update_payment_info(order_id, payment_intent_id, client_secret, payment_status="processing", psp_used=None):
+        payment_updates.append(
+            {
+                "order_id": order_id,
+                "payment_intent_id": payment_intent_id,
+                "client_secret": client_secret,
+                "payment_status": payment_status,
+                "psp_used": psp_used,
+            }
+        )
+        return True
+
+    emitted = []
+
+    async def fake_emit(*args, **kwargs):
+        emitted.append((args, kwargs))
+
+    monkeypatch.setattr(module.settings, "readiness_internal_api_key", "internal_test_key", raising=False)
+    monkeypatch.setattr(module, "_load_canary_merchant", fake_load_merchant)
+    monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
+    monkeypatch.setattr(module, "create_order", fake_create_order)
+    monkeypatch.setattr(module, "initiate_merchant_payment", fake_initiate)
+    monkeypatch.setattr(module, "update_payment_info", fake_update_payment_info)
+    monkeypatch.setattr(module, "_emit_payment_webhook_best_effort", fake_emit)
+
+    response = await module.execute_internal_order_backed_canary(
+        merchant_id="merch_test_payment",
+        payment_request=module.InternalOrderBackedCanaryRequest(
+            amount=100,
+            currency="USD",
+            order_id="requested_canary_ref",
+            customer_email="merchant@example.com",
+            enforce_live_readiness=True,
+        ),
+        request=_build_request("/payment/internal/canary/merchants/merch_test_payment/order-backed/execute"),
+        x_pivota_internal_key="internal_test_key",
+    )
+
+    assert response.success is True
+    assert response.order_id == "ORD_CANARY_LIVE_1"
+    assert response.psp_used == "stripe"
+    assert response.payment_action["type"] == "redirect_url"
+    assert created_orders[0]["merchant_id"] == "merch_test_payment"
+    assert created_orders[0]["psp_id"] == "psp_stripe_live"
+    assert created_orders[0]["metadata"]["requested_order_id"] == "requested_canary_ref"
+    assert payment_updates == [
+        {
+            "order_id": "ORD_CANARY_LIVE_1",
+            "payment_intent_id": "cs_live_test_order_backed",
+            "client_secret": "https://checkout.stripe.test/session",
+            "payment_status": "awaiting_payment",
+            "psp_used": "stripe",
+        }
+    ]
+    assert emitted == []
