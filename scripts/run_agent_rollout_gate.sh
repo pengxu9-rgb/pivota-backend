@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-BACKEND_REPO="${PIVOTA_BACKEND_REPO:-/Users/pengchydan/dev/Pivota-cursor-create-project-directory-structure-8344/pivota-backend}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND_REPO="${PIVOTA_BACKEND_REPO:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 ACP_REPO="${PIVOTA_ACP_REPO:-/Users/pengchydan/dev/pivota-acp-revert}"
 GATEWAY_REPO="${PIVOTA_AGENT_GATEWAY_REPO:-/Users/pengchydan/dev/PIVOTA-Agent}"
 
