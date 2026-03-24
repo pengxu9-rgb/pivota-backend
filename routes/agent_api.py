@@ -38,12 +38,14 @@ from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
+    is_destination_domain_allowed,
     make_redirect_token,
 )
 from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
+from services.external_referral_readiness import should_block_external_referral_runtime
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -2475,6 +2477,14 @@ async def _build_external_seed_product(
     if not external_product_id:
         return None
 
+    blocked, _gate_status = await should_block_external_referral_runtime(
+        seed_row,
+        matched_via="agent_api",
+        allowed_domains=allowed_domains,
+    )
+    if blocked:
+        return None
+
     disclosure_text = (
         seed_row.get("disclosure_text")
         or seed_data.get("disclosure_text")
@@ -2483,6 +2493,13 @@ async def _build_external_seed_product(
     utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
 
     dest_with_utm = apply_utm(destination_url, utm_template, {"market": market, "tool": tool})
+    if allowed_domains is None:
+        allowed_domains = await get_allowed_domains_for_market(market=market)
+    if not is_destination_domain_allowed(
+        destination_url=dest_with_utm,
+        allowed_domains=allowed_domains,
+    ):
+        return None
 
     token = make_redirect_token(
         {
