@@ -58,6 +58,19 @@ class MerchantWebhookConfigRequest(BaseModel):
 class MerchantWebhookTestRequest(BaseModel):
     event_type: Optional[str] = "order.created"
 
+
+class MerchantOrderBackedCanaryRequest(BaseModel):
+    amount: float
+    currency: str
+    order_id: Optional[str] = None
+    customer_email: Optional[str] = None
+    customer_name: Optional[str] = None
+    description: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    emit_merchant_webhook: bool = False
+    enforce_live_readiness: bool = True
+    label: Optional[str] = None
+
 # Payment status normalization:
 # - "status" is the order lifecycle (pending/completed/fulfilled/etc.)
 # - "payment_status" is the payment lifecycle (unpaid/pending/paid/etc.)
@@ -263,6 +276,48 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
         if merchant_data:
             return {"status": "success", "data": merchant_data["profile"]}
         raise HTTPException(status_code=500, detail="Failed to fetch profile")
+
+
+@router.post("/merchant/payment-canary/order-backed", include_in_schema=False)
+async def execute_merchant_order_backed_canary(
+    payload: MerchantOrderBackedCanaryRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = await _resolve_merchant_id(current_user)
+
+    from routes.payment_execution_routes import (
+        InternalOrderBackedCanaryRequest,
+        _execute_order_backed_payment_canary,
+    )
+
+    merchant = {
+        "merchant_id": merchant_id,
+        "business_name": current_user.get("business_name"),
+        "contact_email": current_user.get("email"),
+        "status": "approved",
+    }
+    requested_order_id = payload.order_id or (
+        f"merchant_canary_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    )
+    return await _execute_order_backed_payment_canary(
+        merchant=merchant,
+        payment_request=InternalOrderBackedCanaryRequest(
+            amount=payload.amount,
+            currency=payload.currency,
+            order_id=requested_order_id,
+            customer_email=payload.customer_email or current_user.get("email"),
+            customer_name=payload.customer_name,
+            description=payload.description,
+            metadata=payload.metadata,
+            emit_merchant_webhook=payload.emit_merchant_webhook,
+            enforce_live_readiness=payload.enforce_live_readiness,
+            label=payload.label,
+        ),
+        source="merchant_order_backed_canary",
+    )
 
 
 @router.get("/merchant/settings/preferences")

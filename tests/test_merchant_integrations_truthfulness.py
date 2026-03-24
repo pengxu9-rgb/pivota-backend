@@ -260,3 +260,59 @@ def test_test_psp_connection_persists_environment_and_validation_truth(monkeypat
     assert executed
     assert executed[0]["values"]["environment"] == "live"
     assert executed[0]["values"]["validation_status"] == "valid"
+
+
+def test_merchant_order_backed_canary_route_uses_authenticated_merchant(monkeypatch) -> None:
+    client, module = _build_client()
+
+    captured = {}
+
+    async def fake_execute(*, merchant, payment_request, source):
+        captured["merchant"] = merchant
+        captured["payment_request"] = payment_request
+        captured["source"] = source
+        return {
+            "success": True,
+            "payment_id": "cs_test_hidden_canary",
+            "order_id": "ORD_HIDDEN_CANARY",
+            "amount": 100,
+            "currency": "USD",
+            "psp_used": "stripe",
+            "status": "requires_action",
+            "transaction_id": "cs_test_hidden_canary",
+            "requires_customer_action": True,
+            "payment_action": {
+                "type": "redirect_url",
+                "url": "https://checkout.stripe.test/session",
+                "raw": {},
+            },
+            "error_message": None,
+            "timestamp": "2026-03-24T00:00:00Z",
+        }
+
+    import routes.payment_execution_routes as payment_execution_module
+
+    monkeypatch.setattr(
+        payment_execution_module,
+        "_execute_order_backed_payment_canary",
+        fake_execute,
+    )
+
+    response = client.post(
+        "/merchant/payment-canary/order-backed",
+        json={
+            "amount": 100,
+            "currency": "USD",
+            "customer_email": "merchant@example.com",
+            "enforce_live_readiness": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["order_id"] == "ORD_HIDDEN_CANARY"
+    assert captured["merchant"]["merchant_id"] == "merch_test_integrations"
+    assert captured["merchant"]["contact_email"] == "merchant@example.com"
+    assert captured["payment_request"].order_id.startswith("merchant_canary_")
+    assert captured["payment_request"].enforce_live_readiness is True
+    assert captured["source"] == "merchant_order_backed_canary"
