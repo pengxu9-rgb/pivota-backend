@@ -6,17 +6,10 @@ Provides lightweight monitoring and control of agent behavior:
 - Error rate monitoring
 - Policy enforcement (active, suspended, blocked)
 - Short-term metrics tracking (in-memory or Redis)
-
-TODO (Future enhancements):
-- External governance layer (API Gateway integration)
-- Async scoring system (ML-based agent quality prediction)
-- Dynamic policy adjustment based on agent performance
-- Circuit breaker pattern for failing agents
-- Agent reputation scoring (weighted by historical behavior)
 """
 
-import logging
 import inspect
+import logging
 import time
 from collections import defaultdict, deque
 from typing import Any, Dict
@@ -29,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class AgentMetrics:
-    """Short-term metrics for an agent (rolling window)"""
+    """Short-term metrics for an agent (rolling window)."""
 
     def __init__(self) -> None:
         self.window_start = time.time()
@@ -38,7 +31,6 @@ class AgentMetrics:
         self.latencies = deque(maxlen=100)
 
     def reset_if_old(self, window_seconds: int = 60) -> None:
-        """Reset metrics if window has expired"""
         if time.time() - self.window_start > window_seconds:
             self.window_start = time.time()
             self.requests = 0
@@ -48,14 +40,14 @@ class AgentMetrics:
 
 class AgentGovernance:
     """
-    Lightweight agent governance system
-    
+    Lightweight agent governance system.
+
     Tracks agent behavior and enforces policies:
     - Rate limits (requests per minute)
     - Error rate thresholds
     - Agent status (active, suspended, blocked)
     """
-    
+
     def __init__(self) -> None:
         self._metrics_store: Dict[str, AgentMetrics] = defaultdict(AgentMetrics)
         self._policy_cache: Dict[str, Dict[str, Any]] = {}
@@ -64,24 +56,24 @@ class AgentGovernance:
 
     async def validate_request(self, agent_id: str, *, fail_closed: bool = False) -> None:
         """
-        Validate if agent can make this request
+        Validate if agent can make this request.
 
         Raises:
-            HTTPException(403): If agent is blocked
+            HTTPException(403): If agent is blocked or suspended
             HTTPException(429): If rate limit exceeded
         """
         try:
             policy = await self._get_policy(agent_id, fail_closed=fail_closed)
 
             if policy.get("status") == "blocked":
-                logger.warning(f"[GOVERNANCE] Blocked agent {agent_id} attempted request")
+                logger.warning("[GOVERNANCE] Blocked agent %s attempted request", agent_id)
                 raise HTTPException(
                     status_code=403,
                     detail="Agent access blocked. Contact support for details.",
                 )
 
             if policy.get("status") == "suspended":
-                logger.warning(f"[GOVERNANCE] Suspended agent {agent_id} attempted request")
+                logger.warning("[GOVERNANCE] Suspended agent %s attempted request", agent_id)
                 raise HTTPException(
                     status_code=403,
                     detail="Agent temporarily suspended due to policy violations.",
@@ -91,7 +83,12 @@ class AgentGovernance:
             max_rpm = policy.get("max_requests_per_minute", 100)
 
             if current_rpm > max_rpm:
-                logger.warning(f"[GOVERNANCE] Agent {agent_id} exceeded rate limit: {current_rpm:.1f} > {max_rpm} RPM")
+                logger.warning(
+                    "[GOVERNANCE] Agent %s exceeded rate limit: %.1f > %s RPM",
+                    agent_id,
+                    current_rpm,
+                    max_rpm,
+                )
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limit exceeded: {int(current_rpm)} requests/minute (limit: {max_rpm})",
@@ -103,7 +100,7 @@ class AgentGovernance:
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"[GOVERNANCE] Validation error for {agent_id}: {e}")
+            logger.error("[GOVERNANCE] Validation error for %s: %s", agent_id, e)
             if fail_closed:
                 raise HTTPException(
                     status_code=503,
@@ -113,19 +110,9 @@ class AgentGovernance:
                     },
                 )
 
-    async def record_response(
-        self,
-        agent_id: str,
-        latency_ms: int,
-        success: bool,
-    ) -> None:
+    async def record_response(self, agent_id: str, latency_ms: int, success: bool) -> None:
         """
-        Record response metrics and check for policy violations
-
-        Args:
-            agent_id: Agent identifier
-            latency_ms: Response time in milliseconds
-            success: Whether request succeeded
+        Record response metrics and check for policy violations.
         """
         try:
             metrics = self._get_or_create_metrics(agent_id)
@@ -142,25 +129,29 @@ class AgentGovernance:
 
                 if error_rate > max_error_rate:
                     logger.warning(
-                        f"[GOVERNANCE] Agent {agent_id} exceeds error rate: "
-                        f"{error_rate:.1%} > {max_error_rate:.1%} "
-                        f"({metrics.errors}/{metrics.requests} errors)"
+                        "[GOVERNANCE] Agent %s exceeds error rate: %.1f%% > %.1f%% (%s/%s errors)",
+                        agent_id,
+                        error_rate * 100,
+                        max_error_rate * 100,
+                        metrics.errors,
+                        metrics.requests,
                     )
 
             if metrics.requests % 100 == 0:
                 avg_latency = sum(metrics.latencies) / len(metrics.latencies) if metrics.latencies else 0
                 logger.info(
-                    f"[GOVERNANCE] Agent {agent_id} metrics: "
-                    f"requests={metrics.requests}, errors={metrics.errors}, "
-                    f"error_rate={metrics.errors/metrics.requests:.1%}, "
-                    f"avg_latency={avg_latency:.0f}ms"
+                    "[GOVERNANCE] Agent %s metrics: requests=%s, errors=%s, error_rate=%.1f%%, avg_latency=%.0fms",
+                    agent_id,
+                    metrics.requests,
+                    metrics.errors,
+                    (metrics.errors / metrics.requests) * 100 if metrics.requests else 0.0,
+                    avg_latency,
                 )
 
         except Exception as e:
-            logger.error(f"[GOVERNANCE] Failed to record response for {agent_id}: {e}")
+            logger.error("[GOVERNANCE] Failed to record response for %s: %s", agent_id, e)
 
     async def _get_policy(self, agent_id: str, *, fail_closed: bool = False) -> Dict[str, Any]:
-        """Get agent policy (with caching)"""
         if agent_id in self._policy_cache:
             cache_age = time.time() - self._cache_timestamps.get(agent_id, 0)
             if cache_age < self._cache_ttl:
@@ -168,9 +159,11 @@ class AgentGovernance:
 
         try:
             policy_row = await database.fetch_one(
-                """SELECT agent_id, max_requests_per_minute, max_error_rate, status
-                   FROM agent_policies 
-                   WHERE agent_id = :agent_id""",
+                """
+                SELECT agent_id, max_requests_per_minute, max_error_rate, status
+                FROM agent_policies
+                WHERE agent_id = :agent_id
+                """,
                 {"agent_id": agent_id},
             )
 
@@ -185,9 +178,11 @@ class AgentGovernance:
                 }
                 try:
                     await database.execute(
-                        """INSERT INTO agent_policies (agent_id, max_requests_per_minute, max_error_rate, status)
-                           VALUES (:agent_id, :max_rpm, :max_err, :status)
-                           ON CONFLICT (agent_id) DO NOTHING""",
+                        """
+                        INSERT INTO agent_policies (agent_id, max_requests_per_minute, max_error_rate, status)
+                        VALUES (:agent_id, :max_rpm, :max_err, :status)
+                        ON CONFLICT (agent_id) DO NOTHING
+                        """,
                         {
                             "agent_id": agent_id,
                             "max_rpm": 100,
@@ -200,11 +195,10 @@ class AgentGovernance:
 
             self._policy_cache[agent_id] = policy
             self._cache_timestamps[agent_id] = time.time()
-
             return policy
 
         except Exception as e:
-            logger.error(f"Failed to get policy for {agent_id}: {e}")
+            logger.error("Failed to get policy for %s: %s", agent_id, e)
             if fail_closed:
                 raise
             return {
@@ -215,7 +209,6 @@ class AgentGovernance:
             }
 
     def _get_or_create_metrics(self, agent_id: str) -> AgentMetrics:
-        """Get or create metrics object for agent"""
         if agent_id not in self._metrics_store:
             self._metrics_store[agent_id] = AgentMetrics()
 
@@ -224,19 +217,18 @@ class AgentGovernance:
         return metrics
 
     def _get_current_rpm(self, agent_id: str) -> float:
-        """Calculate current requests per minute (rolling window)"""
         metrics = self._get_or_create_metrics(agent_id)
         elapsed = time.time() - metrics.window_start
-
         if elapsed < 1:
             return 0.0
-
         return (metrics.requests / elapsed) * 60
 
 
 def governance_runtime_contract(governance: Any) -> Dict[str, Any]:
     validate = getattr(governance, "validate_request", None)
+    record_response = getattr(governance, "record_response", None)
     params = []
+    record_response_params = []
     compat_mode = "missing_validate_request"
     if validate is not None:
         try:
@@ -244,13 +236,27 @@ def governance_runtime_contract(governance: Any) -> Dict[str, Any]:
         except (TypeError, ValueError):
             params = []
         compat_mode = "keyword_fail_closed" if "fail_closed" in params else "legacy_positional_only"
+    if record_response is not None:
+        try:
+            record_response_params = list(inspect.signature(record_response).parameters.keys())
+        except (TypeError, ValueError):
+            record_response_params = []
     return {
         "compat_mode": compat_mode,
         "validate_request_params": params,
+        "record_response_present": callable(record_response),
+        "record_response_params": record_response_params,
+        "compat_helper_present": True,
     }
 
 
 async def validate_request_compat(governance: Any, agent_id: str, *, fail_closed: bool = False) -> None:
+    """
+    Backward-compatible governance validation.
+
+    Some runtime environments may still have an older AgentGovernance
+    implementation loaded without the `fail_closed` keyword.
+    """
     validate = getattr(governance, "validate_request")
     try:
         params = inspect.signature(validate).parameters
@@ -265,5 +271,3 @@ async def validate_request_compat(governance: Any, agent_id: str, *, fail_closed
 
 
 agent_governance = AgentGovernance()
-
-

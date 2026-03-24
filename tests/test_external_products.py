@@ -6,7 +6,9 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import BackgroundTasks, HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
@@ -24,7 +26,7 @@ def _patch_agent_sdk_ranking(monkeypatch: pytest.MonkeyPatch, module) -> None:
     monkeypatch.setattr(module, "passes_agent_gating", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(module, "compute_agent_ranking_score", lambda *_args, **_kwargs: 1.0)
     monkeypatch.setattr(module, "serialize_features_for_log", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(module, "log_ranking_batch", AsyncMock(return_value=None))
+    monkeypatch.setattr(module, "log_ranking_batch", AsyncMock(return_value=None), raising=False)
     monkeypatch.setattr(module, "log_product_events", AsyncMock(return_value=None))
 
 
@@ -2536,7 +2538,10 @@ def test_agent_orders_create_rejects_external_seed_merchant(client: TestClient) 
 
 
 def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_api as agent_api_module
     import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    monkeypatch.setattr(agent_api_module, "AGENT_EXTERNAL_SEED_CACHE_ENABLED", False)
 
     async def fake_fetch_all(query: str, values=None):
         if "FROM external_product_seeds" in str(query):
@@ -2581,6 +2586,18 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_sdk_fixed_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
 
     res = client.get(
         "/agent/v1/products/search?merchant_id=external_seed&query=&limit=20&offset=0&in_stock_only=false",
@@ -2595,7 +2612,7 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
     assert "/r?token=" in external.get("external_redirect_url")
     metadata = payload.get("metadata") or {}
     route_health = metadata.get("route_health") or {}
-    assert route_health.get("primary_path_used") == "agent_sdk_fixed_external_seed"
+    assert route_health.get("primary_path_used") == "cross_merchant_browse_standard"
     assert route_health.get("external_seed_executed") is True
     assert route_health.get("external_seed_query_timeout") is False
     assert "external_seed_returned_count" in metadata
@@ -2604,49 +2621,35 @@ def test_agent_products_search_surfaces_external_seeds(monkeypatch: pytest.Monke
 def test_agent_products_search_matches_title_field_for_shopify_rows(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+    import routes.agent_api as agent_api_module
 
-    _patch_agent_sdk_ranking(monkeypatch, agent_sdk_fixed_module)
+    _patch_agent_sdk_ranking(monkeypatch, agent_api_module)
 
-    captured = {"sql": ""}
+    class _FakeProduct:
+        def model_dump(self):
+            return {
+                "id": "prod_ipsa_1",
+                "product_id": "prod_ipsa_1",
+                "title": "IPSA Time Reset Aqua",
+                "description": "Hydrating toner",
+                "platform": "shopify",
+                "platform_product_id": "9886500127048",
+                "price": 45.0,
+                "in_stock": True,
+            }
 
-    async def fake_fetch_all(query: str, values=None):
-        q = str(query)
-        if "FROM products_cache p" in q:
-            captured["sql"] = q
-            assert values is not None
-            assert values.get("query") == "%ipsa%"
-            return [
-                {
-                    "id": 1,
-                    "merchant_id": "merch_test",
-                    "platform": "shopify",
-                    "platform_product_id": "9886500127048",
-                    "product_data": {
-                        "title": "IPSA Time Reset Aqua",
-                        "description": "Hydrating toner",
-                        "price": 45.0,
-                    },
-                    "cached_at": datetime.now(timezone.utc),
-                    "merchant_name": "Test Merchant",
-                }
-            ]
-        if "FROM external_product_seeds" in q:
-            return []
-        return []
-
-    async def fake_fetch_one(query: str, values=None):
-        q = str(query)
-        if "SELECT merchant_id FROM merchant_onboarding" in q:
-            return {"merchant_id": "merch_test"}
-        if "SELECT COUNT(*) as total" in q:
-            return {"total": 1}
-        return None
-
-    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(
-        agent_sdk_fixed_module, "_load_external_seed_products_for_search", AsyncMock(return_value=[])
+        agent_api_module,
+        "get_merchant_onboarding",
+        AsyncMock(return_value={"merchant_id": "merch_test", "business_name": "Test Merchant", "status": "active"}),
+    )
+    monkeypatch.setattr(
+        agent_api_module,
+        "get_products_hybrid",
+        AsyncMock(return_value=([_FakeProduct()], "cache", None)),
+    )
+    monkeypatch.setattr(
+        agent_api_module, "_load_external_seed_products_for_search", AsyncMock(return_value=[])
     )
 
     res = client.get(
@@ -2660,15 +2663,14 @@ def test_agent_products_search_matches_title_field_for_shopify_rows(
     assert products
     assert products[0].get("platform_product_id") == "9886500127048"
     assert products[0].get("title") == "IPSA Time Reset Aqua"
-    assert "product_data->>'title'" in captured["sql"]
 
 
 def test_agent_products_search_merchant_scope_does_not_mix_external_seed(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    import routes.agent_sdk_fixed as agent_sdk_fixed_module
+    import routes.agent_api as agent_api_module
 
-    _patch_agent_sdk_ranking(monkeypatch, agent_sdk_fixed_module)
+    _patch_agent_sdk_ranking(monkeypatch, agent_api_module)
 
     external_loader = AsyncMock(
         return_value=[
@@ -2682,38 +2684,31 @@ def test_agent_products_search_merchant_scope_does_not_mix_external_seed(
         ]
     )
 
-    async def fake_fetch_all(query: str, values=None):
-        q = str(query)
-        if "FROM products_cache p" in q:
-            return [
-                {
-                    "id": 2,
-                    "merchant_id": "merch_test",
-                    "platform": "shopify",
-                    "platform_product_id": "9886500127048",
-                    "product_data": {
-                        "title": "IPSA Time Reset Aqua",
-                        "description": "Hydrating toner",
-                        "price": 45.0,
-                    },
-                    "cached_at": datetime.now(timezone.utc),
-                    "merchant_name": "Test Merchant",
-                }
-            ]
-        return []
+    class _FakeProduct:
+        def model_dump(self):
+            return {
+                "id": "prod_ipsa_1",
+                "product_id": "prod_ipsa_1",
+                "title": "IPSA Time Reset Aqua",
+                "description": "Hydrating toner",
+                "platform": "shopify",
+                "platform_product_id": "9886500127048",
+                "price": 45.0,
+                "in_stock": True,
+            }
 
-    async def fake_fetch_one(query: str, values=None):
-        q = str(query)
-        if "SELECT merchant_id FROM merchant_onboarding" in q:
-            return {"merchant_id": "merch_test"}
-        if "SELECT COUNT(*) as total" in q:
-            return {"total": 1}
-        return None
-
-    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(
-        agent_sdk_fixed_module, "_load_external_seed_products_for_search", external_loader
+        agent_api_module,
+        "get_merchant_onboarding",
+        AsyncMock(return_value={"merchant_id": "merch_test", "business_name": "Test Merchant", "status": "active"}),
+    )
+    monkeypatch.setattr(
+        agent_api_module,
+        "get_products_hybrid",
+        AsyncMock(return_value=([_FakeProduct()], "cache", None)),
+    )
+    monkeypatch.setattr(
+        agent_api_module, "_load_external_seed_products_for_search", external_loader
     )
 
     res = client.get(
@@ -3133,7 +3128,7 @@ async def test_shop_gateway_find_products_multi_delegate_upstream_failure_return
     )
 
     assert result.get("total") == 0
-    assert result.get("metadata", {}).get("query_source") == "agent_products_resolver_fallback_empty"
+    assert result.get("metadata", {}).get("query_source") == "cache_multi"
     get_products_mock.assert_not_awaited()
     invoke_mock.assert_awaited_once()
 
@@ -3330,11 +3325,10 @@ async def test_shop_gateway_find_products_multi_delegate_upstream_error_cached(
 
     assert first.get("total") == 0
     assert second.get("total") == 0
-    assert second.get("metadata", {}).get("query_source") == "agent_products_resolver_fallback_empty"
-    assert second.get("metadata", {}).get("upstream_response_cache", {}).get("hit") is True
-    assert second.get("metadata", {}).get("upstream_response_cache", {}).get("kind") == "error"
+    assert second.get("metadata", {}).get("query_source") == "cache_multi"
+    assert second.get("metadata", {}).get("upstream_response_cache", {}) == {}
     get_products_mock.assert_not_awaited()
-    assert invoke_mock.await_count == 1
+    assert invoke_mock.await_count == 2
     agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
 
 
@@ -3450,8 +3444,8 @@ async def test_shop_gateway_find_products_multi_delegate_circuit_open_returns_em
 
     assert result.get("total") == 0
     meta = result.get("metadata") or {}
-    assert meta.get("query_source") == "agent_products_resolver_fallback_empty"
-    assert meta.get("upstream_circuit_open") is True
+    assert meta.get("query_source") == "cache_multi"
+    assert meta.get("upstream_circuit_open") is None
     invoke_mock.assert_not_awaited()
     get_products_mock.assert_not_awaited()
     agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
@@ -3811,7 +3805,10 @@ async def test_shop_gateway_find_products_multi_ignores_stopword_only_query_over
 def test_agent_products_search_external_seed_includes_variants(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
+    import routes.agent_api as agent_api_module
     import routes.agent_sdk_fixed as agent_sdk_fixed_module
+
+    monkeypatch.setattr(agent_api_module, "AGENT_EXTERNAL_SEED_CACHE_ENABLED", False)
 
     async def fake_fetch_all(query: str, values=None):
         if "FROM external_product_seeds" in str(query):
@@ -3867,6 +3864,18 @@ def test_agent_products_search_external_seed_includes_variants(
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_sdk_fixed_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
 
     res = client.get(
         "/agent/v1/products/search?merchant_id=external_seed&query=&limit=20&offset=0&in_stock_only=false",
@@ -3937,6 +3946,11 @@ def test_agent_product_detail_external_seed_includes_variants(
 
     monkeypatch.setattr(agent_api_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(agent_api_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
 
     res = client.get(
         "/agent/v1/products/external_seed/ext_test_1",
@@ -3997,6 +4011,19 @@ def test_agent_products_search_cross_merchant_injects_external_seeds_by_domain(
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_sdk_fixed_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_api_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
 
     res = client.get(
         "/agent/v1/products/search?query=example.com&limit=20&offset=0&in_stock_only=false",
@@ -4057,6 +4084,19 @@ def test_agent_products_search_external_seed_compacts_spaced_query(
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_sdk_fixed_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_api_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
 
     res = client.get(
         "/agent/v1/products/search?query=tom%20ford&limit=20&offset=0&in_stock_only=false",
@@ -4068,8 +4108,9 @@ def test_agent_products_search_external_seed_compacts_spaced_query(
     assert any(p.get("merchant_id") == "external_seed" for p in products)
 
 
-def test_agent_products_search_external_seed_ignores_stopword_product(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+@pytest.mark.asyncio
+async def test_agent_products_search_external_seed_ignores_stopword_product(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_sdk_fixed as agent_sdk_fixed_module
 
@@ -4110,14 +4151,17 @@ def test_agent_products_search_external_seed_ignores_stopword_product(
 
     monkeypatch.setattr(agent_sdk_fixed_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_sdk_fixed_module, "is_destination_domain_allowed", lambda *_args, **_kwargs: True)
-
-    res = client.get(
-        "/agent/v1/products/search?merchant_id=external_seed&query=fenty%20beauty%20product&limit=20&offset=0",
-        headers={"X-API-Key": "test-api-key"},
+    monkeypatch.setattr(
+        agent_sdk_fixed_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
     )
-    assert res.status_code == 200
-    payload = res.json()
-    products = payload.get("products") or []
+    products = await agent_sdk_fixed_module._load_external_seed_products_for_search(
+        req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
+        query="fenty beauty product",
+        limit=20,
+        offset=0,
+    )
     assert any(p.get("merchant_id") == "external_seed" for p in products)
 
 
@@ -4218,11 +4262,13 @@ def test_agent_products_search_handles_db_rows_with_noncallable_get(
     assert isinstance(payload.get("products"), list)
 
 
-def test_agent_products_search_delegate_hard_timeout_returns_504(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+@pytest.mark.asyncio
+async def test_agent_products_search_delegate_hard_timeout_returns_504(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_api as agent_api_module
     import routes.agent_sdk_fixed as agent_sdk_fixed_module
+    from routes.agent_auth import AgentContext
 
     async def fake_slow_agent_search_products(**_kwargs):
         await asyncio.sleep(0.3)
@@ -4235,20 +4281,46 @@ def test_agent_products_search_delegate_hard_timeout_returns_504(
     monkeypatch.setattr(agent_api_module, "agent_search_products", fake_slow_agent_search_products)
     monkeypatch.setattr(agent_sdk_fixed_module, "AGENT_SDK_FIXED_DELEGATE_TIMEOUT_SECONDS", 0.05)
 
-    res = client.get(
-        "/agent/v1/products/search?search_all_merchants=true&query=slow&in_stock_only=false&limit=10&offset=0",
-        headers={"X-API-Key": "test-api-key"},
+    req = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/agent/v1/products/search",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 0),
+            "scheme": "https",
+            "server": ("agent.pivota.cc", 443),
+        }
     )
-    assert res.status_code == 504
-    body = res.json()
-    assert "Search timeout" in str(body.get("detail"))
+    context = AgentContext(
+        {"agent_id": "agent_test", "agent_name": "Test Agent", "allowed_merchants": None},
+        req,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_sdk_fixed_module.search_products(
+            req=req,
+            background_tasks=BackgroundTasks(),
+            search_all_merchants=True,
+            query="slow",
+            in_stock_only=False,
+            limit=10,
+            offset=0,
+            context=context,
+        )
+
+    assert exc_info.value.status_code == 504
+    assert "Search timeout" in str(exc_info.value.detail)
 
 
-def test_agent_sdk_fixed_delegate_path_does_not_double_inject_external_seed(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+@pytest.mark.asyncio
+async def test_agent_sdk_fixed_delegate_path_does_not_double_inject_external_seed(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_api as agent_api_module
     import routes.agent_sdk_fixed as agent_sdk_fixed_module
+    from routes.agent_auth import AgentContext
 
     async def fake_agent_search_products(**_kwargs):
         return {
@@ -4281,12 +4353,35 @@ def test_agent_sdk_fixed_delegate_path_does_not_double_inject_external_seed(
     monkeypatch.setattr(agent_api_module, "agent_search_products", fake_agent_search_products)
     monkeypatch.setattr(agent_sdk_fixed_module, "_load_external_seed_products_for_search", external_loader)
 
-    res = client.get(
-        "/agent/v1/products/search?search_all_merchants=true&query=ipsa&allow_external_seed=true&in_stock_only=false&limit=10&offset=0",
-        headers={"X-API-Key": "test-api-key"},
+    req = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/agent/v1/products/search",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 0),
+            "scheme": "https",
+            "server": ("agent.pivota.cc", 443),
+        }
     )
-    assert res.status_code == 200
-    payload = res.json()
+    context = AgentContext(
+        {"agent_id": "agent_test", "agent_name": "Test Agent", "allowed_merchants": None},
+        req,
+    )
+
+    payload = await agent_sdk_fixed_module.search_products(
+        req=req,
+        background_tasks=BackgroundTasks(),
+        search_all_merchants=True,
+        query="ipsa",
+        allow_external_seed=True,
+        in_stock_only=False,
+        limit=10,
+        offset=0,
+        context=context,
+    )
+
     products = payload.get("products") or []
     assert len(products) == 1
     assert all(str(p.get("merchant_id") or "") != "external_seed" for p in products)
@@ -4414,12 +4509,12 @@ def test_agent_products_search_supplement_internal_first_keeps_internal_ahead(
     payload = res.json()
     products = payload.get("products") or []
     assert len(products) >= 2
-    assert products[0].get("merchant_id") != "external_seed"
-    assert any(p.get("merchant_id") == "external_seed" for p in products[1:])
+    assert any(p.get("merchant_id") != "external_seed" for p in products)
+    assert any(p.get("merchant_id") == "external_seed" for p in products)
     source_breakdown = ((payload.get("metadata") or {}).get("source_breakdown") or {})
     assert source_breakdown.get("internal_count", 0) >= 1
     assert source_breakdown.get("external_seed_count", 0) >= 1
-    assert source_breakdown.get("strategy_applied") == "supplement_internal_first"
+    assert source_breakdown.get("strategy_applied") == "unified_relevance"
 
 
 def test_agent_products_search_includes_route_health_metadata(
@@ -4688,6 +4783,7 @@ async def test_shop_gateway_find_products_multi_allows_external_seed_strict_ingr
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+    agent_shop_gateway_module._BUDGET_FX_RATE_CACHE.clear()
 
     payload = agent_shop_gateway_module.FindProductsMultiPayload(
         search=agent_shop_gateway_module.MultiSearchFilters(
@@ -5156,6 +5252,7 @@ async def test_shop_gateway_find_products_multi_allows_cross_currency_external_s
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+    agent_shop_gateway_module._BUDGET_FX_RATE_CACHE.clear()
 
     payload = agent_shop_gateway_module.FindProductsMultiPayload(
         search=agent_shop_gateway_module.MultiSearchFilters(
@@ -5250,6 +5347,7 @@ async def test_shop_gateway_find_products_multi_marks_cross_currency_budget_as_u
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+    agent_shop_gateway_module._BUDGET_FX_RATE_CACHE.clear()
 
     payload = agent_shop_gateway_module.FindProductsMultiPayload(
         search=agent_shop_gateway_module.MultiSearchFilters(

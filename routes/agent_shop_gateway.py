@@ -6508,7 +6508,9 @@ async def _handle_find_products_multi(
 
         seed_limit = min(max(limit * max(page, 1) * 2, 30), 200)
         if is_shopping_surface:
-            shopping_seed_cap = max(200, int(MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING or 0))
+            shopping_seed_cap = int(MULTI_SEARCH_SEED_QUERY_LIMIT_SHOPPING or 0)
+            if shopping_seed_cap <= 0:
+                shopping_seed_cap = 200
             seed_limit = min(seed_limit, shopping_seed_cap)
         seed_params: Dict[str, Any] = {"limit": seed_limit}
         seed_where = "status = 'active'"

@@ -236,7 +236,6 @@ async def get_metrics_summary(
         }
 
 
-@router.get("/recent")
 async def get_recent_activity(
     request: Request,
     limit: int = Query(5, ge=1, le=50),

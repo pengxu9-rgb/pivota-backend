@@ -286,52 +286,6 @@ async def confirm_bulk_payouts(
         logger.error(f"Error confirming bulk payouts: {e}")
         raise HTTPException(status_code=500, detail="Failed to confirm payouts")
 
-@router.patch("/{payout_id}/confirm", response_model=dict)
-async def confirm_single_payout(
-    payout_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    Confirm a single payout as paid
-    """
-    # Verify employee access
-    if current_user.get("role") not in ["employee", "admin"]:
-        raise HTTPException(status_code=403, detail="Only employees can access this endpoint")
-    
-    try:
-        # Verify payout exists and is uploaded
-        payout = await database.fetch_one(
-            query="SELECT id, status FROM agent_payouts WHERE id = :id",
-            values={"id": payout_id}
-        )
-        
-        if not payout:
-            raise HTTPException(status_code=404, detail="Payout not found")
-        
-        if payout["status"] != "uploaded":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot confirm payout. Current status: {payout['status']}"
-            )
-        
-        # Confirm payout
-        repo = PayoutRepo()
-        await repo.confirm(payout_id)
-        
-        logger.info(f"Employee {current_user.get('email')} confirmed payout {payout_id}")
-        
-        return {
-            "status": "success",
-            "payout_id": payout_id,
-            "message": "Payout confirmed successfully"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error confirming payout {payout_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to confirm payout")
-
 @router.get("/dashboard", response_model=dict)
 async def get_payout_dashboard(
     days: int = Query(30, ge=1, le=365, description="Number of days to analyze"),
