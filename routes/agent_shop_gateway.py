@@ -784,40 +784,223 @@ def _record_matched_visible_attribute(
         bucket_values.append(target_label)
 
 
-_SKINCARE_INGREDIENT_CANONICAL_ALIASES: Dict[str, str] = {
-    "ascorbic acid": "ascorbic_acid",
-    "azelaic acid": "azelaic_acid",
-    "benzoyl peroxide": "benzoyl_peroxide",
-    "ceramide": "ceramide_np",
-    "ceramides": "ceramide_np",
-    "ceramide np": "ceramide_np",
-    "glycerin": "glycerin",
-    "glycerine": "glycerin",
-    "hyaluronic acid": "hyaluronic_acid",
-    "niacinamide": "niacinamide",
-    "panthenol": "panthenol",
-    "retinol": "retinol",
-    "salicylic acid": "salicylic_acid",
-    "vitamin c": "ascorbic_acid",
-    "zinc pca": "zinc_pca",
+_SKINCARE_INGREDIENT_PROFILES: Dict[str, Dict[str, Any]] = {
+    "ascorbic_acid": {
+        "display_name": "Vitamin C",
+        "aliases": ["ascorbic acid", "vitamin c", "l ascorbic acid"],
+        "expected_step_families": ["serum", "treatment"],
+    },
+    "azelaic_acid": {
+        "display_name": "Azelaic Acid",
+        "aliases": ["azelaic acid", "azelaic"],
+        "expected_step_families": ["serum", "treatment", "cream"],
+    },
+    "benzoyl_peroxide": {
+        "display_name": "Benzoyl Peroxide",
+        "aliases": ["benzoyl peroxide", "benzoyl", "bpo"],
+        "expected_step_families": ["treatment", "cleanser", "gel"],
+    },
+    "ceramide_np": {
+        "display_name": "Ceramide NP",
+        "aliases": ["ceramide", "ceramides", "ceramide np"],
+        "expected_step_families": ["serum", "moisturizer"],
+    },
+    "glycerin": {
+        "display_name": "Glycerin",
+        "aliases": ["glycerin", "glycerine"],
+        "expected_step_families": ["serum", "moisturizer"],
+    },
+    "hyaluronic_acid": {
+        "display_name": "Hyaluronic Acid",
+        "aliases": ["hyaluronic acid", "hyaluronic", "hyaluron", "sodium hyaluronate"],
+        "expected_step_families": ["serum", "moisturizer"],
+    },
+    "niacinamide": {
+        "display_name": "Niacinamide",
+        "aliases": ["niacinamide", "nicotinamide", "vitamin b3"],
+        "expected_step_families": ["serum", "treatment"],
+    },
+    "panthenol": {
+        "display_name": "Panthenol",
+        "aliases": ["panthenol", "vitamin b5", "provitamin b5", "b5"],
+        "expected_step_families": ["serum", "moisturizer"],
+    },
+    "peptides": {
+        "display_name": "Peptides",
+        "aliases": [
+            "peptide",
+            "peptides",
+            "multi peptide",
+            "multi-peptide",
+            "copper peptide",
+            "copper peptides",
+            "tripeptide",
+            "tetrapeptide",
+            "hexapeptide",
+        ],
+        "expected_step_families": ["serum", "treatment"],
+    },
+    "retinol": {
+        "display_name": "Retinol",
+        "aliases": ["retinol", "retinoid", "vitamin a"],
+        "expected_step_families": ["serum", "treatment", "cream"],
+    },
+    "salicylic_acid": {
+        "display_name": "Salicylic Acid",
+        "aliases": ["salicylic acid", "bha"],
+        "expected_step_families": ["serum", "treatment", "cleanser"],
+    },
+    "zinc_pca": {
+        "display_name": "Zinc PCA",
+        "aliases": ["zinc pca", "zinc"],
+        "expected_step_families": ["serum", "treatment"],
+    },
 }
 
+
+def _normalize_skincare_ingredient_alias_term(value: Optional[str]) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or "").lower())
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
+
+
+def _build_skincare_ingredient_alias_map() -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+    for canonical_id, profile in _SKINCARE_INGREDIENT_PROFILES.items():
+        terms = [canonical_id.replace("_", " "), *(profile.get("aliases") or [])]
+        for term in terms:
+            normalized = _normalize_skincare_ingredient_alias_term(term)
+            if normalized:
+                aliases[normalized] = canonical_id
+    return aliases
+
+
+_SKINCARE_INGREDIENT_CANONICAL_ALIASES: Dict[str, str] = _build_skincare_ingredient_alias_map()
 _SKINCARE_INGREDIENT_DISPLAY_NAMES: Dict[str, str] = {
-    "ascorbic_acid": "Vitamin C",
-    "azelaic_acid": "Azelaic Acid",
-    "benzoyl_peroxide": "Benzoyl Peroxide",
-    "ceramide_np": "Ceramide NP",
-    "glycerin": "Glycerin",
-    "hyaluronic_acid": "Hyaluronic Acid",
-    "niacinamide": "Niacinamide",
-    "panthenol": "Panthenol",
-    "retinol": "Retinol",
-    "salicylic_acid": "Salicylic Acid",
-    "zinc_pca": "Zinc PCA",
+    canonical_id: str(profile.get("display_name") or canonical_id.replace("_", " ").title())
+    for canonical_id, profile in _SKINCARE_INGREDIENT_PROFILES.items()
 }
 
 _SKINCARE_INGREDIENT_CATEGORY_LABELS = {"serum", "moisturizer", "cleanser", "toner"}
 _COSMETIC_SHADE_CATEGORY_LABELS = {"foundation", "lipstick", "blush", "gloss"}
+
+
+def _skincare_ingredient_alias_terms(ingredient_id: Optional[str]) -> List[str]:
+    canonical_id = str(ingredient_id or "").strip()
+    profile = _SKINCARE_INGREDIENT_PROFILES.get(canonical_id) or {}
+    deduped: List[str] = []
+    for term in [canonical_id.replace("_", " "), *(profile.get("aliases") or [])]:
+        normalized = _normalize_skincare_ingredient_alias_term(term)
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def _build_strict_ingredient_surface_text(product: StandardProduct) -> str:
+    platform_metadata = getattr(product, "platform_metadata", None) or {}
+    if not isinstance(platform_metadata, dict):
+        platform_metadata = {}
+    values = [
+        getattr(product, "title", None),
+        getattr(product, "product_type", None),
+        platform_metadata.get("canonical_url"),
+        platform_metadata.get("destination_url"),
+        platform_metadata.get("source_ref"),
+    ]
+    return " ".join(str(value or "").strip() for value in values if str(value or "").strip())
+
+
+def _count_strict_ingredient_term_hits(text: Optional[str], terms: List[str]) -> int:
+    return sum(1 for term in terms if _normalized_intent_term_match(text, term))
+
+
+def _infer_strict_ingredient_step_families(
+    product: StandardProduct,
+    product_visible_attributes: Dict[str, List[str]],
+) -> List[str]:
+    deduped: List[str] = []
+    for label in product_visible_attributes.get("product_category", []) or []:
+        normalized = str(label or "").strip().lower()
+        if normalized in _SKINCARE_INGREDIENT_CATEGORY_LABELS and normalized not in deduped:
+            deduped.append(normalized)
+    fallback_blob = " ".join(
+        [
+            getattr(product, "product_type", None) or "",
+            getattr(product, "title", None) or "",
+        ]
+    )
+    for label in _SKINCARE_INGREDIENT_CATEGORY_LABELS:
+        if label in deduped:
+            continue
+        if _normalized_intent_term_match(fallback_blob, label):
+            deduped.append(label)
+    return deduped
+
+
+def _evaluate_strict_ingredient_candidate_precision(
+    product: StandardProduct,
+    *,
+    product_visible_attributes: Dict[str, List[str]],
+    active_ingredient_intents: List[Dict[str, Any]],
+    candidate_source: str = "internal",
+) -> Dict[str, Any]:
+    step_families = _infer_strict_ingredient_step_families(product, product_visible_attributes)
+    surface_text = _build_strict_ingredient_surface_text(product)
+    summary = {
+        "target_surface_anchor_hits": 0,
+        "competing_surface_anchor_hits": 0,
+        "step_family_mismatch": False,
+        "rejected_reason": None,
+        "resolved_step_families": list(step_families),
+    }
+    if not active_ingredient_intents:
+        return {"passed": True, "summary": summary}
+
+    for group in active_ingredient_intents:
+        ingredient_id = str(group.get("ingredient_id") or "").strip()
+        if not ingredient_id:
+            continue
+        profile = _SKINCARE_INGREDIENT_PROFILES.get(ingredient_id) or {}
+        target_hits = _count_strict_ingredient_term_hits(
+            surface_text,
+            _skincare_ingredient_alias_terms(ingredient_id),
+        )
+        competing_hits = 0
+        for other_ingredient_id in _SKINCARE_INGREDIENT_PROFILES.keys():
+            if other_ingredient_id == ingredient_id:
+                continue
+            if _count_strict_ingredient_term_hits(
+                surface_text,
+                _skincare_ingredient_alias_terms(other_ingredient_id),
+            ) > 0:
+                competing_hits += 1
+        expected_step_families = {
+            str(label or "").strip().lower()
+            for label in (profile.get("expected_step_families") or [])
+            if str(label or "").strip()
+        }
+        step_family_mismatch = bool(expected_step_families) and not bool(
+            expected_step_families.intersection(step_families)
+        )
+
+        summary["target_surface_anchor_hits"] += target_hits
+        summary["competing_surface_anchor_hits"] += competing_hits
+        summary["step_family_mismatch"] = summary["step_family_mismatch"] or step_family_mismatch
+
+        if step_family_mismatch:
+            summary["rejected_reason"] = "step_family_mismatch"
+            return {"passed": False, "summary": summary}
+        if target_hits <= 0:
+            if candidate_source != "external_seed" and competing_hits <= 0:
+                continue
+            summary["rejected_reason"] = (
+                "competing_surface_anchor"
+                if competing_hits > 0
+                else "missing_target_surface_anchor"
+            )
+            return {"passed": False, "summary": summary}
+
+    return {"passed": True, "summary": summary}
 
 
 def _normalize_serving_token(value: Optional[str]) -> str:
@@ -5145,6 +5328,7 @@ async def _handle_find_products_multi(
         and bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL)
         and upstream_fallback_hop < 1
     )
+    upstream_fallback_attempted = False
     force_local_fallback_on_delegate_fail = bool(is_shopping_surface)
     upstream_timeout_seconds = _resolve_multi_upstream_timeout_seconds(is_shopping_surface)
     upstream_cache_key: Optional[str] = None
@@ -5206,6 +5390,7 @@ async def _handle_find_products_multi(
         and MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM
         and not skip_delegate_due_circuit_local_fallback
     ):
+        upstream_fallback_attempted = True
         delegated = await _invoke_multi_upstream_fallback(
             payload,
             request_metadata,
@@ -6754,6 +6939,23 @@ async def _handle_find_products_multi(
                     "merchants_searched": 0,
                     **(
                         {
+                            "ingredient_precision_mode": "precision_first_v1",
+                            "ingredient_precision_stage": "surface_anchor_gate",
+                            "ingredient_candidate_breakdown": {
+                                "eligible_total": 0,
+                                "eligible_internal": 0,
+                                "eligible_external_seed": 0,
+                                "precision_passed_total": 0,
+                                "precision_passed_internal": 0,
+                                "precision_passed_external_seed": 0,
+                            },
+                            "ingredient_rejected_reason_summary": {},
+                        }
+                        if active_ingredient_intents
+                        else {}
+                    ),
+                    **(
+                        {
                             "source_breakdown": {
                                 "internal_count": 0,
                                 "external_seed_count": 0,
@@ -7369,6 +7571,15 @@ async def _handle_find_products_multi(
 
     # In-memory filtering and simple relevance scoring (reuse Agent API logic)
     filtered_products: list[dict[str, Any]] = []
+    ingredient_candidate_breakdown = {
+        "eligible_total": 0,
+        "eligible_internal": 0,
+        "eligible_external_seed": 0,
+        "precision_passed_total": 0,
+        "precision_passed_internal": 0,
+        "precision_passed_external_seed": 0,
+    }
+    ingredient_rejected_reason_summary: Dict[str, int] = {}
 
     for product, merchant_name in merchant_products:
         if active_unsupported_beauty_category_labels and not (
@@ -7558,6 +7769,12 @@ async def _handle_find_products_multi(
             continue
         matched_ingredient_ids = []
         matched_ingredient_labels = []
+        candidate_source = (
+            "external_seed"
+            if str(getattr(product, "product_id", None) or getattr(product, "id", None) or "").strip()
+            in strict_external_output_by_product_id
+            else "internal"
+        )
         if active_ingredient_intents:
             product_skin_care_categories = {
                 label
@@ -7573,6 +7790,30 @@ async def _handle_find_products_multi(
                     matched_ingredient_labels.append(str(group.get("display_name") or ingredient_id))
             if len(matched_ingredient_ids) < len(active_ingredient_intents):
                 continue
+            ingredient_candidate_breakdown["eligible_total"] += 1
+            ingredient_candidate_breakdown[
+                "eligible_external_seed" if candidate_source == "external_seed" else "eligible_internal"
+            ] += 1
+            precision_eval = _evaluate_strict_ingredient_candidate_precision(
+                product,
+                product_visible_attributes=product_visible_attributes,
+                active_ingredient_intents=active_ingredient_intents,
+                candidate_source=candidate_source,
+            )
+            if not precision_eval.get("passed"):
+                rejected_reason = str(
+                    (precision_eval.get("summary") or {}).get("rejected_reason") or "precision_rejected"
+                ).strip() or "precision_rejected"
+                ingredient_rejected_reason_summary[rejected_reason] = (
+                    ingredient_rejected_reason_summary.get(rejected_reason, 0) + 1
+                )
+                continue
+            ingredient_candidate_breakdown["precision_passed_total"] += 1
+            ingredient_candidate_breakdown[
+                "precision_passed_external_seed"
+                if candidate_source == "external_seed"
+                else "precision_passed_internal"
+            ] += 1
 
         if exclude_lingerie or exclude_hoodies or exclude_joggers or exclude_underwear:
             if exclude_lingerie:
@@ -7862,12 +8103,7 @@ async def _handle_find_products_multi(
                 "product": product,
                 "merchant_name": merchant_name,
                 "relevance_score": relevance_score,
-                "candidate_source": (
-                    "external_seed"
-                    if str(getattr(product, "product_id", None) or getattr(product, "id", None) or "").strip()
-                    in strict_external_output_by_product_id
-                    else "internal"
-                ),
+                "candidate_source": candidate_source,
                 "is_toy_like": is_toy_like if toys_intent_query else False,
                 "matched_visible_category_labels": list(matched_visible_category_labels),
                 "matched_visible_attribute_labels": list(matched_visible_attribute_labels),
@@ -7998,7 +8234,7 @@ async def _handle_find_products_multi(
     # - For tee intent queries: also allow a global tee-only fallback so we don't
     #   respond with an empty list for strong tee intent (e.g. Spanish camisetas).
     if not out_products:
-        if should_try_upstream:
+        if should_try_upstream and not upstream_fallback_attempted:
             upstream_result = await _invoke_multi_upstream_fallback(
                 payload,
                 request_metadata,
@@ -8328,12 +8564,22 @@ async def _handle_find_products_multi(
                 "creator_name": creator_name,
                 "history_boost_applied": history_used,
                 "upstream_fallback_configured": bool(MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL),
-                "upstream_fallback_attempted": bool(should_try_upstream),
+                "upstream_fallback_attempted": bool(upstream_fallback_attempted),
                 "shopping_fast_prefetch_used": bool(is_shopping_surface and q and merchant_ids_for_search),
                 "shopping_recall_boost_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST
                 ),
                 "strict_live_query_fallback_used": strict_live_query_fallback_used,
+                **(
+                    {
+                        "ingredient_precision_mode": "precision_first_v1",
+                        "ingredient_precision_stage": "surface_anchor_gate",
+                        "ingredient_candidate_breakdown": ingredient_candidate_breakdown,
+                        "ingredient_rejected_reason_summary": ingredient_rejected_reason_summary,
+                    }
+                    if active_ingredient_intents
+                    else {}
+                ),
                 "shopping_sku_json_scan_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN
                 ),
