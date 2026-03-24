@@ -10,6 +10,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from fastapi.encoders import jsonable_encoder
+
 from adapters.multi_psp_orchestrator import create_payment_with_failover
 from adapters.psp_adapter import get_psp_adapter
 from services.merchant_psp_config_service import (
@@ -19,15 +21,19 @@ from services.merchant_psp_config_service import (
 
 
 def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
+    candidate: Dict[str, Any]
     if isinstance(raw, dict):
-        return dict(raw)
+        candidate = dict(raw)
+        return jsonable_encoder(candidate)
     if hasattr(raw, "to_dict"):
         try:
-            return dict(raw.to_dict())
+            candidate = dict(raw.to_dict())
+            return jsonable_encoder(candidate)
         except Exception:
             return {}
     try:
-        return dict(raw or {})
+        candidate = dict(raw or {})
+        return jsonable_encoder(candidate)
     except Exception:
         return {}
 

@@ -2,6 +2,7 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 from typing import List, Optional, Tuple
+from decimal import Decimal
 
 
 @pytest.mark.asyncio
@@ -615,3 +616,29 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
         }
     ]
     assert emitted == []
+
+
+def test_build_payment_initiation_result_normalizes_decimal_raw_payload() -> None:
+    from services.merchant_payment_initiation_service import build_payment_initiation_result
+
+    class FakePaymentIntent:
+        id = "cs_live_decimal"
+        client_secret = None
+        redirect_url = "https://checkout.stripe.test/session"
+        status = "requires_action"
+        psp_type = "stripe_checkout"
+        raw_response = {
+            "amount_total": Decimal("1.00"),
+            "nested": {"unit_price": Decimal("0.50")},
+        }
+
+    result = build_payment_initiation_result(
+        success=True,
+        payment_intent=FakePaymentIntent(),
+        error=None,
+        psp_used="stripe",
+    )
+
+    assert result["payment_action"]["type"] == "redirect_url"
+    assert result["payment_action"]["raw"]["amount_total"] == 1.0
+    assert result["payment_action"]["raw"]["nested"]["unit_price"] == 0.5
