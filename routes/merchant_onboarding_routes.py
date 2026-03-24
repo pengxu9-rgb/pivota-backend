@@ -109,6 +109,94 @@ def canonicalize_store_url(raw_url: str) -> str:
     host_path = (parsed.netloc + parsed.path).rstrip("/")
     return host_path.lower()
 
+
+def normalize_contact_email(raw_email: str) -> str:
+    """Normalize contact email so onboarding and auth use the same lookup key."""
+    return (raw_email or "").strip().lower()
+
+
+async def get_active_onboarding_by_email(contact_email: str) -> Optional[Dict[str, Any]]:
+    """Return the latest non-deleted merchant onboarding record for an email."""
+    record = await database.fetch_one(
+        """
+        SELECT merchant_id, business_name, store_url, website, region,
+               contact_email, contact_phone, status, auto_approved,
+               approval_confidence, full_kyb_deadline
+        FROM merchant_onboarding
+        WHERE LOWER(contact_email) = LOWER(:email)
+          AND COALESCE(status, 'pending_verification') != 'deleted'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        {"email": contact_email},
+    )
+    return dict(record) if record else None
+
+
+async def get_user_auth_binding(contact_email: str) -> Optional[Dict[str, Any]]:
+    """Return the existing auth user row for an email if it exists."""
+    record = await database.fetch_one(
+        """
+        SELECT id, email, role, merchant_id, active
+        FROM users
+        WHERE LOWER(email) = LOWER(:email)
+        LIMIT 1
+        """,
+        {"email": contact_email},
+    )
+    return dict(record) if record else None
+
+
+async def sync_merchant_auth_user(
+    *,
+    contact_email: str,
+    business_name: str,
+    merchant_id: str,
+    password: str,
+    existing_user: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Create or update the merchant auth account tied to this onboarding record."""
+    from utils.auth import hash_password
+
+    password_hash = hash_password(password)
+
+    if existing_user:
+        await database.execute(
+            """
+            UPDATE users
+            SET password_hash = :password_hash,
+                full_name = :full_name,
+                role = :role,
+                active = :active,
+                merchant_id = :merchant_id
+            WHERE id = :user_id
+            """,
+            {
+                "password_hash": password_hash,
+                "full_name": business_name,
+                "role": "merchant",
+                "active": True,
+                "merchant_id": merchant_id,
+                "user_id": existing_user["id"],
+            },
+        )
+        return
+
+    await database.execute(
+        """
+        INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
+        VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
+        """,
+        {
+            "email": contact_email,
+            "password_hash": password_hash,
+            "full_name": business_name,
+            "role": "merchant",
+            "active": True,
+            "merchant_id": merchant_id,
+        },
+    )
+
 async def validate_stripe_key(api_key: str) -> bool:
     """Async wrapper for Stripe validation"""
     import concurrent.futures
@@ -230,111 +318,149 @@ async def register_merchant(
                 await asyncio.sleep(0.5)
                 await database.connect()
 
-        # 0. 去重检查（基于标准化 store_url）
-        norm_url = canonicalize_store_url(merchant_data.store_url)
-        dup = await database.fetch_one(
-            merchant_onboarding.select().where(
-                (merchant_onboarding.c.store_url == merchant_data.store_url) |
-                (merchant_onboarding.c.store_url == norm_url)
-            )
-        )
-        if dup:
-            raise HTTPException(status_code=409, detail="Store URL already registered")
+        normalized_email = normalize_contact_email(merchant_data.contact_email)
+        normalized_store_url = canonicalize_store_url(merchant_data.store_url)
 
-        # 1. 自动 KYB 预审批验证（含 Shopify 域名快速通道）
-        print("🔍 Starting auto-KYB pre-approval validation...")
-        try:
-            from utils.auto_kyb_validator import auto_kyb_pre_approval
-            print("✅ auto_kyb_validator imported successfully")
-        except Exception as import_err:
-            print(f"❌ Failed to import auto_kyb_validator: {import_err}")
-            import traceback
-            traceback.print_exc()
-            raise
-        
+        # 0. 收紧 email 绑定，避免创建无法登录的孤立 merchant 记录。
+        existing_onboarding = await get_active_onboarding_by_email(normalized_email)
+        reuse_existing_onboarding = False
+        if existing_onboarding:
+            existing_norm_url = canonicalize_store_url(existing_onboarding.get("store_url") or "")
+            if existing_norm_url and existing_norm_url != normalized_store_url:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Email already registered to another merchant. Sign in or use a different email.",
+                )
+            reuse_existing_onboarding = True
+
+        existing_user = await get_user_auth_binding(normalized_email)
+        if existing_user and existing_user.get("role") not in {None, "merchant"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Email already in use by another account type. Use a different email.",
+            )
+
+        if existing_user and existing_user.get("merchant_id") and not reuse_existing_onboarding:
+            linked_onboarding = await get_merchant_onboarding(existing_user["merchant_id"])
+            if linked_onboarding and linked_onboarding.get("status") != "deleted":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Email already registered. Sign in or reset password to continue.",
+                )
+
+        # 1. 去重检查（基于标准化 store_url）
         from datetime import datetime
-        
-        try:
-            # Shopify 域名快速通道：*.myshopify.com 直接视为可用平台域
-            parsed = urlparse(merchant_data.store_url if merchant_data.store_url.startswith(('http://','https://')) else ('https://' + merchant_data.store_url))
-            if parsed.netloc.endswith('.myshopify.com'):
-                confidence = 0.96
-                validation_result = {
-                    "approved": True,
-                    "confidence_score": confidence,
-                    "validation_results": {
-                        "url_validation": {"valid": True, "message": f"Known e-commerce platform detected: {parsed.netloc}"},
-                        "name_match": {"match": True, "message": "Trusted platform auto-approval", "score": 0.9},
-                    },
-                    "requires_full_kyb": True,
-                    "full_kyb_deadline": (datetime.utcnow() + timedelta(days=7)).isoformat(),
-                }
-            else:
-                validation_result = await auto_kyb_pre_approval(
+
+        if reuse_existing_onboarding:
+            merchant_id = existing_onboarding["merchant_id"]
+            await database.execute(
+                merchant_onboarding.update()
+                .where(merchant_onboarding.c.merchant_id == merchant_id)
+                .values(
                     business_name=merchant_data.business_name,
                     store_url=merchant_data.store_url,
-                    region=merchant_data.region
+                    website=merchant_data.website,
+                    region=merchant_data.region,
+                    contact_email=normalized_email,
+                    contact_phone=merchant_data.contact_phone,
+                    updated_at=datetime.now(),
                 )
-            print(f"✅ Auto-KYB validation completed: {validation_result}")
-        except Exception as val_err:
-            print(f"❌ Auto-KYB validation failed: {val_err}")
-            import traceback
-            traceback.print_exc()
-            # Continue without auto-approval
-            validation_result = {"approved": False, "confidence_score": 0}
+            )
+            print(f"✅ Recovered existing merchant onboarding: {merchant_id}")
+
+            full_kyb_deadline = existing_onboarding.get("full_kyb_deadline")
+            validation_result = {
+                "approved": bool(
+                    existing_onboarding.get("auto_approved")
+                    or existing_onboarding.get("status") == "approved"
+                ),
+                "confidence_score": existing_onboarding.get("approval_confidence") or 0,
+                "validation_results": {
+                    "recovery": {
+                        "match": True,
+                        "message": "Recovered existing onboarding for the same email and storefront.",
+                    }
+                },
+                "full_kyb_deadline": (
+                    full_kyb_deadline.isoformat()
+                    if full_kyb_deadline and hasattr(full_kyb_deadline, "isoformat")
+                    else full_kyb_deadline
+                ),
+            }
+        else:
+            dup = await database.fetch_one(
+                merchant_onboarding.select().where(
+                    (merchant_onboarding.c.store_url == merchant_data.store_url) |
+                    (merchant_onboarding.c.store_url == normalized_store_url)
+                )
+            )
+            if dup:
+                raise HTTPException(status_code=409, detail="Store URL already registered")
+
+            # 2. 自动 KYB 预审批验证（含 Shopify 域名快速通道）
+            print("🔍 Starting auto-KYB pre-approval validation...")
+            try:
+                from utils.auto_kyb_validator import auto_kyb_pre_approval
+                print("✅ auto_kyb_validator imported successfully")
+            except Exception as import_err:
+                print(f"❌ Failed to import auto_kyb_validator: {import_err}")
+                import traceback
+                traceback.print_exc()
+                raise
+            
+            try:
+                # Shopify 域名快速通道：*.myshopify.com 直接视为可用平台域
+                parsed = urlparse(merchant_data.store_url if merchant_data.store_url.startswith(('http://','https://')) else ('https://' + merchant_data.store_url))
+                if parsed.netloc.endswith('.myshopify.com'):
+                    confidence = 0.96
+                    validation_result = {
+                        "approved": True,
+                        "confidence_score": confidence,
+                        "validation_results": {
+                            "url_validation": {"valid": True, "message": f"Known e-commerce platform detected: {parsed.netloc}"},
+                            "name_match": {"match": True, "message": "Trusted platform auto-approval", "score": 0.9},
+                        },
+                        "requires_full_kyb": True,
+                        "full_kyb_deadline": (datetime.utcnow() + timedelta(days=7)).isoformat(),
+                    }
+                else:
+                    validation_result = await auto_kyb_pre_approval(
+                        business_name=merchant_data.business_name,
+                        store_url=merchant_data.store_url,
+                        region=merchant_data.region
+                    )
+                print(f"✅ Auto-KYB validation completed: {validation_result}")
+            except Exception as val_err:
+                print(f"❌ Auto-KYB validation failed: {val_err}")
+                import traceback
+                traceback.print_exc()
+                # Continue without auto-approval
+                validation_result = {"approved": False, "confidence_score": 0, "validation_results": {}}
+            
+            # 3. 创建商户记录
+            merchant_dict = merchant_data.dict()
+            merchant_dict["contact_email"] = normalized_email
+            # Remove password field as it's not in the merchant_onboarding table
+            merchant_dict.pop('password', None)
+            merchant_id = await create_merchant_onboarding(merchant_dict)
+            print(f"✅ Merchant created: {merchant_id}")
         
-        # 2. 创建商户记录
-        merchant_dict = merchant_data.dict()
-        # Remove password field as it's not in the merchant_onboarding table
-        merchant_dict.pop('password', None)
-        merchant_id = await create_merchant_onboarding(merchant_dict)
-        print(f"✅ Merchant created: {merchant_id}")
-        
-        # 2.5 创建用户登录账户
-        user_created = False
+        # 3.5 创建/更新用户登录账户
         try:
-            from utils.auth import hash_password
             import secrets
             
             # Generate password if not provided
             password = merchant_data.password if merchant_data.password else secrets.token_urlsafe(12)
-            password_hash = hash_password(password)
             
-            print(f"🔐 Creating user account for {merchant_data.contact_email}")
-            print(f"Password provided: {bool(merchant_data.password)}, Hash length: {len(password_hash)}")
-            
-            # Check if user already exists
-            existing_user = await database.fetch_one(
-                "SELECT id FROM users WHERE email = :email",
-                {"email": merchant_data.contact_email}
+            print(f"🔐 Syncing merchant auth user for {normalized_email}")
+            await sync_merchant_auth_user(
+                contact_email=normalized_email,
+                business_name=merchant_data.business_name,
+                merchant_id=merchant_id,
+                password=password,
+                existing_user=existing_user,
             )
-            
-            if existing_user:
-                print(f"⚠️ User already exists for {merchant_data.contact_email}, skipping user creation")
-                user_created = True  # Already exists
-            else:
-                # New Postgres schema: users.id is SERIAL INTEGER, so we let the
-                # database generate it instead of inserting a UUID.
-                await database.execute(
-                    """
-                    INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
-                    VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
-                    """,
-                    {
-                        "email": merchant_data.contact_email,
-                        "password_hash": password_hash,
-                        "full_name": merchant_data.business_name,
-                        "role": "merchant",
-                        "active": True,
-                        "merchant_id": merchant_id,
-                    },
-                )
-                print(f"✅ User account created for {merchant_data.contact_email} with merchant_id {merchant_id}")
-                user_created = True
-                
-                # Store password in response if auto-generated
-                if not merchant_data.password:
-                    print(f"🔑 Auto-generated password: {password}")
+            print(f"✅ Merchant auth user synced for {normalized_email} with merchant_id {merchant_id}")
         except Exception as user_err:
             import traceback
             print(f"❌ Failed to create user account: {user_err}")
@@ -346,7 +472,7 @@ async def register_merchant(
             )
         
         # 3. 如果自动批准，立即更新状态为 approved
-        if validation_result["approved"]:
+        if not reuse_existing_onboarding and validation_result["approved"]:
             print(f"🎉 Auto-approving merchant {merchant_id}...")
             await update_kyc_status(merchant_id, "approved")
             # Update additional fields
@@ -361,21 +487,27 @@ async def register_merchant(
             print(f"✅ Merchant {merchant_id} auto-approved successfully")
         
         # Build response
-        response_data = {
-            "status": "success",
-            "message": (
+        response_message = (
+            "Merchant account recovered. Continue onboarding in the portal."
+            if reuse_existing_onboarding
+            else (
                 "✅ Registration approved! You can now connect your PSP and start processing payments.\n"
                 "⚠️ Please complete full KYB documentation within 7 days."
                 if validation_result["approved"]
                 else "Registration received. Manual review required before PSP connection."
-            ),
+            )
+        )
+
+        response_data = {
+            "status": "success",
+            "message": response_message,
             "merchant_id": merchant_id,
             "auto_approved": validation_result["approved"],
             "confidence_score": validation_result["confidence_score"],
             "validation_details": validation_result["validation_results"],
             "full_kyb_deadline": validation_result.get("full_kyb_deadline"),
             "next_step": "Connect PSP" if validation_result["approved"] else "Wait for admin approval",
-            "login_email": merchant_data.contact_email
+            "login_email": normalized_email
         }
         
         # Include password if auto-generated
@@ -705,15 +837,6 @@ async def list_all_onboardings(
             last_synced = product_info["last_synced"] if product_info else None
             expired_count = product_info["expired_count"] if product_info else 0
             has_expired = expired_count > 0
-            store_info = await database.fetch_one(
-                """
-                SELECT COUNT(*) as count
-                FROM merchant_stores
-                WHERE merchant_id = :merchant_id
-                """,
-                {"merchant_id": m["merchant_id"]},
-            )
-            store_count = store_info["count"] if store_info else 0
             
             merchant_list.append({
                 "merchant_id": m["merchant_id"],
@@ -729,7 +852,6 @@ async def list_all_onboardings(
                 "psp_type": psp_type,
                 "mcp_connected": m.get("mcp_connected", False),
                 "mcp_platform": m.get("mcp_platform"),
-                "store_count": store_count,
                 "product_count": product_count,
                 "last_synced": last_synced.isoformat() if last_synced else None,
                 "products_expired": has_expired,
