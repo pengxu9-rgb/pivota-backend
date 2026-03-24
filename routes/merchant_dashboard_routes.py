@@ -302,7 +302,7 @@ async def execute_merchant_order_backed_canary(
     requested_order_id = payload.order_id or (
         f"merchant_canary_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
     )
-    return await _execute_order_backed_payment_canary(
+    result = await _execute_order_backed_payment_canary(
         merchant=merchant,
         payment_request=InternalOrderBackedCanaryRequest(
             amount=payload.amount,
@@ -318,6 +318,7 @@ async def execute_merchant_order_backed_canary(
         ),
         source="merchant_order_backed_canary",
     )
+    return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
 
 
 @router.get("/merchant/settings/preferences")
