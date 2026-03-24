@@ -5019,6 +5019,188 @@ async def test_shop_gateway_find_products_multi_mixes_internal_and_external_stri
     assert source_breakdown.get("external_seed_count") == 1
 
 
+def test_extract_skin_care_ingredient_intents_supports_registry_parity_aliases() -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    hyaluronic = agent_shop_gateway_module._extract_skin_care_ingredient_intents(
+        "hyaluronic serum",
+        query_semantic_class="beauty",
+    )
+    peptides = agent_shop_gateway_module._extract_skin_care_ingredient_intents(
+        "peptide serum",
+        query_semantic_class="beauty",
+    )
+
+    assert hyaluronic == [
+        {
+            "label": "hyaluronic_acid",
+            "ingredient_id": "hyaluronic_acid",
+            "display_name": "Hyaluronic Acid",
+            "query_terms": ["hyaluronic"],
+        }
+    ]
+    assert peptides == [
+        {
+            "label": "peptides",
+            "ingredient_id": "peptides",
+            "display_name": "Peptides",
+            "query_terms": ["peptide"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_rejects_external_seed_without_target_surface_anchor_for_hyaluronic_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "seed_vitamin_c_hyaluronic",
+                    "title": "Banana Bright 15% Vitamin C Dark Spot Serum",
+                    "canonical_url": "https://ole.example/products/banana-bright-vitamin-c-serum",
+                    "destination_url": "https://ole.example/products/banana-bright-vitamin-c-serum",
+                    "category": "Serum",
+                    "price_amount": 70.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "seed_data": {
+                        "title": "Banana Bright 15% Vitamin C Dark Spot Serum",
+                        "description": "Reviewed seed with hyaluronic acid in ingredient list.",
+                        "category": "Serum",
+                        "reviewed_ingredient_ids": ["ascorbic_acid", "hyaluronic_acid"],
+                        "variants": [],
+                    },
+                }
+            ]
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(*args, **kwargs):
+        return [], "cache_all_platforms", None
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return "https://api.example/r/ext"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="hyaluronic acid serum",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    metadata = result.get("metadata") or {}
+    assert result.get("total") == 0
+    assert metadata.get("ingredient_intents") == ["hyaluronic_acid"]
+    assert metadata.get("matched_ingredient_ids") == []
+    assert metadata.get("ingredient_precision_mode") == "precision_first_v1"
+    assert metadata.get("ingredient_candidate_breakdown") == {
+        "eligible_total": 1,
+        "eligible_internal": 0,
+        "eligible_external_seed": 1,
+        "precision_passed_total": 0,
+        "precision_passed_internal": 0,
+        "precision_passed_external_seed": 0,
+    }
+    assert metadata.get("ingredient_rejected_reason_summary") == {"competing_surface_anchor": 1}
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_rejects_external_seed_without_target_anchor_for_retinol_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "seed_vitamin_c_retargeted",
+                    "title": "Vitamin-C Serum",
+                    "canonical_url": "https://brand.example/products/vitamin-c-serum",
+                    "destination_url": "https://brand.example/products/vitamin-c-serum",
+                    "category": "Serum",
+                    "price_amount": 24.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "seed_data": {
+                        "title": "Vitamin-C Serum",
+                        "description": "Structured row that also carries retinol in reviewed ingredients.",
+                        "category": "Serum",
+                        "reviewed_ingredient_ids": ["ascorbic_acid", "retinol"],
+                        "variants": [],
+                    },
+                }
+            ]
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(*args, **kwargs):
+        return [], "cache_all_platforms", None
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return "https://api.example/r/ext"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="retinol serum",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    metadata = result.get("metadata") or {}
+    assert result.get("total") == 0
+    assert metadata.get("ingredient_intents") == ["retinol"]
+    assert metadata.get("matched_ingredient_ids") == []
+    assert metadata.get("ingredient_precision_mode") == "precision_first_v1"
+    assert metadata.get("ingredient_rejected_reason_summary") == {"competing_surface_anchor": 1}
+
+
 @pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_requires_structured_shade_match_for_cosmetics(
     monkeypatch: pytest.MonkeyPatch,
