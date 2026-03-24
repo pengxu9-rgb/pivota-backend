@@ -13,9 +13,11 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from adapters.stripe_adapter import verify_webhook_signature
 from config.settings import settings
+from db.database import database
 from db.orders import get_order, mark_order_paid, update_order_status, update_payment_info
 from db.products import log_order_event
 from orchestrator.callback_handler import handle_psp_webhook
+from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.psp_payment_finalizer import (
     finalize_cancellation,
     finalize_payment_failure,
@@ -309,6 +311,117 @@ async def _finalize_adyen_cancellation(order: dict, *, psp_reference: str, notif
         log_order_event_fn=log_order_event,
     )
 
+
+async def _lookup_refund_id_for_adyen_reference(
+    *,
+    merchant_id: str,
+    order_id: str,
+    psp_reference: str,
+) -> str:
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT refund_id
+            FROM refund_records
+            WHERE merchant_id = :merchant_id
+              AND order_id = :order_id
+              AND (
+                  refund_id = :psp_reference
+                  OR psp_refund_id = :psp_reference
+                  OR platform_refund_id = :psp_reference
+              )
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_id,
+                "order_id": order_id,
+                "psp_reference": psp_reference,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve Adyen refund_id for merchant=%s order=%s psp_reference=%s: %s",
+            merchant_id,
+            order_id,
+            psp_reference,
+            exc,
+        )
+        return ""
+    if not row:
+        return ""
+    return str(row.get("refund_id") or row.get("refundID") or "").strip()
+
+
+async def _emit_adyen_merchant_webhook_best_effort(
+    order: dict,
+    *,
+    event_type: str,
+    psp_reference: str,
+    notification: dict,
+    error_message: Optional[str] = None,
+) -> None:
+    merchant_id = str((order or {}).get("merchant_id") or "").strip()
+    order_id = str((order or {}).get("order_id") or "").strip()
+    if not merchant_id or not order_id:
+        return
+
+    amount_minor = notification.get("amount", {}).get("value")
+    currency = str(notification.get("amount", {}).get("currency") or order.get("currency") or "")
+    amount = None
+    if amount_minor is not None:
+        try:
+            amount = float(_decimal_money(amount_minor) / _minor_unit_factor(currency))
+        except Exception:
+            amount = None
+
+    if event_type == "refund.processed":
+        order_total = _decimal_money(order.get("total"))
+        current_total_refunded = _decimal_money(order.get("total_refunded"))
+        next_total_refunded = current_total_refunded + _decimal_money(str(amount or 0))
+        refund_status = _next_refund_status(order_total, next_total_refunded)
+        payload = {
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "refund_id": await _lookup_refund_id_for_adyen_reference(
+                merchant_id=merchant_id,
+                order_id=order_id,
+                psp_reference=psp_reference,
+            ),
+            "amount": amount,
+            "currency": currency,
+            "is_partial": refund_status == "partially_refunded",
+            "status": refund_status,
+        }
+    else:
+        payload = {
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "payment_id": psp_reference,
+            "transaction_id": psp_reference,
+            "amount": amount,
+            "currency": currency,
+            "psp_used": "adyen",
+            "status": "paid" if event_type == "payment.completed" else "payment_failed",
+            "customer_email": order.get("customer_email"),
+        }
+        if error_message:
+            payload["error_message"] = error_message
+
+    try:
+        await emit_merchant_webhook_event(
+            merchant_id,
+            event_type=event_type,
+            payload=payload,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to emit merchant Adyen webhook %s for %s: %s",
+            event_type,
+            merchant_id,
+            exc,
+        )
+
 @router.post("/webhook/stripe")
 async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     logger.info("Stripe webhook received via compatibility alias /psp/webhook/stripe")
@@ -396,14 +509,21 @@ async def process_adyen_webhook_request(
                     order_id = merchant_reference
                     order = await get_order(order_id)
                     if order and _can_apply_authorisation_success(order):
-                        await _finalize_adyen_payment_success(
+                        finalization = await _finalize_adyen_payment_success(
                             order,
                             psp_reference=psp_reference,
                             notification=notification,
                         )
-                        logger.info(
-                            f"Order {order_id} marked as paid via Adyen webhook"
-                        )
+                        if finalization.get("applied"):
+                            logger.info(
+                                f"Order {order_id} marked as paid via Adyen webhook"
+                            )
+                            await _emit_adyen_merchant_webhook_best_effort(
+                                order,
+                                event_type="payment.completed",
+                                psp_reference=psp_reference,
+                                notification=notification,
+                            )
                         try:
                             from routes.order_routes import create_shopify_order
 
@@ -432,12 +552,20 @@ async def process_adyen_webhook_request(
                 try:
                     order = await get_order(merchant_reference)
                     if order:
-                        await _finalize_adyen_payment_failure(
+                        finalization = await _finalize_adyen_payment_failure(
                             order,
                             psp_reference=psp_reference,
                             notification=notification,
                             source_event="payment_failed_webhook",
                         )
+                        if finalization.get("applied"):
+                            await _emit_adyen_merchant_webhook_best_effort(
+                                order,
+                                event_type="payment.failed",
+                                psp_reference=psp_reference,
+                                notification=notification,
+                                error_message=notification.get("reason") or notification.get("eventCode"),
+                            )
                 except Exception as authorisation_failure_err:
                     logger.error(
                         f"Adyen authorisation failure webhook order update failed for {merchant_reference}: {authorisation_failure_err}"
@@ -455,12 +583,20 @@ async def process_adyen_webhook_request(
                         )
                         continue
 
-                    await _finalize_adyen_payment_failure(
+                    finalization = await _finalize_adyen_payment_failure(
                         order,
                         psp_reference=psp_reference,
                         notification=notification,
                         source_event="capture_failed_webhook",
                     )
+                    if finalization.get("applied"):
+                        await _emit_adyen_merchant_webhook_best_effort(
+                            order,
+                            event_type="payment.failed",
+                            psp_reference=psp_reference,
+                            notification=notification,
+                            error_message=notification.get("reason") or notification.get("eventCode"),
+                        )
                 except Exception as capture_failed_err:
                     logger.error(
                         f"Adyen capture_failed webhook order update failed for {merchant_reference}: {capture_failed_err}"
@@ -486,6 +622,13 @@ async def process_adyen_webhook_request(
                     if not finalization.get("applied"):
                         logger.info(
                             f"[AdyenWebhook] refund webhook already applied or skipped for {order_id} psp_ref={psp_reference}"
+                        )
+                    else:
+                        await _emit_adyen_merchant_webhook_best_effort(
+                            order,
+                            event_type="refund.processed",
+                            psp_reference=psp_reference,
+                            notification=notification,
                         )
                 except Exception as refund_err:
                     logger.error(

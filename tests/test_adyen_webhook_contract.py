@@ -194,6 +194,7 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
     import routes.psp_routes as psp_routes_module
 
     webhook_calls: list[tuple[str, str, str, str]] = []
+    merchant_webhook_calls: list[Dict[str, Any]] = []
     paid_calls: list[str] = []
     payment_updates: list[Dict[str, Any]] = []
     order_events: list[Dict[str, Any]] = []
@@ -245,6 +246,25 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
+    async def fake_emit_merchant_webhook_event(
+        merchant_id: str,
+        *,
+        event_type: str,
+        payload,
+        request_id=None,
+        force_delivery: bool = False,
+    ) -> Dict[str, Any]:
+        merchant_webhook_calls.append(
+            {
+                "merchant_id": merchant_id,
+                "event_type": event_type,
+                "payload": dict(payload),
+                "request_id": request_id,
+                "force_delivery": force_delivery,
+            }
+        )
+        return {"status": "delivered"}
+
     async def fake_create_shopify_order(order_id: str) -> bool:
         shopify_calls.append(order_id)
         return True
@@ -264,6 +284,7 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
     monkeypatch.setattr(psp_routes_module, "mark_order_paid", fake_mark_order_paid)
     monkeypatch.setattr(psp_routes_module, "update_payment_info", fake_update_payment_info)
     monkeypatch.setattr(psp_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(psp_routes_module, "emit_merchant_webhook_event", fake_emit_merchant_webhook_event)
     monkeypatch.setattr(psp_routes_module.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(order_routes_module, "create_shopify_order", fake_create_shopify_order)
 
@@ -297,6 +318,25 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
     assert order_events[0]["order_id"] == "ORD_ADYEN_SUCCESS"
     assert order_events[0]["merchant_id"] == "m_adyen"
     assert order_events[0]["metadata"]["psp"] == "adyen"
+    assert merchant_webhook_calls == [
+        {
+            "merchant_id": "m_adyen",
+            "event_type": "payment.completed",
+            "payload": {
+                "order_id": "ORD_ADYEN_SUCCESS",
+                "merchant_id": "m_adyen",
+                "payment_id": "PSP_ADYEN_SUCCESS",
+                "transaction_id": "PSP_ADYEN_SUCCESS",
+                "amount": 45.2,
+                "currency": "USD",
+                "psp_used": "adyen",
+                "status": "paid",
+                "customer_email": None,
+            },
+            "request_id": None,
+            "force_delivery": False,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -539,6 +579,7 @@ async def test_adyen_webhook_refund_success_reconciles_partial_refund(
     import routes.psp_routes as psp_routes_module
 
     webhook_calls: list[tuple[str, str, str, str]] = []
+    merchant_webhook_calls: list[Dict[str, Any]] = []
     status_updates: list[Dict[str, Any]] = []
     order_events: list[Dict[str, Any]] = []
 
@@ -576,6 +617,33 @@ async def test_adyen_webhook_refund_success_reconciles_partial_refund(
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
+    async def fake_emit_merchant_webhook_event(
+        merchant_id: str,
+        *,
+        event_type: str,
+        payload,
+        request_id=None,
+        force_delivery: bool = False,
+    ) -> Dict[str, Any]:
+        merchant_webhook_calls.append(
+            {
+                "merchant_id": merchant_id,
+                "event_type": event_type,
+                "payload": dict(payload),
+                "request_id": request_id,
+                "force_delivery": force_delivery,
+            }
+        )
+        return {"status": "delivered"}
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any] | None = None):
+        assert "FROM refund_records" in query
+        assert values is not None
+        assert values["order_id"] == "ORD_ADYEN_REFUND"
+        assert values["merchant_id"] == "m_adyen"
+        assert values["psp_reference"] == "PSP_ADYEN_REFUND"
+        return {"refund_id": "REF_ADYEN_1"}
+
     monkeypatch.setattr(psp_routes_module.settings, "adyen_webhook_username", "adyen_user", raising=False)
     monkeypatch.setattr(psp_routes_module.settings, "adyen_webhook_password", "adyen_pass", raising=False)
     monkeypatch.setattr(psp_routes_module.settings, "adyen_webhook_secret", secret, raising=False)
@@ -583,6 +651,8 @@ async def test_adyen_webhook_refund_success_reconciles_partial_refund(
     monkeypatch.setattr(psp_routes_module, "get_order", fake_get_order)
     monkeypatch.setattr(psp_routes_module, "update_order_status", fake_update_order_status)
     monkeypatch.setattr(psp_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(psp_routes_module, "emit_merchant_webhook_event", fake_emit_merchant_webhook_event)
+    monkeypatch.setattr(psp_routes_module.database, "fetch_one", fake_fetch_one)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -607,6 +677,23 @@ async def test_adyen_webhook_refund_success_reconciles_partial_refund(
     assert order_events[0]["order_id"] == "ORD_ADYEN_REFUND"
     assert order_events[0]["metadata"]["psp"] == "adyen"
     assert order_events[0]["metadata"]["refund_amount"] == "12"
+    assert merchant_webhook_calls == [
+        {
+            "merchant_id": "m_adyen",
+            "event_type": "refund.processed",
+            "payload": {
+                "order_id": "ORD_ADYEN_REFUND",
+                "merchant_id": "m_adyen",
+                "refund_id": "REF_ADYEN_1",
+                "amount": 12.0,
+                "currency": "USD",
+                "is_partial": True,
+                "status": "partially_refunded",
+            },
+            "request_id": None,
+            "force_delivery": False,
+        }
+    ]
 
 
 @pytest.mark.asyncio
