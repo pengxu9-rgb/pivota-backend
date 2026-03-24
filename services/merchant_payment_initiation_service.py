@@ -8,6 +8,7 @@ and order creation return the same PSP-facing action contract.
 from __future__ import annotations
 
 from decimal import Decimal
+import json
 from typing import Any, Dict, List, Optional
 
 from fastapi.encoders import jsonable_encoder
@@ -21,19 +22,28 @@ from services.merchant_psp_config_service import (
 
 
 def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
+    def _encode_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return jsonable_encoder(candidate)
+        except Exception:
+            try:
+                return json.loads(json.dumps(candidate, default=str))
+            except Exception:
+                return {}
+
     candidate: Dict[str, Any]
     if isinstance(raw, dict):
         candidate = dict(raw)
-        return jsonable_encoder(candidate)
+        return _encode_candidate(candidate)
     if hasattr(raw, "to_dict"):
         try:
             candidate = dict(raw.to_dict())
-            return jsonable_encoder(candidate)
+            return _encode_candidate(candidate)
         except Exception:
             return {}
     try:
         candidate = dict(raw or {})
-        return jsonable_encoder(candidate)
+        return _encode_candidate(candidate)
     except Exception:
         return {}
 
