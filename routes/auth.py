@@ -10,7 +10,7 @@ from textwrap import dedent
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, status
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, field_validator
 
 from config.settings import settings
 from db.database import database
@@ -29,6 +29,25 @@ logger = logging.getLogger("auth_routes")
 # Some code/tests patch `routes.auth.require_admin_user`.
 require_admin_user = require_admin
 
+
+def _validate_password_strength(value: str) -> str:
+    if len(value) < 8:
+        raise ValueError('Password must be at least 8 characters long')
+    if not any(c.isupper() for c in value):
+        raise ValueError('Password must contain at least one uppercase letter')
+    if not any(c.islower() for c in value):
+        raise ValueError('Password must contain at least one lowercase letter')
+    if not any(c.isdigit() for c in value):
+        raise ValueError('Password must contain at least one digit')
+    return value
+
+
+def _validate_role_value(value: str) -> str:
+    valid_roles = ['super_admin', 'admin', 'employee', 'outsourced', 'merchant', 'agent']
+    if value not in valid_roles:
+        raise ValueError(f'Invalid role. Must be one of: {", ".join(valid_roles)}')
+    return value
+
 # Request/Response Models
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -36,24 +55,15 @@ class RegisterRequest(BaseModel):
     full_name: Optional[str] = None
     role: str = "employee"
     
-    @validator('password')
-    def validate_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-        if not any(c.isupper() for c in v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not any(c.islower() for c in v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not any(c.isdigit() for c in v):
-            raise ValueError('Password must contain at least one digit')
-        return v
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return _validate_password_strength(value)
     
-    @validator('role')
-    def validate_role(cls, v):
-        valid_roles = ['super_admin', 'admin', 'employee', 'outsourced', 'merchant', 'agent']
-        if v not in valid_roles:
-            raise ValueError(f'Invalid role. Must be one of: {", ".join(valid_roles)}')
-        return v
+    @field_validator('role')
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        return _validate_role_value(value)
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -71,6 +81,10 @@ class UserResponse(BaseModel):
 class MessageResponse(BaseModel):
     success: bool
     message: str
+
+
+def _normalize_email(raw_email: str) -> str:
+    return (raw_email or "").strip().lower()
 
 
 def _send_reset_password_email(email: str, reset_link: str) -> None:
@@ -134,9 +148,10 @@ async def register(data: RegisterRequest):
     - **role**: super_admin, admin, employee, outsourced, merchant, or agent (default: employee)
     """
     try:
+        normalized_email = _normalize_email(data.email)
         # Check if user already exists
         query = "SELECT id FROM users WHERE email = :email"
-        existing_user = await database.fetch_one(query=query, values={"email": data.email})
+        existing_user = await database.fetch_one(query=query, values={"email": normalized_email})
         
         if existing_user:
             raise HTTPException(
@@ -154,9 +169,9 @@ async def register(data: RegisterRequest):
             RETURNING id
         """
         values = {
-            "email": data.email,
+            "email": normalized_email,
             "password_hash": password_hash,
-            "full_name": data.full_name or data.email.split('@')[0],
+            "full_name": data.full_name or normalized_email.split('@')[0],
             "role": data.role
         }
         
@@ -191,13 +206,14 @@ async def login(data: LoginRequest):
     Returns JWT token and user information
     """
     try:
+        normalized_email = _normalize_email(data.email)
         # Find user by email
         query = """
             SELECT id, email, password_hash, full_name, role, active, merchant_id
             FROM users
             WHERE email = :email
         """
-        user = await database.fetch_one(query=query, values={"email": data.email})
+        user = await database.fetch_one(query=query, values={"email": normalized_email})
         
         if not user:
             raise HTTPException(
@@ -476,17 +492,10 @@ class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
     
-    @validator('new_password')
-    def validate_new_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-        if not any(c.isupper() for c in v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not any(c.islower() for c in v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not any(c.isdigit() for c in v):
-            raise ValueError('Password must contain at least one digit')
-        return v
+    @field_validator('new_password')
+    @classmethod
+    def validate_new_password(cls, value: str) -> str:
+        return _validate_password_strength(value)
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
@@ -495,17 +504,10 @@ class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
     
-    @validator('new_password')
-    def validate_new_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-        if not any(c.isupper() for c in v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not any(c.islower() for c in v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not any(c.isdigit() for c in v):
-            raise ValueError('Password must contain at least one digit')
-        return v
+    @field_validator('new_password')
+    @classmethod
+    def validate_new_password(cls, value: str) -> str:
+        return _validate_password_strength(value)
 
 
 @router.post("/change-password", response_model=MessageResponse)
@@ -563,6 +565,7 @@ async def forgot_password(data: ForgotPasswordRequest):
     Generates a reset token and stores it in database
     """
     try:
+        normalized_email = _normalize_email(data.email)
         import secrets
         from datetime import timedelta
         
@@ -571,7 +574,7 @@ async def forgot_password(data: ForgotPasswordRequest):
         # we only need to know whether an email exists, so select email only
         user = await database.fetch_one(
             "SELECT email, role FROM users WHERE email = :email",
-            {"email": data.email},
+            {"email": normalized_email},
         )
         
         if not user:
@@ -579,7 +582,7 @@ async def forgot_password(data: ForgotPasswordRequest):
             # has no corresponding users row yet, create a login user on the fly
             merchant = await database.fetch_one(
                 "SELECT merchant_id, business_name FROM merchant_onboarding WHERE contact_email = :email LIMIT 1",
-                {"email": data.email},
+                {"email": normalized_email},
             )
 
             if merchant:
@@ -595,9 +598,9 @@ async def forgot_password(data: ForgotPasswordRequest):
                     VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
                     """,
                     {
-                        "email": data.email,
+                        "email": normalized_email,
                         "password_hash": password_hash,
-                        "full_name": merchant["business_name"] or data.email.split("@")[0],
+                        "full_name": merchant["business_name"] or normalized_email.split("@")[0],
                         "role": "merchant",
                         "active": True,
                         "merchant_id": merchant["merchant_id"],
@@ -605,7 +608,7 @@ async def forgot_password(data: ForgotPasswordRequest):
                 )
                 logger.info(
                     "[Auth] Auto-created merchant user for %s to support password reset",
-                    data.email,
+                    normalized_email,
                 )
             else:
                 # Don't reveal if email exists or not (security best practice)
@@ -638,7 +641,7 @@ async def forgot_password(data: ForgotPasswordRequest):
             INSERT INTO password_reset_tokens (token, user_email, expires_at)
             VALUES (:token, :email, :expires_at)
             """,
-            {"token": reset_token, "email": data.email, "expires_at": expires_at}
+            {"token": reset_token, "email": normalized_email, "expires_at": expires_at}
         )
         
         # Build reset link. Choose portal base URL based on user role (if known).
@@ -656,7 +659,7 @@ async def forgot_password(data: ForgotPasswordRequest):
         reset_link = f"{base_url}/reset-password?token={reset_token}"
 
         # Best-effort email delivery; failures are logged only
-        _send_reset_password_email(data.email, reset_link)
+        _send_reset_password_email(normalized_email, reset_link)
         
         return MessageResponse(
             success=True,

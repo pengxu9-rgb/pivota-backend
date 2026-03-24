@@ -84,6 +84,10 @@ users_db = {}
 user_roles_db = {}
 sessions_db = {}
 
+def normalize_email(raw_email: str) -> str:
+    """Normalize email so legacy auth uses the same lookup key as canonical auth."""
+    return (raw_email or "").strip().lower()
+
 def hash_password(password: str) -> str:
     """Hash password using SHA-256"""
     return hashlib.sha256(password.encode()).hexdigest()
@@ -152,16 +156,18 @@ def require_employee(current_user: dict = Depends(verify_jwt_token)):
 async def signup(user_data: UserSignup):
     """User signup with role selection (in-memory, no Supabase)."""
     try:
-        if user_data.email in users_db:
+        normalized_email = normalize_email(user_data.email)
+
+        if normalized_email in users_db:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists")
-        users_db[user_data.email] = {
-            "id": user_data.email,
-            "email": user_data.email,
+        users_db[normalized_email] = {
+            "id": normalized_email,
+            "email": normalized_email,
             "password_hash": hash_password(user_data.password),
-            "full_name": user_data.full_name or user_data.email,
+            "full_name": user_data.full_name or normalized_email,
         }
-        user_roles_db[user_data.email] = {
-            "user_id": user_data.email,
+        user_roles_db[normalized_email] = {
+            "user_id": normalized_email,
             "role": user_data.role.value,
             "approved": True,
             "created_at": datetime.utcnow().isoformat()
@@ -169,7 +175,7 @@ async def signup(user_data: UserSignup):
         return {
             "status": "success",
             "message": "Account created",
-            "user_id": user_data.email,
+            "user_id": normalized_email,
             "role": user_data.role.value,
             "approved": True
         }
@@ -191,6 +197,7 @@ async def signin(login_data: UserLogin):
     Preferred for real accounts: `POST /api/auth/login`.
     """
     try:
+        normalized_email = normalize_email(login_data.email)
         demo_accounts = {
             "merchant@test.com": {"password": "Admin123!", "role": "merchant", "merchant_id": "merch_6b90dc9838d5fd9c"},
             "employee@pivota.com": {"password": "Admin123!", "role": "admin"},
@@ -198,18 +205,18 @@ async def signin(login_data: UserLogin):
             "superadmin@pivota.com": {"password": "admin123", "role": "admin"},
         }
         # In-memory users
-        if login_data.email in users_db:
-            stored = users_db[login_data.email]
+        if normalized_email in users_db:
+            stored = users_db[normalized_email]
             if not verify_password(login_data.password, stored["password_hash"]):
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-            role_info = user_roles_db.get(login_data.email, {"role": "employee", "approved": True})
+            role_info = user_roles_db.get(normalized_email, {"role": "employee", "approved": True})
             primary_role = role_info["role"]
-            token = create_jwt_token(login_data.email, primary_role, login_data.email)
+            token = create_jwt_token(normalized_email, primary_role, normalized_email)
             return {
                 "status": "success",
                 "message": "Login successful",
                 "token": token,
-                "user": {"id": login_data.email, "email": login_data.email, "full_name": stored.get("full_name", login_data.email), "role": primary_role}
+                "user": {"id": normalized_email, "email": normalized_email, "full_name": stored.get("full_name", normalized_email), "role": primary_role}
             }
         # Legacy employees table (optional). If the table doesn't exist in the new DB,
         # swallow the error and fall back to demo accounts instead of returning 500.
@@ -220,7 +227,7 @@ async def signin(login_data: UserLogin):
                 FROM employees
                 WHERE email = :email AND status = 'active'
             """
-            employee = await database.fetch_one(employee_query, {"email": login_data.email})
+            employee = await database.fetch_one(employee_query, {"email": normalized_email})
         except Exception as e:
             # Log and ignore missing legacy table or other DB errors
             print(f"Employees lookup skipped: {e}")
@@ -256,7 +263,7 @@ async def signin(login_data: UserLogin):
                 WHERE email = :email
                 LIMIT 1
             """
-            user = await database.fetch_one(user_query, {"email": login_data.email})
+            user = await database.fetch_one(user_query, {"email": normalized_email})
         except Exception as e:
             print(f"Users lookup skipped: {e}")
             user = None
@@ -298,7 +305,7 @@ async def signin(login_data: UserLogin):
             }
 
         # Demo accounts fallback
-        acct = demo_accounts.get(login_data.email)
+        acct = demo_accounts.get(normalized_email)
         if not acct or acct["password"] != login_data.password:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
         
@@ -320,9 +327,9 @@ async def signin(login_data: UserLogin):
         
         # Create token with merchant_id if available
         token_payload = {
-            "sub": login_data.email,
-            "user_id": login_data.email,
-            "email": login_data.email,
+            "sub": normalized_email,
+            "user_id": normalized_email,
+            "email": normalized_email,
             "role": acct["role"],
             "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
             "iat": datetime.utcnow()
@@ -339,7 +346,7 @@ async def signin(login_data: UserLogin):
                 # Check if agent exists
                 existing_agent = await database.fetch_one(
                     "SELECT agent_id, api_key FROM agents WHERE email = :email",
-                    {"email": login_data.email}
+                    {"email": normalized_email}
                 )
                 
                 if not existing_agent:
@@ -353,16 +360,16 @@ async def signin(login_data: UserLogin):
                         ON CONFLICT (email) DO NOTHING
                         """,
                         {
-                            "agent_id": login_data.email,
-                            "name": login_data.email.split('@')[0].title() + " Agent",
-                            "email": login_data.email,
+                            "agent_id": normalized_email,
+                            "name": normalized_email.split('@')[0].title() + " Agent",
+                            "email": normalized_email,
                             "company": "Agent Company",
                             "api_key": api_key,
                             "status": "active"
                         }
                     )
                     agent_api_key = api_key
-                    print(f"✅ Auto-created agent record for {login_data.email}")
+                    print(f"✅ Auto-created agent record for {normalized_email}")
                 else:
                     # Return existing API key
                     agent_api_key = existing_agent["api_key"]
@@ -373,9 +380,9 @@ async def signin(login_data: UserLogin):
         token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
         
         user_data = {
-            "id": login_data.email,
-            "email": login_data.email,
-            "full_name": login_data.email,
+            "id": normalized_email,
+            "email": normalized_email,
+            "full_name": normalized_email,
             "role": acct["role"]
         }
         

@@ -6,7 +6,7 @@ Handles merchant registration, KYC, PSP setup, and API key issuance
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 import asyncio
 import stripe
@@ -33,6 +33,9 @@ from fastapi.responses import StreamingResponse
 import io
 
 router = APIRouter(prefix="/merchant/onboarding", tags=["merchant-onboarding"])
+
+INTERNAL_ACCOUNT_ROLES = {"super_admin", "admin", "employee", "outsourced"}
+PUBLIC_MERGEABLE_ACCOUNT_ROLES = {"agent"}
 
 # ============================================================================
 # REQUEST/RESPONSE MODELS
@@ -115,6 +118,28 @@ def normalize_contact_email(raw_email: str) -> str:
     return (raw_email or "").strip().lower()
 
 
+def normalize_account_role(raw_role: Optional[str]) -> Optional[str]:
+    role = (raw_role or "").strip().lower()
+    return role or None
+
+
+def build_identity_conflict_detail(
+    *,
+    code: str,
+    message: str,
+    current_role: Optional[str],
+    resolution: str,
+    merchant_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    detail: Dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "current_role": current_role,
+        "resolution": resolution,
+    }
+    if merchant_id:
+        detail["merchant_id"] = merchant_id
+    return detail
 async def get_active_onboarding_by_email(contact_email: str) -> Optional[Dict[str, Any]]:
     """Return the latest non-deleted merchant onboarding record for an email."""
     record = await database.fetch_one(
@@ -137,7 +162,7 @@ async def get_user_auth_binding(contact_email: str) -> Optional[Dict[str, Any]]:
     """Return the existing auth user row for an email if it exists."""
     record = await database.fetch_one(
         """
-        SELECT id, email, role, merchant_id, active
+        SELECT id, email, role, merchant_id, active, password_hash, full_name
         FROM users
         WHERE LOWER(email) = LOWER(:email)
         LIMIT 1
@@ -152,19 +177,19 @@ async def sync_merchant_auth_user(
     contact_email: str,
     business_name: str,
     merchant_id: str,
-    password: str,
+    password: Optional[str],
     existing_user: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Create or update the merchant auth account tied to this onboarding record."""
     from utils.auth import hash_password
 
-    password_hash = hash_password(password)
+    password_hash = hash_password(password) if password else None
 
     if existing_user:
         await database.execute(
             """
             UPDATE users
-            SET password_hash = :password_hash,
+            SET password_hash = COALESCE(:password_hash, password_hash),
                 full_name = :full_name,
                 role = :role,
                 active = :active,
@@ -182,6 +207,8 @@ async def sync_merchant_auth_user(
         )
         return
 
+    if not password:
+        raise ValueError("password is required when creating a merchant auth user")
     await database.execute(
         """
         INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
@@ -195,6 +222,88 @@ async def sync_merchant_auth_user(
             "active": True,
             "merchant_id": merchant_id,
         },
+    )
+
+async def resolve_public_merchant_identity_merge(
+    *,
+    existing_user: Optional[Dict[str, Any]],
+    existing_onboarding: Optional[Dict[str, Any]],
+    entered_password: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Decide whether a public merchant signup can reuse/convert an existing identity.
+
+    Rules:
+    - merchant role: reuse directly
+    - agent role: allow conversion only when the current password is verified
+    - internal roles: require an explicit admin merge path
+    """
+    if not existing_user:
+        return None, None
+
+    normalized_role = normalize_account_role(existing_user.get("role"))
+    if normalized_role in {None, "merchant"}:
+        return existing_user, None
+
+    merchant_id = (
+        (existing_onboarding or {}).get("merchant_id")
+        or existing_user.get("merchant_id")
+    )
+
+    if normalized_role in INTERNAL_ACCOUNT_ROLES:
+        raise HTTPException(
+            status_code=409,
+            detail=build_identity_conflict_detail(
+                code="MERCHANT_IDENTITY_MERGE_REQUIRED",
+                message=(
+                    "This email is already attached to an internal account. "
+                    "Pivota support must merge it into a merchant identity before signup can continue."
+                ),
+                current_role=normalized_role,
+                resolution="admin_merge_required",
+                merchant_id=merchant_id,
+            ),
+        )
+
+    if normalized_role in PUBLIC_MERGEABLE_ACCOUNT_ROLES:
+        from utils.auth import verify_password
+
+        if not entered_password or not verify_password(
+            entered_password,
+            str(existing_user.get("password_hash") or ""),
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=build_identity_conflict_detail(
+                    code="MERCHANT_IDENTITY_PASSWORD_VERIFICATION_REQUIRED",
+                    message=(
+                        "This email already has an existing account. "
+                        "Enter the current account password to convert it into a merchant identity, "
+                        "or contact support to merge it."
+                    ),
+                    current_role=normalized_role,
+                    resolution="verify_current_password_or_admin_merge",
+                    merchant_id=merchant_id,
+                ),
+            )
+
+        return existing_user, {
+            "converted_from_role": normalized_role,
+            "message": "Existing account verified and converted into the merchant identity.",
+        }
+
+    raise HTTPException(
+        status_code=409,
+        detail=build_identity_conflict_detail(
+            code="MERCHANT_IDENTITY_MERGE_REQUIRED",
+            message=(
+                "This email is already attached to another account type. "
+                "Pivota support must merge it into a merchant identity before signup can continue."
+            ),
+            current_role=normalized_role,
+            resolution="admin_merge_required",
+            merchant_id=merchant_id,
+        ),
     )
 
 async def validate_stripe_key(api_key: str) -> bool:
@@ -334,11 +443,11 @@ async def register_merchant(
             reuse_existing_onboarding = True
 
         existing_user = await get_user_auth_binding(normalized_email)
-        if existing_user and existing_user.get("role") not in {None, "merchant"}:
-            raise HTTPException(
-                status_code=409,
-                detail="Email already in use by another account type. Use a different email.",
-            )
+        existing_user, identity_merge = await resolve_public_merchant_identity_merge(
+            existing_user=existing_user,
+            existing_onboarding=existing_onboarding,
+            entered_password=merchant_data.password,
+        )
 
         if existing_user and existing_user.get("merchant_id") and not reuse_existing_onboarding:
             linked_onboarding = await get_merchant_onboarding(existing_user["merchant_id"])
@@ -509,7 +618,10 @@ async def register_merchant(
             "next_step": "Connect PSP" if validation_result["approved"] else "Wait for admin approval",
             "login_email": normalized_email
         }
-        
+
+        if identity_merge:
+            response_data["identity_merge"] = identity_merge
+
         # Include password if auto-generated
         if not merchant_data.password and 'password' in locals():
             response_data["temporary_password"] = password
