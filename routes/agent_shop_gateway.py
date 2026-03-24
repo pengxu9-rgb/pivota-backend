@@ -602,7 +602,7 @@ _BUDGET_FX_CACHE_TTL_SECONDS = 900.0
 _BUDGET_FX_RATE_CACHE: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str], float]] = {}
 
 
-def _parse_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
+def _parse_budget_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
     if isinstance(raw_rates, dict):
         return raw_rates
     if isinstance(raw_rates, str):
@@ -612,6 +612,15 @@ def _parse_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _coerce_budget_fx_snapshot(snapshot: Any) -> Dict[str, Any]:
+    if isinstance(snapshot, dict):
+        return snapshot
+    try:
+        return dict(snapshot or {})
+    except Exception:
+        return {}
 
 
 async def _lookup_budget_fx_rate(
@@ -644,8 +653,8 @@ async def _lookup_budget_fx_rate(
             {"base_currency": base_currency},
         )
 
-    direct_snapshot = await _fetch_snapshot(source_currency)
-    direct_rates = _parse_fx_rates_payload((direct_snapshot or {}).get("rates"))
+    direct_snapshot = _coerce_budget_fx_snapshot(await _fetch_snapshot(source_currency))
+    direct_rates = _parse_budget_fx_rates_payload(direct_snapshot.get("rates"))
     direct_value = direct_rates.get(target_currency)
     try:
         if direct_value is not None and float(direct_value) > 0:
@@ -655,8 +664,8 @@ async def _lookup_budget_fx_rate(
     except Exception:
         pass
 
-    reverse_snapshot = await _fetch_snapshot(target_currency)
-    reverse_rates = _parse_fx_rates_payload((reverse_snapshot or {}).get("rates"))
+    reverse_snapshot = _coerce_budget_fx_snapshot(await _fetch_snapshot(target_currency))
+    reverse_rates = _parse_budget_fx_rates_payload(reverse_snapshot.get("rates"))
     reverse_value = reverse_rates.get(source_currency)
     try:
         if reverse_value is not None and float(reverse_value) > 0:
