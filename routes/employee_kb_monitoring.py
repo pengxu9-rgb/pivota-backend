@@ -246,6 +246,8 @@ def _extract_service_identity(
 
     health_git = health_json.get("git") if isinstance(health_json.get("git"), dict) else {}
     version_git = version_json.get("git") if isinstance(version_json.get("git"), dict) else {}
+    health_version = health_json.get("version") if isinstance(health_json.get("version"), dict) else {}
+    backend_version = version_json.get("version") if isinstance(version_json.get("version"), dict) else {}
     version_railway = (
         version_json.get("railway")
         if isinstance(version_json.get("railway"), dict)
@@ -254,20 +256,28 @@ def _extract_service_identity(
 
     commit_sha = _pick_first_non_empty(
         commit_header,
+        backend_version.get("full_sha"),
+        health_version.get("full_sha"),
         version_json.get("full_sha"),
         version_json.get("commit_sha"),
         health_json.get("commit_sha"),
         health_git.get("commit_sha"),
         version_git.get("commit_sha"),
+        backend_version.get("commit"),
+        health_version.get("commit"),
         version_json.get("version"),
     )
     deployment_id = _pick_first_non_empty(
         deployment_header,
+        backend_version.get("deployment_id"),
+        health_version.get("deployment_id"),
         version_json.get("deployment_id"),
         health_json.get("deployment_id"),
         version_railway.get("deployment_id"),
     )
     version_value = _pick_first_non_empty(
+        backend_version.get("build_id"),
+        health_version.get("build_id"),
         version_json.get("version"),
         health_json.get("version"),
         commit_sha[:8] if commit_sha else None,

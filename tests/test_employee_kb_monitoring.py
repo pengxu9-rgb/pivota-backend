@@ -87,6 +87,45 @@ def test_kb_monitor_summary_healthy(monkeypatch):
     app.dependency_overrides.clear()
 
 
+def test_extract_service_identity_prefers_stable_version_object():
+    from routes import employee_kb_monitoring as module
+
+    identity = module._extract_service_identity(
+        base_url="https://aurora.example",
+        health_status="healthy",
+        health_http_status=200,
+        health_json={
+            "version": {
+                "service": "pivota-backend",
+                "commit": "194502fa7301",
+                "full_sha": "194502fa73011c5e49ee2ca7e3a13f8ecbabc123",
+                "build_id": "194502fa7301",
+                "branch": "main",
+                "deployment_id": "dep_health",
+                "started_at": "2026-03-24T07:04:12Z",
+            }
+        },
+        version_json={
+            "version": {
+                "service": "pivota-backend",
+                "commit": "194502fa7301",
+                "full_sha": "194502fa73011c5e49ee2ca7e3a13f8ecbabc123",
+                "build_id": "194502fa7301",
+                "branch": "main",
+                "deployment_id": "dep_version",
+                "started_at": "2026-03-24T07:04:12Z",
+            }
+        },
+        metrics_response=None,
+        health_response=None,
+        version_response=None,
+    )
+
+    assert identity["commit_sha"] == "194502fa73011c5e49ee2ca7e3a13f8ecbabc123"
+    assert identity["deployment_id"] == "dep_version"
+    assert identity["version"] == "194502fa7301"
+
+
 def test_kb_monitor_summary_requires_auth():
     from routes import employee_kb_monitoring as module
 
