@@ -63,6 +63,7 @@ class InternalOrderBackedCanaryRequest(InternalPaymentExecuteRequest):
     customer_name: Optional[str] = None
     label: Optional[str] = None
     enforce_live_readiness: bool = True
+    preferred_provider: Optional[str] = None
 
 
 async def verify_merchant_api_key(api_key: str) -> dict:
@@ -439,6 +440,44 @@ async def _execute_order_backed_payment_canary(
         candidates,
         enforce_live_readiness=bool(payment_request.enforce_live_readiness),
     )
+    requested_provider = str(payment_request.preferred_provider or "").strip().lower()
+    if requested_provider:
+        if requested_provider not in SUPPORTED_MERCHANT_PAYMENT_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported canary provider: {requested_provider}",
+            )
+        selected_candidate = next(
+            (
+                candidate
+                for candidate in candidates
+                if str(candidate.get("provider") or "").strip().lower() == requested_provider
+            ),
+            None,
+        )
+        if selected_candidate is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Provider {requested_provider} is not configured for this merchant",
+            )
+        if bool(payment_request.enforce_live_readiness):
+            readiness = selected_candidate.get("readiness") or _build_candidate_readiness(selected_candidate)
+            if not readiness.get("live_charge_ready"):
+                blockers = readiness.get("readiness_blockers") or []
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Provider {requested_provider} is not live-ready"
+                        + (f": {', '.join(blockers)}" if blockers else "")
+                    ),
+                )
+        elif not str(selected_candidate.get("api_key") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Provider {requested_provider} is not configured for canary execution",
+            )
+        preferred_psps = [requested_provider]
+
     if not preferred_psps:
         if payment_request.enforce_live_readiness:
             blocked_detail = _describe_blocked_candidates(candidates)

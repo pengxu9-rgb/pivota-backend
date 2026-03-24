@@ -141,6 +141,7 @@ class MerchantOrderBackedCanaryRequest(BaseModel):
     emit_merchant_webhook: bool = False
     enforce_live_readiness: bool = True
     label: Optional[str] = None
+    preferred_provider: Optional[str] = None
 
 # Payment status normalization:
 # - "status" is the order lifecycle (pending/completed/fulfilled/etc.)
@@ -386,6 +387,7 @@ async def execute_merchant_order_backed_canary(
             emit_merchant_webhook=payload.emit_merchant_webhook,
             enforce_live_readiness=payload.enforce_live_readiness,
             label=payload.label,
+            preferred_provider=payload.preferred_provider,
         ),
         source="merchant_order_backed_canary",
     )

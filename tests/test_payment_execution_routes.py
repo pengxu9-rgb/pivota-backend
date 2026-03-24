@@ -98,7 +98,11 @@ async def test_execute_payment_returns_unified_action(monkeypatch: pytest.Monkey
                     "api_key": "sk_live_x",
                     "status": "active",
                     "environment": "live",
-                    "provider_config": {"mode": "payment_intent"},
+                    "provider_config": {
+                        "mode": "payment_intent",
+                        "webhook_endpoint_id": "we_live_test",
+                        "webhook_endpoint_secret": "whsec_live_test",
+                    },
                     "validation_status": "valid",
                 },
             ],
@@ -174,7 +178,11 @@ async def test_execute_payment_emits_completed_only_for_terminal_success(
                     "api_key": "sk_live_x",
                     "status": "active",
                     "environment": "live",
-                    "provider_config": {"mode": "payment_intent"},
+                    "provider_config": {
+                        "mode": "payment_intent",
+                        "webhook_endpoint_id": "we_live_terminal",
+                        "webhook_endpoint_secret": "whsec_live_terminal",
+                    },
                     "validation_status": "valid",
                 }
             ],
@@ -273,7 +281,11 @@ async def test_execute_payment_failure_reports_last_attempted_supported_processo
                     "api_key": "sk_live_x",
                     "status": "active",
                     "environment": "live",
-                    "provider_config": {"mode": "payment_intent"},
+                    "provider_config": {
+                        "mode": "payment_intent",
+                        "webhook_endpoint_id": "we_live_failure",
+                        "webhook_endpoint_secret": "whsec_live_failure",
+                    },
                     "validation_status": "valid",
                 },
                 {
@@ -523,7 +535,11 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
                     "api_key": "sk_live_x",
                     "status": "active",
                     "environment": "live",
-                    "provider_config": {"mode": "payment_intent"},
+                    "provider_config": {
+                        "mode": "payment_intent",
+                        "webhook_endpoint_id": "we_live_canary",
+                        "webhook_endpoint_secret": "whsec_live_canary",
+                    },
                     "validation_status": "valid",
                 }
             ],
@@ -618,6 +634,124 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
         }
     ]
     assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_execute_internal_order_backed_canary_honors_preferred_provider_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    async def fake_load_merchant(merchant_id: str):
+        return {
+            "merchant_id": merchant_id,
+            "business_name": "Glow Commerce",
+            "status": "approved",
+            "contact_email": "merchant@example.com",
+        }
+
+    async def fake_candidates(merchant, payment_request):
+        return (
+            [
+                {
+                    "psp_id": "psp_stripe_test",
+                    "provider": "stripe",
+                    "api_key": "sk_test_x",
+                    "status": "active",
+                    "environment": "test",
+                    "provider_config": {"mode": "payment_intent"},
+                    "validation_status": "valid",
+                },
+                {
+                    "psp_id": "psp_adyen_test",
+                    "provider": "adyen",
+                    "api_key": "AQE_test_x",
+                    "status": "active",
+                    "environment": "test",
+                    "provider_config": {
+                        "merchant_account": "WoopayECOM",
+                        "client_key": "test_client_key",
+                    },
+                    "validation_status": "valid",
+                },
+            ],
+            {"route_id": "route_test", "psp_priority": [{"psp": "stripe", "priority": 1}]},
+        )
+
+    created_orders = []
+
+    async def fake_create_order(order_data):
+        created_orders.append(order_data)
+        return "ORD_CANARY_ADYEN_1"
+
+    async def fake_initiate(**kwargs):
+        assert kwargs["preferred_psps"] == ["adyen"]
+        return {
+            "success": True,
+            "payment_id": "adyen_session_test",
+            "status": "requires_action",
+            "transaction_id": "adyen_session_test",
+            "psp_used": "adyen",
+            "requires_customer_action": True,
+            "payment_action": {
+                "type": "adyen_session",
+                "client_secret": "session-data",
+                "session_data": "session-data",
+                "client_key": "test_client_key",
+                "raw": {"id": "SESSION_TEST", "environment": "test"},
+            },
+            "error_message": None,
+        }
+
+    payment_updates = []
+
+    async def fake_update_payment_info(order_id, payment_intent_id, client_secret, payment_status="processing", psp_used=None):
+        payment_updates.append(
+            {
+                "order_id": order_id,
+                "payment_intent_id": payment_intent_id,
+                "client_secret": client_secret,
+                "payment_status": payment_status,
+                "psp_used": psp_used,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(module.settings, "readiness_internal_api_key", "internal_test_key", raising=False)
+    monkeypatch.setattr(module, "_load_canary_merchant", fake_load_merchant)
+    monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
+    monkeypatch.setattr(module, "create_order", fake_create_order)
+    monkeypatch.setattr(module, "initiate_merchant_payment", fake_initiate)
+    monkeypatch.setattr(module, "update_payment_info", fake_update_payment_info)
+
+    response = await module.execute_internal_order_backed_canary(
+        merchant_id="merch_test_payment",
+        payment_request=module.InternalOrderBackedCanaryRequest(
+            amount=100,
+            currency="USD",
+            order_id="requested_adyen_canary_ref",
+            customer_email="merchant@example.com",
+            enforce_live_readiness=False,
+            preferred_provider="adyen",
+        ),
+        request=_build_request("/payment/internal/canary/merchants/merch_test_payment/order-backed/execute"),
+        x_pivota_internal_key="internal_test_key",
+    )
+
+    assert response.success is True
+    assert response.psp_used == "adyen"
+    assert response.payment_action["type"] == "adyen_session"
+    assert created_orders[0]["psp_id"] == "psp_adyen_test"
+    assert created_orders[0]["metadata"]["provider"] == "adyen"
+    assert payment_updates == [
+        {
+            "order_id": "ORD_CANARY_ADYEN_1",
+            "payment_intent_id": "adyen_session_test",
+            "client_secret": "session-data",
+            "payment_status": "awaiting_payment",
+            "psp_used": "adyen",
+        }
+    ]
 
 
 def test_build_payment_initiation_result_normalizes_decimal_raw_payload() -> None:

@@ -371,4 +371,62 @@ def test_merchant_order_backed_canary_route_uses_authenticated_merchant(monkeypa
     assert captured["merchant"]["contact_email"] == "merchant@example.com"
     assert captured["payment_request"].order_id.startswith("merchant_canary_")
     assert captured["payment_request"].enforce_live_readiness is True
+    assert captured["payment_request"].preferred_provider is None
+    assert captured["source"] == "merchant_order_backed_canary"
+
+
+def test_merchant_order_backed_canary_route_passes_preferred_provider(monkeypatch) -> None:
+    client, module = _build_client()
+
+    captured = {}
+
+    async def fake_execute(*, merchant, payment_request, source):
+        captured["merchant"] = merchant
+        captured["payment_request"] = payment_request
+        captured["source"] = source
+        return {
+            "success": True,
+            "payment_id": "adyen_session_test",
+            "order_id": "ORD_HIDDEN_CANARY_ADYEN",
+            "amount": 100,
+            "currency": "USD",
+            "psp_used": "adyen",
+            "status": "requires_action",
+            "transaction_id": "adyen_session_test",
+            "requires_customer_action": True,
+            "payment_action": {
+                "type": "adyen_session",
+                "client_secret": "session-data",
+                "session_data": "session-data",
+                "client_key": "test_client_key",
+                "raw": {"id": "SESSION_TEST", "environment": "test"},
+            },
+            "error_message": None,
+            "timestamp": "2026-03-24T00:00:00Z",
+        }
+
+    import routes.payment_execution_routes as payment_execution_module
+
+    monkeypatch.setattr(
+        payment_execution_module,
+        "_execute_order_backed_payment_canary",
+        fake_execute,
+    )
+
+    response = client.post(
+        "/merchant/payment-canary/order-backed",
+        json={
+            "amount": 100,
+            "currency": "USD",
+            "customer_email": "merchant@example.com",
+            "enforce_live_readiness": False,
+            "preferred_provider": "adyen",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["order_id"] == "ORD_HIDDEN_CANARY_ADYEN"
+    assert captured["payment_request"].preferred_provider == "adyen"
+    assert captured["payment_request"].enforce_live_readiness is False
     assert captured["source"] == "merchant_order_backed_canary"
