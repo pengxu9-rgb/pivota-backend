@@ -195,6 +195,7 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
 
     webhook_calls: list[tuple[str, str, str, str]] = []
     paid_calls: list[str] = []
+    payment_updates: list[Dict[str, Any]] = []
     order_events: list[Dict[str, Any]] = []
     shopify_calls: list[str] = []
     scheduled_tasks: list[asyncio.Task[Any]] = []
@@ -223,6 +224,24 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
     async def fake_mark_order_paid(order_id: str) -> None:
         paid_calls.append(order_id)
 
+    async def fake_update_payment_info(
+        order_id: str,
+        payment_intent_id: str,
+        client_secret: str,
+        payment_status: str = "processing",
+        psp_used: str | None = None,
+    ) -> bool:
+        payment_updates.append(
+            {
+                "order_id": order_id,
+                "payment_intent_id": payment_intent_id,
+                "client_secret": client_secret,
+                "payment_status": payment_status,
+                "psp_used": psp_used,
+            }
+        )
+        return True
+
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
@@ -243,6 +262,7 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
     monkeypatch.setattr(psp_routes_module, "handle_psp_webhook", fake_handle_psp_webhook)
     monkeypatch.setattr(psp_routes_module, "get_order", fake_get_order)
     monkeypatch.setattr(psp_routes_module, "mark_order_paid", fake_mark_order_paid)
+    monkeypatch.setattr(psp_routes_module, "update_payment_info", fake_update_payment_info)
     monkeypatch.setattr(psp_routes_module, "log_order_event", fake_log_order_event)
     monkeypatch.setattr(psp_routes_module.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(order_routes_module, "create_shopify_order", fake_create_shopify_order)
@@ -262,6 +282,15 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
     assert resp.json() == {"notificationResponse": "[accepted]"}
     assert webhook_calls == [("ORD_ADYEN_SUCCESS", "succeeded", "adyen", "PSP_ADYEN_SUCCESS")]
     assert paid_calls == ["ORD_ADYEN_SUCCESS"]
+    assert payment_updates == [
+        {
+            "order_id": "ORD_ADYEN_SUCCESS",
+            "payment_intent_id": "PSP_ADYEN_SUCCESS",
+            "client_secret": "",
+            "payment_status": "paid",
+            "psp_used": "adyen",
+        }
+    ]
     assert shopify_calls == ["ORD_ADYEN_SUCCESS"]
     assert len(order_events) == 1
     assert order_events[0]["event_type"] == "payment_confirmed_webhook"
@@ -279,6 +308,7 @@ async def test_adyen_webhook_handles_multiple_notification_items_without_partial
 
     webhook_calls: list[tuple[str, str, str, str]] = []
     paid_calls: list[str] = []
+    payment_updates: list[Dict[str, Any]] = []
     order_events: list[Dict[str, Any]] = []
     shopify_calls: list[str] = []
     scheduled_tasks: list[asyncio.Task[Any]] = []
@@ -328,6 +358,24 @@ async def test_adyen_webhook_handles_multiple_notification_items_without_partial
     async def fake_mark_order_paid(order_id: str) -> None:
         paid_calls.append(order_id)
 
+    async def fake_update_payment_info(
+        order_id: str,
+        payment_intent_id: str,
+        client_secret: str,
+        payment_status: str = "processing",
+        psp_used: str | None = None,
+    ) -> bool:
+        payment_updates.append(
+            {
+                "order_id": order_id,
+                "payment_intent_id": payment_intent_id,
+                "client_secret": client_secret,
+                "payment_status": payment_status,
+                "psp_used": psp_used,
+            }
+        )
+        return True
+
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
@@ -348,6 +396,7 @@ async def test_adyen_webhook_handles_multiple_notification_items_without_partial
     monkeypatch.setattr(psp_routes_module, "handle_psp_webhook", fake_handle_psp_webhook)
     monkeypatch.setattr(psp_routes_module, "get_order", fake_get_order)
     monkeypatch.setattr(psp_routes_module, "mark_order_paid", fake_mark_order_paid)
+    monkeypatch.setattr(psp_routes_module, "update_payment_info", fake_update_payment_info)
     monkeypatch.setattr(psp_routes_module, "log_order_event", fake_log_order_event)
     monkeypatch.setattr(psp_routes_module.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(order_routes_module, "create_shopify_order", fake_create_shopify_order)
@@ -370,6 +419,15 @@ async def test_adyen_webhook_handles_multiple_notification_items_without_partial
         ("ORD_BATCH_FAIL", "failed", "adyen", "PSP_BATCH_FAIL"),
     ]
     assert paid_calls == ["ORD_BATCH_SUCCESS"]
+    assert payment_updates == [
+        {
+            "order_id": "ORD_BATCH_SUCCESS",
+            "payment_intent_id": "PSP_BATCH_SUCCESS",
+            "client_secret": "",
+            "payment_status": "paid",
+            "psp_used": "adyen",
+        }
+    ]
     assert shopify_calls == ["ORD_BATCH_SUCCESS"]
     assert len(order_events) == 1
     assert order_events[0]["order_id"] == "ORD_BATCH_SUCCESS"

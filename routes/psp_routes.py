@@ -13,7 +13,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from adapters.stripe_adapter import verify_webhook_signature
 from config.settings import settings
-from db.orders import get_order, mark_order_paid, update_order_status
+from db.orders import get_order, mark_order_paid, update_order_status, update_payment_info
 from db.products import log_order_event
 from orchestrator.callback_handler import handle_psp_webhook
 from services.psp_payment_finalizer import (
@@ -171,6 +171,7 @@ async def _finalize_adyen_payment_success(order: dict, *, psp_reference: str, no
         amount_minor=notification.get("amount", {}).get("value"),
         currency=notification.get("amount", {}).get("currency"),
         metadata_extra={"event_code": notification.get("eventCode")},
+        update_payment_info_fn=update_payment_info,
         mark_order_paid_fn=mark_order_paid,
         log_order_event_fn=log_order_event,
     )
