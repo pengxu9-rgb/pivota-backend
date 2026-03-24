@@ -262,6 +262,62 @@ def test_test_psp_connection_persists_environment_and_validation_truth(monkeypat
     assert executed[0]["values"]["validation_status"] == "valid"
 
 
+def test_test_psp_connection_provisions_stripe_webhook_and_persists_truth(monkeypatch) -> None:
+    client, module = _build_client()
+    executed = []
+
+    async def fake_fetch_one(query, values=None):
+        assert values["psp_id"] == "psp_stripe_live_1"
+        return {
+            "provider": "stripe",
+            "api_key": "sk_live_stripe_secret",
+            "secret_key": None,
+            "account_id": None,
+            "merchant_id": "merch_test_integrations",
+            "status": "active",
+            "environment": "live",
+            "provider_config": {"mode": "payment_intent"},
+            "validation_status": "unknown",
+            "validation_error": None,
+        }
+
+    async def fake_execute(query, values=None):
+        executed.append({"query": " ".join(query.split()), "values": dict(values or {})})
+
+    async def fake_ensure_stripe_webhook_endpoint(**kwargs):
+        assert kwargs["psp_id"] == "psp_stripe_live_1"
+        assert kwargs["environment"] == "live"
+        return (
+            {
+                "mode": "payment_intent",
+                "webhook_endpoint_id": "we_live_123",
+                "webhook_endpoint_secret": "whsec_live_123",
+                "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_live_1",
+            },
+            True,
+        )
+
+    import stripe as stripe_sdk
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "_ensure_stripe_webhook_endpoint", fake_ensure_stripe_webhook_endpoint)
+    monkeypatch.setattr(stripe_sdk.Balance, "retrieve", staticmethod(lambda **kwargs: {"object": "balance"}))
+
+    response = client.post("/merchant/psp/psp_stripe_live_1/test")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["data"]["environment"] == "live"
+    assert body["data"]["validation_status"] == "valid"
+    assert body["data"]["live_charge_ready"] is True
+    assert executed
+    provider_config = executed[0]["values"]["provider_config"]
+    assert '"webhook_endpoint_id": "we_live_123"' in provider_config
+    assert executed[0]["values"]["validation_status"] == "valid"
+
+
 def test_merchant_order_backed_canary_route_uses_authenticated_merchant(monkeypatch) -> None:
     client, module = _build_client()
 

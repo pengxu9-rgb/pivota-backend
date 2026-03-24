@@ -57,6 +57,60 @@ async def test_stripe_webhook_rejects_invalid_signature_when_secret_configured(
 
 
 @pytest.mark.asyncio
+async def test_stripe_webhook_psp_path_uses_merchant_specific_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as database_module
+    import routes.webhook_routes as webhook_routes_module
+
+    used_secrets: list[str] = []
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        if "FROM merchant_psps" in query:
+            assert values["psp_id"] == "psp_stripe_live_123"
+            return {
+                "provider_config": {
+                    "webhook_endpoint_secret": "whsec_merchant_specific",
+                }
+            }
+        if values.get("payment_intent_id") == "pi_psp_path_secret":
+            return None
+        raise AssertionError(f"Unexpected query: {query}")
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
+        used_secrets.append(secret)
+        if secret != "whsec_merchant_specific":
+            raise Exception("bad signature")
+        return _stripe_event(
+            "payment_intent.payment_failed",
+            {
+                "id": "pi_psp_path_secret",
+                "last_payment_error": {"message": "Card declined"},
+            },
+        )
+
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_global_fallback", raising=False)
+    monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe/psp_stripe_live_123",
+            content=b'{"id":"evt_psp_path_secret"}',
+            headers={"stripe-signature": "sig_psp_path_secret"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "event": "payment_intent.payment_failed"}
+    assert used_secrets == ["whsec_merchant_specific"]
+
+
+@pytest.mark.asyncio
 async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_shopify_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

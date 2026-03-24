@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import secrets
 from pydantic import BaseModel
+from config.settings import resolve_public_api_base_url
 from utils.auth import get_current_user
 from db.database import database
 from db.merchant_onboarding import merchant_onboarding
@@ -41,6 +42,75 @@ from services.merchant_psp_config_service import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+_STRIPE_AFTERCARE_EVENTS = [
+    "payment_intent.succeeded",
+    "payment_intent.payment_failed",
+    "charge.refunded",
+    "refund.created",
+    "refund.updated",
+    "refund.failed",
+    "checkout.session.completed",
+]
+
+
+def _stripe_webhook_target_url(psp_id: str) -> str:
+    return f"{resolve_public_api_base_url().rstrip('/')}/webhooks/stripe/{psp_id}"
+
+
+async def _ensure_stripe_webhook_endpoint(
+    *,
+    psp_id: str,
+    api_key: str,
+    provider_config: Dict[str, Any],
+    account_id: Optional[str],
+    environment: str,
+) -> tuple[Dict[str, Any], bool]:
+    import stripe as stripe_sdk
+
+    stripe_sdk.api_key = api_key
+    next_config = dict(provider_config or {})
+    desired_url = _stripe_webhook_target_url(psp_id)
+    desired_events = list(_STRIPE_AFTERCARE_EVENTS)
+    stripe_kwargs = {"stripe_account": account_id} if account_id else {}
+    existing_endpoint_id = str(next_config.get("webhook_endpoint_id") or "").strip()
+    existing_secret = str(next_config.get("webhook_endpoint_secret") or "").strip()
+
+    if existing_endpoint_id and existing_secret:
+        try:
+            endpoint = stripe_sdk.WebhookEndpoint.retrieve(existing_endpoint_id, **stripe_kwargs)
+            endpoint_url = str(endpoint.get("url") or "").strip()
+            enabled_events = sorted(str(item).strip() for item in endpoint.get("enabled_events") or [])
+            if endpoint_url != desired_url or enabled_events != sorted(desired_events):
+                stripe_sdk.WebhookEndpoint.modify(
+                    existing_endpoint_id,
+                    url=desired_url,
+                    enabled_events=desired_events,
+                    **stripe_kwargs,
+                )
+            next_config["webhook_endpoint_id"] = existing_endpoint_id
+            next_config["webhook_endpoint_secret"] = existing_secret
+            next_config["webhook_url"] = desired_url
+            return next_config, False
+        except Exception:
+            pass
+
+    created = stripe_sdk.WebhookEndpoint.create(
+        url=desired_url,
+        enabled_events=desired_events,
+        description=f"Pivota merchant PSP webhook for {psp_id} ({environment})",
+        metadata={"psp_id": psp_id, "environment": environment},
+        **stripe_kwargs,
+    )
+    created_secret = str(created.get("secret") or "").strip()
+    created_id = str(created.get("id") or "").strip()
+    if not created_secret or not created_id:
+        raise ValueError("Stripe webhook endpoint creation did not return endpoint credentials")
+
+    next_config["webhook_endpoint_id"] = created_id
+    next_config["webhook_endpoint_secret"] = created_secret
+    next_config["webhook_url"] = desired_url
+    return next_config, True
 
 
 class MerchantPortalPreferencesRequest(BaseModel):
@@ -1169,6 +1239,7 @@ async def test_psp_connection(
     try:
         success = False
         validation_message = ""
+        provider_config_for_persist = psp_row.get("provider_config")
 
         if provider == "stripe":
             import stripe as stripe_sdk
@@ -1179,8 +1250,33 @@ async def test_psp_connection(
                 stripe_sdk.Balance.retrieve(stripe_account=account_id)
             else:
                 stripe_sdk.Balance.retrieve()
+            if provider_summary.get("environment") == "live":
+                raw_provider_config = psp_row.get("provider_config")
+                stripe_provider_config: Dict[str, Any] = {}
+                if isinstance(raw_provider_config, dict):
+                    stripe_provider_config = dict(raw_provider_config)
+                elif isinstance(raw_provider_config, str):
+                    try:
+                        parsed_provider_config = json.loads(raw_provider_config)
+                        if isinstance(parsed_provider_config, dict):
+                            stripe_provider_config = dict(parsed_provider_config)
+                    except Exception:
+                        stripe_provider_config = {}
+                provider_config_for_persist, created_endpoint = await _ensure_stripe_webhook_endpoint(
+                    psp_id=psp_id,
+                    api_key=api_key,
+                    provider_config=stripe_provider_config,
+                    account_id=account_id,
+                    environment=provider_summary.get("environment") or "live",
+                )
+                validation_message = (
+                    "Stripe credentials verified and webhook endpoint provisioned"
+                    if created_endpoint
+                    else "Stripe credentials verified and webhook endpoint confirmed"
+                )
+            else:
+                validation_message = "Stripe credentials verified"
             success = True
-            validation_message = "Stripe credentials verified"
 
         elif provider == "adyen":
             merchant_account = provider_summary.get("merchant_account")
@@ -1253,7 +1349,7 @@ async def test_psp_connection(
             provider,
             api_key=api_key,
             account_id=psp_row.get("account_id"),
-            provider_config=psp_row.get("provider_config"),
+            provider_config=provider_config_for_persist,
             environment=provider_summary.get("environment"),
             validation_status="valid" if success else "invalid",
             validation_error=None,
@@ -1313,7 +1409,7 @@ async def test_psp_connection(
             provider,
             api_key=api_key,
             account_id=psp_row.get("account_id"),
-            provider_config=psp_row.get("provider_config"),
+            provider_config=provider_config_for_persist,
             environment=provider_summary.get("environment"),
             validation_status="invalid",
             validation_error=error_text,

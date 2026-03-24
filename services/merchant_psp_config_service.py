@@ -89,6 +89,15 @@ def normalize_provider_config(
         }
         if account_value:
             normalized["account_id"] = account_value
+        webhook_endpoint_id = str(config.get("webhook_endpoint_id") or "").strip()
+        webhook_endpoint_secret = str(config.get("webhook_endpoint_secret") or "").strip()
+        webhook_url = str(config.get("webhook_url") or "").strip()
+        if webhook_endpoint_id:
+            normalized["webhook_endpoint_id"] = webhook_endpoint_id
+        if webhook_endpoint_secret:
+            normalized["webhook_endpoint_secret"] = webhook_endpoint_secret
+        if webhook_url:
+            normalized["webhook_url"] = webhook_url
         return normalized
 
     if provider_norm == "adyen":
@@ -148,6 +157,12 @@ def build_provider_summary(
             "mode": config.get("mode") or "payment_intent",
             "account_id": config.get("account_id"),
             "environment": env_value,
+            "webhook_endpoint_id": config.get("webhook_endpoint_id"),
+            "webhook_ready": bool(
+                str(config.get("webhook_endpoint_id") or "").strip()
+                and str(config.get("webhook_endpoint_secret") or "").strip()
+            ),
+            "webhook_url": config.get("webhook_url"),
         }
     if provider_norm == "adyen":
         return {
@@ -297,6 +312,8 @@ def evaluate_psp_readiness(
         mode = str(summary.get("mode") or "").strip().lower() or "payment_intent"
         if mode not in {"payment_intent", "checkout_session"}:
             add_blocker("Stripe mode is invalid")
+        if env_value == "live" and not summary.get("webhook_ready"):
+            add_blocker("Stripe webhook endpoint is not configured")
         if error_text:
             lowered = error_text.lower()
             if "access to account" in lowered or (

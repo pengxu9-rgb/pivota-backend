@@ -1504,10 +1504,42 @@ async def connect_psp(
     environment = str(psp_data.get("environment") or "").strip().lower() or None
     provider_config: Dict[str, Any] = {}
 
+    existing_rows = await database.fetch_all(
+        """
+        SELECT psp_id, status, connected_at, provider_config, account_id, environment
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id
+          AND provider = :provider
+        ORDER BY
+            CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+            connected_at DESC NULLS LAST,
+            psp_id ASC
+        """,
+        {"merchant_id": merchant_id, "provider": provider},
+    )
+    canonical_existing = dict(existing_rows[0]) if existing_rows else None
+
+    existing_provider_config: Dict[str, Any] = {}
+    if canonical_existing:
+        raw_provider_config = canonical_existing.get("provider_config")
+        if isinstance(raw_provider_config, dict):
+            existing_provider_config = dict(raw_provider_config)
+        elif isinstance(raw_provider_config, str):
+            try:
+                parsed_provider_config = json.loads(raw_provider_config)
+                if isinstance(parsed_provider_config, dict):
+                    existing_provider_config = dict(parsed_provider_config)
+            except Exception:
+                existing_provider_config = {}
+
     if provider == "stripe":
         # Merchant-facing Stripe setup is always stored as PaymentIntent.
         # Stripe Checkout remains an internal/runtime override, not a merchant config choice.
         provider_config["mode"] = "payment_intent"
+        for key in ("webhook_endpoint_id", "webhook_endpoint_secret", "webhook_url"):
+            value = str(existing_provider_config.get(key) or "").strip()
+            if value:
+                provider_config[key] = value
     elif provider == "adyen":
         merchant_account = str(psp_data.get("merchant_account") or account_id or "").strip()
         client_key = str(psp_data.get("client_key") or "").strip()
@@ -1544,21 +1576,6 @@ async def connect_psp(
         validation_status="unknown",
         validation_error=None,
     )
-
-    existing_rows = await database.fetch_all(
-        """
-        SELECT psp_id, status, connected_at
-        FROM merchant_psps
-        WHERE merchant_id = :merchant_id
-          AND provider = :provider
-        ORDER BY
-            CASE WHEN status = 'active' THEN 0 ELSE 1 END,
-            connected_at DESC NULLS LAST,
-            psp_id ASC
-        """,
-        {"merchant_id": merchant_id, "provider": provider},
-    )
-    canonical_existing = dict(existing_rows[0]) if existing_rows else None
 
     # Save to database
     psp_id = (
@@ -1836,6 +1853,7 @@ async def get_order_detail(
         
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
+        order = dict(order)
 
         # Prefer refund_records sum for historical correctness; fall back to orders.total_refunded.
         try:

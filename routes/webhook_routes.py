@@ -340,13 +340,56 @@ def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
         return raw.lower()
 
 
+async def _stripe_webhook_secret_candidates(psp_id: Optional[str]) -> list[str]:
+    candidates: list[str] = []
+
+    if psp_id:
+        try:
+            from db.database import database
+
+            row = await database.fetch_one(
+                """
+                SELECT provider_config
+                FROM merchant_psps
+                WHERE psp_id = :psp_id AND provider = 'stripe'
+                LIMIT 1
+                """,
+                {"psp_id": psp_id},
+            )
+            if row:
+                raw_provider_config = row["provider_config"]
+                provider_config: Dict[str, Any] = {}
+                if isinstance(raw_provider_config, dict):
+                    provider_config = dict(raw_provider_config)
+                elif isinstance(raw_provider_config, str):
+                    try:
+                        parsed_provider_config = json.loads(raw_provider_config)
+                        if isinstance(parsed_provider_config, dict):
+                            provider_config = dict(parsed_provider_config)
+                    except Exception:
+                        provider_config = {}
+                merchant_secret = str(provider_config.get("webhook_endpoint_secret") or "").strip()
+                if merchant_secret:
+                    candidates.append(merchant_secret)
+        except Exception as exc:
+            logger.warning("Failed to load merchant Stripe webhook secret for psp_id=%s: %s", psp_id, exc)
+
+    global_secret = str(getattr(settings, "stripe_webhook_secret", "") or "").strip()
+    if global_secret and global_secret not in candidates:
+        candidates.append(global_secret)
+
+    return candidates
+
+
 # ============================================================================
 # Stripe Webhooks
 # ============================================================================
 
+@router.post("/stripe/{psp_id}")
 @router.post("/stripe")
 async def handle_stripe_webhook(
     request: Request,
+    psp_id: Optional[str] = None,
     stripe_signature: Optional[str] = Header(None)
 ):
     """
@@ -362,19 +405,27 @@ async def handle_stripe_webhook(
     try:
         payload = await request.body()
         event = None
-        
-        # 验证签名（如果配置了 webhook secret）
-        if hasattr(settings, 'stripe_webhook_secret') and settings.stripe_webhook_secret:
-            try:
-                event = stripe.Webhook.construct_event(
-                    payload, stripe_signature, settings.stripe_webhook_secret
+
+        secret_candidates = await _stripe_webhook_secret_candidates(psp_id)
+        if secret_candidates:
+            last_signature_error: Optional[Exception] = None
+            for webhook_secret in secret_candidates:
+                try:
+                    event = stripe.Webhook.construct_event(payload, stripe_signature, webhook_secret)
+                    break
+                except ValueError:
+                    logger.error("Invalid Stripe webhook payload")
+                    raise HTTPException(status_code=400, detail="Invalid payload")
+                except Exception as exc:
+                    last_signature_error = exc
+                    continue
+            if event is None:
+                logger.error(
+                    "Invalid Stripe webhook signature for psp_id=%s after trying %s candidate(s): %s",
+                    psp_id,
+                    len(secret_candidates),
+                    last_signature_error,
                 )
-            except ValueError:
-                logger.error("Invalid Stripe webhook payload")
-                raise HTTPException(status_code=400, detail="Invalid payload")
-            except Exception:
-                # Avoid referencing stripe.error.SignatureVerificationError directly
-                logger.error("Invalid Stripe webhook signature")
                 raise HTTPException(status_code=400, detail="Invalid signature")
         else:
             # 开发环境：不验证签名

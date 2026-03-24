@@ -65,14 +65,31 @@ def test_evaluate_psp_readiness_marks_live_valid_stripe_as_ready() -> None:
         "stripe",
         status="active",
         api_key="sk_live_123",
-        account_id="acct_123",
-        provider_config={"mode": "payment_intent"},
+        provider_config={
+            "mode": "payment_intent",
+            "webhook_endpoint_id": "we_123",
+            "webhook_endpoint_secret": "whsec_123",
+        },
         environment="live",
         validation_status="valid",
     )
 
     assert readiness["live_charge_ready"] is True
     assert readiness["readiness_blockers"] == []
+
+
+def test_evaluate_psp_readiness_blocks_live_stripe_without_webhook_endpoint() -> None:
+    readiness = evaluate_psp_readiness(
+        "stripe",
+        status="active",
+        api_key="sk_live_123",
+        provider_config={"mode": "payment_intent"},
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert readiness["live_charge_ready"] is False
+    assert "Stripe webhook endpoint is not configured" in readiness["readiness_blockers"]
 
 
 def test_evaluate_psp_readiness_blocks_missing_adyen_client_key() -> None:
@@ -89,3 +106,22 @@ def test_evaluate_psp_readiness_blocks_missing_adyen_client_key() -> None:
     assert readiness["live_charge_ready"] is False
     assert "Adyen client key is missing" in readiness["readiness_blockers"]
     assert "Processor validation has not been run" in readiness["readiness_blockers"]
+
+
+def test_build_provider_connect_record_preserves_stripe_webhook_fields() -> None:
+    record = build_provider_connect_record(
+        "stripe",
+        api_key="sk_live_123",
+        provider_config={
+            "mode": "payment_intent",
+            "webhook_endpoint_id": "we_123",
+            "webhook_endpoint_secret": "whsec_123",
+            "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_123",
+        },
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert record["provider_config"]["webhook_endpoint_id"] == "we_123"
+    assert record["provider_config"]["webhook_endpoint_secret"] == "whsec_123"
+    assert record["provider_summary"]["webhook_ready"] is True
