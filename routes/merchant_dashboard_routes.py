@@ -1,5 +1,6 @@
 """Merchant Dashboard API Routes"""
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -318,7 +319,7 @@ async def execute_merchant_order_backed_canary(
         ),
         source="merchant_order_backed_canary",
     )
-    return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    return jsonable_encoder(result)
 
 
 @router.get("/merchant/settings/preferences")
