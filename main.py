@@ -8,6 +8,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
@@ -38,6 +39,9 @@ from pathlib import Path
 INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
     os.getenv("ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES", "false").lower() == "true"
 )
+
+SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+SERVICE_NAME = (os.getenv("RAILWAY_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
 
 
 def _guard_single_order_routes_py() -> None:
@@ -348,7 +352,7 @@ app = FastAPI(
 
 
 @lru_cache(maxsize=1)
-def _runtime_build_payload() -> dict:
+def _service_version_payload() -> dict:
     commit_sha = (
         os.getenv("RAILWAY_GIT_COMMIT_SHA")
         or os.getenv("GIT_COMMIT_SHA")
@@ -377,18 +381,52 @@ def _runtime_build_payload() -> dict:
         except Exception:
             branch = None
 
+    commit_short = commit_sha[:12] if commit_sha else None
+    build_id = commit_short or f"started-{SERVICE_STARTED_AT}"
+
     return {
-        "service": "pivota-backend",
+        "service": SERVICE_NAME,
+        "commit": commit_short,
+        "full_sha": commit_sha,
+        "build_id": build_id,
+        "branch": branch,
+        "deployment_id": deployment_id,
+        "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
+        "started_at": SERVICE_STARTED_AT,
+    }
+
+
+@lru_cache(maxsize=1)
+def _runtime_build_payload() -> dict:
+    version = _service_version_payload()
+
+    return {
+        "service": version["service"],
+        "version": version,
+        "commit_sha": version["full_sha"],
+        "full_sha": version["full_sha"],
+        "build_id": version["build_id"],
+        "deployment_id": version["deployment_id"],
         "git": {
-            "commit_sha": commit_sha,
-            "branch": branch,
+            "commit_sha": version["full_sha"],
+            "branch": version["branch"],
         },
         "railway": {
-            "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
-            "deployment_id": deployment_id,
+            "environment": version["environment"],
+            "deployment_id": version["deployment_id"],
             "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
         },
     }
+
+
+def _service_version_headers() -> dict[str, str]:
+    version = _service_version_payload()
+    headers: dict[str, str] = {"X-Service-Build-Id": str(version["build_id"])}
+    if version["commit"]:
+        headers["X-Service-Commit"] = str(version["commit"])
+    if version["deployment_id"]:
+        headers["X-Service-Deployment-Id"] = str(version["deployment_id"])
+    return headers
 
 
 def _is_route_mounted(path: str, method: str) -> bool:
@@ -1540,6 +1578,7 @@ async def health_check():
 
     return JSONResponse(
         status_code=status_code,
+        headers=_service_version_headers(),
         content={
             "status": "ok" if healthy else "unhealthy",
             "timestamp": time.time(),
@@ -1547,6 +1586,7 @@ async def health_check():
             "db_ok": db_ok,
             "missing_columns": missing,
             "error": db_error,
+            "version": _service_version_payload(),
             "build": _runtime_build_payload(),
             "runtime_contracts": _runtime_contracts_payload(),
             "settings_contract": _settings_contract_payload(),
@@ -1559,10 +1599,14 @@ async def build_info():
     Deployment introspection (no secrets).
     Useful to confirm which git SHA / deployment is running in prod.
     """
-    return {
-        **_runtime_build_payload(),
-        "timestamp": time.time(),
-    }
+    return JSONResponse(
+        headers=_service_version_headers(),
+        content={
+            **_runtime_build_payload(),
+            "version": _service_version_payload(),
+            "timestamp": time.time(),
+        },
+    )
 
 # Catch-all OPTIONS to satisfy permissive CORS preflight checks (even when Access-Control-Request-Method is missing).
 @app.options("/{full_path:path}")

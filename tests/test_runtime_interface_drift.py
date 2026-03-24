@@ -48,15 +48,52 @@ def test_backend_health_surfaces_runtime_drift_contract() -> None:
     body = resp.json()
     runtime_contracts = body["runtime_contracts"]
     build = body["build"]
+    version = body["version"]
     settings_contract = body["settings_contract"]
 
     assert runtime_contracts["agent_governance"]["compat_mode"] == "keyword_fail_closed"
     assert runtime_contracts["agent_governance"]["record_response_present"] is True
     assert all(item["mounted"] for item in runtime_contracts["canonical_mutating_routes"].values())
     assert build["service"] == "pivota-backend"
-    assert {"git", "railway"} <= set(build.keys())
+    assert {"git", "railway", "version"} <= set(build.keys())
+    assert version["service"] == "pivota-backend"
+    assert build["version"] == version
+    assert isinstance(version["build_id"], str) and version["build_id"]
+    assert isinstance(version["started_at"], str) and version["started_at"]
+    if version["commit"] is not None:
+        assert resp.headers["x-service-commit"] == version["commit"]
+    assert resp.headers["x-service-build-id"] == version["build_id"]
+    if version["deployment_id"] is not None:
+        assert resp.headers["x-service-deployment-id"] == version["deployment_id"]
     assert settings_contract["rate_limit_rpm_present"] is True
     assert settings_contract["rate_limit_rpm_source"] == "settings"
+
+
+def test_backend_build_endpoint_exposes_stable_version_surface() -> None:
+    with TestClient(app) as client:
+        resp = client.get("/__build")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    version = body["version"]
+
+    assert body["service"] == "pivota-backend"
+    assert isinstance(body["timestamp"], float)
+    assert version["service"] == "pivota-backend"
+    assert isinstance(version["build_id"], str) and version["build_id"]
+    assert isinstance(version["started_at"], str) and version["started_at"]
+    assert body["build_id"] == version["build_id"]
+    assert body["deployment_id"] == version["deployment_id"]
+    assert body["commit_sha"] == version["full_sha"]
+    assert body["full_sha"] == version["full_sha"]
+    assert body["git"]["commit_sha"] == version["full_sha"]
+    assert body["git"]["branch"] == version["branch"]
+    assert body["railway"]["deployment_id"] == version["deployment_id"]
+    assert resp.headers["x-service-build-id"] == version["build_id"]
+    if version["commit"] is not None:
+        assert resp.headers["x-service-commit"] == version["commit"]
+    if version["deployment_id"] is not None:
+        assert resp.headers["x-service-deployment-id"] == version["deployment_id"]
 
 
 class _TestAgentContext:
