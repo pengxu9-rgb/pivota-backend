@@ -21,6 +21,35 @@ from services.merchant_psp_config_service import (
 )
 
 
+def _normalize_preferred_psps(preferred_psps: Optional[List[str]]) -> List[str]:
+    normalized: List[str] = []
+    for item in preferred_psps or []:
+        provider = str(item or "").strip().lower()
+        if provider and provider not in normalized:
+            normalized.append(provider)
+    return normalized
+
+
+def _apply_candidate_preference(
+    candidates: List[Dict[str, Any]],
+    preferred_psps: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    preferred_order = _normalize_preferred_psps(preferred_psps)
+    if not preferred_order:
+        return list(candidates or [])
+
+    order_map = {provider: index for index, provider in enumerate(preferred_order)}
+    filtered_candidates = [
+        candidate
+        for candidate in (candidates or [])
+        if str(candidate.get("provider") or "").strip().lower() in order_map
+    ]
+    return sorted(
+        filtered_candidates,
+        key=lambda candidate: order_map.get(str(candidate.get("provider") or "").strip().lower(), 999),
+    )
+
+
 def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
     def _encode_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -173,9 +202,10 @@ async def initiate_merchant_payment(
     )
 
     if candidates:
+        ordered_candidates = _apply_candidate_preference(candidates, preferred_psps)
         last_error = "No supported PSP candidates"
         last_psp = "unknown"
-        for candidate in candidates:
+        for candidate in ordered_candidates:
             provider = str(candidate.get("provider") or "").strip().lower()
             api_key = str(candidate.get("api_key") or "").strip()
             if not provider or not api_key:
