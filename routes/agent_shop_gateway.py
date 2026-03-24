@@ -26,7 +26,7 @@ import mimetypes
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -596,6 +596,114 @@ def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
     if token in {"£", "gbp", "pound", "pounds"}:
         return "GBP"
     return None
+
+
+_BUDGET_FX_CACHE_TTL_SECONDS = 900.0
+_BUDGET_FX_RATE_CACHE: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str], float]] = {}
+
+
+def _parse_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
+    if isinstance(raw_rates, dict):
+        return raw_rates
+    if isinstance(raw_rates, str):
+        try:
+            parsed = json.loads(raw_rates)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def _lookup_budget_fx_rate(
+    from_currency: Optional[str],
+    to_currency: Optional[str],
+) -> Tuple[Optional[float], Optional[str]]:
+    source_currency = str(from_currency or "").strip().upper()
+    target_currency = str(to_currency or "").strip().upper()
+    if not source_currency or not target_currency:
+        return None, None
+    if source_currency == target_currency:
+        return 1.0, "same_currency"
+
+    cache_key = (source_currency, target_currency)
+    cached = _BUDGET_FX_RATE_CACHE.get(cache_key)
+    now = time.time()
+    if cached and (now - cached[2]) < _BUDGET_FX_CACHE_TTL_SECONDS:
+        return cached[0], cached[1]
+
+    async def _fetch_snapshot(base_currency: str) -> Optional[Dict[str, Any]]:
+        return await database.fetch_one(
+            """
+            SELECT rates, base_currency
+            FROM x402_exchange_rates
+            WHERE base_currency = :base_currency
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            {"base_currency": base_currency},
+        )
+
+    direct_snapshot = await _fetch_snapshot(source_currency)
+    direct_rates = _parse_fx_rates_payload((direct_snapshot or {}).get("rates"))
+    direct_value = direct_rates.get(target_currency)
+    try:
+        if direct_value is not None and float(direct_value) > 0:
+            rate = float(direct_value)
+            _BUDGET_FX_RATE_CACHE[cache_key] = (rate, "x402_snapshot_direct", now)
+            return rate, "x402_snapshot_direct"
+    except Exception:
+        pass
+
+    reverse_snapshot = await _fetch_snapshot(target_currency)
+    reverse_rates = _parse_fx_rates_payload((reverse_snapshot or {}).get("rates"))
+    reverse_value = reverse_rates.get(source_currency)
+    try:
+        if reverse_value is not None and float(reverse_value) > 0:
+            rate = 1.0 / float(reverse_value)
+            _BUDGET_FX_RATE_CACHE[cache_key] = (rate, "x402_snapshot_reverse", now)
+            return rate, "x402_snapshot_reverse"
+    except Exception:
+        pass
+
+    _BUDGET_FX_RATE_CACHE[cache_key] = (None, None, now)
+    return None, None
+
+
+async def _budget_allows_price(
+    *,
+    price_amount: Any,
+    price_currency: Optional[str],
+    budget_currency: Optional[str],
+    price_min: Optional[float],
+    price_max: Optional[float],
+) -> Tuple[bool, Dict[str, Any]]:
+    diagnostics: Dict[str, Any] = {}
+    amount = _coerce_float(price_amount)
+    currency = str(price_currency or "").strip().upper() or None
+
+    comparable_amount = amount
+    comparable_currency = currency
+    if budget_currency and comparable_currency and comparable_currency != budget_currency:
+        fx_rate, fx_source = await _lookup_budget_fx_rate(comparable_currency, budget_currency)
+        if fx_rate is None or comparable_amount is None:
+            diagnostics["budget_fx_unresolved"] = True
+            diagnostics["budget_candidate_currency"] = comparable_currency
+            diagnostics["budget_currency"] = budget_currency
+            return False, diagnostics
+        comparable_amount = comparable_amount * fx_rate
+        comparable_currency = budget_currency
+        diagnostics["budget_fx_applied"] = True
+        diagnostics["budget_fx_rate"] = fx_rate
+        diagnostics["budget_fx_source"] = fx_source
+        diagnostics["budget_candidate_currency"] = currency
+        diagnostics["budget_comparison_currency"] = budget_currency
+
+    if price_min is not None and comparable_amount is not None and comparable_amount < price_min:
+        return False, diagnostics
+    if price_max is not None and comparable_amount is not None and comparable_amount > price_max:
+        return False, diagnostics
+    return True, diagnostics
 
 
 def _normalized_intent_term_match(text: Optional[str], term: Optional[str]) -> bool:
@@ -6333,6 +6441,11 @@ async def _handle_find_products_multi(
 
     external_seed_wrappers: list[dict[str, Any]] = []
     strict_external_output_by_product_id: Dict[str, Dict[str, Any]] = {}
+    budget_fx_applied = False
+    budget_fx_rate: Optional[float] = None
+    budget_fx_source: Optional[str] = None
+    budget_fx_unresolved = False
+    budget_fx_candidate_currency: Optional[str] = None
     try:
         external_seed_stopwords = {
             "a",
@@ -6480,12 +6593,27 @@ async def _handle_find_products_multi(
                 or seed_data.get("price_currency")
                 or "USD"
             ).upper()
-            if budget_currency and price_currency != budget_currency:
+            budget_allowed, budget_diagnostics = await _budget_allows_price(
+                price_amount=price_amount,
+                price_currency=price_currency,
+                budget_currency=budget_currency,
+                price_min=effective_price_min,
+                price_max=effective_price_max,
+            )
+            if not budget_allowed:
+                if budget_diagnostics.get("budget_fx_unresolved"):
+                    budget_fx_unresolved = True
+                    budget_fx_candidate_currency = str(
+                        budget_diagnostics.get("budget_candidate_currency") or budget_fx_candidate_currency or ""
+                    ).upper() or budget_fx_candidate_currency
                 continue
-            if effective_price_min is not None and price_amount is not None and price_amount < effective_price_min:
-                continue
-            if effective_price_max is not None and price_amount is not None and price_amount > effective_price_max:
-                continue
+            if budget_diagnostics.get("budget_fx_applied"):
+                budget_fx_applied = True
+                budget_fx_rate = _coerce_float(budget_diagnostics.get("budget_fx_rate"))
+                budget_fx_source = str(budget_diagnostics.get("budget_fx_source") or "").strip() or budget_fx_source
+                budget_fx_candidate_currency = str(
+                    budget_diagnostics.get("budget_candidate_currency") or budget_fx_candidate_currency or ""
+                ).upper() or budget_fx_candidate_currency
 
             availability = row_dict.get("availability") or seed_data.get("availability") or "unknown"
             if filters.in_stock_only and isinstance(availability, str):
@@ -6576,6 +6704,14 @@ async def _handle_find_products_multi(
         logger.info("multi.external_seeds.prefetch.failed", extra={"error": str(e)})
 
     if not has_merchants and not external_seed_wrappers:
+        early_strict_constraint_reason = _resolve_strict_constraint_reason(
+            strict_serving_mode=strict_serving_mode,
+            ingredient_labels=active_ingredient_labels,
+            visible_option_labels=active_visible_option_labels,
+            visible_attribute_labels=active_visible_attribute_labels,
+            price_min=effective_price_min,
+            price_max=effective_price_max,
+        )
         return _maybe_attach_eval_debug(
             {
                 "products": [],
@@ -6584,8 +6720,52 @@ async def _handle_find_products_multi(
                 "page_size": 0,
                 "metadata": {
                     "query_source": "cache_multi",
+                    "query_semantic_class": query_semantic_class,
+                    "visible_category_intents": active_visible_category_labels,
+                    "visible_attribute_intents": active_visible_attribute_labels,
+                    "visible_option_intents": active_visible_option_labels,
+                    "ingredient_intents": active_ingredient_labels,
+                    "matched_visible_categories": [],
+                    "matched_visible_attribute_labels": [],
+                    "matched_visible_option_labels": [],
+                    "matched_ingredient_ids": [],
+                    "matched_ingredient_labels": [],
+                    "matched_visible_attributes": {},
+                    "budget_price_min": effective_price_min,
+                    "budget_price_max": effective_price_max,
+                    "budget_currency": budget_currency,
+                    "budget_fx_applied": budget_fx_applied,
+                    "budget_fx_rate": budget_fx_rate,
+                    "budget_fx_source": budget_fx_source,
+                    "budget_fx_candidate_currency": budget_fx_candidate_currency,
+                    "budget_fx_unresolved": budget_fx_unresolved,
                     "fetched_at": datetime.utcnow().isoformat(),
                     "merchants_searched": 0,
+                    **(
+                        {
+                            "source_breakdown": {
+                                "internal_count": 0,
+                                "external_seed_count": 0,
+                                "strategy_applied": (
+                                    "strict_ingredient_mixed_parity"
+                                    if active_ingredient_intents and commerce_surface == "agent_api"
+                                    else "strict_serving_mode"
+                                ),
+                            }
+                        }
+                        if strict_serving_mode
+                        else {}
+                    ),
+                    **(
+                        {
+                            "commerce_surface": commerce_surface,
+                            "serving_mode": "eligible_only",
+                            "strict_constraint_query": bool(early_strict_constraint_reason),
+                            "strict_constraint_reason": early_strict_constraint_reason,
+                        }
+                        if strict_serving_mode
+                        else {}
+                    ),
                 },
             },
             rewritten_query=q_ascii,
@@ -7192,12 +7372,27 @@ async def _handle_find_products_multi(
 
         # Price filter
         product_currency = str(product.currency or "").strip().upper()
-        if budget_currency and product_currency and product_currency != budget_currency:
+        budget_allowed, budget_diagnostics = await _budget_allows_price(
+            price_amount=product.price,
+            price_currency=product_currency,
+            budget_currency=budget_currency,
+            price_min=effective_price_min,
+            price_max=effective_price_max,
+        )
+        if not budget_allowed:
+            if budget_diagnostics.get("budget_fx_unresolved"):
+                budget_fx_unresolved = True
+                budget_fx_candidate_currency = str(
+                    budget_diagnostics.get("budget_candidate_currency") or budget_fx_candidate_currency or ""
+                ).upper() or budget_fx_candidate_currency
             continue
-        if effective_price_min is not None and product.price < effective_price_min:
-            continue
-        if effective_price_max is not None and product.price > effective_price_max:
-            continue
+        if budget_diagnostics.get("budget_fx_applied"):
+            budget_fx_applied = True
+            budget_fx_rate = _coerce_float(budget_diagnostics.get("budget_fx_rate"))
+            budget_fx_source = str(budget_diagnostics.get("budget_fx_source") or "").strip() or budget_fx_source
+            budget_fx_candidate_currency = str(
+                budget_diagnostics.get("budget_candidate_currency") or budget_fx_candidate_currency or ""
+            ).upper() or budget_fx_candidate_currency
 
         # Category filter
         if filters.category:
@@ -8104,6 +8299,11 @@ async def _handle_find_products_multi(
                 "budget_price_min": effective_price_min,
                 "budget_price_max": effective_price_max,
                 "budget_currency": budget_currency,
+                "budget_fx_applied": budget_fx_applied,
+                "budget_fx_rate": budget_fx_rate,
+                "budget_fx_source": budget_fx_source,
+                "budget_fx_candidate_currency": budget_fx_candidate_currency,
+                "budget_fx_unresolved": budget_fx_unresolved,
                 "semantic_retry_applied": semantic_retry_applied,
                 "semantic_retry_query": semantic_retry_query,
                 "semantic_retry_hits": semantic_retry_hits,
