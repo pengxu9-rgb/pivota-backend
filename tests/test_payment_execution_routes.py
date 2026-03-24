@@ -606,6 +606,8 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
     assert created_orders[0]["merchant_id"] == "merch_test_payment"
     assert created_orders[0]["psp_id"] == "psp_stripe_live"
     assert created_orders[0]["metadata"]["requested_order_id"] == "requested_canary_ref"
+    assert created_orders[0]["items"][0]["unit_price"] == "1.00"
+    assert created_orders[0]["items"][0]["subtotal"] == "1.00"
     assert payment_updates == [
         {
             "order_id": "ORD_CANARY_LIVE_1",

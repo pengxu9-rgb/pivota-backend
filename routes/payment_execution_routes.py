@@ -327,8 +327,8 @@ def _build_canary_order_items(provider: str, amount_major: Decimal) -> List[Dict
             "variant_title": None,
             "sku": f"OPS-{provider_label.upper()}-CANARY",
             "quantity": 1,
-            "unit_price": unit_price,
-            "subtotal": unit_price,
+            "unit_price": str(unit_price),
+            "subtotal": str(unit_price),
         }
     ]
 
