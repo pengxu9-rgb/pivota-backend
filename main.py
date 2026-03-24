@@ -41,7 +41,7 @@ INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
 )
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-SERVICE_NAME = (os.getenv("RAILWAY_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
+SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
 
 
 def _guard_single_order_routes_py() -> None:
@@ -415,6 +415,7 @@ def _runtime_build_payload() -> dict:
             "environment": version["environment"],
             "deployment_id": version["deployment_id"],
             "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
+            "service_name": os.getenv("RAILWAY_SERVICE_NAME") or None,
         },
     }
 
