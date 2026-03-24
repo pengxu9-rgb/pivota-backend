@@ -153,3 +153,31 @@ async def test_hydrate_product_payloads_from_attached_seed_runtime_evidence(
     )
 
     assert hydrated[0]["platform_metadata"]["reviewed_ingredient_ids"] == ["Niacinamide"]
+
+
+def test_build_attached_seed_runtime_evidence_matches_www_and_non_www_source_refs() -> None:
+    evidence_by_key = build_attached_seed_runtime_evidence_by_product_key(
+        seed_rows=[
+            {
+                "attached_product_key": "merch_1|shopify|prod_1",
+                "canonical_url": "https://pixibeauty.com/products/vitamin-c-serum",
+                "destination_url": "https://pixibeauty.com/products/vitamin-c-serum",
+                "attached_variant_id": "∅",
+                "seed_data": {
+                    "snapshot": {
+                        "canonical_url": "https://pixibeauty.com/products/vitamin-c-serum",
+                        "variants": [],
+                    }
+                },
+            }
+        ],
+        kb_rows=[
+            {
+                "sku_key": "opaque_1",
+                "source_ref": "https://www.pixibeauty.com/products/vitamin-c-serum",
+                "inci_list_json": ["Ascorbic Acid"],
+            }
+        ],
+    )
+
+    assert evidence_by_key["merch_1|shopify|prod_1"]["reviewed_ingredient_ids"] == ["Ascorbic Acid"]

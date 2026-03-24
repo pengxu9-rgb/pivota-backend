@@ -39,28 +39,37 @@ def _normalize_source_ref_aliases(value: Any) -> List[str]:
         if alias and alias not in aliases:
             aliases.append(alias)
 
-    base_alias = f"{host}{path}"
-    add(base_alias)
+    host_aliases = [host]
+    if host.startswith("www."):
+        host_aliases.append(host[len("www."):])
+    else:
+        host_aliases.append(f"www.{host}")
+    for host_alias in host_aliases:
+        base_alias = f"{host_alias}{path}"
+        add(base_alias)
 
     query = parse_qs(parsed.query, keep_blank_values=False)
     variant_id = normalize_non_empty_string((query.get("variant") or [""])[0])
     if variant_id:
-        add(f"{base_alias}?variant={variant_id}")
+        for host_alias in host_aliases:
+            add(f"{host_alias}{path}?variant={variant_id}")
 
     if parsed.query:
-        add(f"{base_alias}?{parsed.query}")
+        for host_alias in host_aliases:
+            add(f"{host_alias}{path}?{parsed.query}")
 
-    cleaned_url = urlunparse(
-        (
-            parsed.scheme.lower() or "https",
-            host,
-            path,
-            "",
-            parsed.query,
-            "",
+    for host_alias in host_aliases:
+        cleaned_url = urlunparse(
+            (
+                parsed.scheme.lower() or "https",
+                host_alias,
+                path,
+                "",
+                parsed.query,
+                "",
+            )
         )
-    )
-    add(cleaned_url)
+        add(cleaned_url)
     return aliases
 
 
