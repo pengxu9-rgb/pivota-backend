@@ -42,6 +42,7 @@ async def _ensure_checkout_intents_table() -> None:
     if not IS_POSTGRES:
         return
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS agent_user_ref TEXT")
+    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS order_id TEXT")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS requested_scopes JSONB")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS linked_buyer_id TEXT")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ")
@@ -49,6 +50,7 @@ async def _ensure_checkout_intents_table() -> None:
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS prefill_read_count INTEGER NOT NULL DEFAULT 0")
     await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS prefill_last_read_at TIMESTAMPTZ")
     await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_agent_buyer ON checkout_intents(agent_id, buyer_ref)")
+    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_order_id ON checkout_intents(order_id)")
     await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_at ON checkout_intents(expires_at)")
     await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_used ON checkout_intents(expires_at, used_at)")
 
@@ -420,6 +422,7 @@ class CheckoutIntentItem(BaseModel):
 class CreateCheckoutIntentRequest(BaseModel):
     items: List[CheckoutIntentItem]
     return_url: Optional[str] = None
+    order_id: Optional[str] = None
     buyer_ref: Optional[str] = None
     agent_user_ref: Optional[str] = None
     brief_id: Optional[str] = None
@@ -522,6 +525,7 @@ async def create_checkout_intent(
             checkout_intents.insert().values(
                 intent_id=intent_id,
                 agent_id=context.agent_id,
+                order_id=(str(req.order_id or "").strip() or None),
                 buyer_ref=buyer_ref,
                 agent_user_ref=agent_user_ref,
                 expires_at=expires_at_dt,
@@ -543,6 +547,7 @@ async def create_checkout_intent(
                 checkout_intents.insert().values(
                     intent_id=intent_id,
                     agent_id=context.agent_id,
+                    order_id=(str(req.order_id or "").strip() or None),
                     buyer_ref=buyer_ref,
                     agent_user_ref=agent_user_ref,
                     expires_at=expires_at_dt,
@@ -582,9 +587,12 @@ async def create_checkout_intent(
     checkout_url = f"{checkout_ui}/order?{urlencode(query)}"
 
     return {
+        "intent_id": intent_id,
+        "checkout_session_id": intent_id,
         "checkout_token": token,
         "checkout_url": checkout_url,
         "expires_at": expires_at_sec,
+        **({"order_id": req.order_id} if req.order_id else {}),
         **({"brief_id": brief_id} if brief_id else {}),
         **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
     }

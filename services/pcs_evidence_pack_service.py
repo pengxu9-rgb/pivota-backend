@@ -732,10 +732,11 @@ def _flatten_dispute_collection_task_rows(
     task_status: Optional[str] = None,
     assignee: Optional[str] = None,
     blocking_only: bool = False,
+    now: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     task_status_norm = str(task_status or "").strip().lower() or None
     assignee_norm = str(assignee or "").strip() or None
-    now = datetime.now(timezone.utc)
+    reference_now = now if now is not None else datetime.now(timezone.utc)
     items: List[Dict[str, Any]] = []
     for row in rows:
         manifest = _coerce_json_object(row.get("manifest_json"))
@@ -749,7 +750,7 @@ def _flatten_dispute_collection_task_rows(
             task = _coerce_json_object(raw_task)
             if not task:
                 continue
-            decorated_task = _decorate_collection_task(task, now=now)
+            decorated_task = _decorate_collection_task(task, now=reference_now)
             status_norm = str(decorated_task.get("status") or "pending").strip().lower() or "pending"
             assigned_to = str(decorated_task.get("assigned_to") or "").strip() or None
             if task_status_norm and status_norm != task_status_norm:
@@ -1161,6 +1162,7 @@ async def list_dispute_collection_tasks(
     blocking_only: bool = False,
     limit: int = 50,
     offset: int = 0,
+    now: Optional[datetime] = None,
     db=None,
 ) -> Dict[str, Any]:
     """
@@ -1179,6 +1181,7 @@ async def list_dispute_collection_tasks(
         task_status=task_status,
         assignee=assignee,
         blocking_only=blocking_only,
+        now=now,
     )
 
     total = len(items)
@@ -1201,6 +1204,7 @@ async def list_dispute_collection_worklist(
     include_resolved: bool = False,
     limit: int = 50,
     offset: int = 0,
+    now: Optional[datetime] = None,
     db=None,
 ) -> Dict[str, Any]:
     task_status = None if include_resolved else None
@@ -1214,6 +1218,7 @@ async def list_dispute_collection_worklist(
         task_status=task_status,
         assignee=assignee,
         blocking_only=blocking_only,
+        now=now,
     )
     if not include_resolved:
         items = [
@@ -1243,6 +1248,7 @@ async def get_dispute_collection_dashboard(
     blocking_only: bool = False,
     include_resolved: bool = False,
     preview_limit: int = 5,
+    now: Optional[datetime] = None,
     db=None,
 ) -> Dict[str, Any]:
     rows = await _fetch_latest_dispute_pack_rows(
@@ -1254,6 +1260,7 @@ async def get_dispute_collection_dashboard(
         rows,
         assignee=assignee,
         blocking_only=blocking_only,
+        now=now,
     )
     if not include_resolved:
         items = [

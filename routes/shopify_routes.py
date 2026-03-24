@@ -172,8 +172,8 @@ def _verify_shopify_hmac(query_string: str) -> bool:
         return False
 
 
-@router.get("/oauth/start")
-async def oauth_start(merchant_id: str, shop: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+@router.get("/oauth/start-legacy")
+async def oauth_start_legacy(merchant_id: str, shop: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     # RBAC: allow merchant/employee/admin; if merchant, must match merchant_id
     if current_user["role"] not in ["merchant", "employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -198,8 +198,8 @@ async def oauth_start(merchant_id: str, shop: str, current_user: dict = Depends(
     return {"authorize": auth_url, "state": state}
 
 
-@router.get("/oauth/callback")
-async def oauth_callback(request: Request) -> Dict[str, Any]:
+@router.get("/oauth/callback-legacy")
+async def oauth_callback_legacy(request: Request) -> Dict[str, Any]:
     # Read query params
     shop = request.query_params.get("shop")
     code = request.query_params.get("code")

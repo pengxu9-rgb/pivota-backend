@@ -19,6 +19,7 @@ from db.database import database
 logger = logging.getLogger(__name__)
 
 _WEBHOOK_EVENTS_SCHEMA_READY = False
+_WEBHOOK_EVENTS_SCHEMA_CHECKED = False
 _WEBHOOK_EVENTS_SCHEMA_LOCK = asyncio.Lock()
 
 
@@ -48,93 +49,41 @@ class WebhookService:
     @staticmethod
     async def ensure_webhook_events_table() -> None:
         """
-        Best-effort: ensure `webhook_events` exists so PSP webhooks don't 500 due to missing migrations.
+        Best-effort: verify `webhook_events` migration exists without mutating schema at runtime.
 
-        This intentionally does not raise. If the runtime DB role cannot run DDL,
-        we continue without persistence/idempotency (order-level idempotency still applies).
+        This intentionally does not raise. If the table or expected columns are unavailable,
+        webhook processing continues without audit persistence/idempotency guarantees.
         """
         global _WEBHOOK_EVENTS_SCHEMA_READY
+        global _WEBHOOK_EVENTS_SCHEMA_CHECKED
         if _WEBHOOK_EVENTS_SCHEMA_READY:
+            return
+        if _WEBHOOK_EVENTS_SCHEMA_CHECKED:
             return
 
         async with _WEBHOOK_EVENTS_SCHEMA_LOCK:
             if _WEBHOOK_EVENTS_SCHEMA_READY:
                 return
+            if _WEBHOOK_EVENTS_SCHEMA_CHECKED:
+                return
             try:
-                create_sql = """
-                CREATE TABLE IF NOT EXISTS webhook_events (
-                    id SERIAL PRIMARY KEY,
-                    event_id VARCHAR(255) UNIQUE,
-                    event_type VARCHAR(100),
-                    psp_type VARCHAR(50),
-                    order_id VARCHAR(50),
-                    reference VARCHAR(255),
-                    payload JSONB,
-                    headers JSONB,
-                    status VARCHAR(50) DEFAULT 'pending',
-                    processed_at TIMESTAMP WITH TIME ZONE,
-                    error_message TEXT,
-                    signature_verified BOOLEAN DEFAULT FALSE,
-                    signature_header VARCHAR(500),
-                    retry_count INTEGER DEFAULT 0,
-                    last_retry_at TIMESTAMP WITH TIME ZONE,
-                    received_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                );
-                """
-                await database.execute(create_sql)
-
-                # Add missing columns to older schemas (safe no-ops when present).
-                alter_statements = [
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS event_id VARCHAR(255);",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS event_type VARCHAR(100);",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS psp_type VARCHAR(50);",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS order_id VARCHAR(50);",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS reference VARCHAR(255);",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS payload JSONB;",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS headers JSONB;",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending';",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP WITH TIME ZONE;",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS error_message TEXT;",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS signature_verified BOOLEAN DEFAULT FALSE;",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS signature_header VARCHAR(500);",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMP WITH TIME ZONE;",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS received_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();",
-                    "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();",
-                ]
-                for stmt in alter_statements:
-                    try:
-                        await database.execute(stmt)
-                    except Exception:
-                        # Ignore per-column failures (type conflicts on legacy tables, etc.)
-                        pass
-
-                # Indexes help idempotency checks; all are optional.
-                index_statements = [
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_events_event_id ON webhook_events(event_id);",
-                    "CREATE INDEX IF NOT EXISTS idx_webhook_events_order_id ON webhook_events(order_id);",
-                    "CREATE INDEX IF NOT EXISTS idx_webhook_events_status ON webhook_events(status);",
-                    "CREATE INDEX IF NOT EXISTS idx_webhook_events_psp_type ON webhook_events(psp_type);",
-                    "CREATE INDEX IF NOT EXISTS idx_webhook_events_event_type ON webhook_events(event_type);",
-                    "CREATE INDEX IF NOT EXISTS idx_webhook_events_received_at ON webhook_events(received_at DESC);",
-                ]
-                for stmt in index_statements:
-                    try:
-                        await database.execute(stmt)
-                    except Exception:
-                        pass
-
+                await database.fetch_one(
+                    """
+                    SELECT event_id, event_type, psp_type, order_id, status, signature_verified, received_at
+                    FROM webhook_events
+                    LIMIT 1
+                    """
+                )
                 _WEBHOOK_EVENTS_SCHEMA_READY = True
+                _WEBHOOK_EVENTS_SCHEMA_CHECKED = True
             except Exception as exc:
                 logger.warning(
-                    "Webhook events table not ready (continuing without persistence): %s",
+                    "Webhook events schema not ready (continuing without persistence): %s",
                     exc,
                     exc_info=True,
                 )
                 _WEBHOOK_EVENTS_SCHEMA_READY = False
+                _WEBHOOK_EVENTS_SCHEMA_CHECKED = True
 
     @staticmethod
     async def verify_checkout_signature(

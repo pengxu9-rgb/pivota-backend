@@ -69,9 +69,9 @@ class OrderStatusUpdate(BaseModel):
 
 # MCP API Endpoints
 
-@router.get("/merchants", response_model=Dict[str, MerchantInfo])
-async def get_merchants():
-    """Get all available merchants with their inventory"""
+@router.get("/inventory/merchants", response_model=Dict[str, MerchantInfo])
+async def get_inventory_merchants():
+    """Get the legacy inventory snapshot across all merchants"""
     try:
         merchants = get_all_merchants()
         result = {}
@@ -276,4 +276,3 @@ async def health_check():
         "merchants_count": len(get_all_merchants()),
         "orders_count": len(get_orders_by_agent("dummy"))  # This will be 0, just for count
     }
-

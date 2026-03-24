@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from db.database import database
 from routes.agent_auth import AgentContext, get_agent_context
+from routes.agent_docs import build_agent_openapi_schema
 from utils.logger import logger
 import secrets
 import json
@@ -726,7 +727,6 @@ async def list_merchants(
 # PRODUCTS SEARCH
 # ============================================================================
 
-@router.get("/products/search")
 async def search_products(
     req: Request,
     background_tasks: BackgroundTasks,
@@ -1134,7 +1134,6 @@ async def search_products(
     return result
 
 
-@router.get("/beauty/products/search")
 async def search_products_beauty(
     req: Request,
     background_tasks: BackgroundTasks,
@@ -1263,118 +1262,6 @@ async def list_orders(
 # ============================================================================
 
 @router.get("/openapi.json")
-async def get_openapi_spec():
-    """Return OpenAPI specification for SDK generation"""
-    return {
-        "openapi": "3.0.0",
-        "info": {
-            "title": "Pivota Agent API",
-            "version": "1.0.0",
-            "description": "Production-ready API for agent integrations"
-        },
-        "servers": [
-            {"url": "https://api.pivota.com/agent/v1"}
-        ],
-        "security": [
-            {"ApiKeyAuth": []}
-        ],
-        "components": {
-            "securitySchemes": {
-                "ApiKeyAuth": {
-                    "type": "apiKey",
-                    "in": "header",
-                    "name": "X-API-Key"
-                }
-            }
-        },
-        "paths": {
-            "/health": {
-                "get": {
-                    "summary": "Health Check",
-                    "responses": {
-                        "200": {"description": "API is healthy"}
-                    }
-                }
-            },
-            "/auth": {
-                "post": {
-                    "summary": "Generate API Key",
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["agent_name", "agent_email"],
-                                    "properties": {
-                                        "agent_name": {"type": "string"},
-                                        "agent_email": {"type": "string"},
-                                        "company": {"type": "string"},
-                                        "description": {"type": "string"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {"description": "API key generated"}
-                    }
-                }
-            },
-            "/merchants": {
-                "get": {
-                    "summary": "List Merchants",
-                    "parameters": [
-                        {"name": "status", "in": "query", "schema": {"type": "string"}},
-                        {"name": "limit", "in": "query", "schema": {"type": "integer"}},
-                        {"name": "offset", "in": "query", "schema": {"type": "integer"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "List of merchants"}
-                    }
-                }
-            },
-            "/products/search": {
-                "get": {
-                    "summary": "Search Products",
-                    "parameters": [
-                        {"name": "merchant_id", "in": "query", "schema": {"type": "string"}},
-                        {"name": "query", "in": "query", "schema": {"type": "string"}},
-                        {"name": "category", "in": "query", "schema": {"type": "string"}},
-                        {"name": "min_price", "in": "query", "schema": {"type": "number"}},
-                        {"name": "max_price", "in": "query", "schema": {"type": "number"}},
-                        {"name": "limit", "in": "query", "schema": {"type": "integer"}},
-                        {"name": "offset", "in": "query", "schema": {"type": "integer"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Search results"}
-                    }
-                }
-            },
-            "/payments": {
-                "post": {
-                    "summary": "Create Payment",
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["order_id", "payment_method"],
-                                    "properties": {
-                                        "order_id": {"type": "string"},
-                                        "payment_method": {"type": "object"},
-                                        "return_url": {"type": "string"},
-                                        "idempotency_key": {"type": "string"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {"description": "Payment created"}
-                    }
-                }
-            }
-        }
-    }
+async def get_openapi_spec(request: Request):
+    """Return runtime-derived agent OpenAPI specification for SDK generation"""
+    return build_agent_openapi_schema(request.app, base_url=str(request.base_url))
