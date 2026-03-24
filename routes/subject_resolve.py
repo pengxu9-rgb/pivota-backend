@@ -6,6 +6,7 @@ import math
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from collections import deque
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,20 +26,18 @@ except Exception:  # pragma: no cover
     Gauge = None  # type: ignore
 
 
-router = APIRouter(tags=["subject-resolve"])
+@asynccontextmanager
+async def _subject_resolve_lifespan(_app: Any):
+    if _SUBJECT_RESOLVE_UPSTREAM_WARMUP_ENABLED:
+        # Keep startup non-blocking for deploy health checks.
+        asyncio.create_task(_warm_subject_resolve_upstream_http_client())
+    try:
+        yield
+    finally:
+        await _close_subject_resolve_upstream_http_client()
 
 
-@router.on_event("startup")
-async def _subject_resolve_startup() -> None:
-    if not _SUBJECT_RESOLVE_UPSTREAM_WARMUP_ENABLED:
-        return
-    # Keep startup non-blocking for deploy health checks.
-    asyncio.create_task(_warm_subject_resolve_upstream_http_client())
-
-
-@router.on_event("shutdown")
-async def _subject_resolve_shutdown() -> None:
-    await _close_subject_resolve_upstream_http_client()
+router = APIRouter(tags=["subject-resolve"], lifespan=_subject_resolve_lifespan)
 
 _REASON_MAPPED_HIT = "mapped_hit"
 _REASON_NO_CANDIDATES = "no_candidates"
