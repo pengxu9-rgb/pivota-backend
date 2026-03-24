@@ -8,6 +8,7 @@ from db.database import database
 from db.orders import get_order, mark_order_shipped
 from db.products import log_order_event
 from services.refund_service import refund_service
+from services.merchant_webhook_service import emit_merchant_webhook_event
 from pydantic import BaseModel
 from utils.logger import logger
 from config.feature_flags import is_feature_enabled
@@ -72,6 +73,44 @@ class ReadinessActionRunRequest(BaseModel):
     execution_mode: str = "sync"
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+
+async def _emit_merchant_refund_webhook_best_effort(
+    *,
+    merchant_id: str,
+    order_id: str,
+    amount: float,
+    refund_id: Optional[str],
+    order: Optional[Dict[str, Any]] = None,
+) -> None:
+    resolved_order = order or await get_order(order_id) or {}
+    currency = str(resolved_order.get("currency") or "USD")
+    payment_status = str(
+        resolved_order.get("payment_status")
+        or resolved_order.get("status")
+        or "refund_processed"
+    )
+
+    try:
+        await emit_merchant_webhook_event(
+            str(merchant_id),
+            event_type="refund.processed",
+            payload={
+                "order_id": str(order_id),
+                "merchant_id": str(merchant_id),
+                "refund_id": str(refund_id or ""),
+                "amount": float(amount),
+                "currency": currency,
+                "is_partial": payment_status == "partially_refunded",
+                "status": payment_status,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to emit merchant refund.processed webhook for %s: %s",
+            merchant_id,
+            exc,
+        )
 
 
 async def _ensure_refund_tables_best_effort() -> None:
@@ -2082,6 +2121,20 @@ async def merchant_refund_order(
             except Exception:
                 pass
 
+            latest_order = None
+            try:
+                latest_order = await get_order(order_id)
+            except Exception:
+                latest_order = None
+
+            await _emit_merchant_refund_webhook_best_effort(
+                merchant_id=str(merchant_id),
+                order_id=str(order_id),
+                amount=float(refund_request.amount),
+                refund_id=result.get("refund_id"),
+                order=latest_order,
+            )
+
             return {
                 "status": "success",
                 "message": "Refund processed successfully",
@@ -2117,6 +2170,19 @@ async def merchant_refund_order(
                     detail=f"Refund already processed (refund_id: {result.get('refund_id')})",
                 )
             if isinstance(result, dict) and result.get("status") == "success":
+                latest_order = None
+                try:
+                    latest_order = await get_order(order_id)
+                except Exception:
+                    latest_order = None
+
+                await _emit_merchant_refund_webhook_best_effort(
+                    merchant_id=str(merchant_id),
+                    order_id=str(order_id),
+                    amount=float(refund_request.amount),
+                    refund_id=result.get("refund_id"),
+                    order=latest_order,
+                )
                 return {
                     "status": "success",
                     "message": "Refund processed successfully",
@@ -2511,6 +2577,17 @@ async def merchant_approve_after_sales_case_and_refund(
         pass
 
     reloaded = await database.fetch_one("SELECT * FROM after_sales_cases WHERE case_id = :case_id", {"case_id": cid})
+    try:
+        await _emit_merchant_refund_webhook_best_effort(
+            merchant_id=str(merchant_id),
+            order_id=str(order_id),
+            amount=float(amount),
+            refund_id=refund_result.get("refund_id") if isinstance(refund_result, dict) else None,
+            order=order,
+        )
+    except Exception:
+        pass
+
     # Best-effort: reflect refund in Shopify as a "manual" refund record (accounting/inventory sync).
     try:
         shopify_order_id = str((order or {}).get("shopify_order_id") or "").strip()

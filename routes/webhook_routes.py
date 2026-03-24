@@ -25,6 +25,7 @@ from utils.logger import logger
 from services.dispute_records_service import stripe_dispute_pack_status
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
+from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.psp_payment_finalizer import (
     finalize_payment_failure,
     finalize_payment_success,
@@ -381,6 +382,60 @@ async def _stripe_webhook_secret_candidates(psp_id: Optional[str]) -> list[str]:
     return candidates
 
 
+async def _emit_stripe_merchant_webhook_best_effort(
+    order: Dict[str, Any],
+    *,
+    event_type: str,
+    payment_intent_id: Optional[str] = None,
+    amount_minor: Any = None,
+    currency: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    merchant_id = str((order or {}).get("merchant_id") or "").strip()
+    order_id = str((order or {}).get("order_id") or "").strip()
+    if not merchant_id or not order_id:
+        return
+
+    resolved_currency = currency or str(order.get("currency") or "")
+    amount = None
+    if amount_minor is not None:
+        try:
+            amount = float(
+                Decimal(str(amount_minor))
+                / _stripe_minor_unit_factor(resolved_currency)
+            )
+        except Exception:
+            amount = None
+
+    payload = {
+        "order_id": order_id,
+        "merchant_id": merchant_id,
+        "payment_id": payment_intent_id,
+        "transaction_id": payment_intent_id,
+        "amount": amount,
+        "currency": resolved_currency,
+        "psp_used": "stripe",
+        "status": "paid" if event_type == "payment.completed" else "payment_failed",
+        "customer_email": order.get("customer_email"),
+    }
+    if error_message:
+        payload["error_message"] = error_message
+
+    try:
+        await emit_merchant_webhook_event(
+            merchant_id,
+            event_type=event_type,
+            payload=payload,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to emit merchant Stripe webhook %s for %s: %s",
+            event_type,
+            merchant_id,
+            exc,
+        )
+
+
 # ============================================================================
 # Stripe Webhooks
 # ============================================================================
@@ -456,6 +511,13 @@ async def handle_stripe_webhook(
                 )
                 if finalization.get("applied"):
                     logger.info(f"Order {order_id} marked as paid via webhook")
+                    await _emit_stripe_merchant_webhook_best_effort(
+                        result,
+                        event_type="payment.completed",
+                        payment_intent_id=payment_intent_id,
+                        amount_minor=data.get("amount"),
+                        currency=data.get("currency"),
+                    )
 
                     # PCS: freeze order snapshot evidence (best-effort; does not block payment success)
                     try:
@@ -515,6 +577,14 @@ async def handle_stripe_webhook(
                 )
                 if finalization.get("applied"):
                     logger.warning(f"Order {order_id} payment failed: {error_message}")
+                    await _emit_stripe_merchant_webhook_best_effort(
+                        result,
+                        event_type="payment.failed",
+                        payment_intent_id=payment_intent_id,
+                        amount_minor=data.get("amount"),
+                        currency=data.get("currency"),
+                        error_message=error_message,
+                    )
                 else:
                     logger.info(
                         "Stripe payment failure replay skipped for order %s due to settled or terminal state",

@@ -123,6 +123,7 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     evidence_calls: list[tuple[str, str]] = []
     order_events: list[Dict[str, Any]] = []
     shopify_calls: list[str] = []
+    merchant_webhook_calls: list[Dict[str, Any]] = []
 
     event = _stripe_event(
         "payment_intent.succeeded",
@@ -162,6 +163,25 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
         shopify_calls.append(order_id)
         return True
 
+    async def fake_emit_merchant_webhook_event(
+        merchant_id: str,
+        *,
+        event_type: str,
+        payload: Dict[str, Any],
+        request_id: str | None = None,
+        force_delivery: bool = False,
+    ) -> Dict[str, Any]:
+        merchant_webhook_calls.append(
+            {
+                "merchant_id": merchant_id,
+                "event_type": event_type,
+                "payload": dict(payload),
+                "request_id": request_id,
+                "force_delivery": force_delivery,
+            }
+        )
+        return {"status": "delivered"}
+
     def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
         return event
 
@@ -186,6 +206,11 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
         fake_get_merchant_onboarding,
     )
     monkeypatch.setattr(order_routes_module, "create_shopify_order", fake_create_shopify_order)
+    monkeypatch.setattr(
+        webhook_routes_module,
+        "emit_merchant_webhook_event",
+        fake_emit_merchant_webhook_event,
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -205,6 +230,25 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     assert order_events[0]["order_id"] == "ORD_STRIPE_SUCCESS"
     assert order_events[0]["merchant_id"] == "m_stripe"
     assert order_events[0]["metadata"]["payment_intent_id"] == "pi_success_contract"
+    assert merchant_webhook_calls == [
+        {
+            "merchant_id": "m_stripe",
+            "event_type": "payment.completed",
+            "payload": {
+                "order_id": "ORD_STRIPE_SUCCESS",
+                "merchant_id": "m_stripe",
+                "payment_id": "pi_success_contract",
+                "transaction_id": "pi_success_contract",
+                "amount": 45.2,
+                "currency": "usd",
+                "psp_used": "stripe",
+                "status": "paid",
+                "customer_email": None,
+            },
+            "request_id": None,
+            "force_delivery": False,
+        }
+    ]
 
 
 @pytest.mark.asyncio
