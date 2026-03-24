@@ -275,6 +275,14 @@ class AdyenAdapter(PSPAdapter):
             if self.environment == "live"
             else "https://checkout-test.adyen.com/v70"
         )
+
+    @staticmethod
+    def _should_force_card_only_for_canary(metadata: Dict[str, Any]) -> bool:
+        source = str(metadata.get("source") or "").strip().lower()
+        return bool(metadata.get("ops_canary")) and source in {
+            "ops_order_backed_canary",
+            "merchant_order_backed_canary",
+        }
     
     async def create_payment_intent(
         self,
@@ -308,6 +316,11 @@ class AdyenAdapter(PSPAdapter):
                 "shopperLocale": "en_US",
                 "channel": "Web"
             }
+
+            if self._should_force_card_only_for_canary(metadata):
+                # Adyen test accounts can default to wallet-only methods for sessions.
+                # Keep ops canaries deterministic by constraining the session to cards.
+                payload["allowedPaymentMethods"] = ["scheme"]
             
             print(f"   Payload merchantAccount: {payload['merchantAccount']}")
             
