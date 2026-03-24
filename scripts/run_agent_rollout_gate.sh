@@ -60,14 +60,7 @@ run_step \
 run_step \
   "acp control-plane contract gate" \
   "$ACP_REPO" \
-  python3 -m pytest \
-    tests/test_agent_governance_contract.py \
-    tests/test_agent_control_plane_contract.py \
-    tests/test_runtime_interface_drift.py \
-    tests/test_agent_rollout_contract.py \
-    tests/test_agent_docs_runtime.py \
-    tests/test_route_uniqueness.py \
-    -q
+  bash ./scripts/run_control_plane_contract_gate.sh
 
 echo
 echo "agent rollout gate passed"
