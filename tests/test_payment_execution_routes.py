@@ -149,7 +149,73 @@ async def test_execute_payment_returns_unified_action(monkeypatch: pytest.Monkey
     assert response.psp_used == "adyen"
     assert response.requires_customer_action is True
     assert response.payment_action["type"] == "adyen_session"
-    assert emitted == [("merch_test_payment", "payment.completed", "adyen", "adyen_session_1")]
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_execute_payment_emits_completed_only_for_terminal_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    async def fake_verify(api_key: str):
+        return {
+            "merchant_id": "merch_test_payment",
+            "business_name": "Glow Commerce",
+            "status": "approved",
+        }
+
+    async def fake_candidates(merchant, payment_request):
+        return (
+            [
+                {
+                    "provider": "stripe",
+                    "api_key": "sk_live_x",
+                    "status": "active",
+                    "environment": "live",
+                    "provider_config": {"mode": "payment_intent"},
+                    "validation_status": "valid",
+                }
+            ],
+            {"route_id": "route_terminal_success", "psp_priority": [{"psp": "stripe", "priority": 1}]},
+        )
+
+    async def fake_initiate(**kwargs):
+        return {
+            "success": True,
+            "payment_id": "pi_live_terminal",
+            "status": "succeeded",
+            "transaction_id": "pi_live_terminal",
+            "psp_used": "stripe",
+            "requires_customer_action": False,
+            "payment_action": None,
+            "error_message": None,
+        }
+
+    emitted = []
+
+    async def fake_emit(merchant_id: str, *, event_type: str, payment_request, result, psp_used: str):
+        emitted.append((merchant_id, event_type, psp_used, result["payment_id"]))
+
+    monkeypatch.setattr(module, "verify_merchant_api_key", fake_verify)
+    monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
+    monkeypatch.setattr(module, "initiate_merchant_payment", fake_initiate)
+    monkeypatch.setattr(module, "_emit_payment_webhook_best_effort", fake_emit)
+
+    response = await module.execute_payment(
+        module.PaymentExecuteRequest(
+            amount=1000,
+            currency="USD",
+            order_id="ord_terminal_success",
+            customer_email="merchant@example.com",
+        ),
+        x_merchant_api_key="merchant_test_key",
+    )
+
+    assert response.success is True
+    assert response.psp_used == "stripe"
+    assert response.requires_customer_action is False
+    assert emitted == [("merch_test_payment", "payment.completed", "stripe", "pi_live_terminal")]
 
 
 @pytest.mark.asyncio

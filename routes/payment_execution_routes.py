@@ -281,6 +281,21 @@ async def _emit_payment_webhook_best_effort(
         )
 
 
+def _resolve_payment_webhook_event_type(result: Dict[str, Any]) -> Optional[str]:
+    status = str(result.get("status") or "").strip().lower()
+    terminal_success_statuses = {"succeeded", "completed", "paid", "approved", "captured"}
+    terminal_failure_statuses = {"failed", "cancelled", "canceled", "declined", "error"}
+    non_terminal_statuses = {"requires_action", "pending", "processing", "open", "created"}
+
+    if status in non_terminal_statuses:
+        return None
+    if bool(result.get("success")) and status in terminal_success_statuses:
+        return "payment.completed"
+    if status in terminal_failure_statuses or not bool(result.get("success")):
+        return "payment.failed"
+    return None
+
+
 async def _execute_payment_for_merchant(
     *,
     merchant: Dict[str, Any],
@@ -345,13 +360,15 @@ async def _execute_payment_for_merchant(
 
     payment_id = str(result.get("payment_id") or f"failed_{secrets.token_hex(8)}")
     if emit_merchant_webhook:
-        await _emit_payment_webhook_best_effort(
-            merchant["merchant_id"],
-            event_type="payment.completed" if result.get("success") else "payment.failed",
-            payment_request=payment_request,
-            result={**result, "payment_id": payment_id},
-            psp_used=result.get("psp_used") or preferred_psps[0],
-        )
+        event_type = _resolve_payment_webhook_event_type(result)
+        if event_type:
+            await _emit_payment_webhook_best_effort(
+                merchant["merchant_id"],
+                event_type=event_type,
+                payment_request=payment_request,
+                result={**result, "payment_id": payment_id},
+                psp_used=result.get("psp_used") or preferred_psps[0],
+            )
     return PaymentExecuteResponse(
         success=bool(result.get("success")),
         payment_id=payment_id,
