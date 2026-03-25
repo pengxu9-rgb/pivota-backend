@@ -882,6 +882,18 @@ _SKINCARE_INGREDIENT_DISPLAY_NAMES: Dict[str, str] = {
 }
 
 _SKINCARE_INGREDIENT_CATEGORY_LABELS = {"serum", "moisturizer", "cleanser", "toner"}
+_EXTERNAL_SEED_SKINCARE_CATEGORY_PATTERNS: List[Tuple[str, Any]] = [
+    ("serum", re.compile(r"\b(serum|essence|ampoule|concentrate)\b", re.IGNORECASE)),
+    (
+        "moisturizer",
+        re.compile(r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|barrier cream)\b", re.IGNORECASE),
+    ),
+    (
+        "cleanser",
+        re.compile(r"\b(cleanser|cleansing|face wash|facial wash|cleansing milk|cleansing foam|cleansing gel|wash)\b", re.IGNORECASE),
+    ),
+    ("toner", re.compile(r"\b(toner|mist|pad)\b", re.IGNORECASE)),
+]
 _COSMETIC_SHADE_CATEGORY_LABELS = {"foundation", "lipstick", "blush", "gloss"}
 
 
@@ -4599,9 +4611,32 @@ def _normalize_external_seed_product_type(
         snapshot.get("productType"),
     ):
         text = str(candidate or "").strip()
-        if text:
+        if text and text.lower() != "external":
             return text
+    fallback_blob = " ".join(
+        str(candidate or "").strip()
+        for candidate in (
+            row.get("title"),
+            row.get("canonical_url"),
+            row.get("destination_url"),
+            seed_data.get("title"),
+            snapshot.get("title"),
+            snapshot.get("canonical_url"),
+            snapshot.get("destination_url"),
+        )
+        if str(candidate or "").strip()
+    )
+    for label, pattern in _EXTERNAL_SEED_SKINCARE_CATEGORY_PATTERNS:
+        if pattern.search(fallback_blob):
+            return label.title()
     return ""
+
+
+def _build_external_seed_visible_attributes(product_type: Optional[str]) -> Dict[str, List[str]]:
+    normalized = str(product_type or "").strip().lower()
+    if normalized in _SKINCARE_INGREDIENT_CATEGORY_LABELS:
+        return {"product_category": [normalized]}
+    return {}
 
 
 def _build_external_seed_filter_product(
@@ -4620,6 +4655,7 @@ def _build_external_seed_filter_product(
     inventory_quantity = 999 if in_stock is not False else 0
     ingredient_ids = _normalize_external_seed_structured_ingredient_ids(row, seed_data)
     product_type = _normalize_external_seed_product_type(row, seed_data)
+    visible_attributes = _build_external_seed_visible_attributes(product_type)
     variants: List[StandardProductVariant] = []
 
     for idx, variant in enumerate(_normalize_seed_variants(seed_data)):
@@ -4654,6 +4690,7 @@ def _build_external_seed_filter_product(
         title=title,
         description=str(external_product.get("description") or ""),
         product_type=product_type or None,
+        visible_attributes=visible_attributes or None,
         ingredient_ids=ingredient_ids,
         price=price,
         currency=currency,
@@ -4831,12 +4868,18 @@ async def _build_prefetched_external_seed_wrappers(
 
         seed_data = _ensure_seed_data_obj(candidate.get("seed_data"))
         seed_data = dict(seed_data) if isinstance(seed_data, dict) else {}
-        category = (
-            candidate.get("category")
-            or candidate.get("product_type")
-            or seed_data.get("category")
-            or seed_data.get("product_type")
-        )
+        category = None
+        for category_candidate in (
+            candidate.get("category"),
+            candidate.get("product_type"),
+            seed_data.get("category"),
+            seed_data.get("product_type"),
+        ):
+            text = str(category_candidate or "").strip()
+            if not text or text.lower() == "external":
+                continue
+            category = text
+            break
         ingredient_ids = candidate.get("ingredient_ids") or seed_data.get("reviewed_ingredient_ids")
         if candidate.get("title") and not seed_data.get("title"):
             seed_data["title"] = candidate.get("title")
