@@ -600,8 +600,19 @@ def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
 
 _BUDGET_FX_CACHE_TTL_SECONDS = 900.0
 _BUDGET_FX_RATE_CACHE: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str], float]] = {}
+_DEFAULT_BUDGET_FX_USD_RATES: Dict[str, float] = {
+    "USD": 1.0,
+    "EUR": 1.09,
+    "GBP": 1.27,
+    "CNY": 0.14,
+    "JPY": 0.0067,
+}
 _BUDGET_FX_LATEST_FALLBACK_ENABLED = _env_bool(
     "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED",
+    True,
+)
+_BUDGET_FX_STATIC_FALLBACK_ENABLED = _env_bool(
+    "AGENT_SHOP_BUDGET_FX_STATIC_FALLBACK_ENABLED",
     True,
 )
 _BUDGET_FX_LATEST_BASE_URL = str(
@@ -625,6 +636,36 @@ def _parse_budget_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _load_budget_fx_usd_rates() -> Dict[str, float]:
+    raw = str(os.getenv("AGENT_SHOP_BUDGET_FX_USD_RATES", "") or "").strip()
+    if not raw:
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    if not isinstance(parsed, dict):
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    normalized = dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    for key, value in parsed.items():
+        currency = str(key or "").strip().upper()
+        try:
+            rate = float(value)
+        except Exception:
+            continue
+        if currency and rate > 0:
+            normalized[currency] = rate
+    return normalized
+
+
+_BUDGET_FX_USD_RATES = _load_budget_fx_usd_rates()
+_BUDGET_FX_STATIC_SOURCE = (
+    "env_usd_base_rates"
+    if str(os.getenv("AGENT_SHOP_BUDGET_FX_USD_RATES", "") or "").strip()
+    else "static_default"
+)
 
 
 def _coerce_budget_fx_snapshot(snapshot: Any) -> Dict[str, Any]:
@@ -691,6 +732,31 @@ async def _lookup_budget_fx_latest_rate(
     return None, None
 
 
+def _lookup_budget_fx_static_rate(
+    from_currency: Optional[str],
+    to_currency: Optional[str],
+) -> Tuple[Optional[float], Optional[str]]:
+    if not _BUDGET_FX_STATIC_FALLBACK_ENABLED:
+        return None, None
+    source_currency = str(from_currency or "").strip().upper()
+    target_currency = str(to_currency or "").strip().upper()
+    if not source_currency or not target_currency:
+        return None, None
+    if source_currency == target_currency:
+        return 1.0, "same_currency"
+    source_rate = _BUDGET_FX_USD_RATES.get(source_currency)
+    target_rate = _BUDGET_FX_USD_RATES.get(target_currency)
+    try:
+        if source_rate is not None and target_rate is not None:
+            source_rate = float(source_rate)
+            target_rate = float(target_rate)
+            if source_rate > 0 and target_rate > 0:
+                return source_rate / target_rate, _BUDGET_FX_STATIC_SOURCE
+    except Exception:
+        return None, None
+    return None, None
+
+
 async def _lookup_budget_fx_rate(
     from_currency: Optional[str],
     to_currency: Optional[str],
@@ -752,6 +818,18 @@ async def _lookup_budget_fx_rate(
             rate = float(latest_rate)
             _BUDGET_FX_RATE_CACHE[cache_key] = (rate, latest_source, now)
             return rate, latest_source
+    except Exception:
+        pass
+
+    static_rate, static_source = _lookup_budget_fx_static_rate(
+        source_currency,
+        target_currency,
+    )
+    try:
+        if static_rate is not None and float(static_rate) > 0:
+            rate = float(static_rate)
+            _BUDGET_FX_RATE_CACHE[cache_key] = (rate, static_source, now)
+            return rate, static_source
     except Exception:
         pass
 
