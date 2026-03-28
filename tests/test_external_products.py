@@ -5696,6 +5696,242 @@ async def test_shop_gateway_find_products_multi_search_source_uses_latest_fx_fal
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_search_source_uses_static_fx_fallback_when_snapshot_and_latest_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "seed_vitamin_c_1",
+                    "title": "Vitamin-C Serum",
+                    "canonical_url": "https://brand.example/products/vitamin-c-serum",
+                    "destination_url": "https://brand.example/products/vitamin-c-serum",
+                    "category": "Serum",
+                    "price_amount": 24.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "seed_data": {
+                        "title": "Vitamin-C Serum",
+                        "description": "Reviewed vitamin c serum seed.",
+                        "category": "Serum",
+                        "reviewed_ingredient_ids": ["ascorbic_acid"],
+                        "variants": [],
+                    },
+                }
+            ]
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_one(query: str, values=None):
+        return None
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        return [], "cache_all_platforms", None
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return "https://api.example/r/ext"
+
+    async def fake_lookup_budget_fx_latest_rate(
+        from_currency: str,
+        to_currency: str,
+    ):
+        assert from_currency == "USD"
+        assert to_currency == "EUR"
+        return None, None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_lookup_budget_fx_latest_rate",
+        fake_lookup_budget_fx_latest_rate,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "_BUDGET_FX_STATIC_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_BUDGET_FX_USD_RATES",
+        {"USD": 1.0, "EUR": 1.09},
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_BUDGET_FX_STATIC_SOURCE", "static_default")
+    agent_shop_gateway_module._BUDGET_FX_RATE_CACHE.clear()
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="vitamin c serum under €30",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="search"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "search"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    source_breakdown = metadata.get("source_breakdown") or {}
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["title"] == "Vitamin-C Serum"
+    assert metadata.get("query_source") == "cache_multi_intent"
+    assert metadata.get("budget_currency") == "EUR"
+    assert metadata.get("budget_fx_applied") is True
+    assert metadata.get("budget_fx_rate") == pytest.approx(1 / 1.09, rel=1e-6)
+    assert metadata.get("budget_fx_source") == "static_default"
+    assert metadata.get("budget_fx_candidate_currency") == "USD"
+    assert metadata.get("budget_fx_unresolved") is False
+    assert source_breakdown.get("external_seed_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_prefetched_external_seed_candidates_use_static_fx_fallback_for_cross_currency_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM external_product_seeds" in q or "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_one(query: str, values=None):
+        return None
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        return [], "cache_all_platforms", None
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return "https://api.example/r/ext"
+
+    async def fake_lookup_budget_fx_latest_rate(
+        from_currency: str,
+        to_currency: str,
+    ):
+        assert from_currency == "USD"
+        assert to_currency == "EUR"
+        return None, None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_lookup_budget_fx_latest_rate",
+        fake_lookup_budget_fx_latest_rate,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "_BUDGET_FX_STATIC_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_BUDGET_FX_USD_RATES",
+        {"USD": 1.0, "EUR": 1.09},
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_BUDGET_FX_STATIC_SOURCE", "static_default")
+    agent_shop_gateway_module._BUDGET_FX_RATE_CACHE.clear()
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="vitamin c serum under €30",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {
+            "source": "shopping_agent",
+            "external_seed_candidates": [
+                {
+                    "id": "ext_prefetch_vitc_1",
+                    "product_id": "ext_prefetch_vitc_1",
+                    "external_seed_id": "seed_vitc_1",
+                    "title": "Vitamin-C Serum",
+                    "description": "Prefetched external vitamin c serum seed.",
+                    "price": 24.0,
+                    "currency": "USD",
+                    "product_type": "Serum",
+                    "category": "Serum",
+                    "source": "external_seed",
+                    "market": "US",
+                    "tool": "*",
+                    "in_stock": True,
+                    "availability": "in_stock",
+                    "ingredient_ids": ["ascorbic_acid"],
+                    "canonical_url": "https://brand.example/products/vitamin-c-serum",
+                    "destination_url": "https://brand.example/products/vitamin-c-serum",
+                    "variants": [
+                        {
+                            "id": "ext_prefetch_variant_1",
+                            "variant_id": "ext_prefetch_variant_1",
+                            "title": "Default Title",
+                            "price": 24.0,
+                            "currency": "USD",
+                            "in_stock": True,
+                            "availability": "in_stock",
+                            "options": [],
+                        }
+                    ],
+                }
+            ],
+        },
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    source_breakdown = metadata.get("source_breakdown") or {}
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["title"] == "Vitamin-C Serum"
+    assert products[0]["source"] == "external_seed"
+    assert metadata.get("strict_constraint_query") is True
+    assert metadata.get("strict_constraint_reason") == "multi_constraint"
+    assert metadata.get("budget_currency") == "EUR"
+    assert metadata.get("budget_fx_applied") is True
+    assert metadata.get("budget_fx_rate") == pytest.approx(1 / 1.09, rel=1e-6)
+    assert metadata.get("budget_fx_source") == "static_default"
+    assert metadata.get("budget_fx_candidate_currency") == "USD"
+    assert metadata.get("budget_fx_unresolved") is False
+    assert source_breakdown.get("external_seed_count") == 1
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_marks_cross_currency_budget_as_unresolved_without_fx_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5759,6 +5995,7 @@ async def test_shop_gateway_find_products_multi_marks_cross_currency_budget_as_u
         "_lookup_budget_fx_latest_rate",
         fake_lookup_budget_fx_latest_rate,
     )
+    monkeypatch.setattr(agent_shop_gateway_module, "_BUDGET_FX_STATIC_FALLBACK_ENABLED", False)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
