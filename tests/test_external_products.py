@@ -6313,6 +6313,90 @@ async def test_shop_gateway_find_products_multi_external_only_prefers_sunscreen_
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_external_only_prefers_full_size_spf_over_travel_without_size_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_rows = [
+        _gateway_ranking_seed_row(
+            seed_id="seed_travel_spf",
+            external_product_id="ext_travel_spf",
+            title="Superactive Moisturizer SPF 50: Brightening Travel Size",
+            canonical_url="https://example.com/products/superactive-moisturizer-spf-50-brightening-travel-size",
+            category="Moisturizer",
+            description="Brightening moisturizer with SPF 50.",
+            visible_attributes={"product_category": ["moisturizer"]},
+            price_amount=20.0,
+            source_order=0,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_jumbo_spf",
+            external_product_id="ext_jumbo_spf",
+            title="Dew-Glow Moisturizer SPF 50 - Jumbo",
+            canonical_url="https://example.com/products/dew-glow-moisturizer-spf-50-jumbo",
+            category="Moisturizer",
+            description="Dewy moisturizer with SPF 50.",
+            visible_attributes={"product_category": ["moisturizer"]},
+            price_amount=40.0,
+            source_order=4,
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "spf 50"
+        return {
+            "rows": list(seed_rows),
+            "query_timeout": False,
+            "query_ms": 8,
+            "total_count": len(seed_rows),
+        }
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return f"https://api.example/r/{kwargs['ctx'].get('seedId')}"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="spf 50",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert [product.get("title") for product in products[:2]] == [
+        "Dew-Glow Moisturizer SPF 50 - Jumbo",
+        "Superactive Moisturizer SPF 50: Brightening Travel Size",
+    ]
+    assert products[1]["ranking_score_breakdown"]["quality_penalties"]["travel_size_without_intent"] > 0
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_external_only_penalizes_travel_size_without_size_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6592,6 +6676,99 @@ async def test_shop_gateway_find_products_multi_external_only_prefers_gel_moistu
         "Acne Treatment Serum",
     ]
     assert products[2]["ranking_score_breakdown"]["quality_penalties"]["missing_category_anchor"] > 0
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_external_only_prefers_barrier_moisturizer_over_spf_for_fragrance_free_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_rows = [
+        _gateway_ranking_seed_row(
+            seed_id="seed_barrier_moisturizer",
+            external_product_id="ext_barrier_moisturizer",
+            title="Cellular Hydration Barrier Repair Cream Moisturizer",
+            canonical_url="https://example.com/products/barrier-repair-cream-moisturizer",
+            category="Moisturizer",
+            description="Hydrating barrier moisturizer fragrance free.",
+            visible_attributes={
+                "product_category": ["moisturizer"],
+                "skin_concern": ["hydrating"],
+                "formula_constraint": ["fragrance_free"],
+            },
+            price_amount=32.0,
+            source_order=3,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_spf_hydrating",
+            external_product_id="ext_spf_hydrating",
+            title="Superactive Moisturizer SPF 50: Hydrating",
+            canonical_url="https://example.com/products/superactive-moisturizer-spf-50-hydrating",
+            category="Moisturizer",
+            description="Hydrating moisturizer with SPF 50.",
+            visible_attributes={
+                "product_category": ["moisturizer", "sunscreen"],
+                "skin_concern": ["hydrating"],
+            },
+            price_amount=28.0,
+            source_order=0,
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "hydrating barrier moisturizer fragrance free"
+        return {
+            "rows": list(seed_rows),
+            "query_timeout": False,
+            "query_ms": 8,
+            "total_count": len(seed_rows),
+        }
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return f"https://api.example/r/{kwargs['ctx'].get('seedId')}"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="hydrating barrier moisturizer fragrance free",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert [product.get("title") for product in products[:2]] == [
+        "Cellular Hydration Barrier Repair Cream Moisturizer",
+        "Superactive Moisturizer SPF 50: Hydrating",
+    ]
+    penalties = products[1]["ranking_score_breakdown"]["quality_penalties"]
+    assert penalties["sun_protection_without_intent"] > 0
+    assert penalties["missing_formula_constraint"] > 0
 
 
 @pytest.mark.asyncio

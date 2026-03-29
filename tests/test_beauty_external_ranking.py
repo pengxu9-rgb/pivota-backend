@@ -312,6 +312,36 @@ def test_rank_external_seed_rows_prefers_hyaluronic_hydrating_serum_for_dual_int
     assert ranked[0].ranking_score_breakdown["concern_score"] > 0
 
 
+def test_rank_external_seed_rows_prefers_exact_salicylic_serum_over_mist_when_category_and_concern_both_match() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="salicylic_serum",
+                title="Salicylic Acid Serum 2%",
+                canonical_url="https://example.com/products/salicylic-acid-serum-2",
+                category="Serum",
+                description="A serum for acne-prone skin and visible pores.",
+                reviewed_ingredient_ids=["salicylic_acid"],
+                visible_attributes={"product_category": ["serum"], "skin_concern": ["acne", "pores"]},
+            ),
+            _seed_row(
+                external_product_id="salicylic_mist",
+                title="Body Acne Clearing Mist with 2% Salicylic Acid",
+                canonical_url="https://example.com/products/body-acne-clearing-mist-salicylic-acid",
+                category="Treatment",
+                description="Targets acne and pores with salicylic acid.",
+                reviewed_ingredient_ids=["salicylic_acid"],
+                visible_attributes={"skin_concern": ["acne", "pores"]},
+            ),
+        ],
+        query="salicylic acid serum for acne and pores",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "salicylic_serum"
+    assert ranked[1].ranking_score_breakdown["quality_penalties"]["missing_category_anchor"] > 0
+
+
 def test_rank_external_seed_rows_prefers_gel_moisturizer_for_acne_prone_query() -> None:
     ranked = rank_external_seed_rows(
         [
@@ -351,6 +381,43 @@ def test_rank_external_seed_rows_prefers_gel_moisturizer_for_acne_prone_query() 
     assert ranked[-1].ranking_score_breakdown["quality_penalties"]["missing_category_anchor"] > 0
 
 
+def test_rank_external_seed_rows_prefers_barrier_moisturizer_over_spf_for_fragrance_free_query() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="barrier_moisturizer",
+                title="Cellular Hydration Barrier Repair Cream Moisturizer",
+                canonical_url="https://example.com/products/barrier-repair-cream-moisturizer",
+                category="Moisturizer",
+                description="Hydrating barrier moisturizer fragrance free.",
+                visible_attributes={
+                    "product_category": ["moisturizer"],
+                    "skin_concern": ["hydrating"],
+                    "formula_constraint": ["fragrance_free"],
+                },
+            ),
+            _seed_row(
+                external_product_id="spf_moisturizer",
+                title="Superactive Moisturizer SPF 50: Hydrating",
+                canonical_url="https://example.com/products/superactive-moisturizer-spf-50-hydrating",
+                category="Moisturizer",
+                description="Hydrating moisturizer with SPF 50.",
+                visible_attributes={
+                    "product_category": ["moisturizer", "sunscreen"],
+                    "skin_concern": ["hydrating"],
+                },
+            ),
+        ],
+        query="hydrating barrier moisturizer fragrance free",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "barrier_moisturizer"
+    penalties = ranked[1].ranking_score_breakdown["quality_penalties"]
+    assert penalties["sun_protection_without_intent"] > 0
+    assert penalties["missing_formula_constraint"] > 0
+
+
 def test_rank_external_seed_rows_prefers_sunscreen_category_for_sunscreen_query() -> None:
     ranked = rank_external_seed_rows(
         [
@@ -375,6 +442,32 @@ def test_rank_external_seed_rows_prefers_sunscreen_category_for_sunscreen_query(
 
     assert ranked[0].external_product_id == "mineral_sunscreen"
     assert ranked[1].ranking_score_breakdown["quality_penalties"]["missing_sunscreen_category"] > 0
+
+
+def test_rank_external_seed_rows_prefers_full_size_spf_over_travel_without_packaging_intent() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="travel_spf",
+                title="Superactive Moisturizer SPF 50: Brightening Travel Size",
+                canonical_url="https://example.com/products/superactive-moisturizer-spf-50-brightening-travel-size",
+                category="Moisturizer",
+                visible_attributes={"product_category": ["moisturizer"]},
+            ),
+            _seed_row(
+                external_product_id="jumbo_spf",
+                title="Dew-Glow Moisturizer SPF 50 - Jumbo",
+                canonical_url="https://example.com/products/dew-glow-moisturizer-spf-50-jumbo",
+                category="Moisturizer",
+                visible_attributes={"product_category": ["moisturizer"]},
+            ),
+        ],
+        query="spf 50",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "jumbo_spf"
+    assert ranked[1].ranking_score_breakdown["quality_penalties"]["travel_size_without_intent"] > 0
 
 
 def test_build_external_seed_filter_product_preserves_structured_beauty_fields() -> None:
