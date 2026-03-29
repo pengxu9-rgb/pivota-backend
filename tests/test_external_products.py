@@ -7537,3 +7537,59 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_keeps_high_co
     assert [product.get("title") for product in products] == ["Ergonomic Office Chair"]
     assert metadata.get("generic_default_precision_gate_enabled") is True
     assert metadata.get("generic_default_precision_filtered_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_generic_default_ui_skips_external_seed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM products_cache" in q or "FROM orders" in q:
+            return []
+        return []
+
+    async def fail_fetch_external_seed_rows(**kwargs):
+        raise AssertionError("default generic ui/web queries should not execute external seed search")
+
+    async def fail_prefetched_external_seed_wrappers(request_metadata):
+        raise AssertionError("default generic ui/web queries should not load prefetched external seed wrappers")
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fail_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_build_prefetched_external_seed_wrappers",
+        fail_prefetched_external_seed_wrappers,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="black leather crossbody bag",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-ui"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("products") == []
+    metadata = result.get("metadata") or {}
+    assert metadata.get("query_semantic_class") == "default"
+    assert metadata.get("external_seed_executed") is False
+    assert metadata.get("external_seed_skip_reason") == "semantic_class_blocked"

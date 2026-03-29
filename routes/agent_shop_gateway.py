@@ -7535,6 +7535,9 @@ async def _handle_find_products_multi(
         and not active_visible_option_intents
         and not active_ingredient_intents
     )
+    semantic_external_seed_fallback_allowed = bool(
+        strict_serving_mode or query_semantic_class in {"beauty", "fragrance"}
+    )
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -7841,6 +7844,7 @@ async def _handle_find_products_multi(
     external_seed_broad_fallback_used = False
     external_seed_broad_scope_rows = 0
     external_seed_ranked_count = 0
+    external_seed_skip_reason: Optional[str] = None
     budget_fx_applied = False
     budget_fx_rate: Optional[float] = None
     budget_fx_source: Optional[str] = None
@@ -7904,7 +7908,10 @@ async def _handle_find_products_multi(
                 shopping_seed_cap = 200
             seed_limit = min(seed_limit, shopping_seed_cap)
         seed_rows: List[Any] = []
-        if seed_limit > 0:
+        ranked_seed_candidates = []
+        if not semantic_external_seed_fallback_allowed:
+            external_seed_skip_reason = "semantic_class_blocked"
+        elif seed_limit > 0:
             stage_a_timeout_seconds = max(
                 0.05,
                 min(
@@ -7963,12 +7970,12 @@ async def _handle_find_products_multi(
                     external_seed_rows_fetched = len(seed_rows)
                     external_seed_brand_relevant_rows = len(seed_rows)
 
-        ranked_seed_candidates = rank_external_seed_rows(
-            seed_rows,
-            query=q_ascii or q_lower,
-            limit=seed_limit,
-        )
-        external_seed_ranked_count = len(ranked_seed_candidates)
+            ranked_seed_candidates = rank_external_seed_rows(
+                seed_rows,
+                query=q_ascii or q_lower,
+                limit=seed_limit,
+            )
+            external_seed_ranked_count = len(ranked_seed_candidates)
 
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
@@ -8092,9 +8099,13 @@ async def _handle_find_products_multi(
         logger.info("multi.external_seeds.failed", extra={"error": str(e)})
 
     try:
-        prefetched_external_seed_wrappers = await _build_prefetched_external_seed_wrappers(
-            request_metadata
-        )
+        prefetched_external_seed_wrappers = []
+        if semantic_external_seed_fallback_allowed:
+            prefetched_external_seed_wrappers = await _build_prefetched_external_seed_wrappers(
+                request_metadata
+            )
+        elif external_seed_skip_reason is None:
+            external_seed_skip_reason = "semantic_class_blocked"
         if prefetched_external_seed_wrappers:
             existing_external_product_ids = {
                 str(
@@ -8162,6 +8173,8 @@ async def _handle_find_products_multi(
                     "budget_fx_source": budget_fx_source,
                     "budget_fx_candidate_currency": budget_fx_candidate_currency,
                     "budget_fx_unresolved": budget_fx_unresolved,
+                    "external_seed_executed": False,
+                    "external_seed_skip_reason": external_seed_skip_reason,
                     "fetched_at": datetime.utcnow().isoformat(),
                     "merchants_searched": 0,
                     **(
@@ -9976,7 +9989,7 @@ async def _handle_find_products_multi(
                 "external_seed_broad_fallback_used": external_seed_broad_fallback_used,
                 "external_seed_broad_scope_rows": external_seed_broad_scope_rows,
                 "external_seed_executed": bool(external_seed_rows_fetched or external_filtered_count),
-                "external_seed_skip_reason": None,
+                "external_seed_skip_reason": external_seed_skip_reason,
                 "external_seed_cache_hit": False,
                 "external_seed_rows_built": len(external_seed_wrappers),
                 "external_seed_returned_count": external_filtered_count,
@@ -9999,7 +10012,7 @@ async def _handle_find_products_multi(
                 "final_returned_count": len(out_products),
                 "route_health": {
                     "external_seed_executed": bool(external_seed_rows_fetched or external_filtered_count),
-                    "external_seed_skip_reason": None,
+                    "external_seed_skip_reason": external_seed_skip_reason,
                     "external_seed_cache_hit": False,
                     "external_seed_query_timeout": external_seed_query_timeout,
                     "external_seed_rows_fetched": external_seed_rows_fetched,
