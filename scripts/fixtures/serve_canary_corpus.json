@@ -1,0 +1,110 @@
+[
+  {
+    "case_id": "stage1-shopping-merchant-exact",
+    "category": "merchant_exact",
+    "query": "the ordinary niacinamide serum",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage1-shopping-product-exact",
+    "category": "product_exact",
+    "query": "ultra gentle cream to foam cleanser",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage1-shopping-blended-incentive",
+    "category": "blended_incentive",
+    "query": "best vitamin c serum deals",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage1-shopping-vertical-style",
+    "category": "vertical_style_query",
+    "query": "hydrating barrier moisturizer fragrance free",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage2-ui-merchant-exact",
+    "category": "merchant_exact",
+    "query": "laneige lip sleeping mask",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage2-ui-product-exact",
+    "category": "product_exact",
+    "query": "cloud paint blush",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage2-ui-blended-incentive",
+    "category": "blended_incentive",
+    "query": "best sunscreen under 30",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage2-ui-vertical-style",
+    "category": "vertical_style_query",
+    "query": "spf 50 mineral sunscreen",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "beauty"
+  },
+  {
+    "case_id": "stage3-web-merchant-exact",
+    "category": "merchant_exact",
+    "query": "glossier you perfume",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance"
+  },
+  {
+    "case_id": "stage3-web-product-exact",
+    "category": "product_exact",
+    "query": "le labo santal 33",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance"
+  },
+  {
+    "case_id": "stage3-web-blended-incentive",
+    "category": "blended_incentive",
+    "query": "best body mist gift set",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance"
+  },
+  {
+    "case_id": "stage3-web-vertical-style",
+    "category": "vertical_style_query",
+    "query": "fresh citrus perfume",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance"
+  }
+]

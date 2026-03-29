@@ -1,0 +1,110 @@
+[
+  {
+    "case_id": "default-shopping-merino-cardigan",
+    "query": "merino wool cardigan",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "default",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "default-shopping-linen-sheet",
+    "query": "linen sheet set",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "default",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "default-shopping-ui-leather-bag",
+    "query": "black leather crossbody bag",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "default",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "default-shopping-ui-office-chair",
+    "query": "ergonomic office chair",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "default",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "default-shopping-web-running-shoes",
+    "query": "neutral running shoes",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "default",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "default-shopping-web-carry-on",
+    "query": "carry on suitcase",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "default",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "fragrance-shopping-eau-de-parfum",
+    "query": "rose eau de parfum",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "fragrance-shopping-body-mist",
+    "query": "vanilla body mist",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "fragrance-ui-cologne",
+    "query": "woody cologne",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "fragrance-ui-travel-spray",
+    "query": "travel perfume spray",
+    "source": "shopping-agent-ui",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "fragrance-web-santal",
+    "query": "santal parfum",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance",
+    "expected_nonempty": true
+  },
+  {
+    "case_id": "fragrance-web-no-result",
+    "query": "vintage fig accord extrait 1987",
+    "source": "shopping-agent-web",
+    "page": 1,
+    "limit": 10,
+    "semantic_class": "fragrance",
+    "expected_nonempty": false
+  }
+]

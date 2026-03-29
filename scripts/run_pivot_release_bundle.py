@@ -20,6 +20,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--release-gate-base-url", default=None)
+    parser.add_argument("--release-gate-source-filter", action="append", default=[])
     parser.add_argument("--smoke-base-url", default=None)
     parser.add_argument("--corpus", required=True)
     parser.add_argument("--merchant-id", action="append", dest="merchant_ids", required=True)
@@ -90,6 +91,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--beauty-ranking-audit-header", action="append", default=[])
     parser.add_argument("--beauty-ranking-audit-gateway-header", action="append", default=[])
     parser.add_argument("--beauty-ranking-audit-pivot-header", action="append", default=[])
+    parser.add_argument("--commerce-shadow-audit", action="store_true")
+    parser.add_argument("--commerce-shadow-audit-blocking", action="store_true")
+    parser.add_argument("--commerce-shadow-audit-compare-before-json", default=None)
+    parser.add_argument("--commerce-shadow-audit-compare-before-label", default="before-deploy")
+    parser.add_argument("--commerce-shadow-audit-compare-after-label", default=None)
+    parser.add_argument("--commerce-shadow-audit-compare-blocking", action="store_true")
+    parser.add_argument("--commerce-shadow-audit-corpus", default=None)
+    parser.add_argument("--commerce-shadow-audit-gateway-base-url", default=None)
+    parser.add_argument("--commerce-shadow-audit-pivot-base-url", default=None)
+    parser.add_argument("--commerce-shadow-audit-timeout-seconds", type=float, default=None)
+    parser.add_argument("--commerce-shadow-audit-header", action="append", default=[])
+    parser.add_argument("--commerce-shadow-audit-gateway-header", action="append", default=[])
+    parser.add_argument("--commerce-shadow-audit-pivot-header", action="append", default=[])
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--smoke-header", action="append", default=[])
     parser.add_argument(
@@ -398,6 +412,13 @@ def _run_bundle(
             str(release_gate_md),
             *_header_args(args.header),
         ]
+        if getattr(args, "release_gate_source_filter", None):
+            command.extend(
+                _repeatable_flag_args(
+                    "--source-filter",
+                    list(getattr(args, "release_gate_source_filter", []) or []),
+                )
+            )
         result = runner(SCRIPT_DIR / "pivot_multi_release_gate.py", command)
         _record_step(
             steps=steps,
@@ -610,6 +631,92 @@ def _run_bundle(
         outputs["beauty_ranking_audit_compare_json"] = str(beauty_ranking_compare_json)
         outputs["beauty_ranking_audit_compare_md"] = str(beauty_ranking_compare_md)
 
+    commerce_shadow_audit_json: Optional[Path] = None
+    commerce_shadow_audit_md: Optional[Path] = None
+    if bool(getattr(args, "commerce_shadow_audit", False)):
+        commerce_shadow_audit_json = output_dir / "commerce-shadow-audit.json"
+        commerce_shadow_audit_md = output_dir / "commerce-shadow-audit.md"
+        commerce_shadow_audit_gateway_base_url = (
+            getattr(args, "commerce_shadow_audit_gateway_base_url", None)
+            or args.release_gate_base_url
+            or args.base_url
+        )
+        commerce_shadow_audit_pivot_base_url = (
+            getattr(args, "commerce_shadow_audit_pivot_base_url", None)
+            or args.smoke_base_url
+            or args.base_url
+        )
+        commerce_shadow_audit_timeout_seconds = (
+            getattr(args, "commerce_shadow_audit_timeout_seconds", None) or args.timeout_seconds
+        )
+        commerce_shadow_audit_headers = list(
+            getattr(args, "commerce_shadow_audit_header", []) or list(args.header)
+        )
+        commerce_shadow_audit_gateway_headers = list(
+            getattr(args, "commerce_shadow_audit_gateway_header", []) or []
+        )
+        commerce_shadow_audit_pivot_headers = [
+            *list(getattr(args, "smoke_header", []) or []),
+            *list(getattr(args, "commerce_shadow_audit_pivot_header", []) or []),
+        ]
+        command = [
+            "--gateway-base-url",
+            commerce_shadow_audit_gateway_base_url,
+            "--pivot-base-url",
+            commerce_shadow_audit_pivot_base_url,
+            "--timeout-seconds",
+            str(commerce_shadow_audit_timeout_seconds),
+            "--output-json",
+            str(commerce_shadow_audit_json),
+            "--output-md",
+            str(commerce_shadow_audit_md),
+            *_repeatable_flag_args("--header", commerce_shadow_audit_headers),
+            *_repeatable_flag_args("--gateway-header", commerce_shadow_audit_gateway_headers),
+            *_repeatable_flag_args("--pivot-header", commerce_shadow_audit_pivot_headers),
+        ]
+        if getattr(args, "commerce_shadow_audit_corpus", None):
+            command.extend(["--corpus", str(getattr(args, "commerce_shadow_audit_corpus"))])
+        result = runner(SCRIPT_DIR / "commerce_shadow_audit.py", command)
+        _record_step(
+            steps=steps,
+            name="commerce_shadow_audit",
+            result=result,
+            output_json=commerce_shadow_audit_json,
+            output_md=commerce_shadow_audit_md,
+        )["blocking"] = bool(getattr(args, "commerce_shadow_audit_blocking", False))
+        outputs["commerce_shadow_audit_json"] = str(commerce_shadow_audit_json)
+        outputs["commerce_shadow_audit_md"] = str(commerce_shadow_audit_md)
+
+    commerce_shadow_compare_json: Optional[Path] = None
+    commerce_shadow_compare_md: Optional[Path] = None
+    if commerce_shadow_audit_json and getattr(args, "commerce_shadow_audit_compare_before_json", None):
+        commerce_shadow_compare_json = output_dir / "commerce-shadow-audit-compare.json"
+        commerce_shadow_compare_md = output_dir / "commerce-shadow-audit-compare.md"
+        command = [
+            "--before-json",
+            str(getattr(args, "commerce_shadow_audit_compare_before_json")),
+            "--after-json",
+            str(commerce_shadow_audit_json),
+            "--output-json",
+            str(commerce_shadow_compare_json),
+            "--output-md",
+            str(commerce_shadow_compare_md),
+            "--before-label",
+            str(getattr(args, "commerce_shadow_audit_compare_before_label", "before-deploy") or "before-deploy"),
+            "--after-label",
+            str(getattr(args, "commerce_shadow_audit_compare_after_label", None) or args.label),
+        ]
+        result = runner(SCRIPT_DIR / "compare_commerce_shadow_audit.py", command)
+        _record_step(
+            steps=steps,
+            name="compare_commerce_shadow_audit",
+            result=result,
+            output_json=commerce_shadow_compare_json,
+            output_md=commerce_shadow_compare_md,
+        )["blocking"] = bool(getattr(args, "commerce_shadow_audit_compare_blocking", False))
+        outputs["commerce_shadow_audit_compare_json"] = str(commerce_shadow_compare_json)
+        outputs["commerce_shadow_audit_compare_md"] = str(commerce_shadow_compare_md)
+
     evidence_json: Optional[Path] = None
     evidence_md: Optional[Path] = None
     if not args.skip_evidence:
@@ -638,6 +745,10 @@ def _run_bundle(
             command.extend(["--beauty-ranking-audit-json", str(beauty_ranking_audit_json)])
         if beauty_ranking_compare_json:
             command.extend(["--beauty-ranking-audit-compare-json", str(beauty_ranking_compare_json)])
+        if commerce_shadow_audit_json:
+            command.extend(["--commerce-shadow-audit-json", str(commerce_shadow_audit_json)])
+        if commerce_shadow_compare_json:
+            command.extend(["--commerce-shadow-audit-compare-json", str(commerce_shadow_compare_json)])
         result = runner(SCRIPT_DIR / "build_pivot_release_evidence.py", command)
         _record_step(
             steps=steps,

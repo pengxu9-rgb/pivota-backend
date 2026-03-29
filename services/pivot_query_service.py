@@ -39,6 +39,7 @@ from services.external_seed_search import (
     fetch_external_seed_rows,
     seed_search_terms,
 )
+from services.query_semantic_class import classify_query_semantic_class
 from services.quote_service import QuoteService
 
 
@@ -997,6 +998,7 @@ async def _fetch_external_fallback_items(request: PivotQueryRequest) -> List[Piv
 
 async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse:
     started = time.perf_counter()
+    query_semantic_class = classify_query_semantic_class(request.query)
     canonical_rows = await _fetch_canonical_search_rows(
         query=request.query,
         merchant_id=request.merchant_id,
@@ -1011,7 +1013,11 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
     )
 
     external_items: List[PivotResultItem] = []
-    if request.include_external and len(canonical_items) < max(3, request.limit):
+    if (
+        request.include_external
+        and query_semantic_class in {"beauty", "fragrance"}
+        and len(canonical_items) < max(3, request.limit)
+    ):
         external_items = await _fetch_external_fallback_items(request)
 
     items = _sort_items((canonical_items + external_items)[: request.limit * 2])[: request.limit]
