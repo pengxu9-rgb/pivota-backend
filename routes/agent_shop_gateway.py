@@ -218,7 +218,7 @@ PIVOT_MULTI_SHADOW_SOURCE_ALLOWLIST = _bootstrap_env_csv_set(
 )
 PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST = _bootstrap_env_csv_set(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST",
-    {"shopping_agent", "shopping-agent-ui", "shopping-agent-web"},
+    {"shopping_agent"},
 )
 PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = _bootstrap_env_bool(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL",

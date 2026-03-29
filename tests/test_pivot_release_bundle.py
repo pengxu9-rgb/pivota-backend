@@ -682,3 +682,216 @@ def test_run_bundle_can_include_beauty_ranking_audit_and_compare(tmp_path: Path)
     assert compare_call[compare_call.index("--before-json") + 1] == str(before_json)
     assert "--beauty-ranking-audit-json" in evidence_call
     assert "--beauty-ranking-audit-compare-json" in evidence_call
+
+
+def test_run_bundle_can_include_commerce_shadow_audit_and_compare(tmp_path: Path) -> None:
+    recorded = []
+
+    def fake_runner(script_path: Path, script_args: list[str]) -> dict:
+        recorded.append((script_path.name, list(script_args)))
+        output_json = None
+        output_md = None
+        for index, token in enumerate(script_args):
+            if token == "--output-json":
+                output_json = Path(script_args[index + 1])
+            if token == "--output-md":
+                output_md = Path(script_args[index + 1])
+        if output_md:
+            output_md.parent.mkdir(parents=True, exist_ok=True)
+            output_md.write_text("# stub\n", encoding="utf-8")
+        if output_json:
+            output_json.parent.mkdir(parents=True, exist_ok=True)
+            if script_path.name == "pivot_multi_release_gate.py":
+                payload = {"summary": {"failed_cases": 0, "passed_cases": 4}}
+            elif script_path.name == "smoke_catalog_pivot_v1.py":
+                payload = {"overall_ok": True, "steps": []}
+            elif script_path.name == "commerce_shadow_audit.py":
+                payload = {
+                    "summary": {
+                        "case_count": 12,
+                        "top1_matches": 9,
+                        "top1_evaluable": 10,
+                    }
+                }
+            elif script_path.name == "compare_commerce_shadow_audit.py":
+                payload = {
+                    "summary": {
+                        "top1_match_delta": 3,
+                        "improved_query_count": 3,
+                        "regressed_query_count": 0,
+                    }
+                }
+            else:
+                payload = {"ok": True}
+            output_json.write_text(json.dumps(payload), encoding="utf-8")
+        return _result()
+
+    before_json = tmp_path / "commerce-before.json"
+    before_json.write_text(json.dumps({"summary": {"top1_matches": 6}}), encoding="utf-8")
+
+    args = argparse.Namespace(
+        base_url="https://default.example",
+        release_gate_base_url="https://public.example",
+        smoke_base_url="https://direct.example",
+        corpus=str(tmp_path / "corpus.json"),
+        merchant_ids=["merch_a"],
+        smoke_merchant_id="merch_a",
+        label="bundle-test",
+        output_dir=str(tmp_path / "out"),
+        migration_artifact=None,
+        migration_mode="skip",
+        database_url="",
+        backfill_platform=None,
+        backfill_limit=10,
+        backfill_include_expired=False,
+        smoke_query="vitamin c",
+        smoke_offer_id=None,
+        smoke_product_key=None,
+        smoke_sku_key=None,
+        timeout_seconds=10.0,
+        catalog_migration_verify_smoke=False,
+        catalog_webhook_smoke=False,
+        catalog_sync_job_smoke=False,
+        catalog_sync_limit=1,
+        catalog_sync_wait_seconds=0.0,
+        catalog_sync_poll_interval_seconds=2.0,
+        service_side_data_plane_verify=False,
+        search_chain_probe=False,
+        search_chain_probe_blocking=False,
+        probe_agent_base_url=None,
+        probe_gateway_url=None,
+        probe_source="shopping_agent",
+        probe_rounds=1,
+        probe_limit=5,
+        probe_sleep_ms=0,
+        probe_queries=None,
+        probe_agent_api_key="",
+        probe_gateway_api_key="",
+        commerce_shadow_audit=True,
+        commerce_shadow_audit_blocking=True,
+        commerce_shadow_audit_compare_before_json=str(before_json),
+        commerce_shadow_audit_compare_before_label="before",
+        commerce_shadow_audit_compare_after_label="after",
+        commerce_shadow_audit_compare_blocking=False,
+        commerce_shadow_audit_corpus=str(tmp_path / "commerce-corpus.json"),
+        commerce_shadow_audit_gateway_base_url=None,
+        commerce_shadow_audit_pivot_base_url=None,
+        commerce_shadow_audit_time_seconds=None,
+        commerce_shadow_audit_timeout_seconds=8.0,
+        commerce_shadow_audit_header=["X-Commerce-Audit: shared"],
+        commerce_shadow_audit_gateway_header=["Authorization: Bearer gateway"],
+        commerce_shadow_audit_pivot_header=["Authorization: Bearer pivot"],
+        header=["X-Test: shared"],
+        smoke_header=["Authorization: Bearer smoke"],
+        release_gate_default_rollout_mode="shadow",
+        skip_backfill_apply=True,
+        skip_backfill_verify=True,
+        skip_release_gate=False,
+        skip_smoke=False,
+        skip_evidence=False,
+    )
+    Path(args.corpus).write_text("[]", encoding="utf-8")
+    Path(args.commerce_shadow_audit_corpus).write_text("[]", encoding="utf-8")
+
+    report, exit_code = module._run_bundle(args, runner=fake_runner)
+
+    assert exit_code == 0
+    assert report["overall_ok"] is True
+    called_scripts = [name for name, _ in recorded]
+    assert "commerce_shadow_audit.py" in called_scripts
+    assert "compare_commerce_shadow_audit.py" in called_scripts
+
+    audit_step = next(step for step in report["steps"] if step["name"] == "commerce_shadow_audit")
+    compare_step = next(step for step in report["steps"] if step["name"] == "compare_commerce_shadow_audit")
+    assert audit_step["blocking"] is True
+    assert compare_step["blocking"] is False
+
+    audit_call = next(script_args for name, script_args in recorded if name == "commerce_shadow_audit.py")
+    compare_call = next(script_args for name, script_args in recorded if name == "compare_commerce_shadow_audit.py")
+    evidence_call = next(script_args for name, script_args in recorded if name == "build_pivot_release_evidence.py")
+    assert audit_call[audit_call.index("--gateway-base-url") + 1] == "https://public.example"
+    assert audit_call[audit_call.index("--pivot-base-url") + 1] == "https://direct.example"
+    assert "--corpus" in audit_call
+    assert "Authorization: Bearer gateway" in audit_call
+    assert "Authorization: Bearer pivot" in audit_call
+    assert compare_call[compare_call.index("--before-json") + 1] == str(before_json)
+    assert "--commerce-shadow-audit-json" in evidence_call
+    assert "--commerce-shadow-audit-compare-json" in evidence_call
+
+
+def test_run_bundle_can_forward_release_gate_source_filters(tmp_path: Path) -> None:
+    recorded = []
+
+    def fake_runner(script_path: Path, script_args: list[str]) -> dict:
+        recorded.append((script_path.name, list(script_args)))
+        output_json = None
+        output_md = None
+        for index, token in enumerate(script_args):
+            if token == "--output-json":
+                output_json = Path(script_args[index + 1])
+            if token == "--output-md":
+                output_md = Path(script_args[index + 1])
+        if output_md:
+            output_md.parent.mkdir(parents=True, exist_ok=True)
+            output_md.write_text("# stub\n", encoding="utf-8")
+        if output_json:
+            output_json.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"summary": {"failed_cases": 0, "passed_cases": 1}, "overall_ok": True, "steps": []}
+            output_json.write_text(json.dumps(payload), encoding="utf-8")
+        return _result()
+
+    args = argparse.Namespace(
+        base_url="https://default.example",
+        release_gate_base_url="https://public.example",
+        release_gate_source_filter=["shopping_agent"],
+        smoke_base_url="https://direct.example",
+        corpus=str(tmp_path / "corpus.json"),
+        merchant_ids=["merch_a"],
+        smoke_merchant_id="merch_a",
+        label="bundle-test",
+        output_dir=str(tmp_path / "out"),
+        migration_artifact=None,
+        migration_mode="skip",
+        database_url="",
+        backfill_platform=None,
+        backfill_limit=10,
+        backfill_include_expired=False,
+        smoke_query="vitamin c",
+        smoke_offer_id=None,
+        smoke_product_key=None,
+        smoke_sku_key=None,
+        timeout_seconds=10.0,
+        catalog_migration_verify_smoke=False,
+        catalog_webhook_smoke=False,
+        catalog_sync_job_smoke=False,
+        catalog_sync_limit=1,
+        catalog_sync_wait_seconds=0.0,
+        catalog_sync_poll_interval_seconds=2.0,
+        service_side_data_plane_verify=False,
+        search_chain_probe=False,
+        search_chain_probe_blocking=False,
+        probe_agent_base_url=None,
+        probe_gateway_url=None,
+        probe_source="shopping_agent",
+        probe_rounds=1,
+        probe_limit=5,
+        probe_sleep_ms=0,
+        probe_queries=None,
+        probe_agent_api_key="",
+        probe_gateway_api_key="",
+        header=[],
+        smoke_header=[],
+        release_gate_default_rollout_mode="shadow",
+        skip_backfill_apply=True,
+        skip_backfill_verify=True,
+        skip_release_gate=False,
+        skip_smoke=False,
+        skip_evidence=True,
+    )
+    Path(args.corpus).write_text("[]", encoding="utf-8")
+
+    report, exit_code = module._run_bundle(args, runner=fake_runner)
+
+    assert exit_code == 0
+    gate_call = next(script_args for name, script_args in recorded if name == "pivot_multi_release_gate.py")
+    assert gate_call[gate_call.index("--source-filter") + 1] == "shopping_agent"

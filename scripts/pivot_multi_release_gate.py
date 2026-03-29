@@ -18,6 +18,12 @@ REQUIRED_ROUTE_HEALTH_FIELDS = [
     "pivot_rollout_mode",
     "pivot_rollout_guard_passed",
 ]
+SOURCE_STAGE_ORDER = ["shopping_agent", "shopping-agent-ui", "shopping-agent-web"]
+SOURCE_STAGE_LABELS = {
+    "shopping_agent": "stage_1",
+    "shopping-agent-ui": "stage_2",
+    "shopping-agent-web": "stage_3",
+}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -41,6 +47,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional fallback expected rollout mode when a case omits expected_rollout_mode.",
     )
+    parser.add_argument(
+        "--source-filter",
+        action="append",
+        default=[],
+        help="Optional repeatable source filter. When set, only matching corpus sources are executed.",
+    )
     return parser.parse_args()
 
 
@@ -62,6 +74,24 @@ def _load_corpus(path: str) -> List[Dict[str, Any]]:
     if not isinstance(payload, list):
         raise ValueError("Corpus must be a JSON list")
     return [item for item in payload if isinstance(item, dict)]
+
+
+def _filter_corpus_by_source(
+    corpus: List[Dict[str, Any]],
+    source_filters: List[str],
+) -> List[Dict[str, Any]]:
+    normalized_filters = {
+        str(source or "").strip()
+        for source in source_filters
+        if str(source or "").strip()
+    }
+    if not normalized_filters:
+        return list(corpus)
+    return [
+        case
+        for case in corpus
+        if str(case.get("source") or "shopping_agent").strip() in normalized_filters
+    ]
 
 
 def _build_request(case: Dict[str, Any]) -> Dict[str, Any]:
@@ -119,6 +149,11 @@ def _extract_case_result(
         check_notes.append(f"missing_route_health={','.join(missing_route_health)}")
 
     actual_rollout_mode = str(route_health.get("pivot_rollout_mode") or metadata.get("pivot_rollout_mode") or "").strip() or None
+    query_semantic_class = str(
+        route_health.get("query_semantic_class")
+        or metadata.get("query_semantic_class")
+        or "unknown"
+    ).strip() or "unknown"
     if expected_rollout:
         rollout_ok = actual_rollout_mode == expected_rollout
         pass_checks.append(rollout_ok)
@@ -143,6 +178,7 @@ def _extract_case_result(
         "http_status": response.status_code,
         "product_count": len(products),
         "query_source": str(metadata.get("query_source") or ""),
+        "query_semantic_class": query_semantic_class,
         "service_commit": str(response.headers.get("X-Service-Commit") or "").strip() or None,
         "route_health_missing": missing_route_health,
         "pivot_shadow_scheduled": bool(route_health.get("pivot_shadow_scheduled")),
@@ -152,6 +188,55 @@ def _extract_case_result(
         "pass": all(pass_checks),
         "check_notes": check_notes,
     }
+
+
+def _summarize_by_source(cases: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for case in cases:
+        grouped[str(case.get("source") or "unknown")].append(case)
+
+    def _sort_key(source: str) -> tuple[int, str]:
+        if source in SOURCE_STAGE_ORDER:
+            return (SOURCE_STAGE_ORDER.index(source), source)
+        return (len(SOURCE_STAGE_ORDER) + 1, source)
+
+    summary: Dict[str, Dict[str, Any]] = {}
+    for source in sorted(grouped, key=_sort_key):
+        items = grouped[source]
+        passed_cases = sum(1 for case in items if bool(case.get("pass")))
+        failed_cases = len(items) - passed_cases
+        summary[source] = {
+            "source_stage": SOURCE_STAGE_LABELS.get(source),
+            "sample_count": len(items),
+            "passed_cases": passed_cases,
+            "failed_cases": failed_cases,
+            "rollout_modes": dict(Counter(str(case.get("pivot_rollout_mode") or "unknown") for case in items)),
+            "semantic_classes": dict(
+                Counter(str(case.get("query_semantic_class") or "unknown") for case in items)
+            ),
+            "ready_for_canary": len(items) > 0 and failed_cases == 0,
+        }
+    return summary
+
+
+def _summarize_by_semantic_class(cases: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for case in cases:
+        grouped[str(case.get("query_semantic_class") or "unknown")].append(case)
+
+    summary: Dict[str, Dict[str, Any]] = {}
+    for semantic_class in sorted(grouped):
+        items = grouped[semantic_class]
+        passed_cases = sum(1 for case in items if bool(case.get("pass")))
+        failed_cases = len(items) - passed_cases
+        summary[semantic_class] = {
+            "sample_count": len(items),
+            "passed_cases": passed_cases,
+            "failed_cases": failed_cases,
+            "sources": dict(Counter(str(case.get("source") or "unknown") for case in items)),
+            "rollout_modes": dict(Counter(str(case.get("pivot_rollout_mode") or "unknown") for case in items)),
+        }
+    return summary
 
 
 def _render_markdown(report: Dict[str, Any]) -> str:
@@ -171,6 +256,30 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     ]
     for key, value in sorted((report["summary"].get("rollout_modes") or {}).items()):
         lines.append(f"- {key}: `{value}`")
+    lines.extend(["", "## Source Summary", ""])
+    source_summary = report["summary"].get("source_summary") or {}
+    if not source_summary:
+        lines.append("- none")
+    else:
+        for source, details in source_summary.items():
+            lines.append(
+                f"- {source}: sample_count=`{details.get('sample_count')}` "
+                f"passed=`{details.get('passed_cases')}` failed=`{details.get('failed_cases')}` "
+                f"source_stage=`{details.get('source_stage') or 'n/a'}` "
+                f"ready_for_canary=`{details.get('ready_for_canary')}` "
+                f"rollout_modes=`{details.get('rollout_modes')}`"
+            )
+    lines.extend(["", "## Semantic Classes", ""])
+    semantic_summary = report["summary"].get("semantic_class_summary") or {}
+    if not semantic_summary:
+        lines.append("- none")
+    else:
+        for semantic_class, details in semantic_summary.items():
+            lines.append(
+                f"- {semantic_class}: sample_count=`{details.get('sample_count')}` "
+                f"passed=`{details.get('passed_cases')}` failed=`{details.get('failed_cases')}` "
+                f"sources=`{details.get('sources')}`"
+            )
     lines.extend(["", "## Failed Cases", ""])
     failed_cases = [case for case in report["cases"] if not case.get("pass")]
     if not failed_cases:
@@ -186,7 +295,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
 
 def main() -> int:
     args = _parse_args()
-    corpus = _load_corpus(args.corpus)
+    corpus = _filter_corpus_by_source(_load_corpus(args.corpus), list(args.source_filter or []))
     headers = _load_headers(args.header)
     base_url = args.base_url.rstrip("/")
     session = requests.Session()
@@ -215,6 +324,8 @@ def main() -> int:
         "rollout_modes": dict(Counter(str(case.get("pivot_rollout_mode") or "unknown") for case in cases)),
         "categories": dict(Counter(str(case.get("category") or "uncategorized") for case in cases)),
         "sources": dict(Counter(str(case.get("source") or "unknown") for case in cases)),
+        "source_summary": _summarize_by_source(cases),
+        "semantic_class_summary": _summarize_by_semantic_class(cases),
         "service_commits": dict(Counter(str(case.get("service_commit") or "unknown") for case in cases)),
     }
     report = {
