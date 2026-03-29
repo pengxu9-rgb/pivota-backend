@@ -102,9 +102,15 @@ It should not run as part of routine pivot release close-out.
 - operator window is scheduled
 
 ### Recommended Surfaces
+- [smoke_real_payment_completion_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_real_payment_completion_signoff.py)
 - [smoke_readiness_alpha.sh](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_readiness_alpha.sh)
 - [DEVELOPER_RUNBOOK.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/readiness/2026-03-agent-commerce/DEVELOPER_RUNBOOK.md)
 - [REAL_MERCHANT_ALPHA_REPORT.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/readiness/2026-03-agent-commerce/REAL_MERCHANT_ALPHA_REPORT.md)
+
+Use the structured Python wrapper for routine operator evidence collection:
+- `--mode preflight` for readiness-owned checkout + order-sync only
+- `--mode bridge_paid_reference --payment-reference <psp_ref>` when a real successful PSP reference already exists
+- `--mode payment_status_sync` when readiness should create the payment intent and then absorb PSP state
 
 ### Execution Shape
 1. preflight with the existing order-backed safe canary
