@@ -758,6 +758,81 @@ async def test_shop_gateway_find_products_multi_visible_category_intent_prefers_
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_beauty_query_filters_pet_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        pet_vest = agent_shop_gateway_module.StandardProduct(
+            id="prod_pet_vest_1",
+            product_id="prod_pet_vest_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Warm Fall/Winter Padded Winter Vest for Dogs & Cats",
+            description="Soft-touch fabric for all-day comfort on sensitive skin.",
+            product_type="Padded Winter Vest",
+            price=24.0,
+            currency="USD",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [pet_vest], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="oil free sunscreen",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+            commerce_surface="agent_api",
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("total") == 0
+    assert result.get("products") == []
+    metadata = result.get("metadata") or {}
+    assert metadata.get("query_semantic_class") == "beauty"
+    assert metadata.get("beauty_pet_noise_filtered_count") == 1
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_visible_skin_care_category_intent_keeps_matching_moisturizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
