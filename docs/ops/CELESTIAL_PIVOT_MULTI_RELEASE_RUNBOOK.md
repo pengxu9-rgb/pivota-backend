@@ -17,6 +17,7 @@
 - Backfill / verify CLI: [catalog_backfill_verify.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_backfill_verify.py)
 - Release gate CLI: [pivot_multi_release_gate.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/pivot_multi_release_gate.py)
 - Catalog/Pivot live smoke: [smoke_catalog_pivot_v1.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_catalog_pivot_v1.py)
+- Commerce channels signoff smoke: [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
 - Employee/admin JWT mint helper: [mint_employee_jwt.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/mint_employee_jwt.py)
 - Generic commerce shadow audit: [commerce_shadow_audit.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/commerce_shadow_audit.py)
 - Generic commerce shadow compare: [compare_commerce_shadow_audit.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/compare_commerce_shadow_audit.py)
@@ -24,6 +25,7 @@
 - Bundle orchestrator: [run_pivot_release_bundle.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_pivot_release_bundle.py)
 - Grafana dashboard: [celestial_pivot_multi_release_dashboard.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/grafana/celestial_pivot_multi_release_dashboard.json)
 - Alert rules: [celestial_pivot_multi_release_alerts.yml](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/prometheus/celestial_pivot_multi_release_alerts.yml)
+- Follow-on phase plan: [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
 
 ## Corpus Assets
 - Fast beauty smoke corpus: [beauty_ranking_golden_corpus.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/beauty_ranking_golden_corpus.json)
@@ -62,6 +64,10 @@
     - Stage 2: `shopping-agent-ui`
     - Stage 3: `shopping-agent-web`
 13. Keep `Aurora` shadow-only throughout this phase.
+14. After stable all-sources observation passes, run `smoke_commerce_channels_signoff.py` against one approved primary merchant to directly sign off:
+    - catalog read-side query
+    - catalog write-side webhook + sync job + backfill apply/verify
+    - order-backed payment initiation canary
 
 ## Standard Bundle Command
 ```bash
@@ -169,6 +175,8 @@ After the active source is enabled and the new deployment is visible in `/health
 Notes:
 - `pivot_multi_release_gate.py` now retries transient transport failures per case and records request-level failures in the report instead of aborting the entire run.
 - If a report shows a one-off `shadow` or `no_result_mismatch` immediately after a deployment flip, verify with a stable rerun before treating it as a rollback signal.
+- `smoke_commerce_channels_signoff.py` is a close-out signoff for one approved merchant after the stage is already green.
+  It is not a replacement for the corpus-driven release gate.
 
 Example final all-sources observation:
 
@@ -213,6 +221,7 @@ python3 scripts/pivot_multi_release_gate.py \
 - beauty ranking audit compare JSON + Markdown
 - generic commerce shadow audit JSON + Markdown
 - generic commerce shadow audit compare JSON + Markdown
+- commerce channels signoff JSON + Markdown
 - consolidated evidence JSON + Markdown
 - Grafana screenshot/export
 - deployed commit from `X-Service-Commit`
@@ -299,3 +308,58 @@ Bundle integration:
 - `run_pivot_release_bundle.py --commerce-shadow-audit` writes `commerce-shadow-audit.json/md`.
 - Add `--commerce-shadow-audit-compare-before-json ...` to also emit `commerce-shadow-audit-compare.json/md`.
 - Keep generic commerce audit non-blocking by default, or add `--commerce-shadow-audit-blocking` for active serve canary signoff.
+
+## Commerce Channels Signoff
+Run this after the all-sources observation window is green and production is stable.
+This signoff is intentionally direct and merchant-specific; it supplements the corpus-based release bundle instead of replacing it.
+
+```bash
+ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \
+  --railway-service web \
+  --role admin \
+  --email ops+commerce-signoff@pivota.invalid \
+  --employee-id emp_commerce_signoff)"
+
+READINESS_INTERNAL_API_KEY="$(railway variables --service web --json | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["READINESS_INTERNAL_API_KEY"])')"
+
+python3 scripts/smoke_commerce_channels_signoff.py \
+  --base-url https://api.pivota.cc \
+  --merchant-id "$MERCHANT_ID" \
+  --database-url "$DATABASE_PUBLIC_URL" \
+  --query "winona soothing repair serum" \
+  --header "Authorization: Bearer $ADMIN_JWT" \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --backfill-timeout-seconds 60 \
+  --output-json output/pivot-release/commerce-signoff/commerce-channels-signoff.json \
+  --output-md output/pivot-release/commerce-signoff/commerce-channels-signoff.md
+```
+
+Review:
+- `overall_ok`
+- `summary.catalog_read_ok`
+- `summary.catalog_write_ok`
+- `summary.payment_order_ok`
+- step `catalog_webhook_ingest`
+- step `catalog_sync_job_final`
+- step `catalog_backfill_apply`
+- step `catalog_backfill_verify`
+- step `payment_order_backed_canary`
+
+Acceptance boundaries:
+- This directly signs off:
+  - product/catalog read-side lookup
+  - catalog write-side webhook ingest
+  - catalog sync job create/poll
+  - products-cache backfill apply + verify
+  - production-safe order-backed payment initiation
+- This does not sign off a real paid terminal state.
+  The order-backed canary intentionally stops at payment initiation and should remain safe to run during routine release close-out.
+- The script redacts `client_secret` and similar secrets before writing JSON/Markdown artifacts.
+
+When to rerun:
+- rerun after material changes to catalog write plumbing, PSP routing, or merchant-readiness order-backed canary behavior
+- rerun when closing a new production stage if the direct merchant signoff is part of that phase's acceptance
+
+For the next step beyond this merchant-specific signoff, use the separate follow-on phase plan:
+- [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
