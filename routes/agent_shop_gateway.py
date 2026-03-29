@@ -149,13 +149,17 @@ def _bootstrap_env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _bootstrap_normalize_surface_source(source: Optional[str]) -> str:
+    return str(source or "").strip().lower().replace("_", "-")
+
+
 def _bootstrap_env_csv_set(name: str, default: set[str]) -> set[str]:
     raw = (os.getenv(name) or "").strip()
     if not raw:
         return {item for item in default if str(item or "").strip()}
     values: set[str] = set()
     for part in raw.split(","):
-        token = _normalize_surface_source(part)
+        token = _bootstrap_normalize_surface_source(part)
         if token:
             values.add(token)
     return values
@@ -2046,7 +2050,7 @@ SHOPPING_MULTI_SOURCES = {
 
 
 def _normalize_surface_source(source: Optional[str]) -> str:
-    return str(source or "").strip().lower().replace("_", "-")
+    return _bootstrap_normalize_surface_source(source)
 
 
 def _is_shopping_multi_source(source: Optional[str]) -> bool:
