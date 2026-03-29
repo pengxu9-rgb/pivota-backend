@@ -25,6 +25,7 @@ def _build_args(tmp_path: Path, *, mode: str, refund: bool = False, payment_refe
         payment_intent_preferred_psps=None,
         payment_intent_psp_mode=None,
         refund=refund,
+        subprocess_timeout_seconds=180.0,
         run_id="20260330T000000Z",
         work_dir=str(tmp_path / "work"),
         output_json=str(tmp_path / "report.json"),
@@ -40,7 +41,7 @@ def _write_json(path: Path, payload: dict) -> None:
 def test_phase_b_preflight_wrapper_passes_when_order_sync_is_ready(monkeypatch, tmp_path: Path) -> None:
     args = _build_args(tmp_path, mode="preflight")
 
-    def _fake_run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    def _fake_run(cmd: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
         work_dir = Path(args.work_dir)
         _write_json(work_dir / "order_sync.json", {"checkout_id": "chk_1", "status": "state_synced", "order_id": "ORD_1", "replayed": False})
         _write_json(
@@ -70,7 +71,7 @@ def test_phase_b_preflight_wrapper_passes_when_order_sync_is_ready(monkeypatch, 
 def test_phase_b_bridge_wrapper_passes_when_paid_reference_converges(monkeypatch, tmp_path: Path) -> None:
     args = _build_args(tmp_path, mode="bridge_paid_reference", payment_reference="pi_live_123")
 
-    def _fake_run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    def _fake_run(cmd: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
         work_dir = Path(args.work_dir)
         _write_json(work_dir / "order_sync.json", {"checkout_id": "chk_1", "status": "state_synced", "order_id": "ORD_1", "replayed": False})
         _write_json(
@@ -119,7 +120,7 @@ def test_phase_b_bridge_wrapper_passes_when_paid_reference_converges(monkeypatch
 def test_phase_b_status_sync_wrapper_fails_when_payment_is_not_terminal(monkeypatch, tmp_path: Path) -> None:
     args = _build_args(tmp_path, mode="payment_status_sync")
 
-    def _fake_run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    def _fake_run(cmd: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
         work_dir = Path(args.work_dir)
         _write_json(work_dir / "order_sync.json", {"checkout_id": "chk_1", "status": "state_synced", "order_id": "ORD_1", "replayed": False})
         _write_json(
@@ -175,3 +176,21 @@ def test_phase_b_status_sync_wrapper_fails_when_payment_is_not_terminal(monkeypa
     assert payload["artifacts"]["payment_intent"]["payment_action"]["client_secret"] == "[REDACTED]"
     internal_key_index = payload["command"].index("--internal-key")
     assert payload["command"][internal_key_index + 1] == "[REDACTED]"
+
+
+def test_phase_b_wrapper_reports_timeout_as_structured_failure(monkeypatch, tmp_path: Path) -> None:
+    args = _build_args(tmp_path, mode="preflight")
+
+    def _fake_run(cmd: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 124, "", "[timeout] exceeded 180.0s")
+
+    monkeypatch.setattr(module, "_parse_args", lambda: args)
+    monkeypatch.setattr(module, "_run_smoke_command", _fake_run)
+
+    exit_code = module.main()
+
+    assert exit_code == 1
+    payload = json.loads(Path(args.output_json).read_text(encoding="utf-8"))
+    assert payload["summary"]["underlying_returncode"] == 124
+    assert payload["summary"]["overall_ok"] is False
+    assert "[timeout]" in payload["underlying_process"]["stderr_tail"]
