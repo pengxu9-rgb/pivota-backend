@@ -338,6 +338,49 @@ async def test_sort_items_prefers_external_source_order_before_price_when_releva
 
 
 @pytest.mark.asyncio
+async def test_sort_items_preserves_external_zero_source_order() -> None:
+    def build_item(title: str, source_order: int) -> module.PivotResultItem:
+        return module.PivotResultItem(
+            merchant=module.MerchantNode(merchant_name="Demo"),
+            product=module.ProductNode(title=title),
+            sku=module.SkuNode(),
+            offers=[
+                module.OfferNode(
+                    offer_id=f"offer::{title}",
+                    catalog_track="external_referral",
+                    truth_tier="fallback",
+                    readiness_tier="commerce_ready",
+                    offer_mode="redirect",
+                    source_system="external_product_seeds",
+                    pricing=module.PivotPricing(
+                        currency="USD",
+                        merchant_effective_price=Decimal("20.00"),
+                        estimated_best_price=Decimal("20.00"),
+                    ),
+                    incentives=[],
+                )
+            ],
+            catalog_track="external_referral",
+            truth_tier="fallback",
+            readiness_tier="commerce_ready",
+            freshness={},
+            source_system="external_product_seeds",
+            match_explanation={
+                "lane": "external_fallback",
+                "relevance_score": 0.9,
+                "source_order": source_order,
+            },
+        )
+
+    first_seed_row = build_item("First Seed Row", 0)
+    later_seed_row = build_item("Later Seed Row", 1)
+
+    items = module._sort_items([later_seed_row, first_seed_row])
+
+    assert items[0].product.title == "First Seed Row"
+
+
+@pytest.mark.asyncio
 async def test_build_external_item_uses_text_relevance_as_primary_signal() -> None:
     more_relevant = module._build_external_item(
         {

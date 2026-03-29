@@ -999,7 +999,9 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
         source_order = 999999
         if item.catalog_track == "external_referral":
             try:
-                source_order = int(item.match_explanation.get("source_order") or 999999)
+                raw_source_order = item.match_explanation.get("source_order")
+                if raw_source_order is not None:
+                    source_order = int(raw_source_order)
             except Exception:
                 source_order = 999999
         best_price = None
