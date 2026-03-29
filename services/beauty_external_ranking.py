@@ -51,6 +51,17 @@ _CATEGORY_ANCHORS: Dict[str, List[str]] = {
     "gloss": ["gloss", "glosses", "lip gloss", "lip glosses"],
 }
 
+_STRICT_CATEGORY_INTENT_LABELS = {
+    "cleanser",
+    "moisturizer",
+    "sunscreen",
+    "foundation",
+    "blush",
+    "lipstick",
+    "gloss",
+    "toner",
+}
+
 _CONCERN_TERMS: Dict[str, List[str]] = {
     "acne": ["acne", "blemish", "breakout", "breakouts"],
     "pores": ["pore", "pores"],
@@ -760,6 +771,9 @@ def score_external_beauty_candidate(
     candidate_packaging_labels = _packaging_variant_labels(blob)
     query_has_sun_protection_intent = "sunscreen" in query_categories or "spf" in normalized_query
     candidate_has_sun_protection = _candidate_has_sun_protection(candidate)
+    query_has_strict_category_intent = any(
+        label in _STRICT_CATEGORY_INTENT_LABELS for label in query_categories
+    )
 
     category_match_count = sum(
         1 for label in query_categories if label in candidate_categories or label in category_anchor_blob
@@ -798,13 +812,19 @@ def score_external_beauty_candidate(
 
     penalties: Dict[str, float] = {}
     if query_categories and category_match_count <= 0:
-        penalties["missing_category_anchor"] = 0.1 if ingredient_concern_synergy > 0 else 0.24
+        penalties["missing_category_anchor"] = (
+            0.24
+            if query_has_strict_category_intent
+            else (0.1 if ingredient_concern_synergy > 0 else 0.24)
+        )
     if query_ingredient_ids and ingredient_match_count <= 0:
         penalties["missing_active_ingredient"] = 0.12
     if query_concerns and concern_match_count <= 0:
         penalties["missing_concern_anchor"] = 0.18 if query_ingredient_ids else 0.1
     if query_formula and formula_match_count <= 0:
         penalties["missing_formula_constraint"] = 0.08
+    if "sunscreen" in query_categories and "sunscreen" not in candidate_categories:
+        penalties["missing_sunscreen_category"] = 0.12 if candidate_has_sun_protection else 0.08
     if "eye cream" in title_text and "eye" not in query_terms:
         penalties["eye_cream_mismatch"] = 0.22
     if any(term in blob for term in _EXCLUSION_BUNDLE_TERMS) and not any(term in query_terms for term in _EXCLUSION_BUNDLE_TERMS):
@@ -856,6 +876,7 @@ def score_external_beauty_candidate(
         "query_form_factor_labels": query_form_factors,
         "query_packaging_labels": query_packaging_labels,
         "query_has_sun_protection_intent": query_has_sun_protection_intent,
+        "query_has_strict_category_intent": query_has_strict_category_intent,
         "candidate_category_labels": candidate_categories,
         "candidate_concern_labels": candidate_concerns,
         "candidate_formula_labels": candidate_formula,

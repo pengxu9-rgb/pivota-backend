@@ -6052,6 +6052,93 @@ async def test_shop_gateway_find_products_multi_external_only_preserves_canonica
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_external_only_keeps_cleanser_intent_over_treatment_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_rows = [
+        _gateway_ranking_seed_row(
+            seed_id="seed_acne_mist",
+            external_product_id="ext_acne_mist",
+            title="Body Acne Clearing Mist with 2% Salicylic Acid",
+            canonical_url="https://example.com/products/body-acne-clearing-mist-salicylic-acid",
+            category="Treatment",
+            description="Targets acne and pores with salicylic acid.",
+            visible_attributes={"skin_concern": ["acne", "pores"]},
+            price_amount=28.0,
+            source_order=0,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_acne_cleanser",
+            external_product_id="ext_acne_cleanser",
+            title="Acne Control Clarifying Cleanser",
+            canonical_url="https://example.com/products/acne-control-clarifying-cleanser",
+            category="Cleanser",
+            description="Clarifying cleanser for acne-prone skin and pores.",
+            visible_attributes={
+                "product_category": ["cleanser"],
+                "skin_concern": ["acne", "pores"],
+            },
+            price_amount=28.0,
+            source_order=5,
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "acne cleanser"
+        return {
+            "rows": list(seed_rows),
+            "query_timeout": False,
+            "query_ms": 10,
+            "total_count": len(seed_rows),
+        }
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return f"https://api.example/r/{kwargs['ctx'].get('seedId')}"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="acne cleanser",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert [product.get("title") for product in products[:2]] == [
+        "Acne Control Clarifying Cleanser",
+        "Body Acne Clearing Mist with 2% Salicylic Acid",
+    ]
+    assert products[1]["ranking_score_breakdown"]["quality_penalties"]["missing_category_anchor"] > 0
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_external_only_uses_category_anchor_for_spf_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6138,6 +6225,7 @@ async def test_shop_gateway_find_products_multi_external_only_uses_category_anch
     )
     assert products[0]["ranking_score_breakdown"]["category_anchor_score"] > 0
     assert products[1]["ranking_score_breakdown"]["quality_penalties_total"] > 0
+    assert products[1]["ranking_score_breakdown"]["quality_penalties"]["missing_sunscreen_category"] > 0
 
 
 @pytest.mark.asyncio
