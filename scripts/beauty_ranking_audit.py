@@ -285,17 +285,32 @@ def _post_json(
     timeout_seconds: float,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
-    response = requests.post(url, json=payload, headers=headers, timeout=timeout_seconds)
-    elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
     try:
-        body = response.json()
-    except Exception:
-        body = {"raw_text": response.text[:2000]}
-    return {
-        "status_code": response.status_code,
-        "elapsed_ms": elapsed_ms,
-        "body": body,
-    }
+        response = requests.post(url, json=payload, headers=headers, timeout=timeout_seconds)
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw_text": response.text[:2000]}
+        return {
+            "status_code": response.status_code,
+            "elapsed_ms": elapsed_ms,
+            "body": body,
+            "request_failed": False,
+            "request_timed_out": False,
+        }
+    except requests.RequestException as exc:
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        return {
+            "status_code": None,
+            "elapsed_ms": elapsed_ms,
+            "body": {
+                "error": exc.__class__.__name__,
+                "message": str(exc)[:2000],
+            },
+            "request_failed": True,
+            "request_timed_out": isinstance(exc, requests.Timeout),
+        }
 
 
 def _extract_titles(payload: Dict[str, Any], *, payload_type: str) -> List[str]:
