@@ -144,6 +144,59 @@ def test_rank_external_seed_rows_uses_source_order_only_as_tie_break() -> None:
     assert ranked[0].candidate_score == ranked[1].candidate_score
 
 
+def test_rank_external_seed_rows_penalizes_travel_size_without_packaging_intent() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="travel_cleanser",
+                title="Ultra Gentle Cream-to-Foam Face Cleanser Travel Size",
+                canonical_url="https://example.com/products/ultra-gentle-cleanser-travel",
+                category="Cleanser",
+                visible_attributes={"product_category": ["cleanser"]},
+            ),
+            _seed_row(
+                external_product_id="jumbo_cleanser",
+                title="Ultra Gentle Cream-to-Foam Face Cleanser Jumbo",
+                canonical_url="https://example.com/products/ultra-gentle-cleanser-jumbo",
+                category="Cleanser",
+                visible_attributes={"product_category": ["cleanser"]},
+            ),
+        ],
+        query="gentle cleanser",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "jumbo_cleanser"
+    assert ranked[1].ranking_score_breakdown["quality_penalties"]["travel_size_without_intent"] > 0
+    assert ranked[0].candidate_score > ranked[1].candidate_score
+
+
+def test_rank_external_seed_rows_does_not_use_description_only_for_cleanser_category_anchor() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="body_wash",
+                title="Pistachio & Dark Cherry Hand & Body Wash",
+                canonical_url="https://example.com/products/pistachio-dark-cherry-hand-body-wash",
+                category="Body Wash",
+                description="Powered by goat milk, this gentle cleanser creates a warm, foamy lather.",
+            ),
+            _seed_row(
+                external_product_id="face_cleanser",
+                title="Ultra Gentle Cream-to-Foam Face Cleanser",
+                canonical_url="https://example.com/products/ultra-gentle-face-cleanser",
+                category="Cleanser",
+                visible_attributes={"product_category": ["cleanser"]},
+            ),
+        ],
+        query="gentle cleanser",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "face_cleanser"
+    assert ranked[1].ranking_score_breakdown["quality_penalties"]["missing_category_anchor"] > 0
+
+
 def test_build_external_seed_filter_product_preserves_structured_beauty_fields() -> None:
     row = _seed_row(
         external_product_id="spf_50",

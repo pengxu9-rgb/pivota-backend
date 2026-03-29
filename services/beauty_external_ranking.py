@@ -72,6 +72,26 @@ _FORMULA_TERMS: Dict[str, List[str]] = {
 
 _FORM_FACTOR_TERMS = ("gel", "mist", "pads", "cream", "balm", "eye", "travel", "jumbo")
 _EXCLUSION_BUNDLE_TERMS = ("routine", "duo", "set", "kit", "bundle")
+_PACKAGING_VARIANT_TERMS: Dict[str, List[str]] = {
+    "travel_size": [
+        "travel size",
+        "travel-size",
+        "travel",
+        "mini",
+        "mini size",
+        "trial size",
+        "sample size",
+        "deluxe sample",
+    ],
+    "jumbo": [
+        "jumbo",
+        "value size",
+        "full size",
+        "full-size",
+        "larger size",
+        "large size",
+    ],
+}
 
 
 @dataclass
@@ -535,12 +555,33 @@ def _candidate_category_labels(candidate: RankedExternalBeautyCandidate) -> List
     return categories
 
 
+def _candidate_category_anchor_blob(candidate: RankedExternalBeautyCandidate) -> str:
+    return _normalize_query_text(
+        " ".join(
+            [
+                candidate.title,
+                candidate.product_type,
+                " ".join(_candidate_category_labels(candidate)),
+            ]
+        )
+    )
+
+
 def _form_factor_labels(text: str) -> List[str]:
     labels: List[str] = []
     normalized = _normalize_query_text(text)
     for term in _FORM_FACTOR_TERMS:
         if _normalized_visible_term_matches(normalized, term):
             labels.append(term)
+    return labels
+
+
+def _packaging_variant_labels(text: str) -> List[str]:
+    labels: List[str] = []
+    normalized = _normalize_query_text(text)
+    for label, terms in _PACKAGING_VARIANT_TERMS.items():
+        if any(_normalized_visible_term_matches(normalized, term) for term in terms):
+            labels.append(label)
     return labels
 
 
@@ -601,6 +642,7 @@ def score_external_beauty_candidate(
     title_compact = re.sub(r"[^a-z0-9]+", "", title_text)
     blob = _candidate_blob(candidate)
     blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
+    category_anchor_blob = _candidate_category_anchor_blob(candidate)
     candidate_categories = _candidate_category_labels(candidate)
     candidate_concerns = list((candidate.filter_product.visible_attributes or {}).get("skin_concern") or [])
     candidate_formula = list((candidate.filter_product.visible_attributes or {}).get("formula_constraint") or [])
@@ -631,8 +673,12 @@ def score_external_beauty_candidate(
     query_ingredient_ids = _extract_query_ingredient_ids(normalized_query)
     query_form_factors = _form_factor_labels(normalized_query)
     candidate_form_factors = _form_factor_labels(blob)
+    query_packaging_labels = _packaging_variant_labels(normalized_query)
+    candidate_packaging_labels = _packaging_variant_labels(blob)
 
-    category_match_count = sum(1 for label in query_categories if label in candidate_categories or label in blob)
+    category_match_count = sum(
+        1 for label in query_categories if label in candidate_categories or label in category_anchor_blob
+    )
     ingredient_match_count = sum(
         1
         for ingredient_id in query_ingredient_ids
@@ -649,12 +695,16 @@ def score_external_beauty_candidate(
         if label in candidate_formula or label.replace("_", " ") in blob
     )
     form_factor_match_count = sum(1 for label in query_form_factors if label in candidate_form_factors or label in blob)
+    packaging_match_count = sum(
+        1 for label in query_packaging_labels if label in candidate_packaging_labels
+    )
 
     category_anchor_score = min(0.28, category_match_count * 0.18)
     active_ingredient_score = min(0.28, ingredient_match_count * 0.2)
     concern_score = min(0.24, concern_match_count * 0.12)
     formula_score = min(0.12, formula_match_count * 0.08)
     form_factor_score = min(0.1, form_factor_match_count * 0.05)
+    packaging_score = min(0.08, packaging_match_count * 0.04)
     ingredient_concern_synergy = (
         0.12
         if query_ingredient_ids and query_concerns and concern_match_count > 0
@@ -678,6 +728,10 @@ def score_external_beauty_candidate(
         query_ingredient_ids and concern_match_count > 0
     ):
         penalties["form_factor_mismatch"] = 0.08
+    if query_packaging_labels and packaging_match_count <= 0:
+        penalties["packaging_mismatch"] = 0.08
+    if not query_packaging_labels and "travel_size" in candidate_packaging_labels:
+        penalties["travel_size_without_intent"] = 0.12
 
     quality_penalties_total = round(sum(penalties.values()), 4)
     candidate_score = round(
@@ -692,6 +746,7 @@ def score_external_beauty_candidate(
                 + ingredient_concern_synergy
                 + formula_score
                 + form_factor_score
+                + packaging_score
                 - quality_penalties_total,
             ),
         ),
@@ -708,11 +763,13 @@ def score_external_beauty_candidate(
         "query_formula_labels": query_formula,
         "query_ingredient_ids": query_ingredient_ids,
         "query_form_factor_labels": query_form_factors,
+        "query_packaging_labels": query_packaging_labels,
         "candidate_category_labels": candidate_categories,
         "candidate_concern_labels": candidate_concerns,
         "candidate_formula_labels": candidate_formula,
         "candidate_ingredient_ids": candidate_ingredient_ids,
         "candidate_form_factor_labels": candidate_form_factors,
+        "candidate_packaging_labels": candidate_packaging_labels,
         "title_matches": title_matches,
         "blob_matches": blob_matches,
         "category_match_count": category_match_count,
@@ -720,6 +777,7 @@ def score_external_beauty_candidate(
         "concern_match_count": concern_match_count,
         "formula_match_count": formula_match_count,
         "form_factor_match_count": form_factor_match_count,
+        "packaging_match_count": packaging_match_count,
     }
     candidate.ranking_score_breakdown = {
         "ranking_audit_version": BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
@@ -729,6 +787,7 @@ def score_external_beauty_candidate(
         "concern_score": round(concern_score, 4),
         "formula_score": round(formula_score, 4),
         "form_factor_score": round(form_factor_score, 4),
+        "packaging_score": round(packaging_score, 4),
         "ingredient_concern_synergy": round(ingredient_concern_synergy, 4),
         "quality_penalties": penalties,
         "quality_penalties_total": quality_penalties_total,

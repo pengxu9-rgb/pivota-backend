@@ -6138,3 +6138,102 @@ async def test_shop_gateway_find_products_multi_external_only_uses_category_anch
     )
     assert products[0]["ranking_score_breakdown"]["category_anchor_score"] > 0
     assert products[1]["ranking_score_breakdown"]["quality_penalties_total"] > 0
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_external_only_penalizes_travel_size_without_size_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_rows = [
+        _gateway_ranking_seed_row(
+            seed_id="seed_cleanser_travel",
+            external_product_id="ext_cleanser_travel",
+            title="Ultra Gentle Cream-to-Foam Face Cleanser Travel Size",
+            canonical_url="https://example.com/products/ultra-gentle-cleanser-travel",
+            category="Cleanser",
+            description="Travel size ultra gentle cleanser.",
+            visible_attributes={"product_category": ["cleanser"]},
+            price_amount=12.0,
+            source_order=0,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_cleanser_jumbo",
+            external_product_id="ext_cleanser_jumbo",
+            title="Ultra Gentle Cream-to-Foam Face Cleanser Jumbo",
+            canonical_url="https://example.com/products/ultra-gentle-cleanser-jumbo",
+            category="Cleanser",
+            description="Gentle cleanser jumbo size.",
+            visible_attributes={"product_category": ["cleanser"]},
+            price_amount=24.0,
+            source_order=7,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_body_wash_noise",
+            external_product_id="ext_body_wash_noise",
+            title="Pistachio & Dark Cherry Hand & Body Wash",
+            canonical_url="https://example.com/products/pistachio-dark-cherry-hand-body-wash",
+            category="Body Wash",
+            description="Powered by goat milk, this gentle cleanser creates a warm, foamy lather.",
+            price_amount=22.0,
+            source_order=2,
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "gentle cleanser"
+        return {
+            "rows": list(seed_rows),
+            "query_timeout": False,
+            "query_ms": 8,
+            "total_count": len(seed_rows),
+        }
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return f"https://api.example/r/{kwargs['ctx'].get('seedId')}"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="gentle cleanser",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert [product.get("title") for product in products[:3]] == [
+        "Ultra Gentle Cream-to-Foam Face Cleanser Jumbo",
+        "Ultra Gentle Cream-to-Foam Face Cleanser Travel Size",
+        "Pistachio & Dark Cherry Hand & Body Wash",
+    ]
+    assert (
+        products[1]["ranking_score_breakdown"]["quality_penalties"]["travel_size_without_intent"]
+        > 0
+    )
+    assert products[2]["ranking_score_breakdown"]["quality_penalties"]["missing_category_anchor"] > 0
