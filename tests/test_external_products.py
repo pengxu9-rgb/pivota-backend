@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock
 
 import pytest
@@ -5903,3 +5903,238 @@ async def test_shop_gateway_find_products_multi_marks_cross_currency_budget_as_u
     assert metadata.get("budget_fx_candidate_currency") == "USD"
     assert metadata.get("budget_fx_unresolved") is True
     assert source_breakdown.get("external_seed_count") == 0
+
+
+def _gateway_ranking_seed_row(
+    *,
+    seed_id: str,
+    external_product_id: str,
+    title: str,
+    canonical_url: str,
+    category: str,
+    description: str = "",
+    visible_attributes: Optional[dict[str, Any]] = None,
+    reviewed_ingredient_ids: Optional[list[str]] = None,
+    price_amount: float = 20.0,
+    source_order: int = 0,
+) -> dict[str, Any]:
+    return {
+        "id": seed_id,
+        "external_product_id": external_product_id,
+        "market": "US",
+        "tool": "*",
+        "utm_template": None,
+        "partner_type": None,
+        "disclosure_text": None,
+        "destination_url": canonical_url,
+        "canonical_url": canonical_url,
+        "domain": canonical_url.split("/")[2],
+        "title": title,
+        "image_url": None,
+        "price_amount": price_amount,
+        "price_currency": "USD",
+        "availability": "in_stock",
+        "source_order": source_order,
+        "updated_at": "2026-03-29T00:00:00Z",
+        "seed_data": {
+            "title": title,
+            "description": description,
+            "category": category,
+            "visible_attributes": visible_attributes or {},
+            "reviewed_ingredient_ids": reviewed_ingredient_ids or [],
+            "variants": [],
+            "brand": "Demo Brand",
+        },
+        "status": "active",
+        "notes": None,
+        "created_by_employee_id": None,
+        "attached_product_key": None,
+        "attached_variant_id": None,
+        "created_at": None,
+        "updated_at": "2026-03-29T00:00:00Z",
+    }
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_external_only_preserves_canonical_ranking_for_acne_cleanser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_rows = [
+        _gateway_ranking_seed_row(
+            seed_id="seed_cleanser_large",
+            external_product_id="ext_cleanser_large",
+            title="Clarifying Cleanser Larger Size",
+            canonical_url="https://example.com/products/clarifying-cleanser-larger-size",
+            category="Cleanser",
+            description="Clarifying cleanser for blemish-prone skin.",
+            visible_attributes={"product_category": ["cleanser"]},
+            price_amount=32.0,
+            source_order=0,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_cleanser_acne",
+            external_product_id="ext_cleanser_acne",
+            title="Acne Control Clarifying Cleanser",
+            canonical_url="https://example.com/products/acne-control-clarifying-cleanser",
+            category="Cleanser",
+            description="Clarifying cleanser for acne-prone skin and pores.",
+            visible_attributes={
+                "product_category": ["cleanser"],
+                "skin_concern": ["acne", "pores"],
+            },
+            price_amount=28.0,
+            source_order=5,
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "acne cleanser"
+        return {
+            "rows": list(seed_rows),
+            "query_timeout": False,
+            "query_ms": 10,
+            "total_count": len(seed_rows),
+        }
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return f"https://api.example/r/{kwargs['ctx'].get('seedId')}"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="acne cleanser",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    assert [product.get("title") for product in products[:2]] == [
+        "Acne Control Clarifying Cleanser",
+        "Clarifying Cleanser Larger Size",
+    ]
+    assert products[0]["candidate_source"] == "external_seed"
+    assert (
+        products[0]["ranking_score_breakdown"]["candidate_score"]
+        > products[1]["ranking_score_breakdown"]["candidate_score"]
+    )
+    assert products[0]["ranking_score_breakdown"]["concern_score"] > 0
+    assert products[1]["ranking_score_breakdown"]["quality_penalties_total"] > 0
+    assert metadata.get("external_seed_returned_count") == 2
+    assert metadata.get("ranking_audit_version") == agent_shop_gateway_module.BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_external_only_uses_category_anchor_for_spf_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_rows = [
+        _gateway_ranking_seed_row(
+            seed_id="seed_spf_moisturizer",
+            external_product_id="ext_spf_moisturizer",
+            title="Superactive Moisturizer SPF 50: Brightening Travel Size",
+            canonical_url="https://example.com/products/superactive-moisturizer-spf-50-brightening-travel-size",
+            category="Moisturizer",
+            description="Daily brightening moisturizer with SPF 50.",
+            visible_attributes={"product_category": ["moisturizer"]},
+            price_amount=20.0,
+            source_order=0,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_spf_sunscreen",
+            external_product_id="ext_spf_sunscreen",
+            title="Mineral Sunscreen SPF 50",
+            canonical_url="https://example.com/products/mineral-sunscreen-spf-50",
+            category="Sunscreen",
+            description="Broad spectrum sunscreen SPF 50.",
+            visible_attributes={"product_category": ["sunscreen"]},
+            price_amount=24.0,
+            source_order=6,
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "spf 50"
+        return {
+            "rows": list(seed_rows),
+            "query_timeout": False,
+            "query_ms": 9,
+            "total_count": len(seed_rows),
+        }
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return f"https://api.example/r/{kwargs['ctx'].get('seedId')}"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="spf 50",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert [product.get("title") for product in products[:2]] == [
+        "Mineral Sunscreen SPF 50",
+        "Superactive Moisturizer SPF 50: Brightening Travel Size",
+    ]
+    assert (
+        products[0]["ranking_score_breakdown"]["candidate_score"]
+        > products[1]["ranking_score_breakdown"]["candidate_score"]
+    )
+    assert products[0]["ranking_score_breakdown"]["category_anchor_score"] > 0
+    assert products[1]["ranking_score_breakdown"]["quality_penalties_total"] > 0
