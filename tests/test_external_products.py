@@ -6237,3 +6237,87 @@ async def test_shop_gateway_find_products_multi_external_only_penalizes_travel_s
         > 0
     )
     assert products[2]["ranking_score_breakdown"]["quality_penalties"]["missing_category_anchor"] > 0
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_external_only_penalizes_spf_moisturizer_without_spf_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    seed_rows = [
+        _gateway_ranking_seed_row(
+            seed_id="seed_plain_moisturizer",
+            external_product_id="ext_plain_moisturizer",
+            title="Multi-Peptide Moisturizer",
+            canonical_url="https://example.com/products/multi-peptide-moisturizer",
+            category="Moisturizer",
+            description="Daily peptide moisturizer.",
+            visible_attributes={"product_category": ["moisturizer"]},
+            price_amount=24.0,
+            source_order=7,
+        ),
+        _gateway_ranking_seed_row(
+            seed_id="seed_spf_moisturizer",
+            external_product_id="ext_spf_moisturizer",
+            title="Dew-Glow Moisturizer SPF 50",
+            canonical_url="https://example.com/products/dew-glow-moisturizer-spf-50",
+            category="Moisturizer",
+            description="Daily moisturizer with SPF 50.",
+            visible_attributes={"product_category": ["moisturizer"]},
+            price_amount=24.0,
+            source_order=0,
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return []
+        if "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "moisturizer"
+        return {
+            "rows": list(seed_rows),
+            "query_timeout": False,
+            "query_ms": 8,
+            "total_count": len(seed_rows),
+        }
+
+    async def fake_make_external_redirect_url(**kwargs):
+        return f"https://api.example/r/{kwargs['ctx'].get('seedId')}"
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(agent_shop_gateway_module, "_make_external_redirect_url", fake_make_external_redirect_url)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="moisturizer",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert [product.get("title") for product in products[:2]] == [
+        "Multi-Peptide Moisturizer",
+        "Dew-Glow Moisturizer SPF 50",
+    ]
+    assert products[1]["ranking_score_breakdown"]["quality_penalties"]["sun_protection_without_intent"] > 0

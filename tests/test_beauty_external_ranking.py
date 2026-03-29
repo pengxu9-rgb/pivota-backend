@@ -197,6 +197,32 @@ def test_rank_external_seed_rows_does_not_use_description_only_for_cleanser_cate
     assert ranked[1].ranking_score_breakdown["quality_penalties"]["missing_category_anchor"] > 0
 
 
+def test_rank_external_seed_rows_penalizes_spf_moisturizer_without_sun_protection_intent() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="plain_moisturizer",
+                title="Multi-Peptide Moisturizer",
+                canonical_url="https://example.com/products/multi-peptide-moisturizer",
+                category="Moisturizer",
+                visible_attributes={"product_category": ["moisturizer"]},
+            ),
+            _seed_row(
+                external_product_id="spf_moisturizer",
+                title="Dew-Glow Moisturizer SPF 50",
+                canonical_url="https://example.com/products/dew-glow-moisturizer-spf-50",
+                category="Moisturizer",
+                visible_attributes={"product_category": ["moisturizer"]},
+            ),
+        ],
+        query="moisturizer",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "plain_moisturizer"
+    assert ranked[1].ranking_score_breakdown["quality_penalties"]["sun_protection_without_intent"] > 0
+
+
 def test_build_external_seed_filter_product_preserves_structured_beauty_fields() -> None:
     row = _seed_row(
         external_product_id="spf_50",

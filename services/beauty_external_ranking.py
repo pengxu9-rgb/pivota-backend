@@ -567,6 +567,31 @@ def _candidate_category_anchor_blob(candidate: RankedExternalBeautyCandidate) ->
     )
 
 
+def _candidate_has_sun_protection(candidate: RankedExternalBeautyCandidate) -> bool:
+    visible_option_labels: List[str] = []
+    for variant in candidate.filter_product.variants or []:
+        for label in variant.visible_option_labels or []:
+            normalized = _normalize_query_text(label)
+            if normalized:
+                visible_option_labels.append(normalized)
+    haystack = _normalize_query_text(
+        " ".join(
+            [
+                candidate.title,
+                candidate.product_type,
+                " ".join(_candidate_category_labels(candidate)),
+                " ".join(visible_option_labels),
+            ]
+        )
+    )
+    return bool(
+        "sunscreen" in haystack
+        or "sun screen" in haystack
+        or "spf" in haystack
+        or any(label.startswith("spf_") for label in visible_option_labels)
+    )
+
+
 def _form_factor_labels(text: str) -> List[str]:
     labels: List[str] = []
     normalized = _normalize_query_text(text)
@@ -675,6 +700,8 @@ def score_external_beauty_candidate(
     candidate_form_factors = _form_factor_labels(blob)
     query_packaging_labels = _packaging_variant_labels(normalized_query)
     candidate_packaging_labels = _packaging_variant_labels(blob)
+    query_has_sun_protection_intent = "sunscreen" in query_categories or "spf" in normalized_query
+    candidate_has_sun_protection = _candidate_has_sun_protection(candidate)
 
     category_match_count = sum(
         1 for label in query_categories if label in candidate_categories or label in category_anchor_blob
@@ -732,6 +759,12 @@ def score_external_beauty_candidate(
         penalties["packaging_mismatch"] = 0.08
     if not query_packaging_labels and "travel_size" in candidate_packaging_labels:
         penalties["travel_size_without_intent"] = 0.12
+    if (
+        "moisturizer" in query_categories
+        and not query_has_sun_protection_intent
+        and candidate_has_sun_protection
+    ):
+        penalties["sun_protection_without_intent"] = 0.1
 
     quality_penalties_total = round(sum(penalties.values()), 4)
     candidate_score = round(
@@ -764,12 +797,14 @@ def score_external_beauty_candidate(
         "query_ingredient_ids": query_ingredient_ids,
         "query_form_factor_labels": query_form_factors,
         "query_packaging_labels": query_packaging_labels,
+        "query_has_sun_protection_intent": query_has_sun_protection_intent,
         "candidate_category_labels": candidate_categories,
         "candidate_concern_labels": candidate_concerns,
         "candidate_formula_labels": candidate_formula,
         "candidate_ingredient_ids": candidate_ingredient_ids,
         "candidate_form_factor_labels": candidate_form_factors,
         "candidate_packaging_labels": candidate_packaging_labels,
+        "candidate_has_sun_protection": candidate_has_sun_protection,
         "title_matches": title_matches,
         "blob_matches": blob_matches,
         "category_match_count": category_match_count,
