@@ -48,6 +48,7 @@ from services.beauty_external_ranking import (
 from services.product_query_service import get_products_hybrid
 from services.external_seed_search import fetch_external_seed_rows
 from services.pivot_query_service import search_pivot_catalog
+from services.query_semantic_class import classify_query_semantic_class
 from services.similarity_service import (
     SimilarityService,
     SimilarityStrategy,
@@ -530,55 +531,7 @@ def _clamp_search_limit(raw_limit: Any, *, fallback: int = 20) -> int:
 
 
 def _classify_query_semantic_class(query: Optional[str]) -> str:
-    q = str(query or "").strip().lower()
-    if not q:
-        return "default"
-    q_compact = re.sub(r"[^a-z0-9]+", "", q)
-    if (
-        "fragrance free" in q
-        or "fragrance-free" in q
-        or "free fragrance" in q
-        or "sin fragancia" in q
-    ):
-        return "beauty"
-    if re.search(
-        r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist)\b",
-        q,
-    ):
-        return "fragrance"
-    if any(
-        token in q_compact
-        for token in (
-            "perfume",
-            "perfumes",
-            "fragrance",
-            "fragrances",
-            "parfum",
-            "parfums",
-            "cologne",
-            "bodymist",
-            "eaudeparfum",
-            "eaudetoilette",
-            "edp",
-            "edt",
-        )
-    ):
-        return "fragrance"
-    if re.search(
-        r"\b(lingerie|underwear|bra|panties|panty|briefs|thong|lencer[ií]a|ropa interior)\b",
-        q,
-    ):
-        return "lingerie"
-    if re.search(
-        r"\b("
-        r"beauty|skincare|skin care|cosmetic|cosmetics|makeup|"
-        r"serum|toner|moisturizer|moisturiser|cleanser|"
-        r"foundation|lipstick|blush|gloss"
-        r")\b",
-        q,
-    ):
-        return "beauty"
-    return "default"
+    return classify_query_semantic_class(query)
 
 
 def _build_fragrance_semantic_retry_query(query: Optional[str]) -> Optional[str]:

@@ -195,6 +195,81 @@ async def test_search_pivot_catalog_uses_lightweight_external_fallback_query(
 
 
 @pytest.mark.asyncio
+async def test_search_pivot_catalog_skips_external_fallback_for_default_generic_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_fetch_rows(**_kwargs):
+        return []
+
+    async def fake_build_items(*_args, **_kwargs):
+        return []
+
+    async def fail_fetch_external_seed_rows(**_kwargs):
+        raise AssertionError("default generic queries should not trigger beauty external fallback")
+
+    monkeypatch.setattr(module, "_fetch_canonical_search_rows", fake_fetch_rows)
+    monkeypatch.setattr(module, "_build_canonical_items", fake_build_items)
+    monkeypatch.setattr(module, "fetch_external_seed_rows", fail_fetch_external_seed_rows)
+
+    result = await module.search_pivot_catalog(
+        PivotQueryRequest(
+            query="linen sheet set",
+            limit=5,
+            include_external=True,
+            include_incentives=False,
+        )
+    )
+
+    assert result.total == 0
+    assert result.items == []
+
+
+@pytest.mark.asyncio
+async def test_search_pivot_catalog_keeps_external_fallback_for_fragrance_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {}
+
+    async def fake_fetch_rows(**_kwargs):
+        return []
+
+    async def fake_build_items(*_args, **_kwargs):
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        observed.update(kwargs)
+        return {
+            "rows": [
+                {
+                    "external_product_id": "ext_frag_1",
+                    "title": "Café Rose Eau de Parfum",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/cafe-rose-edp",
+                    "destination_url": "https://example.com/products/cafe-rose-edp",
+                    "seed_data": {"brand": "Example"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(module, "_fetch_canonical_search_rows", fake_fetch_rows)
+    monkeypatch.setattr(module, "_build_canonical_items", fake_build_items)
+    monkeypatch.setattr(module, "fetch_external_seed_rows", fake_fetch_external_seed_rows)
+
+    result = await module.search_pivot_catalog(
+        PivotQueryRequest(
+            query="rose eau de parfum",
+            limit=5,
+            include_external=True,
+            include_incentives=False,
+        )
+    )
+
+    assert result.total == 1
+    assert observed["include_seed_data_text_match"] is False
+    assert observed["prefer_terms"] == ["rose", "eau", "de", "parfum"]
+
+
+@pytest.mark.asyncio
 async def test_search_pivot_catalog_uses_broad_external_text_scan_when_lightweight_stage_is_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
