@@ -446,6 +446,102 @@ def test_external_text_relevance_uses_slug_tokens_for_acne_queries() -> None:
     assert slug_with_acne > slug_without_acne
 
 
+def test_sort_items_prefers_gentle_cleanser_anchor_over_serum_and_generic_cleanser() -> None:
+    items = module._sort_items(
+        [
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_gentle_serum",
+                    "title": "Gentle Glycolic Acid Resurfacing Serum",
+                    "domain": "murad.com",
+                    "canonical_url": "https://murad.com/products/gentle-glycolic-acid-resurfacing-serum",
+                    "destination_url": "https://murad.com/products/gentle-glycolic-acid-resurfacing-serum",
+                    "brand_term_hit": 1,
+                    "seed_data": {"brand": "Murad"},
+                },
+                "gentle cleanser",
+                source_order=0,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_milky_cleanser",
+                    "title": "Milky Moisture Cleanser",
+                    "domain": "byoma.com",
+                    "canonical_url": "https://byoma.com/products/milky-moisture-cleanser",
+                    "destination_url": "https://byoma.com/products/milky-moisture-cleanser",
+                    "brand_term_hit": 1,
+                    "seed_data": {"brand": "BYOMA"},
+                },
+                "gentle cleanser",
+                source_order=1,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_ultra_gentle_cleanser",
+                    "title": "Ultra Gentle Cream-to-Foam Face Cleanser with Colloidal Oatmeal + Glycerin Travel Size",
+                    "domain": "firstaidbeauty.com",
+                    "canonical_url": "https://firstaidbeauty.com/products/face-cleanser-travel-size",
+                    "destination_url": "https://firstaidbeauty.com/products/face-cleanser-travel-size",
+                    "brand_term_hit": 2,
+                    "seed_data": {"brand": "First Aid Beauty"},
+                },
+                "gentle cleanser",
+                source_order=2,
+            ),
+        ]
+    )
+
+    assert items[0].product.title == "Ultra Gentle Cream-to-Foam Face Cleanser with Colloidal Oatmeal + Glycerin Travel Size"
+
+
+def test_sort_items_penalizes_eye_cream_and_routine_for_barrier_moisturizer_query() -> None:
+    items = module._sort_items(
+        [
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_eye_cream",
+                    "title": "Barrier Repair Eye Cream",
+                    "domain": "byoma.com",
+                    "canonical_url": "https://byoma.com/products/barrier-repair-eye-cream",
+                    "destination_url": "https://byoma.com/products/barrier-repair-eye-cream",
+                    "brand_term_hit": 1,
+                    "seed_data": {"brand": "BYOMA"},
+                },
+                "hydrating barrier moisturizer fragrance free",
+                source_order=0,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_routine",
+                    "title": "Cult Fragrance-Free Skincare Routine",
+                    "domain": "embryolisse.com",
+                    "canonical_url": "https://embryolisse.com/products/natural-beauty-set",
+                    "destination_url": "https://embryolisse.com/products/natural-beauty-set",
+                    "brand_term_hit": 2,
+                    "seed_data": {"brand": "Embryolisse"},
+                },
+                "hydrating barrier moisturizer fragrance free",
+                source_order=1,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_barrier_moisturizer",
+                    "title": "Après Skin Rich Rescue Barrier Moisturizer with Ceramides",
+                    "domain": "olehenriksen.com",
+                    "canonical_url": "https://olehenriksen.com/products/apres-skin-multi-use-rich-rescue-cream",
+                    "destination_url": "https://olehenriksen.com/products/apres-skin-multi-use-rich-rescue-cream",
+                    "brand_term_hit": 2,
+                    "seed_data": {"brand": "Olehenriksen"},
+                },
+                "hydrating barrier moisturizer fragrance free",
+                source_order=2,
+            ),
+        ]
+    )
+
+    assert items[0].product.title == "Après Skin Rich Rescue Barrier Moisturizer with Ceramides"
+
+
 @pytest.mark.asyncio
 async def test_fetch_canonical_search_rows_uses_candidate_cte_and_avoids_json_search_for_non_vertical(
     monkeypatch: pytest.MonkeyPatch,
