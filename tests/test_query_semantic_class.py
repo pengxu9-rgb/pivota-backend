@@ -15,4 +15,6 @@ def test_classify_query_semantic_class_detects_fragrance() -> None:
 
 def test_classify_query_semantic_class_detects_beauty_and_lingerie() -> None:
     assert classify_query_semantic_class("fragrance free barrier moisturizer") == "beauty"
+    assert classify_query_semantic_class("sunscreen") == "beauty"
+    assert classify_query_semantic_class("spf 50") == "beauty"
     assert classify_query_semantic_class("lingerie set") == "lingerie"

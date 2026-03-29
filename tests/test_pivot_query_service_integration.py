@@ -270,6 +270,51 @@ async def test_search_pivot_catalog_keeps_external_fallback_for_fragrance_query(
 
 
 @pytest.mark.asyncio
+async def test_search_pivot_catalog_keeps_external_fallback_for_sunscreen_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {}
+
+    async def fake_fetch_rows(**_kwargs):
+        return []
+
+    async def fake_build_items(*_args, **_kwargs):
+        return []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        observed.update(kwargs)
+        return {
+            "rows": [
+                {
+                    "external_product_id": "ext_sun_1",
+                    "title": "Ultra Light Liquid Mineral Sunscreen SPF 30",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/mineral-sunscreen-spf-30",
+                    "destination_url": "https://example.com/products/mineral-sunscreen-spf-30",
+                    "seed_data": {"brand": "Example"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(module, "_fetch_canonical_search_rows", fake_fetch_rows)
+    monkeypatch.setattr(module, "_build_canonical_items", fake_build_items)
+    monkeypatch.setattr(module, "fetch_external_seed_rows", fake_fetch_external_seed_rows)
+
+    result = await module.search_pivot_catalog(
+        PivotQueryRequest(
+            query="sunscreen",
+            limit=5,
+            include_external=True,
+            include_incentives=False,
+        )
+    )
+
+    assert result.total == 1
+    assert observed["include_seed_data_text_match"] is False
+    assert observed["prefer_terms"] == ["sunscreen"]
+
+
+@pytest.mark.asyncio
 async def test_search_pivot_catalog_uses_broad_external_text_scan_when_lightweight_stage_is_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
