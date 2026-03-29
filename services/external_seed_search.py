@@ -260,6 +260,7 @@ async def fetch_external_seed_rows(
     prefer_terms: Optional[List[str]] = None,
     scope: str = "default",
     use_required_terms_filter: bool = False,
+    include_total_count: bool = True,
 ) -> Dict[str, Any]:
     where = ["status = :status"]
     values: Dict[str, Any] = {
@@ -281,6 +282,15 @@ async def fetch_external_seed_rows(
     if text_clause:
         where.append(text_clause)
         values.update(text_values)
+    if use_required_terms_filter:
+        required_clause, required_values = build_external_seed_required_terms_clause(
+            required_terms=required_terms,
+            include_seed_data_text_match=include_seed_data_text_match,
+            param_prefix="required",
+        )
+        if required_clause:
+            where.append(required_clause)
+            values.update(required_values)
     # Recall-first policy: required_terms are ranking hints only (via prefer_terms),
     # never a hard SQL filter.
     rank_sql, rank_values = build_external_seed_prefer_terms_rank_sql(
@@ -332,13 +342,16 @@ async def fetch_external_seed_rows(
                 async with database.transaction():
                     await database.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
                     rows = await database.fetch_all(query_sql, query_values)
-                    try:
-                        count_row = await database.fetch_one(count_sql, count_values)
-                        total_count = int(
-                            (count_row.get("total_count") if isinstance(count_row, dict) else dict(count_row).get("total_count"))
-                            or 0
-                        )
-                    except Exception:
+                    if include_total_count:
+                        try:
+                            count_row = await database.fetch_one(count_sql, count_values)
+                            total_count = int(
+                                (count_row.get("total_count") if isinstance(count_row, dict) else dict(count_row).get("total_count"))
+                                or 0
+                            )
+                        except Exception:
+                            total_count = len(rows or [])
+                    else:
                         total_count = len(rows or [])
             except Exception as exc:
                 if _is_missing_external_seed_table(exc):
@@ -361,6 +374,30 @@ async def fetch_external_seed_rows(
                     database.fetch_all(query_sql, query_values),
                     timeout=timeout_seconds,
                 )
+                if include_total_count:
+                    try:
+                        count_row = await asyncio.wait_for(
+                            database.fetch_one(count_sql, count_values),
+                            timeout=timeout_seconds,
+                        )
+                        total_count = int(
+                            (
+                                count_row.get("total_count")
+                                if isinstance(count_row, dict)
+                                else dict(count_row).get("total_count")
+                            )
+                            or 0
+                        )
+                    except Exception:
+                        total_count = len(rows or [])
+                else:
+                    total_count = len(rows or [])
+        else:
+            rows = await asyncio.wait_for(
+                database.fetch_all(query_sql, query_values),
+                timeout=timeout_seconds,
+            )
+            if include_total_count:
                 try:
                     count_row = await asyncio.wait_for(
                         database.fetch_one(count_sql, count_values),
@@ -376,25 +413,7 @@ async def fetch_external_seed_rows(
                     )
                 except Exception:
                     total_count = len(rows or [])
-        else:
-            rows = await asyncio.wait_for(
-                database.fetch_all(query_sql, query_values),
-                timeout=timeout_seconds,
-            )
-            try:
-                count_row = await asyncio.wait_for(
-                    database.fetch_one(count_sql, count_values),
-                    timeout=timeout_seconds,
-                )
-                total_count = int(
-                    (
-                        count_row.get("total_count")
-                        if isinstance(count_row, dict)
-                        else dict(count_row).get("total_count")
-                    )
-                    or 0
-                )
-            except Exception:
+            else:
                 total_count = len(rows or [])
         if total_count <= 0:
             total_count = len(rows or [])

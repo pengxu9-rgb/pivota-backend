@@ -34,9 +34,13 @@ async def test_sync_marks_truncated_when_limit_reached_with_next_page(monkeypatc
     async def fake_upsert(**_kwargs):
         return None
 
+    async def fake_delete_missing(**_kwargs):
+        return 0
+
     monkeypatch.setattr(sync_service, "_get_shopify_store_credentials", fake_creds)
     monkeypatch.setattr(sync_service, "fetch_merchant_products", fake_fetch)
     monkeypatch.setattr(sync_service, "upsert_product_cache", fake_upsert)
+    monkeypatch.setattr(sync_service, "delete_missing_products_from_cache", fake_delete_missing)
 
     summary = await sync_service.sync_shopify_products_for_merchant(
         merchant_id="merch_1",
@@ -44,6 +48,7 @@ async def test_sync_marks_truncated_when_limit_reached_with_next_page(monkeypatc
         ttl_seconds=3600,
         per_page=2,
         max_pages=20,
+        ingest_catalog=False,
     )
 
     assert summary["productsFetched"] == 2
@@ -66,9 +71,13 @@ async def test_sync_marks_truncated_when_next_token_is_unparseable(monkeypatch: 
     async def fake_upsert(**_kwargs):
         return None
 
+    async def fake_delete_missing(**_kwargs):
+        return 0
+
     monkeypatch.setattr(sync_service, "_get_shopify_store_credentials", fake_creds)
     monkeypatch.setattr(sync_service, "fetch_merchant_products", fake_fetch)
     monkeypatch.setattr(sync_service, "upsert_product_cache", fake_upsert)
+    monkeypatch.setattr(sync_service, "delete_missing_products_from_cache", fake_delete_missing)
 
     summary = await sync_service.sync_shopify_products_for_merchant(
         merchant_id="merch_1",
@@ -76,6 +85,7 @@ async def test_sync_marks_truncated_when_next_token_is_unparseable(monkeypatch: 
         ttl_seconds=3600,
         per_page=5,
         max_pages=20,
+        ingest_catalog=False,
     )
 
     assert summary["productsFetched"] == 1
@@ -115,10 +125,14 @@ async def test_sync_injects_description_text_for_html_descriptions(
         payloads[0]["platform_metadata"] = {"reviewed_ingredient_ids": ["Niacinamide"]}
         return payloads
 
+    async def fake_delete_missing(**_kwargs):
+        return 0
+
     monkeypatch.setattr(module, "_get_shopify_store_credentials", fake_creds)
     monkeypatch.setattr(module, "fetch_merchant_products", fake_fetch)
     monkeypatch.setattr(module, "upsert_product_cache", fake_upsert)
     monkeypatch.setattr(module, "hydrate_product_payloads_from_attached_seed_runtime_evidence", fake_hydrate)
+    monkeypatch.setattr(module, "delete_missing_products_from_cache", fake_delete_missing)
 
     await module.sync_shopify_products_for_merchant(
         merchant_id="merch_1",
@@ -126,6 +140,7 @@ async def test_sync_injects_description_text_for_html_descriptions(
         ttl_seconds=3600,
         per_page=5,
         max_pages=20,
+        ingest_catalog=False,
     )
 
     assert len(captured) == 1

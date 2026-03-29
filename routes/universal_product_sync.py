@@ -13,6 +13,7 @@ import logging
 from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
 from db.products import delete_missing_products_from_cache
+from services.catalog_sync_service import ingest_standard_products
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,7 @@ async def universal_product_sync(
         # 4.1 Paginate through all pages (Shopify limit=250/page). Guard with max_pages.
         synced_count = 0
         synced_platform_ids = set()
+        catalog_payloads = []
         page_token: Optional[str] = None
         max_pages = 20  # safety guard: 20 * 250 = 5000 items
         pages = 0
@@ -174,6 +176,7 @@ async def universal_product_sync(
                             ttl_seconds=604800  # 7 days
                         )
                         synced_platform_ids.add(str(product.id))
+                        catalog_payloads.append(product_data)
                         synced_count += 1
                     except Exception as e:
                         logger.error(f"Failed to cache product {product.id}: {e}")
@@ -201,6 +204,23 @@ async def universal_product_sync(
                 f"Failed to cleanup stale products after sync for "
                 f"merchant={request.merchant_id}, platform={platform}: {cleanup_error}"
             )
+
+        if catalog_payloads:
+            try:
+                await ingest_standard_products(
+                    merchant_id=request.merchant_id,
+                    platform=platform,
+                    product_payloads=catalog_payloads,
+                    source_system="universal_product_sync",
+                    source_ref=f"universal_product_sync:{request.merchant_id}:{platform}",
+                )
+            except Exception as catalog_error:
+                logger.error(
+                    "Failed canonical catalog ingest after universal sync merchant=%s platform=%s err=%s",
+                    request.merchant_id,
+                    platform,
+                    catalog_error,
+                )
 
         # 6. Update store sync status
         await update_sync_status(store_info.get("store_id"), synced_count)

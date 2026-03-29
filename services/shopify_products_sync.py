@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from db.database import database
-from db.products import upsert_product_cache
+from db.products import delete_missing_products_from_cache, upsert_product_cache
 from adapters.product_adapters import (
     SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE,
     fetch_merchant_products,
@@ -108,6 +108,7 @@ async def sync_shopify_products_for_merchant(
     ttl_seconds: int = 7 * 24 * 60 * 60,
     per_page: int = 250,
     max_pages: int = 20,
+    ingest_catalog: bool = True,
 ) -> Dict[str, Any]:
     """
     Fetch Shopify products and upsert into products_cache.
@@ -134,6 +135,8 @@ async def sync_shopify_products_for_merchant(
     last_error: Optional[str] = None
     truncated = False
     truncated_reason: Optional[str] = None
+    synced_platform_ids = set()
+    catalog_payloads = []
 
     # Fetch in pages to avoid huge payloads and to stay within timeouts.
     while fetched < limit and pages < max_pages:
@@ -210,6 +213,8 @@ async def sync_shopify_products_for_merchant(
                 ttl_seconds=ttl_seconds,
             )
             upserted += 1
+            synced_platform_ids.add(platform_product_id)
+            catalog_payloads.append(prod)
 
         fetched += len(products)
         page_token = next_token
@@ -223,6 +228,26 @@ async def sync_shopify_products_for_merchant(
     if not truncated and pages >= max_pages and page_token:
         truncated = True
         truncated_reason = "max_pages_reached_with_next_page"
+
+    deleted_stale = 0
+    if synced_platform_ids:
+        deleted_stale = await delete_missing_products_from_cache(
+            merchant_id=merchant_id,
+            platform="shopify",
+            valid_platform_product_ids=list(synced_platform_ids),
+        )
+
+    catalog_stats: Optional[Dict[str, Any]] = None
+    if ingest_catalog and catalog_payloads:
+        from services.catalog_sync_service import ingest_standard_products
+
+        catalog_stats = await ingest_standard_products(
+            merchant_id=merchant_id,
+            platform="shopify",
+            product_payloads=catalog_payloads,
+            source_system="shopify_products_sync",
+            source_ref=f"shopify_products_sync:{merchant_id}:{datetime.utcnow().isoformat()}",
+        )
 
     return {
         "merchantId": merchant_id,
@@ -238,6 +263,9 @@ async def sync_shopify_products_for_merchant(
         "limit": limit,
         "perPage": per_page,
         "maxPages": max_pages,
+        "deletedStale": deleted_stale,
+        "catalogIngested": bool(catalog_stats),
+        "catalogStats": catalog_stats,
         "syncedAt": datetime.utcnow().isoformat(),
         "lastError": last_error,
     }

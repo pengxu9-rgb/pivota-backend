@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
+import db.catalog  # noqa: F401  (register canonical catalog tables in metadata)
 try:
     import db.merchant_portal_preferences  # noqa: F401  (register merchant portal preferences table in metadata)
 except ModuleNotFoundError:
@@ -34,6 +35,7 @@ except ModuleNotFoundError:
 import subprocess
 import os
 from pathlib import Path
+from utils.startup_mode import should_skip_heavy_startup
 
 
 INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
@@ -167,6 +169,8 @@ from routes.product_routes import router as product_router
 from routes.product_routes_v2 import router as product_router_v2
 from routes.product_sync import router as product_sync_router
 from routes.universal_product_sync import router as universal_sync_router
+from routes.catalog_routes import router as catalog_router
+from routes.pivot_routes import router as pivot_router
 from routes.sync_all_platforms import router as sync_all_router
 # Temporary debug endpoints removed - v2 endpoint is now stable
 # from routes.products_no_auth import router as products_debug_router
@@ -226,6 +230,8 @@ from routes.agent_routing_api import router as agent_routing_api_router
 from routes.agent_revenue_api import router as agent_revenue_api_router
 from routes.admin_run_migration_012 import router as admin_run_migration_012_router
 from routes.admin_run_migration_013 import router as admin_run_migration_013_router
+from routes.admin_run_migration_058 import router as admin_run_migration_058_router
+from routes.admin_run_migration_059 import router as admin_run_migration_059_router
 # [Phase 5.5] Dual-sided revenue
 from routes.merchant_commission_api import router as merchant_commission_api_router
 # [Phase 5.6] Agent Portal settlement, protocol, integration
@@ -762,6 +768,8 @@ app.include_router(agent_routing_api_router)  # Agent routing policies and testi
 app.include_router(agent_revenue_api_router)  # Agent revenue policies and earnings (+ Phase 5.5 expectations)
 app.include_router(admin_run_migration_012_router)  # Run migrations 012a/012b - Phase 5 Revenue
 app.include_router(admin_run_migration_013_router)  # Run migration 013 - Consolidate routing systems
+app.include_router(admin_run_migration_058_router)  # Run migration 058 - Catalog core
+app.include_router(admin_run_migration_059_router)  # Run migration 059 - Catalog pivot search indexes
 
 # [Phase 5.5] Dual-sided revenue matching
 app.include_router(merchant_commission_api_router)  # Merchant commission offers
@@ -855,6 +863,8 @@ app.include_router(product_router_v2)  # Product management v2 (cache-based) - M
 app.include_router(product_sync_router)  # Product sync from platforms (legacy)
 app.include_router(product_router)  # Product management - MUST be after v2 to avoid /{merchant_id} matching /v2/xxx
 app.include_router(universal_sync_router)
+app.include_router(catalog_router)  # Canonical catalog sync and reconcile APIs
+app.include_router(pivot_router)  # Celestial pivot semantic query APIs
 app.include_router(sync_all_router)  # Universal product sync (new)
 app.include_router(product_monitoring_router)  # Product sync monitoring and metrics
 # Temporary debug endpoints commented out - v2 is stable now
@@ -1049,11 +1059,7 @@ async def startup():
         # This startup function contains a large amount of best-effort schema/DDL work.
         # In Railway, the service healthcheck must pass quickly; long-running DDL can
         # exceed the healthcheck retry window and cause deploy rollbacks.
-        skip_heavy_env = os.getenv("SKIP_HEAVY_STARTUP_INIT")
-        if skip_heavy_env is None:
-            skip_heavy = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower() == "production"
-        else:
-            skip_heavy = skip_heavy_env.lower() in {"1", "true", "yes"}
+        skip_heavy = should_skip_heavy_startup()
 
         if skip_heavy:
             logger.warning(

@@ -1,0 +1,433 @@
+from __future__ import annotations
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Table,
+    Text,
+)
+from sqlalchemy.sql import func
+
+from db.database import JSONB_TYPE, metadata
+
+
+catalog_merchants = Table(
+    "catalog_merchants",
+    metadata,
+    Column("merchant_id", String(64), primary_key=True),
+    Column("merchant_name", String(255), nullable=True),
+    Column("primary_platform", String(64), nullable=True),
+    Column("status", String(32), nullable=False, server_default="active"),
+    Column("source_system", String(64), nullable=True),
+    Column("source_ref", String(255), nullable=True),
+    Column("metadata_json", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+catalog_products = Table(
+    "catalog_products",
+    metadata,
+    Column("product_key", String(255), primary_key=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("platform", String(64), nullable=False, index=True),
+    Column("source_product_id", String(128), nullable=False),
+    Column("catalog_track", String(32), nullable=False, server_default="internal_merchant"),
+    Column("truth_tier", String(32), nullable=False, server_default="primary"),
+    Column("readiness_tier", String(32), nullable=False, server_default="commerce_ready"),
+    Column("source_system", String(64), nullable=True),
+    Column("source_ref", String(255), nullable=True),
+    Column("title", Text, nullable=False),
+    Column("description", Text, nullable=True),
+    Column("brand", String(255), nullable=True),
+    Column("product_type", String(255), nullable=True),
+    Column("category", String(255), nullable=True),
+    Column("canonical_url", Text, nullable=True),
+    Column("image_url", Text, nullable=True),
+    Column("product_payload", JSONB_TYPE, nullable=True),
+    Column("freshness_json", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    Index(
+        "idx_catalog_products_source_identity",
+        "merchant_id",
+        "platform",
+        "source_product_id",
+        unique=True,
+    ),
+)
+
+
+catalog_skus = Table(
+    "catalog_skus",
+    metadata,
+    Column("sku_key", String(255), primary_key=True),
+    Column("product_key", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("platform", String(64), nullable=False, index=True),
+    Column("source_product_id", String(128), nullable=False),
+    Column("source_variant_id", String(128), nullable=False),
+    Column("sku", String(128), nullable=True, index=True),
+    Column("barcode", String(128), nullable=True),
+    Column("title", Text, nullable=False),
+    Column("currency", String(16), nullable=True),
+    Column("image_url", Text, nullable=True),
+    Column("visible_attributes", JSONB_TYPE, nullable=True),
+    Column("visible_option_labels", JSONB_TYPE, nullable=True),
+    Column("ingredient_ids", JSONB_TYPE, nullable=True),
+    Column("sku_payload", JSONB_TYPE, nullable=True),
+    Column("readiness_tier", String(32), nullable=False, server_default="commerce_ready"),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    Index("idx_catalog_skus_product_key", "product_key"),
+    Index(
+        "idx_catalog_skus_source_identity",
+        "merchant_id",
+        "platform",
+        "source_variant_id",
+        unique=True,
+    ),
+)
+
+
+catalog_offers = Table(
+    "catalog_offers",
+    metadata,
+    Column("offer_id", String(255), primary_key=True),
+    Column("sku_key", String(255), nullable=False, index=True),
+    Column("product_key", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("catalog_track", String(32), nullable=False, server_default="internal_merchant"),
+    Column("truth_tier", String(32), nullable=False, server_default="primary"),
+    Column("readiness_tier", String(32), nullable=False, server_default="commerce_ready"),
+    Column("offer_mode", String(32), nullable=False, server_default="merchant_checkout"),
+    Column("channel", String(64), nullable=False, server_default="default"),
+    Column("availability", String(32), nullable=False, server_default="unknown"),
+    Column("inventory_quantity", Integer, nullable=True),
+    Column("currency", String(16), nullable=True),
+    Column("list_price", Numeric(12, 2), nullable=True),
+    Column("merchant_effective_price", Numeric(12, 2), nullable=True),
+    Column("estimated_best_price", Numeric(12, 2), nullable=True),
+    Column("price_confidence", Numeric(5, 2), nullable=True),
+    Column("source_system", String(64), nullable=True),
+    Column("source_ref", String(255), nullable=True),
+    Column("offer_payload", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    Index("idx_catalog_offers_merchant_track", "merchant_id", "catalog_track"),
+)
+
+
+catalog_inventory_snapshots = Table(
+    "catalog_inventory_snapshots",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("offer_id", String(255), nullable=False, index=True),
+    Column("sku_key", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("inventory_quantity", Integer, nullable=True),
+    Column("availability", String(32), nullable=False, server_default="unknown"),
+    Column("source_system", String(64), nullable=True),
+    Column("source_ref", String(255), nullable=True),
+    Column("observed_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+catalog_price_snapshots = Table(
+    "catalog_price_snapshots",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("offer_id", String(255), nullable=False, index=True),
+    Column("sku_key", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("currency", String(16), nullable=True),
+    Column("list_price", Numeric(12, 2), nullable=True),
+    Column("merchant_effective_price", Numeric(12, 2), nullable=True),
+    Column("estimated_best_price", Numeric(12, 2), nullable=True),
+    Column("source_system", String(64), nullable=True),
+    Column("source_ref", String(255), nullable=True),
+    Column("observed_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+catalog_field_facts = Table(
+    "catalog_field_facts",
+    metadata,
+    Column("fact_id", String(255), primary_key=True),
+    Column("entity_type", String(32), nullable=False, index=True),
+    Column("entity_id", String(255), nullable=False, index=True),
+    Column("field_family", String(64), nullable=False),
+    Column("field_key", String(128), nullable=False),
+    Column("source_system", String(64), nullable=False),
+    Column("source_ref", String(255), nullable=True),
+    Column("value_json", JSONB_TYPE, nullable=True),
+    Column("observed_at", DateTime, nullable=False),
+    Column("fresh_until", DateTime, nullable=True),
+    Column("confidence", Numeric(5, 2), nullable=True),
+    Column("review_state", String(32), nullable=False, server_default="observed"),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    Index(
+        "idx_catalog_field_facts_field",
+        "entity_type",
+        "entity_id",
+        "field_family",
+        "field_key",
+    ),
+)
+
+
+catalog_sync_events = Table(
+    "catalog_sync_events",
+    metadata,
+    Column("event_id", String(255), primary_key=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("connector", String(64), nullable=False, index=True),
+    Column("event_type", String(64), nullable=False),
+    Column("topic", String(128), nullable=True),
+    Column("status", String(32), nullable=False, server_default="pending"),
+    Column("payload_json", JSONB_TYPE, nullable=True),
+    Column("source_ref", String(255), nullable=True),
+    Column("error_message", Text, nullable=True),
+    Column("occurred_at", DateTime, nullable=True),
+    Column("processed_at", DateTime, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    Index("idx_catalog_sync_events_pending", "merchant_id", "connector", "status"),
+)
+
+
+catalog_sync_jobs = Table(
+    "catalog_sync_jobs",
+    metadata,
+    Column("job_id", String(255), primary_key=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("connector", String(64), nullable=False, index=True),
+    Column("mode", String(64), nullable=False),
+    Column("scope_json", JSONB_TYPE, nullable=True),
+    Column("status", String(32), nullable=False, server_default="pending"),
+    Column("requested_by", String(128), nullable=True),
+    Column("stats_json", JSONB_TYPE, nullable=True),
+    Column("error_message", Text, nullable=True),
+    Column("started_at", DateTime, nullable=True),
+    Column("completed_at", DateTime, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    Index("idx_catalog_sync_jobs_status", "merchant_id", "connector", "status"),
+)
+
+
+catalog_promotions = Table(
+    "catalog_promotions",
+    metadata,
+    Column("promotion_id", String(255), primary_key=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("source_promotion_id", String(255), nullable=True),
+    Column("name", String(255), nullable=False),
+    Column("promotion_class", String(32), nullable=False),
+    Column("method", String(32), nullable=False, server_default="automatic"),
+    Column("label", String(255), nullable=False),
+    Column("code", String(128), nullable=True),
+    Column("start_at", DateTime, nullable=True),
+    Column("end_at", DateTime, nullable=True),
+    Column("channels_json", JSONB_TYPE, nullable=True),
+    Column("scope_json", JSONB_TYPE, nullable=True),
+    Column("config_json", JSONB_TYPE, nullable=True),
+    Column("truth_tier", String(32), nullable=False, server_default="primary"),
+    Column("source_system", String(64), nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+catalog_payment_incentives = Table(
+    "catalog_payment_incentives",
+    metadata,
+    Column("incentive_id", String(255), primary_key=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("incentive_type", String(64), nullable=False),
+    Column("funding_source", String(64), nullable=True),
+    Column("payment_method_type", String(64), nullable=True),
+    Column("card_network", String(64), nullable=True),
+    Column("issuer_name", String(128), nullable=True),
+    Column("wallet_type", String(64), nullable=True),
+    Column("installment_provider", String(64), nullable=True),
+    Column("label", String(255), nullable=False),
+    Column("benefit_kind", String(64), nullable=False),
+    Column("benefit_value", Numeric(12, 2), nullable=True),
+    Column("benefit_currency", String(16), nullable=True),
+    Column("market", String(16), nullable=True),
+    Column("eligibility_confidence", Numeric(5, 2), nullable=True),
+    Column("source_system", String(64), nullable=True),
+    Column("source_ref", String(255), nullable=True),
+    Column("status", String(32), nullable=False, server_default="active"),
+    Column("starts_at", DateTime, nullable=True),
+    Column("ends_at", DateTime, nullable=True),
+    Column("metadata_json", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+catalog_incentive_rules = Table(
+    "catalog_incentive_rules",
+    metadata,
+    Column("rule_id", String(255), primary_key=True),
+    Column("incentive_id", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("rule_type", String(64), nullable=False),
+    Column("scope_json", JSONB_TYPE, nullable=True),
+    Column("conditions_json", JSONB_TYPE, nullable=True),
+    Column("schedule_json", JSONB_TYPE, nullable=True),
+    Column("human_rule", Text, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+catalog_offer_incentive_links = Table(
+    "catalog_offer_incentive_links",
+    metadata,
+    Column("link_id", String(255), primary_key=True),
+    Column("offer_id", String(255), nullable=False, index=True),
+    Column("incentive_id", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("relationship_type", String(64), nullable=False, server_default="eligible"),
+    Column("priority", Integer, nullable=False, server_default="0"),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+catalog_quote_snapshots = Table(
+    "catalog_quote_snapshots",
+    metadata,
+    Column("quote_snapshot_id", String(255), primary_key=True),
+    Column("quote_id", String(255), nullable=True, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("offer_id", String(255), nullable=True, index=True),
+    Column("sku_key", String(255), nullable=True, index=True),
+    Column("product_key", String(255), nullable=True, index=True),
+    Column("currency", String(16), nullable=True),
+    Column("list_price", Numeric(12, 2), nullable=True),
+    Column("merchant_effective_price", Numeric(12, 2), nullable=True),
+    Column("estimated_best_price", Numeric(12, 2), nullable=True),
+    Column("exact_quote_price", Numeric(12, 2), nullable=True),
+    Column("incentives_json", JSONB_TYPE, nullable=True),
+    Column("quote_payload_json", JSONB_TYPE, nullable=True),
+    Column("expires_at", DateTime, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+beauty_product_profiles = Table(
+    "beauty_product_profiles",
+    metadata,
+    Column("product_key", String(255), primary_key=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("taxonomy_json", JSONB_TYPE, nullable=True),
+    Column("concerns_json", JSONB_TYPE, nullable=True),
+    Column("claims_json", JSONB_TYPE, nullable=True),
+    Column("routine_phase", String(64), nullable=True),
+    Column("benefits_json", JSONB_TYPE, nullable=True),
+    Column("profile_payload", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+beauty_sku_ingredients = Table(
+    "beauty_sku_ingredients",
+    metadata,
+    Column("sku_key", String(255), primary_key=True),
+    Column("product_key", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("raw_inci", Text, nullable=True),
+    Column("normalized_ingredients_json", JSONB_TYPE, nullable=True),
+    Column("active_ingredients_json", JSONB_TYPE, nullable=True),
+    Column("concentration_notes_json", JSONB_TYPE, nullable=True),
+    Column("allergen_flags_json", JSONB_TYPE, nullable=True),
+    Column("evidence_refs_json", JSONB_TYPE, nullable=True),
+    Column("source_system", String(64), nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+beauty_usage_guides = Table(
+    "beauty_usage_guides",
+    metadata,
+    Column("guide_id", String(255), primary_key=True),
+    Column("product_key", String(255), nullable=False, index=True),
+    Column("sku_key", String(255), nullable=True, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("how_to_use_text", Text, nullable=True),
+    Column("steps_json", JSONB_TYPE, nullable=True),
+    Column("frequency", String(64), nullable=True),
+    Column("time_of_day", String(32), nullable=True),
+    Column("application_order", Integer, nullable=True),
+    Column("warnings_json", JSONB_TYPE, nullable=True),
+    Column("evidence_refs_json", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+beauty_shades = Table(
+    "beauty_shades",
+    metadata,
+    Column("shade_id", String(255), primary_key=True),
+    Column("sku_key", String(255), nullable=False, index=True),
+    Column("product_key", String(255), nullable=False, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("shade_code", String(128), nullable=True),
+    Column("shade_name", String(255), nullable=False),
+    Column("shade_family", String(128), nullable=True),
+    Column("undertone", String(128), nullable=True),
+    Column("finish", String(128), nullable=True),
+    Column("swatch_refs_json", JSONB_TYPE, nullable=True),
+    Column("media_refs_json", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+beauty_compatibility_rules = Table(
+    "beauty_compatibility_rules",
+    metadata,
+    Column("compatibility_rule_id", String(255), primary_key=True),
+    Column("product_key", String(255), nullable=True, index=True),
+    Column("sku_key", String(255), nullable=True, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("rule_type", String(64), nullable=False),
+    Column("subject_ingredients_json", JSONB_TYPE, nullable=True),
+    Column("related_ingredients_json", JSONB_TYPE, nullable=True),
+    Column("verdict", String(64), nullable=False),
+    Column("rationale", Text, nullable=True),
+    Column("evidence_refs_json", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+beauty_content_assets = Table(
+    "beauty_content_assets",
+    metadata,
+    Column("asset_id", String(255), primary_key=True),
+    Column("product_key", String(255), nullable=False, index=True),
+    Column("sku_key", String(255), nullable=True, index=True),
+    Column("merchant_id", String(64), nullable=False, index=True),
+    Column("asset_type", String(64), nullable=False),
+    Column("title", String(255), nullable=True),
+    Column("url", Text, nullable=False),
+    Column("thumbnail_url", Text, nullable=True),
+    Column("sort_order", Integer, nullable=False, server_default="0"),
+    Column("metadata_json", JSONB_TYPE, nullable=True),
+    Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)

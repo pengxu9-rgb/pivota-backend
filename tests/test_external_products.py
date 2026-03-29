@@ -852,6 +852,335 @@ async def test_shop_gateway_find_products_multi_visible_skin_care_category_inten
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_non_strict_beauty_prefetch_expands_scope_and_uses_text_recall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_test_1", "business_name": "Test Merchant 1"},
+        {"merchant_id": "merch_test_2", "business_name": "Test Merchant 2"},
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+    captured_prefetch_values: dict[str, Any] = {}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q or "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            captured_prefetch_values["merchant_ids"] = list((values or {}).get("merchant_ids") or [])
+            return [
+                {
+                    "merchant_id": "merch_live_1",
+                    "product_data": {
+                        "id": "prod_moisturizer_live",
+                        "product_id": "prod_moisturizer_live",
+                        "platform": "shopify",
+                        "merchant_id": "merch_live_1",
+                        "title": "Barrier Repair Cream",
+                        "description": "A barrier moisturizer for dry skin.",
+                        "product_type": "Face Cream",
+                        "price": 29.0,
+                        "currency": "USD",
+                        "inventory_quantity": 8,
+                        "image_url": "https://cdn.example.com/moisturizer.jpg",
+                        "status": "active",
+                        "orderable": True,
+                        "variants": [],
+                    },
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SHOPPING_FAST_MERCHANT_SEED_LIMIT", 1)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="moisturizer",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    assert captured_prefetch_values["merchant_ids"] == [
+        "merch_test_1",
+        "merch_test_2",
+        "merch_live_1",
+    ]
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_moisturizer_live"
+    assert metadata.get("expanded_shopping_beauty_prefetch") is True
+    assert metadata.get("non_strict_beauty_text_recall_enabled") is True
+    assert metadata.get("non_strict_beauty_text_recall_used") is True
+    assert metadata.get("visible_category_intents") == ["moisturizer"]
+    assert metadata.get("matched_visible_attributes") == {}
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_non_strict_beauty_text_matches_ingredient_and_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_live_1", "business_name": "Live Merchant"}]
+        if "FROM external_product_seeds" in q or "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        serum = agent_shop_gateway_module.StandardProduct(
+            id="prod_serum_ha",
+            product_id="prod_serum_ha",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Barrier Repair Serum",
+            description="Hydrating hyaluronic acid serum for dry and sensitive skin.",
+            product_type="Serum",
+            price=29.0,
+            currency="USD",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+        )
+        return [serum], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="hyaluronic acid hydrating serum",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_serum_ha"
+    assert metadata.get("visible_category_intents") == ["serum"]
+    assert metadata.get("visible_attribute_intents") == ["hydrating"]
+    assert metadata.get("ingredient_intents") == ["hyaluronic_acid"]
+    assert metadata.get("matched_ingredient_ids") == ["hyaluronic_acid"]
+    assert metadata.get("matched_ingredient_labels") == ["Hyaluronic Acid"]
+    assert metadata.get("non_strict_beauty_text_recall_used") is True
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_non_strict_foundation_does_not_require_explicit_shade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_live_1", "business_name": "Live Merchant"}]
+        if "FROM external_product_seeds" in q or "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        foundation = agent_shop_gateway_module.StandardProduct(
+            id="prod_foundation_1",
+            product_id="prod_foundation_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Soft Focus Foundation",
+            product_type="Foundation",
+            price=39.0,
+            currency="USD",
+            inventory_quantity=6,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_foundation_210",
+                    title="Shade 210 Neutral Beige",
+                    price=39.0,
+                    inventory_quantity=6,
+                    options={"Shade": "210"},
+                )
+            ],
+        )
+        return [foundation], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="foundation",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    assert result.get("total") == 1
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_foundation_1"
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_non_strict_beauty_uses_live_query_fallback_when_cache_prefetch_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    merchant_rows = [
+        {"merchant_id": "merch_test_1", "business_name": "Test Merchant 1"},
+        {"merchant_id": "merch_test_2", "business_name": "Test Merchant 2"},
+        {"merchant_id": "merch_live_1", "business_name": "Live Merchant"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return merchant_rows
+        if "FROM external_product_seeds" in q or "FROM orders" in q or "FROM products_cache" in q:
+            return []
+        return []
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_get_products_hybrid(
+        merchant_id: str,
+        limit: int,
+        agent_id: str,
+        background_tasks=None,
+        force_cache_only: bool = False,
+    ):
+        calls.append(
+            {
+                "merchant_id": merchant_id,
+                "limit": limit,
+                "agent_id": agent_id,
+                "force_cache_only": force_cache_only,
+            }
+        )
+        if merchant_id != "merch_live_1":
+            return [], "cache_all_platforms", None
+        product = agent_shop_gateway_module.StandardProduct(
+            id="prod_live_1",
+            product_id="prod_live_1",
+            platform="shopify",
+            merchant_id=merchant_id,
+            title="Barrier Repair Moisturizer",
+            description="A soothing barrier moisturizer.",
+            product_type="Moisturizer",
+            price=29.0,
+            currency="USD",
+            inventory_quantity=8,
+            orderable=True,
+            status=agent_shop_gateway_module.ProductStatus.ACTIVE,
+            variants=[
+                agent_shop_gateway_module.StandardProductVariant(
+                    id="var_live_1",
+                    sku="BARRIER-REPAIR-MOISTURIZER",
+                    title="Default",
+                    price=29.0,
+                    inventory_quantity=8,
+                )
+            ],
+        )
+        return [product], "cache_all_platforms", None
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SHOPPING_FAST_MERCHANT_SEED_LIMIT", 1)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="moisturizer",
+            page=1,
+            limit=5,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping_agent"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping_agent"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    assert [call["merchant_id"] for call in calls] == [
+        "merch_test_1",
+        "merch_test_2",
+        "merch_live_1",
+    ]
+    assert len(products) == 1
+    assert products[0]["product_id"] == "prod_live_1"
+    assert metadata.get("beauty_live_query_fallback_used") is True
+    assert metadata.get("expanded_shopping_beauty_prefetch") is True
+    assert metadata.get("merchants_scanned") == 3
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_visible_attribute_intent_fails_closed_without_visible_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2728,7 +3057,6 @@ def test_agent_products_search_merchant_scope_does_not_mix_external_seed(
 async def test_shop_gateway_find_products_multi_matches_external_seeds_with_stopwords(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import db.database as db_database_module
     import routes.agent_shop_gateway as agent_shop_gateway_module
 
     seed_row = {
@@ -2762,34 +3090,32 @@ async def test_shop_gateway_find_products_multi_matches_external_seeds_with_stop
         q = str(query)
         if "FROM merchant_onboarding" in q:
             return []
-        if "FROM external_product_seeds" in q:
-            values = values or {}
-            haystack = " ".join(
-                [
-                    seed_row.get("title") or "",
-                    seed_row.get("domain") or "",
-                    seed_row.get("canonical_url") or "",
-                    seed_row.get("destination_url") or "",
-                    str(seed_row.get("seed_data") or ""),
-                ]
-            ).lower()
-
-            like_terms = []
-            for key, val in values.items():
-                if str(key).startswith("like_"):
-                    term = str(val).strip("%").lower()
-                    if term:
-                        like_terms.append(term)
-            return [seed_row] if any(t in haystack for t in like_terms) else []
-
         return []
 
-    monkeypatch.setattr(db_database_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(
         agent_shop_gateway_module,
         "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT",
         True,
+    )
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        assert kwargs.get("query") == "fenty beauty product"
+        prefer_terms = kwargs.get("prefer_terms") or []
+        assert "fenty" in prefer_terms
+        assert "beauty" in prefer_terms
+        assert "product" not in prefer_terms
+        return {
+            "rows": [seed_row],
+            "query_timeout": False,
+            "query_ms": 12,
+            "total_count": 1,
+        }
+
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
     )
 
     async def fake_redirect_url(**_kwargs):
@@ -2812,7 +3138,10 @@ async def test_shop_gateway_find_products_multi_matches_external_seeds_with_stop
     )
 
     products = result.get("products") or []
+    metadata = result.get("metadata") or {}
     assert any(p.get("source") == "external_seed" for p in products)
+    assert metadata.get("external_seed_rows_fetched") == 1
+    assert metadata.get("external_seed_query_timeout") is False
 
 
 @pytest.mark.asyncio

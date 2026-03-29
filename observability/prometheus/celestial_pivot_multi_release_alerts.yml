@@ -1,0 +1,47 @@
+groups:
+  - name: celestial-pivot-multi-release
+    rules:
+      - alert: CelestialPivotShadowCoverageMissing
+        expr: sum(rate(catalog_pivot_shadow_compare_total[15m])) < 0.01
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pivot multi shadow coverage is missing"
+          description: "No pivot shadow compares have been observed in the last 20 minutes."
+
+      - alert: CelestialPivotTop1AgreementLow
+        expr: (sum(rate(catalog_pivot_shadow_compare_total{top1_same=\"true\"}[30m])) / clamp_min(sum(rate(catalog_pivot_shadow_compare_total[30m])), 1)) < 0.85
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pivot multi top1 agreement dropped below threshold"
+          description: "Top1 agreement is below 85% for the last 30 minutes."
+
+      - alert: CelestialPivotNoResultMismatchSpike
+        expr: sum(rate(catalog_pivot_shadow_no_result_mismatch_total[15m])) > 0.05
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pivot multi no-result mismatch spike"
+          description: "Pivot shadow is disagreeing with the served path on empty vs non-empty results."
+
+      - alert: CelestialPivotBadPriceAnomalySpike
+        expr: sum(rate(catalog_pivot_shadow_bad_price_anomaly_total[15m])) > 0.02
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pivot multi price anomaly spike"
+          description: "Estimated-best-price delta anomaly is above the release threshold."
+
+      - alert: CelestialPivotLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(catalog_search_latency_seconds_bucket{path=\"pivot_semantic_core_multi\"}[15m]))) > 1.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pivot multi search latency p95 is elevated"
+          description: "Pivot semantic core multi-search latency p95 is above 1.5 seconds."

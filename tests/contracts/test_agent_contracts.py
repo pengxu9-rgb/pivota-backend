@@ -113,6 +113,10 @@ async def test_contract_agent_products_search_response_shape(
         "external_seed_brand_relevant_rows",
         "external_seed_broad_fallback_used",
         "external_seed_broad_scope_rows",
+        "pivot_shadow_scheduled",
+        "pivot_shadow_mode",
+        "pivot_rollout_mode",
+        "pivot_rollout_guard_passed",
     ):
         assert key in route_health
 
@@ -180,6 +184,10 @@ async def test_contract_agent_shop_invoke_find_products_multi_response_shape(
         "external_seed_brand_relevant_rows",
         "external_seed_broad_fallback_used",
         "external_seed_broad_scope_rows",
+        "pivot_shadow_scheduled",
+        "pivot_shadow_mode",
+        "pivot_rollout_mode",
+        "pivot_rollout_guard_passed",
     ):
         assert key in route_health
 
