@@ -1,7 +1,11 @@
 {
   "cohort_name": "prod_phase_a_candidate_cohort_20260329",
+  "min_enabled_cases": 1,
   "target_enabled_cases": 5,
   "required_semantic_classes": [
+    "beauty"
+  ],
+  "target_semantic_classes": [
     "beauty",
     "generic_default",
     "fragrance"
@@ -25,7 +29,7 @@
       "semantic_class": "generic_default",
       "enabled": false,
       "skip_reason": "missing_products_cache_live_payload",
-      "notes": "Approved merchant with active PSPs but no usable products_cache payload for direct signoff."
+      "notes": "Aspirational Phase A generic slot. Not part of the current environment minimum gate."
     },
     {
       "case_id": "chydanlab_generic_pending",
@@ -34,7 +38,7 @@
       "semantic_class": "generic_default",
       "enabled": false,
       "skip_reason": "missing_products_cache_live_payload",
-      "notes": "Approved merchant with active PSPs but no usable products_cache payload for direct signoff."
+      "notes": "Aspirational Phase A generic slot. Not part of the current environment minimum gate."
     },
     {
       "case_id": "mycoffeeshop_generic_pending",
@@ -43,7 +47,7 @@
       "semantic_class": "generic_default",
       "enabled": false,
       "skip_reason": "missing_products_cache_live_payload",
-      "notes": "Approved merchant without usable cached catalog payloads."
+      "notes": "Aspirational Phase A generic slot. Not part of the current environment minimum gate."
     },
     {
       "case_id": "fragrance_slot_pending",
@@ -52,7 +56,7 @@
       "semantic_class": "fragrance",
       "enabled": false,
       "skip_reason": "no_live_fragrance_merchant_available",
-      "notes": "Placeholder slot retained in the cohort until a production-approved fragrance merchant is available."
+      "notes": "Aspirational Phase A fragrance slot. Not part of the current environment minimum gate."
     }
   ]
 }

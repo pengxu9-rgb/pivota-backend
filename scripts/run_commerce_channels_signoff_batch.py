@@ -36,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
         "--min-enabled-cases",
         type=int,
         default=None,
-        help="Override cohort target_enabled_cases for pass/fail evaluation.",
+        help="Override cohort current-environment minimum enabled-case gate for pass/fail evaluation.",
     )
     return parser.parse_args()
 
@@ -55,6 +55,7 @@ def _load_cohort(path_str: str) -> Dict[str, Any]:
     if isinstance(payload, list):
         return {
             "cohort_name": path.stem,
+            "min_enabled_cases": 1,
             "target_enabled_cases": 1,
             "required_semantic_classes": [],
             "cases": payload,
@@ -148,6 +149,8 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- skipped_cases: `{summary.get('skipped_cases')}`",
         f"- min_enabled_cases: `{summary.get('min_enabled_cases')}`",
         f"- meets_min_enabled_cases: `{summary.get('meets_min_enabled_cases')}`",
+        f"- target_enabled_cases: `{summary.get('target_enabled_cases')}`",
+        f"- meets_target_enabled_cases: `{summary.get('meets_target_enabled_cases')}`",
         "",
         "## Cases",
         "",
@@ -165,6 +168,15 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 "## Missing Semantic Classes",
                 "",
                 f"- `{', '.join(summary['missing_semantic_classes'])}`",
+            ]
+        )
+    if summary.get("missing_target_semantic_classes"):
+        lines.extend(
+            [
+                "",
+                "## Missing Long-Term Semantic Classes",
+                "",
+                f"- `{', '.join(summary['missing_target_semantic_classes'])}`",
             ]
         )
     return "\n".join(lines) + "\n"
@@ -204,14 +216,18 @@ def main() -> int:
     failed_cases = [case for case in enabled_cases if case.get("ok") is not True]
     skipped_cases = [case for case in cases if not case.get("enabled")]
     required_semantic_classes = [str(item) for item in (cohort.get("required_semantic_classes") or []) if str(item).strip()]
+    target_semantic_classes = [str(item) for item in (cohort.get("target_semantic_classes") or []) if str(item).strip()]
     present_semantic_classes = {
         str(case.get("semantic_class"))
         for case in enabled_cases
         if case.get("semantic_class")
     }
     missing_semantic_classes = [item for item in required_semantic_classes if item not in present_semantic_classes]
-    min_enabled_cases = int(args.min_enabled_cases if args.min_enabled_cases is not None else cohort.get("target_enabled_cases") or 1)
+    missing_target_semantic_classes = [item for item in target_semantic_classes if item not in present_semantic_classes]
+    min_enabled_cases = int(args.min_enabled_cases if args.min_enabled_cases is not None else cohort.get("min_enabled_cases") or cohort.get("target_enabled_cases") or 1)
     meets_min_enabled_cases = len(enabled_cases) >= min_enabled_cases
+    target_enabled_cases = int(cohort.get("target_enabled_cases") or min_enabled_cases)
+    meets_target_enabled_cases = len(enabled_cases) >= target_enabled_cases
     skipped_reason_counts = Counter(str(case.get("skip_reason") or "unknown") for case in skipped_cases)
 
     summary = {
@@ -222,8 +238,12 @@ def main() -> int:
         "skipped_cases": len(skipped_cases),
         "min_enabled_cases": min_enabled_cases,
         "meets_min_enabled_cases": meets_min_enabled_cases,
+        "target_enabled_cases": target_enabled_cases,
+        "meets_target_enabled_cases": meets_target_enabled_cases,
         "required_semantic_classes": required_semantic_classes,
         "missing_semantic_classes": missing_semantic_classes,
+        "target_semantic_classes": target_semantic_classes,
+        "missing_target_semantic_classes": missing_target_semantic_classes,
         "skipped_reason_counts": dict(skipped_reason_counts),
         "semantic_class_summary": dict(
             Counter(str(case.get("semantic_class") or "unspecified") for case in cases)

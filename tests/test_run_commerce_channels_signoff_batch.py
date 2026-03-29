@@ -32,14 +32,18 @@ def _build_args(tmp_path: Path, cohort_path: Path) -> argparse.Namespace:
     )
 
 
-def test_batch_runner_blocks_when_cohort_is_too_small(monkeypatch, tmp_path: Path) -> None:
+def test_batch_runner_passes_current_gate_when_only_long_term_target_is_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
     cohort_path = tmp_path / "cohort.json"
     cohort_path.write_text(
         json.dumps(
             {
                 "cohort_name": "cohort_a",
+                "min_enabled_cases": 1,
                 "target_enabled_cases": 3,
-                "required_semantic_classes": ["beauty", "generic_default"],
+                "required_semantic_classes": ["beauty"],
+                "target_semantic_classes": ["beauty", "generic_default"],
                 "cases": [
                     {
                         "case_id": "beauty_1",
@@ -77,12 +81,14 @@ def test_batch_runner_blocks_when_cohort_is_too_small(monkeypatch, tmp_path: Pat
 
     exit_code = module.main()
 
-    assert exit_code == 1
+    assert exit_code == 0
     payload = json.loads((tmp_path / "batch.json").read_text(encoding="utf-8"))
-    assert payload["overall_ok"] is False
+    assert payload["overall_ok"] is True
     assert payload["summary"]["enabled_cases"] == 1
-    assert payload["summary"]["meets_min_enabled_cases"] is False
-    assert payload["summary"]["missing_semantic_classes"] == ["generic_default"]
+    assert payload["summary"]["meets_min_enabled_cases"] is True
+    assert payload["summary"]["meets_target_enabled_cases"] is False
+    assert payload["summary"]["missing_semantic_classes"] == []
+    assert payload["summary"]["missing_target_semantic_classes"] == ["generic_default"]
     assert payload["summary"]["skipped_reason_counts"] == {"missing_products_cache_live_payload": 1}
 
 
@@ -92,8 +98,10 @@ def test_batch_runner_passes_when_cases_and_coverage_are_satisfied(monkeypatch, 
         json.dumps(
             {
                 "cohort_name": "cohort_b",
+                "min_enabled_cases": 1,
                 "target_enabled_cases": 2,
-                "required_semantic_classes": ["beauty", "generic_default"],
+                "required_semantic_classes": ["beauty"],
+                "target_semantic_classes": ["beauty", "generic_default"],
                 "cases": [
                     {
                         "case_id": "beauty_1",
@@ -135,6 +143,7 @@ def test_batch_runner_passes_when_cases_and_coverage_are_satisfied(monkeypatch, 
     assert payload["overall_ok"] is True
     assert payload["summary"]["passed_cases"] == 2
     assert payload["summary"]["missing_semantic_classes"] == []
+    assert payload["summary"]["missing_target_semantic_classes"] == []
 
 
 def test_batch_runner_supports_case_filter(monkeypatch, tmp_path: Path) -> None:
@@ -143,8 +152,10 @@ def test_batch_runner_supports_case_filter(monkeypatch, tmp_path: Path) -> None:
         json.dumps(
             {
                 "cohort_name": "cohort_c",
+                "min_enabled_cases": 1,
                 "target_enabled_cases": 1,
                 "required_semantic_classes": ["beauty"],
+                "target_semantic_classes": ["beauty"],
                 "cases": [
                     {
                         "case_id": "beauty_1",

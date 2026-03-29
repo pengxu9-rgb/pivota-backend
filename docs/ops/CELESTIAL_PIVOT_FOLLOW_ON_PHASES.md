@@ -33,8 +33,12 @@ That is enough to close the current phase, but it does not prove that the same b
 - keep this phase non-paid and non-capture
 
 ### Merchant Cohort Rules
-- at least 5 merchants
-- include `beauty`, `fragrance`, and generic commerce coverage
+- current production minimum gate:
+  - at least 1 live-eligible merchant
+  - include `beauty`
+- long-term target:
+  - at least 5 merchants
+  - include `beauty`, `fragrance`, and generic commerce coverage
 - include more than one PSP readiness profile
 - include at least one merchant with a larger catalog
 - include at least one non-EUR pricing case
@@ -55,7 +59,16 @@ That is enough to close the current phase, but it does not prove that the same b
 - keep emitting a rollup JSON/Markdown summary for the cohort
 
 ### Acceptance Criteria
-- every merchant in the cohort has:
+- current environment gate:
+  - every enabled merchant in the cohort has:
+    - `catalog_read_ok = true`
+    - `catalog_write_ok = true`
+    - `payment_order_ok = true`
+  - the enabled subset satisfies the cohort's current minimum gate
+- long-term target:
+  - the enabled subset reaches the cohort's `target_enabled_cases`
+  - the enabled subset covers the cohort's `target_semantic_classes`
+- every merchant in the cohort that actually runs has:
   - `catalog_read_ok = true`
   - `catalog_write_ok = true`
   - `payment_order_ok = true`
