@@ -48,6 +48,7 @@ def classify_query_semantic_class(query: Optional[str]) -> str:
         r"\b("
         r"beauty|skincare|skin care|cosmetic|cosmetics|makeup|"
         r"serum|toner|moisturizer|moisturiser|cleanser|"
+        r"sunscreen|sun screen|sunblock|spf|"
         r"foundation|lipstick|blush|gloss"
         r")\b",
         q,
