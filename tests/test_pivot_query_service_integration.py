@@ -414,6 +414,46 @@ async def test_build_external_item_uses_text_relevance_as_primary_signal() -> No
     assert more_relevant.match_explanation["source_order"] == 5
 
 
+@pytest.mark.asyncio
+async def test_build_external_item_preserves_structured_beauty_fields() -> None:
+    item = module._build_external_item(
+        {
+            "external_product_id": "ext_spf_50",
+            "title": "Mineral Sunscreen SPF 50",
+            "domain": "example.com",
+            "canonical_url": "https://example.com/products/mineral-sunscreen-spf-50",
+            "destination_url": "https://example.com/products/mineral-sunscreen-spf-50",
+            "category": "Sunscreen",
+            "seed_data": {
+                "brand": "Example",
+                "category": "Sunscreen",
+                "reviewed_ingredient_ids": ["zinc_oxide"],
+                "visible_attributes": {
+                    "product_category": ["sunscreen"],
+                    "formula_constraint": ["fragrance_free"],
+                },
+                "variants": [
+                    {
+                        "id": "variant_1",
+                        "title": "SPF 50",
+                        "price": 24.0,
+                        "options": {"SPF": "50"},
+                    }
+                ],
+            },
+        },
+        "spf 50 sunscreen",
+        source_order=0,
+    )
+
+    assert item.sku.visible_attributes["product_category"] == ["sunscreen"]
+    assert item.sku.visible_attributes["formula_constraint"] == ["fragrance_free"]
+    assert item.sku.ingredient_ids == ["zinc_oxide"]
+    assert "spf_50" in item.sku.visible_option_labels
+    assert item.match_explanation["ranking_audit_version"] == "beauty_external_ranking_v1"
+    assert item.match_explanation["candidate_source"] == "external_seed"
+
+
 def test_external_text_relevance_prefers_title_term_hits_and_penalizes_eye_cream() -> None:
     gentle_cleanser = module._external_text_relevance_score(
         {

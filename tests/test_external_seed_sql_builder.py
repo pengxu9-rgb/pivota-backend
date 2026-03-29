@@ -74,7 +74,7 @@ async def test_fetch_external_seed_rows_supports_brand_terms_and_rank_ordering()
     )
 
     assert "AS brand_term_hit" in db.last_query
-    assert "ORDER BY brand_term_hit DESC, updated_at DESC, created_at DESC" in db.last_query
+    assert "ORDER BY brand_term_hit DESC, created_at DESC, id DESC" in db.last_query
     assert "required_0" not in db.last_query
     assert "prefer_0" in db.last_query
     assert "required_term_" not in db.last_query

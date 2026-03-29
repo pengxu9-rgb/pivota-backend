@@ -38,6 +38,13 @@ from config.settings import resolve_public_api_base_url
 from db.database import database
 from models.catalog import PivotQueryRequest, PivotResultItem
 from models.reviews_refs import SkuRef as ReviewsSkuRef
+from services.beauty_external_ranking import (
+    BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
+    build_external_seed_filter_product as _shared_build_external_seed_filter_product,
+    normalize_external_seed_product_type as _shared_normalize_external_seed_product_type,
+    normalize_external_seed_structured_ingredient_ids as _shared_normalize_external_seed_structured_ingredient_ids,
+    rank_external_seed_rows,
+)
 from services.product_query_service import get_products_hybrid
 from services.external_seed_search import fetch_external_seed_rows
 from services.pivot_query_service import search_pivot_catalog
@@ -5523,95 +5530,14 @@ def _normalize_external_seed_structured_ingredient_ids(
     row: Dict[str, Any],
     seed_data: Dict[str, Any],
 ) -> List[str]:
-    snapshot = _ensure_seed_data_obj(seed_data.get("snapshot"))
-    deduped: List[str] = []
-
-    def add_raw(raw: Any) -> None:
-        if raw is None:
-            return
-        if isinstance(raw, dict):
-            for key in (
-                "ingredient_ids",
-                "ingredientIds",
-                "reviewed_ingredient_ids",
-                "reviewedIngredientIds",
-                "canonical_ingredient_ids",
-                "canonicalIngredientIds",
-                "platform_metadata",
-                "platformMetadata",
-                "beauty_meta",
-                "beautyMeta",
-            ):
-                if key in raw:
-                    add_raw(raw.get(key))
-            return
-        if isinstance(raw, str):
-            parsed = None
-            stripped = raw.strip()
-            if not stripped:
-                return
-            if stripped.startswith("[") or stripped.startswith("{"):
-                try:
-                    parsed = json.loads(stripped)
-                except Exception:
-                    parsed = None
-            if parsed is not None:
-                add_raw(parsed)
-                return
-            values = [value.strip() for value in re.split(r"[;,|]", stripped) if value.strip()]
-        elif isinstance(raw, (list, tuple, set)):
-            values = list(raw)
-        else:
-            values = [raw]
-
-        for value in values:
-            normalized = _normalize_serving_token(str(value or "").replace("_", " "))
-            if not normalized:
-                continue
-            canonical = _SKINCARE_INGREDIENT_CANONICAL_ALIASES.get(
-                normalized.replace("_", " "),
-                normalized,
-            )
-            if canonical not in deduped:
-                deduped.append(canonical)
-
-    for candidate in (
-        row.get("reviewed_ingredient_ids"),
-        row.get("canonical_ingredient_ids"),
-        row.get("ingredient_ids"),
-        row.get("platform_metadata"),
-        seed_data.get("reviewed_ingredient_ids"),
-        seed_data.get("canonical_ingredient_ids"),
-        seed_data.get("ingredient_ids"),
-        seed_data.get("platform_metadata"),
-        snapshot.get("reviewed_ingredient_ids"),
-        snapshot.get("canonical_ingredient_ids"),
-        snapshot.get("ingredient_ids"),
-        snapshot.get("platform_metadata"),
-    ):
-        add_raw(candidate)
-
-    return deduped
+    return _shared_normalize_external_seed_structured_ingredient_ids(row, seed_data)
 
 
 def _normalize_external_seed_product_type(
     row: Dict[str, Any],
     seed_data: Dict[str, Any],
 ) -> str:
-    snapshot = _ensure_seed_data_obj(seed_data.get("snapshot"))
-    for candidate in (
-        row.get("category"),
-        seed_data.get("category"),
-        snapshot.get("category"),
-        seed_data.get("product_type"),
-        snapshot.get("product_type"),
-        seed_data.get("productType"),
-        snapshot.get("productType"),
-    ):
-        text = str(candidate or "").strip()
-        if text:
-            return text
-    return ""
+    return _shared_normalize_external_seed_product_type(row, seed_data)
 
 
 def _build_external_seed_filter_product(
@@ -5620,64 +5546,10 @@ def _build_external_seed_filter_product(
     seed_data: Dict[str, Any],
     external_product: Dict[str, Any],
 ) -> StandardProduct:
-    title = str(external_product.get("title") or "External product").strip() or "External product"
-    try:
-        price = float(external_product.get("price") or 0)
-    except Exception:
-        price = 0.0
-    currency = str(external_product.get("currency") or "USD").strip().upper() or "USD"
-    in_stock = external_product.get("in_stock")
-    inventory_quantity = 999 if in_stock is not False else 0
-    ingredient_ids = _normalize_external_seed_structured_ingredient_ids(row, seed_data)
-    product_type = _normalize_external_seed_product_type(row, seed_data)
-    variants: List[StandardProductVariant] = []
-
-    for idx, variant in enumerate(_normalize_seed_variants(seed_data)):
-        if not isinstance(variant, dict):
-            continue
-        price_payload = variant.get("price") if isinstance(variant.get("price"), dict) else {}
-        variant_price = price_payload.get("price_amount") if isinstance(price_payload, dict) else variant.get("price")
-        try:
-            normalized_variant_price = float(variant_price or price or 0)
-        except Exception:
-            normalized_variant_price = price
-        availability = str(variant.get("availability") or "").strip().lower()
-        variant_inventory = 999 if availability not in {"out_of_stock", "outofstock", "sold_out"} else 0
-        variant_id = str(variant.get("variant_id") or variant.get("id") or f"seed_variant_{idx + 1}")
-        variants.append(
-            StandardProductVariant(
-                id=variant_id,
-                variant_id=variant_id,
-                title=str(variant.get("title") or f"Variant {idx + 1}"),
-                price=normalized_variant_price,
-                inventory_quantity=variant_inventory,
-                options=variant.get("options") or {},
-                image_url=variant.get("image_url"),
-            )
-        )
-
-    return StandardProduct(
-        id=str(external_product.get("product_id") or external_product.get("id") or ""),
-        product_id=str(external_product.get("product_id") or external_product.get("id") or ""),
-        platform="external",
-        merchant_id="external_seed",
-        title=title,
-        description=str(external_product.get("description") or ""),
-        product_type=product_type or None,
-        ingredient_ids=ingredient_ids,
-        price=price,
-        currency=currency,
-        inventory_quantity=inventory_quantity,
-        image_url=external_product.get("image_url"),
-        variants=variants,
-        status=ProductStatus.ACTIVE,
-        in_stock=bool(in_stock) if in_stock is not None else None,
-        platform_metadata={
-            "external_seed_id": external_product.get("external_seed_id"),
-            "canonical_url": row.get("canonical_url") or seed_data.get("canonical_url"),
-            "destination_url": row.get("destination_url") or seed_data.get("destination_url"),
-            **({"reviewed_ingredient_ids": ingredient_ids} if ingredient_ids else {}),
-        },
+    return _shared_build_external_seed_filter_product(
+        row=row,
+        seed_data=seed_data,
+        external_product=external_product,
     )
 
 
@@ -5740,6 +5612,22 @@ def _external_seed_to_shop_product(
     if isinstance(availability, str):
         in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
 
+    filter_product = _build_external_seed_filter_product(
+        row=row,
+        seed_data=seed_data,
+        external_product={
+            "id": external_product_id,
+            "product_id": external_product_id,
+            "title": title,
+            "description": seed_data.get("description") or "",
+            "price": price_amount or 0,
+            "currency": price_currency,
+            "image_url": image_url,
+            "in_stock": in_stock,
+            "external_seed_id": row.get("id"),
+        },
+    )
+
     product: Dict[str, Any] = {
         "id": external_product_id,
         "product_id": external_product_id,
@@ -5765,6 +5653,7 @@ def _external_seed_to_shop_product(
         "attached_variant_id": row.get("attached_variant_id") or seed_data.get("attached_variant_id"),
         "source": "external_seed",
         "orderable": False,
+        "visible_attributes": dict(filter_product.visible_attributes or {}),
     }
     if ingredient_ids:
         product["ingredient_ids"] = list(ingredient_ids)
@@ -7690,6 +7579,7 @@ async def _handle_find_products_multi(
     external_seed_brand_relevant_rows = 0
     external_seed_broad_fallback_used = False
     external_seed_broad_scope_rows = 0
+    external_seed_ranked_count = 0
     budget_fx_applied = False
     budget_fx_rate: Optional[float] = None
     budget_fx_source: Optional[str] = None
@@ -7812,6 +7702,13 @@ async def _handle_find_products_multi(
                     external_seed_rows_fetched = len(seed_rows)
                     external_seed_brand_relevant_rows = len(seed_rows)
 
+        ranked_seed_candidates = rank_external_seed_rows(
+            seed_rows,
+            query=q_ascii or q_lower,
+            limit=seed_limit,
+        )
+        external_seed_ranked_count = len(ranked_seed_candidates)
+
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
         seed_budget_ms = int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 0)
@@ -7821,47 +7718,24 @@ async def _handle_find_products_multi(
             else None
         )
         shopping_seed_target = max(1, limit * max(page, 1))
-        for row in seed_rows:
+        for candidate in ranked_seed_candidates:
             if seed_build_deadline is not None and time.perf_counter() >= seed_build_deadline:
                 break
-            row_dict = dict(row) if isinstance(row, dict) else {}
-            seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
-            dest = row_dict.get("destination_url") or seed_data.get("destination_url")
+            row_dict = dict(candidate.row or {})
+            seed_data = dict(candidate.seed_data or {})
+            dest = candidate.destination_url or row_dict.get("destination_url") or seed_data.get("destination_url")
             if not isinstance(dest, str) or not dest.startswith(("http://", "https://")):
                 continue
 
-            canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or dest
-            external_id = seed_data.get("external_product_id") or _stable_external_product_id(canonical_url or dest)
+            canonical_url = candidate.canonical_url or row_dict.get("canonical_url") or seed_data.get("canonical_url") or dest
+            external_id = candidate.external_product_id or seed_data.get("external_product_id") or _stable_external_product_id(canonical_url or dest)
             if not external_id or external_id in seen_external_ids:
                 continue
 
-            title = row_dict.get("title") or seed_data.get("title") or ""
-            domain = row_dict.get("domain") or seed_data.get("domain") or ""
-            brand = seed_data.get("brand") or seed_data.get("merchant_display_name") or ""
-            blob = " ".join([title, str(brand or ""), domain, canonical_url or "", dest]).lower().strip()
-            blob_ascii = _strip_accents(blob)
-            blob_compact = re.sub(r"[^a-z0-9]+", "", blob_ascii)
-
-            if q_lower:
-                if q_lower in blob:
-                    score = 0.85
-                elif seed_query_terms and any(t in blob for t in seed_query_terms):
-                    score = 0.75
-                elif q_compact and q_compact in blob_compact:
-                    score = 0.7
-                elif seed_query_compacts and any(t in blob_compact for t in seed_query_compacts):
-                    score = 0.65
-                elif _fuzzy_token_match(seed_query_terms or q_tokens, _tokenize(blob_ascii), max_dist=1):
-                    score = 0.6
-                else:
-                    # Recall-first: keep low-confidence external seeds for downstream rerank.
-                    score = 0.12
-            else:
-                score = 0.15
-
-            price_amount = row_dict.get("price_amount") or seed_data.get("price_amount")
+            price_amount = candidate.price_amount if candidate.price_amount is not None else row_dict.get("price_amount") or seed_data.get("price_amount")
             price_currency = str(
-                row_dict.get("price_currency")
+                candidate.price_currency
+                or row_dict.get("price_currency")
                 or seed_data.get("price_currency")
                 or "USD"
             ).upper()
@@ -7887,7 +7761,7 @@ async def _handle_find_products_multi(
                     budget_diagnostics.get("budget_candidate_currency") or budget_fx_candidate_currency or ""
                 ).upper() or budget_fx_candidate_currency
 
-            availability = row_dict.get("availability") or seed_data.get("availability") or "unknown"
+            availability = candidate.availability or row_dict.get("availability") or seed_data.get("availability") or "unknown"
             if filters.in_stock_only and isinstance(availability, str):
                 if availability.lower() in {"out_of_stock", "outofstock", "sold_out"}:
                     continue
@@ -7923,18 +7797,31 @@ async def _handle_find_products_multi(
                 seed_data=seed_data,
                 redirect_url=redirect_url,
             )
-            filter_product = _build_external_seed_filter_product(
-                row=row_dict,
-                seed_data=seed_data,
-                external_product=product,
-            )
+            product["visible_attributes"] = dict(candidate.filter_product.visible_attributes or {})
+            product["ingredient_ids"] = list(candidate.filter_product.ingredient_ids or [])
+            product["candidate_source"] = "external_seed"
+            product["ranking_audit_version"] = BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
+            product["ranking_features"] = dict(candidate.ranking_features or {})
+            product["ranking_score_breakdown"] = dict(candidate.ranking_score_breakdown or {})
+            filter_product = candidate.filter_product
             external_seed_wrappers.append(
                 {
                     "product": product,
                     "filter_product": filter_product,
                     "merchant_name": product.get("merchant_name"),
-                    "relevance_score": score,
+                    "relevance_score": candidate.candidate_score,
+                    "candidate_score": candidate.candidate_score,
+                    "source_boost": candidate.source_boost,
+                    "quality_penalties": dict(
+                        (candidate.ranking_score_breakdown or {}).get("quality_penalties") or {}
+                    ),
+                    "quality_penalties_total": candidate.quality_penalties_total,
+                    "price_tie_break": candidate.price_amount,
+                    "source_order": candidate.source_order,
                     "candidate_source": "external_seed",
+                    "ranking_audit_version": BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
+                    "ranking_features": dict(candidate.ranking_features or {}),
+                    "ranking_score_breakdown": dict(candidate.ranking_score_breakdown or {}),
                 }
             )
             seen_external_ids.add(external_id)
@@ -9297,7 +9184,12 @@ async def _handle_find_products_multi(
                 "product": product,
                 "merchant_name": merchant_name,
                 "relevance_score": relevance_score,
+                "candidate_score": relevance_score,
                 "candidate_source": candidate_source,
+                "source_boost": 0.08 if candidate_source != "external_seed" else 0.0,
+                "quality_penalties": {},
+                "quality_penalties_total": 0.0,
+                "price_tie_break": getattr(product, "price", None),
                 "is_toy_like": is_toy_like if toys_intent_query else False,
                 "matched_visible_category_labels": list(matched_visible_category_labels),
                 "matched_visible_attribute_labels": list(matched_visible_attribute_labels),
@@ -9327,9 +9219,34 @@ async def _handle_find_products_multi(
         toy_candidates = [p for p in filtered_products if p.get("is_toy_like")]
         filtered_products = toy_candidates if toy_candidates else []
 
-    # Sort by relevance
+    def _candidate_sort_key(item: Dict[str, Any]) -> tuple[float, int, float]:
+        try:
+            candidate_score = float(
+                item.get("candidate_score")
+                if item.get("candidate_score") is not None
+                else item.get("relevance_score") or 0.0
+            )
+        except Exception:
+            candidate_score = 0.0
+        try:
+            source_boost = float(item.get("source_boost") or 0.0)
+        except Exception:
+            source_boost = 0.0
+        raw_source_order = item.get("source_order")
+        try:
+            source_order = int(raw_source_order) if raw_source_order is not None else 999999
+        except Exception:
+            source_order = 999999
+        price_tie_break = item.get("price_tie_break")
+        try:
+            normalized_price = float(price_tie_break) if price_tie_break is not None else 999999.0
+        except Exception:
+            normalized_price = 999999.0
+        return (-(candidate_score + source_boost), source_order, normalized_price)
+
+    # Sort by canonical ranking contract.
     filtered_products.sort(
-        key=lambda p: p.get("relevance_score", 0), reverse=True
+        key=_candidate_sort_key
     )
 
     external_filtered_count = sum(
@@ -9780,6 +9697,7 @@ async def _handle_find_products_multi(
                 "strict_live_query_fallback_used": strict_live_query_fallback_used,
                 "external_seed_query_timeout": external_seed_query_timeout,
                 "external_seed_rows_fetched": external_seed_rows_fetched,
+                "external_seed_ranked_count": external_seed_ranked_count,
                 "external_seed_brand_strict_rows": external_seed_brand_strict_rows,
                 "external_seed_brand_relevant_rows": external_seed_brand_relevant_rows,
                 "external_seed_broad_fallback_used": external_seed_broad_fallback_used,
@@ -9789,6 +9707,11 @@ async def _handle_find_products_multi(
                 "external_seed_cache_hit": False,
                 "external_seed_rows_built": len(external_seed_wrappers),
                 "external_seed_returned_count": external_filtered_count,
+                "ranking_audit_version": (
+                    BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
+                    if external_seed_wrappers or external_seed_rows_fetched
+                    else None
+                ),
                 "internal_raw_count": internal_filtered_count,
                 "external_raw_count": external_filtered_count,
                 "merged_pre_limit_count": total,
@@ -9807,11 +9730,17 @@ async def _handle_find_products_multi(
                     "external_seed_cache_hit": False,
                     "external_seed_query_timeout": external_seed_query_timeout,
                     "external_seed_rows_fetched": external_seed_rows_fetched,
+                    "external_seed_ranked_count": external_seed_ranked_count,
                     "external_seed_rows_built": len(external_seed_wrappers),
                     "external_seed_brand_strict_rows": external_seed_brand_strict_rows,
                     "external_seed_brand_relevant_rows": external_seed_brand_relevant_rows,
                     "external_seed_broad_fallback_used": external_seed_broad_fallback_used,
                     "external_seed_broad_scope_rows": external_seed_broad_scope_rows,
+                    "ranking_audit_version": (
+                        BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
+                        if external_seed_wrappers or external_seed_rows_fetched
+                        else None
+                    ),
                     "internal_raw_count": internal_filtered_count,
                     "external_raw_count": external_filtered_count,
                     "merged_pre_limit_count": total,

@@ -1,0 +1,12 @@
+[
+  {"query": "acne cleanser", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "salicylic acid serum for acne and pores", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "gentle cleanser", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "hyaluronic acid hydrating serum", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "barrier moisturizer", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "hydrating barrier moisturizer fragrance free", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "lightweight gel moisturizer for acne-prone skin", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "moisturizer", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "sunscreen", "source": "shopping_agent", "page": 1, "limit": 10},
+  {"query": "spf 50", "source": "shopping_agent", "page": 1, "limit": 10}
+]

@@ -27,12 +27,17 @@ from models.catalog import (
     SkuNode,
 )
 from services.catalog_sync_service import store_catalog_quote_snapshot
+from services.beauty_external_ranking import (
+    BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
+    RankedExternalBeautyCandidate,
+    build_ranked_external_beauty_candidate,
+    rank_external_seed_rows,
+    score_external_beauty_candidate,
+)
 from services.external_seed_search import (
-    dedupe_external_seed_rows,
     ensure_json_obj,
     fetch_external_seed_rows,
     seed_search_terms,
-    stable_external_product_id,
 )
 from services.quote_service import QuoteService
 
@@ -402,6 +407,14 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
         _normalize_query(row.get("source_variant_id")),
         _normalize_query(row.get("source_product_id")),
     }
+    raw_rank_score = row.get("rank_score")
+    try:
+        normalized_candidate_score = round(
+            max(0.12, min(float(raw_rank_score or 0.0) / 100.0, 1.4)),
+            4,
+        )
+    except Exception:
+        normalized_candidate_score = 0.12
     return {
         "lane": "exact_lookup" if exact else "catalog_discovery",
         "query": query,
@@ -412,6 +425,11 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
             "source_variant_id": row.get("source_variant_id"),
         },
         "exact_match": bool(exact),
+        "candidate_source": "internal",
+        "candidate_score": normalized_candidate_score,
+        "source_boost": 0.0,
+        "quality_penalties_total": 0.0,
+        "price_tie_break": row.get("estimated_best_price") or row.get("merchant_effective_price") or row.get("list_price"),
     }
 
 
@@ -780,204 +798,54 @@ def _external_relevance_score(row: Dict[str, Any]) -> int:
         return 0
 
 
-def _external_seed_ingredient_blob(seed_data: Dict[str, Any]) -> str:
-    values: List[str] = []
-    for key in (
-        "ingredient_ids",
-        "reviewed_ingredient_ids",
-        "canonical_ingredient_ids",
-        "ingredients",
-    ):
-        raw = seed_data.get(key)
-        if isinstance(raw, str):
-            values.append(raw)
-        elif isinstance(raw, list):
-            values.extend(str(item or "") for item in raw)
-    return " ".join(v for v in values if v).strip()
-
-
 def _external_text_relevance_score(row: Dict[str, Any], query: str) -> float:
-    seed_data = ensure_json_obj(row.get("seed_data"))
-    q_ascii = _strip_accents(_normalize_query(query))
-    title = _strip_accents(
-        str(row.get("title") or seed_data.get("title") or "").strip().lower()
+    candidate = score_external_beauty_candidate(
+        build_ranked_external_beauty_candidate(row, source_order=0),
+        query=query,
     )
-    description = _strip_accents(
-        str(seed_data.get("description") or seed_data.get("pdp_description_raw") or "").strip().lower()
-    )
-    product_type = _strip_accents(
-        str(
-            seed_data.get("product_type")
-            or seed_data.get("category")
-            or row.get("category")
-            or ""
-        ).strip().lower()
-    )
-    brand = _strip_accents(str(seed_data.get("brand") or "").strip().lower())
-    domain = _strip_accents(str(row.get("domain") or "").strip().lower())
-    canonical_url = _strip_accents(str(row.get("canonical_url") or "").strip().lower())
-    destination_url = _strip_accents(str(row.get("destination_url") or "").strip().lower())
-    ingredient_blob = _strip_accents(_external_seed_ingredient_blob(seed_data).lower())
-    blob = " ".join(
-        part
-        for part in [
-            title,
-            description,
-            product_type,
-            brand,
-            domain,
-            canonical_url,
-            destination_url,
-            ingredient_blob,
-        ]
-        if part
-    ).strip()
-    title_compact = re.sub(r"[^a-z0-9]+", "", title)
-    blob_compact = re.sub(r"[^a-z0-9]+", "", blob)
-    q_compact = re.sub(r"[^a-z0-9]+", "", q_ascii)
-
-    if q_ascii:
-        if q_ascii in title:
-            return 1.0 if q_ascii == title else 0.9
-        if q_ascii in description:
-            return 0.7
-        if q_compact and len(q_compact) >= 4 and q_compact in title_compact:
-            return 0.85
-        if q_compact and len(q_compact) >= 4 and q_compact in blob_compact:
-            return 0.8
-
-    query_terms = _filter_relevance_terms(_tokenize_relevance(q_ascii))
-    if not query_terms and q_compact and len(q_compact) > 2:
-        query_terms = [q_compact]
-    if not query_terms:
-        return 0.12
-
-    active_ingredient_terms = {
-        "salicylic",
-        "retinol",
-        "niacinamide",
-        "hyaluronic",
-        "glycolic",
-        "azelaic",
-        "benzoyl",
-        "ceramide",
-        "vitamin",
-    }
-    concern_terms = {
-        "acne",
-        "pore",
-        "pores",
-        "blemish",
-        "breakout",
-    }
-    has_active_ingredient_query = any(term in active_ingredient_terms for term in query_terms)
-    query_concerns = [term for term in query_terms if term in concern_terms]
-
-    title_matches = sum(
-        1 for term in query_terms if term and (term in title or term in title_compact)
-    )
-    blob_matches = sum(
-        1 for term in query_terms if term and (term in blob or term in blob_compact)
-    )
-    if blob_matches == 0:
-        return 0.12
-
-    if title_matches == len(query_terms):
-        score = 0.88
-    elif title_matches > 0:
-        score = 0.56 + (title_matches / len(query_terms)) * 0.24
-    else:
-        score = 0.5 + (blob_matches / len(query_terms)) * 0.22
-
-    if "cleanser" in query_terms and "cleanser" in title:
-        score += 0.05
-    if "moisturizer" in query_terms and "moisturizer" in title:
-        score += 0.05
-    if "sunscreen" in query_terms and "sunscreen" in title:
-        score += 0.05
-    if "serum" in query_terms and "serum" in title:
-        score += 0.05
-    if "gentle" in query_terms and "gentle" in title:
-        score += 0.08
-    if "acne" in query_terms and ("acne" in title or "acne" in canonical_url or "acne" in destination_url):
-        score += 0.08
-    if (
-        ("fragrance" in query_terms or "free" in query_terms)
-        and ("fragrance free" in blob or "fragrance-free" in blob)
-    ):
-        score += 0.08
-
-    matched_concerns = sum(
-        1
-        for term in query_concerns
-        if term and (term in blob or term in blob_compact)
-    )
-    if has_active_ingredient_query and query_concerns:
-        if matched_concerns > 0:
-            score += min(0.08, matched_concerns * 0.04)
-        else:
-            score -= 0.08
-
-    for anchor in ("cleanser", "moisturizer", "sunscreen", "serum"):
-        if anchor in query_terms and anchor not in blob:
-            penalty = 0.2
-            if has_active_ingredient_query and matched_concerns > 0:
-                penalty = 0.08
-            score -= penalty
-
-    if "eye cream" in title and "eye" not in query_terms:
-        score -= 0.18
-
-    bundle_markers = (" routine", "duo", " set", " kit")
-    if any(marker in f" {blob}" for marker in bundle_markers) and not any(
-        marker.strip() in query_terms for marker in ("duo", "set", "kit", "routine")
-    ):
-        score -= 0.12
-
-    return round(max(0.12, min(score, 1.0)), 4)
+    return float(candidate.candidate_score)
 
 
-def _build_external_item(row: Dict[str, Any], query: str, *, source_order: int) -> PivotResultItem:
-    seed_data = ensure_json_obj(row.get("seed_data"))
-    destination_url = str(row.get("destination_url") or "").strip()
-    canonical_url = str(row.get("canonical_url") or "").strip() or destination_url
-    brand_term_hit = _external_relevance_score(row)
-    text_relevance_score = _external_text_relevance_score(row, query)
-    # Keep SQL term-hit ranking as a light tie-breaker. The gateway's external
-    # main path is still primarily text-driven, and letting brand_term_hit
-    # dominate turns too many rows into indistinguishable 2/3-point ties.
-    relevance_score = round(
-        text_relevance_score + min(0.08, brand_term_hit * 0.02),
-        4,
-    )
-    external_product_id = (
-        str(row.get("external_product_id") or "").strip()
-        or seed_data.get("external_product_id")
-        or stable_external_product_id(canonical_url)
-    )
+def _external_visible_option_labels(candidate: RankedExternalBeautyCandidate) -> List[str]:
+    labels: List[str] = []
+    for variant in candidate.filter_product.variants or []:
+        for label in variant.visible_option_labels or []:
+            normalized = str(label or "").strip()
+            if normalized and normalized not in labels:
+                labels.append(normalized)
+    return labels
+
+
+def _build_external_item_from_candidate(
+    candidate: RankedExternalBeautyCandidate,
+    *,
+    query: str,
+) -> PivotResultItem:
+    row = candidate.row
+    seed_data = candidate.seed_data
     pricing = PivotPricing(
-        currency=row.get("price_currency"),
-        list_price=_to_decimal(row.get("price_amount")),
-        merchant_effective_price=_to_decimal(row.get("price_amount")),
-        estimated_best_price=_to_decimal(row.get("price_amount")),
+        currency=candidate.price_currency or row.get("price_currency"),
+        list_price=_to_decimal(candidate.price_amount if candidate.price_amount is not None else row.get("price_amount")),
+        merchant_effective_price=_to_decimal(candidate.price_amount if candidate.price_amount is not None else row.get("price_amount")),
+        estimated_best_price=_to_decimal(candidate.price_amount if candidate.price_amount is not None else row.get("price_amount")),
         exact_quote_price=None,
         price_confidence=Decimal("0.6"),
     )
     return PivotResultItem(
         merchant=MerchantNode(
             merchant_id=None,
-            merchant_name=str(seed_data.get("brand") or row.get("domain") or "").strip() or None,
+            merchant_name=str(candidate.brand or row.get("domain") or "").strip() or None,
             primary_platform="external_referral",
         ),
         product=ProductNode(
             product_key=None,
-            source_product_id=external_product_id,
-            title=str(row.get("title") or seed_data.get("title") or "").strip() or None,
-            description=str(seed_data.get("description") or seed_data.get("pdp_description_raw") or "").strip() or None,
-            brand=str(seed_data.get("brand") or row.get("domain") or "").strip() or None,
-            product_type=str(seed_data.get("product_type") or "").strip() or None,
-            category=str(seed_data.get("category") or "").strip() or None,
-            canonical_url=canonical_url or None,
+            source_product_id=candidate.external_product_id,
+            title=str(candidate.title or "").strip() or None,
+            description=str(candidate.description or "").strip() or None,
+            brand=str(candidate.brand or row.get("domain") or "").strip() or None,
+            product_type=str(candidate.product_type or "").strip() or None,
+            category=str(candidate.category or candidate.product_type or "").strip() or None,
+            canonical_url=str(candidate.canonical_url or candidate.destination_url or "").strip() or None,
             image_url=row.get("image_url"),
         ),
         sku=SkuNode(
@@ -985,20 +853,20 @@ def _build_external_item(row: Dict[str, Any], query: str, *, source_order: int) 
             source_variant_id=None,
             sku=str(seed_data.get("sku") or "").strip() or None,
             barcode=None,
-            title=str(row.get("title") or "").strip() or None,
-            visible_attributes={},
-            visible_option_labels=[],
-            ingredient_ids=[],
+            title=str(candidate.title or row.get("title") or "").strip() or None,
+            visible_attributes=dict(candidate.filter_product.visible_attributes or {}),
+            visible_option_labels=_external_visible_option_labels(candidate),
+            ingredient_ids=list(candidate.filter_product.ingredient_ids or []),
         ),
         offers=[
             OfferNode(
-                offer_id=f"external::{external_product_id}",
+                offer_id=f"external::{candidate.external_product_id}",
                 catalog_track="external_referral",
                 truth_tier="fallback",
                 readiness_tier=_readiness_from_seed(seed_data),
                 offer_mode="redirect",
                 source_system="external_product_seeds",
-                availability=row.get("availability"),
+                availability=candidate.availability or row.get("availability"),
                 inventory_quantity=None,
                 pricing=pricing,
                 incentives=[],
@@ -1012,14 +880,32 @@ def _build_external_item(row: Dict[str, Any], query: str, *, source_order: int) 
         match_explanation={
             "lane": "external_fallback",
             "query": query,
-            "destination_url": destination_url,
-            "relevance_score": relevance_score,
-            "text_relevance_score": text_relevance_score,
-            "brand_term_hit": brand_term_hit,
-            "source_order": source_order,
+            "candidate_source": "external_seed",
+            "destination_url": candidate.destination_url,
+            "canonical_url": candidate.canonical_url,
+            "ranking_audit_version": BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
+            "candidate_score": candidate.candidate_score,
+            "relevance_score": candidate.candidate_score,
+            "text_relevance_score": candidate.ranking_score_breakdown.get("text_relevance"),
+            "source_boost": candidate.source_boost,
+            "quality_penalties": candidate.ranking_score_breakdown.get("quality_penalties"),
+            "quality_penalties_total": candidate.quality_penalties_total,
+            "ranking_features": candidate.ranking_features,
+            "ranking_score_breakdown": candidate.ranking_score_breakdown,
+            "ranking_drop_reason": list(candidate.ranking_drop_reason),
+            "brand_term_hit": candidate.brand_term_hit,
+            "source_order": candidate.source_order,
         },
         verticals={},
     )
+
+
+def _build_external_item(row: Dict[str, Any], query: str, *, source_order: int) -> PivotResultItem:
+    candidate = score_external_beauty_candidate(
+        build_ranked_external_beauty_candidate(row, source_order=source_order),
+        query=query,
+    )
+    return _build_external_item_from_candidate(candidate, query=query)
 
 
 def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
@@ -1027,10 +913,19 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
         internal_boost = 1 if item.catalog_track == "internal_merchant" else 0
         exact_boost = 1 if item.match_explanation.get("exact_match") else 0
         relevance_boost = 0.0
+        source_boost = 0.0
         try:
-            relevance_boost = float(item.match_explanation.get("relevance_score") or 0.0)
+            relevance_boost = float(
+                item.match_explanation.get("candidate_score")
+                or item.match_explanation.get("relevance_score")
+                or 0.0
+            )
         except Exception:
             relevance_boost = 0.0
+        try:
+            source_boost = float(item.match_explanation.get("source_boost") or 0.0)
+        except Exception:
+            source_boost = 0.0
         source_order = 999999
         if item.catalog_track == "external_referral":
             try:
@@ -1047,7 +942,7 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
         return (
             -exact_boost,
             -internal_boost,
-            -relevance_boost,
+            -(relevance_boost + source_boost),
             source_order,
             best_price if best_price is not None else Decimal("999999"),
         )
@@ -1089,10 +984,14 @@ async def _fetch_external_fallback_items(request: PivotQueryRequest) -> List[Piv
             include_total_count=False,
         )
         external_rows = stage_b_result.get("rows") or []
-    deduped_rows = dedupe_external_seed_rows(external_rows, limit=external_limit)
+    ranked_candidates = rank_external_seed_rows(
+        external_rows,
+        query=request.query,
+        limit=external_limit,
+    )
     return [
-        _build_external_item(row, request.query, source_order=idx)
-        for idx, row in enumerate(deduped_rows)
+        _build_external_item_from_candidate(candidate, query=request.query)
+        for candidate in ranked_candidates
     ]
 
 

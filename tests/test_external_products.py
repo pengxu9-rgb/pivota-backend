@@ -5142,8 +5142,10 @@ async def test_shop_gateway_find_products_multi_allows_external_seed_strict_ingr
     assert metadata.get("matched_ingredient_ids") == ["niacinamide"]
     assert metadata.get("strict_constraint_query") is True
     assert metadata.get("strict_constraint_reason") == "ingredient"
+    assert metadata.get("ranking_audit_version") == "beauty_external_ranking_v1"
     assert source_breakdown.get("internal_count") == 0
     assert source_breakdown.get("external_seed_count") == 1
+    assert (metadata.get("route_health") or {}).get("ranking_audit_version") == "beauty_external_ranking_v1"
 
 
 @pytest.mark.asyncio

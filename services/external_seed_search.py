@@ -315,7 +315,7 @@ async def fetch_external_seed_rows(
                   {rank_expr} AS brand_term_hit
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
-                ORDER BY brand_term_hit DESC, updated_at DESC, created_at DESC
+                ORDER BY brand_term_hit DESC, created_at DESC, id DESC
                 LIMIT :limit OFFSET :offset
                 """
     count_sql = f"""
