@@ -9,6 +9,43 @@ def classify_query_semantic_class(query: Optional[str]) -> str:
     if not q:
         return "default"
     q_compact = re.sub(r"[^a-z0-9]+", "", q)
+    if re.search(
+        r"\b("
+        r"eye cream|eye serum|night cream|overnight mask|face mask|sleeping mask|"
+        r"makeup remover|remover balm|cleansing balm|hand cream|"
+        r"retinal|retinol|niacinamide|hyaluronic acid|salicylic acid|vitamin c|"
+        r"dark circles|acne|pores|dry skin|sensitive skin"
+        r")\b",
+        q,
+    ):
+        return "beauty"
+    if any(
+        token in q_compact
+        for token in (
+            "eyecream",
+            "eyeserum",
+            "nightcream",
+            "overnightmask",
+            "facemask",
+            "sleepingmask",
+            "makeupremover",
+            "removerbalm",
+            "cleansingbalm",
+            "handcream",
+            "retinal",
+            "retinol",
+            "niacinamide",
+            "hyaluronicacid",
+            "salicylicacid",
+            "vitaminc",
+            "darkcircles",
+            "acne",
+            "pores",
+            "dryskin",
+            "sensitiveskin",
+        )
+    ):
+        return "beauty"
     if (
         "fragrance free" in q
         or "fragrance-free" in q

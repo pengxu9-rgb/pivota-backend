@@ -18,3 +18,11 @@ def test_classify_query_semantic_class_detects_beauty_and_lingerie() -> None:
     assert classify_query_semantic_class("sunscreen") == "beauty"
     assert classify_query_semantic_class("spf 50") == "beauty"
     assert classify_query_semantic_class("lingerie set") == "lingerie"
+
+
+def test_classify_query_semantic_class_catches_beauty_regression_queries() -> None:
+    assert classify_query_semantic_class("body acne treatment spray") == "beauty"
+    assert classify_query_semantic_class("eye cream for dark circles") == "beauty"
+    assert classify_query_semantic_class("overnight mask for dry skin") == "beauty"
+    assert classify_query_semantic_class("retinal night cream") == "beauty"
+    assert classify_query_semantic_class("clean makeup remover balm") == "beauty"
