@@ -1,0 +1,38 @@
+[
+  {
+    "case_id": "merchant-exact-ulta",
+    "category": "merchant_exact_lookup",
+    "query": "ulta beauty",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  },
+  {
+    "case_id": "product-exact-retinol-serum",
+    "category": "product_exact_lookup",
+    "query": "retinol serum",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  },
+  {
+    "case_id": "beauty-vertical-how-to-use-cleanser",
+    "category": "beauty_vertical_query",
+    "query": "cleanser how to use",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  },
+  {
+    "case_id": "blended-offer-bank-card",
+    "category": "blended_offer_incentive_query",
+    "query": "moisturizer bank card discount",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  }
+]

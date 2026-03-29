@@ -116,6 +116,83 @@ try:
         catalog_search_latency_seconds = _existing_collector("catalog_search_latency_seconds")
 
     try:
+        catalog_pivot_shadow_compare_total = Counter(
+            "catalog_pivot_shadow_compare_total",
+            "Catalog pivot shadow compare count by served path, shadow path, and top1 agreement.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path", "top1_same"],
+        )
+    except ValueError:
+        catalog_pivot_shadow_compare_total = _existing_collector("catalog_pivot_shadow_compare_total")
+
+    try:
+        catalog_pivot_shadow_overlap_ratio = Histogram(
+            "catalog_pivot_shadow_overlap_ratio",
+            "Catalog pivot shadow overlap ratio by served path and shadow path.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path", "top1_same"],
+            buckets=(0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0),
+        )
+    except ValueError:
+        catalog_pivot_shadow_overlap_ratio = _existing_collector("catalog_pivot_shadow_overlap_ratio")
+
+    try:
+        catalog_pivot_shadow_returned_count_delta = Histogram(
+            "catalog_pivot_shadow_returned_count_delta",
+            "Signed delta between pivot shadow returned count and served returned count.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path", "top1_same"],
+            buckets=(-20, -10, -5, -2, -1, 0, 1, 2, 5, 10, 20),
+        )
+    except ValueError:
+        catalog_pivot_shadow_returned_count_delta = _existing_collector("catalog_pivot_shadow_returned_count_delta")
+
+    try:
+        catalog_pivot_shadow_internal_share_delta = Histogram(
+            "catalog_pivot_shadow_internal_share_delta",
+            "Signed delta between pivot and served internal-result share.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path", "top1_same"],
+            buckets=(-1.0, -0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0),
+        )
+    except ValueError:
+        catalog_pivot_shadow_internal_share_delta = _existing_collector("catalog_pivot_shadow_internal_share_delta")
+
+    try:
+        catalog_pivot_shadow_external_share_delta = Histogram(
+            "catalog_pivot_shadow_external_share_delta",
+            "Signed delta between pivot and served external-result share.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path", "top1_same"],
+            buckets=(-1.0, -0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0),
+        )
+    except ValueError:
+        catalog_pivot_shadow_external_share_delta = _existing_collector("catalog_pivot_shadow_external_share_delta")
+
+    try:
+        catalog_pivot_shadow_no_result_mismatch_total = Counter(
+            "catalog_pivot_shadow_no_result_mismatch_total",
+            "Count of shadow compare cases where served and pivot disagree on empty vs non-empty results.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path"],
+        )
+    except ValueError:
+        catalog_pivot_shadow_no_result_mismatch_total = _existing_collector("catalog_pivot_shadow_no_result_mismatch_total")
+
+    try:
+        catalog_pivot_shadow_estimated_price_delta_ratio = Histogram(
+            "catalog_pivot_shadow_estimated_price_delta_ratio",
+            "Relative delta between pivot and served top-result estimated-best-price.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path", "top1_same"],
+            buckets=(-1.0, -0.5, -0.25, -0.1, -0.05, 0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0),
+        )
+    except ValueError:
+        catalog_pivot_shadow_estimated_price_delta_ratio = _existing_collector("catalog_pivot_shadow_estimated_price_delta_ratio")
+
+    try:
+        catalog_pivot_shadow_bad_price_anomaly_total = Counter(
+            "catalog_pivot_shadow_bad_price_anomaly_total",
+            "Count of shadow compare cases where pivot estimated-best-price delta exceeds anomaly threshold.",
+            ["source", "page_bucket", "query_semantic_class", "served_path", "shadow_path"],
+        )
+    except ValueError:
+        catalog_pivot_shadow_bad_price_anomaly_total = _existing_collector("catalog_pivot_shadow_bad_price_anomaly_total")
+
+    try:
         retry_attempts_total = Counter(
             "retry_attempts_total",
             "Retry attempts by domain/category.",
@@ -136,6 +213,14 @@ except Exception:  # pragma: no cover
     catalog_upstream_timeout_total = None
     catalog_upstream_circuit_state = None
     catalog_search_latency_seconds = None
+    catalog_pivot_shadow_compare_total = None
+    catalog_pivot_shadow_overlap_ratio = None
+    catalog_pivot_shadow_returned_count_delta = None
+    catalog_pivot_shadow_internal_share_delta = None
+    catalog_pivot_shadow_external_share_delta = None
+    catalog_pivot_shadow_no_result_mismatch_total = None
+    catalog_pivot_shadow_estimated_price_delta_ratio = None
+    catalog_pivot_shadow_bad_price_anomaly_total = None
     retry_attempts_total = None
 
 
@@ -196,6 +281,80 @@ def record_catalog_search(*, mode: str, path: str, result: str, duration_seconds
             path=str(path or "unknown"),
             result=str(result or "unknown"),
         ).observe(max(0.0, float(duration_seconds)))
+
+
+def record_catalog_pivot_shadow_compare(
+    *,
+    source: str,
+    page_bucket: str,
+    query_semantic_class: str,
+    served_path: str,
+    shadow_path: str,
+    top1_same: bool,
+    overlap_ratio: float,
+    returned_count_delta: int = 0,
+    internal_share_delta: float = 0.0,
+    external_share_delta: float = 0.0,
+    no_result_mismatch: bool = False,
+    estimated_price_delta_ratio: Optional[float] = None,
+    bad_price_anomaly: bool = False,
+) -> None:
+    labels = {
+        "source": str(source or "unknown"),
+        "page_bucket": str(page_bucket or "unknown"),
+        "query_semantic_class": str(query_semantic_class or "default"),
+        "served_path": str(served_path or "unknown"),
+        "shadow_path": str(shadow_path or "unknown"),
+        "top1_same": "true" if bool(top1_same) else "false",
+    }
+    if catalog_pivot_shadow_compare_total is not None:
+        catalog_pivot_shadow_compare_total.labels(**labels).inc()
+    if catalog_pivot_shadow_overlap_ratio is not None:
+        try:
+            normalized_ratio = max(0.0, min(1.0, float(overlap_ratio)))
+        except Exception:
+            normalized_ratio = 0.0
+        catalog_pivot_shadow_overlap_ratio.labels(**labels).observe(normalized_ratio)
+    if catalog_pivot_shadow_returned_count_delta is not None:
+        try:
+            normalized_delta = int(returned_count_delta)
+        except Exception:
+            normalized_delta = 0
+        catalog_pivot_shadow_returned_count_delta.labels(**labels).observe(normalized_delta)
+    if catalog_pivot_shadow_internal_share_delta is not None:
+        try:
+            normalized_delta = max(-1.0, min(1.0, float(internal_share_delta)))
+        except Exception:
+            normalized_delta = 0.0
+        catalog_pivot_shadow_internal_share_delta.labels(**labels).observe(normalized_delta)
+    if catalog_pivot_shadow_external_share_delta is not None:
+        try:
+            normalized_delta = max(-1.0, min(1.0, float(external_share_delta)))
+        except Exception:
+            normalized_delta = 0.0
+        catalog_pivot_shadow_external_share_delta.labels(**labels).observe(normalized_delta)
+    if no_result_mismatch and catalog_pivot_shadow_no_result_mismatch_total is not None:
+        catalog_pivot_shadow_no_result_mismatch_total.labels(
+            source=labels["source"],
+            page_bucket=labels["page_bucket"],
+            query_semantic_class=labels["query_semantic_class"],
+            served_path=labels["served_path"],
+            shadow_path=labels["shadow_path"],
+        ).inc()
+    if estimated_price_delta_ratio is not None and catalog_pivot_shadow_estimated_price_delta_ratio is not None:
+        try:
+            normalized_delta = max(-5.0, min(5.0, float(estimated_price_delta_ratio)))
+        except Exception:
+            normalized_delta = 0.0
+        catalog_pivot_shadow_estimated_price_delta_ratio.labels(**labels).observe(normalized_delta)
+    if bad_price_anomaly and catalog_pivot_shadow_bad_price_anomaly_total is not None:
+        catalog_pivot_shadow_bad_price_anomaly_total.labels(
+            source=labels["source"],
+            page_bucket=labels["page_bucket"],
+            query_semantic_class=labels["query_semantic_class"],
+            served_path=labels["served_path"],
+            shadow_path=labels["shadow_path"],
+        ).inc()
 
 
 def record_catalog_upstream_fallback(*, reason: str) -> None:

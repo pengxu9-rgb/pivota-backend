@@ -24,6 +24,13 @@ from config.settings import settings
 from utils.logger import logger
 from services.dispute_records_service import stripe_dispute_pack_status
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
+from services.catalog_sync_service import (
+    create_catalog_sync_job,
+    mark_catalog_sync_event_processed,
+    record_catalog_sync_event,
+    run_catalog_sync_job,
+)
+from services.shopify_products_sync import sync_shopify_products_for_merchant
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.psp_payment_finalizer import (
@@ -43,6 +50,34 @@ from routes.reviews_invitation_issuer import (
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 adyen_webhook_security = HTTPBasic()
+
+
+async def _run_shopify_catalog_webhook_reconcile(
+    *,
+    merchant_id: str,
+    job_id: str,
+    event_id: Optional[str],
+    limit: int = 5000,
+) -> None:
+    try:
+        await sync_shopify_products_for_merchant(
+            merchant_id=merchant_id,
+            limit=limit,
+            ingest_catalog=False,
+        )
+        await run_catalog_sync_job(job_id)
+        if event_id:
+            await mark_catalog_sync_event_processed(event_id, status="processed")
+    except Exception as exc:  # pragma: no cover - background task
+        if event_id:
+            await mark_catalog_sync_event_processed(event_id, status="failed", error_message=str(exc))
+        logger.exception(
+            "Shopify catalog webhook reconcile failed merchant=%s job_id=%s event_id=%s err=%s",
+            merchant_id,
+            job_id,
+            event_id,
+            exc,
+        )
 
 def _reviews_invitation_auto_send_on_shopify_fulfillment_enabled() -> bool:
     raw = (os.getenv("REVIEWS_INVITATION_AUTO_SEND_ON_SHOPIFY_FULFILLMENT") or "").strip().lower()
@@ -1105,6 +1140,39 @@ async def handle_shopify_webhook(
 
         record_shopify_webhook(result="success", reason="ok", topic=topic)
         logger.info(f"Received Shopify webhook for {merchant_id}: {topic}")
+
+        if topic.startswith("products/"):
+            catalog_event = await record_catalog_sync_event(
+                merchant_id=merchant_id,
+                connector="shopify",
+                event_type="product_webhook",
+                topic=topic,
+                payload_json=data if isinstance(data, dict) else {"raw": data},
+                source_ref=x_shopify_webhook_id or f"{merchant_id}:{topic}",
+                occurred_at=occurred_at,
+            )
+            catalog_job = await create_catalog_sync_job(
+                merchant_id=merchant_id,
+                connector="shopify",
+                mode="webhook",
+                scope={
+                    "platform": "shopify",
+                    "limit": 5000,
+                    "include_expired": True,
+                    "source_system": "products_cache",
+                    "source_ref": x_shopify_webhook_id or f"{merchant_id}:{topic}",
+                    "trigger_topic": topic,
+                },
+                requested_by="shopify_webhook",
+            )
+            background_tasks.add_task(
+                _run_shopify_catalog_webhook_reconcile,
+                merchant_id=merchant_id,
+                job_id=str(catalog_job.get("job_id") or ""),
+                event_id=str(catalog_event.get("event_id") or ""),
+                limit=5000,
+            )
+
         if topic == "app/uninstalled":
             try:
                 from db.database import database

@@ -1,0 +1,1258 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import uuid
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from sqlalchemy import select
+
+from db.catalog import (
+    beauty_compatibility_rules,
+    beauty_content_assets,
+    beauty_product_profiles,
+    beauty_shades,
+    beauty_sku_ingredients,
+    beauty_usage_guides,
+    catalog_field_facts,
+    catalog_inventory_snapshots,
+    catalog_merchants,
+    catalog_offer_incentive_links,
+    catalog_offers,
+    catalog_payment_incentives,
+    catalog_price_snapshots,
+    catalog_products,
+    catalog_promotions,
+    catalog_quote_snapshots,
+    catalog_skus,
+    catalog_sync_events,
+    catalog_sync_jobs,
+    catalog_incentive_rules,
+)
+from db.database import database, promotions
+from db.merchant_onboarding import merchant_onboarding
+from db.products import products_cache
+from models.catalog import PaymentIncentiveInput
+from models.standard_product import StandardProduct, StandardProductVariant
+
+
+logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    # The catalog tables created by migration 058 use timestamp columns without
+    # timezone metadata. asyncpg rejects aware datetimes for those columns, so
+    # persist naive UTC consistently here.
+    return datetime.utcnow()
+
+
+def _stable_key(prefix: str, *parts: Any) -> str:
+    normalized = "::".join(str(part or "").strip() for part in parts)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
+    return f"{prefix}_{digest}"
+
+
+def _json_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _json_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _safe_decimal(value: Any) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def make_catalog_product_key(merchant_id: str, platform: str, source_product_id: str) -> str:
+    return f"prod::{merchant_id}::{platform}::{source_product_id}"
+
+
+def make_catalog_sku_key(product_key: str, source_variant_id: str) -> str:
+    return f"sku::{product_key}::{source_variant_id}"
+
+
+def make_catalog_offer_id(sku_key: str, channel: str, catalog_track: str) -> str:
+    return f"offer::{catalog_track}::{channel}::{sku_key}"
+
+
+def _coerce_variant(product: StandardProduct) -> StandardProductVariant:
+    variant_id = str(product.sku or product.id or "default").strip() or "default"
+    return StandardProductVariant(
+        id=variant_id,
+        title=product.title,
+        variant_id=variant_id,
+        sku=product.sku,
+        barcode=product.barcode,
+        price=product.price,
+        compare_at_price=product.compare_at_price,
+        inventory_quantity=product.inventory_quantity or 0,
+        image_url=product.image_url,
+        visible_option_labels=[],
+        platform_metadata=product.platform_metadata,
+    )
+
+
+def _iter_variants(product: StandardProduct) -> List[StandardProductVariant]:
+    variants = list(product.variants or [])
+    return variants or [_coerce_variant(product)]
+
+
+def _extract_metadata_values(metadata: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in metadata and metadata.get(key) not in (None, "", [], {}):
+            return metadata.get(key)
+    return None
+
+
+def _split_text_steps(text: str) -> List[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    parts = [part.strip(" -•\n\r\t") for part in re.split(r"(?:\r?\n|\. +|\d+\.\s+|•)", raw) if part.strip(" -•\n\r\t")]
+    deduped: List[str] = []
+    for part in parts:
+        if part and part not in deduped:
+            deduped.append(part)
+    return deduped
+
+
+def _normalize_shade_name(label: str) -> str:
+    normalized = str(label or "").strip().replace("_", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.title() if normalized else ""
+
+
+def _shade_family_from_name(name: str) -> Optional[str]:
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return None
+    for family in ("red", "pink", "berry", "brown", "coral", "peach", "nude", "orange", "gold", "bronze"):
+        if family in lowered:
+            return family
+    return None
+
+
+def _extract_how_to_use(metadata: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+    raw = _extract_metadata_values(
+        metadata,
+        "how_to_use",
+        "howToUse",
+        "usage",
+        "usage_text",
+        "directions",
+        "directions_text",
+    )
+    if not raw:
+        return None, []
+    if isinstance(raw, list):
+        steps = [str(item or "").strip() for item in raw if str(item or "").strip()]
+        text = " ".join(steps).strip() or None
+        return text, steps
+    text = str(raw).strip()
+    return text or None, _split_text_steps(text)
+
+
+def _extract_claims(metadata: Dict[str, Any]) -> List[str]:
+    claims = _json_list(_extract_metadata_values(metadata, "claims", "benefit_claims", "claim_labels"))
+    if claims:
+        return [str(item or "").strip() for item in claims if str(item or "").strip()]
+    text = _extract_metadata_values(metadata, "claims_text", "benefits_text")
+    if text:
+        return _split_text_steps(str(text))
+    return []
+
+
+def _extract_benefits(product: StandardProduct, metadata: Dict[str, Any]) -> List[str]:
+    benefits = _json_list(_extract_metadata_values(metadata, "benefits", "benefit_labels"))
+    normalized = [str(item or "").strip() for item in benefits if str(item or "").strip()]
+    if normalized:
+        return normalized
+    derived: List[str] = []
+    for labels in (product.visible_attributes or {}).values():
+        for label in labels or []:
+            value = str(label or "").strip().replace("_", " ")
+            if value and value not in derived:
+                derived.append(value)
+    return derived
+
+
+def _extract_active_ingredients(metadata: Dict[str, Any], ingredient_ids: List[str]) -> List[Dict[str, Any]]:
+    raw = _extract_metadata_values(metadata, "active_ingredients", "activeIngredients")
+    if isinstance(raw, list):
+        normalized: List[Dict[str, Any]] = []
+        for item in raw:
+            if isinstance(item, dict):
+                normalized.append(item)
+            else:
+                label = str(item or "").strip()
+                if label:
+                    normalized.append({"label": label})
+        return normalized
+    if ingredient_ids:
+        return [{"label": ingredient_id} for ingredient_id in ingredient_ids[:5]]
+    return []
+
+
+def _extract_raw_inci(metadata: Dict[str, Any], ingredient_ids: List[str]) -> Optional[str]:
+    raw = _extract_metadata_values(
+        metadata,
+        "ingredients",
+        "ingredients_text",
+        "inci",
+        "raw_inci",
+        "pdp_ingredients_raw",
+    )
+    if raw:
+        if isinstance(raw, list):
+            return ", ".join(str(item or "").strip() for item in raw if str(item or "").strip()) or None
+        return str(raw).strip() or None
+    if ingredient_ids:
+        return ", ".join(ingredient_ids)
+    return None
+
+
+def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tutorials = _json_list(_extract_metadata_values(metadata, "tutorials", "tutorial_assets", "media_assets"))
+    assets: List[Dict[str, Any]] = []
+    for idx, item in enumerate(tutorials):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or item.get("href") or "").strip()
+        if not url:
+            continue
+        assets.append(
+            {
+                "asset_id": item.get("asset_id") or _stable_key("beauty_asset", product.id, idx, url),
+                "asset_type": str(item.get("asset_type") or item.get("type") or "tutorial"),
+                "title": item.get("title"),
+                "url": url,
+                "thumbnail_url": item.get("thumbnail_url") or item.get("thumbnail"),
+                "sort_order": idx,
+                "metadata_json": item,
+            }
+        )
+    return assets
+
+
+def _extract_shades(product: StandardProduct, variant: StandardProductVariant) -> List[Dict[str, Any]]:
+    shades: List[Dict[str, Any]] = []
+    labels = list(variant.visible_option_labels or [])
+    for idx, label in enumerate(labels):
+        if not str(label).startswith("shade_"):
+            continue
+        shade_name = _normalize_shade_name(str(label)[len("shade_"):])
+        if not shade_name:
+            continue
+        shades.append(
+            {
+                "shade_id": _stable_key("beauty_shade", product.id, variant.variant_id or variant.id, shade_name),
+                "shade_name": shade_name,
+                "shade_code": None,
+                "shade_family": _shade_family_from_name(shade_name),
+                "undertone": None,
+                "finish": None,
+                "swatch_refs_json": [],
+                "media_refs_json": [],
+            }
+        )
+    return shades
+
+
+def _beauty_taxonomy(product: StandardProduct) -> Dict[str, Any]:
+    return {
+        "product_type": product.product_type,
+        "visible_attributes": product.visible_attributes or {},
+        "tags": list(product.tags or []),
+    }
+
+
+def _beauty_is_candidate(product: StandardProduct) -> bool:
+    if product.ingredient_ids:
+        return True
+    if product.visible_attributes:
+        return True
+    for variant in _iter_variants(product):
+        if any(str(label or "").startswith("shade_") for label in variant.visible_option_labels or []):
+            return True
+    product_type = str(product.product_type or "").lower()
+    return any(token in product_type for token in ("serum", "cleanser", "toner", "foundation", "lip", "cream", "spf"))
+
+
+def _compatibility_rules_from_ingredients(ingredient_ids: List[str], merchant_id: str, product_key: str, sku_key: str) -> List[Dict[str, Any]]:
+    ingredient_set = set(ingredient_ids)
+    rules: List[Dict[str, Any]] = []
+    if "retinol" in ingredient_set and "salicylic_acid" in ingredient_set:
+        rules.append(
+            {
+                "compatibility_rule_id": _stable_key("beauty_compat", sku_key, "retinol", "salicylic_acid"),
+                "product_key": product_key,
+                "sku_key": sku_key,
+                "merchant_id": merchant_id,
+                "rule_type": "ingredient_conflict",
+                "subject_ingredients_json": ["retinol"],
+                "related_ingredients_json": ["salicylic_acid"],
+                "verdict": "caution",
+                "rationale": "Retinoids and exfoliating acids often require staggered use in the same routine.",
+                "evidence_refs_json": ["deterministic_rule:retinol_salicylic_acid"],
+            }
+        )
+    if "retinol" in ingredient_set and "benzoyl_peroxide" in ingredient_set:
+        rules.append(
+            {
+                "compatibility_rule_id": _stable_key("beauty_compat", sku_key, "retinol", "benzoyl_peroxide"),
+                "product_key": product_key,
+                "sku_key": sku_key,
+                "merchant_id": merchant_id,
+                "rule_type": "ingredient_conflict",
+                "subject_ingredients_json": ["retinol"],
+                "related_ingredients_json": ["benzoyl_peroxide"],
+                "verdict": "caution",
+                "rationale": "Retinoids and benzoyl peroxide commonly require schedule separation to reduce irritation risk.",
+                "evidence_refs_json": ["deterministic_rule:retinol_benzoyl_peroxide"],
+            }
+        )
+    return rules
+
+
+def _readiness_tier_for_product(product: StandardProduct) -> str:
+    commerce_ready = bool(product.title and product.price is not None and _iter_variants(product))
+    if not commerce_ready:
+        return "identity_only"
+    if _beauty_is_candidate(product):
+        how_to_use, _ = _extract_how_to_use(_json_dict(product.platform_metadata))
+        if product.ingredient_ids and how_to_use:
+            return "knowledge_ready"
+        return "vertical_ready"
+    return "commerce_ready"
+
+
+async def _fetch_one_by_pk(table: Any, pk_name: str, pk_value: Any) -> Optional[Dict[str, Any]]:
+    row = await database.fetch_one(select(table).where(getattr(table.c, pk_name) == pk_value))
+    return dict(row) if row else None
+
+
+async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> None:
+    pk_value = values[pk_name]
+    existing = await _fetch_one_by_pk(table, pk_name, pk_value)
+    payload = dict(values)
+    payload["updated_at"] = _utcnow()
+    if existing:
+        await database.execute(table.update().where(getattr(table.c, pk_name) == pk_value).values(**payload))
+        return
+    payload.setdefault("created_at", _utcnow())
+    await database.execute(table.insert().values(**payload))
+
+
+async def _replace_child_rows(table: Any, match_column: str, match_value: Any, rows: Iterable[Dict[str, Any]]) -> int:
+    await database.execute(table.delete().where(getattr(table.c, match_column) == match_value))
+    count = 0
+    for row in rows:
+        payload = dict(row)
+        payload.setdefault("created_at", _utcnow())
+        payload.setdefault("updated_at", _utcnow())
+        await database.execute(table.insert().values(**payload))
+        count += 1
+    return count
+
+
+async def _replace_child_rows_multi(table: Any, where_clauses: List[Any], rows: Iterable[Dict[str, Any]]) -> int:
+    stmt = table.delete()
+    for clause in where_clauses:
+        stmt = stmt.where(clause)
+    await database.execute(stmt)
+    count = 0
+    for row in rows:
+        payload = dict(row)
+        payload.setdefault("created_at", _utcnow())
+        payload.setdefault("updated_at", _utcnow())
+        await database.execute(table.insert().values(**payload))
+        count += 1
+    return count
+
+
+async def _append_snapshot(table: Any, values: Dict[str, Any]) -> None:
+    payload = dict(values)
+    payload.setdefault("observed_at", _utcnow())
+    await database.execute(table.insert().values(**payload))
+
+
+async def _upsert_field_fact(
+    *,
+    entity_type: str,
+    entity_id: str,
+    field_family: str,
+    field_key: str,
+    source_system: str,
+    source_ref: Optional[str],
+    value: Any,
+    observed_at: Optional[datetime] = None,
+    fresh_until: Optional[datetime] = None,
+    confidence: Optional[Decimal] = None,
+    review_state: str = "observed",
+) -> None:
+    fact_id = _stable_key(
+        "fact",
+        entity_type,
+        entity_id,
+        field_family,
+        field_key,
+        source_system,
+        source_ref or "",
+    )
+    await _upsert_by_pk(
+        catalog_field_facts,
+        "fact_id",
+        {
+            "fact_id": fact_id,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "field_family": field_family,
+            "field_key": field_key,
+            "source_system": source_system,
+            "source_ref": source_ref,
+            "value_json": value,
+            "observed_at": observed_at or _utcnow(),
+            "fresh_until": fresh_until,
+            "confidence": confidence,
+            "review_state": review_state,
+        },
+    )
+
+
+async def _resolve_merchant_name(merchant_id: str) -> Optional[str]:
+    candidate_keys = [
+        key
+        for key in ("merchant_name", "business_name", "store_name")
+        if hasattr(merchant_onboarding.c, key)
+    ]
+    if not candidate_keys:
+        return None
+    row = await database.fetch_one(
+        select(*(getattr(merchant_onboarding.c, key) for key in candidate_keys))
+        .where(merchant_onboarding.c.merchant_id == merchant_id)
+        .limit(1)
+    )
+    if not row:
+        return None
+    data = dict(row)
+    for key in candidate_keys:
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+async def upsert_catalog_merchant(
+    *,
+    merchant_id: str,
+    merchant_name: Optional[str],
+    primary_platform: Optional[str],
+    source_system: str,
+    source_ref: Optional[str],
+    metadata_json: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not merchant_name:
+        merchant_name = await _resolve_merchant_name(merchant_id)
+    await _upsert_by_pk(
+        catalog_merchants,
+        "merchant_id",
+        {
+            "merchant_id": merchant_id,
+            "merchant_name": merchant_name,
+            "primary_platform": primary_platform,
+            "status": "active",
+            "source_system": source_system,
+            "source_ref": source_ref,
+            "metadata_json": metadata_json or {},
+        },
+    )
+
+
+async def ingest_standard_products(
+    *,
+    merchant_id: str,
+    platform: str,
+    product_payloads: List[Dict[str, Any]],
+    source_system: str,
+    source_ref: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    stats = {
+        "products_scanned": len(product_payloads or []),
+        "products_ingested": 0,
+        "products_failed": 0,
+        "skus_ingested": 0,
+        "offers_ingested": 0,
+        "beauty_profiles_upserted": 0,
+        "beauty_ingredient_rows_upserted": 0,
+        "beauty_usage_guides_upserted": 0,
+        "beauty_shades_upserted": 0,
+        "beauty_content_assets_upserted": 0,
+        "beauty_compatibility_rules_upserted": 0,
+    }
+
+    async with database.transaction():
+        await upsert_catalog_merchant(
+            merchant_id=merchant_id,
+            merchant_name=None,
+            primary_platform=platform,
+            source_system=source_system,
+            source_ref=source_ref,
+            metadata_json={"ingested_from": source_system},
+        )
+
+    for raw_product in product_payloads or []:
+        try:
+            product = StandardProduct(**raw_product)
+        except Exception as exc:
+            stats["products_failed"] += 1
+            logger.warning("Catalog ingest: failed to parse StandardProduct merchant=%s platform=%s err=%s", merchant_id, platform, exc)
+            continue
+
+        async with database.transaction():
+            product_key = make_catalog_product_key(merchant_id, platform, str(product.product_id or product.id))
+            metadata = _json_dict(product.platform_metadata)
+            readiness_tier = _readiness_tier_for_product(product)
+            canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
+            brand = str(product.vendor or metadata.get("brand") or "").strip() or None
+
+            await _upsert_by_pk(
+                catalog_products,
+                "product_key",
+                {
+                    "product_key": product_key,
+                    "merchant_id": merchant_id,
+                    "platform": platform,
+                    "source_product_id": str(product.product_id or product.id),
+                    "catalog_track": "internal_merchant",
+                    "truth_tier": "primary",
+                    "readiness_tier": readiness_tier,
+                    "source_system": source_system,
+                    "source_ref": source_ref,
+                    "title": product.title,
+                    "description": product.description_text or product.description,
+                    "brand": brand,
+                    "product_type": product.product_type,
+                    "category": product.product_type,
+                    "canonical_url": canonical_url,
+                    "image_url": product.image_url,
+                    "product_payload": raw_product,
+                    "freshness_json": {
+                        "updated_at": product.updated_at.isoformat() if product.updated_at else None,
+                        "observed_at": _utcnow().isoformat(),
+                    },
+                },
+            )
+            stats["products_ingested"] += 1
+
+            await _upsert_field_fact(
+                entity_type="product",
+                entity_id=product_key,
+                field_family="identity",
+                field_key="title",
+                source_system=source_system,
+                source_ref=source_ref,
+                value=product.title,
+                fresh_until=_utcnow() + timedelta(hours=24),
+                confidence=Decimal("1.0"),
+            )
+            if brand:
+                await _upsert_field_fact(
+                    entity_type="product",
+                    entity_id=product_key,
+                    field_family="identity",
+                    field_key="brand",
+                    source_system=source_system,
+                    source_ref=source_ref,
+                    value=brand,
+                    fresh_until=_utcnow() + timedelta(days=7),
+                    confidence=Decimal("1.0"),
+                )
+
+            variants = _iter_variants(product)
+            beauty_usage_rows: List[Dict[str, Any]] = []
+            beauty_shade_rows: List[Dict[str, Any]] = []
+            beauty_asset_rows: List[Dict[str, Any]] = []
+            beauty_compat_rows: List[Dict[str, Any]] = []
+            ingredient_row_upserts = 0
+
+            for variant in variants:
+                source_variant_id = str(variant.variant_id or variant.id or "default")
+                sku_key = make_catalog_sku_key(product_key, source_variant_id)
+                variant_price = _safe_decimal(variant.price if variant.price is not None else product.price)
+                compare_at = _safe_decimal(
+                    variant.compare_at_price if variant.compare_at_price is not None else product.compare_at_price
+                )
+                inventory_quantity = _safe_int(
+                    variant.inventory_quantity if variant.inventory_quantity is not None else product.inventory_quantity
+                )
+
+                await _upsert_by_pk(
+                    catalog_skus,
+                    "sku_key",
+                    {
+                        "sku_key": sku_key,
+                        "product_key": product_key,
+                        "merchant_id": merchant_id,
+                        "platform": platform,
+                        "source_product_id": str(product.product_id or product.id),
+                        "source_variant_id": source_variant_id,
+                        "sku": variant.sku or product.sku,
+                        "barcode": variant.barcode or product.barcode,
+                        "title": variant.title or product.title,
+                        "currency": product.currency,
+                        "image_url": variant.image_url or product.image_url,
+                        "visible_attributes": product.visible_attributes or {},
+                        "visible_option_labels": list(variant.visible_option_labels or []),
+                        "ingredient_ids": list(product.ingredient_ids or []),
+                        "sku_payload": variant.model_dump(mode="json"),
+                        "readiness_tier": readiness_tier,
+                    },
+                )
+                stats["skus_ingested"] += 1
+
+                offer_id = make_catalog_offer_id(sku_key, "default", "internal_merchant")
+                list_price = compare_at if compare_at and variant_price and compare_at > variant_price else variant_price
+                merchant_effective_price = variant_price
+                availability = "in_stock" if (inventory_quantity or 0) > 0 else "out_of_stock"
+                offer_mode = "merchant_checkout" if product.orderable is not False else "merchant_view_only"
+
+                await _upsert_by_pk(
+                    catalog_offers,
+                    "offer_id",
+                    {
+                        "offer_id": offer_id,
+                        "sku_key": sku_key,
+                        "product_key": product_key,
+                        "merchant_id": merchant_id,
+                        "catalog_track": "internal_merchant",
+                        "truth_tier": "primary",
+                        "readiness_tier": readiness_tier,
+                        "offer_mode": offer_mode,
+                        "channel": "default",
+                        "availability": availability,
+                        "inventory_quantity": inventory_quantity,
+                        "currency": product.currency,
+                        "list_price": list_price,
+                        "merchant_effective_price": merchant_effective_price,
+                        "estimated_best_price": merchant_effective_price,
+                        "price_confidence": Decimal("1.0"),
+                        "source_system": source_system,
+                        "source_ref": source_ref,
+                        "offer_payload": {
+                            "product_id": str(product.product_id or product.id),
+                            "variant_id": source_variant_id,
+                            "sku": variant.sku or product.sku,
+                        },
+                    },
+                )
+                stats["offers_ingested"] += 1
+
+                await _append_snapshot(
+                    catalog_inventory_snapshots,
+                    {
+                        "offer_id": offer_id,
+                        "sku_key": sku_key,
+                        "merchant_id": merchant_id,
+                        "inventory_quantity": inventory_quantity,
+                        "availability": availability,
+                        "source_system": source_system,
+                        "source_ref": source_ref,
+                    },
+                )
+                await _append_snapshot(
+                    catalog_price_snapshots,
+                    {
+                        "offer_id": offer_id,
+                        "sku_key": sku_key,
+                        "merchant_id": merchant_id,
+                        "currency": product.currency,
+                        "list_price": list_price,
+                        "merchant_effective_price": merchant_effective_price,
+                        "estimated_best_price": merchant_effective_price,
+                        "source_system": source_system,
+                        "source_ref": source_ref,
+                    },
+                )
+
+                await _upsert_field_fact(
+                    entity_type="offer",
+                    entity_id=offer_id,
+                    field_family="pricing",
+                    field_key="merchant_effective_price",
+                    source_system=source_system,
+                    source_ref=source_ref,
+                    value={
+                        "amount": str(merchant_effective_price) if merchant_effective_price is not None else None,
+                        "currency": product.currency,
+                    },
+                    fresh_until=_utcnow() + timedelta(hours=1),
+                    confidence=Decimal("1.0"),
+                )
+                await _upsert_field_fact(
+                    entity_type="offer",
+                    entity_id=offer_id,
+                    field_family="inventory",
+                    field_key="availability",
+                    source_system=source_system,
+                    source_ref=source_ref,
+                    value={"availability": availability, "inventory_quantity": inventory_quantity},
+                    fresh_until=_utcnow() + timedelta(minutes=15),
+                    confidence=Decimal("1.0"),
+                )
+
+                if _beauty_is_candidate(product):
+                    raw_inci = _extract_raw_inci(metadata, list(product.ingredient_ids or []))
+                    active_ingredients = _extract_active_ingredients(metadata, list(product.ingredient_ids or []))
+                    await _upsert_by_pk(
+                        beauty_sku_ingredients,
+                        "sku_key",
+                        {
+                            "sku_key": sku_key,
+                            "product_key": product_key,
+                            "merchant_id": merchant_id,
+                            "raw_inci": raw_inci,
+                            "normalized_ingredients_json": list(product.ingredient_ids or []),
+                            "active_ingredients_json": active_ingredients,
+                            "concentration_notes_json": _json_list(
+                                _extract_metadata_values(metadata, "concentrations", "concentration_notes")
+                            ),
+                            "allergen_flags_json": _json_list(_extract_metadata_values(metadata, "allergens", "allergen_flags")),
+                            "evidence_refs_json": [source_ref] if source_ref else [],
+                            "source_system": source_system,
+                        },
+                    )
+                    ingredient_row_upserts += 1
+                    await _upsert_field_fact(
+                        entity_type="sku",
+                        entity_id=sku_key,
+                        field_family="beauty_knowledge",
+                        field_key="ingredient_ids",
+                        source_system=source_system,
+                        source_ref=source_ref,
+                        value=list(product.ingredient_ids or []),
+                        fresh_until=_utcnow() + timedelta(days=30),
+                        confidence=Decimal("0.8"),
+                    )
+
+                    how_to_use_text, steps = _extract_how_to_use(metadata)
+                    if how_to_use_text or steps:
+                        beauty_usage_rows.append(
+                            {
+                                "guide_id": _stable_key("beauty_usage", product_key, sku_key or "product"),
+                                "product_key": product_key,
+                                "sku_key": sku_key,
+                                "merchant_id": merchant_id,
+                                "how_to_use_text": how_to_use_text,
+                                "steps_json": steps,
+                                "frequency": str(metadata.get("usage_frequency") or "").strip() or None,
+                                "time_of_day": str(metadata.get("usage_time_of_day") or metadata.get("am_pm") or "").strip()
+                                or None,
+                                "application_order": _safe_int(metadata.get("application_order")),
+                                "warnings_json": _json_list(_extract_metadata_values(metadata, "warnings", "usage_warnings")),
+                                "evidence_refs_json": [source_ref] if source_ref else [],
+                            }
+                        )
+                        await _upsert_field_fact(
+                            entity_type="sku",
+                            entity_id=sku_key,
+                            field_family="beauty_knowledge",
+                            field_key="how_to_use",
+                            source_system=source_system,
+                            source_ref=source_ref,
+                            value={"text": how_to_use_text, "steps": steps},
+                            fresh_until=_utcnow() + timedelta(days=30),
+                            confidence=Decimal("0.8"),
+                        )
+
+                    beauty_shade_rows.extend(
+                        [
+                            {
+                                **shade,
+                                "sku_key": sku_key,
+                                "product_key": product_key,
+                                "merchant_id": merchant_id,
+                            }
+                            for shade in _extract_shades(product, variant)
+                        ]
+                    )
+                    beauty_asset_rows.extend(
+                        [
+                            {
+                                **asset,
+                                "product_key": product_key,
+                                "sku_key": sku_key,
+                                "merchant_id": merchant_id,
+                            }
+                            for asset in _extract_tutorial_assets(product, metadata)
+                        ]
+                    )
+                    beauty_compat_rows.extend(
+                        _compatibility_rules_from_ingredients(list(product.ingredient_ids or []), merchant_id, product_key, sku_key)
+                    )
+
+            if _beauty_is_candidate(product):
+                claims = _extract_claims(metadata)
+                benefits = _extract_benefits(product, metadata)
+                await _upsert_by_pk(
+                    beauty_product_profiles,
+                    "product_key",
+                    {
+                        "product_key": product_key,
+                        "merchant_id": merchant_id,
+                        "taxonomy_json": _beauty_taxonomy(product),
+                        "concerns_json": list((product.visible_attributes or {}).get("skin_concern") or []),
+                        "claims_json": claims,
+                        "routine_phase": str(metadata.get("routine_phase") or metadata.get("usage_stage") or "").strip() or None,
+                        "benefits_json": benefits,
+                        "profile_payload": {
+                            "product_type": product.product_type,
+                            "tags": list(product.tags or []),
+                        },
+                    },
+                )
+                stats["beauty_profiles_upserted"] += 1
+
+                stats["beauty_ingredient_rows_upserted"] += ingredient_row_upserts
+                stats["beauty_usage_guides_upserted"] += await _replace_child_rows_multi(
+                    beauty_usage_guides,
+                    [beauty_usage_guides.c.product_key == product_key],
+                    beauty_usage_rows,
+                )
+                stats["beauty_shades_upserted"] += await _replace_child_rows_multi(
+                    beauty_shades,
+                    [beauty_shades.c.product_key == product_key],
+                    beauty_shade_rows,
+                )
+                stats["beauty_content_assets_upserted"] += await _replace_child_rows_multi(
+                    beauty_content_assets,
+                    [beauty_content_assets.c.product_key == product_key],
+                    beauty_asset_rows,
+                )
+                stats["beauty_compatibility_rules_upserted"] += await _replace_child_rows_multi(
+                    beauty_compatibility_rules,
+                    [beauty_compatibility_rules.c.product_key == product_key],
+                    beauty_compat_rows,
+                )
+
+    if job_id:
+        await _upsert_by_pk(
+            catalog_sync_jobs,
+            "job_id",
+            {
+                "job_id": job_id,
+                "merchant_id": merchant_id,
+                "connector": platform,
+                "mode": "sync",
+                "scope_json": {"platform": platform},
+                "status": "completed",
+                "stats_json": stats,
+                "completed_at": _utcnow(),
+            },
+        )
+    return stats
+
+
+async def create_catalog_sync_job(
+    *,
+    merchant_id: str,
+    connector: str,
+    mode: str,
+    scope: Optional[Dict[str, Any]] = None,
+    requested_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    job_id = _stable_key("catalog_job", merchant_id, connector, mode, uuid.uuid4().hex)
+    row = {
+        "job_id": job_id,
+        "merchant_id": merchant_id,
+        "connector": connector,
+        "mode": mode,
+        "scope_json": scope or {},
+        "status": "pending",
+        "requested_by": requested_by,
+        "stats_json": {},
+        "error_message": None,
+        "started_at": None,
+        "completed_at": None,
+    }
+    await _upsert_by_pk(catalog_sync_jobs, "job_id", row)
+    created = await _fetch_one_by_pk(catalog_sync_jobs, "job_id", job_id)
+    return created or row
+
+
+async def get_catalog_sync_job(job_id: str) -> Optional[Dict[str, Any]]:
+    return await _fetch_one_by_pk(catalog_sync_jobs, "job_id", job_id)
+
+
+async def record_catalog_sync_event(
+    *,
+    merchant_id: str,
+    connector: str,
+    event_type: str,
+    topic: Optional[str],
+    payload_json: Dict[str, Any],
+    source_ref: Optional[str] = None,
+    occurred_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    event_id = _stable_key("catalog_event", merchant_id, connector, event_type, source_ref or uuid.uuid4().hex)
+    row = {
+        "event_id": event_id,
+        "merchant_id": merchant_id,
+        "connector": connector,
+        "event_type": event_type,
+        "topic": topic,
+        "status": "pending",
+        "payload_json": payload_json,
+        "source_ref": source_ref,
+        "error_message": None,
+        "occurred_at": occurred_at,
+        "processed_at": None,
+    }
+    await _upsert_by_pk(catalog_sync_events, "event_id", row)
+    created = await _fetch_one_by_pk(catalog_sync_events, "event_id", event_id)
+    return created or row
+
+
+async def mark_catalog_sync_event_processed(event_id: str, *, status: str = "processed", error_message: Optional[str] = None) -> None:
+    existing = await _fetch_one_by_pk(catalog_sync_events, "event_id", event_id)
+    if not existing:
+        return
+    existing["status"] = status
+    existing["error_message"] = error_message
+    existing["processed_at"] = _utcnow()
+    await _upsert_by_pk(catalog_sync_events, "event_id", existing)
+
+
+async def sync_products_cache_to_catalog(
+    *,
+    merchant_id: str,
+    platform: Optional[str],
+    limit: int = 500,
+    include_expired: bool = True,
+    source_system: str = "products_cache",
+    source_ref: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if platform:
+        query = """
+            SELECT product_data
+            FROM products_cache
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+        """
+        params: Dict[str, Any] = {"merchant_id": merchant_id, "platform": platform}
+    else:
+        query = """
+            SELECT product_data
+            FROM products_cache
+            WHERE merchant_id = :merchant_id
+        """
+        params = {"merchant_id": merchant_id}
+
+    if not include_expired:
+        query += " AND expires_at > NOW()"
+    query += " ORDER BY cached_at DESC"
+    if limit > 0:
+        query += " LIMIT :limit"
+        params["limit"] = limit
+
+    rows = await database.fetch_all(query, params)
+    payloads = [dict(row).get("product_data") for row in rows if dict(row).get("product_data")]
+    normalized_payloads = []
+    seen: set[str] = set()
+    for payload in payloads:
+        obj = _json_dict(payload) if not isinstance(payload, dict) else payload
+        product_id = str(obj.get("product_id") or obj.get("id") or "").strip()
+        platform_value = str(obj.get("platform") or platform or "").strip()
+        dedupe_key = f"{platform_value}:{product_id}"
+        if not product_id or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        normalized_payloads.append(obj)
+
+    return await ingest_standard_products(
+        merchant_id=merchant_id,
+        platform=platform or "shopify",
+        product_payloads=normalized_payloads,
+        source_system=source_system,
+        source_ref=source_ref,
+        job_id=job_id,
+    )
+
+
+async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
+    job = await get_catalog_sync_job(job_id)
+    if not job:
+        raise RuntimeError(f"Catalog sync job not found: {job_id}")
+
+    scope = _json_dict(job.get("scope_json"))
+    connector = str(job.get("connector") or "shopify")
+    merchant_id = str(job.get("merchant_id") or "").strip()
+    mode = str(job.get("mode") or "reconcile")
+
+    await _upsert_by_pk(
+        catalog_sync_jobs,
+        "job_id",
+        {
+            **job,
+            "status": "running",
+            "started_at": _utcnow(),
+            "error_message": None,
+        },
+    )
+
+    try:
+        stats = await sync_products_cache_to_catalog(
+            merchant_id=merchant_id,
+            platform=str(scope.get("platform") or connector or "shopify"),
+            limit=int(scope.get("limit") or 500),
+            include_expired=bool(scope.get("include_expired", True)),
+            source_system=str(scope.get("source_system") or "products_cache"),
+            source_ref=scope.get("source_ref") or job_id,
+            job_id=job_id,
+        )
+        updated = await get_catalog_sync_job(job_id)
+        if updated:
+            return updated
+        return {
+            "job_id": job_id,
+            "merchant_id": merchant_id,
+            "connector": connector,
+            "mode": mode,
+            "status": "completed",
+            "stats_json": stats,
+        }
+    except Exception as exc:
+        await _upsert_by_pk(
+            catalog_sync_jobs,
+            "job_id",
+            {
+                **job,
+                "status": "failed",
+                "error_message": str(exc),
+                "completed_at": _utcnow(),
+            },
+        )
+        raise
+
+
+async def rebuild_beauty_verticals_for_merchant(
+    *,
+    merchant_id: str,
+    platform: Optional[str] = "shopify",
+    limit: int = 1000,
+) -> Dict[str, Any]:
+    await database.execute(beauty_product_profiles.delete().where(beauty_product_profiles.c.merchant_id == merchant_id))
+    await database.execute(beauty_sku_ingredients.delete().where(beauty_sku_ingredients.c.merchant_id == merchant_id))
+    await database.execute(beauty_usage_guides.delete().where(beauty_usage_guides.c.merchant_id == merchant_id))
+    await database.execute(beauty_shades.delete().where(beauty_shades.c.merchant_id == merchant_id))
+    await database.execute(beauty_compatibility_rules.delete().where(beauty_compatibility_rules.c.merchant_id == merchant_id))
+    await database.execute(beauty_content_assets.delete().where(beauty_content_assets.c.merchant_id == merchant_id))
+    stats = await sync_products_cache_to_catalog(
+        merchant_id=merchant_id,
+        platform=platform,
+        limit=limit,
+        include_expired=True,
+        source_system="beauty_rebuild",
+        source_ref=f"beauty_rebuild:{merchant_id}",
+    )
+    return {"merchant_id": merchant_id, "rebuild_stats": stats, "rebuild_at": _utcnow()}
+
+
+async def reconcile_catalog_incentives_for_merchant(
+    *,
+    merchant_id: str,
+    payment_incentives: Optional[List[PaymentIncentiveInput]] = None,
+    source_system: str = "merchant_config",
+) -> Dict[str, Any]:
+    promotion_rows = await database.fetch_all(
+        select(promotions).where(promotions.c.merchant_id == merchant_id)
+    )
+    promotions_synced = 0
+    for row in promotion_rows:
+        data = dict(row)
+        promotion_id = str(data.get("id") or _stable_key("catalog_promo", merchant_id, promotions_synced))
+        await _upsert_by_pk(
+            catalog_promotions,
+            "promotion_id",
+            {
+                "promotion_id": promotion_id,
+                "merchant_id": merchant_id,
+                "source_promotion_id": str(data.get("id") or ""),
+                "name": str(data.get("name") or "Promotion"),
+                "promotion_class": str(data.get("type") or "order").lower(),
+                "method": "automatic",
+                "label": str(data.get("human_readable_rule") or data.get("name") or "Promotion"),
+                "code": None,
+                "start_at": data.get("start_at"),
+                "end_at": data.get("end_at"),
+                "channels_json": data.get("channels") or [],
+                "scope_json": data.get("scope") or {},
+                "config_json": data.get("config") or {},
+                "truth_tier": "primary",
+                "source_system": "merchant_promotions",
+            },
+        )
+        promotions_synced += 1
+
+    payment_incentives_synced = 0
+    offer_links_synced = 0
+    offer_rows = await database.fetch_all(select(catalog_offers).where(catalog_offers.c.merchant_id == merchant_id))
+    for item in payment_incentives or []:
+        incentive_id = item.incentive_id or _stable_key(
+            "pay_incentive",
+            merchant_id,
+            item.label,
+            item.incentive_type,
+            item.card_network or "",
+            item.issuer_name or "",
+        )
+        await _upsert_by_pk(
+            catalog_payment_incentives,
+            "incentive_id",
+            {
+                "incentive_id": incentive_id,
+                "merchant_id": merchant_id,
+                "incentive_type": item.incentive_type,
+                "funding_source": item.funding_source,
+                "payment_method_type": item.payment_method_type,
+                "card_network": item.card_network,
+                "issuer_name": item.issuer_name,
+                "wallet_type": item.wallet_type,
+                "installment_provider": item.installment_provider,
+                "label": item.label,
+                "benefit_kind": item.benefit_kind,
+                "benefit_value": item.benefit_value,
+                "benefit_currency": item.benefit_currency,
+                "market": item.market,
+                "eligibility_confidence": item.eligibility_confidence,
+                "source_system": item.source_system,
+                "source_ref": item.source_ref,
+                "status": item.status,
+                "starts_at": item.starts_at,
+                "ends_at": item.ends_at,
+                "metadata_json": item.metadata,
+            },
+        )
+        await _upsert_by_pk(
+            catalog_incentive_rules,
+            "rule_id",
+            {
+                "rule_id": _stable_key("incentive_rule", incentive_id),
+                "incentive_id": incentive_id,
+                "merchant_id": merchant_id,
+                "rule_type": "payment_eligibility",
+                "scope_json": item.rule_scope,
+                "conditions_json": item.rule_conditions,
+                "schedule_json": item.schedule,
+                "human_rule": item.human_rule,
+            },
+        )
+        payment_incentives_synced += 1
+        for offer in offer_rows:
+            offer_dict = dict(offer)
+            link_id = _stable_key("offer_incentive_link", offer_dict.get("offer_id"), incentive_id)
+            await _upsert_by_pk(
+                catalog_offer_incentive_links,
+                "link_id",
+                {
+                    "link_id": link_id,
+                    "offer_id": offer_dict.get("offer_id"),
+                    "incentive_id": incentive_id,
+                    "merchant_id": merchant_id,
+                    "relationship_type": "eligible",
+                    "priority": 0,
+                },
+            )
+            offer_links_synced += 1
+
+    return {
+        "merchant_id": merchant_id,
+        "source_system": source_system,
+        "promotions_synced": promotions_synced,
+        "payment_incentives_synced": payment_incentives_synced,
+        "offer_links_synced": offer_links_synced,
+        "reconciled_at": _utcnow(),
+    }
+
+
+async def store_catalog_quote_snapshot(
+    *,
+    quote_id: str,
+    merchant_id: str,
+    offer_id: Optional[str],
+    sku_key: Optional[str],
+    product_key: Optional[str],
+    currency: Optional[str],
+    list_price: Optional[Decimal],
+    merchant_effective_price: Optional[Decimal],
+    estimated_best_price: Optional[Decimal],
+    exact_quote_price: Optional[Decimal],
+    incentives: List[Dict[str, Any]],
+    quote_payload: Dict[str, Any],
+    expires_at: Optional[datetime],
+) -> None:
+    quote_snapshot_id = _stable_key("quote_snapshot", merchant_id, quote_id, offer_id or sku_key or "")
+    await _upsert_by_pk(
+        catalog_quote_snapshots,
+        "quote_snapshot_id",
+        {
+            "quote_snapshot_id": quote_snapshot_id,
+            "quote_id": quote_id,
+            "merchant_id": merchant_id,
+            "offer_id": offer_id,
+            "sku_key": sku_key,
+            "product_key": product_key,
+            "currency": currency,
+            "list_price": list_price,
+            "merchant_effective_price": merchant_effective_price,
+            "estimated_best_price": estimated_best_price,
+            "exact_quote_price": exact_quote_price,
+            "incentives_json": incentives,
+            "quote_payload_json": quote_payload,
+            "expires_at": expires_at,
+        },
+    )

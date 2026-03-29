@@ -1,0 +1,94 @@
+{
+  "title": "Celestial Pivot Multi Release Gate",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "tags": ["pivot", "catalog", "rollout"],
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Eligible Shadow Coverage",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (source, page_bucket) (rate(catalog_pivot_shadow_compare_total[5m]))",
+          "legendFormat": "{{source}} {{page_bucket}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Top1 / Overlap Quality",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(catalog_pivot_shadow_compare_total{top1_same=\"true\"}[5m])) / clamp_min(sum(rate(catalog_pivot_shadow_compare_total[5m])), 1)",
+          "legendFormat": "top1_same_rate"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(catalog_pivot_shadow_overlap_ratio_bucket[5m])))",
+          "legendFormat": "overlap_p50"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(catalog_pivot_shadow_overlap_ratio_bucket[5m])))",
+          "legendFormat": "overlap_p90"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Returned Count / No-Result Drift",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(catalog_pivot_shadow_returned_count_delta_bucket[5m])))",
+          "legendFormat": "returned_count_delta_p50"
+        },
+        {
+          "expr": "sum(rate(catalog_pivot_shadow_no_result_mismatch_total[5m]))",
+          "legendFormat": "no_result_mismatch_rate"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Internal / External Mix Drift",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(catalog_pivot_shadow_internal_share_delta_bucket[5m])))",
+          "legendFormat": "internal_share_delta_p50"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(catalog_pivot_shadow_external_share_delta_bucket[5m])))",
+          "legendFormat": "external_share_delta_p50"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Price Anomaly / Search Latency",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(catalog_pivot_shadow_estimated_price_delta_ratio_bucket[5m])))",
+          "legendFormat": "estimated_price_delta_p90"
+        },
+        {
+          "expr": "sum(rate(catalog_pivot_shadow_bad_price_anomaly_total[5m]))",
+          "legendFormat": "bad_price_anomaly_rate"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(catalog_search_latency_seconds_bucket{path=\"pivot_semantic_core_multi\"}[5m])))",
+          "legendFormat": "pivot_search_latency_p95"
+        }
+      ]
+    }
+  ]
+}

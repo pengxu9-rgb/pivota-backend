@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import scripts.build_pivot_release_evidence as module
+
+
+def test_build_pivot_release_evidence_distinguishes_blocking_and_legacy_probe(tmp_path: Path, monkeypatch) -> None:
+    release_gate = tmp_path / "release-gate.json"
+    smoke = tmp_path / "smoke.json"
+    probe = tmp_path / "probe.json"
+    output_json = tmp_path / "evidence.json"
+    output_md = tmp_path / "evidence.md"
+
+    release_gate.write_text(
+        json.dumps({"summary": {"failed_cases": 0, "passed_cases": 4}}),
+        encoding="utf-8",
+    )
+    smoke.write_text(json.dumps({"overall_ok": True}), encoding="utf-8")
+    probe.write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"http_status": 0, "ok": False, "product_count": None},
+                    {"http_status": 401, "ok": False, "product_count": None},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        migration=None,
+        backfill_verify_json=None,
+        release_gate_json=str(release_gate),
+        catalog_pivot_smoke_json=str(smoke),
+        search_chain_probe_json=str(probe),
+        output_json=str(output_json),
+        output_md=str(output_md),
+        label="test-evidence",
+    )
+    monkeypatch.setattr(module, "_parse_args", lambda: args)
+
+    exit_code = module.main()
+
+    assert exit_code == 0
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    summary = payload["summary"]
+    assert summary["blocking_ready"] is True
+    assert summary["search_chain_probe_present"] is True
+    assert summary["search_chain_probe_records_total"] == 2
+    assert summary["search_chain_probe_records_ok"] == 0
+    assert summary["search_chain_probe_records_http_200"] == 0
+    assert summary["search_chain_probe_legacy_parity_ok"] is False
+
+
+def test_build_pivot_release_evidence_summarizes_beauty_ranking_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    release_gate = tmp_path / "release-gate.json"
+    smoke = tmp_path / "smoke.json"
+    beauty_audit = tmp_path / "beauty-audit.json"
+    beauty_compare = tmp_path / "beauty-compare.json"
+    output_json = tmp_path / "evidence.json"
+    output_md = tmp_path / "evidence.md"
+
+    release_gate.write_text(
+        json.dumps({"summary": {"failed_cases": 0, "passed_cases": 4}}),
+        encoding="utf-8",
+    )
+    smoke.write_text(json.dumps({"overall_ok": True}), encoding="utf-8")
+    beauty_audit.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "case_count": 10,
+                    "gateway_top1_matches": 7,
+                    "gateway_top1_evaluable": 10,
+                    "pivot_top1_matches": 6,
+                    "pivot_top1_evaluable": 10,
+                    "gateway_nonempty": 10,
+                    "pivot_nonempty": 10,
+                    "raw_seed_available_cases": 10,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    beauty_compare.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "top1_match_delta": 4,
+                    "improved_query_count": 4,
+                    "regressed_query_count": 0,
+                    "overlap_gain_cases": 5,
+                    "overlap_loss_cases": 0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        migration=None,
+        backfill_verify_json=None,
+        release_gate_json=str(release_gate),
+        catalog_pivot_smoke_json=str(smoke),
+        search_chain_probe_json=None,
+        beauty_ranking_audit_json=str(beauty_audit),
+        beauty_ranking_audit_compare_json=str(beauty_compare),
+        output_json=str(output_json),
+        output_md=str(output_md),
+        label="test-evidence",
+    )
+    monkeypatch.setattr(module, "_parse_args", lambda: args)
+
+    exit_code = module.main()
+
+    assert exit_code == 0
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    summary = payload["summary"]
+    assert summary["beauty_ranking_audit_present"] is True
+    assert summary["beauty_ranking_case_count"] == 10
+    assert summary["beauty_ranking_gateway_top1_matches"] == 7
+    assert summary["beauty_ranking_gateway_top1_match_rate"] == 0.7
+    assert summary["beauty_ranking_pivot_top1_matches"] == 6
+    assert summary["beauty_ranking_compare_present"] is True
+    assert summary["beauty_ranking_top1_match_delta"] == 4
+    assert summary["beauty_ranking_regressed_query_count"] == 0
+    assert summary["beauty_ranking_non_regressing"] is True

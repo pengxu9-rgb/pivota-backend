@@ -64,6 +64,10 @@ ROUTE_HEALTH_CONTRACT_FIELDS = [
     "selected_fallback_attempt",
     "final_returned_count",
     "fallback_reason",
+    "pivot_shadow_scheduled",
+    "pivot_shadow_mode",
+    "pivot_rollout_mode",
+    "pivot_rollout_guard_passed",
 ]
 
 
@@ -375,6 +379,36 @@ def _extract_common_metrics(body: Dict[str, Any]) -> Dict[str, Any]:
             if route_health.get("final_returned_count") is not None
             else metadata.get("final_returned_count")
             or product_count
+        ),
+        "pivot_shadow_scheduled": bool(
+            route_health.get("pivot_shadow_scheduled")
+            if route_health.get("pivot_shadow_scheduled") is not None
+            else metadata.get("pivot_shadow_scheduled")
+            or False
+        ),
+        "pivot_shadow_mode": (
+            str(
+                route_health.get("pivot_shadow_mode")
+                if route_health.get("pivot_shadow_mode") is not None
+                else metadata.get("pivot_shadow_mode")
+                or ""
+            ).strip()
+            or None
+        ),
+        "pivot_rollout_mode": (
+            str(
+                route_health.get("pivot_rollout_mode")
+                if route_health.get("pivot_rollout_mode") is not None
+                else metadata.get("pivot_rollout_mode")
+                or ""
+            ).strip()
+            or None
+        ),
+        "pivot_rollout_guard_passed": bool(
+            route_health.get("pivot_rollout_guard_passed")
+            if route_health.get("pivot_rollout_guard_passed") is not None
+            else metadata.get("pivot_rollout_guard_passed")
+            or False
         ),
         "external_seed_brand_strict_rows": _non_negative_int(
             route_health.get("external_seed_brand_strict_rows")
@@ -843,6 +877,8 @@ def main() -> int:
     )
     parser.add_argument("--release-sha-agent", default=os.getenv("RELEASE_SHA_AGENT", "").strip())
     parser.add_argument("--release-sha-backend", default=os.getenv("RELEASE_SHA_BACKEND", "").strip())
+    parser.add_argument("--output-json", default=None)
+    parser.add_argument("--output-md", default=None)
     args = parser.parse_args()
 
     rounds = max(1, int(args.rounds))
@@ -952,11 +988,21 @@ def main() -> int:
         "records": records,
     }
 
-    out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    json_path = out_dir / f"search_chain_inventory_{stamp}.json"
-    md_path = out_dir / f"search_chain_inventory_{stamp}.md"
+    if args.output_json:
+        json_path = Path(args.output_json).resolve()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = Path(args.out_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        json_path = out_dir / f"search_chain_inventory_{stamp}.json"
+    if args.output_md:
+        md_path = Path(args.output_md).resolve()
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = json_path.parent
+        stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        md_path = out_dir / f"search_chain_inventory_{stamp}.md"
 
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(

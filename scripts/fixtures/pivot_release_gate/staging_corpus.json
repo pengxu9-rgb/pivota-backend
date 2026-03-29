@@ -1,0 +1,38 @@
+[
+  {
+    "case_id": "merchant-exact-sephora",
+    "category": "merchant_exact_lookup",
+    "query": "sephora",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  },
+  {
+    "case_id": "product-exact-vitamin-c-serum",
+    "category": "product_exact_lookup",
+    "query": "vitamin c serum",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  },
+  {
+    "case_id": "beauty-vertical-niacinamide",
+    "category": "beauty_vertical_query",
+    "query": "niacinamide serum ingredients",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  },
+  {
+    "case_id": "blended-offer-mastercard",
+    "category": "blended_offer_incentive_query",
+    "query": "lip tint mastercard discount",
+    "source": "shopping_agent",
+    "page": 1,
+    "limit": 8,
+    "expected_rollout_mode": "shadow"
+  }
+]
