@@ -2421,6 +2421,129 @@ def _resolve_multi_base_merchant_fanout(source: Optional[str], is_creator_surfac
     return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT
 
 
+_GENERIC_DEFAULT_PRECISION_GATE_SOURCES = {
+    "shopping-agent-ui",
+    "shopping-agent-web",
+}
+_GENERIC_DEFAULT_PRECISION_IGNORED_QUERY_TOKENS = {
+    "black",
+    "white",
+    "beige",
+    "brown",
+    "camel",
+    "gray",
+    "grey",
+    "green",
+    "navy",
+    "neutral",
+    "pink",
+    "red",
+    "silver",
+    "tan",
+    "vintage",
+    "warm",
+}
+_GENERIC_DEFAULT_PRECISION_MIN_COVERAGE = 0.6
+_GENERIC_DEFAULT_PRECISION_MIN_MATCHES = 2
+
+
+def _normalize_generic_precision_token(value: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _strip_accents(str(value or "").lower())).strip()
+
+
+def _generic_precision_token_variants(token: str) -> set[str]:
+    normalized = _normalize_generic_precision_token(token)
+    if not normalized:
+        return set()
+    variants = {normalized}
+    if len(normalized) > 4 and normalized.endswith("ies"):
+        variants.add(normalized[:-3] + "y")
+    if len(normalized) > 4 and normalized.endswith("es"):
+        variants.add(normalized[:-2])
+    if len(normalized) > 3 and normalized.endswith("s"):
+        variants.add(normalized[:-1])
+    return {item for item in variants if item}
+
+
+def _default_query_precision_terms(query: Optional[str]) -> list[str]:
+    deduped: list[str] = []
+    for raw_token in re.split(r"[^a-z0-9]+", _strip_accents(str(query or "").lower())):
+        token = _normalize_generic_precision_token(raw_token)
+        if (
+            not token
+            or len(token) <= 2
+            or token.isdigit()
+            or token in _GENERIC_DEFAULT_PRECISION_IGNORED_QUERY_TOKENS
+        ):
+            continue
+        if token not in deduped:
+            deduped.append(token)
+    return deduped
+
+
+def _candidate_generic_precision_terms(product: StandardProduct) -> set[str]:
+    candidate_terms: set[str] = set()
+    raw_terms: list[str] = []
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(product.title or "").lower())))
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(product.product_type or "").lower())))
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(getattr(product, "vendor", "") or "").lower())))
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(getattr(product, "sku", "") or "").lower())))
+    for tag in getattr(product, "tags", None) or []:
+        raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(tag or "").lower())))
+    for raw_term in raw_terms:
+        for variant in _generic_precision_token_variants(raw_term):
+            if len(variant) > 2:
+                candidate_terms.add(variant)
+    return candidate_terms
+
+
+def _evaluate_generic_default_precision_gate(
+    *,
+    query: Optional[str],
+    product: StandardProduct,
+) -> Dict[str, Any]:
+    query_terms = _default_query_precision_terms(query)
+    if len(query_terms) < 2:
+        return {
+            "applied": False,
+            "passed": True,
+            "matched_terms": [],
+            "coverage_ratio": 1.0,
+            "required_matches": 0,
+        }
+
+    candidate_terms = _candidate_generic_precision_terms(product)
+    matched_terms = [
+        term
+        for term in query_terms
+        if _generic_precision_token_variants(term) & candidate_terms
+    ]
+    coverage_ratio = len(matched_terms) / float(len(query_terms)) if query_terms else 1.0
+    query_compact = _normalize_generic_precision_token(query)
+    candidate_compact = _normalize_generic_precision_token(
+        " ".join(
+            [
+                str(product.title or ""),
+                str(product.product_type or ""),
+                " ".join(str(tag or "") for tag in (getattr(product, "tags", None) or [])),
+            ]
+        )
+    )
+    exact_phrase_match = bool(query_compact and len(query_compact) >= 8 and query_compact in candidate_compact)
+    passed = exact_phrase_match or (
+        len(matched_terms) >= min(_GENERIC_DEFAULT_PRECISION_MIN_MATCHES, len(query_terms))
+        and coverage_ratio >= _GENERIC_DEFAULT_PRECISION_MIN_COVERAGE
+    )
+    return {
+        "applied": True,
+        "passed": passed,
+        "matched_terms": matched_terms,
+        "coverage_ratio": round(coverage_ratio, 4),
+        "required_matches": min(_GENERIC_DEFAULT_PRECISION_MIN_MATCHES, len(query_terms)),
+        "exact_phrase_match": exact_phrase_match,
+    }
+
+
 class SearchFilters(BaseModel):
     merchant_id: str = Field(..., description="Merchant ID")
     query: str = Field("", description="Search query, empty string means 'all products'")
@@ -7403,6 +7526,15 @@ async def _handle_find_products_multi(
     active_ingredient_labels = [str(group["ingredient_id"]) for group in active_ingredient_intents]
     non_strict_beauty_text_recall_enabled = query_semantic_class == "beauty" and not strict_serving_mode
     expanded_shopping_beauty_prefetch = False
+    generic_default_precision_gate_enabled = bool(
+        not strict_serving_mode
+        and query_semantic_class == "default"
+        and source_normalized in _GENERIC_DEFAULT_PRECISION_GATE_SOURCES
+        and not active_visible_category_intents
+        and not active_visible_attribute_intents
+        and not active_visible_option_intents
+        and not active_ingredient_intents
+    )
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -8745,6 +8877,7 @@ async def _handle_find_products_multi(
     }
     ingredient_rejected_reason_summary: Dict[str, int] = {}
     non_strict_beauty_text_recall_used = False
+    generic_default_precision_filtered_count = 0
 
     for product, merchant_name in merchant_products:
         if (
@@ -9087,6 +9220,15 @@ async def _handle_find_products_multi(
         # products whose text contains those markers (best-effort).
         if beauty_exclude_tags and query_semantic_class != "fragrance":
             if any(tag in blob_for_filters_ascii for tag in beauty_exclude_tags):
+                continue
+
+        if generic_default_precision_gate_enabled:
+            precision_eval = _evaluate_generic_default_precision_gate(
+                query=q_ascii,
+                product=product,
+            )
+            if precision_eval.get("applied") and not precision_eval.get("passed"):
+                generic_default_precision_filtered_count += 1
                 continue
 
         if only_skirts:
@@ -9824,6 +9966,8 @@ async def _handle_find_products_multi(
                 "expanded_shopping_beauty_prefetch": expanded_shopping_beauty_prefetch,
                 "beauty_live_query_fallback_used": beauty_live_query_fallback_used,
                 "strict_live_query_fallback_used": strict_live_query_fallback_used,
+                "generic_default_precision_gate_enabled": generic_default_precision_gate_enabled,
+                "generic_default_precision_filtered_count": generic_default_precision_filtered_count,
                 "external_seed_query_timeout": external_seed_query_timeout,
                 "external_seed_rows_fetched": external_seed_rows_fetched,
                 "external_seed_ranked_count": external_seed_ranked_count,

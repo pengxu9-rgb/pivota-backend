@@ -7313,3 +7313,227 @@ async def test_shop_gateway_find_products_multi_external_only_infers_title_ingre
     ]
     assert products[0]["ranking_score_breakdown"]["active_ingredient_score"] > 0
     assert products[0]["ingredient_ids"] == ["salicylic_acid"]
+
+
+def _generic_default_cache_row(
+    *,
+    product_id: str,
+    title: str,
+    product_type: str = "",
+    description: str = "",
+    merchant_id: str = "merch_generic_1",
+    tags: Optional[list[str]] = None,
+) -> dict:
+    return {
+        "merchant_id": merchant_id,
+        "platform": "shopify",
+        "platform_product_id": product_id,
+        "product_data": {
+            "id": product_id,
+            "product_id": product_id,
+            "platform": "shopify",
+            "merchant_id": merchant_id,
+            "title": title,
+            "description": description,
+            "product_type": product_type,
+            "tags": list(tags or []),
+            "price": 39.0,
+            "currency": "USD",
+            "inventory_quantity": 12,
+            "image_url": f"https://cdn.example.com/{product_id}.jpg",
+            "status": "active",
+            "orderable": True,
+            "variants": [
+                {
+                    "id": f"var_{product_id}",
+                    "sku": f"sku_{product_id}",
+                    "title": "Default",
+                    "price": 39.0,
+                    "inventory_quantity": 12,
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_generic_default_ui_filters_weak_bag_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    cache_rows = [
+        _generic_default_cache_row(
+            product_id="prod_tote",
+            title="Pixi 25th Anniversary Tote Bag",
+            product_type="Tote Bag",
+            description="Anniversary tote for everyday carry.",
+        ),
+        _generic_default_cache_row(
+            product_id="prod_black_bag",
+            title="Puffy Makeup Bag",
+            product_type="Bag",
+            description="Black quilted cosmetic pouch.",
+        ),
+        _generic_default_cache_row(
+            product_id="prod_traveler",
+            title="Puffy Traveler Tote – Black",
+            product_type="Tote",
+            description="Travel tote in black nylon.",
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_generic_1", "business_name": "Generic Merchant"}]
+        if "FROM external_product_seeds" in q or "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return list(cache_rows)
+        return []
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="black leather crossbody bag",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-ui"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("products") == []
+    metadata = result.get("metadata") or {}
+    assert metadata.get("query_semantic_class") == "default"
+    assert metadata.get("generic_default_precision_gate_enabled") is True
+    assert metadata.get("generic_default_precision_filtered_count") == len(cache_rows)
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_generic_default_web_filters_partial_term_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    cache_rows = [
+        _generic_default_cache_row(
+            product_id="prod_palette",
+            title="Cool Neutrals Eyeshadow Palette",
+            product_type="Palette",
+            description="Cool neutral eye looks.",
+        ),
+        _generic_default_cache_row(
+            product_id="prod_tote",
+            title="Puffy Carryall Tote – Awaken Confidence",
+            product_type="Tote",
+            description="Carryall tote for daily essentials.",
+        ),
+        _generic_default_cache_row(
+            product_id="prod_extrait",
+            title="L'Art & La Matière VANILLE PLANIFOLIA EXTRAIT 21 – EXTRACT 50 ML / 1.69 OZ",
+            product_type="Fragrance",
+            description="Vanilla extrait.",
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_generic_1", "business_name": "Generic Merchant"}]
+        if "FROM external_product_seeds" in q or "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return list(cache_rows)
+        return []
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="vintage fig accord extrait 1987",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-web"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-web"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    assert result.get("products") == []
+    metadata = result.get("metadata") or {}
+    assert metadata.get("query_semantic_class") == "default"
+    assert metadata.get("generic_default_precision_gate_enabled") is True
+    assert metadata.get("generic_default_precision_filtered_count") == len(cache_rows)
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_generic_default_ui_keeps_high_coverage_exact_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    cache_rows = [
+        _generic_default_cache_row(
+            product_id="prod_chair",
+            title="Ergonomic Office Chair",
+            product_type="Office Chair",
+            description="Ergonomic chair for desk work.",
+        ),
+        _generic_default_cache_row(
+            product_id="prod_stool",
+            title="Standing Desk Stool",
+            product_type="Stool",
+            description="Adjustable desk stool.",
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_generic_1", "business_name": "Generic Merchant"}]
+        if "FROM external_product_seeds" in q or "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return list(cache_rows)
+        return []
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="ergonomic office chair",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-ui"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    products = result.get("products") or []
+    metadata = result.get("metadata") or {}
+    assert [product.get("title") for product in products] == ["Ergonomic Office Chair"]
+    assert metadata.get("generic_default_precision_gate_enabled") is True
+    assert metadata.get("generic_default_precision_filtered_count") == 1
