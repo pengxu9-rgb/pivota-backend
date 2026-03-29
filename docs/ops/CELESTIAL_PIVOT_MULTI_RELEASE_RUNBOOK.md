@@ -14,6 +14,7 @@
 - Backfill / verify CLI: [catalog_backfill_verify.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_backfill_verify.py)
 - Release gate CLI: [pivot_multi_release_gate.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/pivot_multi_release_gate.py)
 - Catalog/Pivot live smoke: [smoke_catalog_pivot_v1.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_catalog_pivot_v1.py)
+- Employee/admin JWT mint helper: [mint_employee_jwt.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/mint_employee_jwt.py)
 - Release evidence builder: [build_pivot_release_evidence.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/build_pivot_release_evidence.py)
 - Bundle orchestrator: [run_pivot_release_bundle.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_pivot_release_bundle.py)
 - Grafana dashboard: [celestial_pivot_multi_release_dashboard.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/grafana/celestial_pivot_multi_release_dashboard.json)
@@ -63,6 +64,12 @@ python3 scripts/run_pivot_release_bundle.py \
 
 ## Production Shadow Bundle Command
 ```bash
+ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \
+  --railway-service web \
+  --role admin \
+  --email ops+pivot@pivota.invalid \
+  --employee-id emp_pivot)"
+
 python3 scripts/run_pivot_release_bundle.py \
   --base-url "$BASE_URL" \
   --release-gate-base-url https://api.pivota.cc \
@@ -74,6 +81,7 @@ python3 scripts/run_pivot_release_bundle.py \
   --service-side-data-plane-verify \
   --smoke-header "Authorization: Bearer $ADMIN_JWT" \
   --beauty-ranking-audit \
+  --beauty-ranking-audit-pivot-header "Authorization: Bearer $ADMIN_JWT" \
   --beauty-ranking-audit-db-mode sync \
   --beauty-ranking-audit-database-url "$DATABASE_PUBLIC_URL" \
   --beauty-ranking-audit-compare-before-json output/pivot-release/beauty-ranking-before.json \
@@ -116,9 +124,17 @@ Note:
 Before deploy, capture a production baseline with the fast sync path:
 
 ```bash
+ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \
+  --railway-service web \
+  --role admin \
+  --email ops+pivot@pivota.invalid \
+  --employee-id emp_pivot)"
+
 python3 scripts/beauty_ranking_audit.py \
   --gateway-base-url https://api.pivota.cc \
+  --pivot-base-url https://web-production-fedb.up.railway.app \
   --gateway-header "Authorization: Bearer $SHOP_GATEWAY_AGENT_API_KEY" \
+  --pivot-header "Authorization: Bearer $ADMIN_JWT" \
   --database-url "$DATABASE_PUBLIC_URL" \
   --db-mode sync \
   --seed-fetch-mode fast \
