@@ -1764,6 +1764,30 @@ def _normalize_gateway_route_health(
     return md
 
 
+def _apply_pivot_rollout_metadata(
+    metadata: Optional[Dict[str, Any]],
+    *,
+    pivot_shadow_scheduled: bool,
+) -> Dict[str, Any]:
+    md = dict(metadata) if isinstance(metadata, dict) else {}
+    query_source = str(md.get("query_source") or "").strip()
+    rollout_mode = str(md.get("pivot_rollout_mode") or "").strip().lower()
+
+    if query_source == "pivot_semantic_core_multi" or rollout_mode == "serve":
+        md["pivot_shadow_scheduled"] = False
+        md.pop("pivot_shadow_mode", None)
+        md["pivot_rollout_mode"] = "serve"
+        md["pivot_rollout_guard_passed"] = True
+        return md
+
+    md["pivot_shadow_scheduled"] = pivot_shadow_scheduled
+    if pivot_shadow_scheduled:
+        md["pivot_shadow_mode"] = "background_compare"
+    md["pivot_rollout_mode"] = "shadow" if pivot_shadow_scheduled else "legacy"
+    md["pivot_rollout_guard_passed"] = bool(pivot_shadow_scheduled)
+    return md
+
+
 MULTI_SEARCH_MERCHANT_SCAN_LIMIT = _env_int(
     "AGENT_SHOP_MULTI_MERCHANT_SCAN_LIMIT",
     18,
@@ -11178,11 +11202,10 @@ async def invoke_shop_operation(
                 source_normalized=_normalize_surface_source(normalized_metadata.get("source")),
                 page=multi_payload.search.page or 1,
             )
-            response_metadata["pivot_shadow_scheduled"] = pivot_shadow_scheduled
-            if pivot_shadow_scheduled:
-                response_metadata["pivot_shadow_mode"] = "background_compare"
-            response_metadata["pivot_rollout_mode"] = "shadow" if pivot_shadow_scheduled else "legacy"
-            response_metadata["pivot_rollout_guard_passed"] = bool(pivot_shadow_scheduled)
+            response_metadata = _apply_pivot_rollout_metadata(
+                response_metadata,
+                pivot_shadow_scheduled=pivot_shadow_scheduled,
+            )
             response_metadata = _normalize_gateway_route_health(
                 response_metadata,
                 default_decision_node=str(response_metadata.get("query_source") or "cache_multi_intent"),
@@ -11817,11 +11840,10 @@ async def invoke_shop_operation(
                     dedup_cache_hit=dedup_cache_hit,
                     dedup_inflight_joined=dedup_inflight_joined,
                 )
-                response_metadata["pivot_shadow_scheduled"] = pivot_shadow_scheduled
-                if pivot_shadow_scheduled:
-                    response_metadata["pivot_shadow_mode"] = "background_compare"
-                response_metadata["pivot_rollout_mode"] = "shadow" if pivot_shadow_scheduled else "legacy"
-                response_metadata["pivot_rollout_guard_passed"] = bool(pivot_shadow_scheduled)
+                response_metadata = _apply_pivot_rollout_metadata(
+                    response_metadata,
+                    pivot_shadow_scheduled=pivot_shadow_scheduled,
+                )
                 response_metadata.setdefault("query_semantic_class", query_semantic_class)
                 response_metadata = _normalize_gateway_route_health(
                     response_metadata,
