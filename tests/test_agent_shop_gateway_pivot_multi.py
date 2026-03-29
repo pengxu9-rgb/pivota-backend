@@ -552,3 +552,19 @@ def test_normalize_gateway_route_health_carries_pivot_shadow_fields() -> None:
     assert metadata["route_health"]["pivot_shadow_mode"] == "background_compare"
     assert metadata["route_health"]["pivot_rollout_mode"] == "shadow"
     assert metadata["route_health"]["pivot_rollout_guard_passed"] is True
+
+
+def test_apply_pivot_rollout_metadata_preserves_serve_for_pivot_primary_path() -> None:
+    metadata = gateway._apply_pivot_rollout_metadata(
+        {
+            "query_source": "pivot_semantic_core_multi",
+            "pivot_rollout_mode": "serve",
+            "pivot_rollout_guard_passed": True,
+        },
+        pivot_shadow_scheduled=False,
+    )
+
+    assert metadata["pivot_shadow_scheduled"] is False
+    assert metadata.get("pivot_shadow_mode") is None
+    assert metadata["pivot_rollout_mode"] == "serve"
+    assert metadata["pivot_rollout_guard_passed"] is True
