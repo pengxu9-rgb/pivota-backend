@@ -41,6 +41,8 @@ class _FakeSession:
             return _FakeResponse({"quote_id": "quote_123"})
         if url.endswith("/admin/migrations/run/058"):
             return _FakeResponse({"mode": "apply-verify", "success": True, "verification": {}})
+        if url.endswith("/v1/catalog/connectors/shopify/webhooks"):
+            return _FakeResponse({"event_id": "catalog_event_123", "status": "pending"})
         if url.endswith("/v1/catalog/sync/jobs"):
             return _FakeResponse({"job_id": "catalog_job_123", "status": "pending"})
         raise AssertionError(f"unexpected POST {url}")
@@ -183,3 +185,37 @@ def test_smoke_catalog_pivot_v1_can_skip_pivot_query(monkeypatch, tmp_path: Path
     assert "pivot_query" not in step_names
     assert "pivot_offers_resolve" in step_names
     assert "pivot_quote" in step_names
+
+
+def test_smoke_catalog_pivot_v1_can_smoke_webhook_ingest(monkeypatch, tmp_path: Path) -> None:
+    fake_session = _FakeSession()
+    monkeypatch.setattr(module.requests, "Session", lambda: fake_session)
+    args = argparse.Namespace(
+        base_url="https://pivot.example",
+        merchant_id="merch_1",
+        query="vitamin c serum",
+        offer_id=None,
+        product_key=None,
+        sku_key=None,
+        skip_pivot_query=False,
+        timeout_seconds=20.0,
+        header=["Authorization: Bearer test"],
+        catalog_migration_verify_smoke=False,
+        catalog_migration_run_smoke=False,
+        catalog_migration_run_mode="apply-verify",
+        catalog_webhook_smoke=True,
+        catalog_sync_job_smoke=False,
+        catalog_sync_limit=1,
+        catalog_sync_wait_seconds=0.0,
+        catalog_sync_poll_interval_seconds=2.0,
+        output_json=str(tmp_path / "smoke.json"),
+        output_md=str(tmp_path / "smoke.md"),
+    )
+    monkeypatch.setattr(module, "_parse_args", lambda: args)
+
+    exit_code = module.main()
+
+    assert exit_code == 0
+    payload = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    step_names = [step["step"] for step in payload["steps"]]
+    assert "catalog_webhook_ingest" in step_names
