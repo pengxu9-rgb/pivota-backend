@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+from sqlalchemy import create_engine, text
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -24,6 +25,10 @@ from services.beauty_external_ranking import (
     rank_external_seed_rows,
 )
 from services.external_seed_search import fetch_external_seed_rows, seed_search_terms
+from services.external_seed_search import (
+    build_external_seed_prefer_terms_rank_sql,
+    build_external_seed_text_clause,
+)
 
 
 DEFAULT_CORPUS = (
@@ -45,6 +50,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gateway-header", action="append", default=[], help="Repeatable raw header for gateway in 'Name: Value' form.")
     parser.add_argument("--pivot-header", action="append", default=[], help="Repeatable raw header for pivot in 'Name: Value' form.")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
+    parser.add_argument("--database-url", default=None)
+    parser.add_argument("--db-mode", choices=("auto", "async", "sync"), default="auto")
+    parser.add_argument("--seed-fetch-mode", choices=("fast", "deep"), default="fast")
     parser.add_argument("--seed-stage-a-timeout-seconds", type=float, default=0.9)
     parser.add_argument("--seed-stage-b-timeout-seconds", type=float, default=1.6)
     parser.add_argument("--output-json", default=None)
@@ -78,6 +86,102 @@ def _load_corpus(path_str: str) -> List[Dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _resolve_database_url(args: argparse.Namespace) -> Optional[str]:
+    explicit = str(getattr(args, "database_url", "") or "").strip()
+    if explicit:
+        return explicit
+    env_value = str(os.getenv("DATABASE_URL") or "").strip()
+    return env_value or None
+
+
+def _use_sync_db(args: argparse.Namespace) -> bool:
+    mode = str(getattr(args, "db_mode", "auto") or "auto").strip().lower()
+    if mode == "sync":
+        return True
+    if mode == "async":
+        return False
+    return bool(_resolve_database_url(args))
+
+
+def _fetch_external_seed_rows_sync(
+    *,
+    connection: Any,
+    query: str,
+    limit: int,
+    market: Optional[str],
+    include_seed_data_text_match: bool,
+    query_timeout_seconds: float,
+) -> Dict[str, Any]:
+    where = ["status = :status"]
+    values: Dict[str, Any] = {
+        "status": "active",
+        "limit": max(1, int(limit or 1)),
+    }
+    normalized_market = str(market or "").strip().upper()
+    if normalized_market:
+        where.append("market = :market")
+        values["market"] = normalized_market
+
+    text_clause, text_values = build_external_seed_text_clause(
+        raw_query=query,
+        include_seed_data_text_match=include_seed_data_text_match,
+        param_prefix="q",
+    )
+    if text_clause:
+        where.append(text_clause)
+        values.update(text_values)
+
+    rank_sql, rank_values = build_external_seed_prefer_terms_rank_sql(
+        prefer_terms=seed_search_terms(query),
+        include_seed_data_text_match=include_seed_data_text_match,
+        param_prefix="prefer",
+    )
+    values.update(rank_values)
+    query_sql = text(
+        f"""
+        SELECT
+          id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+          destination_url, canonical_url, domain, title, image_url,
+          price_amount, price_currency, availability,
+          seed_data,
+          status, notes, created_by_employee_id,
+          attached_product_key, attached_variant_id,
+          created_at, updated_at,
+          {rank_sql} AS brand_term_hit
+        FROM external_product_seeds
+        WHERE {" AND ".join(where)}
+        ORDER BY brand_term_hit DESC, created_at DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    started = time.perf_counter()
+    try:
+        rows = [dict(row._mapping) for row in connection.execute(query_sql, values)]
+        return {
+            "rows": rows,
+            "query_ms": int((time.perf_counter() - started) * 1000),
+            "query_timeout": False,
+            "table_missing": False,
+        }
+    except Exception as exc:
+        message = str(exc or "").lower()
+        table_missing = "external_product_seeds" in message and (
+            "no such table" in message
+            or "does not exist" in message
+            or "undefinedtable" in message
+            or "relation" in message
+        )
+        query_timeout = "timeout" in message or "statement timeout" in message
+        if table_missing or query_timeout:
+            return {
+                "rows": [],
+                "query_ms": int((time.perf_counter() - started) * 1000),
+                "query_timeout": bool(query_timeout),
+                "table_missing": bool(table_missing),
+            }
+        raise
+
+
 async def _fetch_raw_external_rows(
     *,
     query: str,
@@ -85,41 +189,68 @@ async def _fetch_raw_external_rows(
     market: Optional[str],
     stage_a_timeout_seconds: float,
     stage_b_timeout_seconds: float,
+    seed_fetch_mode: str,
+    sync_connection: Any = None,
 ) -> Dict[str, Any]:
     query_terms = seed_search_terms(query)
-    stage_a = await fetch_external_seed_rows(
-        database=database,
-        market=market,
-        query=query,
-        limit=limit,
-        offset=0,
-        include_seed_data_text_match=False,
-        only_unattached=False,
-        query_timeout_seconds=stage_a_timeout_seconds,
-        required_terms=None,
-        prefer_terms=query_terms or None,
-        scope="default",
-        use_required_terms_filter=False,
-        include_total_count=False,
-    )
-    rows = stage_a.get("rows") or []
-    stage_b = None
-    if not rows and query.strip() and not bool(stage_a.get("table_missing")):
-        stage_b = await fetch_external_seed_rows(
+    if sync_connection is not None:
+        stage_a = _fetch_external_seed_rows_sync(
+            connection=sync_connection,
+            market=market,
+            query=query,
+            limit=limit,
+            include_seed_data_text_match=False,
+            query_timeout_seconds=stage_a_timeout_seconds,
+        )
+    else:
+        stage_a = await fetch_external_seed_rows(
             database=database,
             market=market,
             query=query,
             limit=limit,
             offset=0,
-            include_seed_data_text_match=True,
+            include_seed_data_text_match=False,
             only_unattached=False,
-            query_timeout_seconds=stage_b_timeout_seconds,
+            query_timeout_seconds=stage_a_timeout_seconds,
             required_terms=None,
             prefer_terms=query_terms or None,
             scope="default",
             use_required_terms_filter=False,
             include_total_count=False,
         )
+    rows = stage_a.get("rows") or []
+    stage_b = None
+    if (
+        str(seed_fetch_mode or "fast").strip().lower() == "deep"
+        and not rows
+        and query.strip()
+        and not bool(stage_a.get("table_missing"))
+    ):
+        if sync_connection is not None:
+            stage_b = _fetch_external_seed_rows_sync(
+                connection=sync_connection,
+                market=market,
+                query=query,
+                limit=limit,
+                include_seed_data_text_match=True,
+                query_timeout_seconds=stage_b_timeout_seconds,
+            )
+        else:
+            stage_b = await fetch_external_seed_rows(
+                database=database,
+                market=market,
+                query=query,
+                limit=limit,
+                offset=0,
+                include_seed_data_text_match=True,
+                only_unattached=False,
+                query_timeout_seconds=stage_b_timeout_seconds,
+                required_terms=None,
+                prefer_terms=query_terms or None,
+                scope="default",
+                use_required_terms_filter=False,
+                include_total_count=False,
+            )
         rows = stage_b.get("rows") or []
     ranked = rank_external_seed_rows(rows, query=query, limit=limit)
     return {
@@ -249,6 +380,8 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "",
         f"- ranking_audit_version: `{report['ranking_audit_version']}`",
         f"- corpus_path: `{report['corpus_path']}`",
+        f"- db_mode: `{report.get('db_mode')}`",
+        f"- seed_fetch_mode: `{report.get('seed_fetch_mode')}`",
         f"- cases: `{report['summary']['case_count']}`",
         f"- gateway_top1_matches: `{report['summary']['gateway_top1_matches']}`",
         f"- gateway_top1_evaluable: `{report['summary']['gateway_top1_evaluable']}`",
@@ -281,8 +414,17 @@ def _render_markdown(report: Dict[str, Any]) -> str:
 
 async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
     corpus = _load_corpus(args.corpus)
+    use_sync_db = _use_sync_db(args)
+    sync_engine = None
+    sync_connection = None
     connected_here = False
-    if hasattr(database, "is_connected") and not database.is_connected:
+    if use_sync_db:
+        database_url = _resolve_database_url(args)
+        if not database_url:
+            raise ValueError("database_url is required when db_mode resolves to sync")
+        sync_engine = create_engine(database_url, pool_pre_ping=True)
+        sync_connection = sync_engine.connect()
+    elif hasattr(database, "is_connected") and not database.is_connected:
         await database.connect()
         connected_here = True
     try:
@@ -313,6 +455,8 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
                 market=market,
                 stage_a_timeout_seconds=float(args.seed_stage_a_timeout_seconds),
                 stage_b_timeout_seconds=float(args.seed_stage_b_timeout_seconds),
+                seed_fetch_mode=str(args.seed_fetch_mode or "fast"),
+                sync_connection=sync_connection,
             )
             ranked_candidates = raw_fetch["ranking_audit"]["ranked_candidates"]
             ranked_titles = [str(item.get("title") or "").strip() for item in ranked_candidates if isinstance(item, dict)]
@@ -430,6 +574,8 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "gateway_base_url": gateway_base_url,
             "pivot_base_url": pivot_base_url,
+            "db_mode": "sync" if use_sync_db else "async",
+            "seed_fetch_mode": str(args.seed_fetch_mode or "fast"),
             "seed_stage_a_timeout_seconds": float(args.seed_stage_a_timeout_seconds),
             "seed_stage_b_timeout_seconds": float(args.seed_stage_b_timeout_seconds),
             "summary": {
@@ -446,6 +592,10 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
             "cases": cases,
         }
     finally:
+        if sync_connection is not None:
+            sync_connection.close()
+        if sync_engine is not None:
+            sync_engine.dispose()
         if connected_here:
             await database.disconnect()
 
