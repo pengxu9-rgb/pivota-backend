@@ -583,6 +583,19 @@ def test_sort_items_prefers_gentle_cleanser_anchor_over_serum_and_generic_cleans
             ),
             module._build_external_item(
                 {
+                    "external_product_id": "ext_ultra_gentle_cleanser_jumbo",
+                    "title": "Ultra Gentle Cream-to-Foam Face Cleanser Jumbo",
+                    "domain": "firstaidbeauty.com",
+                    "canonical_url": "https://firstaidbeauty.com/products/face-cleanser-jumbo",
+                    "destination_url": "https://firstaidbeauty.com/products/face-cleanser-jumbo",
+                    "brand_term_hit": 2,
+                    "seed_data": {"brand": "First Aid Beauty"},
+                },
+                "gentle cleanser",
+                source_order=1,
+            ),
+            module._build_external_item(
+                {
                     "external_product_id": "ext_ultra_gentle_cleanser",
                     "title": "Ultra Gentle Cream-to-Foam Face Cleanser with Colloidal Oatmeal + Glycerin Travel Size",
                     "domain": "firstaidbeauty.com",
@@ -597,7 +610,221 @@ def test_sort_items_prefers_gentle_cleanser_anchor_over_serum_and_generic_cleans
         ]
     )
 
-    assert items[0].product.title == "Ultra Gentle Cream-to-Foam Face Cleanser with Colloidal Oatmeal + Glycerin Travel Size"
+    assert items[0].product.title == "Ultra Gentle Cream-to-Foam Face Cleanser Jumbo"
+    assert items[1].match_explanation["quality_penalties"]["travel_size_without_intent"] > 0
+
+
+def test_sort_items_prefers_exact_salicylic_serum_over_mist_when_category_matches() -> None:
+    items = module._sort_items(
+        [
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_salicylic_mist",
+                    "title": "Body Acne Clearing Mist with 2% Salicylic Acid",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/body-acne-clearing-mist-salicylic-acid",
+                    "destination_url": "https://example.com/products/body-acne-clearing-mist-salicylic-acid",
+                    "brand_term_hit": 2,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Treatment",
+                        "visible_attributes": {"skin_concern": ["acne", "pores"]},
+                        "reviewed_ingredient_ids": ["salicylic_acid"],
+                    },
+                },
+                "salicylic acid serum for acne and pores",
+                source_order=0,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_salicylic_serum",
+                    "title": "Salicylic Acid Serum 2%",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/salicylic-acid-serum-2",
+                    "destination_url": "https://example.com/products/salicylic-acid-serum-2",
+                    "brand_term_hit": 3,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Serum",
+                        "visible_attributes": {
+                            "product_category": ["serum"],
+                            "skin_concern": ["acne", "pores"],
+                        },
+                        "reviewed_ingredient_ids": ["salicylic_acid"],
+                    },
+                },
+                "salicylic acid serum for acne and pores",
+                source_order=1,
+            ),
+        ]
+    )
+
+    assert items[0].product.title == "Salicylic Acid Serum 2%"
+    assert items[1].match_explanation["quality_penalties"]["missing_category_anchor"] > 0
+
+
+def test_sort_items_prefers_barrier_moisturizer_over_spf_for_fragrance_free_query() -> None:
+    items = module._sort_items(
+        [
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_spf_hydrating",
+                    "title": "Superactive Moisturizer SPF 50: Hydrating",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/superactive-moisturizer-spf-50-hydrating",
+                    "destination_url": "https://example.com/products/superactive-moisturizer-spf-50-hydrating",
+                    "brand_term_hit": 2,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Moisturizer",
+                        "visible_attributes": {
+                            "product_category": ["moisturizer", "sunscreen"],
+                            "skin_concern": ["hydrating"],
+                        },
+                    },
+                },
+                "hydrating barrier moisturizer fragrance free",
+                source_order=0,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_barrier_moisturizer",
+                    "title": "Cellular Hydration Barrier Repair Cream Moisturizer",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/barrier-repair-cream-moisturizer",
+                    "destination_url": "https://example.com/products/barrier-repair-cream-moisturizer",
+                    "brand_term_hit": 2,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Moisturizer",
+                        "visible_attributes": {
+                            "product_category": ["moisturizer"],
+                            "skin_concern": ["hydrating"],
+                            "formula_constraint": ["fragrance_free"],
+                        },
+                    },
+                },
+                "hydrating barrier moisturizer fragrance free",
+                source_order=1,
+            ),
+        ]
+    )
+
+    assert items[0].product.title == "Cellular Hydration Barrier Repair Cream Moisturizer"
+    penalties = items[1].match_explanation["quality_penalties"]
+    assert penalties["sun_protection_without_intent"] > 0
+    assert penalties["missing_formula_constraint"] > 0
+
+
+def test_sort_items_prefers_sunscreen_category_for_sunscreen_query() -> None:
+    items = module._sort_items(
+        [
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_spf_moisturizer",
+                    "title": "Daily Moisturizer SPF 50",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/daily-moisturizer-spf-50",
+                    "destination_url": "https://example.com/products/daily-moisturizer-spf-50",
+                    "brand_term_hit": 2,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Moisturizer",
+                        "visible_attributes": {"product_category": ["moisturizer"]},
+                    },
+                },
+                "sunscreen",
+                source_order=0,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_sunscreen",
+                    "title": "Mineral Sunscreen SPF 50",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/mineral-sunscreen-spf-50",
+                    "destination_url": "https://example.com/products/mineral-sunscreen-spf-50",
+                    "brand_term_hit": 2,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Sunscreen",
+                        "visible_attributes": {"product_category": ["sunscreen"]},
+                    },
+                },
+                "sunscreen",
+                source_order=1,
+            ),
+        ]
+    )
+
+    assert items[0].product.title == "Mineral Sunscreen SPF 50"
+    assert items[1].match_explanation["quality_penalties"]["missing_sunscreen_category"] > 0
+
+
+def test_sort_items_prefers_gel_moisturizer_for_acne_prone_query() -> None:
+    items = module._sort_items(
+        [
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_cream_moisturizer",
+                    "title": "Heartleaf Calming Cream Moisturizer for Sensitive Skin and Eczema-Prone Skin",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/heartleaf-calming-cream-moisturizer",
+                    "destination_url": "https://example.com/products/heartleaf-calming-cream-moisturizer",
+                    "brand_term_hit": 3,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Moisturizer",
+                        "visible_attributes": {"product_category": ["moisturizer"]},
+                    },
+                },
+                "lightweight gel moisturizer for acne-prone skin",
+                source_order=0,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_gel_moisturizer",
+                    "title": "Calm + Restore Oat Gel Moisturizer, Sensitive Skin",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/calm-restore-oat-gel-moisturizer",
+                    "destination_url": "https://example.com/products/calm-restore-oat-gel-moisturizer",
+                    "brand_term_hit": 2,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Moisturizer",
+                        "visible_attributes": {
+                            "product_category": ["moisturizer"],
+                            "skin_concern": ["acne"],
+                        },
+                    },
+                },
+                "lightweight gel moisturizer for acne-prone skin",
+                source_order=1,
+            ),
+            module._build_external_item(
+                {
+                    "external_product_id": "ext_acne_serum",
+                    "title": "Rapid Clear Stubborn Acne Spot Gel",
+                    "domain": "example.com",
+                    "canonical_url": "https://example.com/products/rapid-clear-stubborn-acne-spot-gel",
+                    "destination_url": "https://example.com/products/rapid-clear-stubborn-acne-spot-gel",
+                    "brand_term_hit": 2,
+                    "seed_data": {
+                        "brand": "Example",
+                        "category": "Serum",
+                        "visible_attributes": {
+                            "product_category": ["serum"],
+                            "skin_concern": ["acne"],
+                        },
+                    },
+                },
+                "lightweight gel moisturizer for acne-prone skin",
+                source_order=2,
+            ),
+        ]
+    )
+
+    assert items[0].product.title == "Calm + Restore Oat Gel Moisturizer, Sensitive Skin"
+    assert items[2].match_explanation["quality_penalties"]["missing_category_anchor"] > 0
 
 
 def test_sort_items_penalizes_eye_cream_and_routine_for_barrier_moisturizer_query() -> None:
