@@ -156,6 +156,40 @@ Note:
    - rerun with `--release-gate-source-filter shopping-agent-web`
 5. Never add `aurora` or `aurora-chatbox` to the serve allowlist in this phase.
 
+## Post-Enable Observation Window
+After the active source is enabled and the new deployment is visible in `/health`, run one stable observation pass before closing the stage:
+
+1. Confirm the deployment/commit changed and the serve allowlist is live.
+2. Wait for the deployment to settle before judging parity.
+   A short settle window is enough; avoid using the first requests after a config flip as final evidence.
+3. Rerun the source-stage gate and source-stage commerce audit.
+4. For final stage close-out, rerun the full all-sources gate and full generic commerce audit.
+5. Build a fresh evidence bundle from the stable rerun artifacts and archive that bundle as the canonical stage-close record.
+
+Notes:
+- `pivot_multi_release_gate.py` now retries transient transport failures per case and records request-level failures in the report instead of aborting the entire run.
+- If a report shows a one-off `shadow` or `no_result_mismatch` immediately after a deployment flip, verify with a stable rerun before treating it as a rollback signal.
+
+Example final all-sources observation:
+
+```bash
+python3 scripts/pivot_multi_release_gate.py \
+  --base-url https://api.pivota.cc \
+  --corpus scripts/fixtures/serve_canary_corpus.json \
+  --default-rollout-mode serve \
+  --output-json output/pivot-release/serve-observation/pivot-release-gate.json \
+  --output-md output/pivot-release/serve-observation/pivot-release-gate.md
+
+python3 scripts/commerce_shadow_audit.py \
+  --gateway-base-url https://api.pivota.cc \
+  --pivot-base-url https://web-production-fedb.up.railway.app \
+  --pivot-header "Authorization: Bearer $ADMIN_JWT" \
+  --corpus scripts/fixtures/generic_commerce_shadow_corpus.json \
+  --timeout-seconds 20 \
+  --output-json output/pivot-release/serve-observation/commerce-shadow-after.json \
+  --output-md output/pivot-release/serve-observation/commerce-shadow-after.md
+```
+
 Example source-stage gate:
 
 ```bash
