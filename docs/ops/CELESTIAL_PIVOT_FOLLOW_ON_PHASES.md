@@ -49,9 +49,10 @@ That is enough to close the current phase, but it does not prove that the same b
   - payment canary PSP/provider distribution
 
 ### Suggested Tooling Work
-- add a batch wrapper around [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
-- add a curated merchant manifest fixture under `scripts/fixtures/`
-- emit a rollup JSON/Markdown summary for the cohort
+- batch wrapper: [run_commerce_channels_signoff_batch.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_commerce_channels_signoff_batch.py)
+- merchant cohort fixture: [commerce_signoff_cohort.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/commerce_signoff_cohort.json)
+- direct single-merchant signoff: [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
+- keep emitting a rollup JSON/Markdown summary for the cohort
 
 ### Acceptance Criteria
 - every merchant in the cohort has:
