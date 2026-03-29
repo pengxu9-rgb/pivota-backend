@@ -62,6 +62,34 @@ def _parse_args() -> argparse.Namespace:
         "--probe-gateway-api-key",
         default=(os.getenv("GATEWAY_API_KEY") or os.getenv("X_API_KEY") or os.getenv("API_KEY") or ""),
     )
+    parser.add_argument("--beauty-ranking-audit", action="store_true")
+    parser.add_argument("--beauty-ranking-audit-blocking", action="store_true")
+    parser.add_argument("--beauty-ranking-audit-compare-before-json", default=None)
+    parser.add_argument("--beauty-ranking-audit-compare-before-label", default="before-deploy")
+    parser.add_argument("--beauty-ranking-audit-compare-after-label", default=None)
+    parser.add_argument("--beauty-ranking-audit-compare-blocking", action="store_true")
+    parser.add_argument("--beauty-ranking-audit-corpus", default=None)
+    parser.add_argument("--beauty-ranking-audit-market", default=None)
+    parser.add_argument("--beauty-ranking-audit-limit", type=int, default=50)
+    parser.add_argument("--beauty-ranking-audit-gateway-base-url", default=None)
+    parser.add_argument("--beauty-ranking-audit-pivot-base-url", default=None)
+    parser.add_argument("--beauty-ranking-audit-database-url", default=None)
+    parser.add_argument(
+        "--beauty-ranking-audit-db-mode",
+        choices=("auto", "async", "sync"),
+        default="sync",
+    )
+    parser.add_argument(
+        "--beauty-ranking-audit-seed-fetch-mode",
+        choices=("fast", "deep"),
+        default="fast",
+    )
+    parser.add_argument("--beauty-ranking-audit-timeout-seconds", type=float, default=None)
+    parser.add_argument("--beauty-ranking-audit-stage-a-timeout-seconds", type=float, default=0.9)
+    parser.add_argument("--beauty-ranking-audit-stage-b-timeout-seconds", type=float, default=1.6)
+    parser.add_argument("--beauty-ranking-audit-header", action="append", default=[])
+    parser.add_argument("--beauty-ranking-audit-gateway-header", action="append", default=[])
+    parser.add_argument("--beauty-ranking-audit-pivot-header", action="append", default=[])
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--smoke-header", action="append", default=[])
     parser.add_argument(
@@ -169,6 +197,13 @@ def _header_args(headers: Sequence[str]) -> List[str]:
     args: List[str] = []
     for header in headers:
         args.extend(["--header", header])
+    return args
+
+
+def _repeatable_flag_args(flag: str, values: Sequence[str]) -> List[str]:
+    args: List[str] = []
+    for value in values:
+        args.extend([flag, value])
     return args
 
 
@@ -472,6 +507,109 @@ def _run_bundle(
         outputs["search_chain_probe_json"] = str(probe_json)
         outputs["search_chain_probe_md"] = str(probe_md)
 
+    beauty_ranking_audit_json: Optional[Path] = None
+    beauty_ranking_audit_md: Optional[Path] = None
+    if bool(getattr(args, "beauty_ranking_audit", False)):
+        beauty_ranking_audit_json = output_dir / "beauty-ranking-audit.json"
+        beauty_ranking_audit_md = output_dir / "beauty-ranking-audit.md"
+        beauty_ranking_audit_gateway_base_url = (
+            getattr(args, "beauty_ranking_audit_gateway_base_url", None)
+            or args.release_gate_base_url
+            or args.base_url
+        )
+        beauty_ranking_audit_pivot_base_url = (
+            getattr(args, "beauty_ranking_audit_pivot_base_url", None)
+            or args.smoke_base_url
+            or args.base_url
+        )
+        beauty_ranking_audit_timeout_seconds = (
+            getattr(args, "beauty_ranking_audit_timeout_seconds", None) or args.timeout_seconds
+        )
+        beauty_ranking_audit_database_url = (
+            getattr(args, "beauty_ranking_audit_database_url", None) or args.database_url
+        )
+        beauty_ranking_audit_headers = list(
+            getattr(args, "beauty_ranking_audit_header", []) or list(args.header)
+        )
+        beauty_ranking_audit_gateway_headers = list(
+            getattr(args, "beauty_ranking_audit_gateway_header", []) or []
+        )
+        beauty_ranking_audit_pivot_headers = [
+            *list(getattr(args, "smoke_header", []) or []),
+            *list(getattr(args, "beauty_ranking_audit_pivot_header", []) or []),
+        ]
+        command = [
+            "--gateway-base-url",
+            beauty_ranking_audit_gateway_base_url,
+            "--pivot-base-url",
+            beauty_ranking_audit_pivot_base_url,
+            "--limit",
+            str(getattr(args, "beauty_ranking_audit_limit", 50) or 50),
+            "--timeout-seconds",
+            str(beauty_ranking_audit_timeout_seconds),
+            "--db-mode",
+            str(getattr(args, "beauty_ranking_audit_db_mode", "sync") or "sync"),
+            "--seed-fetch-mode",
+            str(getattr(args, "beauty_ranking_audit_seed_fetch_mode", "fast") or "fast"),
+            "--seed-stage-a-timeout-seconds",
+            str(getattr(args, "beauty_ranking_audit_stage_a_timeout_seconds", 0.9) or 0.9),
+            "--seed-stage-b-timeout-seconds",
+            str(getattr(args, "beauty_ranking_audit_stage_b_timeout_seconds", 1.6) or 1.6),
+            "--output-json",
+            str(beauty_ranking_audit_json),
+            "--output-md",
+            str(beauty_ranking_audit_md),
+            *_repeatable_flag_args("--header", beauty_ranking_audit_headers),
+            *_repeatable_flag_args("--gateway-header", beauty_ranking_audit_gateway_headers),
+            *_repeatable_flag_args("--pivot-header", beauty_ranking_audit_pivot_headers),
+        ]
+        if getattr(args, "beauty_ranking_audit_corpus", None):
+            command.extend(["--corpus", str(getattr(args, "beauty_ranking_audit_corpus"))])
+        if getattr(args, "beauty_ranking_audit_market", None):
+            command.extend(["--market", str(getattr(args, "beauty_ranking_audit_market"))])
+        if beauty_ranking_audit_database_url:
+            command.extend(["--database-url", beauty_ranking_audit_database_url])
+        result = runner(SCRIPT_DIR / "beauty_ranking_audit.py", command)
+        _record_step(
+            steps=steps,
+            name="beauty_ranking_audit",
+            result=result,
+            output_json=beauty_ranking_audit_json,
+            output_md=beauty_ranking_audit_md,
+        )["blocking"] = bool(getattr(args, "beauty_ranking_audit_blocking", False))
+        outputs["beauty_ranking_audit_json"] = str(beauty_ranking_audit_json)
+        outputs["beauty_ranking_audit_md"] = str(beauty_ranking_audit_md)
+
+    beauty_ranking_compare_json: Optional[Path] = None
+    beauty_ranking_compare_md: Optional[Path] = None
+    if beauty_ranking_audit_json and getattr(args, "beauty_ranking_audit_compare_before_json", None):
+        beauty_ranking_compare_json = output_dir / "beauty-ranking-audit-compare.json"
+        beauty_ranking_compare_md = output_dir / "beauty-ranking-audit-compare.md"
+        command = [
+            "--before-json",
+            str(getattr(args, "beauty_ranking_audit_compare_before_json")),
+            "--after-json",
+            str(beauty_ranking_audit_json),
+            "--output-json",
+            str(beauty_ranking_compare_json),
+            "--output-md",
+            str(beauty_ranking_compare_md),
+            "--before-label",
+            str(getattr(args, "beauty_ranking_audit_compare_before_label", "before-deploy") or "before-deploy"),
+            "--after-label",
+            str(getattr(args, "beauty_ranking_audit_compare_after_label", None) or args.label),
+        ]
+        result = runner(SCRIPT_DIR / "compare_beauty_ranking_audit.py", command)
+        _record_step(
+            steps=steps,
+            name="compare_beauty_ranking_audit",
+            result=result,
+            output_json=beauty_ranking_compare_json,
+            output_md=beauty_ranking_compare_md,
+        )["blocking"] = bool(getattr(args, "beauty_ranking_audit_compare_blocking", False))
+        outputs["beauty_ranking_audit_compare_json"] = str(beauty_ranking_compare_json)
+        outputs["beauty_ranking_audit_compare_md"] = str(beauty_ranking_compare_md)
+
     evidence_json: Optional[Path] = None
     evidence_md: Optional[Path] = None
     if not args.skip_evidence:
@@ -496,6 +634,10 @@ def _run_bundle(
             command.extend(["--catalog-pivot-smoke-json", str(smoke_json)])
         if probe_json:
             command.extend(["--search-chain-probe-json", str(probe_json)])
+        if beauty_ranking_audit_json:
+            command.extend(["--beauty-ranking-audit-json", str(beauty_ranking_audit_json)])
+        if beauty_ranking_compare_json:
+            command.extend(["--beauty-ranking-audit-compare-json", str(beauty_ranking_compare_json)])
         result = runner(SCRIPT_DIR / "build_pivot_release_evidence.py", command)
         _record_step(
             steps=steps,

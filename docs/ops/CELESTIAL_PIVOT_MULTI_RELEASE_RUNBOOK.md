@@ -39,9 +39,10 @@
    For production shadow from a laptop, prefer service-side data-plane validation so the bundle does not depend on Railway private Postgres reachability.
 7. Run `search_chain_inventory_probe.py` for route-health / dual-entry parity evidence when doing full staging or prod shadow signoff.
    Treat this as legacy parity evidence, not as a blocking pivot rollout gate, unless you are explicitly validating those older public entrypoints and have the correct agent/gateway credentials.
-8. Build one evidence bundle with `build_pivot_release_evidence.py`.
-9. Review Grafana dashboard and Prometheus alerts.
-10. If shadow metrics pass threshold, enable `serve=true` for `shopping_agent` only.
+8. Run `beauty_ranking_audit.py` for cross-merchant beauty ranking parity evidence before deploy, then compare the before/after reports after deploy.
+9. Build one evidence bundle with `build_pivot_release_evidence.py`.
+10. Review Grafana dashboard and Prometheus alerts.
+11. If shadow metrics pass threshold, enable `serve=true` for `shopping_agent` only.
 
 ## Standard Bundle Command
 ```bash
@@ -54,6 +55,9 @@ python3 scripts/run_pivot_release_bundle.py \
   --migration-mode apply-verify \
   --catalog-migration-verify-smoke \
   --search-chain-probe \
+  --beauty-ranking-audit \
+  --beauty-ranking-audit-db-mode sync \
+  --beauty-ranking-audit-database-url "$DATABASE_PUBLIC_URL" \
   --catalog-sync-job-smoke
 ```
 
@@ -69,6 +73,10 @@ python3 scripts/run_pivot_release_bundle.py \
   --migration-mode apply-verify \
   --service-side-data-plane-verify \
   --smoke-header "Authorization: Bearer $ADMIN_JWT" \
+  --beauty-ranking-audit \
+  --beauty-ranking-audit-db-mode sync \
+  --beauty-ranking-audit-database-url "$DATABASE_PUBLIC_URL" \
+  --beauty-ranking-audit-compare-before-json output/pivot-release/beauty-ranking-before.json \
   --catalog-sync-wait-seconds 60 \
   --search-chain-probe
 ```
@@ -98,6 +106,8 @@ Note:
 - prod shadow release-gate JSON + Markdown
 - staging/prod catalog-pivot smoke JSON + Markdown
 - staging/prod search-chain probe JSON + Markdown
+- beauty ranking audit JSON + Markdown
+- beauty ranking audit compare JSON + Markdown
 - consolidated evidence JSON + Markdown
 - Grafana screenshot/export
 - deployed commit from `X-Service-Commit`
@@ -134,3 +144,8 @@ Review:
 - `improved_query_count`
 - `regressed_query_count`
 - per-query `before/after` top1 and top5 overlap
+
+Bundle integration:
+- `run_pivot_release_bundle.py --beauty-ranking-audit` writes `beauty-ranking-audit.json/md` into the bundle output directory.
+- Add `--beauty-ranking-audit-compare-before-json ...` to have the bundle also emit `beauty-ranking-audit-compare.json/md`.
+- Keep beauty audit non-blocking by default, or add `--beauty-ranking-audit-blocking` when ranking parity is part of the active release gate.

@@ -16,6 +16,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--release-gate-json", default=None)
     parser.add_argument("--catalog-pivot-smoke-json", default=None)
     parser.add_argument("--search-chain-probe-json", default=None)
+    parser.add_argument("--beauty-ranking-audit-json", default=None)
+    parser.add_argument("--beauty-ranking-audit-compare-json", default=None)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-md", required=True)
     parser.add_argument("--label", default="celestial-pivot-production-ready")
@@ -88,20 +90,93 @@ def _summarize_search_chain_probe(payload: Optional[Dict[str, Any]]) -> Dict[str
     }
 
 
+def _summarize_beauty_ranking_audit(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {
+            "present": False,
+            "case_count": 0,
+            "gateway_top1_matches": None,
+            "gateway_top1_evaluable": None,
+            "gateway_top1_match_rate": None,
+            "pivot_top1_matches": None,
+            "pivot_top1_evaluable": None,
+            "pivot_top1_match_rate": None,
+            "gateway_nonempty": None,
+            "pivot_nonempty": None,
+            "raw_seed_available_cases": None,
+        }
+
+    summary = payload.get("summary") or {}
+    if not isinstance(summary, dict):
+        summary = {}
+
+    def _match_rate(matches_key: str, evaluable_key: str) -> Optional[float]:
+        matches = summary.get(matches_key)
+        evaluable = summary.get(evaluable_key)
+        if not isinstance(matches, int) or not isinstance(evaluable, int) or evaluable <= 0:
+            return None
+        return round(matches / evaluable, 4)
+
+    return {
+        "present": True,
+        "case_count": summary.get("case_count"),
+        "gateway_top1_matches": summary.get("gateway_top1_matches"),
+        "gateway_top1_evaluable": summary.get("gateway_top1_evaluable"),
+        "gateway_top1_match_rate": _match_rate("gateway_top1_matches", "gateway_top1_evaluable"),
+        "pivot_top1_matches": summary.get("pivot_top1_matches"),
+        "pivot_top1_evaluable": summary.get("pivot_top1_evaluable"),
+        "pivot_top1_match_rate": _match_rate("pivot_top1_matches", "pivot_top1_evaluable"),
+        "gateway_nonempty": summary.get("gateway_nonempty"),
+        "pivot_nonempty": summary.get("pivot_nonempty"),
+        "raw_seed_available_cases": summary.get("raw_seed_available_cases"),
+    }
+
+
+def _summarize_beauty_ranking_compare(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {
+            "present": False,
+            "top1_match_delta": None,
+            "improved_query_count": None,
+            "regressed_query_count": None,
+            "overlap_gain_cases": None,
+            "overlap_loss_cases": None,
+            "non_regressing": None,
+        }
+
+    summary = payload.get("summary") or {}
+    if not isinstance(summary, dict):
+        summary = {}
+    regressed_query_count = summary.get("regressed_query_count")
+    return {
+        "present": True,
+        "top1_match_delta": summary.get("top1_match_delta"),
+        "improved_query_count": summary.get("improved_query_count"),
+        "regressed_query_count": regressed_query_count,
+        "overlap_gain_cases": summary.get("overlap_gain_cases"),
+        "overlap_loss_cases": summary.get("overlap_loss_cases"),
+        "non_regressing": (regressed_query_count == 0) if isinstance(regressed_query_count, int) else None,
+    }
+
+
 def main() -> int:
     args = _parse_args()
     artifacts = {
-        "migration": _load_optional_json(args.migration),
-        "backfill_verify": _load_optional_json(args.backfill_verify_json),
-        "release_gate": _load_optional_json(args.release_gate_json),
-        "catalog_pivot_smoke": _load_optional_json(args.catalog_pivot_smoke_json),
-        "search_chain_probe": _load_optional_json(args.search_chain_probe_json),
+        "migration": _load_optional_json(getattr(args, "migration", None)),
+        "backfill_verify": _load_optional_json(getattr(args, "backfill_verify_json", None)),
+        "release_gate": _load_optional_json(getattr(args, "release_gate_json", None)),
+        "catalog_pivot_smoke": _load_optional_json(getattr(args, "catalog_pivot_smoke_json", None)),
+        "search_chain_probe": _load_optional_json(getattr(args, "search_chain_probe_json", None)),
+        "beauty_ranking_audit": _load_optional_json(getattr(args, "beauty_ranking_audit_json", None)),
+        "beauty_ranking_audit_compare": _load_optional_json(getattr(args, "beauty_ranking_audit_compare_json", None)),
     }
 
     release_gate_summary = ((artifacts.get("release_gate") or {}).get("summary") or {}) if isinstance(artifacts.get("release_gate"), dict) else {}
     smoke_ok = bool((artifacts.get("catalog_pivot_smoke") or {}).get("overall_ok")) if isinstance(artifacts.get("catalog_pivot_smoke"), dict) else False
     backfill_summary = ((artifacts.get("backfill_verify") or {}).get("summary") or {}) if isinstance(artifacts.get("backfill_verify"), dict) else {}
     search_chain_summary = _summarize_search_chain_probe(artifacts.get("search_chain_probe"))
+    beauty_ranking_summary = _summarize_beauty_ranking_audit(artifacts.get("beauty_ranking_audit"))
+    beauty_ranking_compare_summary = _summarize_beauty_ranking_compare(artifacts.get("beauty_ranking_audit_compare"))
     release_gate_failed_cases = release_gate_summary.get("failed_cases")
     blocking_ready = (release_gate_failed_cases in (0, None)) and smoke_ok
 
@@ -120,6 +195,24 @@ def main() -> int:
             "search_chain_probe_records_http_200": search_chain_summary["records_http_200"],
             "search_chain_probe_records_nonempty": search_chain_summary["records_nonempty"],
             "search_chain_probe_legacy_parity_ok": search_chain_summary["legacy_parity_ok"],
+            "beauty_ranking_audit_present": beauty_ranking_summary["present"],
+            "beauty_ranking_case_count": beauty_ranking_summary["case_count"],
+            "beauty_ranking_gateway_top1_matches": beauty_ranking_summary["gateway_top1_matches"],
+            "beauty_ranking_gateway_top1_evaluable": beauty_ranking_summary["gateway_top1_evaluable"],
+            "beauty_ranking_gateway_top1_match_rate": beauty_ranking_summary["gateway_top1_match_rate"],
+            "beauty_ranking_pivot_top1_matches": beauty_ranking_summary["pivot_top1_matches"],
+            "beauty_ranking_pivot_top1_evaluable": beauty_ranking_summary["pivot_top1_evaluable"],
+            "beauty_ranking_pivot_top1_match_rate": beauty_ranking_summary["pivot_top1_match_rate"],
+            "beauty_ranking_gateway_nonempty": beauty_ranking_summary["gateway_nonempty"],
+            "beauty_ranking_pivot_nonempty": beauty_ranking_summary["pivot_nonempty"],
+            "beauty_ranking_raw_seed_available_cases": beauty_ranking_summary["raw_seed_available_cases"],
+            "beauty_ranking_compare_present": beauty_ranking_compare_summary["present"],
+            "beauty_ranking_top1_match_delta": beauty_ranking_compare_summary["top1_match_delta"],
+            "beauty_ranking_improved_query_count": beauty_ranking_compare_summary["improved_query_count"],
+            "beauty_ranking_regressed_query_count": beauty_ranking_compare_summary["regressed_query_count"],
+            "beauty_ranking_overlap_gain_cases": beauty_ranking_compare_summary["overlap_gain_cases"],
+            "beauty_ranking_overlap_loss_cases": beauty_ranking_compare_summary["overlap_loss_cases"],
+            "beauty_ranking_non_regressing": beauty_ranking_compare_summary["non_regressing"],
         },
     }
 
