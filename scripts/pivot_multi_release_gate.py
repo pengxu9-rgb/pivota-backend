@@ -7,7 +7,7 @@ import statistics
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -24,6 +24,8 @@ SOURCE_STAGE_LABELS = {
     "shopping-agent-ui": "stage_2",
     "shopping-agent-web": "stage_3",
 }
+DEFAULT_REQUEST_RETRIES = 2
+DEFAULT_RETRY_SLEEP_SECONDS = 0.5
 
 
 def _parse_args() -> argparse.Namespace:
@@ -33,6 +35,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--corpus", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
+    parser.add_argument("--request-retries", type=int, default=DEFAULT_REQUEST_RETRIES)
+    parser.add_argument("--retry-sleep-seconds", type=float, default=DEFAULT_RETRY_SLEEP_SECONDS)
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--output-md", default=None)
     parser.add_argument(
@@ -124,6 +128,7 @@ def _extract_case_result(
     case: Dict[str, Any],
     response: requests.Response,
     elapsed_ms: float,
+    request_attempts: int = 1,
 ) -> Dict[str, Any]:
     try:
         body = response.json()
@@ -176,6 +181,10 @@ def _extract_case_result(
         "limit": int(case.get("limit") or 10),
         "elapsed_ms": round(elapsed_ms, 1),
         "http_status": response.status_code,
+        "request_failed": False,
+        "request_timed_out": False,
+        "request_attempts": max(int(request_attempts), 1),
+        "request_error": None,
         "product_count": len(products),
         "query_source": str(metadata.get("query_source") or ""),
         "query_semantic_class": query_semantic_class,
@@ -188,6 +197,76 @@ def _extract_case_result(
         "pass": all(pass_checks),
         "check_notes": check_notes,
     }
+
+
+def _build_request_failure_result(
+    *,
+    case: Dict[str, Any],
+    elapsed_ms: float,
+    error: requests.RequestException,
+    request_attempts: int,
+) -> Dict[str, Any]:
+    error_name = type(error).__name__
+    error_message = str(error).strip() or error_name
+    check_notes = [f"request_failed={error_name}"]
+    if error_message and error_message != error_name:
+        check_notes.append(f"request_error={error_message}")
+    return {
+        "case_id": str(case.get("case_id") or ""),
+        "category": str(case.get("category") or "uncategorized"),
+        "query": str(case.get("query") or ""),
+        "source": str(case.get("source") or "shopping_agent"),
+        "page": int(case.get("page") or 1),
+        "limit": int(case.get("limit") or 10),
+        "elapsed_ms": round(elapsed_ms, 1),
+        "http_status": None,
+        "request_failed": True,
+        "request_timed_out": isinstance(error, requests.Timeout),
+        "request_attempts": max(int(request_attempts), 1),
+        "request_error": f"{error_name}: {error_message}" if error_message != error_name else error_name,
+        "product_count": 0,
+        "query_source": "",
+        "query_semantic_class": "unknown",
+        "service_commit": None,
+        "route_health_missing": list(REQUIRED_ROUTE_HEALTH_FIELDS),
+        "pivot_shadow_scheduled": False,
+        "pivot_shadow_mode": None,
+        "pivot_rollout_mode": None,
+        "pivot_rollout_guard_passed": False,
+        "pass": False,
+        "check_notes": check_notes,
+    }
+
+
+def _perform_request(
+    *,
+    session: requests.Session,
+    base_url: str,
+    headers: Dict[str, str],
+    request_payload: Dict[str, Any],
+    timeout_seconds: float,
+    request_retries: int,
+    retry_sleep_seconds: float,
+) -> Tuple[requests.Response, int]:
+    attempts = max(int(request_retries), 0) + 1
+    last_error: Optional[requests.RequestException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.post(
+                f"{base_url}/agent/shop/v1/invoke",
+                headers=headers,
+                json=request_payload,
+                timeout=timeout_seconds,
+            )
+            return response, attempt
+        except requests.RequestException as error:
+            last_error = error
+            if attempt >= attempts:
+                break
+            if retry_sleep_seconds > 0:
+                time.sleep(retry_sleep_seconds)
+    assert last_error is not None
+    raise last_error
 
 
 def _summarize_by_source(cases: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -307,14 +386,36 @@ def main() -> int:
             case["expected_rollout_mode"] = args.default_rollout_mode
         request_payload = _build_request(case)
         started = time.perf_counter()
-        response = session.post(
-            f"{base_url}/agent/shop/v1/invoke",
-            headers=headers,
-            json=request_payload,
-            timeout=args.timeout_seconds,
-        )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        cases.append(_extract_case_result(case=case, response=response, elapsed_ms=elapsed_ms))
+        try:
+            response, request_attempts = _perform_request(
+                session=session,
+                base_url=base_url,
+                headers=headers,
+                request_payload=request_payload,
+                timeout_seconds=args.timeout_seconds,
+                request_retries=args.request_retries,
+                retry_sleep_seconds=args.retry_sleep_seconds,
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            cases.append(
+                _extract_case_result(
+                    case=case,
+                    response=response,
+                    elapsed_ms=elapsed_ms,
+                    request_attempts=request_attempts,
+                )
+            )
+        except requests.RequestException as error:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            cases.append(
+                _build_request_failure_result(
+                    case=case,
+                    elapsed_ms=elapsed_ms,
+                    error=error,
+                    request_attempts=max(int(args.request_retries), 0) + 1,
+                )
+            )
 
     summary = {
         "total_cases": len(cases),
