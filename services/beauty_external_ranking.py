@@ -166,6 +166,32 @@ def _normalize_query_text(text: Optional[str]) -> str:
     return " ".join(_strip_accents(str(text or "").strip().lower()).split())
 
 
+def _infer_category_labels_from_text(text: Optional[str]) -> List[str]:
+    normalized = _normalize_query_text(text)
+    if not normalized:
+        return []
+    labels: List[str] = []
+    for label, terms in _CATEGORY_ANCHORS.items():
+        if any(_normalized_visible_term_matches(normalized, term) for term in terms):
+            labels.append(label)
+    return labels
+
+
+def _infer_ingredient_ids_from_text(text: Optional[str]) -> List[str]:
+    normalized = _normalize_query_text(text)
+    if not normalized:
+        return []
+    matched: List[str] = []
+    for phrase, canonical in sorted(
+        _INGREDIENT_CANONICAL_ALIASES.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if _normalized_visible_term_matches(normalized, phrase) and canonical not in matched:
+            matched.append(canonical)
+    return matched
+
+
 def _tokenize_query_terms(text: str) -> List[str]:
     normalized = _normalize_query_text(text)
     if not normalized:
@@ -287,6 +313,20 @@ def _extract_seed_visible_attributes(row: Dict[str, Any], seed_data: Dict[str, A
         for bucket in ("product_category", "skin_concern", "formula_constraint"):
             merge_bucket(bucket, container.get(bucket))
 
+    if not merged.get("product_category"):
+        inferred_categories = _infer_category_labels_from_text(
+            " ".join(
+                [
+                    str(row.get("title") or ""),
+                    str(seed_data.get("title") or ""),
+                    str(row.get("canonical_url") or ""),
+                    str(row.get("destination_url") or ""),
+                ]
+            )
+        )
+        for label in inferred_categories:
+            merge_bucket("product_category", label)
+
     return {bucket: labels for bucket, labels in merged.items() if labels}
 
 
@@ -316,6 +356,20 @@ def normalize_external_seed_structured_ingredient_ids(
             if value not in deduped:
                 deduped.append(value)
 
+    inferred = _infer_ingredient_ids_from_text(
+        " ".join(
+            [
+                str(row.get("title") or ""),
+                str(seed_data.get("title") or ""),
+                str(row.get("canonical_url") or ""),
+                str(row.get("destination_url") or ""),
+            ]
+        )
+    )
+    for value in inferred:
+        if value not in deduped:
+            deduped.append(value)
+
     return deduped
 
 
@@ -336,6 +390,18 @@ def normalize_external_seed_product_type(
         text = str(candidate or "").strip()
         if text:
             return text
+    inferred_categories = _infer_category_labels_from_text(
+        " ".join(
+            [
+                str(row.get("title") or ""),
+                str(seed_data.get("title") or ""),
+                str(row.get("canonical_url") or ""),
+                str(row.get("destination_url") or ""),
+            ]
+        )
+    )
+    if inferred_categories:
+        return inferred_categories[0].replace("_", " ").title()
     return ""
 
 
@@ -496,11 +562,7 @@ def build_external_seed_filter_product(
 
 
 def _extract_query_category_labels(normalized_query: str) -> List[str]:
-    labels: List[str] = []
-    for label, terms in _CATEGORY_ANCHORS.items():
-        if any(_normalized_visible_term_matches(normalized_query, term) for term in terms):
-            labels.append(label)
-    return labels
+    return _infer_category_labels_from_text(normalized_query)
 
 
 def _extract_query_formula_labels(normalized_query: str) -> List[str]:
@@ -520,11 +582,7 @@ def _extract_query_concern_labels(normalized_query: str) -> List[str]:
 
 
 def _extract_query_ingredient_ids(normalized_query: str) -> List[str]:
-    matched: List[str] = []
-    for phrase, canonical in sorted(_INGREDIENT_CANONICAL_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
-        if _normalized_visible_term_matches(normalized_query, phrase) and canonical not in matched:
-            matched.append(canonical)
-    return matched
+    return _infer_ingredient_ids_from_text(normalized_query)
 
 
 def _candidate_blob(candidate: RankedExternalBeautyCandidate) -> str:

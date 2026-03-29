@@ -305,6 +305,38 @@ def test_build_external_seed_filter_product_normalizes_list_variant_options() ->
     assert "spf_50" in product.variants[0].visible_option_labels
 
 
+def test_build_external_seed_filter_product_infers_missing_category_and_ingredient_from_title() -> None:
+    row = _seed_row(
+        external_product_id="salicylic_seed",
+        title="Salicylic Acid Serum 2%",
+        canonical_url="https://example.com/products/salicylic-acid-serum",
+        category="",
+        description="A targeted serum for blemish-prone skin.",
+        reviewed_ingredient_ids=[],
+        visible_attributes={},
+    )
+
+    product = build_external_seed_filter_product(
+        row=row,
+        seed_data=row["seed_data"],
+        external_product={
+            "id": "salicylic_seed",
+            "product_id": "salicylic_seed",
+            "title": row["title"],
+            "description": row["seed_data"]["description"],
+            "price": row["price_amount"],
+            "currency": row["price_currency"],
+            "image_url": None,
+            "in_stock": True,
+            "external_seed_id": row["id"],
+        },
+    )
+
+    assert product.product_type == "Serum"
+    assert product.visible_attributes["product_category"] == ["serum"]
+    assert "salicylic_acid" in product.ingredient_ids
+
+
 def test_ranked_feature_dump_exposes_audit_version_and_structure() -> None:
     ranked = rank_external_seed_rows(
         [
@@ -325,3 +357,64 @@ def test_ranked_feature_dump_exposes_audit_version_and_structure() -> None:
     assert ranked[0].ranking_score_breakdown["ranking_audit_version"] == BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
     assert dump["candidate_source"] == "external_seed"
     assert dump["normalized_visible_attributes"]["product_category"] == ["cleanser"]
+
+
+def test_rank_external_seed_rows_infers_missing_ingredient_from_title_for_acne_serum_query() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="niacinamide_serum",
+                title="Niacinamide Serum 12% Plus Zinc 2%",
+                canonical_url="https://example.com/products/niacinamide-serum",
+                category="",
+                description="Serum for visible pores.",
+                reviewed_ingredient_ids=[],
+                visible_attributes={},
+            ),
+            _seed_row(
+                external_product_id="salicylic_mist",
+                title="Body Acne Clearing Mist with 2% Salicylic Acid",
+                canonical_url="https://example.com/products/body-acne-clearing-mist",
+                category="",
+                description="Targets acne and pores with salicylic acid.",
+                reviewed_ingredient_ids=[],
+                visible_attributes={},
+            ),
+        ],
+        query="salicylic acid serum for acne and pores",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "salicylic_mist"
+    assert ranked[0].ranking_score_breakdown["active_ingredient_score"] > 0
+    assert ranked[1].ranking_score_breakdown["active_ingredient_score"] == 0
+
+
+def test_build_external_seed_filter_product_does_not_infer_ingredient_from_long_description_noise() -> None:
+    row = _seed_row(
+        external_product_id="vitamin_c_super_serum",
+        title="Vitamin C Super Serum Plus",
+        canonical_url="https://example.com/products/vitamin-c-super-serum-plus",
+        category="",
+        description="Hero formula with brightening support. Ingredients: water, salicylic acid, retinol, niacinamide.",
+        reviewed_ingredient_ids=[],
+        visible_attributes={},
+    )
+
+    product = build_external_seed_filter_product(
+        row=row,
+        seed_data=row["seed_data"],
+        external_product={
+            "id": "vitamin_c_super_serum",
+            "product_id": "vitamin_c_super_serum",
+            "title": row["title"],
+            "description": row["seed_data"]["description"],
+            "price": row["price_amount"],
+            "currency": row["price_currency"],
+            "image_url": None,
+            "in_stock": True,
+            "external_seed_id": row["id"],
+        },
+    )
+
+    assert "salicylic_acid" not in product.ingredient_ids
