@@ -852,6 +852,27 @@ def _external_text_relevance_score(row: Dict[str, Any], query: str) -> float:
     if not query_terms:
         return 0.12
 
+    active_ingredient_terms = {
+        "salicylic",
+        "retinol",
+        "niacinamide",
+        "hyaluronic",
+        "glycolic",
+        "azelaic",
+        "benzoyl",
+        "ceramide",
+        "vitamin",
+    }
+    concern_terms = {
+        "acne",
+        "pore",
+        "pores",
+        "blemish",
+        "breakout",
+    }
+    has_active_ingredient_query = any(term in active_ingredient_terms for term in query_terms)
+    query_concerns = [term for term in query_terms if term in concern_terms]
+
     title_matches = sum(
         1 for term in query_terms if term and (term in title or term in title_compact)
     )
@@ -886,9 +907,23 @@ def _external_text_relevance_score(row: Dict[str, Any], query: str) -> float:
     ):
         score += 0.08
 
+    matched_concerns = sum(
+        1
+        for term in query_concerns
+        if term and (term in blob or term in blob_compact)
+    )
+    if has_active_ingredient_query and query_concerns:
+        if matched_concerns > 0:
+            score += min(0.08, matched_concerns * 0.04)
+        else:
+            score -= 0.08
+
     for anchor in ("cleanser", "moisturizer", "sunscreen", "serum"):
         if anchor in query_terms and anchor not in blob:
-            score -= 0.2
+            penalty = 0.2
+            if has_active_ingredient_query and matched_concerns > 0:
+                penalty = 0.08
+            score -= penalty
 
     if "eye cream" in title and "eye" not in query_terms:
         score -= 0.18

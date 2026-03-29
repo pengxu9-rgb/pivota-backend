@@ -489,6 +489,29 @@ def test_external_text_relevance_uses_slug_tokens_for_acne_queries() -> None:
     assert slug_with_acne > slug_without_acne
 
 
+def test_external_text_relevance_prefers_concern_match_for_active_ingredient_query() -> None:
+    acne_mist = module._external_text_relevance_score(
+        {
+            "title": "Body Acne Clearing Mist with 2% Salicylic Acid",
+            "canonical_url": "https://example.com/products/body-acne-clearing-mist-salicylic-acid",
+            "destination_url": "https://example.com/products/body-acne-clearing-mist-salicylic-acid",
+            "seed_data": {},
+        },
+        "salicylic acid serum for acne and pores",
+    )
+    plain_serum = module._external_text_relevance_score(
+        {
+            "title": "Salicylic Acid Serum 2%",
+            "canonical_url": "https://example.com/products/salicylic-acid-serum",
+            "destination_url": "https://example.com/products/salicylic-acid-serum",
+            "seed_data": {},
+        },
+        "salicylic acid serum for acne and pores",
+    )
+
+    assert acne_mist > plain_serum
+
+
 def test_sort_items_prefers_gentle_cleanser_anchor_over_serum_and_generic_cleanser() -> None:
     items = module._sort_items(
         [
