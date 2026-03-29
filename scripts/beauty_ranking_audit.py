@@ -45,6 +45,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gateway-header", action="append", default=[], help="Repeatable raw header for gateway in 'Name: Value' form.")
     parser.add_argument("--pivot-header", action="append", default=[], help="Repeatable raw header for pivot in 'Name: Value' form.")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
+    parser.add_argument("--seed-stage-a-timeout-seconds", type=float, default=0.9)
+    parser.add_argument("--seed-stage-b-timeout-seconds", type=float, default=1.6)
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--output-md", default=None)
     return parser.parse_args()
@@ -81,6 +83,8 @@ async def _fetch_raw_external_rows(
     query: str,
     limit: int,
     market: Optional[str],
+    stage_a_timeout_seconds: float,
+    stage_b_timeout_seconds: float,
 ) -> Dict[str, Any]:
     query_terms = seed_search_terms(query)
     stage_a = await fetch_external_seed_rows(
@@ -91,7 +95,7 @@ async def _fetch_raw_external_rows(
         offset=0,
         include_seed_data_text_match=False,
         only_unattached=False,
-        query_timeout_seconds=0.9,
+        query_timeout_seconds=stage_a_timeout_seconds,
         required_terms=None,
         prefer_terms=query_terms or None,
         scope="default",
@@ -109,7 +113,7 @@ async def _fetch_raw_external_rows(
             offset=0,
             include_seed_data_text_match=True,
             only_unattached=False,
-            query_timeout_seconds=1.6,
+            query_timeout_seconds=stage_b_timeout_seconds,
             required_terms=None,
             prefer_terms=query_terms or None,
             scope="default",
@@ -307,6 +311,8 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
                 query=query,
                 limit=max(1, int(case.get("limit") or args.limit)),
                 market=market,
+                stage_a_timeout_seconds=float(args.seed_stage_a_timeout_seconds),
+                stage_b_timeout_seconds=float(args.seed_stage_b_timeout_seconds),
             )
             ranked_candidates = raw_fetch["ranking_audit"]["ranked_candidates"]
             ranked_titles = [str(item.get("title") or "").strip() for item in ranked_candidates if isinstance(item, dict)]
@@ -424,6 +430,8 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "gateway_base_url": gateway_base_url,
             "pivot_base_url": pivot_base_url,
+            "seed_stage_a_timeout_seconds": float(args.seed_stage_a_timeout_seconds),
+            "seed_stage_b_timeout_seconds": float(args.seed_stage_b_timeout_seconds),
             "summary": {
                 "case_count": len(cases),
                 "gateway_top1_matches": gateway_top1_matches,

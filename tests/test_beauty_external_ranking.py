@@ -187,6 +187,45 @@ def test_build_external_seed_filter_product_preserves_structured_beauty_fields()
     assert "spf_50" in product.variants[0].visible_option_labels
 
 
+def test_build_external_seed_filter_product_normalizes_list_variant_options() -> None:
+    row = _seed_row(
+        external_product_id="size_option_seed",
+        title="Clarifying Cleanser",
+        canonical_url="https://example.com/products/clarifying-cleanser",
+        category="Cleanser",
+        variants=[
+            {
+                "id": "variant_1",
+                "title": "4 oz",
+                "price": 29.0,
+                "options": [
+                    {"name": "Size", "value": "4 oz"},
+                    {"name": "SPF", "value": "50"},
+                ],
+            }
+        ],
+    )
+
+    product = build_external_seed_filter_product(
+        row=row,
+        seed_data=row["seed_data"],
+        external_product={
+            "id": "size_option_seed",
+            "product_id": "size_option_seed",
+            "title": row["title"],
+            "description": row["seed_data"]["description"],
+            "price": row["price_amount"],
+            "currency": row["price_currency"],
+            "image_url": None,
+            "in_stock": True,
+            "external_seed_id": row["id"],
+        },
+    )
+
+    assert product.variants[0].options == {"Size": "4 oz", "SPF": "50"}
+    assert "spf_50" in product.variants[0].visible_option_labels
+
+
 def test_ranked_feature_dump_exposes_audit_version_and_structure() -> None:
     ranked = rank_external_seed_rows(
         [

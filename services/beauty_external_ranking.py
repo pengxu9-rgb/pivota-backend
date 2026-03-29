@@ -327,20 +327,41 @@ def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [item for item in raw_variants if isinstance(item, dict)] if isinstance(raw_variants, list) else []
 
 
+def _normalize_seed_variant_options(variant: Dict[str, Any]) -> Dict[str, str]:
+    options = variant.get("options")
+    if isinstance(options, dict):
+        normalized: Dict[str, str] = {}
+        for key, value in options.items():
+            key_text = str(key or "").strip()
+            value_text = str(value or "").strip()
+            if key_text and value_text:
+                normalized[key_text] = value_text
+        return normalized
+    if isinstance(options, list):
+        normalized = {}
+        for item in options:
+            if not isinstance(item, dict):
+                continue
+            key_text = str(item.get("name") or item.get("key") or "").strip()
+            value_text = str(item.get("value") or item.get("label") or "").strip()
+            if key_text and value_text:
+                normalized[key_text] = value_text
+        return normalized
+    return {}
+
+
 def _derive_seed_variant_visible_option_labels(variant: Dict[str, Any]) -> List[str]:
     explicit = _coerce_string_list(variant.get("visible_option_labels"))
     normalized = [label for label in explicit if label]
-    options = variant.get("options")
-    if isinstance(options, dict):
-        for key, value in options.items():
-            key_norm = _normalize_query_text(str(key or ""))
-            value_norm = _normalize_query_text(str(value or ""))
-            if not key_norm or not value_norm:
-                continue
-            if key_norm == "spf":
-                label = f"spf_{re.sub(r'[^a-z0-9]+', '_', value_norm).strip('_')}"
-                if label and label not in normalized:
-                    normalized.append(label)
+    for key, value in _normalize_seed_variant_options(variant).items():
+        key_norm = _normalize_query_text(str(key or ""))
+        value_norm = _normalize_query_text(str(value or ""))
+        if not key_norm or not value_norm:
+            continue
+        if key_norm == "spf":
+            label = f"spf_{re.sub(r'[^a-z0-9]+', '_', value_norm).strip('_')}"
+            if label and label not in normalized:
+                normalized.append(label)
     return normalized
 
 
@@ -413,7 +434,7 @@ def build_external_seed_filter_product(
                 title=str(variant.get("title") or variant.get("name") or f"Variant {idx + 1}"),
                 price=variant_price,
                 inventory_quantity=0 if variant_availability in {"out_of_stock", "outofstock", "sold_out"} else 999,
-                options=variant.get("options") or {},
+                options=_normalize_seed_variant_options(variant),
                 image_url=variant.get("image_url"),
                 visible_option_labels=_derive_seed_variant_visible_option_labels(variant),
             )
