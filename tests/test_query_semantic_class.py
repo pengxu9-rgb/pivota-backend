@@ -11,6 +11,7 @@ def test_classify_query_semantic_class_defaults_to_default() -> None:
 def test_classify_query_semantic_class_detects_fragrance() -> None:
     assert classify_query_semantic_class("rose eau de parfum") == "fragrance"
     assert classify_query_semantic_class("travel perfume spray") == "fragrance"
+    assert classify_query_semantic_class("le labo santal 33") == "fragrance"
 
 
 def test_classify_query_semantic_class_detects_beauty_and_lingerie() -> None:

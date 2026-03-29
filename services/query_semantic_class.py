@@ -58,6 +58,8 @@ def classify_query_semantic_class(query: Optional[str]) -> str:
         q,
     ):
         return "fragrance"
+    if re.search(r"\bsantal\s*33\b", q):
+        return "fragrance"
     if any(
         token in q_compact
         for token in (
@@ -71,6 +73,7 @@ def classify_query_semantic_class(query: Optional[str]) -> str:
             "bodymist",
             "eaudeparfum",
             "eaudetoilette",
+            "santal33",
             "edp",
             "edt",
         )
