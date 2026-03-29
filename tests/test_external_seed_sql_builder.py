@@ -14,6 +14,12 @@ class _FakeDatabase:
         return []
 
 
+def test_is_missing_external_seed_table_supports_sqlite_message() -> None:
+    from services.external_seed_search import _is_missing_external_seed_table
+
+    assert _is_missing_external_seed_table(Exception("no such table: external_product_seeds"))
+
+
 @pytest.mark.asyncio
 async def test_fetch_external_seed_rows_uses_lower_like_predicates() -> None:
     from services.external_seed_search import fetch_external_seed_rows

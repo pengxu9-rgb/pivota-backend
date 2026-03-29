@@ -223,7 +223,12 @@ def _is_missing_external_seed_table(exc: Exception) -> bool:
     msg = str(exc or "")
     return (
         "external_product_seeds" in msg
-        and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg)
+        and (
+            "does not exist" in msg
+            or "UndefinedTable" in msg
+            or "relation" in msg
+            or "no such table" in msg.lower()
+        )
     )
 
 

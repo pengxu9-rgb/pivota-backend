@@ -5,11 +5,17 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from db.database import database
 from services.beauty_external_ranking import (
@@ -33,7 +39,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--market", default=None)
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--base-url", default=None)
+    parser.add_argument("--gateway-base-url", default=None)
+    parser.add_argument("--pivot-base-url", default=None)
     parser.add_argument("--header", action="append", default=[], help="Repeatable raw header in 'Name: Value' form.")
+    parser.add_argument("--gateway-header", action="append", default=[], help="Repeatable raw header for gateway in 'Name: Value' form.")
+    parser.add_argument("--pivot-header", action="append", default=[], help="Repeatable raw header for pivot in 'Name: Value' form.")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--output-md", default=None)
@@ -90,7 +100,7 @@ async def _fetch_raw_external_rows(
     )
     rows = stage_a.get("rows") or []
     stage_b = None
-    if not rows and query.strip():
+    if not rows and query.strip() and not bool(stage_a.get("table_missing")):
         stage_b = await fetch_external_seed_rows(
             database=database,
             market=market,
@@ -113,12 +123,14 @@ async def _fetch_raw_external_rows(
             "row_count": len(stage_a.get("rows") or []),
             "query_timeout": bool(stage_a.get("query_timeout") or False),
             "query_ms": stage_a.get("query_ms"),
+            "table_missing": bool(stage_a.get("table_missing") or False),
         },
         "stage_b": {
             "executed": bool(stage_b is not None),
             "row_count": len((stage_b or {}).get("rows") or []),
             "query_timeout": bool((stage_b or {}).get("query_timeout") or False),
             "query_ms": (stage_b or {}).get("query_ms"),
+            "table_missing": bool((stage_b or {}).get("table_missing") or False),
         },
         "raw_rows": rows,
         "ranked_candidates": ranked,
@@ -235,9 +247,13 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- corpus_path: `{report['corpus_path']}`",
         f"- cases: `{report['summary']['case_count']}`",
         f"- gateway_top1_matches: `{report['summary']['gateway_top1_matches']}`",
+        f"- gateway_top1_evaluable: `{report['summary']['gateway_top1_evaluable']}`",
         f"- pivot_top1_matches: `{report['summary']['pivot_top1_matches']}`",
+        f"- pivot_top1_evaluable: `{report['summary']['pivot_top1_evaluable']}`",
         f"- gateway_nonempty: `{report['summary']['gateway_nonempty']}`",
         f"- pivot_nonempty: `{report['summary']['pivot_nonempty']}`",
+        f"- raw_seed_available_cases: `{report['summary']['raw_seed_available_cases']}`",
+        f"- raw_seed_table_missing_cases: `{report['summary']['raw_seed_table_missing_cases']}`",
         "",
         "## Cases",
         "",
@@ -266,12 +282,21 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
         await database.connect()
         connected_here = True
     try:
-        headers = _headers(args.header)
+        base_url = str(args.base_url or "").strip() or None
+        gateway_base_url = str(args.gateway_base_url or base_url or "").strip() or None
+        pivot_base_url = str(args.pivot_base_url or base_url or "").strip() or None
+        shared_headers = _headers(args.header)
+        gateway_headers = {**shared_headers, **_headers(args.gateway_header)}
+        pivot_headers = {**shared_headers, **_headers(args.pivot_header)}
         cases: List[Dict[str, Any]] = []
         gateway_top1_matches = 0
         pivot_top1_matches = 0
         gateway_nonempty = 0
         pivot_nonempty = 0
+        gateway_top1_evaluable = 0
+        pivot_top1_evaluable = 0
+        raw_seed_available_cases = 0
+        raw_seed_table_missing_cases = 0
 
         for case in corpus:
             query = str(case.get("query") or "").strip()
@@ -285,12 +310,18 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
             )
             ranked_candidates = raw_fetch["ranking_audit"]["ranked_candidates"]
             ranked_titles = [str(item.get("title") or "").strip() for item in ranked_candidates if isinstance(item, dict)]
+            raw_seed_available = bool(raw_fetch["raw_rows"])
+            raw_seed_table_missing = bool(raw_fetch["stage_a"].get("table_missing") or raw_fetch["stage_b"].get("table_missing"))
+            if raw_seed_available:
+                raw_seed_available_cases += 1
+            if raw_seed_table_missing:
+                raw_seed_table_missing_cases += 1
 
             gateway_payload = None
             pivot_payload = None
-            if args.base_url:
+            if gateway_base_url:
                 gateway_payload = _post_json(
-                    url=f"{args.base_url.rstrip('/')}/agent/shop/v1/invoke",
+                    url=f"{gateway_base_url.rstrip('/')}/agent/shop/v1/invoke",
                     payload={
                         "operation": "find_products_multi",
                         "payload": {
@@ -306,11 +337,12 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
                             **({"market": market} if market else {}),
                         },
                     },
-                    headers=headers,
+                    headers=gateway_headers,
                     timeout_seconds=float(args.timeout_seconds),
                 )
+            if pivot_base_url:
                 pivot_payload = _post_json(
-                    url=f"{args.base_url.rstrip('/')}/v1/pivot/query",
+                    url=f"{pivot_base_url.rstrip('/')}/v1/pivot/query",
                     payload={
                         "query": query,
                         "limit": int(case.get("limit") or 10),
@@ -318,7 +350,7 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
                         "include_incentives": False,
                         **({"market": market} if market else {}),
                     },
-                    headers=headers,
+                    headers=pivot_headers,
                     timeout_seconds=float(args.timeout_seconds),
                 )
 
@@ -328,15 +360,21 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
                 gateway_nonempty += 1
             if pivot_titles:
                 pivot_nonempty += 1
-            if ranked_titles and gateway_titles and ranked_titles[0].strip().lower() == gateway_titles[0].strip().lower():
-                gateway_top1_matches += 1
-            if ranked_titles and pivot_titles and ranked_titles[0].strip().lower() == pivot_titles[0].strip().lower():
-                pivot_top1_matches += 1
+            if ranked_titles and gateway_titles:
+                gateway_top1_evaluable += 1
+                if ranked_titles[0].strip().lower() == gateway_titles[0].strip().lower():
+                    gateway_top1_matches += 1
+            if ranked_titles and pivot_titles:
+                pivot_top1_evaluable += 1
+                if ranked_titles[0].strip().lower() == pivot_titles[0].strip().lower():
+                    pivot_top1_matches += 1
 
             cases.append(
                 {
                     "query": query,
                     "market": market,
+                    "raw_seed_available": raw_seed_available,
+                    "raw_seed_table_missing": raw_seed_table_missing,
                     "raw_seed_fetch": {
                         "stage_a": raw_fetch["stage_a"],
                         "stage_b": raw_fetch["stage_b"],
@@ -384,12 +422,18 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
             "ranking_audit_version": BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
             "corpus_path": str(Path(args.corpus).resolve()),
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "gateway_base_url": gateway_base_url,
+            "pivot_base_url": pivot_base_url,
             "summary": {
                 "case_count": len(cases),
                 "gateway_top1_matches": gateway_top1_matches,
+                "gateway_top1_evaluable": gateway_top1_evaluable,
                 "pivot_top1_matches": pivot_top1_matches,
+                "pivot_top1_evaluable": pivot_top1_evaluable,
                 "gateway_nonempty": gateway_nonempty,
                 "pivot_nonempty": pivot_nonempty,
+                "raw_seed_available_cases": raw_seed_available_cases,
+                "raw_seed_table_missing_cases": raw_seed_table_missing_cases,
             },
             "cases": cases,
         }
