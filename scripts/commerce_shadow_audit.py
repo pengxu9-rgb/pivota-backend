@@ -15,6 +15,8 @@ import requests
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CORPUS = SCRIPT_DIR / "fixtures" / "generic_commerce_shadow_corpus.json"
 BAD_PRICE_DELTA_RATIO_THRESHOLD = 0.20
+DEFAULT_PIVOT_LIMIT_MULTIPLIER = 4
+DEFAULT_PIVOT_LIMIT_CAP = 100
 
 
 def _parse_args() -> argparse.Namespace:
@@ -26,6 +28,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gateway-base-url", default=None)
     parser.add_argument("--pivot-base-url", default=None)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
+    parser.add_argument(
+        "--pivot-limit-multiplier",
+        type=int,
+        default=DEFAULT_PIVOT_LIMIT_MULTIPLIER,
+        help="Mirror gateway raw_limit widening when auditing direct pivot parity.",
+    )
     parser.add_argument(
         "--header",
         action="append",
@@ -290,11 +298,18 @@ def _build_request(case: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _pivot_request(case: Dict[str, Any]) -> Dict[str, Any]:
+def _pivot_request_limit(case: Dict[str, Any], *, pivot_limit_multiplier: int) -> int:
+    requested_limit = max(1, int(case.get("limit") or 10))
+    requested_page = max(1, int(case.get("page") or 1))
+    widened_limit = requested_limit * requested_page * max(1, int(pivot_limit_multiplier or 1))
+    return min(max(widened_limit, requested_limit), DEFAULT_PIVOT_LIMIT_CAP)
+
+
+def _pivot_request(case: Dict[str, Any], *, pivot_limit_multiplier: int) -> Dict[str, Any]:
     query = str(case.get("query") or "").strip()
     payload = {
         "query": query,
-        "limit": int(case.get("limit") or 10),
+        "limit": _pivot_request_limit(case, pivot_limit_multiplier=pivot_limit_multiplier),
         "include_external": True,
         "include_incentives": True,
     }
@@ -439,9 +454,13 @@ def main() -> int:
             headers=gateway_headers,
             timeout_seconds=float(args.timeout_seconds),
         )
+        pivot_request_payload = _pivot_request(
+            case,
+            pivot_limit_multiplier=int(getattr(args, "pivot_limit_multiplier", DEFAULT_PIVOT_LIMIT_MULTIPLIER) or DEFAULT_PIVOT_LIMIT_MULTIPLIER),
+        )
         pivot_payload = _post_json(
             url=f"{pivot_base_url.rstrip('/')}/v1/pivot/query",
-            payload=_pivot_request(case),
+            payload=pivot_request_payload,
             headers=pivot_headers,
             timeout_seconds=float(args.timeout_seconds),
         )
@@ -493,6 +512,7 @@ def main() -> int:
                 "source": str(case.get("source") or "shopping_agent"),
                 "page": int(case.get("page") or 1),
                 "limit": int(case.get("limit") or 10),
+                "pivot_request_limit": int(pivot_request_payload.get("limit") or 0),
                 "query_semantic_class": query_semantic_class,
                 "expected_rollout_mode": case.get("expected_rollout_mode"),
                 "gateway_status_code": gateway_payload.get("status_code"),

@@ -120,6 +120,7 @@ def test_commerce_shadow_audit_builds_report_without_crashing(
         gateway_base_url="https://api.example.com",
         pivot_base_url="https://pivot.example.com",
         timeout_seconds=5.0,
+        pivot_limit_multiplier=4,
         header=[],
         gateway_header=[],
         pivot_header=[],
@@ -140,6 +141,83 @@ def test_commerce_shadow_audit_builds_report_without_crashing(
     assert payload["summary"]["no_result_mismatch_cases"] == 0
     assert payload["summary"]["source_summary"]["shopping_agent"]["top1_match_rate"] == 1.0
     assert payload["summary"]["semantic_class_summary"]["fragrance"]["top1_match_rate"] == 1.0
+
+
+def test_commerce_shadow_audit_uses_gateway_widened_limit_for_direct_pivot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = tmp_path / "corpus.json"
+    output_json = tmp_path / "audit.json"
+    output_md = tmp_path / "audit.md"
+    corpus.write_text(
+        json.dumps(
+            [
+                {
+                    "case_id": "fragrance-ui-travel-spray",
+                    "query": "travel perfume spray",
+                    "source": "shopping-agent-ui",
+                    "page": 1,
+                    "limit": 10,
+                    "semantic_class": "fragrance",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    recorded_pivot_payloads: list[dict] = []
+
+    def fake_post(url: str, json: dict, headers: dict, timeout: float):
+        if url.endswith("/agent/shop/v1/invoke"):
+            return _FakeResponse(
+                {
+                    "products": [],
+                    "metadata": {
+                        "query_source": "pivot_semantic_core_multi",
+                        "pivot_rollout_mode": "serve",
+                        "pivot_rollout_guard_passed": True,
+                        "route_health": {"query_semantic_class": "fragrance"},
+                    },
+                }
+            )
+        recorded_pivot_payloads.append(dict(json))
+        return _FakeResponse(
+            {
+                "items": [],
+                "metadata": {"query_source": "pivot_semantic_core_multi"},
+            }
+        )
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+    args = argparse.Namespace(
+        corpus=str(corpus),
+        base_url=None,
+        gateway_base_url="https://api.example.com",
+        pivot_base_url="https://pivot.example.com",
+        timeout_seconds=5.0,
+        pivot_limit_multiplier=4,
+        header=[],
+        gateway_header=[],
+        pivot_header=[],
+        output_json=str(output_json),
+        output_md=str(output_md),
+    )
+    monkeypatch.setattr(module, "_parse_args", lambda: args)
+
+    exit_code = module.main()
+
+    assert exit_code == 0
+    assert recorded_pivot_payloads == [
+        {
+            "query": "travel perfume spray",
+            "limit": 40,
+            "include_external": True,
+            "include_incentives": True,
+        }
+    ]
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    assert payload["cases"][0]["pivot_request_limit"] == 40
 
 
 def test_commerce_shadow_audit_records_timeout_as_case_level_evidence(
@@ -175,6 +253,7 @@ def test_commerce_shadow_audit_records_timeout_as_case_level_evidence(
         gateway_base_url="https://api.example.com",
         pivot_base_url="https://pivot.example.com",
         timeout_seconds=1.0,
+        pivot_limit_multiplier=4,
         header=[],
         gateway_header=[],
         pivot_header=[],
