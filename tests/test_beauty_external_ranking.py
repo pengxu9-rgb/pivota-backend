@@ -281,6 +281,102 @@ def test_rank_external_seed_rows_prefers_sunscreen_category_for_spf_query() -> N
     assert ranked[1].ranking_score_breakdown["quality_penalties"]["missing_sunscreen_category"] > 0
 
 
+def test_rank_external_seed_rows_prefers_hyaluronic_hydrating_serum_for_dual_intent_query() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="hyaluronic_serum",
+                title="Hyaluronic Acid Hydrating Serum",
+                canonical_url="https://example.com/products/hyaluronic-acid-hydrating-serum",
+                category="Serum",
+                description="Deep hydration serum powered by hyaluronic acid.",
+                reviewed_ingredient_ids=["hyaluronic_acid"],
+                visible_attributes={"product_category": ["serum"], "skin_concern": ["hydrating"]},
+            ),
+            _seed_row(
+                external_product_id="niacinamide_serum",
+                title="Niacinamide Daily Serum",
+                canonical_url="https://example.com/products/niacinamide-daily-serum",
+                category="Serum",
+                description="Balancing serum for visible pores.",
+                reviewed_ingredient_ids=["niacinamide"],
+                visible_attributes={"product_category": ["serum"], "skin_concern": ["hydrating"]},
+            ),
+        ],
+        query="hyaluronic acid hydrating serum",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "hyaluronic_serum"
+    assert ranked[0].ranking_score_breakdown["active_ingredient_score"] > 0
+    assert ranked[0].ranking_score_breakdown["concern_score"] > 0
+
+
+def test_rank_external_seed_rows_prefers_gel_moisturizer_for_acne_prone_query() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="gel_moisturizer",
+                title="Lightweight Gel Moisturizer for Acne-Prone Skin",
+                canonical_url="https://example.com/products/lightweight-gel-moisturizer-acne-prone",
+                category="Moisturizer",
+                description="Oil-free gel moisturizer for acne-prone skin.",
+                visible_attributes={
+                    "product_category": ["moisturizer"],
+                    "skin_concern": ["acne"],
+                },
+            ),
+            _seed_row(
+                external_product_id="cream_moisturizer",
+                title="Barrier Repair Cream Moisturizer",
+                canonical_url="https://example.com/products/barrier-repair-cream-moisturizer",
+                category="Moisturizer",
+                description="Rich daily moisturizer.",
+                visible_attributes={"product_category": ["moisturizer"]},
+            ),
+            _seed_row(
+                external_product_id="acne_serum",
+                title="Acne Treatment Serum",
+                canonical_url="https://example.com/products/acne-treatment-serum",
+                category="Serum",
+                description="Targeted acne treatment serum.",
+                visible_attributes={"product_category": ["serum"], "skin_concern": ["acne"]},
+            ),
+        ],
+        query="lightweight gel moisturizer for acne-prone skin",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "gel_moisturizer"
+    assert ranked[-1].ranking_score_breakdown["quality_penalties"]["missing_category_anchor"] > 0
+
+
+def test_rank_external_seed_rows_prefers_sunscreen_category_for_sunscreen_query() -> None:
+    ranked = rank_external_seed_rows(
+        [
+            _seed_row(
+                external_product_id="spf_moisturizer",
+                title="Daily Moisturizer SPF 50",
+                canonical_url="https://example.com/products/daily-moisturizer-spf-50",
+                category="Moisturizer",
+                visible_attributes={"product_category": ["moisturizer"]},
+            ),
+            _seed_row(
+                external_product_id="mineral_sunscreen",
+                title="Mineral Sunscreen SPF 50",
+                canonical_url="https://example.com/products/mineral-sunscreen-spf-50",
+                category="Sunscreen",
+                visible_attributes={"product_category": ["sunscreen"]},
+            ),
+        ],
+        query="sunscreen",
+        limit=5,
+    )
+
+    assert ranked[0].external_product_id == "mineral_sunscreen"
+    assert ranked[1].ranking_score_breakdown["quality_penalties"]["missing_sunscreen_category"] > 0
+
+
 def test_build_external_seed_filter_product_preserves_structured_beauty_fields() -> None:
     row = _seed_row(
         external_product_id="spf_50",
