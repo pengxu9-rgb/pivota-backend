@@ -62,6 +62,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="After paid-state convergence, attempt readiness refund validation.",
     )
+    parser.add_argument(
+        "--subprocess-timeout-seconds",
+        type=float,
+        default=180.0,
+        help="Timeout for the underlying smoke_readiness_alpha.sh execution.",
+    )
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--work-dir", default=None)
     parser.add_argument("--output-json", default=None)
@@ -125,8 +131,23 @@ def _build_smoke_command(args: argparse.Namespace, run_id: str, work_dir: Path) 
     return cmd
 
 
-def _run_smoke_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+def _run_smoke_command(cmd: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = _coerce_text(exc.stderr) + f"\n[timeout] exceeded {timeout_seconds:.1f}s"
+        return subprocess.CompletedProcess(
+            exc.cmd,
+            124,
+            _coerce_text(exc.stdout),
+            stderr,
+        )
 
 
 def _load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
@@ -137,6 +158,14 @@ def _load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else {"value": payload}
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _redact(obj: Any) -> Any:
@@ -266,7 +295,7 @@ def main() -> int:
     run_id = _run_id(args.run_id)
     work_dir = _work_dir(args, run_id)
     cmd = _build_smoke_command(args, run_id, work_dir)
-    completed = _run_smoke_command(cmd)
+    completed = _run_smoke_command(cmd, args.subprocess_timeout_seconds)
 
     artifact_paths = {
         "report": str(work_dir / "report.json"),
