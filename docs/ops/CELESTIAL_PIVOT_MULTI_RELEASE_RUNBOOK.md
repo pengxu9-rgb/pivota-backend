@@ -101,3 +101,36 @@ Note:
 - consolidated evidence JSON + Markdown
 - Grafana screenshot/export
 - deployed commit from `X-Service-Commit`
+
+## Beauty Ranking Audit
+Before deploy, capture a production baseline with the fast sync path:
+
+```bash
+python3 scripts/beauty_ranking_audit.py \
+  --gateway-base-url https://api.pivota.cc \
+  --gateway-header "Authorization: Bearer $SHOP_GATEWAY_AGENT_API_KEY" \
+  --database-url "$DATABASE_PUBLIC_URL" \
+  --db-mode sync \
+  --seed-fetch-mode fast \
+  --timeout-seconds 6 \
+  --output-json output/pivot-release/beauty-ranking-before.json \
+  --output-md output/pivot-release/beauty-ranking-before.md
+```
+
+After deploy, rerun the same command and compare the two reports:
+
+```bash
+python3 scripts/compare_beauty_ranking_audit.py \
+  --before-json output/pivot-release/beauty-ranking-before.json \
+  --after-json output/pivot-release/beauty-ranking-after.json \
+  --output-json output/pivot-release/beauty-ranking-compare.json \
+  --output-md output/pivot-release/beauty-ranking-compare.md \
+  --before-label before-deploy \
+  --after-label after-deploy
+```
+
+Review:
+- `top1_match_delta`
+- `improved_query_count`
+- `regressed_query_count`
+- per-query `before/after` top1 and top5 overlap
