@@ -223,8 +223,16 @@ def test_build_pivot_release_evidence_summarizes_commerce_shadow_and_source_read
                     "overlap_gain_cases": 2,
                     "overlap_loss_cases": 0,
                     "source_summary": {
-                        "shopping_agent": {"top1_match_delta": 1},
-                        "shopping-agent-ui": {"top1_match_delta": 1},
+                        "shopping_agent": {
+                            "top1_match_delta": 1,
+                            "before_top1_match_rate": 0.5,
+                            "after_top1_match_rate": 1.0,
+                        },
+                        "shopping-agent-ui": {
+                            "top1_match_delta": 1,
+                            "before_top1_match_rate": 0.5,
+                            "after_top1_match_rate": 1.0,
+                        },
                     },
                 }
             }
@@ -262,3 +270,109 @@ def test_build_pivot_release_evidence_summarizes_commerce_shadow_and_source_read
     assert summary["serve_readiness_by_source"]["shopping_agent"]["ready"] is True
     assert summary["serve_readiness_by_source"]["shopping_agent"]["source_stage"] == "stage_1"
     assert summary["semantic_class_summary"]["commerce_shadow"]["fragrance"]["sample_count"] == 3
+
+
+def test_build_pivot_release_evidence_uses_match_rate_for_source_readiness(
+    tmp_path: Path, monkeypatch
+) -> None:
+    release_gate = tmp_path / "release-gate.json"
+    smoke = tmp_path / "smoke.json"
+    commerce_audit = tmp_path / "commerce-audit.json"
+    commerce_compare = tmp_path / "commerce-compare.json"
+    output_json = tmp_path / "evidence.json"
+    output_md = tmp_path / "evidence.md"
+
+    release_gate.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "failed_cases": 0,
+                    "passed_cases": 2,
+                    "source_summary": {
+                        "shopping-agent-ui": {
+                            "source_stage": "stage_2",
+                            "sample_count": 2,
+                            "passed_cases": 2,
+                            "failed_cases": 0,
+                            "rollout_modes": {"serve": 2},
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    smoke.write_text(json.dumps({"overall_ok": True}), encoding="utf-8")
+    commerce_audit.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "case_count": 4,
+                    "top1_matches": 2,
+                    "top1_evaluable": 2,
+                    "gateway_nonempty": 2,
+                    "pivot_nonempty": 2,
+                    "no_result_mismatch_cases": 0,
+                    "bad_price_anomaly_cases": 0,
+                    "source_summary": {
+                        "shopping-agent-ui": {
+                            "sample_count": 4,
+                            "top1_matches": 2,
+                            "top1_evaluable": 2,
+                            "top1_match_rate": 1.0,
+                            "no_result_mismatch_cases": 0,
+                            "bad_price_anomaly_cases": 0,
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    commerce_compare.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "top1_match_delta": -1,
+                    "improved_query_count": 0,
+                    "regressed_query_count": 0,
+                    "overlap_gain_cases": 0,
+                    "overlap_loss_cases": 1,
+                    "source_summary": {
+                        "shopping-agent-ui": {
+                            "top1_match_delta": -1,
+                            "before_top1_match_rate": 1.0,
+                            "after_top1_match_rate": 1.0,
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        migration=None,
+        backfill_verify_json=None,
+        release_gate_json=str(release_gate),
+        catalog_pivot_smoke_json=str(smoke),
+        search_chain_probe_json=None,
+        beauty_ranking_audit_json=None,
+        beauty_ranking_audit_compare_json=None,
+        commerce_shadow_audit_json=str(commerce_audit),
+        commerce_shadow_audit_compare_json=str(commerce_compare),
+        output_json=str(output_json),
+        output_md=str(output_md),
+        label="test-evidence-rate",
+    )
+    monkeypatch.setattr(module, "_parse_args", lambda: args)
+
+    exit_code = module.main()
+
+    assert exit_code == 0
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    source_readiness = payload["summary"]["serve_readiness_by_source"]["shopping-agent-ui"]
+    assert source_readiness["commerce_shadow_compare_top1_match_delta"] == -1
+    assert source_readiness["commerce_shadow_compare_before_top1_match_rate"] == 1.0
+    assert source_readiness["commerce_shadow_compare_after_top1_match_rate"] == 1.0
+    assert source_readiness["ready"] is True

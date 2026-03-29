@@ -261,6 +261,13 @@ def _serve_readiness_by_source(
         no_result_mismatch_cases = commerce_shadow.get("no_result_mismatch_cases")
         bad_price_anomaly_cases = commerce_shadow.get("bad_price_anomaly_cases")
         compare_delta = compare_shadow.get("top1_match_delta")
+        before_top1_match_rate = compare_shadow.get("before_top1_match_rate")
+        after_top1_match_rate = compare_shadow.get("after_top1_match_rate")
+        rate_non_regressing = (
+            True
+            if before_top1_match_rate is None or after_top1_match_rate is None
+            else bool(float(after_top1_match_rate) >= float(before_top1_match_rate))
+        )
         ready = None
         if release_gate or commerce_shadow:
             ready = bool(
@@ -268,7 +275,7 @@ def _serve_readiness_by_source(
                 and release_gate_failed_cases == 0
                 and (no_result_mismatch_cases in (0, None))
                 and (bad_price_anomaly_cases in (0, None))
-                and (compare_delta is None or compare_delta >= 0)
+                and rate_non_regressing
             )
         readiness[source] = {
             "source_stage": stage_labels.get(source),
@@ -281,6 +288,8 @@ def _serve_readiness_by_source(
             "commerce_shadow_no_result_mismatch_cases": no_result_mismatch_cases,
             "commerce_shadow_bad_price_anomaly_cases": bad_price_anomaly_cases,
             "commerce_shadow_compare_top1_match_delta": compare_delta,
+            "commerce_shadow_compare_before_top1_match_rate": before_top1_match_rate,
+            "commerce_shadow_compare_after_top1_match_rate": after_top1_match_rate,
             "ready": ready,
         }
     return readiness

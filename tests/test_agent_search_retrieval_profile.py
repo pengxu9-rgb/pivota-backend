@@ -83,3 +83,4 @@ def test_profile_filter_keeps_tool_candidate_when_prune_enabled():
 def test_has_fragrance_signal_supports_compact_tokens():
     assert agent_api._has_fragrance_signal("EAUDEPARFUM collection") is True
     assert agent_api._has_fragrance_signal("best bodymist picks") is True
+    assert agent_api._has_fragrance_signal("Le Labo Santal 33") is True

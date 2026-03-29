@@ -364,6 +364,8 @@ def _has_fragrance_signal(text: Optional[str]) -> bool:
         raw,
     ):
         return True
+    if re.search(r"\bsantal\s*33\b", raw):
+        return True
     compact = re.sub(r"[^a-z0-9]+", "", raw)
     if not compact:
         return False
@@ -381,6 +383,7 @@ def _has_fragrance_signal(text: Optional[str]) -> bool:
             "eaudeparfum",
             "eaudetoilette",
             "extraitdeparfum",
+            "santal33",
             "edp",
             "edt",
         )
