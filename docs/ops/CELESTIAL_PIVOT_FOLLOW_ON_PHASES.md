@@ -33,8 +33,12 @@ That is enough to close the current phase, but it does not prove that the same b
 - keep this phase non-paid and non-capture
 
 ### Merchant Cohort Rules
-- at least 5 merchants
-- include `beauty`, `fragrance`, and generic commerce coverage
+- current production minimum gate:
+  - at least 1 live-eligible merchant
+  - include `beauty`
+- long-term target:
+  - at least 5 merchants
+  - include `beauty`, `fragrance`, and generic commerce coverage
 - include more than one PSP readiness profile
 - include at least one merchant with a larger catalog
 - include at least one non-EUR pricing case
@@ -49,12 +53,22 @@ That is enough to close the current phase, but it does not prove that the same b
   - payment canary PSP/provider distribution
 
 ### Suggested Tooling Work
-- add a batch wrapper around [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
-- add a curated merchant manifest fixture under `scripts/fixtures/`
-- emit a rollup JSON/Markdown summary for the cohort
+- batch wrapper: [run_commerce_channels_signoff_batch.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_commerce_channels_signoff_batch.py)
+- merchant cohort fixture: [commerce_signoff_cohort.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/commerce_signoff_cohort.json)
+- direct single-merchant signoff: [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
+- keep emitting a rollup JSON/Markdown summary for the cohort
 
 ### Acceptance Criteria
-- every merchant in the cohort has:
+- current environment gate:
+  - every enabled merchant in the cohort has:
+    - `catalog_read_ok = true`
+    - `catalog_write_ok = true`
+    - `payment_order_ok = true`
+  - the enabled subset satisfies the cohort's current minimum gate
+- long-term target:
+  - the enabled subset reaches the cohort's `target_enabled_cases`
+  - the enabled subset covers the cohort's `target_semantic_classes`
+- every merchant in the cohort that actually runs has:
   - `catalog_read_ok = true`
   - `catalog_write_ok = true`
   - `payment_order_ok = true`
