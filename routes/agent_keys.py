@@ -3,8 +3,8 @@ Agent API Key Management Routes
 """
 
 from fastapi import APIRouter, Depends, HTTPException
-from typing import Optional, List
-from datetime import datetime, timedelta
+from typing import Optional
+from datetime import datetime
 import secrets
 import hashlib
 from pydantic import BaseModel
@@ -16,6 +16,7 @@ router = APIRouter(prefix="/agents", tags=["agent-keys"])
 
 class CreateApiKeyRequest(BaseModel):
     name: str
+    environment: Optional[str] = "live"
     
 class ApiKeyResponse(BaseModel):
     id: str
@@ -25,6 +26,44 @@ class ApiKeyResponse(BaseModel):
     last_used: Optional[str] = None
     status: str
     usage_count: int
+    environment: Optional[str] = None
+    masked: bool = True
+
+
+def _normalize_key_environment(raw_environment: Optional[str]) -> str:
+    value = str(raw_environment or "live").strip().lower()
+    if value in {"production", "prod", "live"}:
+        return "live"
+    if value in {"test", "sandbox", "staging"}:
+        return "test"
+    return "live"
+
+
+def _prefix_for_environment(environment: str) -> str:
+    return "ak_live_" if environment == "live" else "ak_test_"
+
+
+def _infer_environment_from_value(value: Optional[str]) -> str:
+    probe = str(value or "").lower()
+    if "ak_test_" in probe:
+        return "test"
+    if "ak_live_" in probe:
+        return "live"
+    return "unknown"
+
+
+def _format_last_used(last_used_at):
+    if not last_used_at:
+        return None
+
+    diff = datetime.utcnow() - last_used_at
+    if diff.days > 0:
+        return f"{diff.days} days ago"
+    if diff.seconds > 3600:
+        return f"{diff.seconds // 3600} hours ago"
+    if diff.seconds > 60:
+        return f"{diff.seconds // 60} minutes ago"
+    return "Just now"
 
 @router.get("/{agent_id}/api-keys")
 async def get_agent_api_keys(
@@ -113,30 +152,22 @@ async def get_agent_api_keys(
                     "last_used": None,
                     "status": "active",
                     "usage_count": 0,
+                    "environment": _infer_environment_from_value(legacy_dict["api_key"]),
+                    "masked": True,
                 })
 
         for key in keys:
-            last_used = None
-            if key["last_used"]:
-                # Calculate relative time
-                diff = datetime.utcnow() - key["last_used"]
-                if diff.days > 0:
-                    last_used = f"{diff.days} days ago"
-                elif diff.seconds > 3600:
-                    last_used = f"{diff.seconds // 3600} hours ago"
-                elif diff.seconds > 60:
-                    last_used = f"{diff.seconds // 60} minutes ago"
-                else:
-                    last_used = "Just now"
-            
+            masked_key = key["key"]
             formatted_keys.append({
                 "id": key["id"],
                 "name": key["name"],
-                "key": key["key"],
+                "key": masked_key,
                 "created_at": key["created_at"].isoformat() if key["created_at"] else None,
-                "last_used": last_used,
+                "last_used": _format_last_used(key["last_used"]),
                 "status": key["status"],
-                "usage_count": key["usage_count"]
+                "usage_count": key["usage_count"],
+                "environment": _infer_environment_from_value(masked_key),
+                "masked": True,
             })
         
         return {
@@ -181,9 +212,8 @@ async def create_agent_api_key(
             )
         """)
         
-        # Generate a new API key (ak_live_ format with 64 hex chars)
-        key_prefix = "ak_live_" if "production" in request.name.lower() or "live" in request.name.lower() else "ak_test_"
-        full_key = f"{key_prefix}{secrets.token_hex(32)}"  # 64 hex chars
+        environment = _normalize_key_environment(request.environment)
+        full_key = f"{_prefix_for_environment(environment)}{secrets.token_hex(32)}"
         
         # Hash the key for storage
         key_hash = hashlib.sha256(full_key.encode()).hexdigest()
@@ -199,16 +229,18 @@ async def create_agent_api_key(
                 "agent_id": agent_id,
                 "name": request.name,
                 "key_hash": key_hash,
-                "key_prefix": full_key[:10]  # Store first 10 chars for display
+                "key_prefix": full_key[:10]
             }
         )
         
         return {
             "status": "success",
-            "key": full_key,  # Return full key only on creation
+            "key": full_key,
             "key_id": str(result["id"]),
             "name": request.name,
-            "created_at": result["created_at"].isoformat()
+            "created_at": result["created_at"].isoformat(),
+            "environment": environment,
+            "masked": False,
         }
         
     except Exception as e:
@@ -374,6 +406,8 @@ async def reset_agent_api_key(
             "api_key": new_api_key,
             "new_api_key": new_api_key,
             "key_sync_source": key_sync_source,
+            "environment": "live",
+            "masked": False,
         }
         
     except HTTPException:

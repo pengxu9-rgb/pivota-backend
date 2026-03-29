@@ -660,6 +660,30 @@ def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
 
 _BUDGET_FX_CACHE_TTL_SECONDS = 900.0
 _BUDGET_FX_RATE_CACHE: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str], float]] = {}
+_DEFAULT_BUDGET_FX_USD_RATES: Dict[str, float] = {
+    "USD": 1.0,
+    "EUR": 1.09,
+    "GBP": 1.27,
+    "CNY": 0.14,
+    "JPY": 0.0067,
+}
+_BUDGET_FX_LATEST_FALLBACK_ENABLED = _env_bool(
+    "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED",
+    True,
+)
+_BUDGET_FX_STATIC_FALLBACK_ENABLED = _env_bool(
+    "AGENT_SHOP_BUDGET_FX_STATIC_FALLBACK_ENABLED",
+    True,
+)
+_BUDGET_FX_LATEST_BASE_URL = str(
+    os.getenv("AGENT_SHOP_BUDGET_FX_LATEST_BASE_URL", "https://api.exchangerate.host") or ""
+).strip().rstrip("/")
+_BUDGET_FX_LATEST_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_BUDGET_FX_LATEST_TIMEOUT_SECONDS",
+    1.5,
+    min_value=0.2,
+    max_value=10.0,
+)
 
 
 def _parse_budget_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
@@ -674,6 +698,36 @@ def _parse_budget_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
     return {}
 
 
+def _load_budget_fx_usd_rates() -> Dict[str, float]:
+    raw = str(os.getenv("AGENT_SHOP_BUDGET_FX_USD_RATES", "") or "").strip()
+    if not raw:
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    if not isinstance(parsed, dict):
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    normalized = dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    for key, value in parsed.items():
+        currency = str(key or "").strip().upper()
+        try:
+            rate = float(value)
+        except Exception:
+            continue
+        if currency and rate > 0:
+            normalized[currency] = rate
+    return normalized
+
+
+_BUDGET_FX_USD_RATES = _load_budget_fx_usd_rates()
+_BUDGET_FX_STATIC_SOURCE = (
+    "env_usd_base_rates"
+    if str(os.getenv("AGENT_SHOP_BUDGET_FX_USD_RATES", "") or "").strip()
+    else "static_default"
+)
+
+
 def _coerce_budget_fx_snapshot(snapshot: Any) -> Dict[str, Any]:
     if isinstance(snapshot, dict):
         return snapshot
@@ -681,6 +735,86 @@ def _coerce_budget_fx_snapshot(snapshot: Any) -> Dict[str, Any]:
         return dict(snapshot or {})
     except Exception:
         return {}
+
+
+async def _lookup_budget_fx_latest_rate(
+    from_currency: Optional[str],
+    to_currency: Optional[str],
+) -> Tuple[Optional[float], Optional[str]]:
+    if not _BUDGET_FX_LATEST_FALLBACK_ENABLED:
+        return None, None
+
+    source_currency = str(from_currency or "").strip().upper()
+    target_currency = str(to_currency or "").strip().upper()
+    if not source_currency or not target_currency:
+        return None, None
+
+    base_url = _BUDGET_FX_LATEST_BASE_URL
+    if not base_url:
+        return None, None
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=_build_request_timeout(_BUDGET_FX_LATEST_TIMEOUT_SECONDS)
+        ) as client:
+            response = await client.get(
+                f"{base_url}/latest",
+                params={
+                    "base": source_currency,
+                    "symbols": target_currency,
+                },
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        logger.info(
+            "multi.budget_fx.latest_lookup.failed",
+            extra={
+                "event": "multi.budget_fx.latest_lookup.failed",
+                "from_currency": source_currency,
+                "to_currency": target_currency,
+                "error": str(exc),
+            },
+        )
+        return None, None
+
+    rates = payload.get("rates") if isinstance(payload, dict) else None
+    if not isinstance(rates, dict):
+        return None, None
+
+    raw_rate = rates.get(target_currency)
+    try:
+        if raw_rate is not None and float(raw_rate) > 0:
+            return float(raw_rate), "latest_rate_api"
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _lookup_budget_fx_static_rate(
+    from_currency: Optional[str],
+    to_currency: Optional[str],
+) -> Tuple[Optional[float], Optional[str]]:
+    if not _BUDGET_FX_STATIC_FALLBACK_ENABLED:
+        return None, None
+    source_currency = str(from_currency or "").strip().upper()
+    target_currency = str(to_currency or "").strip().upper()
+    if not source_currency or not target_currency:
+        return None, None
+    if source_currency == target_currency:
+        return 1.0, "same_currency"
+    source_rate = _BUDGET_FX_USD_RATES.get(source_currency)
+    target_rate = _BUDGET_FX_USD_RATES.get(target_currency)
+    try:
+        if source_rate is not None and target_rate is not None:
+            source_rate = float(source_rate)
+            target_rate = float(target_rate)
+            if source_rate > 0 and target_rate > 0:
+                return source_rate / target_rate, _BUDGET_FX_STATIC_SOURCE
+    except Exception:
+        return None, None
+    return None, None
 
 
 async def _lookup_budget_fx_rate(
@@ -732,6 +866,30 @@ async def _lookup_budget_fx_rate(
             rate = 1.0 / float(reverse_value)
             _BUDGET_FX_RATE_CACHE[cache_key] = (rate, "x402_snapshot_reverse", now)
             return rate, "x402_snapshot_reverse"
+    except Exception:
+        pass
+
+    latest_rate, latest_source = await _lookup_budget_fx_latest_rate(
+        source_currency,
+        target_currency,
+    )
+    try:
+        if latest_rate is not None and float(latest_rate) > 0:
+            rate = float(latest_rate)
+            _BUDGET_FX_RATE_CACHE[cache_key] = (rate, latest_source, now)
+            return rate, latest_source
+    except Exception:
+        pass
+
+    static_rate, static_source = _lookup_budget_fx_static_rate(
+        source_currency,
+        target_currency,
+    )
+    try:
+        if static_rate is not None and float(static_rate) > 0:
+            rate = float(static_rate)
+            _BUDGET_FX_RATE_CACHE[cache_key] = (rate, static_source, now)
+            return rate, static_source
     except Exception:
         pass
 
@@ -942,6 +1100,18 @@ _SKINCARE_INGREDIENT_DISPLAY_NAMES: Dict[str, str] = {
 }
 
 _SKINCARE_INGREDIENT_CATEGORY_LABELS = {"serum", "moisturizer", "cleanser", "toner"}
+_EXTERNAL_SEED_SKINCARE_CATEGORY_PATTERNS: List[Tuple[str, Any]] = [
+    ("serum", re.compile(r"\b(serum|essence|ampoule|concentrate)\b", re.IGNORECASE)),
+    (
+        "moisturizer",
+        re.compile(r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|barrier cream)\b", re.IGNORECASE),
+    ),
+    (
+        "cleanser",
+        re.compile(r"\b(cleanser|cleansing|face wash|facial wash|cleansing milk|cleansing foam|cleansing gel|wash)\b", re.IGNORECASE),
+    ),
+    ("toner", re.compile(r"\b(toner|mist|pad)\b", re.IGNORECASE)),
+]
 _COSMETIC_SHADE_CATEGORY_LABELS = {"foundation", "lipstick", "blush", "gloss"}
 
 
@@ -5730,12 +5900,18 @@ async def _build_prefetched_external_seed_wrappers(
 
         seed_data = _ensure_seed_data_obj(candidate.get("seed_data"))
         seed_data = dict(seed_data) if isinstance(seed_data, dict) else {}
-        category = (
-            candidate.get("category")
-            or candidate.get("product_type")
-            or seed_data.get("category")
-            or seed_data.get("product_type")
-        )
+        category = None
+        for category_candidate in (
+            candidate.get("category"),
+            candidate.get("product_type"),
+            seed_data.get("category"),
+            seed_data.get("product_type"),
+        ):
+            text = str(category_candidate or "").strip()
+            if not text or text.lower() == "external":
+                continue
+            category = text
+            break
         ingredient_ids = candidate.get("ingredient_ids") or seed_data.get("reviewed_ingredient_ids")
         if candidate.get("title") and not seed_data.get("title"):
             seed_data["title"] = candidate.get("title")

@@ -399,7 +399,7 @@ def normalize_external_seed_product_type(
         snapshot.get("productType"),
     ):
         text = str(candidate or "").strip()
-        if text:
+        if text and text.lower() != "external":
             return text
     inferred_categories = _infer_category_labels_from_text(
         " ".join(
@@ -414,6 +414,13 @@ def normalize_external_seed_product_type(
     if inferred_categories:
         return inferred_categories[0].replace("_", " ").title()
     return ""
+
+
+def _build_external_seed_visible_attributes(product_type: Optional[str]) -> Dict[str, List[str]]:
+    normalized = _normalize_visible_attribute_text(product_type).replace(" ", "_")
+    if normalized and normalized in _CATEGORY_ANCHORS:
+        return {"product_category": [normalized]}
+    return {}
 
 
 def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -513,6 +520,12 @@ def build_external_seed_filter_product(
     product_type = normalize_external_seed_product_type(row, seed_data)
     variants: List[StandardProductVariant] = []
     explicit_visible_attributes = _extract_seed_visible_attributes(row, seed_data)
+    fallback_visible_attributes = _build_external_seed_visible_attributes(product_type)
+    for bucket, labels in fallback_visible_attributes.items():
+        existing = explicit_visible_attributes.setdefault(bucket, [])
+        for label in labels:
+            if label not in existing:
+                existing.append(label)
     for idx, variant in enumerate(_normalize_seed_variants(seed_data)):
         variant_id = str(variant.get("variant_id") or variant.get("id") or variant.get("sku") or f"{product_id}_{idx + 1}").strip()
         try:
