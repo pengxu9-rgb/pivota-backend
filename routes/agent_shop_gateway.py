@@ -8892,6 +8892,7 @@ async def _handle_find_products_multi(
     non_strict_beauty_text_recall_used = False
     generic_default_precision_filtered_count = 0
     beauty_pet_noise_filtered_count = 0
+    beauty_apparel_noise_filtered_count = 0
 
     for product, merchant_name in merchant_products:
         if (
@@ -8990,6 +8991,24 @@ async def _handle_find_products_multi(
             "kitten",
             "kittens",
         ]
+        beauty_apparel_noise_markers = [
+            "sleepwear",
+            "nightdress",
+            "nightgown",
+            "lingerie",
+            "underwear",
+            "bralette",
+            "bra",
+            "panties",
+            "panty",
+            "briefs",
+            "thong",
+            "deep v",
+            "deep-v",
+            "robe",
+            "slip dress",
+            "slipdress",
+        ]
         pet_accessory_blob = " ".join(
             [
                 (product.title or "").lower(),
@@ -9032,6 +9051,12 @@ async def _handle_find_products_multi(
             continue
         if query_semantic_class == "beauty" and not pet_accessory_intent_query and has_pet_subject_marker:
             beauty_pet_noise_filtered_count += 1
+            continue
+        if (
+            query_semantic_class == "beauty"
+            and any(tok in blob_for_filters_ascii for tok in beauty_apparel_noise_markers)
+        ):
+            beauty_apparel_noise_filtered_count += 1
             continue
 
         matched_visible_category_labels = []
@@ -9986,6 +10011,7 @@ async def _handle_find_products_multi(
                 "generic_default_precision_gate_enabled": generic_default_precision_gate_enabled,
                 "generic_default_precision_filtered_count": generic_default_precision_filtered_count,
                 "beauty_pet_noise_filtered_count": beauty_pet_noise_filtered_count,
+                "beauty_apparel_noise_filtered_count": beauty_apparel_noise_filtered_count,
                 "external_seed_query_timeout": external_seed_query_timeout,
                 "external_seed_rows_fetched": external_seed_rows_fetched,
                 "external_seed_ranked_count": external_seed_ranked_count,
