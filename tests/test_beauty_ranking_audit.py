@@ -13,6 +13,21 @@ from sqlalchemy import create_engine, text
 import scripts.beauty_ranking_audit as beauty_ranking_audit
 
 
+def test_raw_seed_fetch_limit_matches_gateway_shopping_seed_budget() -> None:
+    assert beauty_ranking_audit._raw_seed_fetch_limit(
+        {"source": "shopping_agent", "page": 1, "limit": 10},
+        50,
+    ) == 30
+    assert beauty_ranking_audit._raw_seed_fetch_limit(
+        {"source": "aurora", "page": 2, "limit": 15},
+        50,
+    ) == 60
+    assert beauty_ranking_audit._raw_seed_fetch_limit(
+        {"source": "merchant_api", "page": 1, "limit": 10},
+        50,
+    ) == 10
+
+
 def test_post_json_returns_error_payload_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_post(*args, **kwargs):
         raise requests.ReadTimeout("gateway timed out")

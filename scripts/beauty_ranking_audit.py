@@ -35,6 +35,8 @@ DEFAULT_CORPUS = (
     Path(__file__).resolve().parent / "fixtures" / "beauty_ranking_golden_corpus.json"
 )
 
+_SHOPPING_SURFACES = {"shopping_agent", "aurora", "aurora-bff"}
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -84,6 +86,15 @@ def _load_corpus(path_str: str) -> List[Dict[str, Any]]:
     if not isinstance(payload, list):
         raise ValueError("Corpus must be a JSON list")
     return [item for item in payload if isinstance(item, dict)]
+
+
+def _raw_seed_fetch_limit(case: Dict[str, Any], default_limit: int) -> int:
+    display_limit = max(1, int(case.get("limit") or default_limit or 1))
+    page = max(1, int(case.get("page") or 1))
+    source = str(case.get("source") or "").strip().lower()
+    if source in _SHOPPING_SURFACES:
+        return min(max(display_limit * page * 2, 30), 200)
+    return display_limit
 
 
 def _resolve_database_url(args: argparse.Namespace) -> Optional[str]:
@@ -464,9 +475,10 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
             if not query:
                 continue
             market = str(case.get("market") or args.market or "").strip() or None
+            raw_limit = _raw_seed_fetch_limit(case, int(args.limit))
             raw_fetch = await _fetch_raw_external_rows(
                 query=query,
-                limit=max(1, int(case.get("limit") or args.limit)),
+                limit=raw_limit,
                 market=market,
                 stage_a_timeout_seconds=float(args.seed_stage_a_timeout_seconds),
                 stage_b_timeout_seconds=float(args.seed_stage_b_timeout_seconds),
@@ -538,6 +550,7 @@ async def _build_report(args: argparse.Namespace) -> Dict[str, Any]:
                 {
                     "query": query,
                     "market": market,
+                    "raw_seed_fetch_limit": raw_limit,
                     "raw_seed_available": raw_seed_available,
                     "raw_seed_table_missing": raw_seed_table_missing,
                     "raw_seed_fetch": {
