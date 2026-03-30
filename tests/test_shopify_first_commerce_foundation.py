@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -52,6 +53,28 @@ def test_standard_product_from_record_payload_accepts_standard_product() -> None
     assert isinstance(product, StandardProduct)
     assert product.id == "prod_1"
     assert product.title == "Cleanser"
+
+
+def test_model_dump_normalizes_datetimes_for_json_storage() -> None:
+    from services.canonical_commerce_service import _model_dump
+
+    product = StandardProduct(
+        id="prod_1",
+        platform="shopify",
+        merchant_id="merch_1",
+        title="Cleanser",
+        price=19.0,
+        currency="USD",
+        created_at=datetime(2026, 3, 30, 8, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 3, 30, 9, 0, tzinfo=timezone.utc),
+        variants=[],
+    )
+
+    payload = _model_dump(product)
+
+    assert payload["created_at"] == "2026-03-30T08:00:00+00:00"
+    assert payload["updated_at"] == "2026-03-30T09:00:00+00:00"
+    json.dumps(payload)
 
 
 @pytest.mark.asyncio

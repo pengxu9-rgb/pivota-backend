@@ -27,8 +27,10 @@ logger = logging.getLogger(__name__)
 def _model_dump(model: Any) -> Dict[str, Any]:
     dump = getattr(model, "model_dump", None)
     if callable(dump):
-        return dump()
-    return model.dict()
+        payload = dump()
+    else:
+        payload = model.dict()
+    return _make_json_safe(payload)
 
 
 def _json_default(value: Any) -> Any:
@@ -37,6 +39,10 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     return str(value)
+
+
+def _make_json_safe(payload: Any) -> Any:
+    return json.loads(json.dumps(payload, default=_json_default, ensure_ascii=False))
 
 
 def _hash_payload(payload: Any) -> str:
@@ -382,7 +388,7 @@ async def upsert_canonical_product(
                     source_name=source_name,
                     source_recorded_at=source_recorded_at,
                     payload_hash=variant_hash,
-                    raw_payload=raw_payload or variant_payload,
+                    raw_payload=_make_json_safe(raw_payload or variant_payload),
                     is_primary=True,
                 )
             )
@@ -399,7 +405,7 @@ async def upsert_canonical_product(
                 source_name=source_name,
                 source_recorded_at=source_recorded_at,
                 payload_hash=product_payload_hash,
-                raw_payload=raw_payload or product_payload,
+                raw_payload=_make_json_safe(raw_payload or product_payload),
                 is_primary=True,
             )
         )
