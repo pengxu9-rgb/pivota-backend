@@ -162,11 +162,12 @@ async def _verify_summary(
     payloads: List[Dict[str, Any]],
     sample_limit: int,
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"merchant_id": merchant_id}
+    base_params: Dict[str, Any] = {"merchant_id": merchant_id}
+    platform_params: Dict[str, Any] = {"merchant_id": merchant_id}
     platform_clause = ""
     if platform:
         platform_clause = "AND platform = :platform"
-        params["platform"] = platform
+        platform_params["platform"] = platform
 
     async def _count(sql: str, sql_params: Dict[str, Any]) -> int:
         row = await database.fetch_one(sql, sql_params)
@@ -175,27 +176,27 @@ async def _verify_summary(
 
     catalog_product_count = await _count(
         f"SELECT COUNT(*) AS count FROM catalog_products WHERE merchant_id = :merchant_id {platform_clause}",
-        params,
+        platform_params,
     )
     catalog_sku_count = await _count(
         f"SELECT COUNT(*) AS count FROM catalog_skus WHERE merchant_id = :merchant_id {platform_clause}",
-        params,
+        platform_params,
     )
     catalog_offer_count = await _count(
         "SELECT COUNT(*) AS count FROM catalog_offers WHERE merchant_id = :merchant_id",
-        params,
+        base_params,
     )
     beauty_profile_count = await _count(
         "SELECT COUNT(*) AS count FROM beauty_product_profiles WHERE merchant_id = :merchant_id",
-        params,
+        base_params,
     )
     quote_snapshot_count = await _count(
         "SELECT COUNT(*) AS count FROM catalog_quote_snapshots WHERE merchant_id = :merchant_id",
-        params,
+        base_params,
     )
     sync_job_count = await _count(
         "SELECT COUNT(*) AS count FROM catalog_sync_jobs WHERE merchant_id = :merchant_id",
-        params,
+        base_params,
     )
 
     expected_product_keys: List[str] = []
@@ -214,7 +215,7 @@ async def _verify_summary(
         WHERE merchant_id = :merchant_id
         {platform_clause}
         """,
-        params,
+        platform_params,
     )
     existing_keys = {str(dict(row).get("product_key") or "").strip() for row in existing_rows}
     missing_keys = [key for key in expected_product_keys if key not in existing_keys]

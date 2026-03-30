@@ -35,6 +35,22 @@ def test_build_candidate_marks_live_eligible() -> None:
             "active_psp_providers": ["stripe", "adyen"],
             "active_psp_environments": ["live"],
             "psp_statuses": ["active"],
+            "active_psp_records": [
+                {
+                    "provider": "stripe",
+                    "status": "active",
+                    "api_key": "sk_live_123",
+                    "account_id": None,
+                    "provider_config": {
+                        "mode": "payment_intent",
+                        "webhook_endpoint_id": "we_123",
+                        "webhook_endpoint_secret": "whsec_123",
+                    },
+                    "environment": "live",
+                    "validation_status": "valid",
+                    "validation_error": None,
+                }
+            ],
             "catalog_offer_rows": 25,
             "currencies": ["USD"],
         },
@@ -47,6 +63,8 @@ def test_build_candidate_marks_live_eligible() -> None:
     )
 
     assert candidate["live_eligible"] is True
+    assert candidate["has_live_ready_supported_psp"] is True
+    assert candidate["live_ready_supported_psp_providers"] == ["stripe"]
     assert candidate["gap_reasons"] == []
     assert candidate["candidate_query"] == "Winona Serum"
     assert candidate["cohort_case_id"] == "beauty_1"
@@ -65,6 +83,22 @@ def test_build_report_counts_gaps_and_capacity() -> None:
                 "active_psp_providers": ["stripe"],
                 "active_psp_environments": ["live"],
                 "psp_statuses": ["active"],
+                "active_psp_records": [
+                    {
+                        "provider": "stripe",
+                        "status": "active",
+                        "api_key": "sk_live_123",
+                        "account_id": None,
+                        "provider_config": {
+                            "mode": "payment_intent",
+                            "webhook_endpoint_id": "we_123",
+                            "webhook_endpoint_secret": "whsec_123",
+                        },
+                        "environment": "live",
+                        "validation_status": "valid",
+                        "validation_error": None,
+                    }
+                ],
                 "catalog_offer_rows": 25,
                 "currencies": ["USD"],
             },
@@ -76,8 +110,20 @@ def test_build_report_counts_gaps_and_capacity() -> None:
                 "latest_cached_at": None,
                 "active_psp_rows": 1,
                 "active_psp_providers": ["stripe"],
-                "active_psp_environments": ["unknown"],
+                "active_psp_environments": ["test"],
                 "psp_statuses": ["active"],
+                "active_psp_records": [
+                    {
+                        "provider": "stripe",
+                        "status": "active",
+                        "api_key": "sk_test_123",
+                        "account_id": None,
+                        "provider_config": {"mode": "payment_intent"},
+                        "environment": "test",
+                        "validation_status": "valid",
+                        "validation_error": None,
+                    }
+                ],
                 "catalog_offer_rows": 0,
                 "currencies": [],
             },
@@ -99,11 +145,13 @@ def test_build_report_counts_gaps_and_capacity() -> None:
 
     summary = report["summary"]
     assert summary["live_eligible_merchants"] == 1
+    assert summary["merchants_with_live_ready_supported_psp"] == 1
     assert summary["enough_capacity_for_min_gate"] is True
     assert summary["enough_capacity_for_target_gate"] is False
     assert summary["missing_capacity_to_target"] == 2
     assert summary["gap_reason_counts"] == {
         "missing_catalog_offers": 1,
+        "missing_live_ready_supported_psp": 1,
         "missing_products_cache": 1,
     }
 
@@ -142,6 +190,22 @@ def test_main_writes_json_and_markdown(monkeypatch, tmp_path: Path) -> None:
                 "active_psp_providers": ["stripe"],
                 "active_psp_environments": ["live"],
                 "psp_statuses": ["active"],
+                "active_psp_records": [
+                    {
+                        "provider": "stripe",
+                        "status": "active",
+                        "api_key": "sk_live_123",
+                        "account_id": None,
+                        "provider_config": {
+                            "mode": "payment_intent",
+                            "webhook_endpoint_id": "we_123",
+                            "webhook_endpoint_secret": "whsec_123",
+                        },
+                        "environment": "live",
+                        "validation_status": "valid",
+                        "validation_error": None,
+                    }
+                ],
                 "catalog_offer_rows": 25,
                 "currencies": ["USD"],
             }

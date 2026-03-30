@@ -3,9 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from services.merchant_psp_config_service import (
+    SUPPORTED_CANONICAL_PSPS,
+    evaluate_psp_readiness,
+)
 
 
 LIVE_PSP_STATUSES = {"active", "connected", "validated"}
@@ -69,6 +79,26 @@ def _normalize_list(value: Any) -> List[str]:
     return normalized
 
 
+def _normalize_dict_list(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            value = json.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(value, list):
+        return []
+    items: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            items.append(dict(item))
+    return items
+
+
 def _fetch_merchant_rows(database_url: str, limit: int) -> List[Dict[str, Any]]:
     sql = """
     WITH merchant_universe AS (
@@ -94,7 +124,19 @@ def _fetch_merchant_rows(database_url: str, limit: int) -> List[Dict[str, Any]]:
         COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('active', 'connected', 'validated')) AS active_psp_rows,
         ARRAY_AGG(DISTINCT provider) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('active', 'connected', 'validated')) AS active_psp_providers,
         ARRAY_AGG(DISTINCT environment) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('active', 'connected', 'validated')) AS active_psp_environments,
-        ARRAY_AGG(DISTINCT status) FILTER (WHERE status IS NOT NULL) AS psp_statuses
+        ARRAY_AGG(DISTINCT status) FILTER (WHERE status IS NOT NULL) AS psp_statuses,
+        JSONB_AGG(
+          JSONB_BUILD_OBJECT(
+            'provider', provider,
+            'status', status,
+            'api_key', api_key,
+            'account_id', account_id,
+            'provider_config', provider_config,
+            'environment', environment,
+            'validation_status', validation_status,
+            'validation_error', validation_error
+          )
+        ) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('active', 'connected', 'validated')) AS active_psp_records
       FROM merchant_psps
       GROUP BY merchant_id
     ),
@@ -116,6 +158,7 @@ def _fetch_merchant_rows(database_url: str, limit: int) -> List[Dict[str, Any]]:
       COALESCE(psp.active_psp_providers, ARRAY[]::text[]) AS active_psp_providers,
       COALESCE(psp.active_psp_environments, ARRAY[]::text[]) AS active_psp_environments,
       COALESCE(psp.psp_statuses, ARRAY[]::text[]) AS psp_statuses,
+      COALESCE(psp.active_psp_records, '[]'::jsonb) AS active_psp_records,
       COALESCE(cat.catalog_offer_rows, 0) AS catalog_offer_rows,
       COALESCE(cat.currencies, ARRAY[]::text[]) AS currencies
     FROM merchant_universe u
@@ -162,7 +205,31 @@ def _build_candidate(row: Dict[str, Any], cohort_case: Optional[Dict[str, Any]])
     has_live_payload = titled_rows > 0
     has_active_psp = active_psp_rows > 0
     has_catalog_offers = catalog_offer_rows > 0
-    live_eligible = has_products_cache and has_live_payload and has_active_psp and has_catalog_offers
+    active_psp_records = _normalize_dict_list(row.get("active_psp_records"))
+    supported_active_psp_providers: List[str] = []
+    live_ready_supported_psp_providers: List[str] = []
+    for record in active_psp_records:
+        provider = str(record.get("provider") or "").strip().lower()
+        if provider not in SUPPORTED_CANONICAL_PSPS:
+            continue
+        if provider not in supported_active_psp_providers:
+            supported_active_psp_providers.append(provider)
+        readiness = evaluate_psp_readiness(
+            provider,
+            status=record.get("status"),
+            api_key=record.get("api_key"),
+            account_id=record.get("account_id"),
+            provider_config=record.get("provider_config"),
+            environment=record.get("environment"),
+            validation_status=record.get("validation_status"),
+            validation_error=record.get("validation_error"),
+        )
+        if readiness.get("live_charge_ready") and provider not in live_ready_supported_psp_providers:
+            live_ready_supported_psp_providers.append(provider)
+
+    has_supported_active_psp = bool(supported_active_psp_providers)
+    has_live_ready_supported_psp = bool(live_ready_supported_psp_providers)
+    live_eligible = has_products_cache and has_live_payload and has_catalog_offers and has_live_ready_supported_psp
 
     gap_reasons: List[str] = []
     if not has_products_cache:
@@ -173,6 +240,10 @@ def _build_candidate(row: Dict[str, Any], cohort_case: Optional[Dict[str, Any]])
         gap_reasons.append("missing_catalog_offers")
     if not has_active_psp:
         gap_reasons.append("missing_active_psp")
+    elif not has_supported_active_psp:
+        gap_reasons.append("missing_supported_active_psp")
+    elif not has_live_ready_supported_psp:
+        gap_reasons.append("missing_live_ready_supported_psp")
 
     case = cohort_case or {}
     return {
@@ -191,8 +262,12 @@ def _build_candidate(row: Dict[str, Any], cohort_case: Optional[Dict[str, Any]])
         "has_products_cache": has_products_cache,
         "has_products_cache_live_payload": has_live_payload,
         "has_active_psp": has_active_psp,
+        "has_supported_active_psp": has_supported_active_psp,
+        "has_live_ready_supported_psp": has_live_ready_supported_psp,
         "has_catalog_offers": has_catalog_offers,
         "live_eligible": live_eligible,
+        "supported_active_psp_providers": supported_active_psp_providers,
+        "live_ready_supported_psp_providers": live_ready_supported_psp_providers,
         "gap_reasons": gap_reasons,
         "cohort_case_id": case.get("case_id"),
         "cohort_label": case.get("label"),
@@ -223,6 +298,8 @@ def _build_report(rows: List[Dict[str, Any]], cohort: Dict[str, Any]) -> Dict[st
         "merchants_with_products_cache_live_payload": _count_if(candidates, "has_products_cache_live_payload"),
         "merchants_with_catalog_offers": _count_if(candidates, "has_catalog_offers"),
         "merchants_with_active_psp": _count_if(candidates, "has_active_psp"),
+        "merchants_with_supported_active_psp": _count_if(candidates, "has_supported_active_psp"),
+        "merchants_with_live_ready_supported_psp": _count_if(candidates, "has_live_ready_supported_psp"),
         "live_eligible_merchants": len(live_eligible),
         "live_eligible_merchants_in_cohort": len(live_eligible_in_cohort),
         "live_eligible_merchants_outside_cohort": len(live_eligible_outside_cohort),
@@ -261,6 +338,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- merchants_with_products_cache: `{summary.get('merchants_with_products_cache')}`",
         f"- merchants_with_catalog_offers: `{summary.get('merchants_with_catalog_offers')}`",
         f"- merchants_with_active_psp: `{summary.get('merchants_with_active_psp')}`",
+        f"- merchants_with_live_ready_supported_psp: `{summary.get('merchants_with_live_ready_supported_psp')}`",
         f"- live_eligible_merchants: `{summary.get('live_eligible_merchants')}`",
     ]
     if summary.get("cohort_name"):
