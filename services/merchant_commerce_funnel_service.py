@@ -1,44 +1,18 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
-from db.orders import orders
 from db.surface_listing_registry import surface_listing_states
 
 
 def _supported_indexed_statuses() -> tuple[str, ...]:
     return ("exported", "indexed", "tradeable")
-
-
-def _normalized_status(row: Dict[str, Any]) -> str:
-    return str(row.get("status") or "unknown").strip().lower() or "unknown"
-
-
-def _normalized_surface(row: Dict[str, Any]) -> str:
-    return str(row.get("surface") or "unknown").strip().lower() or "unknown"
-
-
-def _count_listing_status_breakdown_rows(rows: List[Dict[str, Any]]) -> Dict[str, int]:
-    breakdown: Dict[str, int] = defaultdict(int)
-    for row in rows:
-        breakdown[_normalized_status(row)] += 1
-    return dict(breakdown)
-
-
-def _count_listing_status_breakdown_by_surface(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
-    by_surface: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for row in rows:
-        by_surface[_normalized_surface(row)][_normalized_status(row)] += 1
-    return {
-        surface: dict(status_counts)
-        for surface, status_counts in by_surface.items()
-    }
 
 
 async def _fetch_listing_rows(merchant_id: str, surface: Optional[str]) -> List[Dict[str, Any]]:
@@ -76,29 +50,38 @@ async def get_merchant_commerce_funnel(
     edge_rows = await _fetch_edge_rows(merchant_id, surface)
 
     indexed_statuses = set(_supported_indexed_statuses())
-    indexed_rows = [row for row in listing_rows if _normalized_status(row) in indexed_statuses]
+    indexed_rows = [row for row in listing_rows if str(row.get("status") or "").strip().lower() in indexed_statuses]
+    surfaced_exposure = len({row.get("click_id") for row in click_rows if row.get("click_id") and int(row.get("impression_count") or 0) > 0})
     clicked_exposure = len({row.get("click_id") for row in click_rows if row.get("click_id")})
     total_click_events = sum(int(row.get("click_count") or 0) for row in click_rows)
     ordered_conversion = len({row.get("order_id") for row in edge_rows if row.get("order_id")})
     refunded_orders = len({row.get("order_id") for row in edge_rows if row.get("latest_refund_id")})
     refunded_amount = str(sum(Decimal(str(row.get("refunded_amount") or "0")) for row in edge_rows))
-    listing_status_breakdown_rows = _count_listing_status_breakdown_rows(listing_rows)
-    listing_status_breakdown_by_surface = _count_listing_status_breakdown_by_surface(listing_rows)
+    listing_status_breakdown = dict(Counter(str(row.get("status") or "unknown") for row in listing_rows))
+    listing_status_breakdown_by_surface: Dict[str, Dict[str, int]] = {}
+    for row in listing_rows:
+        surface_key = str(row.get("surface") or "unknown")
+        surface_bucket = listing_status_breakdown_by_surface.setdefault(surface_key, {})
+        status_key = str(row.get("status") or "unknown")
+        surface_bucket[status_key] = int(surface_bucket.get(status_key, 0)) + 1
+
+    clicked_rate_denominator = surfaced_exposure or len({row.get("canonical_variant_id") for row in indexed_rows if row.get("canonical_variant_id")})
+    ordered_rate_denominator = clicked_exposure or 0
 
     summary = {
         "indexed_exposure": len({row.get("canonical_variant_id") for row in indexed_rows if row.get("canonical_variant_id")}),
-        "indexed_exposure_scope": "unique_variants",
-        "surfaced_exposure": None,
-        "surfaced_exposure_supported": False,
+        "surfaced_exposure": surfaced_exposure,
+        "surfaced_exposure_supported": True,
         "clicked_exposure": clicked_exposure,
         "clicked_events_total": total_click_events,
         "ordered_conversion": ordered_conversion,
         "refunded_orders": refunded_orders,
         "refunded_amount": refunded_amount,
+        "clicked_rate": (clicked_exposure / clicked_rate_denominator) if clicked_rate_denominator else 0,
+        "ordered_rate": (ordered_conversion / ordered_rate_denominator) if ordered_rate_denominator else 0,
         "listing_rows_total": len(listing_rows),
-        "listing_status_breakdown": listing_status_breakdown_rows,
-        "listing_status_breakdown_rows": listing_status_breakdown_rows,
-        "listing_status_breakdown_scope": "listing_rows_across_surfaces",
+        "listing_status_breakdown": listing_status_breakdown,
+        "listing_status_breakdown_rows": listing_status_breakdown,
         "listing_status_breakdown_by_surface": listing_status_breakdown_by_surface,
     }
 
@@ -113,15 +96,19 @@ async def get_merchant_commerce_funnel(
             lambda: {
                 "key": None,
                 "indexed_exposure": 0,
+                "surfaced_exposure": 0,
                 "clicked_exposure": 0,
                 "clicked_events_total": 0,
                 "ordered_conversion": 0,
                 "refunded_orders": 0,
                 "refunded_amount": Decimal("0"),
+                "clicked_rate": 0,
+                "ordered_rate": 0,
                 "listing_rows_total": 0,
                 "listing_status_breakdown_rows": defaultdict(int),
                 "listing_status_breakdown_by_surface": defaultdict(lambda: defaultdict(int)),
                 "_indexed_variant_ids": set(),
+                "_surfaced_click_ids": set(),
                 "_click_ids": set(),
                 "_order_ids": set(),
                 "_refunded_order_ids": set(),
@@ -135,8 +122,10 @@ async def get_merchant_commerce_funnel(
             bucket = grouped[key]
             bucket["key"] = key
             bucket["listing_rows_total"] += 1
-            bucket["listing_status_breakdown_rows"][_normalized_status(row)] += 1
-            bucket["listing_status_breakdown_by_surface"][_normalized_surface(row)][_normalized_status(row)] += 1
+            status_key = str(row.get("status") or "unknown")
+            surface_key = str(row.get("surface") or "unknown")
+            bucket["listing_status_breakdown_rows"][status_key] += 1
+            bucket["listing_status_breakdown_by_surface"][surface_key][status_key] += 1
 
         for row in indexed_rows:
             key = str(row.get(key_field) or "").strip()
@@ -156,6 +145,9 @@ async def get_merchant_commerce_funnel(
             bucket = grouped[key]
             bucket["key"] = key
             click_id = str(row.get("click_id") or "").strip()
+            if click_id and int(row.get("impression_count") or 0) > 0 and click_id not in bucket["_surfaced_click_ids"]:
+                bucket["_surfaced_click_ids"].add(click_id)
+                bucket["surfaced_exposure"] += 1
             if click_id and click_id not in bucket["_click_ids"]:
                 bucket["_click_ids"].add(click_id)
                 bucket["clicked_exposure"] += 1
@@ -178,19 +170,19 @@ async def get_merchant_commerce_funnel(
 
         slices = {
             key: {
-                **{
-                    field: value[field]
-                    for field in {
-                        "key",
-                        "indexed_exposure",
-                        "clicked_exposure",
-                        "clicked_events_total",
-                        "ordered_conversion",
-                        "refunded_orders",
-                        "listing_rows_total",
-                    }
-                },
+                **value,
+                "clicked_rate": (
+                    value["clicked_exposure"] / (value["surfaced_exposure"] or value["indexed_exposure"])
+                    if (value["surfaced_exposure"] or value["indexed_exposure"])
+                    else 0
+                ),
+                "ordered_rate": (
+                    value["ordered_conversion"] / value["clicked_exposure"]
+                    if value["clicked_exposure"]
+                    else 0
+                ),
                 "refunded_amount": str(value["refunded_amount"]),
+                "listing_rows_total": value["listing_rows_total"],
                 "listing_status_breakdown_rows": dict(value["listing_status_breakdown_rows"]),
                 "listing_status_breakdown_by_surface": {
                     surface_key: dict(status_counts)

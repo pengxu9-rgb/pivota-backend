@@ -58,6 +58,10 @@ def _load_cohort(path_str: str) -> Dict[str, Any]:
             "min_enabled_cases": 1,
             "target_enabled_cases": 1,
             "required_semantic_classes": [],
+            "required_platform_counts": {},
+            "target_platform_counts": {},
+            "required_ready_domains": [],
+            "target_ready_domains": [],
             "cases": payload,
         }
     if isinstance(payload, dict) and isinstance(payload.get("cases"), list):
@@ -124,11 +128,25 @@ def _run_case_signoff(case: Dict[str, Any], args: argparse.Namespace, case_outpu
                 "raw_stdout": stdout[-4000:],
                 "raw_stderr": (completed.stderr or "")[-4000:],
             }
+    readiness_state = payload.get("readiness_state") if isinstance(payload.get("readiness_state"), dict) else {}
+    readiness_domain_statuses = (
+        ((payload.get("summary") or {}).get("readiness_domain_statuses") or {})
+        if isinstance(payload.get("summary"), dict)
+        else {}
+    )
     return {
         "case_id": case_id,
         "merchant_id": str(case.get("merchant_id") or ""),
         "label": case.get("label"),
         "semantic_class": case.get("semantic_class"),
+        "catalog_platform": payload.get("catalog_platform"),
+        "readiness_state_available": bool((payload.get("summary") or {}).get("readiness_state_available")),
+        "readiness_domains": {
+            "foundation": readiness_domain_statuses.get("foundation") or readiness_state.get("foundation_status"),
+            "discover": readiness_domain_statuses.get("discover") or readiness_state.get("discover_status"),
+            "signals": readiness_domain_statuses.get("signals") or readiness_state.get("signals_status"),
+            "execute": readiness_domain_statuses.get("execute") or readiness_state.get("execute_status"),
+        },
         "enabled": True,
         "ok": completed.returncode == 0 and bool(payload.get("overall_ok")),
         "returncode": completed.returncode,
@@ -151,13 +169,17 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- meets_min_enabled_cases: `{summary.get('meets_min_enabled_cases')}`",
         f"- target_enabled_cases: `{summary.get('target_enabled_cases')}`",
         f"- meets_target_enabled_cases: `{summary.get('meets_target_enabled_cases')}`",
+        f"- meets_required_platform_counts: `{summary.get('meets_required_platform_counts')}`",
+        f"- meets_target_platform_counts: `{summary.get('meets_target_platform_counts')}`",
+        f"- all_enabled_cases_ready_for_required_domains: `{summary.get('all_enabled_cases_ready_for_required_domains')}`",
+        f"- all_enabled_cases_ready_for_target_domains: `{summary.get('all_enabled_cases_ready_for_target_domains')}`",
         "",
         "## Cases",
         "",
     ]
     for case in report.get("cases") or []:
         lines.append(
-            f"- `{case['case_id']}` enabled=`{case.get('enabled')}` ok=`{case.get('ok')}` merchant_id=`{case.get('merchant_id')}` semantic_class=`{case.get('semantic_class')}`"
+            f"- `{case['case_id']}` enabled=`{case.get('enabled')}` ok=`{case.get('ok')}` merchant_id=`{case.get('merchant_id')}` semantic_class=`{case.get('semantic_class')}` platform=`{case.get('catalog_platform')}`"
         )
         if case.get("skip_reason"):
             lines.append(f"  skip_reason: `{case['skip_reason']}`")
@@ -177,6 +199,24 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 "## Missing Long-Term Semantic Classes",
                 "",
                 f"- `{', '.join(summary['missing_target_semantic_classes'])}`",
+            ]
+        )
+    if summary.get("missing_required_platform_counts"):
+        lines.extend(
+            [
+                "",
+                "## Missing Required Platform Capacity",
+                "",
+                f"- `{json.dumps(summary['missing_required_platform_counts'], ensure_ascii=False, sort_keys=True)}`",
+            ]
+        )
+    if summary.get("missing_target_platform_counts"):
+        lines.extend(
+            [
+                "",
+                "## Missing Long-Term Platform Capacity",
+                "",
+                f"- `{json.dumps(summary['missing_target_platform_counts'], ensure_ascii=False, sort_keys=True)}`",
             ]
         )
     return "\n".join(lines) + "\n"
@@ -217,6 +257,18 @@ def main() -> int:
     skipped_cases = [case for case in cases if not case.get("enabled")]
     required_semantic_classes = [str(item) for item in (cohort.get("required_semantic_classes") or []) if str(item).strip()]
     target_semantic_classes = [str(item) for item in (cohort.get("target_semantic_classes") or []) if str(item).strip()]
+    required_platform_counts = {
+        str(key).strip().lower(): int(value or 0)
+        for key, value in dict(cohort.get("required_platform_counts") or {}).items()
+        if str(key).strip()
+    }
+    target_platform_counts = {
+        str(key).strip().lower(): int(value or 0)
+        for key, value in dict(cohort.get("target_platform_counts") or {}).items()
+        if str(key).strip()
+    }
+    required_ready_domains = [str(item).strip().lower() for item in (cohort.get("required_ready_domains") or []) if str(item).strip()]
+    target_ready_domains = [str(item).strip().lower() for item in (cohort.get("target_ready_domains") or []) if str(item).strip()]
     present_semantic_classes = {
         str(case.get("semantic_class"))
         for case in enabled_cases
@@ -224,10 +276,54 @@ def main() -> int:
     }
     missing_semantic_classes = [item for item in required_semantic_classes if item not in present_semantic_classes]
     missing_target_semantic_classes = [item for item in target_semantic_classes if item not in present_semantic_classes]
+    present_platform_counts = Counter(
+        str(case.get("catalog_platform") or "").strip().lower()
+        for case in enabled_cases
+        if str(case.get("catalog_platform") or "").strip()
+    )
+    missing_required_platform_counts = {
+        platform: max(0, count - int(present_platform_counts.get(platform) or 0))
+        for platform, count in required_platform_counts.items()
+        if max(0, count - int(present_platform_counts.get(platform) or 0)) > 0
+    }
+    missing_target_platform_counts = {
+        platform: max(0, count - int(present_platform_counts.get(platform) or 0))
+        for platform, count in target_platform_counts.items()
+        if max(0, count - int(present_platform_counts.get(platform) or 0)) > 0
+    }
+    domain_status_summary = {
+        domain: dict(
+            Counter(
+                str((case.get("readiness_domains") or {}).get(domain) or "unknown").strip().lower() or "unknown"
+                for case in enabled_cases
+            )
+        )
+        for domain in ("foundation", "discover", "signals", "execute")
+    }
+    required_domain_failures = {
+        domain: [
+            str(case.get("case_id") or "")
+            for case in enabled_cases
+            if str((case.get("readiness_domains") or {}).get(domain) or "").strip().lower() != "ready"
+        ]
+        for domain in required_ready_domains
+    }
+    target_domain_failures = {
+        domain: [
+            str(case.get("case_id") or "")
+            for case in enabled_cases
+            if str((case.get("readiness_domains") or {}).get(domain) or "").strip().lower() != "ready"
+        ]
+        for domain in target_ready_domains
+    }
+    all_enabled_cases_ready_for_required_domains = not any(required_domain_failures.values())
+    all_enabled_cases_ready_for_target_domains = not any(target_domain_failures.values())
     min_enabled_cases = int(args.min_enabled_cases if args.min_enabled_cases is not None else cohort.get("min_enabled_cases") or cohort.get("target_enabled_cases") or 1)
     meets_min_enabled_cases = len(enabled_cases) >= min_enabled_cases
     target_enabled_cases = int(cohort.get("target_enabled_cases") or min_enabled_cases)
     meets_target_enabled_cases = len(enabled_cases) >= target_enabled_cases
+    meets_required_platform_counts = not missing_required_platform_counts
+    meets_target_platform_counts = not missing_target_platform_counts
     skipped_reason_counts = Counter(str(case.get("skip_reason") or "unknown") for case in skipped_cases)
 
     summary = {
@@ -244,12 +340,32 @@ def main() -> int:
         "missing_semantic_classes": missing_semantic_classes,
         "target_semantic_classes": target_semantic_classes,
         "missing_target_semantic_classes": missing_target_semantic_classes,
+        "required_platform_counts": required_platform_counts,
+        "missing_required_platform_counts": missing_required_platform_counts,
+        "meets_required_platform_counts": meets_required_platform_counts,
+        "target_platform_counts": target_platform_counts,
+        "missing_target_platform_counts": missing_target_platform_counts,
+        "meets_target_platform_counts": meets_target_platform_counts,
+        "required_ready_domains": required_ready_domains,
+        "target_ready_domains": target_ready_domains,
+        "all_enabled_cases_ready_for_required_domains": all_enabled_cases_ready_for_required_domains,
+        "all_enabled_cases_ready_for_target_domains": all_enabled_cases_ready_for_target_domains,
+        "required_domain_failures": required_domain_failures,
+        "target_domain_failures": target_domain_failures,
         "skipped_reason_counts": dict(skipped_reason_counts),
         "semantic_class_summary": dict(
             Counter(str(case.get("semantic_class") or "unspecified") for case in cases)
         ),
+        "platform_summary": dict(present_platform_counts),
+        "readiness_domain_summary": domain_status_summary,
     }
-    overall_ok = not failed_cases and meets_min_enabled_cases and not missing_semantic_classes
+    overall_ok = (
+        not failed_cases
+        and meets_min_enabled_cases
+        and not missing_semantic_classes
+        and meets_required_platform_counts
+        and all_enabled_cases_ready_for_required_domains
+    )
     report = {
         "cohort_name": cohort.get("cohort_name") or Path(args.cohort).stem,
         "overall_ok": overall_ok,

@@ -25,7 +25,9 @@ from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
 import db.canonical_commerce  # noqa: F401  (register canonical commerce tables in metadata)
+import db.commerce_interactions  # noqa: F401  (register canonical interaction ledger tables in metadata)
 import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
+import db.merchant_commerce_readiness  # noqa: F401  (register merchant commerce readiness state in metadata)
 import db.surface_listing_registry  # noqa: F401  (register surface listing registry tables in metadata)
 try:
     import db.merchant_portal_preferences  # noqa: F401  (register merchant portal preferences table in metadata)
@@ -95,6 +97,7 @@ from routes.agent_metrics_routes import router as agent_metrics_router
 from routes.auth_routes import router as auth_router
 from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.agent_account import router as agent_account_router  # Agent account management
+from routes.agent_commerce import router as agent_commerce_router
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
@@ -657,6 +660,7 @@ if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
     app.include_router(debug_psp_validation_router)  # Debug PSP validation
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
+app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_reset_employee_router)  # Admin employee password reset
 app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplicate data

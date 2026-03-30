@@ -5,10 +5,22 @@
   "required_semantic_classes": [
     "beauty"
   ],
+  "required_platform_counts": {},
+  "required_ready_domains": [],
   "target_semantic_classes": [
     "beauty",
     "generic_default",
     "fragrance"
+  ],
+  "target_platform_counts": {
+    "shopify": 3,
+    "wix": 2
+  },
+  "target_ready_domains": [
+    "foundation",
+    "discover",
+    "signals",
+    "execute"
   ],
   "cases": [
     {

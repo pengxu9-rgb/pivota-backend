@@ -97,6 +97,37 @@ def test_smoke_commerce_channels_signoff_runs_all_channels(monkeypatch, tmp_path
     monkeypatch.setattr(module.requests, "Session", lambda: fake_session)
     monkeypatch.setattr(
         module,
+        "_fetch_merchant_commerce_readiness_evidence",
+        lambda **kwargs: {
+            "available": True,
+            "reason": None,
+            "readiness_state": {
+                "merchant_id": "merch_1",
+                "foundation_status": "ready",
+                "discover_status": "ready",
+                "signals_status": "ready",
+                "execute_status": "ready",
+            },
+            "domain_statuses": {
+                "foundation": "ready",
+                "discover": "ready",
+                "signals": "ready",
+                "execute": "ready",
+            },
+            "blocker_counts": {
+                "foundation": 0,
+                "discover": 0,
+                "signals": 0,
+                "execute": 0,
+            },
+            "ledger_counts": {
+                "interaction_count": 3,
+                "event_count": 5,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
         "_run_backfill_subprocess",
         lambda **kwargs: {
             "returncode": 0,
@@ -122,11 +153,12 @@ def test_smoke_commerce_channels_signoff_runs_all_channels(monkeypatch, tmp_path
     assert exit_code == 0
     payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert payload["overall_ok"] is True
-    assert payload["summary"] == {
-        "catalog_read_ok": True,
-        "catalog_write_ok": True,
-        "payment_order_ok": True,
-    }
+    assert payload["summary"]["catalog_read_ok"] is True
+    assert payload["summary"]["catalog_write_ok"] is True
+    assert payload["summary"]["payment_order_ok"] is True
+    assert payload["summary"]["readiness_state_available"] is True
+    assert payload["summary"]["readiness_domain_statuses"]["signals"] == "ready"
+    assert payload["ledger_counts"]["interaction_count"] == 3
     payment_step = next(step for step in payload["steps"] if step["step"] == "payment_order_backed_canary")
     assert payment_step["body"]["payment_action"]["client_secret"] == "[REDACTED]"
     step_names = [step["step"] for step in payload["steps"]]
@@ -138,6 +170,7 @@ def test_smoke_commerce_channels_signoff_runs_all_channels(monkeypatch, tmp_path
         "catalog_backfill_apply",
         "catalog_backfill_verify",
         "payment_order_backed_canary",
+        "merchant_commerce_readiness_snapshot",
     ]
 
 
@@ -145,6 +178,18 @@ def test_smoke_commerce_channels_signoff_can_derive_query(monkeypatch, tmp_path:
     fake_session = _FakeSession()
     monkeypatch.setattr(module.requests, "Session", lambda: fake_session)
     monkeypatch.setattr(module, "_derive_query", lambda database_url, merchant_id: "derived product title")
+    monkeypatch.setattr(
+        module,
+        "_fetch_merchant_commerce_readiness_evidence",
+        lambda **kwargs: {
+            "available": False,
+            "reason": "missing_readiness_row",
+            "readiness_state": None,
+            "domain_statuses": {},
+            "blocker_counts": {},
+            "ledger_counts": {},
+        },
+    )
     monkeypatch.setattr(
         module,
         "_run_backfill_subprocess",
@@ -166,6 +211,18 @@ def test_smoke_commerce_channels_signoff_can_derive_query(monkeypatch, tmp_path:
 def test_smoke_commerce_channels_signoff_fails_when_backfill_verify_fails(monkeypatch, tmp_path: Path) -> None:
     fake_session = _FakeSession()
     monkeypatch.setattr(module.requests, "Session", lambda: fake_session)
+    monkeypatch.setattr(
+        module,
+        "_fetch_merchant_commerce_readiness_evidence",
+        lambda **kwargs: {
+            "available": False,
+            "reason": "missing_readiness_row",
+            "readiness_state": None,
+            "domain_statuses": {},
+            "blocker_counts": {},
+            "ledger_counts": {},
+        },
+    )
 
     def _fake_backfill(**kwargs):
         if kwargs["mode"] == "apply":
@@ -194,6 +251,35 @@ def test_smoke_commerce_channels_signoff_fails_when_backfill_verify_fails(monkey
 
 def test_smoke_commerce_channels_signoff_uses_detected_wix_platform(monkeypatch, tmp_path: Path) -> None:
     fake_session = _FakeSession()
+    monkeypatch.setattr(
+        module,
+        "_fetch_merchant_commerce_readiness_evidence",
+        lambda **kwargs: {
+            "available": True,
+            "reason": None,
+            "readiness_state": {
+                "merchant_id": "merch_1",
+                "primary_platform": "wix",
+                "foundation_status": "ready",
+                "discover_status": "ready",
+                "signals_status": "ready",
+                "execute_status": "ready",
+            },
+            "domain_statuses": {
+                "foundation": "ready",
+                "discover": "ready",
+                "signals": "ready",
+                "execute": "ready",
+            },
+            "blocker_counts": {
+                "foundation": 0,
+                "discover": 0,
+                "signals": 0,
+                "execute": 0,
+            },
+            "ledger_counts": {"interaction_count": 1},
+        },
+    )
 
     def _fake_request(method, url, **kwargs):
         fake_session.calls.append((method, url, kwargs))
