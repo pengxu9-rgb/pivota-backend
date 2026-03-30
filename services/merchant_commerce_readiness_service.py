@@ -4,6 +4,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import select
+
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
 from db.merchant_commerce_readiness import merchant_commerce_readiness_state
