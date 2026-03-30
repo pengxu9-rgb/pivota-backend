@@ -432,6 +432,26 @@ def _fetch_merchant_commerce_readiness_evidence(
     }
 
 
+def _refresh_merchant_commerce_readiness_via_api(
+    *,
+    session: requests.Session,
+    steps: List[Dict[str, Any]],
+    base_url: str,
+    headers: Dict[str, str],
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    return _request_step(
+        session=session,
+        steps=steps,
+        name="merchant_commerce_readiness_refresh",
+        method="GET",
+        url=f"{base_url}/merchant/analytics/readiness-state",
+        headers=headers,
+        timeout=timeout_seconds,
+        ok_if=lambda status, body: status == 200 and str(body.get("merchant_id") or "").strip() != "",
+    )
+
+
 def _render_markdown(report: Dict[str, Any]) -> str:
     summary = report.get("summary") or {}
     lines = [
@@ -642,6 +662,13 @@ def main() -> int:
             "label": args.payment_label,
         },
         ok_if=lambda status, body: status == 200 and bool(body.get("success")),
+    )
+    _refresh_merchant_commerce_readiness_via_api(
+        session=session,
+        steps=steps,
+        base_url=base_url,
+        headers=headers,
+        timeout_seconds=args.timeout_seconds,
     )
     readiness_evidence = _fetch_merchant_commerce_readiness_evidence(
         database_url=args.database_url,
