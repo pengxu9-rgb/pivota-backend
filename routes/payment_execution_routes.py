@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from db.database import database
-from db.orders import create_order, update_order, update_payment_info
+from db.orders import create_order, get_order, update_order, update_order_status, update_payment_info
 from db.merchant_onboarding import get_merchant_by_api_key, get_merchant_onboarding
 from services.merchant_payment_initiation_service import initiate_merchant_payment
 from services.merchant_psp_config_service import evaluate_psp_readiness
@@ -643,6 +643,58 @@ async def _execute_order_backed_payment_canary(
     )
 
 
+async def _cancel_order_backed_canary_order(
+    *,
+    merchant_id: str,
+    order_id: str,
+    source: str,
+) -> Dict[str, Any]:
+    order = await get_order(order_id)
+    if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Canary order not found")
+
+    metadata = dict(order.get("metadata") or {})
+    if not bool(metadata.get("ops_canary")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Order is not managed by ops canary")
+
+    payment_status = str(order.get("payment_status") or "").strip().lower()
+    if payment_status in {"paid", "succeeded", "completed", "refunded", "partially_refunded"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot cancel paid canary order",
+        )
+
+    current_status = str(order.get("status") or "").strip().lower()
+    if current_status == "cancelled":
+        return {
+            "success": True,
+            "order_id": order_id,
+            "status": "cancelled",
+            "message": "Order already cancelled",
+        }
+
+    update_success = await update_order_status(
+        order_id=order_id,
+        status="cancelled",
+        cancelled_at=datetime.now(),
+        payment_status="cancelled",
+        metadata={
+            **metadata,
+            "cleanup_source": source,
+            "cleanup_reason": "ops_canary_cleanup",
+        },
+    )
+    if not update_success:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to cancel canary order")
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "status": "cancelled",
+        "message": "Order cancelled",
+    }
+
+
 @router.post("/execute", response_model=PaymentExecuteResponse)
 async def execute_payment(
     payment_request: PaymentExecuteRequest,
@@ -724,6 +776,33 @@ async def execute_internal_order_backed_canary(
         raise HTTPException(
             status_code=500,
             detail=f"Internal order-backed canary failed: {str(exc)}",
+        )
+
+
+@router.post(
+    "/internal/canary/merchants/{merchant_id}/orders/{order_id}/cancel",
+    include_in_schema=False,
+)
+async def cancel_internal_order_backed_canary(
+    merchant_id: str,
+    order_id: str,
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+):
+    try:
+        _require_internal_canary_access(request, x_pivota_internal_key)
+        return await _cancel_order_backed_canary_order(
+            merchant_id=merchant_id,
+            order_id=order_id,
+            source="ops_order_backed_canary_cleanup",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Internal order-backed canary cleanup failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal order-backed canary cleanup failed: {str(exc)}",
         )
 
 
