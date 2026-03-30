@@ -4,11 +4,9 @@ from collections import Counter, defaultdict
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
-
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
-from db.surface_listing_registry import surface_listing_states
+from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
 
 
 def _supported_indexed_statuses() -> tuple[str, ...]:
@@ -16,11 +14,7 @@ def _supported_indexed_statuses() -> tuple[str, ...]:
 
 
 async def _fetch_listing_rows(merchant_id: str, surface: Optional[str]) -> List[Dict[str, Any]]:
-    query = select(surface_listing_states).where(surface_listing_states.c.merchant_id == merchant_id)
-    if surface:
-        query = query.where(surface_listing_states.c.surface == surface)
-    rows = await database.fetch_all(query)
-    return [dict(row) for row in rows]
+    return await fetch_listing_rows_with_catalog_fallback(merchant_id, surface)
 
 
 async def _fetch_click_rows(merchant_id: str, surface: Optional[str]) -> List[Dict[str, Any]]:
