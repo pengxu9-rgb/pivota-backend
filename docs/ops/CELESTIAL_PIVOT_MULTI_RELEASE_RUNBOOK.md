@@ -24,6 +24,7 @@
 - Release evidence builder: [build_pivot_release_evidence.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/build_pivot_release_evidence.py)
 - Bundle orchestrator: [run_pivot_release_bundle.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_pivot_release_bundle.py)
 - Grafana dashboard: [celestial_pivot_multi_release_dashboard.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/grafana/celestial_pivot_multi_release_dashboard.json)
+- Merchant readiness dashboard query pack: [merchant_commerce_readiness_queries.sql](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/observability/grafana/merchant_commerce_readiness_queries.sql)
 - Alert rules: [celestial_pivot_multi_release_alerts.yml](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/prometheus/celestial_pivot_multi_release_alerts.yml)
 - Follow-on phase plan: [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
 
@@ -364,6 +365,85 @@ When to rerun:
 For the next step beyond this merchant-specific signoff, use the separate follow-on phase plan:
 - [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
 
+## Merchant Portal Readiness And Signals
+This release train now exposes merchant-facing readiness and commerce diagnostics in addition to the existing product-level optimization views.
+Treat these surfaces as complementary:
+
+- product diagnosis remains the single-product/source-data remediation lane
+- merchant readiness answers whether the whole merchant is `Foundation / Discover / Signals / Execute` ready
+- commerce issues + interaction trace answer where the runtime path broke across listing, click, order, refund, and return
+
+Merchant-facing endpoints:
+- `GET /merchant/analytics/readiness-state`
+  - source: [merchant_analytics_routes.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/routes/merchant_analytics_routes.py)
+  - computation: [merchant_commerce_readiness_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_readiness_service.py)
+- `GET /merchant/analytics/commerce-funnel`
+  - grouped summary/read model for indexed, surfaced, clicked, ordered, refunded, and listing status breakdown
+  - computation: [merchant_commerce_funnel_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_funnel_service.py)
+- `GET /merchant/analytics/commerce-funnel/issues`
+  - merchant-facing diagnostic buckets such as `LISTING_ERROR`, `MISSING_INFO`, `VARIANT_MISMATCH`, `TRACE_BROKEN`, `UNATTRIBUTED_ORDER`
+  - computation: [merchant_commerce_diagnostics_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_diagnostics_service.py)
+- `GET /merchant/analytics/commerce-interactions/{interaction_id}`
+  - drilldown for a single interaction ledger trace
+  - lookup: [commerce_interaction_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/commerce_interaction_service.py)
+
+Portal expectation:
+- `/dashboard/analytics` now has four complementary blocks:
+  - funnel summary
+  - grouped funnel table
+  - issue drilldown
+  - readiness state + interaction trace
+- these are merchant-level operating views and do not replace `/dashboard/products` or product optimization blockers
+
+Operational guardrails:
+- migrations `062_commerce_interaction_ledger.sql`, `063_merchant_commerce_readiness_state.sql`, and `064_commerce_interaction_backrefs.sql` should be applied before treating the portal readiness/signals views as canonical
+- dual-write into the interaction ledger is best-effort during rollout
+  - legacy write paths such as listing export and click attribution must continue even if the new ledger tables are not present yet
+  - after migrations are live, investigate any degraded ledger writes immediately instead of treating them as acceptable steady-state behavior
+- `surfaced_exposure_supported` must be `true` for `shopify` and `wix`; legacy referral-only surfaces can remain excluded from readiness denominator
+
+Suggested operator checks after deploy:
+1. Confirm `/merchant/analytics/readiness-state` returns domain statuses and blocker arrays for a known merchant.
+2. Confirm `/merchant/analytics/commerce-funnel` returns non-null `indexed_exposure`, `surfaced_exposure`, `clicked_rate`, `ordered_rate`.
+3. Confirm `/merchant/analytics/commerce-funnel/issues` returns stable diagnostic codes and at least one sample interaction id when issues exist.
+4. From one sample interaction id, call `/merchant/analytics/commerce-interactions/{interaction_id}` and verify the event timeline is ordered and merchant-scoped.
+
+Rollback/cutover interpretation:
+- `Stage A`
+  - schema + dual-write + hidden portal drilldown can ship without switching merchant eligibility
+- `Stage B`
+  - 5-merchant cohort validation should include at least `3 Shopify + 2 Wix`
+- `Stage C`
+  - readiness policy replaces manual merchant allowlists for Discover/Signals/Execute
+- `Stage D`
+  - remove fake metrics, single-merchant alpha loaders, and any legacy funnel logic that is write-only / not read anymore
+
+If the readiness/signals UI regresses but primary product diagnosis still works:
+- keep the merchant product optimization lane live
+- disable or hide the merchant analytics drilldown before reverting core catalog or execute paths
+- prefer rollback to the old analytics read path while preserving new writes for later replay
+
+## Public Execute API
+The commerce execute surface now has a public agent contract in addition to the existing internal readiness routes.
+
+Endpoints:
+- `POST /agent/v2/commerce/checkouts`
+- `POST /agent/v2/commerce/checkouts/{checkout_id}/payment-intent`
+- `GET /agent/v2/commerce/checkouts/{checkout_id}/status`
+- `POST /agent/v2/commerce/checkouts/{checkout_id}/refunds`
+- `POST /agent/v2/commerce/checkouts/{checkout_id}/returns`
+
+Implementation:
+- route surface: [agent_commerce.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/routes/agent_commerce.py)
+- the public contract requires `interaction_id` plus normalized item references
+- Shopify uses the readiness/native PSP orchestration already present
+- Wix shares the same public contract; return sync can still report `pending_external_platform` until full adapter automation lands
+
+Operator checks:
+1. Validate create-checkout returns `checkout_id`, `platform`, `status`, and either `payment_url` or `client_secret`.
+2. Validate payment-intent fetch does not mint a second order and only reflects the existing checkout action.
+3. Validate refund and return actions append ledger events and do not break merchant authorization boundaries.
+
 ## Follow-On Phase Status
 Current follow-on status as of `2026-03-30 UTC`:
 
@@ -380,6 +460,8 @@ Current follow-on status as of `2026-03-30 UTC`:
   - The long-term cohort target remains open by design:
     - `target_enabled_cases = 5`
     - target semantic coverage: `beauty`, `generic_default`, `fragrance`
+    - target platform mix: `shopify >= 3`, `wix >= 2`
+    - target readiness domains per enabled merchant: `foundation`, `discover`, `signals`, `execute`
 
 - `Phase B` supervised paid terminal-state signoff is also green.
   - This was executed with a fresh readiness-owned Stripe Checkout session, not a reused historical PSP reference.

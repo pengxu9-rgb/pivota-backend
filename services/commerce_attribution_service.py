@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
+from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -186,8 +187,10 @@ async def record_surface_event(
 
     if existing:
         row = dict(existing)
+        interaction_id = _first_nonempty(row, "interaction_id") or _first_nonempty(common_values["context"], "interaction_id")
         values = {
             **common_values,
+            "interaction_id": interaction_id,
             "impression_count": int(row.get("impression_count") or 0) + impression_increment,
             "click_count": int(row.get("click_count") or 0) + click_increment,
             "last_impression_at": now if impression_increment else row.get("last_impression_at"),
@@ -201,11 +204,49 @@ async def record_surface_event(
             .where(surface_click_events.c.click_id == click_id)
             .values(**values)
         )
+        interaction_event = await record_commerce_event_best_effort(
+            event_type=f"surface.{event_type}",
+            metadata={
+                **common_values["context"],
+                "merchant_id": common_values["merchant_id"],
+                "platform": _first_nonempty(ctx, "platform"),
+                "surface": common_values["surface"],
+                "click_id": click_id,
+                "canonical_product_id": common_values["canonical_product_id"],
+                "canonical_variant_id": common_values["canonical_variant_id"],
+                "session_id": common_values["session_id"],
+            },
+            source="surface_click_events",
+            upstream_idempotency_key=f"{click_id}:{event_type}",
+        )
+        if not interaction_id:
+            values["interaction_id"] = interaction_event["interaction_id"]
+            await database.execute(
+                surface_click_events.update()
+                .where(surface_click_events.c.click_id == click_id)
+                .values(interaction_id=interaction_event["interaction_id"], updated_at=_now())
+            )
         return values
 
+    interaction_event = await record_commerce_event_best_effort(
+        event_type=f"surface.{event_type}",
+        metadata={
+            **common_values["context"],
+            "merchant_id": common_values["merchant_id"],
+            "platform": _first_nonempty(ctx, "platform"),
+            "surface": common_values["surface"],
+            "click_id": click_id,
+            "canonical_product_id": common_values["canonical_product_id"],
+            "canonical_variant_id": common_values["canonical_variant_id"],
+            "session_id": common_values["session_id"],
+        },
+        source="surface_click_events",
+        upstream_idempotency_key=f"{click_id}:{event_type}",
+    )
     values = {
         "click_id": click_id,
         **common_values,
+        "interaction_id": interaction_event["interaction_id"],
         "impression_count": impression_increment,
         "click_count": click_increment,
         "first_impression_at": now if impression_increment else None,
@@ -249,6 +290,24 @@ async def upsert_order_attribution_edge(
         "metadata": {**payload, **attribution},
         "updated_at": now,
     }
+    interaction_event = await record_commerce_event_best_effort(
+        event_type="order.created",
+        metadata={
+            **payload,
+            **attribution,
+            "merchant_id": merchant_id,
+            "interaction_id": _first_nonempty(payload, "interaction_id"),
+            "order_id": order_id,
+            "platform": _first_nonempty(payload, "platform"),
+            "trace_id": _first_nonempty(payload, "trace_id"),
+            "brief_id": _first_nonempty(payload, "brief_id"),
+            "quote_id": _first_nonempty(payload, "quote_id"),
+            "checkout_id": _first_nonempty(payload, "checkout_id"),
+        },
+        source="commerce_attribution_edges",
+        upstream_idempotency_key=f"order:{order_id}",
+    )
+    values["interaction_id"] = interaction_event["interaction_id"]
     existing = await database.fetch_one(
         select(commerce_attribution_edges).where(commerce_attribution_edges.c.order_id == order_id)
     )
@@ -305,6 +364,24 @@ async def attach_refund_to_attribution_edge(
         "latest_refund_at": now,
         "updated_at": now,
     }
+    await record_commerce_event_best_effort(
+        event_type="refund.succeeded",
+        metadata={
+            **row.get("metadata", {}),
+            "merchant_id": row.get("merchant_id"),
+            "interaction_id": row.get("interaction_id"),
+            "order_id": order_id,
+            "refund_id": refund_id,
+            "click_id": row.get("click_id"),
+            "canonical_product_id": row.get("canonical_product_id"),
+            "canonical_variant_id": row.get("canonical_variant_id"),
+            "surface": row.get("surface"),
+            "prompt_cluster": row.get("prompt_cluster"),
+            "refunded_amount": str(amount or "0"),
+        },
+        source="commerce_attribution_edges",
+        upstream_idempotency_key=f"refund:{refund_id}",
+    )
     await database.execute(
         commerce_attribution_edges.update()
         .where(commerce_attribution_edges.c.order_id == order_id)

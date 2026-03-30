@@ -30,6 +30,8 @@ Current status as of `2026-03-30 UTC`:
   - Long-term expansion is still intentionally open:
     - `target_enabled_cases = 5`
     - `target_semantic_classes = ["beauty", "generic_default", "fragrance"]`
+    - `target_platform_counts = {"shopify": 3, "wix": 2}`
+    - `target_ready_domains = ["foundation", "discover", "signals", "execute"]`
 
 - `Phase B` supervised real payment completion is complete.
   - Evidence:
@@ -71,6 +73,8 @@ That is enough to close the current phase, but it does not prove that the same b
 - long-term target:
   - at least 5 merchants
   - include `beauty`, `fragrance`, and generic commerce coverage
+  - include `shopify >= 3` and `wix >= 2`
+  - every enabled merchant should eventually be `ready` for `foundation`, `discover`, `signals`, and `execute`
 - include more than one PSP readiness profile
 - include at least one merchant with a larger catalog
 - include at least one non-EUR pricing case
@@ -88,6 +92,7 @@ That is enough to close the current phase, but it does not prove that the same b
 - batch wrapper: [run_commerce_channels_signoff_batch.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_commerce_channels_signoff_batch.py)
 - merchant cohort fixture: [commerce_signoff_cohort.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/commerce_signoff_cohort.json)
 - direct single-merchant signoff: [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
+- operator query pack: [merchant_commerce_readiness_queries.sql](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/observability/grafana/merchant_commerce_readiness_queries.sql)
 - keep emitting a rollup JSON/Markdown summary for the cohort
 
 ### Acceptance Criteria
@@ -100,6 +105,8 @@ That is enough to close the current phase, but it does not prove that the same b
 - long-term target:
   - the enabled subset reaches the cohort's `target_enabled_cases`
   - the enabled subset covers the cohort's `target_semantic_classes`
+  - the enabled subset reaches the cohort's `target_platform_counts`
+  - every enabled merchant is `ready` for the cohort's `target_ready_domains`
 - every merchant in the cohort that actually runs has:
   - `catalog_read_ok = true`
   - `catalog_write_ok = true`

@@ -328,6 +328,110 @@ def _detect_catalog_platform(*, database_url: str, merchant_id: str, read_body: 
     return "shopify"
 
 
+def _fetch_merchant_commerce_readiness_evidence(
+    *,
+    database_url: str,
+    merchant_id: str,
+) -> Dict[str, Any]:
+    try:
+        with _connect_postgres(database_url) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        merchant_id,
+                        primary_platform,
+                        active_psp,
+                        foundation_status,
+                        discover_status,
+                        signals_status,
+                        execute_status,
+                        foundation_blockers,
+                        discover_blockers,
+                        signals_blockers,
+                        execute_blockers,
+                        surfaced_exposure_supported,
+                        first_store_connected_at,
+                        first_catalog_synced_at,
+                        first_discover_ready_at,
+                        days_to_discover_ready,
+                        observed_at,
+                        metadata
+                    FROM merchant_commerce_readiness_state
+                    WHERE merchant_id = %s
+                    """,
+                    (merchant_id,),
+                )
+                readiness_row = cursor.fetchone()
+                readiness_columns = [col[0] for col in cursor.description] if cursor.description else []
+
+                cursor.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM commerce_interactions WHERE merchant_id = %s) AS interaction_count,
+                        (SELECT COUNT(*) FROM commerce_interaction_events WHERE merchant_id = %s) AS event_count,
+                        (SELECT COUNT(*) FROM commerce_interaction_events WHERE merchant_id = %s AND event_type = 'surface.click') AS surface_click_event_count,
+                        (SELECT COUNT(*) FROM commerce_interaction_events WHERE merchant_id = %s AND event_type = 'order.created') AS ordered_event_count,
+                        (SELECT COUNT(*) FROM commerce_interaction_events WHERE merchant_id = %s AND event_type = 'refund.succeeded') AS refunded_event_count,
+                        (SELECT COUNT(*) FROM surface_listing_states WHERE merchant_id = %s) AS listing_row_count,
+                        (SELECT COUNT(*) FROM surface_click_events WHERE merchant_id = %s) AS click_row_count,
+                        (SELECT COUNT(*) FROM commerce_attribution_edges WHERE merchant_id = %s) AS attribution_edge_count
+                    """,
+                    (
+                        merchant_id,
+                        merchant_id,
+                        merchant_id,
+                        merchant_id,
+                        merchant_id,
+                        merchant_id,
+                        merchant_id,
+                        merchant_id,
+                    ),
+                )
+                ledger_row = cursor.fetchone()
+                ledger_columns = [col[0] for col in cursor.description] if cursor.description else []
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"query_failed:{exc}",
+            "readiness_state": None,
+            "domain_statuses": {},
+            "blocker_counts": {},
+            "ledger_counts": {},
+        }
+
+    readiness_state = (
+        {key: value for key, value in zip(readiness_columns, readiness_row)}
+        if readiness_row and readiness_columns
+        else None
+    )
+    ledger_counts = (
+        {key: value for key, value in zip(ledger_columns, ledger_row)}
+        if ledger_row and ledger_columns
+        else {}
+    )
+    domain_statuses = {
+        "foundation": (readiness_state or {}).get("foundation_status"),
+        "discover": (readiness_state or {}).get("discover_status"),
+        "signals": (readiness_state or {}).get("signals_status"),
+        "execute": (readiness_state or {}).get("execute_status"),
+    }
+    blocker_counts = {
+        "foundation": len((readiness_state or {}).get("foundation_blockers") or []),
+        "discover": len((readiness_state or {}).get("discover_blockers") or []),
+        "signals": len((readiness_state or {}).get("signals_blockers") or []),
+        "execute": len((readiness_state or {}).get("execute_blockers") or []),
+    }
+    return {
+        "available": readiness_state is not None,
+        "reason": None if readiness_state is not None else "missing_readiness_row",
+        "readiness_state": readiness_state,
+        "domain_statuses": domain_statuses,
+        "blocker_counts": blocker_counts,
+        "ledger_counts": ledger_counts,
+    }
+
+
 def _render_markdown(report: Dict[str, Any]) -> str:
     summary = report.get("summary") or {}
     lines = [
@@ -344,6 +448,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- catalog_read_ok: `{summary.get('catalog_read_ok')}`",
         f"- catalog_write_ok: `{summary.get('catalog_write_ok')}`",
         f"- payment_order_ok: `{summary.get('payment_order_ok')}`",
+        f"- readiness_state_available: `{summary.get('readiness_state_available')}`",
         "",
         "## Steps",
         "",
@@ -538,6 +643,18 @@ def main() -> int:
         },
         ok_if=lambda status, body: status == 200 and bool(body.get("success")),
     )
+    readiness_evidence = _fetch_merchant_commerce_readiness_evidence(
+        database_url=args.database_url,
+        merchant_id=args.merchant_id,
+    )
+    readiness_step = _record_step(
+        steps=steps,
+        name="merchant_commerce_readiness_snapshot",
+        ok=bool(readiness_evidence.get("available")),
+        elapsed_ms=0.0,
+        status_code=None,
+        body=readiness_evidence,
+    )
 
     summary = {
         "catalog_read_ok": bool(read_step.get("ok")),
@@ -552,13 +669,21 @@ def main() -> int:
             )
         ),
         "payment_order_ok": bool(payment_step.get("ok")),
+        "readiness_state_available": bool(readiness_step.get("ok")),
+        "readiness_domain_statuses": readiness_evidence.get("domain_statuses") or {},
+        "readiness_blocker_counts": readiness_evidence.get("blocker_counts") or {},
     }
     report = {
         "base_url": base_url,
         "merchant_id": args.merchant_id,
         "catalog_platform": catalog_platform,
         "query": query,
-        "overall_ok": all(summary.values()),
+        "readiness_state": readiness_evidence.get("readiness_state"),
+        "ledger_counts": readiness_evidence.get("ledger_counts") or {},
+        "overall_ok": all(
+            bool(summary.get(key))
+            for key in ("catalog_read_ok", "catalog_write_ok", "payment_order_ok")
+        ),
         "summary": summary,
         "steps": steps,
     }

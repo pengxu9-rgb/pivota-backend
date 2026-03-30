@@ -325,7 +325,23 @@ def can_access_merchant(user_info: Dict[str, Any], merchant_id: str) -> bool:
     
     # Agents can access their assigned merchants
     if role == "agent":
-        # TODO: Check agent-merchant assignment in database
+        scoped_values = (
+            user_info.get("assigned_merchant_ids")
+            or user_info.get("merchant_ids")
+            or user_info.get("merchant_scopes")
+            or user_info.get("merchants")
+        )
+        if isinstance(scoped_values, str):
+            scoped_list = [item.strip() for item in scoped_values.split(",") if item.strip()]
+            if scoped_list:
+                return merchant_id in scoped_list
+        elif isinstance(scoped_values, list):
+            scoped_list = [str(item).strip() for item in scoped_values if str(item).strip()]
+            if scoped_list:
+                return merchant_id in scoped_list
+        single_merchant = str(user_info.get("merchant_id") or "").strip()
+        if single_merchant:
+            return single_merchant == merchant_id
         return True
     
     return False

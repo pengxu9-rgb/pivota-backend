@@ -200,3 +200,88 @@ def test_batch_runner_supports_case_filter(monkeypatch, tmp_path: Path) -> None:
     assert calls == ["beauty_1"]
     payload = json.loads((tmp_path / "batch.json").read_text(encoding="utf-8"))
     assert payload["summary"]["total_cases"] == 1
+
+
+def test_batch_runner_reports_target_platform_and_target_domain_gaps_without_failing_current_gate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cohort_path = tmp_path / "cohort.json"
+    cohort_path.write_text(
+        json.dumps(
+            {
+                "cohort_name": "cohort_d",
+                "min_enabled_cases": 1,
+                "target_enabled_cases": 5,
+                "required_semantic_classes": ["beauty"],
+                "target_semantic_classes": ["beauty", "generic_default", "fragrance"],
+                "target_platform_counts": {"shopify": 3, "wix": 2},
+                "target_ready_domains": ["foundation", "discover", "signals", "execute"],
+                "cases": [
+                    {
+                        "case_id": "beauty_1",
+                        "merchant_id": "merch_1",
+                        "semantic_class": "beauty",
+                        "enabled": True,
+                    },
+                    {
+                        "case_id": "generic_1",
+                        "merchant_id": "merch_2",
+                        "semantic_class": "generic_default",
+                        "enabled": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_run(case, args, case_output_dir):
+        if case["case_id"] == "beauty_1":
+            return {
+                "case_id": case["case_id"],
+                "merchant_id": case["merchant_id"],
+                "semantic_class": case["semantic_class"],
+                "catalog_platform": "shopify",
+                "readiness_state_available": True,
+                "readiness_domains": {
+                    "foundation": "ready",
+                    "discover": "ready",
+                    "signals": "ready",
+                    "execute": "ready",
+                },
+                "enabled": True,
+                "ok": True,
+                "returncode": 0,
+                "payload": {"overall_ok": True},
+            }
+        return {
+            "case_id": case["case_id"],
+            "merchant_id": case["merchant_id"],
+            "semantic_class": case["semantic_class"],
+            "catalog_platform": "shopify",
+            "readiness_state_available": True,
+            "readiness_domains": {
+                "foundation": "ready",
+                "discover": "ready",
+                "signals": "blocked",
+                "execute": "ready",
+            },
+            "enabled": True,
+            "ok": True,
+            "returncode": 0,
+            "payload": {"overall_ok": True},
+        }
+
+    monkeypatch.setattr(module, "_run_case_signoff", _fake_run)
+    monkeypatch.setattr(module, "_parse_args", lambda: _build_args(tmp_path, cohort_path))
+
+    exit_code = module.main()
+
+    assert exit_code == 0
+    payload = json.loads((tmp_path / "batch.json").read_text(encoding="utf-8"))
+    assert payload["overall_ok"] is True
+    assert payload["summary"]["platform_summary"] == {"shopify": 2}
+    assert payload["summary"]["missing_target_platform_counts"] == {"shopify": 1, "wix": 2}
+    assert payload["summary"]["meets_target_platform_counts"] is False
+    assert payload["summary"]["all_enabled_cases_ready_for_target_domains"] is False
+    assert payload["summary"]["target_domain_failures"]["signals"] == ["generic_1"]

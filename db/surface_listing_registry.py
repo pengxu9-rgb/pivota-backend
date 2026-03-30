@@ -11,6 +11,7 @@ surface_listing_states = Table(
     metadata,
     Column("listing_id", String(64), primary_key=True),
     Column("merchant_id", String(50), nullable=False, index=True),
+    Column("interaction_id", String(64), nullable=True, index=True),
     Column("surface", String(32), nullable=False, index=True),
     Column("listing_key", String(255), nullable=False),
     Column("canonical_product_id", String(64), nullable=True, index=True),

@@ -18,7 +18,10 @@ import httpx
 
 from db.database import database
 from db.orders import orders
+from services.commerce_interaction_service import trace_interaction
+from services.merchant_commerce_diagnostics_service import build_merchant_commerce_funnel_issues
 from services.merchant_commerce_funnel_service import get_merchant_commerce_funnel
+from services.merchant_commerce_readiness_service import upsert_merchant_commerce_readiness_state
 from utils.auth import verify_jwt_token
 from dashboard.core import UserRole
 
@@ -85,6 +88,47 @@ async def get_commerce_funnel(
         surface=str(surface).strip().lower() if surface else None,
         group_by=group_by,
     )
+
+
+@router.get("/analytics/commerce-funnel/issues")
+async def get_commerce_funnel_issues(
+    surface: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    principal: Dict[str, Any] = Depends(_get_principal),
+):
+    merchant_id = principal.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id")
+    return await build_merchant_commerce_funnel_issues(
+        merchant_id=str(merchant_id),
+        surface=str(surface).strip().lower() if surface else None,
+        limit=limit,
+    )
+
+
+@router.get("/analytics/commerce-interactions/{interaction_id}")
+async def get_commerce_interaction_trace(
+    interaction_id: str,
+    principal: Dict[str, Any] = Depends(_get_principal),
+):
+    merchant_id = principal.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id")
+    trace = await trace_interaction(interaction_id)
+    interaction = trace.get("interaction") or {}
+    if str(interaction.get("merchant_id") or "").strip() != str(merchant_id):
+        raise HTTPException(status_code=404, detail="Commerce interaction not found")
+    return trace
+
+
+@router.get("/analytics/readiness-state")
+async def get_commerce_readiness_state(
+    principal: Dict[str, Any] = Depends(_get_principal),
+):
+    merchant_id = principal.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id")
+    return await upsert_merchant_commerce_readiness_state(str(merchant_id))
 
 
 @router.get("/analytics/debug/query")

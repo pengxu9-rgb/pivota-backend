@@ -13,6 +13,7 @@ from db.surface_listing_registry import (
     surface_listing_states,
 )
 from readiness.models import ChannelReadinessReport, MerchantReadinessSnapshot
+from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -57,6 +58,7 @@ def _best_status(current: Optional[str], candidate: str) -> str:
 async def _upsert_listing_state(
     *,
     listing_id: str,
+    interaction_id: str,
     merchant_id: str,
     surface: str,
     listing_key: str,
@@ -76,6 +78,7 @@ async def _upsert_listing_state(
         final_status = _best_status(row.get("status"), status)
         values = {
             "merchant_id": merchant_id,
+            "interaction_id": interaction_id,
             "surface": surface,
             "listing_key": listing_key,
             "canonical_product_id": canonical_product_id,
@@ -99,6 +102,7 @@ async def _upsert_listing_state(
     values = {
         "listing_id": listing_id,
         "merchant_id": merchant_id,
+        "interaction_id": interaction_id,
         "surface": surface,
         "listing_key": listing_key,
         "canonical_product_id": canonical_product_id,
@@ -161,6 +165,21 @@ async def persist_channel_export(
             }
 
             if ready:
+                interaction_event = await record_commerce_event_best_effort(
+                    event_type="listing.exported",
+                    metadata={
+                        "merchant_id": snapshot.merchant_id,
+                        "platform": platform,
+                        "surface": report.channel,
+                        "canonical_product_id": canonical_product_id,
+                        "canonical_variant_id": canonical_variant_id,
+                        "listing_id": listing_id,
+                        "listing_key": listing_key,
+                        "status": "exported",
+                    },
+                    source="surface_listing_registry",
+                    upstream_idempotency_key=f"listing:{listing_id}:exported:{report.generated_at}",
+                )
                 receipt_id = _receipt_id(listing_id, "exported")
                 await database.execute(
                     surface_listing_receipts.insert().values(
@@ -175,6 +194,7 @@ async def persist_channel_export(
                 )
                 await _upsert_listing_state(
                     listing_id=listing_id,
+                    interaction_id=interaction_event["interaction_id"],
                     merchant_id=snapshot.merchant_id,
                     surface=report.channel,
                     listing_key=listing_key,
@@ -192,6 +212,24 @@ async def persist_channel_export(
             error_code = blocker_codes[0] if blocker_codes else "variant_not_ready"
             error_message = ", ".join(blocker_codes or warning_codes or [error_code])[:1024]
             error_id = _error_id(listing_id, error_code)
+            interaction_event = await record_commerce_event_best_effort(
+                event_type="listing.blocked" if blocker_codes else "listing.error",
+                metadata={
+                    "merchant_id": snapshot.merchant_id,
+                    "platform": platform,
+                    "surface": report.channel,
+                    "canonical_product_id": canonical_product_id,
+                    "canonical_variant_id": canonical_variant_id,
+                    "listing_id": listing_id,
+                    "listing_key": listing_key,
+                    "status": "blocked" if blocker_codes else "error",
+                    "diagnostic_code": "LISTING_ERROR",
+                    "error_code": error_code,
+                    "error_message": error_message,
+                },
+                source="surface_listing_registry",
+                upstream_idempotency_key=f"listing:{listing_id}:{error_code}:{report.generated_at}",
+            )
             await database.execute(
                 surface_listing_errors.insert().values(
                     error_id=error_id,
@@ -206,6 +244,7 @@ async def persist_channel_export(
             )
             await _upsert_listing_state(
                 listing_id=listing_id,
+                interaction_id=interaction_event["interaction_id"],
                 merchant_id=snapshot.merchant_id,
                 surface=report.channel,
                 listing_key=listing_key,
