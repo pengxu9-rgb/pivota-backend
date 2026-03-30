@@ -594,6 +594,18 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
     async def fake_emit(*args, **kwargs):
         emitted.append((args, kwargs))
 
+    attribution_edges = []
+
+    async def fake_upsert_order_attribution_edge(*, order_id, merchant_id, metadata):
+        attribution_edges.append(
+            {
+                "order_id": order_id,
+                "merchant_id": merchant_id,
+                "metadata": dict(metadata or {}),
+            }
+        )
+        return {"order_id": order_id}
+
     monkeypatch.setattr(module.settings, "readiness_internal_api_key", "internal_test_key", raising=False)
     monkeypatch.setattr(module, "_load_canary_merchant", fake_load_merchant)
     monkeypatch.setattr(module, "_resolve_payment_candidates", fake_candidates)
@@ -601,6 +613,7 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
     monkeypatch.setattr(module, "initiate_merchant_payment", fake_initiate)
     monkeypatch.setattr(module, "update_payment_info", fake_update_payment_info)
     monkeypatch.setattr(module, "_emit_payment_webhook_best_effort", fake_emit)
+    monkeypatch.setattr(module, "upsert_order_attribution_edge", fake_upsert_order_attribution_edge)
 
     response = await module.execute_internal_order_backed_canary(
         merchant_id="merch_test_payment",
@@ -610,6 +623,13 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
             order_id="requested_canary_ref",
             customer_email="merchant@example.com",
             enforce_live_readiness=True,
+            metadata={
+                "surface": "ucp",
+                "pvt_click_id": "clk_test_canary_1",
+                "pvt_product_id": "cp_test_product",
+                "pvt_variant_id": "cv_test_variant",
+                "pvt_prompt_cluster": "hydration",
+            },
         ),
         request=_build_request("/payment/internal/canary/merchants/merch_test_payment/order-backed/execute"),
         x_pivota_internal_key="internal_test_key",
@@ -622,8 +642,31 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
     assert created_orders[0]["merchant_id"] == "merch_test_payment"
     assert created_orders[0]["psp_id"] == "psp_stripe_live"
     assert created_orders[0]["metadata"]["requested_order_id"] == "requested_canary_ref"
+    assert created_orders[0]["metadata"]["pvt_click_id"] == "clk_test_canary_1"
+    assert created_orders[0]["metadata"]["pvt_product_id"] == "cp_test_product"
+    assert created_orders[0]["metadata"]["pvt_variant_id"] == "cv_test_variant"
     assert created_orders[0]["items"][0]["unit_price"] == "1.00"
     assert created_orders[0]["items"][0]["subtotal"] == "1.00"
+    assert attribution_edges == [
+        {
+            "order_id": "ORD_CANARY_LIVE_1",
+            "merchant_id": "merch_test_payment",
+            "metadata": {
+                "surface": "ucp",
+                "pvt_click_id": "clk_test_canary_1",
+                "pvt_product_id": "cp_test_product",
+                "pvt_variant_id": "cv_test_variant",
+                "pvt_prompt_cluster": "hydration",
+                "ops_canary": True,
+                "skip_platform_order_creation": True,
+                "source": "ops_order_backed_canary",
+                "provider": "stripe",
+                "requested_order_id": "requested_canary_ref",
+                "canary_label": None,
+                "pvt_surface": "ucp",
+            },
+        }
+    ]
     assert payment_updates == [
         {
             "order_id": "ORD_CANARY_LIVE_1",

@@ -22,6 +22,16 @@ from services.merchant_payment_initiation_service import initiate_merchant_payme
 from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.payment_routing_service import PaymentRoutingService
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_PROMPT_CLUSTER,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    has_attribution_signal,
+    materialize_attribution_context,
+    upsert_order_attribution_edge,
+)
 
 
 logger = logging.getLogger("payment_execution")
@@ -504,6 +514,30 @@ async def _execute_order_backed_payment_canary(
     )
     amount_major = (Decimal(str(payment_request.amount)) / Decimal("100")).quantize(Decimal("0.01"))
     customer_name = str(payment_request.customer_name or "Pivota Ops Canary").strip() or "Pivota Ops Canary"
+    order_metadata: Dict[str, Any] = {
+        **(payment_request.metadata or {}),
+        "ops_canary": True,
+        "skip_platform_order_creation": True,
+        "source": source,
+        "provider": selected_provider,
+        "requested_order_id": payment_request.order_id,
+        "canary_label": payment_request.label,
+    }
+    if has_attribution_signal(order_metadata):
+        attribution_context = materialize_attribution_context(
+            order_metadata,
+            default_surface=str(order_metadata.get(PVT_SURFACE) or order_metadata.get("surface") or source),
+            merchant_id=str(merchant["merchant_id"]),
+        )
+        for key in (
+            PVT_SURFACE,
+            PVT_CLICK_ID,
+            PVT_PRODUCT_ID,
+            PVT_VARIANT_ID,
+            PVT_PROMPT_CLUSTER,
+        ):
+            if attribution_context.get(key):
+                order_metadata[key] = attribution_context[key]
 
     order_id = await create_order(
         {
@@ -518,16 +552,21 @@ async def _execute_order_backed_payment_canary(
             "tax": Decimal("0.00"),
             "total": amount_major,
             "currency": payment_request.currency.upper(),
-            "metadata": {
-                "ops_canary": True,
-                "skip_platform_order_creation": True,
-                "source": source,
-                "provider": selected_provider,
-                "requested_order_id": payment_request.order_id,
-                "canary_label": payment_request.label,
-            },
+            "metadata": order_metadata,
         }
     )
+    try:
+        await upsert_order_attribution_edge(
+            order_id=str(order_id),
+            merchant_id=str(merchant["merchant_id"]),
+            metadata=order_metadata,
+        )
+    except Exception as attribution_exc:
+        logger.warning(
+            "Failed to persist commerce attribution edge for order-backed canary %s: %s",
+            order_id,
+            attribution_exc,
+        )
 
     result = await initiate_merchant_payment(
         merchant_id=str(merchant["merchant_id"]),
@@ -540,8 +579,7 @@ async def _execute_order_backed_payment_canary(
             "description": payment_request.description or "ops_order_backed_canary",
             "route_id": route_config.get("route_id") if isinstance(route_config, dict) else None,
             "skip_platform_order_creation": True,
-            "ops_canary": True,
-            **(payment_request.metadata or {}),
+            **order_metadata,
             "source": source,
             "enforce_live_readiness": bool(payment_request.enforce_live_readiness),
         },
