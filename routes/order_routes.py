@@ -39,6 +39,16 @@ from services.payment_routing_service import PaymentRoutingService
 from services.merchant_payment_initiation_service import build_payment_action
 from services.merchant_psp_config_service import build_runtime_adapter_kwargs
 from services.promotions_service import list_promotions, PromotionStatus
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_PROMPT_CLUSTER,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    has_attribution_signal,
+    materialize_attribution_context,
+    upsert_order_attribution_edge,
+)
 from services.quote_service import (
     QuoteError,
     QuoteService,
@@ -1010,6 +1020,22 @@ async def create_new_order(
             # 促销信息统一挂在 metadata.promotions 下
             order_metadata["promotions"] = {**existing_promos, **promo_meta}
 
+        if has_attribution_signal(order_metadata):
+            attribution_context = materialize_attribution_context(
+                order_metadata,
+                default_surface=str(order_metadata.get(PVT_SURFACE) or order_metadata.get("surface") or "merchant_native"),
+                merchant_id=order_request.merchant_id,
+            )
+            for key in (
+                PVT_SURFACE,
+                PVT_CLICK_ID,
+                PVT_PRODUCT_ID,
+                PVT_VARIANT_ID,
+                PVT_PROMPT_CLUSTER,
+            ):
+                if attribution_context.get(key):
+                    order_metadata[key] = attribution_context[key]
+
         # Bind order to the current store connection (if any) so downstream Shopify sync
         # does not accidentally use a different store after a merchant connects another store.
         store_id_value: Optional[str] = None
@@ -1046,6 +1072,18 @@ async def create_new_order(
             "payment_method": None
         }
         order_id = await create_order(order_data)
+        try:
+            await upsert_order_attribution_edge(
+                order_id=str(order_id),
+                merchant_id=order_request.merchant_id,
+                metadata=order_metadata,
+            )
+        except Exception as attribution_exc:
+            logger.warning(
+                "[OrderRoutes] Failed to persist commerce attribution edge for %s: %s",
+                order_id,
+                attribution_exc,
+            )
 
         try:
             await emit_merchant_webhook_event(
@@ -1135,6 +1173,17 @@ async def create_new_order(
                     "customer_email": order_request.customer_email,
                     "route_id": route_id_for_attempt,
                     "agent_id": agent_id,
+                    **(
+                        {
+                            PVT_SURFACE: order_metadata.get(PVT_SURFACE),
+                            PVT_CLICK_ID: order_metadata.get(PVT_CLICK_ID),
+                            PVT_PRODUCT_ID: order_metadata.get(PVT_PRODUCT_ID),
+                            PVT_VARIANT_ID: order_metadata.get(PVT_VARIANT_ID),
+                            PVT_PROMPT_CLUSTER: order_metadata.get(PVT_PROMPT_CLUSTER),
+                        }
+                        if has_attribution_signal(order_metadata)
+                        else {}
+                    ),
                     **({"psp_mode": psp_mode} if psp_mode else {}),
                 },
                 preferred_psps=preferred_psps,

@@ -24,6 +24,7 @@ from readiness.sources import load_merchant_source_dataset, supported_merchant_i
 from readiness.sync_audit import build_order_sync_audit_snapshot
 from services.refund_service import refund_service
 from services.merchant_store_service import get_primary_store
+from services.surface_listing_registry_service import persist_channel_export
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.shopify_returns_service import (
     probe_shopify_return_eligibility_best_effort,
@@ -605,13 +606,26 @@ async def build_readiness_snapshot(merchant_id: str, channel: str = "ucp") -> Me
 
 async def build_channel_export(merchant_id: str, channel: str = "ucp") -> ChannelReadinessReport:
     snapshot = await build_readiness_snapshot(merchant_id, channel=channel)
+    report: ChannelReadinessReport
     if channel == "ucp":
-        return build_ucp_export(snapshot)
-    if channel == "acp":
-        return build_acp_export(snapshot)
-    if channel not in {"ucp", "acp"}:
+        report = build_ucp_export(snapshot)
+    elif channel == "acp":
+        report = build_acp_export(snapshot)
+    elif channel not in {"ucp", "acp"}:
         raise ValueError(f"Unsupported channel export: {channel}")
-    raise ValueError(f"Unsupported channel export: {channel}")
+    else:
+        raise ValueError(f"Unsupported channel export: {channel}")
+
+    try:
+        await persist_channel_export(snapshot, report)
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist surface listing registry for merchant=%s channel=%s: %s",
+            merchant_id,
+            channel,
+            exc,
+        )
+    return report
 
 
 def supported_merchants() -> list[str]:

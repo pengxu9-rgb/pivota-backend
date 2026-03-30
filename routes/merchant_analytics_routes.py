@@ -18,6 +18,7 @@ import httpx
 
 from db.database import database
 from db.orders import orders
+from services.merchant_commerce_funnel_service import get_merchant_commerce_funnel
 from utils.auth import verify_jwt_token
 from dashboard.core import UserRole
 
@@ -66,6 +67,24 @@ async def _get_principal(
     except Exception as e:
         logger.error(f"JWT verification failed: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+@router.get("/analytics/commerce-funnel")
+async def get_commerce_funnel(
+    surface: Optional[str] = Query(None),
+    group_by: str = Query("product"),
+    principal: Dict[str, Any] = Depends(_get_principal),
+):
+    merchant_id = principal.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id")
+    if group_by not in {"product", "variant", "surface"}:
+        raise HTTPException(status_code=400, detail="group_by must be one of product, variant, surface")
+    return await get_merchant_commerce_funnel(
+        merchant_id=str(merchant_id),
+        surface=str(surface).strip().lower() if surface else None,
+        group_by=group_by,
+    )
 
 
 @router.get("/analytics/debug/query")
@@ -245,17 +264,6 @@ async def _get_rate(from_currency: str, to_currency: str, date_obj: date) -> Tup
     
     # Tier 5: Assume 1:1 (last resort)
     return (1.0, "assumed")
-
-
-async def _get_principal(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
-    """Decode JWT and return principal claims"""
-    try:
-        token = credentials.credentials
-        claims = verify_jwt_token(token)
-        return claims or {}
-    except Exception as e:
-        logger.error(f"Auth decode failed: {e}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
 def _parse_range(range_str: str) -> timedelta:

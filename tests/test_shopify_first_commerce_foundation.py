@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from models.standard_product import StandardProduct
+from readiness.models import (
+    CapabilityStatus,
+    ChannelReadinessReport,
+    MerchantReadinessSnapshot,
+    ReadyProduct,
+    ReadyVariant,
+)
+
+
+def test_make_canonical_ids_are_stable() -> None:
+    from services.canonical_commerce_service import (
+        make_canonical_product_id,
+        make_canonical_variant_id,
+    )
+
+    first_product = make_canonical_product_id("merch_1", "shopify", "prod_1")
+    second_product = make_canonical_product_id("merch_1", "shopify", "prod_1")
+    first_variant = make_canonical_variant_id("merch_1", "shopify", "prod_1", "var_1")
+    second_variant = make_canonical_variant_id("merch_1", "shopify", "prod_1", "var_1")
+
+    assert first_product == second_product
+    assert first_variant == second_variant
+    assert first_product.startswith("cp_")
+    assert first_variant.startswith("cv_")
+
+
+def test_standard_product_from_record_payload_accepts_standard_product() -> None:
+    from services.canonical_commerce_service import standard_product_from_record_payload
+
+    payload = {
+        "id": "prod_1",
+        "platform": "shopify",
+        "merchant_id": "merch_1",
+        "title": "Cleanser",
+        "price": 19.0,
+        "currency": "USD",
+        "variants": [],
+    }
+
+    product = standard_product_from_record_payload("merch_1", payload)
+
+    assert isinstance(product, StandardProduct)
+    assert product.id == "prod_1"
+    assert product.title == "Cleanser"
+
+
+@pytest.mark.asyncio
+async def test_resolve_outbound_link_includes_pvt_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.outbound_links_service as module
+
+    async def fake_select_best_rule(**_kwargs):
+        return {
+            "id": "rule_1",
+            "destination_url": "https://example.com/products/cleanser",
+            "purchase_enabled_override": None,
+            "disclosure_text": None,
+            "partner_type": "partner",
+            "utm_template": None,
+        }
+
+    async def fake_is_domain_allowed(**_kwargs):
+        return True
+
+    monkeypatch.setattr(module, "_select_best_rule", fake_select_best_rule)
+    monkeypatch.setattr(module, "_is_domain_allowed", fake_is_domain_allowed)
+
+    resolved = await module.resolve_outbound_link(
+        {
+            "market": "US",
+            "tool": "ucp",
+            "candidates": {"skuId": "sku_123"},
+            "context": {
+                "merchantId": "merch_1",
+                "platform": "shopify",
+                "platform_product_id": "prod_1",
+                "platform_variant_id": "var_1",
+                "promptCluster": "hydration",
+                "surface": "ucp",
+            },
+        },
+        request_base_url="https://api.example.com",
+    )
+
+    parsed = urlparse(resolved.destination_url)
+    qs = parse_qs(parsed.query)
+    assert qs["pvt_surface"] == ["ucp"]
+    assert "pvt_click_id" in qs
+    assert "pvt_product_id" in qs
+    assert "pvt_variant_id" in qs
+    assert qs["pvt_prompt_cluster"] == ["hydration"]
+
+    token = parse_qs(urlparse(resolved.redirect_url).query)["token"][0]
+    payload = module.parse_and_verify_redirect_token(token)
+    ctx = payload["ctx"]
+    assert ctx["pvt_surface"] == "ucp"
+    assert ctx["pvt_prompt_cluster"] == "hydration"
+
+
+@pytest.mark.asyncio
+async def test_persist_channel_export_records_ready_and_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.surface_listing_registry_service as module
+
+    executed = []
+
+    class FakeDB:
+        async def fetch_one(self, query):
+            return None
+
+        async def execute(self, query):
+            executed.append(query)
+            return None
+
+    monkeypatch.setattr(module, "database", FakeDB())
+
+    snapshot = MerchantReadinessSnapshot(
+        merchant_id="merch_1",
+        merchant_name="Merchant One",
+        channel="ucp",
+        generated_at="2026-03-30T00:00:00Z",
+        readiness_score=80,
+        products=[
+            ReadyProduct(
+                product_id="prod_1",
+                platform="shopify",
+                title="Cleanser",
+                variants=[
+                    ReadyVariant(
+                        variant_id="var_ready",
+                        title="Default",
+                        discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                        checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                        channel_coverage={"ucp": "ready"},
+                        blockers={},
+                        warnings={},
+                    ),
+                    ReadyVariant(
+                        variant_id="var_blocked",
+                        title="Blocked",
+                        discovery=CapabilityStatus(capability="discovery", status="blocked", score=0),
+                        checkout=CapabilityStatus(capability="checkout", status="blocked", score=0),
+                        channel_coverage={"ucp": "blocked"},
+                        blockers={"ucp": ["missing_price"]},
+                        warnings={},
+                    ),
+                ],
+            )
+        ],
+    )
+    report = ChannelReadinessReport(
+        merchant_id="merch_1",
+        channel="ucp",
+        generated_at="2026-03-30T00:00:00Z",
+        readiness_score=80,
+        offers=[
+            {
+                "offer_id": "ucp:merch_1:prod_1:var_ready",
+                "product_id": "prod_1",
+                "variant_id": "var_ready",
+                "availability": "in_stock",
+            }
+        ],
+    )
+
+    result = await module.persist_channel_export(snapshot, report)
+
+    assert result == {"exported": 1, "blocked": 1, "errors": 0}
+    assert len(executed) == 4
+
+
+@pytest.mark.asyncio
+async def test_get_merchant_commerce_funnel_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.merchant_commerce_funnel_service as module
+
+    async def fake_fetch_listing_rows(merchant_id: str, surface: str | None):
+        assert merchant_id == "merch_1"
+        return [
+            {"canonical_variant_id": "cv_1", "status": "exported", "canonical_product_id": "cp_1", "surface": "ucp"},
+            {"canonical_variant_id": "cv_2", "status": "blocked", "canonical_product_id": "cp_2", "surface": "ucp"},
+        ]
+
+    async def fake_fetch_click_rows(merchant_id: str, surface: str | None):
+        return [
+            {"click_id": "clk_1", "click_count": 2, "canonical_product_id": "cp_1", "canonical_variant_id": "cv_1", "surface": "ucp"},
+        ]
+
+    async def fake_fetch_edge_rows(merchant_id: str, surface: str | None):
+        return [
+            {
+                "order_id": "ORD_1",
+                "canonical_product_id": "cp_1",
+                "canonical_variant_id": "cv_1",
+                "surface": "ucp",
+                "latest_refund_id": "REF_1",
+                "refunded_amount": "1.00",
+            }
+        ]
+
+    monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
+    monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
+    monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+
+    funnel = await module.get_merchant_commerce_funnel(
+        merchant_id="merch_1",
+        surface="ucp",
+        group_by="product",
+    )
+
+    assert funnel["summary"]["indexed_exposure"] == 1
+    assert funnel["summary"]["clicked_exposure"] == 1
+    assert funnel["summary"]["clicked_events_total"] == 2
+    assert funnel["summary"]["ordered_conversion"] == 1
+    assert funnel["summary"]["refunded_orders"] == 1
+    assert funnel["summary"]["refunded_amount"] == "1.00"
+
+
+def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.merchant_analytics_routes as module
+
+    app = FastAPI()
+    app.include_router(module.router)
+
+    async def fake_principal():
+        return {"merchant_id": "merch_1", "role": "merchant"}
+
+    async def fake_funnel(**kwargs):
+        assert kwargs["merchant_id"] == "merch_1"
+        return {"merchant_id": "merch_1", "summary": {"indexed_exposure": 3}, "slices": []}
+
+    app.dependency_overrides[module._get_principal] = fake_principal
+    monkeypatch.setattr(module, "get_merchant_commerce_funnel", fake_funnel)
+
+    client = TestClient(app)
+    response = client.get("/merchant/analytics/commerce-funnel")
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["indexed_exposure"] == 3

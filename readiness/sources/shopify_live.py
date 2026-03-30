@@ -15,6 +15,7 @@ from models.standard_product import StandardProduct, StandardProductVariant
 from readiness.flags import readiness_alpha_merchant_id
 from readiness.models import MerchantSourceDataset
 from readiness.reviews import load_product_review_summaries
+from services.canonical_commerce_service import load_canonical_cache_rows
 from services.merchant_store_service import get_primary_store
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,17 @@ async def _fetch_active_psp_config(merchant_id: str) -> Optional[Dict[str, Any]]
     except Exception:
         logger.warning("PSP capability lookup failed for merchant=%s", merchant_id, exc_info=True)
         return None
+
+
+async def _load_runtime_cache_rows(merchant_id: str) -> List[Dict[str, Any]]:
+    canonical_rows = await load_canonical_cache_rows(
+        merchant_id=merchant_id,
+        platform="shopify",
+        include_expired=True,
+    )
+    if canonical_rows:
+        return canonical_rows
+    return await get_cached_products(merchant_id=merchant_id, platform="shopify", include_expired=True)
 
 
 async def _fetch_live_products(merchant_id: str, shop_domain: str, access_token: str) -> Tuple[List[StandardProduct], Optional[str]]:
@@ -276,7 +288,7 @@ class ShopifyLiveMerchantSource:
 
         cached_rows: List[Dict[str, Any]] = []
         try:
-            cached_rows = await get_cached_products(merchant_id=merchant_id, platform="shopify", include_expired=True)
+            cached_rows = await _load_runtime_cache_rows(merchant_id)
         except Exception:
             merchant_warnings.append("products_cache_lookup_failed")
             logger.warning("products_cache lookup failed for merchant=%s", merchant_id, exc_info=True)

@@ -8,7 +8,6 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
@@ -25,7 +24,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
-import db.catalog  # noqa: F401  (register canonical catalog tables in metadata)
+import db.canonical_commerce  # noqa: F401  (register canonical commerce tables in metadata)
+import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
+import db.surface_listing_registry  # noqa: F401  (register surface listing registry tables in metadata)
 try:
     import db.merchant_portal_preferences  # noqa: F401  (register merchant portal preferences table in metadata)
 except ModuleNotFoundError:
@@ -35,15 +36,11 @@ except ModuleNotFoundError:
 import subprocess
 import os
 from pathlib import Path
-from utils.startup_mode import should_skip_heavy_startup
 
 
 INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
     os.getenv("ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES", "false").lower() == "true"
 )
-
-SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
 
 
 def _guard_single_order_routes_py() -> None:
@@ -169,8 +166,6 @@ from routes.product_routes import router as product_router
 from routes.product_routes_v2 import router as product_router_v2
 from routes.product_sync import router as product_sync_router
 from routes.universal_product_sync import router as universal_sync_router
-from routes.catalog_routes import router as catalog_router
-from routes.pivot_routes import router as pivot_router
 from routes.sync_all_platforms import router as sync_all_router
 # Temporary debug endpoints removed - v2 endpoint is now stable
 # from routes.products_no_auth import router as products_debug_router
@@ -230,8 +225,6 @@ from routes.agent_routing_api import router as agent_routing_api_router
 from routes.agent_revenue_api import router as agent_revenue_api_router
 from routes.admin_run_migration_012 import router as admin_run_migration_012_router
 from routes.admin_run_migration_013 import router as admin_run_migration_013_router
-from routes.admin_run_migration_058 import router as admin_run_migration_058_router
-from routes.admin_run_migration_059 import router as admin_run_migration_059_router
 # [Phase 5.5] Dual-sided revenue
 from routes.merchant_commission_api import router as merchant_commission_api_router
 # [Phase 5.6] Agent Portal settlement, protocol, integration
@@ -358,7 +351,7 @@ app = FastAPI(
 
 
 @lru_cache(maxsize=1)
-def _service_version_payload() -> dict:
+def _runtime_build_payload() -> dict:
     commit_sha = (
         os.getenv("RAILWAY_GIT_COMMIT_SHA")
         or os.getenv("GIT_COMMIT_SHA")
@@ -387,53 +380,18 @@ def _service_version_payload() -> dict:
         except Exception:
             branch = None
 
-    commit_short = commit_sha[:12] if commit_sha else None
-    build_id = commit_short or f"started-{SERVICE_STARTED_AT}"
-
     return {
-        "service": SERVICE_NAME,
-        "commit": commit_short,
-        "full_sha": commit_sha,
-        "build_id": build_id,
-        "branch": branch,
-        "deployment_id": deployment_id,
-        "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
-        "started_at": SERVICE_STARTED_AT,
-    }
-
-
-@lru_cache(maxsize=1)
-def _runtime_build_payload() -> dict:
-    version = _service_version_payload()
-
-    return {
-        "service": version["service"],
-        "version": version,
-        "commit_sha": version["full_sha"],
-        "full_sha": version["full_sha"],
-        "build_id": version["build_id"],
-        "deployment_id": version["deployment_id"],
+        "service": "pivota-backend",
         "git": {
-            "commit_sha": version["full_sha"],
-            "branch": version["branch"],
+            "commit_sha": commit_sha,
+            "branch": branch,
         },
         "railway": {
-            "environment": version["environment"],
-            "deployment_id": version["deployment_id"],
+            "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
+            "deployment_id": deployment_id,
             "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
-            "service_name": os.getenv("RAILWAY_SERVICE_NAME") or None,
         },
     }
-
-
-def _service_version_headers() -> dict[str, str]:
-    version = _service_version_payload()
-    headers: dict[str, str] = {"X-Service-Build-Id": str(version["build_id"])}
-    if version["commit"]:
-        headers["X-Service-Commit"] = str(version["commit"])
-    if version["deployment_id"]:
-        headers["X-Service-Deployment-Id"] = str(version["deployment_id"])
-    return headers
 
 
 def _is_route_mounted(path: str, method: str) -> bool:
@@ -768,8 +726,6 @@ app.include_router(agent_routing_api_router)  # Agent routing policies and testi
 app.include_router(agent_revenue_api_router)  # Agent revenue policies and earnings (+ Phase 5.5 expectations)
 app.include_router(admin_run_migration_012_router)  # Run migrations 012a/012b - Phase 5 Revenue
 app.include_router(admin_run_migration_013_router)  # Run migration 013 - Consolidate routing systems
-app.include_router(admin_run_migration_058_router)  # Run migration 058 - Catalog core
-app.include_router(admin_run_migration_059_router)  # Run migration 059 - Catalog pivot search indexes
 
 # [Phase 5.5] Dual-sided revenue matching
 app.include_router(merchant_commission_api_router)  # Merchant commission offers
@@ -863,8 +819,6 @@ app.include_router(product_router_v2)  # Product management v2 (cache-based) - M
 app.include_router(product_sync_router)  # Product sync from platforms (legacy)
 app.include_router(product_router)  # Product management - MUST be after v2 to avoid /{merchant_id} matching /v2/xxx
 app.include_router(universal_sync_router)
-app.include_router(catalog_router)  # Canonical catalog sync and reconcile APIs
-app.include_router(pivot_router)  # Celestial pivot semantic query APIs
 app.include_router(sync_all_router)  # Universal product sync (new)
 app.include_router(product_monitoring_router)  # Product sync monitoring and metrics
 # Temporary debug endpoints commented out - v2 is stable now
@@ -1059,7 +1013,11 @@ async def startup():
         # This startup function contains a large amount of best-effort schema/DDL work.
         # In Railway, the service healthcheck must pass quickly; long-running DDL can
         # exceed the healthcheck retry window and cause deploy rollbacks.
-        skip_heavy = should_skip_heavy_startup()
+        skip_heavy_env = os.getenv("SKIP_HEAVY_STARTUP_INIT")
+        if skip_heavy_env is None:
+            skip_heavy = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower() == "production"
+        else:
+            skip_heavy = skip_heavy_env.lower() in {"1", "true", "yes"}
 
         if skip_heavy:
             logger.warning(
@@ -1275,16 +1233,29 @@ async def startup():
                     name VARCHAR(255) NOT NULL,
                     api_key TEXT,
                     account_id VARCHAR(255),
+                    secret_key TEXT,
+                    environment VARCHAR(20) DEFAULT 'unknown',
+                    provider_config JSONB DEFAULT '{}'::jsonb,
+                    validation_status VARCHAR(20) DEFAULT 'unknown',
+                    validation_error TEXT,
+                    last_validated_at TIMESTAMP WITH TIME ZONE,
                     capabilities TEXT,
                     status VARCHAR(50) DEFAULT 'active',
                     connected_at TIMESTAMP WITH TIME ZONE,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS secret_key TEXT")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS environment VARCHAR(20) DEFAULT 'unknown'")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown'")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_error TEXT")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE")
             
             # Create indexes
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_id ON merchant_stores(merchant_id)")
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_merchant_id ON merchant_psps(merchant_id)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_provider_status ON merchant_psps(merchant_id, provider, status)")
             
             # Create performance indexes for agent tables
             await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_agent_id_timestamp ON agent_usage_logs(agent_id, timestamp DESC)")
@@ -1585,7 +1556,6 @@ async def health_check():
 
     return JSONResponse(
         status_code=status_code,
-        headers=_service_version_headers(),
         content={
             "status": "ok" if healthy else "unhealthy",
             "timestamp": time.time(),
@@ -1593,7 +1563,6 @@ async def health_check():
             "db_ok": db_ok,
             "missing_columns": missing,
             "error": db_error,
-            "version": _service_version_payload(),
             "build": _runtime_build_payload(),
             "runtime_contracts": _runtime_contracts_payload(),
             "settings_contract": _settings_contract_payload(),
@@ -1606,14 +1575,10 @@ async def build_info():
     Deployment introspection (no secrets).
     Useful to confirm which git SHA / deployment is running in prod.
     """
-    return JSONResponse(
-        headers=_service_version_headers(),
-        content={
-            **_runtime_build_payload(),
-            "version": _service_version_payload(),
-            "timestamp": time.time(),
-        },
-    )
+    return {
+        **_runtime_build_payload(),
+        "timestamp": time.time(),
+    }
 
 # Catch-all OPTIONS to satisfy permissive CORS preflight checks (even when Access-Control-Request-Method is missing).
 @app.options("/{full_path:path}")
