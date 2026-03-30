@@ -209,6 +209,7 @@ async def test_get_merchant_commerce_funnel_summary(monkeypatch: pytest.MonkeyPa
         return [
             {"canonical_variant_id": "cv_1", "status": "exported", "canonical_product_id": "cp_1", "surface": "ucp"},
             {"canonical_variant_id": "cv_2", "status": "blocked", "canonical_product_id": "cp_2", "surface": "ucp"},
+            {"canonical_variant_id": "cv_1", "status": "exported", "canonical_product_id": "cp_1", "surface": "acp"},
         ]
 
     async def fake_fetch_click_rows(merchant_id: str, surface: str | None):
@@ -244,6 +245,21 @@ async def test_get_merchant_commerce_funnel_summary(monkeypatch: pytest.MonkeyPa
     assert funnel["summary"]["ordered_conversion"] == 1
     assert funnel["summary"]["refunded_orders"] == 1
     assert funnel["summary"]["refunded_amount"] == "1.00"
+    assert funnel["summary"]["listing_rows_total"] == 3
+    assert funnel["summary"]["listing_status_breakdown_rows"] == {"exported": 2, "blocked": 1}
+    assert funnel["summary"]["listing_status_breakdown_by_surface"] == {
+        "ucp": {"exported": 1, "blocked": 1},
+        "acp": {"exported": 1},
+    }
+
+    slices = {row["key"]: row for row in funnel["slices"]}
+    assert slices["cp_1"]["indexed_exposure"] == 1
+    assert slices["cp_1"]["listing_rows_total"] == 2
+    assert slices["cp_1"]["listing_status_breakdown_rows"] == {"exported": 2}
+    assert slices["cp_1"]["listing_status_breakdown_by_surface"] == {
+        "ucp": {"exported": 1},
+        "acp": {"exported": 1},
+    }
 
 
 def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.MonkeyPatch) -> None:
