@@ -1,7 +1,7 @@
 """Merchant Dashboard API Routes"""
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime, timedelta
 from decimal import Decimal
 import logging
@@ -19,6 +19,7 @@ from db.database import database
 from db.merchant_onboarding import merchant_onboarding
 from db.merchant_portal_preferences import (
     DEFAULT_MERCHANT_PORTAL_PREFERENCES,
+    DEFAULT_PORTAL_LANGUAGE,
     get_merchant_portal_preferences,
     upsert_merchant_portal_preferences,
 )
@@ -114,10 +115,13 @@ async def _ensure_stripe_webhook_endpoint(
 
 
 class MerchantPortalPreferencesRequest(BaseModel):
-    email_orders: bool = True
-    email_payments: bool = True
-    email_inventory: bool = False
-    email_weekly: bool = False
+    email_orders: Optional[bool] = None
+    email_payments: Optional[bool] = None
+    email_inventory: Optional[bool] = None
+    email_weekly: Optional[bool] = None
+    portal_language: Optional[
+        Literal["en", "zh-CN", "ja-JP", "ko-KR", "fr-FR", "de-DE"]
+    ] = None
 
 
 class MerchantWebhookConfigRequest(BaseModel):
@@ -396,7 +400,7 @@ async def execute_merchant_order_backed_canary(
 
 @router.get("/merchant/settings/preferences")
 async def get_merchant_settings_preferences(current_user: dict = Depends(get_current_user)):
-    """Get merchant portal notification preferences."""
+    """Get merchant portal notification preferences and portal language."""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Merchant access only")
 
@@ -413,6 +417,7 @@ async def get_merchant_settings_preferences(current_user: dict = Depends(get_cur
             "email_payments": preferences.get("email_payments", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_payments"]),
             "email_inventory": preferences.get("email_inventory", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_inventory"]),
             "email_weekly": preferences.get("email_weekly", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_weekly"]),
+            "portal_language": preferences.get("portal_language", DEFAULT_PORTAL_LANGUAGE),
             "updated_at": preferences.get("updated_at"),
         },
     }
@@ -423,7 +428,7 @@ async def update_merchant_settings_preferences(
     payload: MerchantPortalPreferencesRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Persist merchant portal notification preferences."""
+    """Persist merchant portal notification preferences and portal language."""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Merchant access only")
 
@@ -433,12 +438,7 @@ async def update_merchant_settings_preferences(
 
     preferences = await upsert_merchant_portal_preferences(
         merchant_id,
-        {
-            "email_orders": payload.email_orders,
-            "email_payments": payload.email_payments,
-            "email_inventory": payload.email_inventory,
-            "email_weekly": payload.email_weekly,
-        },
+        payload.model_dump(exclude_none=True),
     )
     return {
         "status": "success",
@@ -448,6 +448,7 @@ async def update_merchant_settings_preferences(
             "email_payments": preferences["email_payments"],
             "email_inventory": preferences["email_inventory"],
             "email_weekly": preferences["email_weekly"],
+            "portal_language": preferences.get("portal_language", DEFAULT_PORTAL_LANGUAGE),
             "updated_at": preferences.get("updated_at"),
         },
     }
