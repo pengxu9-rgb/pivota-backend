@@ -6,6 +6,7 @@ import hashlib
 import logging
 import time
 from typing import Any, Dict, Iterable, Optional
+from urllib.parse import quote
 
 from db.database import database
 from db.product_enrichment import get_enrichments_for_products
@@ -36,6 +37,7 @@ from readiness.models import (
     SourceDataLaneSummary,
 )
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
+from services.merchant_store_service import get_merchant_active_stores
 from services.product_exposure_service import (
     AGENT_PUSH_STATUS_EXCLUDED,
     build_agent_push_projection_from_ready_product,
@@ -879,7 +881,58 @@ def _variant_impact(variant: Any) -> str:
     return "discovery_only"
 
 
-def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem:
+def _normalize_store_domain(domain: Optional[str]) -> str:
+    normalized = str(domain or "").strip()
+    if not normalized:
+        return ""
+    normalized = normalized.replace("https://", "").replace("http://", "")
+    return normalized.strip().strip("/")
+
+
+def _build_platform_admin_url(
+    *,
+    platform: Optional[str],
+    platform_product_id: Optional[str],
+    store_domains_by_platform: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_product_id = str(platform_product_id or "").strip()
+    if not normalized_platform or not normalized_product_id:
+        return None
+
+    if normalized_platform == "shopify":
+        domain = _normalize_store_domain((store_domains_by_platform or {}).get(normalized_platform))
+        if not domain:
+            return None
+        return f"https://{domain}/admin/products/{quote(normalized_product_id, safe='')}"
+
+    return None
+
+
+async def _load_store_domains_by_platform(merchant_id: str) -> dict[str, str]:
+    try:
+        stores = await get_merchant_active_stores(merchant_id)
+    except Exception as exc:
+        logger.warning("Failed to load merchant stores for readiness links: %s", str(exc)[:200])
+        return {}
+
+    store_domains_by_platform: dict[str, str] = {}
+    for store in stores:
+        platform = str((store or {}).get("platform") or "").strip().lower()
+        domain = _normalize_store_domain((store or {}).get("domain"))
+        if not platform or not domain or platform in store_domains_by_platform:
+            continue
+        store_domains_by_platform[platform] = domain
+
+    return store_domains_by_platform
+
+
+def _product_queue_item(
+    product: Any,
+    channel: str,
+    *,
+    store_domains_by_platform: Optional[dict[str, str]] = None,
+) -> ProductReadinessQueueItem:
     issue_counts = _product_issue_counts(product, channel)
     blocked_variant_count = sum(1 for variant in product.variants if variant.channel_coverage.get(channel) != "ready")
     ready_variant_count = max(0, len(product.variants) - blocked_variant_count)
@@ -959,6 +1012,11 @@ def _product_queue_item(product: Any, channel: str) -> ProductReadinessQueueItem
         impact=impact,
         priority_score=priority_score,
         priority_reason=priority_reason,
+        platform_admin_url=_build_platform_admin_url(
+            platform=product.platform or "unknown",
+            platform_product_id=product.product_id,
+            store_domains_by_platform=store_domains_by_platform,
+        ),
         recommended_action_id=f"act_product:{product.platform or 'unknown'}:{product.product_id}",
         recommended_action_type=recommended_action_type,
     )
@@ -1263,6 +1321,7 @@ async def _build_source_data_lanes(
                     blocked_variant_count=int(item.blocked_variant_count or 0),
                     excluded_variant_count=int(item.excluded_variant_count or 0),
                     sample_variant_id=sample_variant_id,
+                    platform_admin_url=item.platform_admin_url,
                 )
             if queue_state_key:
                 lane["state_counts"][queue_state_key] += 1
@@ -1899,7 +1958,15 @@ async def get_readiness_optimization_context(
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
     issue_buckets = _build_issue_buckets(snapshot)
     merchant_actions = _build_merchant_actions(summary, issue_buckets)
-    full_product_queue = [_product_queue_item(product, snapshot.channel) for product in snapshot.products]
+    store_domains_by_platform = await _load_store_domains_by_platform(merchant_id)
+    full_product_queue = [
+        _product_queue_item(
+            product,
+            snapshot.channel,
+            store_domains_by_platform=store_domains_by_platform,
+        )
+        for product in snapshot.products
+    ]
     full_product_queue, agent_push_summary = _apply_agent_push_projection(
         snapshot_products=snapshot.products,
         product_queue=full_product_queue,

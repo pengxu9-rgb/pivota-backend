@@ -71,6 +71,7 @@ def _optimization_payload(*, plan_id: str, snapshot_id: str, score: int) -> Merc
                     "product_id": "prod_1",
                     "platform": "shopify",
                     "platform_product_id": "prod_1",
+                    "platform_admin_url": "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1",
                     "title": "Alpha Product",
                     "blocked_variant_count": 1,
                     "ready_variant_count": 0,
@@ -542,10 +543,18 @@ async def test_get_source_data_triage_returns_summary_and_rows(monkeypatch):
     assert missing_price_row["scope"] == "variant"
     assert missing_price_row["variant_id"] == "var_1"
     assert missing_price_row["agent_push_status"] == "excluded_from_agent_push"
+    assert (
+        missing_price_row["platform_admin_url"]
+        == "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1"
+    )
 
     image_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_primary_image")
     assert image_row["scope"] == "product"
     assert image_row["platform_product_id"] == "prod_1"
+    assert (
+        image_row["platform_admin_url"]
+        == "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1"
+    )
 
 
 @pytest.mark.asyncio

@@ -234,6 +234,7 @@ class ProductReadinessQueueItem(BaseModel):
     eligible_variant_count: int = 0
     excluded_variant_count: int = 0
     store_data_last_checked_at: Optional[str] = None
+    platform_admin_url: Optional[str] = None
     decision_state: Optional[str] = None
 
 
@@ -326,6 +327,7 @@ class SourceDataTriageRow(BaseModel):
     agent_push_reason_codes: List[str] = Field(default_factory=list)
     recommended_action_type: Optional[str] = None
     fix_surface: Optional[str] = None
+    platform_admin_url: Optional[str] = None
     decision_state: Optional[str] = None
 
 
@@ -349,6 +351,7 @@ class SourceDataLaneNextProduct(BaseModel):
     blocked_variant_count: int = 0
     excluded_variant_count: int = 0
     sample_variant_id: Optional[str] = None
+    platform_admin_url: Optional[str] = None
 
 
 class SourceDataLaneSummary(BaseModel):

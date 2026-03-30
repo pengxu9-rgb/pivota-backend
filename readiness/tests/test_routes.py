@@ -581,6 +581,7 @@ def test_merchant_readiness_source_data_triage_route_returns_rows(monkeypatch):
                     "reason_label": "Missing price",
                     "platform": "shopify",
                     "platform_product_id": "prod_1",
+                    "platform_admin_url": "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1",
                     "product_id": "prod_1",
                     "product_title": "Alpha Product",
                     "variant_id": "var_1",
@@ -626,6 +627,10 @@ def test_merchant_readiness_source_data_triage_route_returns_rows(monkeypatch):
     assert body["data"]["plan_id"] == "rdplan_test"
     assert body["data"]["rows"][0]["variant_id"] == "var_1"
     assert body["data"]["rows"][0]["reason_code"] == "missing_price"
+    assert (
+        body["data"]["rows"][0]["platform_admin_url"]
+        == "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1"
+    )
 
 
 def test_merchant_readiness_source_data_triage_export_route_returns_csv(monkeypatch):
@@ -656,6 +661,7 @@ def test_merchant_readiness_source_data_triage_export_route_returns_csv(monkeypa
                     "reason_label": "Missing price",
                     "platform": "shopify",
                     "platform_product_id": "prod_1",
+                    "platform_admin_url": "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1",
                     "product_id": "prod_1",
                     "product_title": "Alpha Product",
                     "variant_id": "var_1",
@@ -698,6 +704,8 @@ def test_merchant_readiness_source_data_triage_export_route_returns_csv(monkeypa
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
     assert "attachment; filename=" in response.headers["content-disposition"]
+    assert "platform_admin_url" in response.text
+    assert "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1" in response.text
     assert "reason_code" in response.text
     assert "missing_price" in response.text
     assert "pricing_fix_saved" in response.text
