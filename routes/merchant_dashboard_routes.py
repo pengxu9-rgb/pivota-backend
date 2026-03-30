@@ -59,6 +59,22 @@ def _stripe_webhook_target_url(psp_id: str) -> str:
     return f"{resolve_public_api_base_url().rstrip('/')}/webhooks/stripe/{psp_id}"
 
 
+def _stripe_object_field(obj: Any, field: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(field)
+    getter = getattr(obj, "get", None)
+    if callable(getter):
+        try:
+            return getter(field)
+        except Exception:
+            pass
+    try:
+        return obj[field]  # type: ignore[index]
+    except Exception:
+        pass
+    return getattr(obj, field, None)
+
+
 async def _ensure_stripe_webhook_endpoint(
     *,
     psp_id: str,
@@ -80,8 +96,10 @@ async def _ensure_stripe_webhook_endpoint(
     if existing_endpoint_id and existing_secret:
         try:
             endpoint = stripe_sdk.WebhookEndpoint.retrieve(existing_endpoint_id, **stripe_kwargs)
-            endpoint_url = str(endpoint.get("url") or "").strip()
-            enabled_events = sorted(str(item).strip() for item in endpoint.get("enabled_events") or [])
+            endpoint_url = str(_stripe_object_field(endpoint, "url") or "").strip()
+            enabled_events = sorted(
+                str(item).strip() for item in (_stripe_object_field(endpoint, "enabled_events") or [])
+            )
             if endpoint_url != desired_url or enabled_events != sorted(desired_events):
                 stripe_sdk.WebhookEndpoint.modify(
                     existing_endpoint_id,
@@ -103,8 +121,8 @@ async def _ensure_stripe_webhook_endpoint(
         metadata={"psp_id": psp_id, "environment": environment},
         **stripe_kwargs,
     )
-    created_secret = str(created.get("secret") or "").strip()
-    created_id = str(created.get("id") or "").strip()
+    created_secret = str(_stripe_object_field(created, "secret") or "").strip()
+    created_id = str(_stripe_object_field(created, "id") or "").strip()
     if not created_secret or not created_id:
         raise ValueError("Stripe webhook endpoint creation did not return endpoint credentials")
 
