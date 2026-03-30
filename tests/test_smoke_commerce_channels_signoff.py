@@ -61,6 +61,8 @@ class _FakeSession:
                     },
                 }
             )
+        if url.endswith("/merchant/analytics/readiness-state"):
+            return _FakeResponse({"merchant_id": "merch_1", "execute_status": "ready"})
         raise AssertionError(f"unexpected {method} {url}")
 
 
@@ -170,6 +172,7 @@ def test_smoke_commerce_channels_signoff_runs_all_channels(monkeypatch, tmp_path
         "catalog_backfill_apply",
         "catalog_backfill_verify",
         "payment_order_backed_canary",
+        "merchant_commerce_readiness_refresh",
         "merchant_commerce_readiness_snapshot",
     ]
 
@@ -206,6 +209,7 @@ def test_smoke_commerce_channels_signoff_can_derive_query(monkeypatch, tmp_path:
     assert exit_code == 0
     payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert payload["query"] == "derived product title"
+    assert any(step["step"] == "merchant_commerce_readiness_refresh" for step in payload["steps"])
 
 
 def test_smoke_commerce_channels_signoff_fails_when_backfill_verify_fails(monkeypatch, tmp_path: Path) -> None:
@@ -247,6 +251,8 @@ def test_smoke_commerce_channels_signoff_fails_when_backfill_verify_fails(monkey
     assert payload["summary"]["catalog_write_ok"] is False
     verify_step = next(step for step in payload["steps"] if step["step"] == "catalog_backfill_verify")
     assert verify_step["ok"] is False
+    refresh_step = next(step for step in payload["steps"] if step["step"] == "merchant_commerce_readiness_refresh")
+    assert refresh_step["ok"] is True
 
 
 def test_smoke_commerce_channels_signoff_uses_detected_wix_platform(monkeypatch, tmp_path: Path) -> None:
@@ -306,6 +312,8 @@ def test_smoke_commerce_channels_signoff_uses_detected_wix_platform(monkeypatch,
             return _FakeResponse({"job_id": "catalog_job_123", "status": "completed"})
         if url.endswith("/payment/internal/canary/merchants/merch_1/order-backed/execute"):
             return _FakeResponse({"success": True, "status": "requires_payment_method"})
+        if url.endswith("/merchant/analytics/readiness-state"):
+            return _FakeResponse({"merchant_id": "merch_1", "execute_status": "ready"})
         raise AssertionError(f"unexpected {method} {url}")
 
     fake_session.request = _fake_request  # type: ignore[assignment]

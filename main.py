@@ -105,6 +105,8 @@ from routes.platform_onboarding_routes import router as platform_onboarding_rout
 from routes.merchant_dashboard_routes import router as merchant_dashboard_router  # Original with fallback - STABLE
 from routes.admin_catalog_debug import router as admin_catalog_debug_router
 from routes.merchant_analytics_routes import router as merchant_analytics_router
+from routes.pivot_routes import router as pivot_router
+from routes.catalog_routes import router as catalog_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
 from routes.debug_integrations import router as debug_integrations_router
@@ -756,6 +758,8 @@ else:
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
 app.include_router(admin_catalog_debug_router)  # Internal catalog debug
 app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
+app.include_router(pivot_router)  # Pivot catalog query and quote APIs
+app.include_router(catalog_router)  # Catalog sync and webhook ingest APIs
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
 app.include_router(payout_router)  # Payout management
 app.include_router(debug_integrations_router)  # Debug integrations
