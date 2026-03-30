@@ -202,6 +202,7 @@ def _run_backfill_subprocess(
     *,
     database_url: str,
     merchant_id: str,
+    platform: Optional[str],
     mode: str,
     limit: int,
     sample_limit: int,
@@ -227,6 +228,8 @@ def _run_backfill_subprocess(
         "--source-ref",
         f"products_cache_backfill_signoff:{int(time.time())}",
     ]
+    if platform:
+        cmd.extend(["--platform", platform])
     started = time.perf_counter()
     try:
         completed = subprocess.run(
@@ -278,6 +281,53 @@ def _backfill_ok(mode: str, payload: Dict[str, Any]) -> bool:
     return int(verify.get("missing_product_keys_count") or 0) == 0
 
 
+def _platform_from_product_key(product_key: Any) -> Optional[str]:
+    raw = str(product_key or "").strip()
+    if not raw:
+        return None
+    parts = raw.split("::")
+    if len(parts) >= 4 and parts[2].strip():
+        return parts[2].strip().lower()
+    return None
+
+
+def _detect_catalog_platform(*, database_url: str, merchant_id: str, read_body: Dict[str, Any]) -> str:
+    items = read_body.get("items") if isinstance(read_body, dict) else None
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            product = item.get("product") if isinstance(item.get("product"), dict) else {}
+            detected = _platform_from_product_key(product.get("product_key"))
+            if detected:
+                return detected
+            merchant = item.get("merchant") if isinstance(item.get("merchant"), dict) else {}
+            primary_platform = str(merchant.get("primary_platform") or "").strip().lower()
+            if primary_platform:
+                return primary_platform
+
+    try:
+        with _connect_postgres(database_url) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT platform
+                    FROM merchant_stores
+                    WHERE merchant_id = %s
+                      AND status IN ('active', 'connected')
+                    ORDER BY connected_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (merchant_id,),
+                )
+                row = cursor.fetchone()
+        if row and row[0]:
+            return str(row[0]).strip().lower()
+    except Exception:
+        pass
+    return "shopify"
+
+
 def _render_markdown(report: Dict[str, Any]) -> str:
     summary = report.get("summary") or {}
     lines = [
@@ -285,6 +335,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "",
         f"- base_url: `{report['base_url']}`",
         f"- merchant_id: `{report['merchant_id']}`",
+        f"- catalog_platform: `{report.get('catalog_platform')}`",
         f"- query: `{report['query']}`",
         f"- overall_ok: `{report['overall_ok']}`",
         "",
@@ -329,24 +380,43 @@ def main() -> int:
         },
         ok_if=lambda status, body: status == 200 and int(body.get("total") or 0) > 0,
     )
-
-    webhook_step = _request_step(
-        session=session,
-        steps=steps,
-        name="catalog_webhook_ingest",
-        method="POST",
-        url=f"{base_url}/v1/catalog/connectors/shopify/webhooks",
-        headers=headers,
-        timeout=args.timeout_seconds,
-        params={
-            "merchant_id": args.merchant_id,
-            "event_type": "signoff_probe",
-            "topic": "products/update",
-            "source_ref": "codex_signoff_probe",
-        },
-        json={"smoke": True, "query": query},
-        ok_if=lambda status, body: status == 200 and str(body.get("event_id") or "").strip() != "",
+    catalog_platform = _detect_catalog_platform(
+        database_url=args.database_url,
+        merchant_id=args.merchant_id,
+        read_body=read_step.get("body") or {},
     )
+
+    if catalog_platform == "shopify":
+        webhook_step = _request_step(
+            session=session,
+            steps=steps,
+            name="catalog_webhook_ingest",
+            method="POST",
+            url=f"{base_url}/v1/catalog/connectors/shopify/webhooks",
+            headers=headers,
+            timeout=args.timeout_seconds,
+            params={
+                "merchant_id": args.merchant_id,
+                "event_type": "signoff_probe",
+                "topic": "products/update",
+                "source_ref": "codex_signoff_probe",
+            },
+            json={"smoke": True, "query": query},
+            ok_if=lambda status, body: status == 200 and str(body.get("event_id") or "").strip() != "",
+        )
+    else:
+        webhook_step = _record_step(
+            steps=steps,
+            name="catalog_webhook_ingest",
+            ok=True,
+            elapsed_ms=0.0,
+            status_code=None,
+            body={
+                "skipped": True,
+                "reason": "no_platform_webhook_route",
+                "platform": catalog_platform,
+            },
+        )
 
     sync_create_step = _request_step(
         session=session,
@@ -358,9 +428,9 @@ def main() -> int:
         timeout=args.timeout_seconds,
         json={
             "merchant_id": args.merchant_id,
-            "connector": "shopify",
+            "connector": catalog_platform,
             "mode": "reconcile",
-            "platform": "shopify",
+            "platform": catalog_platform,
             "force_refresh": False,
             "limit": args.sync_limit,
             "sync_from_cache": True,
@@ -410,6 +480,7 @@ def main() -> int:
     backfill_apply = _run_backfill_subprocess(
         database_url=args.database_url,
         merchant_id=args.merchant_id,
+        platform=catalog_platform,
         mode="apply",
         limit=args.backfill_limit,
         sample_limit=args.backfill_sample_limit,
@@ -427,6 +498,7 @@ def main() -> int:
     backfill_verify = _run_backfill_subprocess(
         database_url=args.database_url,
         merchant_id=args.merchant_id,
+        platform=catalog_platform,
         mode="verify",
         limit=args.backfill_limit,
         sample_limit=args.backfill_sample_limit,
@@ -484,6 +556,7 @@ def main() -> int:
     report = {
         "base_url": base_url,
         "merchant_id": args.merchant_id,
+        "catalog_platform": catalog_platform,
         "query": query,
         "overall_ok": all(summary.values()),
         "summary": summary,

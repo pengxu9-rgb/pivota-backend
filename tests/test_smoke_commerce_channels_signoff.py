@@ -190,3 +190,62 @@ def test_smoke_commerce_channels_signoff_fails_when_backfill_verify_fails(monkey
     assert payload["summary"]["catalog_write_ok"] is False
     verify_step = next(step for step in payload["steps"] if step["step"] == "catalog_backfill_verify")
     assert verify_step["ok"] is False
+
+
+def test_smoke_commerce_channels_signoff_uses_detected_wix_platform(monkeypatch, tmp_path: Path) -> None:
+    fake_session = _FakeSession()
+
+    def _fake_request(method, url, **kwargs):
+        fake_session.calls.append((method, url, kwargs))
+        if url.endswith("/v1/pivot/query"):
+            return _FakeResponse(
+                {
+                    "total": 1,
+                    "items": [
+                        {
+                            "merchant": {"merchant_id": "merch_1", "primary_platform": "wix"},
+                            "product": {
+                                "product_key": "prod::merch_1::wix::prod_123",
+                                "title": "Sports TEE quick dry",
+                            },
+                        }
+                    ],
+                }
+            )
+        if url.endswith("/v1/catalog/sync/jobs"):
+            assert kwargs["json"]["connector"] == "wix"
+            assert kwargs["json"]["platform"] == "wix"
+            return _FakeResponse({"job_id": "catalog_job_123", "status": "pending"})
+        if url.endswith("/v1/catalog/sync/jobs/catalog_job_123"):
+            return _FakeResponse({"job_id": "catalog_job_123", "status": "completed"})
+        if url.endswith("/payment/internal/canary/merchants/merch_1/order-backed/execute"):
+            return _FakeResponse({"success": True, "status": "requires_payment_method"})
+        raise AssertionError(f"unexpected {method} {url}")
+
+    fake_session.request = _fake_request  # type: ignore[assignment]
+    monkeypatch.setattr(module.requests, "Session", lambda: fake_session)
+
+    backfill_calls = []
+
+    def _fake_backfill(**kwargs):
+        backfill_calls.append(kwargs)
+        return {
+            "returncode": 0,
+            "elapsed_ms": 1.0,
+            "body": {"summary": {"apply_stats": {"products_failed": 0}, "verify": {"missing_product_keys_count": 0}}},
+        }
+
+    monkeypatch.setattr(module, "_run_backfill_subprocess", _fake_backfill)
+    monkeypatch.setattr(module, "_parse_args", lambda: _build_args(tmp_path, query="Sports TEE quick dry"))
+
+    exit_code = module.main()
+
+    assert exit_code == 0
+    payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert payload["catalog_platform"] == "wix"
+    webhook_step = next(step for step in payload["steps"] if step["step"] == "catalog_webhook_ingest")
+    assert webhook_step["ok"] is True
+    assert webhook_step["body"]["skipped"] is True
+    assert webhook_step["body"]["platform"] == "wix"
+    assert all(call["platform"] == "wix" for call in backfill_calls)
+    assert not any("/v1/catalog/connectors/shopify/webhooks" in url for _, url, _ in fake_session.calls)
