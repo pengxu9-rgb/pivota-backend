@@ -1,5 +1,5 @@
 """Extended Merchant API Routes for Dashboard Features"""
-from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Response
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
@@ -20,6 +20,8 @@ import string
 import time
 import json
 import hashlib
+import csv
+import io
 
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_psp_config_service import (
@@ -34,10 +36,13 @@ from readiness.remediation import (
     ActionNotFoundError,
     JobNotFoundError,
     PlanSupersededError,
+    delete_source_data_decision_state,
     get_execution_job,
     get_product_blocker_detail,
+    get_source_data_triage,
     preview_remediation_action,
     run_remediation_action,
+    upsert_source_data_decision_state,
 )
 from readiness.summary import build_readiness_optimization, build_readiness_summary
 
@@ -72,7 +77,84 @@ class ReadinessActionRunRequest(BaseModel):
     idempotency_key: Optional[str] = None
     execution_mode: str = "sync"
 
+
+class SourceDataDecisionRequest(BaseModel):
+    decision_state: str
+
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+
+def _render_source_data_triage_csv(payload: Dict[str, Any]) -> str:
+    buffer = io.StringIO()
+    fieldnames = [
+        "plan_id",
+        "snapshot_id",
+        "reason_code",
+        "reason_label",
+        "scope",
+        "platform",
+        "platform_product_id",
+        "product_id",
+        "product_title",
+        "variant_id",
+        "variant_title",
+        "sku",
+        "price_value",
+        "price_currency",
+        "inventory_quantity",
+        "blocked_variant_count",
+        "excluded_variant_count",
+        "readiness_blocker_codes",
+        "readiness_warning_codes",
+        "agent_push_status",
+        "agent_push_reason_codes",
+        "recommended_action_type",
+        "fix_surface",
+        "decision_state",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+
+    plan_id = str(payload.get("plan_id") or "").strip()
+    snapshot_id = str(payload.get("snapshot_id") or "").strip()
+
+    for row in payload.get("rows") or []:
+        writer.writerow(
+            {
+                "plan_id": plan_id,
+                "snapshot_id": snapshot_id,
+                "reason_code": row.get("reason_code"),
+                "reason_label": row.get("reason_label"),
+                "scope": row.get("scope"),
+                "platform": row.get("platform"),
+                "platform_product_id": row.get("platform_product_id"),
+                "product_id": row.get("product_id"),
+                "product_title": row.get("product_title"),
+                "variant_id": row.get("variant_id"),
+                "variant_title": row.get("variant_title"),
+                "sku": row.get("sku"),
+                "price_value": row.get("price_value"),
+                "price_currency": row.get("price_currency"),
+                "inventory_quantity": row.get("inventory_quantity"),
+                "blocked_variant_count": row.get("blocked_variant_count"),
+                "excluded_variant_count": row.get("excluded_variant_count"),
+                "readiness_blocker_codes": "|".join(
+                    str(code) for code in (row.get("readiness_blocker_codes") or [])
+                ),
+                "readiness_warning_codes": "|".join(
+                    str(code) for code in (row.get("readiness_warning_codes") or [])
+                ),
+                "agent_push_status": row.get("agent_push_status"),
+                "agent_push_reason_codes": "|".join(
+                    str(code) for code in (row.get("agent_push_reason_codes") or [])
+                ),
+                "recommended_action_type": row.get("recommended_action_type"),
+                "fix_surface": row.get("fix_surface"),
+                "decision_state": row.get("decision_state"),
+            }
+        )
+
+    return buffer.getvalue()
 
 
 async def _emit_merchant_refund_webhook_best_effort(
@@ -926,6 +1008,209 @@ async def get_readiness_product_blockers(
         raise HTTPException(
             status_code=500,
             detail=f"Readiness blocker detail failed: {str(e)}",
+        )
+
+
+@router.get("/merchant/readiness/optimization/source-data-triage/export.csv")
+async def export_readiness_source_data_triage_csv(
+    plan_id: str,
+    reason_code: Optional[str] = None,
+    limit: int = 5000,
+    current_user: dict = Depends(get_current_user),
+):
+    """Export the source-data triage queue as CSV for the selected plan/lane."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+    normalized_limit = max(1, min(int(limit or 5000), 5000))
+
+    try:
+        triage = await get_source_data_triage(
+            merchant_id,
+            plan_id=plan_id,
+            reason_code=reason_code,
+            limit=normalized_limit,
+        )
+        lane_code = str(reason_code or "all").strip() or "all"
+        filename = f"catalog-health-source-data-triage-{lane_code}-{plan_id}.csv"
+        return Response(
+            content=_render_source_data_triage_csv(triage),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except PlanSupersededError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
+                "current_plan_id": exc.current_plan_id,
+                "current_snapshot_id": exc.current_snapshot_id,
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Readiness source-data triage export failed for merchant %s plan %s reason %s: %s",
+            merchant_id,
+            plan_id,
+            reason_code,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness source-data triage export failed: {str(e)}",
+        )
+
+
+@router.get("/merchant/readiness/optimization/source-data-triage")
+async def get_readiness_source_data_triage(
+    plan_id: str,
+    reason_code: Optional[str] = None,
+    limit: int = 500,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the source-data triage queue for the selected optimization plan."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+    normalized_limit = max(1, min(int(limit or 500), 5000))
+
+    try:
+        triage = await get_source_data_triage(
+            merchant_id,
+            plan_id=plan_id,
+            reason_code=reason_code,
+            limit=normalized_limit,
+        )
+        return {
+            "status": "success",
+            "data": triage,
+        }
+    except PlanSupersededError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OPTIMIZATION_PLAN_SUPERSEDED",
+                "current_plan_id": exc.current_plan_id,
+                "current_snapshot_id": exc.current_snapshot_id,
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Readiness source-data triage failed for merchant %s plan %s reason %s: %s",
+            merchant_id,
+            plan_id,
+            reason_code,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness source-data triage failed: {str(e)}",
+        )
+
+
+@router.put("/merchant/readiness/source-data-decisions/{reason_code}/{platform}/{platform_product_id}")
+async def put_readiness_source_data_decision(
+    reason_code: str,
+    platform: str,
+    platform_product_id: str,
+    body: SourceDataDecisionRequest = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist the merchant's source-data decision for one product queue target."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        decision = await upsert_source_data_decision_state(
+            merchant_id,
+            reason_code=reason_code,
+            platform=platform,
+            platform_product_id=platform_product_id,
+            decision_state=body.decision_state,
+        )
+        return {
+            "status": "success",
+            "data": decision,
+        }
+    except ActionNotExecutableError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "SOURCE_DATA_DECISION_UNSUPPORTED",
+                "message": str(exc),
+            },
+        )
+    except ActionNotFoundError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "SOURCE_DATA_DECISION_INVALID",
+                "message": str(exc),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Source-data decision save failed for merchant %s %s/%s (%s): %s",
+            merchant_id,
+            platform,
+            platform_product_id,
+            reason_code,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Source-data decision save failed: {str(e)}",
+        )
+
+
+@router.delete("/merchant/readiness/source-data-decisions/{reason_code}/{platform}/{platform_product_id}")
+async def delete_readiness_source_data_decision(
+    reason_code: str,
+    platform: str,
+    platform_product_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Clear a previously saved merchant source-data decision."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    try:
+        decision = await delete_source_data_decision_state(
+            merchant_id,
+            reason_code=reason_code,
+            platform=platform,
+            platform_product_id=platform_product_id,
+        )
+        return {
+            "status": "success",
+            "data": decision,
+        }
+    except ActionNotExecutableError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "SOURCE_DATA_DECISION_UNSUPPORTED",
+                "message": str(exc),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Source-data decision delete failed for merchant %s %s/%s (%s): %s",
+            merchant_id,
+            platform,
+            platform_product_id,
+            reason_code,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Source-data decision delete failed: {str(e)}",
         )
 
 
