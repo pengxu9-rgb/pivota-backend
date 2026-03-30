@@ -54,6 +54,63 @@ async def test_compute_merchant_commerce_readiness_state_marks_supported_platfor
     assert readiness["surfaced_exposure_supported"] is True
 
 
+@pytest.mark.asyncio
+async def test_compute_merchant_commerce_readiness_state_uses_catalog_fallback_for_discover(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.merchant_commerce_readiness_service as module
+
+    async def fake_get_merchant_onboarding(_merchant_id: str):
+        return {"merchant_id": "merch_1", "mcp_platform": "wix", "mcp_connected_at": "2026-03-25T00:00:00Z"}
+
+    async def fake_get_primary_store(_merchant_id: str):
+        return {"platform": "wix", "connected_at": "2026-03-25T00:00:00Z"}
+
+    async def fake_fetch_listing_rows(_merchant_id: str):
+        return [
+            {
+                "status": "indexed",
+                "canonical_product_id": "prod::merch_1::wix::prod_1",
+                "canonical_variant_id": "sku::prod::merch_1::wix::var_1",
+                "surface": "default",
+                "updated_at": "2026-03-30T00:00:00Z",
+            }
+        ]
+
+    async def fake_fetch_click_rows(_merchant_id: str):
+        return []
+
+    async def fake_fetch_edge_rows(_merchant_id: str):
+        return []
+
+    async def fake_fetch_active_psps(_merchant_id: str):
+        return [
+            {
+                "provider": "stripe",
+                "status": "active",
+                "api_key": "sk_live_123",
+                "account_id": "acct_123",
+                "provider_config": {"mode": "payment_intent", "webhook_endpoint_id": "we_123", "webhook_endpoint_secret": "sec_123"},
+                "environment": "live",
+                "validation_status": "valid",
+                "validation_error": None,
+            }
+        ]
+
+    monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(module, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
+    monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
+    monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_active_psps", fake_fetch_active_psps)
+
+    readiness = await module.compute_merchant_commerce_readiness_state("merch_1")
+
+    assert readiness["foundation_status"] == "ready"
+    assert readiness["discover_status"] == "ready"
+    assert readiness["signals_status"] == "blocked"
+    assert readiness["signals_blockers"] == ["missing_surface_impressions"]
+    assert readiness["execute_status"] == "ready"
+
+
 def test_merchant_analytics_routes_expose_readiness_issues_and_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.merchant_analytics_routes as module
 

@@ -9,6 +9,7 @@ from db.commerce_attribution import commerce_attribution_edges, surface_click_ev
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
 from db.database import database
 from db.surface_listing_registry import surface_listing_errors, surface_listing_states
+from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
 
 
 def _normalize_text(value: Any) -> str:
@@ -36,7 +37,7 @@ async def build_merchant_commerce_funnel_issues(
         interaction_query = interaction_query.where(commerce_interactions.c.surface == surface)
         event_query = event_query.where(commerce_interaction_events.c.surface == surface)
 
-    listing_rows = [dict(row) for row in await database.fetch_all(listing_query)]
+    listing_rows = await fetch_listing_rows_with_catalog_fallback(merchant_id, surface)
     listing_errors = [dict(row) for row in await database.fetch_all(listing_error_query)]
     click_rows = [dict(row) for row in await database.fetch_all(click_query)]
     edge_rows = [dict(row) for row in await database.fetch_all(edge_query)]

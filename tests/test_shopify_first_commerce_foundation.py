@@ -55,6 +55,38 @@ def test_standard_product_from_record_payload_accepts_standard_product() -> None
     assert product.title == "Cleanser"
 
 
+@pytest.mark.asyncio
+async def test_fetch_listing_rows_with_catalog_fallback_uses_catalog_rows_when_registry_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.merchant_catalog_listing_fallback_service as module
+
+    class FakeDB:
+        async def fetch_all(self, query, params=None):
+            rendered = str(query)
+            if "surface_listing_states" in rendered:
+                return []
+            return [
+                {
+                    "product_key": "prod::merch_1::wix::prod_1",
+                    "sku_key": "sku::prod::merch_1::wix::var_1",
+                    "channel": "default",
+                    "platform": "wix",
+                    "offer_id": "offer_1",
+                    "updated_at": "2026-03-30T00:00:00Z",
+                }
+            ]
+
+    monkeypatch.setattr(module, "database", FakeDB())
+
+    rows = await module.fetch_listing_rows_with_catalog_fallback("merch_1")
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "indexed"
+    assert rows[0]["surface"] == "default"
+    assert rows[0]["canonical_product_id"] == "prod::merch_1::wix::prod_1"
+    assert rows[0]["canonical_variant_id"] == "sku::prod::merch_1::wix::var_1"
+    assert rows[0]["metadata"]["source"] == "catalog_offer_fallback"
+
+
 def test_model_dump_normalizes_datetimes_for_json_storage() -> None:
     from services.canonical_commerce_service import _model_dump
 

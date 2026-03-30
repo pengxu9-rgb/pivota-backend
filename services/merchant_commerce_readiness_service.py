@@ -4,13 +4,11 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
-
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
 from db.merchant_commerce_readiness import merchant_commerce_readiness_state
 from db.merchant_onboarding import get_merchant_onboarding
-from db.surface_listing_registry import surface_listing_states
+from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
 from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_store_service import get_primary_store
 
@@ -50,10 +48,7 @@ async def _fetch_active_psps(merchant_id: str) -> List[Dict[str, Any]]:
 
 
 async def _fetch_listing_rows(merchant_id: str) -> List[Dict[str, Any]]:
-    rows = await database.fetch_all(
-        select(surface_listing_states).where(surface_listing_states.c.merchant_id == merchant_id)
-    )
-    return [dict(row) for row in rows]
+    return await fetch_listing_rows_with_catalog_fallback(merchant_id)
 
 
 async def _fetch_click_rows(merchant_id: str) -> List[Dict[str, Any]]:
