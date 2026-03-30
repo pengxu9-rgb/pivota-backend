@@ -23,13 +23,15 @@
       "notes": "Current production merchant with real products_cache payloads, catalog rows, and active PSPs."
     },
     {
-      "case_id": "testlab_generic_pending",
+      "case_id": "testlab_generic_ready",
       "merchant_id": "merch_7298c977f20c8f1a",
-      "label": "testlab generic candidate",
+      "label": "testlab generic ready merchant",
       "semantic_class": "generic_default",
-      "enabled": false,
-      "skip_reason": "missing_products_cache_live_payload",
-      "notes": "Aspirational Phase A generic slot. Not part of the current environment minimum gate."
+      "query": "AeroFlex Joggers",
+      "payment_preferred_provider": "stripe",
+      "payment_currency": "USD",
+      "enabled": true,
+      "notes": "Production generic merchant with live-ready Stripe, products_cache payloads, catalog rows, and direct signoff evidence."
     },
     {
       "case_id": "chydanlab_generic_pending",
