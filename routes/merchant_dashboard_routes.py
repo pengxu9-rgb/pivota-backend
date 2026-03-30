@@ -62,7 +62,10 @@ def _stripe_webhook_target_url(psp_id: str) -> str:
 def _stripe_object_field(obj: Any, field: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(field)
-    getter = getattr(obj, "get", None)
+    try:
+        getter = getattr(obj, "get", None)
+    except Exception:
+        getter = None
     if callable(getter):
         try:
             return getter(field)

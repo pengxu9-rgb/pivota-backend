@@ -354,6 +354,45 @@ def test_ensure_stripe_webhook_endpoint_handles_object_style_stripe_responses(mo
     assert provider_config["webhook_url"].endswith("/webhooks/stripe/psp_stripe_live_obj")
 
 
+def test_ensure_stripe_webhook_endpoint_handles_getattr_keyerror(monkeypatch) -> None:
+    _, module = _build_client()
+
+    class FakeStripeObject:
+        def __init__(self, **kwargs):
+            self._values = dict(kwargs)
+
+        def __getattr__(self, name):
+            if name in self._values:
+                return self._values[name]
+            raise KeyError(name)
+
+    class FakeWebhookEndpoint:
+        @staticmethod
+        def create(**kwargs):
+            return FakeStripeObject(id="we_live_keyerror", secret="whsec_live_keyerror")
+
+    class FakeStripeSDK:
+        api_key = None
+        WebhookEndpoint = FakeWebhookEndpoint
+
+    monkeypatch.setitem(sys.modules, "stripe", FakeStripeSDK)
+
+    provider_config, created = module.asyncio.run(
+        module._ensure_stripe_webhook_endpoint(
+            psp_id="psp_stripe_live_keyerror",
+            api_key="sk_live_stripe_secret",
+            provider_config={"mode": "payment_intent"},
+            account_id=None,
+            environment="live",
+        )
+    )
+
+    assert created is True
+    assert provider_config["webhook_endpoint_id"] == "we_live_keyerror"
+    assert provider_config["webhook_endpoint_secret"] == "whsec_live_keyerror"
+    assert provider_config["webhook_url"].endswith("/webhooks/stripe/psp_stripe_live_keyerror")
+
+
 def test_merchant_order_backed_canary_route_uses_authenticated_merchant(monkeypatch) -> None:
     client, module = _build_client()
 
