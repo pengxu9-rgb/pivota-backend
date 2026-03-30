@@ -158,8 +158,8 @@ async def compute_merchant_commerce_readiness_state(merchant_id: str) -> Dict[st
         execute_blockers.append("missing_store_connection")
     if not supported_checkout_platform:
         execute_blockers.append("unsupported_platform")
-    if not (live_psp or supported_checkout_platform):
-        execute_blockers.append("missing_live_psp_or_checkout_path")
+    if not live_psp:
+        execute_blockers.append("missing_live_psp")
 
     first_discover_ready_at = store_connected_at if not discover_blockers else None
     values = {

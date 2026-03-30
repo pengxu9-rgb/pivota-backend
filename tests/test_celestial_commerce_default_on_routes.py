@@ -111,6 +111,58 @@ async def test_compute_merchant_commerce_readiness_state_uses_catalog_fallback_f
     assert readiness["execute_status"] == "ready"
 
 
+@pytest.mark.asyncio
+async def test_compute_merchant_commerce_readiness_state_blocks_execute_without_live_psp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.merchant_commerce_readiness_service as module
+
+    async def fake_get_merchant_onboarding(_merchant_id: str):
+        return {"merchant_id": "merch_1", "mcp_platform": "wix", "mcp_connected_at": "2026-03-25T00:00:00Z"}
+
+    async def fake_get_primary_store(_merchant_id: str):
+        return {"platform": "wix", "connected_at": "2026-03-25T00:00:00Z"}
+
+    async def fake_fetch_listing_rows(_merchant_id: str):
+        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": "2026-03-30T00:00:00Z"}]
+
+    async def fake_fetch_click_rows(_merchant_id: str):
+        return [{"click_id": "clk_1", "impression_count": 1, "click_count": 0}]
+
+    async def fake_fetch_edge_rows(_merchant_id: str):
+        return []
+
+    async def fake_fetch_active_psps(_merchant_id: str):
+        return [
+            {
+                "provider": "stripe",
+                "status": "active",
+                "api_key": "sk_test_123",
+                "account_id": "acct_123",
+                "provider_config": {"mode": "payment_intent"},
+                "environment": "test",
+                "validation_status": "invalid",
+                "validation_error": "test credential",
+            }
+        ]
+
+    monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(module, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
+    monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
+    monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_active_psps", fake_fetch_active_psps)
+
+    readiness = await module.compute_merchant_commerce_readiness_state("merch_1")
+
+    assert readiness["foundation_status"] == "ready"
+    assert readiness["discover_status"] == "ready"
+    assert readiness["signals_status"] == "ready"
+    assert readiness["execute_status"] == "blocked"
+    assert readiness["execute_blockers"] == ["missing_live_psp"]
+    assert readiness["active_psp"] is None
+
+
 def test_merchant_analytics_routes_expose_readiness_issues_and_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.merchant_analytics_routes as module
 
