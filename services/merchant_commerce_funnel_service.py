@@ -15,6 +15,36 @@ def _supported_indexed_statuses() -> tuple[str, ...]:
     return ("exported", "indexed", "tradeable")
 
 
+def _normalize_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _listing_key_aliases(row: Dict[str, Any], *, key_field: str) -> set[str]:
+    aliases: set[str] = set()
+    key = _normalize_text(row.get(key_field))
+    if key:
+        aliases.add(key)
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    if key_field == "canonical_product_id":
+        for alias_key in ("catalog_product_key", "product_key"):
+            alias = _normalize_text(metadata.get(alias_key))
+            if alias:
+                aliases.add(alias)
+    elif key_field == "canonical_variant_id":
+        for alias_key in ("catalog_sku_key", "sku_key"):
+            alias = _normalize_text(metadata.get(alias_key))
+            if alias:
+                aliases.add(alias)
+    return aliases
+
+
+def _resolve_bucket_key(row: Dict[str, Any], *, key_field: str, alias_to_bucket: Dict[str, str]) -> str:
+    raw = _normalize_text(row.get(key_field))
+    if not raw:
+        return ""
+    return alias_to_bucket.get(raw, raw)
+
+
 async def _fetch_listing_rows(merchant_id: str, surface: Optional[str]) -> List[Dict[str, Any]]:
     return await fetch_listing_rows_with_catalog_fallback(merchant_id, surface)
 
@@ -88,6 +118,7 @@ async def get_merchant_commerce_funnel(
             "variant": "canonical_variant_id",
             "surface": "surface",
         }[group_by]
+        alias_to_bucket: Dict[str, str] = {}
         grouped: Dict[str, Dict[str, Any]] = defaultdict(
             lambda: {
                 "key": None,
@@ -112,35 +143,37 @@ async def get_merchant_commerce_funnel(
         )
 
         for row in listing_rows:
-            key = str(row.get(key_field) or "").strip()
+            key = _normalize_text(row.get(key_field))
             if not key:
                 continue
             bucket = grouped[key]
             bucket["key"] = key
+            for alias in _listing_key_aliases(row, key_field=key_field):
+                alias_to_bucket[alias] = key
             bucket["listing_rows_total"] += 1
-            status_key = str(row.get("status") or "unknown")
-            surface_key = str(row.get("surface") or "unknown")
+            status_key = _normalize_text(row.get("status")) or "unknown"
+            surface_key = _normalize_text(row.get("surface")) or "unknown"
             bucket["listing_status_breakdown_rows"][status_key] += 1
             bucket["listing_status_breakdown_by_surface"][surface_key][status_key] += 1
 
         for row in indexed_rows:
-            key = str(row.get(key_field) or "").strip()
+            key = _resolve_bucket_key(row, key_field=key_field, alias_to_bucket=alias_to_bucket)
             if not key:
                 continue
             bucket = grouped[key]
             bucket["key"] = key
-            variant_id = str(row.get("canonical_variant_id") or "").strip()
+            variant_id = _normalize_text(row.get("canonical_variant_id"))
             if variant_id and variant_id not in bucket["_indexed_variant_ids"]:
                 bucket["_indexed_variant_ids"].add(variant_id)
                 bucket["indexed_exposure"] += 1
 
         for row in click_rows:
-            key = str(row.get(key_field) or "").strip()
+            key = _resolve_bucket_key(row, key_field=key_field, alias_to_bucket=alias_to_bucket)
             if not key:
                 continue
             bucket = grouped[key]
             bucket["key"] = key
-            click_id = str(row.get("click_id") or "").strip()
+            click_id = _normalize_text(row.get("click_id"))
             if click_id and int(row.get("impression_count") or 0) > 0 and click_id not in bucket["_surfaced_click_ids"]:
                 bucket["_surfaced_click_ids"].add(click_id)
                 bucket["surfaced_exposure"] += 1
@@ -150,12 +183,12 @@ async def get_merchant_commerce_funnel(
             bucket["clicked_events_total"] += int(row.get("click_count") or 0)
 
         for row in edge_rows:
-            key = str(row.get(key_field) or "").strip()
+            key = _resolve_bucket_key(row, key_field=key_field, alias_to_bucket=alias_to_bucket)
             if not key:
                 continue
             bucket = grouped[key]
             bucket["key"] = key
-            order_id = str(row.get("order_id") or "").strip()
+            order_id = _normalize_text(row.get("order_id"))
             if order_id and order_id not in bucket["_order_ids"]:
                 bucket["_order_ids"].add(order_id)
                 bucket["ordered_conversion"] += 1
