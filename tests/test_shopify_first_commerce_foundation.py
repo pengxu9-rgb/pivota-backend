@@ -58,6 +58,10 @@ def test_standard_product_from_record_payload_accepts_standard_product() -> None
 @pytest.mark.asyncio
 async def test_fetch_listing_rows_with_catalog_fallback_uses_catalog_rows_when_registry_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     import services.merchant_catalog_listing_fallback_service as module
+    from services.canonical_commerce_service import (
+        make_canonical_product_id,
+        make_canonical_variant_id,
+    )
 
     class FakeDB:
         async def fetch_all(self, query, params=None):
@@ -68,6 +72,8 @@ async def test_fetch_listing_rows_with_catalog_fallback_uses_catalog_rows_when_r
                 {
                     "product_key": "prod::merch_1::wix::prod_1",
                     "sku_key": "sku::prod::merch_1::wix::var_1",
+                    "source_product_id": "prod_1",
+                    "source_variant_id": "var_1",
                     "channel": "default",
                     "platform": "wix",
                     "offer_id": "offer_1",
@@ -82,9 +88,11 @@ async def test_fetch_listing_rows_with_catalog_fallback_uses_catalog_rows_when_r
     assert len(rows) == 1
     assert rows[0]["status"] == "indexed"
     assert rows[0]["surface"] == "default"
-    assert rows[0]["canonical_product_id"] == "prod::merch_1::wix::prod_1"
-    assert rows[0]["canonical_variant_id"] == "sku::prod::merch_1::wix::var_1"
+    assert rows[0]["canonical_product_id"] == make_canonical_product_id("merch_1", "wix", "prod_1")
+    assert rows[0]["canonical_variant_id"] == make_canonical_variant_id("merch_1", "wix", "prod_1", "var_1")
     assert rows[0]["metadata"]["source"] == "catalog_offer_fallback"
+    assert rows[0]["metadata"]["catalog_product_key"] == "prod::merch_1::wix::prod_1"
+    assert rows[0]["metadata"]["catalog_sku_key"] == "sku::prod::merch_1::wix::var_1"
 
 
 def test_model_dump_normalizes_datetimes_for_json_storage() -> None:
@@ -277,20 +285,93 @@ async def test_get_merchant_commerce_funnel_summary(monkeypatch: pytest.MonkeyPa
     assert funnel["summary"]["ordered_conversion"] == 1
     assert funnel["summary"]["refunded_orders"] == 1
     assert funnel["summary"]["refunded_amount"] == "1.00"
-    assert funnel["summary"]["listing_rows_total"] == 3
-    assert funnel["summary"]["listing_status_breakdown_rows"] == {"exported": 2, "blocked": 1}
+
+
+@pytest.mark.asyncio
+async def test_get_merchant_commerce_funnel_groups_click_aliases_into_catalog_fallback_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.merchant_commerce_funnel_service as module
+    from services.canonical_commerce_service import (
+        make_canonical_product_id,
+        make_canonical_variant_id,
+    )
+
+    short_product_id = make_canonical_product_id("merch_1", "wix", "prod_1")
+    short_variant_id = make_canonical_variant_id("merch_1", "wix", "prod_1", "var_1")
+    long_product_id = "prod::merch_1::wix::prod_1"
+    long_variant_id = "sku::prod::merch_1::wix::prod_1::var_1"
+
+    async def fake_fetch_listing_rows(merchant_id: str, surface: str | None):
+        assert merchant_id == "merch_1"
+        return [
+            {
+                "canonical_product_id": short_product_id,
+                "canonical_variant_id": short_variant_id,
+                "status": "indexed",
+                "surface": "default",
+                "metadata": {
+                    "source": "catalog_offer_fallback",
+                    "catalog_product_key": long_product_id,
+                    "catalog_sku_key": long_variant_id,
+                },
+            }
+        ]
+
+    async def fake_fetch_click_rows(merchant_id: str, surface: str | None):
+        return [
+            {
+                "click_id": "clk_1",
+                "click_count": 1,
+                "impression_count": 1,
+                "canonical_product_id": long_product_id,
+                "canonical_variant_id": long_variant_id,
+                "surface": "ucp",
+            }
+        ]
+
+    async def fake_fetch_edge_rows(merchant_id: str, surface: str | None):
+        return [
+            {
+                "order_id": "ORD_1",
+                "canonical_product_id": long_product_id,
+                "canonical_variant_id": long_variant_id,
+                "surface": "ucp",
+                "latest_refund_id": None,
+                "refunded_amount": "0",
+            }
+        ]
+
+    monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
+    monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
+    monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+
+    funnel = await module.get_merchant_commerce_funnel(
+        merchant_id="merch_1",
+        group_by="product",
+    )
+
+    assert funnel["summary"]["surfaced_exposure"] == 1
+    assert funnel["summary"]["clicked_exposure"] == 1
+    assert funnel["summary"]["ordered_conversion"] == 1
+    assert len(funnel["slices"]) == 1
+    assert funnel["slices"][0]["key"] == short_product_id
+    assert funnel["slices"][0]["indexed_exposure"] == 1
+    assert funnel["slices"][0]["surfaced_exposure"] == 1
+    assert funnel["slices"][0]["clicked_exposure"] == 1
+    assert funnel["slices"][0]["ordered_conversion"] == 1
+    assert funnel["summary"]["listing_rows_total"] == 1
+    assert funnel["summary"]["listing_status_breakdown_rows"] == {"indexed": 1}
     assert funnel["summary"]["listing_status_breakdown_by_surface"] == {
-        "ucp": {"exported": 1, "blocked": 1},
-        "acp": {"exported": 1},
+        "default": {"indexed": 1},
     }
 
     slices = {row["key"]: row for row in funnel["slices"]}
-    assert slices["cp_1"]["indexed_exposure"] == 1
-    assert slices["cp_1"]["listing_rows_total"] == 2
-    assert slices["cp_1"]["listing_status_breakdown_rows"] == {"exported": 2}
-    assert slices["cp_1"]["listing_status_breakdown_by_surface"] == {
-        "ucp": {"exported": 1},
-        "acp": {"exported": 1},
+    assert slices[short_product_id]["indexed_exposure"] == 1
+    assert slices[short_product_id]["listing_rows_total"] == 1
+    assert slices[short_product_id]["listing_status_breakdown_rows"] == {"indexed": 1}
+    assert slices[short_product_id]["listing_status_breakdown_by_surface"] == {
+        "default": {"indexed": 1},
     }
 
 
