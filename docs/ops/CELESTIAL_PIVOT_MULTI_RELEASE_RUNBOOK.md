@@ -363,3 +363,46 @@ When to rerun:
 
 For the next step beyond this merchant-specific signoff, use the separate follow-on phase plan:
 - [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
+
+## Follow-On Phase Status
+Current follow-on status as of `2026-03-30 UTC`:
+
+- `Phase A` current-environment gate is green.
+  - Evidence:
+    - [commerce-signoff-batch.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.md)
+    - [commerce-signoff-batch.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.json)
+  - Current gate outcome:
+    - `overall_ok = true`
+    - `enabled_cases = 1`
+    - `passed_cases = 1`
+    - `min_enabled_cases = 1`
+    - required semantic coverage for the current environment: `beauty`
+  - The long-term cohort target remains open by design:
+    - `target_enabled_cases = 5`
+    - target semantic coverage: `beauty`, `generic_default`, `fragrance`
+
+- `Phase B` supervised paid terminal-state signoff is also green.
+  - This was executed with a fresh readiness-owned Stripe Checkout session, not a reused historical PSP reference.
+  - Execution shape:
+    - create readiness-owned checkout + local order
+    - mint fresh Stripe Checkout session
+    - complete the real payment externally
+    - run read-only `payment-status-sync` verification
+    - run `payment-bridge`
+    - run `refund`
+    - confirm post-refund audit convergence
+  - Evidence:
+    - [bridge-paid-reference-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.md)
+    - [bridge-paid-reference-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.json)
+  - Outcome:
+    - `normalized_payment_status = paid`
+    - `bridge payment_status = paid`
+    - `refund_eligible_after_bridge = true`
+    - `refund_status = success`
+    - `post_refund_payment_status = refunded`
+    - `overall_ok = true`
+
+Operational interpretation:
+- the standard Celestial pivot release close-out remains separate from these follow-on phases
+- there is no remaining baseline backend-runtime blocker in the follow-on path
+- what remains open after `2026-03-30 UTC` is cohort expansion and repeatability, not whether the supervised paid path can converge end to end

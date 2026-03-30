@@ -15,6 +15,38 @@ Recommended order:
 1. Phase A first
 2. Phase B second
 
+## Current Status
+Current status as of `2026-03-30 UTC`:
+
+- `Phase A` current-environment gate is complete.
+  - Evidence:
+    - [commerce-signoff-batch.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.md)
+    - [commerce-signoff-batch.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.json)
+  - Current-environment outcome:
+    - `overall_ok = true`
+    - `enabled_cases = 1`
+    - `passed_cases = 1`
+    - current gate requires only `beauty`
+  - Long-term expansion is still intentionally open:
+    - `target_enabled_cases = 5`
+    - `target_semantic_classes = ["beauty", "generic_default", "fragrance"]`
+
+- `Phase B` supervised real payment completion is complete.
+  - Evidence:
+    - [bridge-paid-reference-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.md)
+    - [bridge-paid-reference-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.json)
+  - Outcome:
+    - a fresh readiness-owned Stripe Checkout session reached a real paid terminal state
+    - readiness verified the paid PSP state before bridging it into the local order
+    - `payment-bridge` converged successfully
+    - `refund` converged successfully
+    - post-refund audit ended at `payment_status=refunded`
+    - `overall_ok = true`
+
+Net result:
+- both follow-on phases now have a green minimum slice
+- the remaining work is expansion and repeatability, not first-path feasibility
+
 ## Phase A: Multi-Merchant Expanded Acceptance
 
 ### Goal
