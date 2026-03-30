@@ -104,8 +104,28 @@ async def get_merchant_commerce_funnel(
                 "refunded_amount": Decimal("0"),
                 "clicked_rate": 0,
                 "ordered_rate": 0,
+                "listing_rows_total": 0,
+                "listing_status_breakdown_rows": defaultdict(int),
+                "listing_status_breakdown_by_surface": defaultdict(lambda: defaultdict(int)),
+                "_indexed_variant_ids": set(),
+                "_surfaced_click_ids": set(),
+                "_click_ids": set(),
+                "_order_ids": set(),
+                "_refunded_order_ids": set(),
             }
         )
+
+        for row in listing_rows:
+            key = str(row.get(key_field) or "").strip()
+            if not key:
+                continue
+            bucket = grouped[key]
+            bucket["key"] = key
+            bucket["listing_rows_total"] += 1
+            status_key = str(row.get("status") or "unknown")
+            surface_key = str(row.get("surface") or "unknown")
+            bucket["listing_status_breakdown_rows"][status_key] += 1
+            bucket["listing_status_breakdown_by_surface"][surface_key][status_key] += 1
 
         for row in indexed_rows:
             key = str(row.get(key_field) or "").strip()
@@ -113,7 +133,10 @@ async def get_merchant_commerce_funnel(
                 continue
             bucket = grouped[key]
             bucket["key"] = key
-            bucket["indexed_exposure"] += 1
+            variant_id = str(row.get("canonical_variant_id") or "").strip()
+            if variant_id and variant_id not in bucket["_indexed_variant_ids"]:
+                bucket["_indexed_variant_ids"].add(variant_id)
+                bucket["indexed_exposure"] += 1
 
         for row in click_rows:
             key = str(row.get(key_field) or "").strip()
@@ -121,9 +144,13 @@ async def get_merchant_commerce_funnel(
                 continue
             bucket = grouped[key]
             bucket["key"] = key
-            if int(row.get("impression_count") or 0) > 0:
+            click_id = str(row.get("click_id") or "").strip()
+            if click_id and int(row.get("impression_count") or 0) > 0 and click_id not in bucket["_surfaced_click_ids"]:
+                bucket["_surfaced_click_ids"].add(click_id)
                 bucket["surfaced_exposure"] += 1
-            bucket["clicked_exposure"] += 1
+            if click_id and click_id not in bucket["_click_ids"]:
+                bucket["_click_ids"].add(click_id)
+                bucket["clicked_exposure"] += 1
             bucket["clicked_events_total"] += int(row.get("click_count") or 0)
 
         for row in edge_rows:
@@ -132,8 +159,12 @@ async def get_merchant_commerce_funnel(
                 continue
             bucket = grouped[key]
             bucket["key"] = key
-            bucket["ordered_conversion"] += 1
-            if row.get("latest_refund_id"):
+            order_id = str(row.get("order_id") or "").strip()
+            if order_id and order_id not in bucket["_order_ids"]:
+                bucket["_order_ids"].add(order_id)
+                bucket["ordered_conversion"] += 1
+            if row.get("latest_refund_id") and order_id and order_id not in bucket["_refunded_order_ids"]:
+                bucket["_refunded_order_ids"].add(order_id)
                 bucket["refunded_orders"] += 1
             bucket["refunded_amount"] += Decimal(str(row.get("refunded_amount") or "0"))
 
@@ -151,6 +182,12 @@ async def get_merchant_commerce_funnel(
                     else 0
                 ),
                 "refunded_amount": str(value["refunded_amount"]),
+                "listing_rows_total": value["listing_rows_total"],
+                "listing_status_breakdown_rows": dict(value["listing_status_breakdown_rows"]),
+                "listing_status_breakdown_by_surface": {
+                    surface_key: dict(status_counts)
+                    for surface_key, status_counts in value["listing_status_breakdown_by_surface"].items()
+                },
             }
             for key, value in grouped.items()
         }
