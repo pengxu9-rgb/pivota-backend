@@ -16,6 +16,7 @@ from services.merchant_store_service import get_primary_store
 
 READY = "ready"
 BLOCKED = "blocked"
+_SUPPORTED_COMMERCE_PLATFORMS = {"shopify", "wix", "woocommerce", "bigcommerce"}
 
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
@@ -96,7 +97,7 @@ def _days_between(start: Optional[datetime], end: Optional[datetime]) -> Optiona
 
 
 def _surfaced_exposure_supported(platform: Optional[str]) -> bool:
-    return str(platform or "").strip().lower() in {"shopify", "wix"}
+    return str(platform or "").strip().lower() in _SUPPORTED_COMMERCE_PLATFORMS
 
 
 async def compute_merchant_commerce_readiness_state(merchant_id: str) -> Dict[str, Any]:
@@ -109,7 +110,7 @@ async def compute_merchant_commerce_readiness_state(merchant_id: str) -> Dict[st
     edge_rows = await _fetch_edge_rows(merchant_id)
     psp_rows = await _fetch_active_psps(merchant_id)
 
-    supported_checkout_platform = platform in {"shopify", "wix"}
+    supported_checkout_platform = platform in _SUPPORTED_COMMERCE_PLATFORMS
     indexed_statuses = {"exported", "indexed", "tradeable"}
     indexed_rows = [row for row in listing_rows if str(row.get("status") or "").strip().lower() in indexed_statuses]
     last_catalog_sync = max(

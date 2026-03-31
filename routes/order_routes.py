@@ -249,6 +249,15 @@ def _normalize_shopify_domain(domain: str) -> str:
     return f"{d}.myshopify.com"
 
 
+def _normalize_storefront_base_url(domain: str) -> str:
+    d = (domain or "").strip()
+    if not d:
+        return ""
+    if not d.startswith(("http://", "https://")):
+        d = f"https://{d}"
+    return d.rstrip("/")
+
+
 def _shopify_order_create_lock_key(order_id: str) -> int:
     """
     Stable advisory-lock key for a given order_id.
@@ -345,6 +354,96 @@ def _build_shopify_cart_permalink_best_effort(
     return base
 
 
+def _build_woocommerce_checkout_permalink_best_effort(
+    *,
+    store_url: str,
+    items: List[OrderItem],
+) -> Optional[str]:
+    """
+    Best-effort WooCommerce hosted checkout fallback.
+
+    We only generate a URL for a single simple product because variable and multi-product
+    carts require extra form state that we do not persist in OrderItem today.
+    """
+    base = _normalize_storefront_base_url(store_url)
+    if not base:
+        return None
+
+    valid_items: List[OrderItem] = []
+    for item in items or []:
+        try:
+            qty = int(getattr(item, "quantity", 0) or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        valid_items.append(item)
+
+    if len(valid_items) != 1:
+        return None
+
+    item = valid_items[0]
+    if getattr(item, "variant_id", None):
+        return None
+
+    try:
+        product_id = str(int(str(getattr(item, "product_id", "") or "")))
+        quantity = int(getattr(item, "quantity", 0) or 0)
+    except Exception:
+        return None
+
+    if quantity <= 0:
+        return None
+
+    query = urlencode({"add-to-cart": product_id, "quantity": quantity})
+    return f"{base}/checkout/?{query}"
+
+
+def _build_bigcommerce_checkout_permalink_best_effort(
+    *,
+    store_domain: str,
+    items: List[OrderItem],
+) -> Optional[str]:
+    """
+    Best-effort BigCommerce hosted checkout fallback.
+
+    BigCommerce's storefront add-to-cart redirect is only reliable here for a single
+    product line item without option reconstruction.
+    """
+    base = _normalize_storefront_base_url(store_domain)
+    if not base:
+        return None
+
+    valid_items: List[OrderItem] = []
+    for item in items or []:
+        try:
+            qty = int(getattr(item, "quantity", 0) or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        valid_items.append(item)
+
+    if len(valid_items) != 1:
+        return None
+
+    item = valid_items[0]
+    if getattr(item, "variant_id", None):
+        return None
+
+    try:
+        product_id = str(int(str(getattr(item, "product_id", "") or "")))
+        quantity = int(getattr(item, "quantity", 0) or 0)
+    except Exception:
+        return None
+
+    if quantity <= 0:
+        return None
+
+    query = urlencode({"action": "buy", "product_id": product_id, "qty": quantity})
+    return f"{base}/cart.php?{query}"
+
+
 async def _get_platform_checkout_fallback_url_best_effort(
     *,
     merchant_id: str,
@@ -373,8 +472,21 @@ async def _get_platform_checkout_fallback_url_best_effort(
         )
         if url:
             return {"url": url, "platform": "shopify", "method": "cart_permalink"}
+    elif str(platform).lower() == "woocommerce":
+        url = _build_woocommerce_checkout_permalink_best_effort(
+            store_url=str(domain),
+            items=items,
+        )
+        if url:
+            return {"url": url, "platform": "woocommerce", "method": "checkout_add_to_cart"}
+    elif str(platform).lower() == "bigcommerce":
+        url = _build_bigcommerce_checkout_permalink_best_effort(
+            store_domain=str(domain),
+            items=items,
+        )
+        if url:
+            return {"url": url, "platform": "bigcommerce", "method": "cart_buy_now"}
 
-    # TODO: add platform-hosted checkout fallbacks for wix/woocommerce when needed.
     return None
 
 

@@ -55,6 +55,59 @@ async def test_compute_merchant_commerce_readiness_state_marks_supported_platfor
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["woocommerce", "bigcommerce"])
+async def test_compute_merchant_commerce_readiness_state_marks_woocommerce_and_bigcommerce_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+) -> None:
+    import services.merchant_commerce_readiness_service as module
+
+    async def fake_get_merchant_onboarding(_merchant_id: str):
+        return {"merchant_id": "merch_1", "mcp_platform": platform, "mcp_connected_at": "2026-03-25T00:00:00Z"}
+
+    async def fake_get_primary_store(_merchant_id: str):
+        return {"platform": platform, "connected_at": "2026-03-25T00:00:00Z"}
+
+    async def fake_fetch_listing_rows(_merchant_id: str):
+        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": "2026-03-30T00:00:00Z"}]
+
+    async def fake_fetch_click_rows(_merchant_id: str):
+        return [{"click_id": "clk_1", "impression_count": 2, "click_count": 1}]
+
+    async def fake_fetch_edge_rows(_merchant_id: str):
+        return [{"order_id": "ord_1", "click_id": "clk_1"}]
+
+    async def fake_fetch_active_psps(_merchant_id: str):
+        return [
+            {
+                "provider": "stripe",
+                "status": "active",
+                "api_key": "sk_live_123",
+                "account_id": "acct_123",
+                "provider_config": {"mode": "payment_intent", "webhook_endpoint_id": "we_123", "webhook_endpoint_secret": "sec_123"},
+                "environment": "live",
+                "validation_status": "valid",
+                "validation_error": None,
+            }
+        ]
+
+    monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(module, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
+    monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
+    monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_active_psps", fake_fetch_active_psps)
+
+    readiness = await module.compute_merchant_commerce_readiness_state("merch_1")
+
+    assert readiness["foundation_status"] == "ready"
+    assert readiness["discover_status"] == "ready"
+    assert readiness["signals_status"] == "ready"
+    assert readiness["execute_status"] == "ready"
+    assert readiness["surfaced_exposure_supported"] is True
+
+
+@pytest.mark.asyncio
 async def test_compute_merchant_commerce_readiness_state_uses_catalog_fallback_for_discover(monkeypatch: pytest.MonkeyPatch) -> None:
     import services.merchant_commerce_readiness_service as module
 
