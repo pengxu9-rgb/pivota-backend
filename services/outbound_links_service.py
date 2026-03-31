@@ -455,6 +455,15 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
             **({ PVT_PRODUCT_ID: attribution.get(PVT_PRODUCT_ID) } if attribution.get(PVT_PRODUCT_ID) else {}),
             **({ PVT_VARIANT_ID: attribution.get(PVT_VARIANT_ID) } if attribution.get(PVT_VARIANT_ID) else {}),
             **({ PVT_PROMPT_CLUSTER: attribution.get(PVT_PROMPT_CLUSTER) } if attribution.get(PVT_PROMPT_CLUSTER) else {}),
+            **({ "source_channel": attribution.get("source_channel") } if attribution.get("source_channel") else {}),
+            **({ "source_family": attribution.get("source_family") } if attribution.get("source_family") else {}),
+            **({ "query_source": attribution.get("query_source") } if attribution.get("query_source") else {}),
+            **({ "agent_id": attribution.get("agent_id") } if attribution.get("agent_id") else {}),
+            **({ "protocol_name": attribution.get("protocol_name") } if attribution.get("protocol_name") else {}),
+            **({ "commerce_surface": attribution.get("commerce_surface") } if attribution.get("commerce_surface") else {}),
+            **({ "llm_provider": attribution.get("llm_provider") } if attribution.get("llm_provider") else {}),
+            **({ "llm_model": attribution.get("llm_model") } if attribution.get("llm_model") else {}),
+            **({ "caller_id": attribution.get("caller_id") } if attribution.get("caller_id") else {}),
         },
     }
 

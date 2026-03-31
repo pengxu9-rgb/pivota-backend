@@ -20,7 +20,10 @@ from db.database import database
 from db.orders import orders
 from services.commerce_interaction_service import trace_interaction
 from services.merchant_commerce_diagnostics_service import build_merchant_commerce_funnel_issues
-from services.merchant_commerce_funnel_service import get_merchant_commerce_funnel
+from services.merchant_commerce_funnel_service import (
+    SUPPORTED_COMMERCE_FUNNEL_GROUP_BYS,
+    get_merchant_commerce_funnel,
+)
 from services.merchant_commerce_readiness_service import upsert_merchant_commerce_readiness_state
 from utils.auth import verify_jwt_token
 from dashboard.core import UserRole
@@ -76,17 +79,39 @@ async def _get_principal(
 async def get_commerce_funnel(
     surface: Optional[str] = Query(None),
     group_by: str = Query("product"),
+    source_channel: Optional[str] = Query(None),
+    source_family: Optional[str] = Query(None),
+    protocol_name: Optional[str] = Query(None),
+    agent_id: Optional[str] = Query(None),
+    query_source: Optional[str] = Query(None),
+    llm_provider: Optional[str] = Query(None),
+    llm_model: Optional[str] = Query(None),
+    commerce_surface: Optional[str] = Query(None),
     principal: Dict[str, Any] = Depends(_get_principal),
 ):
     merchant_id = principal.get("merchant_id")
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Missing merchant_id")
-    if group_by not in {"product", "variant", "surface"}:
-        raise HTTPException(status_code=400, detail="group_by must be one of product, variant, surface")
+    if group_by not in SUPPORTED_COMMERCE_FUNNEL_GROUP_BYS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "group_by must be one of "
+                + ", ".join(sorted(SUPPORTED_COMMERCE_FUNNEL_GROUP_BYS))
+            ),
+        )
     return await get_merchant_commerce_funnel(
         merchant_id=str(merchant_id),
         surface=str(surface).strip().lower() if surface else None,
         group_by=group_by,
+        source_channel=str(source_channel).strip().lower() if source_channel else None,
+        source_family=str(source_family).strip().lower() if source_family else None,
+        protocol_name=str(protocol_name).strip().lower() if protocol_name else None,
+        agent_id=str(agent_id).strip() if agent_id else None,
+        query_source=str(query_source).strip().lower() if query_source else None,
+        llm_provider=str(llm_provider).strip().lower() if llm_provider else None,
+        llm_model=str(llm_model).strip().lower() if llm_model else None,
+        commerce_surface=str(commerce_surface).strip().lower() if commerce_surface else None,
     )
 
 

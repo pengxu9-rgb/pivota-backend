@@ -149,6 +149,10 @@ async def test_resolve_outbound_link_includes_pvt_contract(monkeypatch: pytest.M
                 "platform_variant_id": "var_1",
                 "promptCluster": "hydration",
                 "surface": "ucp",
+                "source": "shopping-agent-ui",
+                "query_source": "cache_multi_intent",
+                "protocol_name": "ucp",
+                "agent_id": "agent_123",
             },
         },
         request_base_url="https://api.example.com",
@@ -167,6 +171,10 @@ async def test_resolve_outbound_link_includes_pvt_contract(monkeypatch: pytest.M
     ctx = payload["ctx"]
     assert ctx["pvt_surface"] == "ucp"
     assert ctx["pvt_prompt_cluster"] == "hydration"
+    assert ctx["source_channel"] == "shopping-agent-ui"
+    assert ctx["query_source"] == "cache_multi_intent"
+    assert ctx["protocol_name"] == "ucp"
+    assert ctx["agent_id"] == "agent_123"
 
 
 @pytest.mark.asyncio
@@ -423,6 +431,73 @@ async def test_fetch_click_rows_supports_row_mapping(monkeypatch: pytest.MonkeyP
     assert rows == [{"click_id": "clk_1", "surface": "ucp"}]
 
 
+@pytest.mark.asyncio
+async def test_get_merchant_commerce_funnel_supports_taxonomy_grouping_and_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.merchant_commerce_funnel_service as module
+
+    async def fake_fetch_listing_rows(merchant_id: str, surface: str | None):
+        assert merchant_id == "merch_1"
+        assert surface == "agent_api"
+        return [{"canonical_variant_id": "cv_1", "status": "indexed", "canonical_product_id": "cp_1", "surface": "agent_api"}]
+
+    async def fake_fetch_click_rows(merchant_id: str, surface: str | None):
+        return [
+            {
+                "click_id": "clk_1",
+                "click_count": 1,
+                "impression_count": 1,
+                "surface": "agent_api",
+                "commerce_surface": "agent_api",
+                "source_channel": "shopping-agent-ui",
+                "protocol_name": "rest",
+                "query_source": "cache_multi_intent",
+            },
+            {
+                "click_id": "clk_2",
+                "click_count": 1,
+                "impression_count": 1,
+                "surface": "agent_api",
+                "commerce_surface": "agent_api",
+                "source_channel": "partner-foo",
+                "protocol_name": "mcp",
+                "query_source": "pivot_semantic_core_multi",
+            },
+        ]
+
+    async def fake_fetch_edge_rows(merchant_id: str, surface: str | None):
+        return [
+            {
+                "order_id": "ORD_1",
+                "surface": "agent_api",
+                "commerce_surface": "agent_api",
+                "source_channel": "partner-foo",
+                "protocol_name": "mcp",
+                "query_source": "pivot_semantic_core_multi",
+                "refunded_amount": "0",
+            }
+        ]
+
+    monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
+    monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
+    monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+
+    funnel = await module.get_merchant_commerce_funnel(
+        merchant_id="merch_1",
+        group_by="source_channel",
+        protocol_name="mcp",
+        commerce_surface="agent_api",
+    )
+
+    assert funnel["summary"]["clicked_exposure"] == 1
+    assert funnel["summary"]["ordered_conversion"] == 1
+    assert funnel["applied_filters"]["protocol_name"] == "mcp"
+    assert funnel["slices"][0]["key"] == "partner-foo"
+    assert funnel["slices"][0]["clicked_exposure"] == 1
+    assert funnel["slices"][0]["ordered_conversion"] == 1
+
+
 def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.merchant_analytics_routes as module
 
@@ -434,13 +509,23 @@ def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.Mo
 
     async def fake_funnel(**kwargs):
         assert kwargs["merchant_id"] == "merch_1"
+        assert kwargs["group_by"] == "source_channel"
+        assert kwargs["source_channel"] == "shopping-agent-ui"
+        assert kwargs["query_source"] == "cache_multi_intent"
         return {"merchant_id": "merch_1", "summary": {"indexed_exposure": 3}, "slices": []}
 
     app.dependency_overrides[module._get_principal] = fake_principal
     monkeypatch.setattr(module, "get_merchant_commerce_funnel", fake_funnel)
 
     client = TestClient(app)
-    response = client.get("/merchant/analytics/commerce-funnel")
+    response = client.get(
+        "/merchant/analytics/commerce-funnel",
+        params={
+            "group_by": "source_channel",
+            "source_channel": "shopping-agent-ui",
+            "query_source": "cache_multi_intent",
+        },
+    )
 
     assert response.status_code == 200
     assert response.json()["summary"]["indexed_exposure"] == 3

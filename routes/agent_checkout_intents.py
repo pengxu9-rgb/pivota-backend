@@ -21,6 +21,7 @@ from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from db.buyer_vault import buyer_addresses, buyer_identity_links, hash_agent_user_ref
 from routes.accounts_orders_api import get_accounts_principal
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 from sqlalchemy.sql import func
 
@@ -515,6 +516,17 @@ async def create_checkout_intent(
         token_payload["brief_schema_version"] = brief_schema_version
     if requested_scopes:
         token_payload["requested_scopes"] = requested_scopes
+    token_payload = attach_traffic_taxonomy(
+        token_payload,
+        build_traffic_taxonomy(
+            token_payload,
+            authenticated_agent_id=context.agent_id,
+            caller_id=context.agent_id,
+            default_source_channel=source,
+            default_protocol_name="rest",
+            default_commerce_surface="agent_api",
+        ),
+    )
 
     token = mint_checkout_token(token_payload, ttl_seconds=_checkout_token_ttl_seconds())
 

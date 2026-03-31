@@ -201,6 +201,33 @@ try:
     except ValueError:
         retry_attempts_total = _existing_collector("retry_attempts_total")
 
+    try:
+        traffic_taxonomy_records_total = Counter(
+            "traffic_taxonomy_records_total",
+            "Traffic taxonomy records by stage.",
+            ["stage"],
+        )
+    except ValueError:
+        traffic_taxonomy_records_total = _existing_collector("traffic_taxonomy_records_total")
+
+    try:
+        traffic_taxonomy_missing_total = Counter(
+            "traffic_taxonomy_missing_total",
+            "Traffic taxonomy missing values by stage and field.",
+            ["stage", "field"],
+        )
+    except ValueError:
+        traffic_taxonomy_missing_total = _existing_collector("traffic_taxonomy_missing_total")
+
+    try:
+        traffic_taxonomy_diagnostics_warning_total = Counter(
+            "traffic_taxonomy_diagnostics_warning_total",
+            "Traffic taxonomy diagnostics warnings by stage and reason.",
+            ["stage", "reason"],
+        )
+    except ValueError:
+        traffic_taxonomy_diagnostics_warning_total = _existing_collector("traffic_taxonomy_diagnostics_warning_total")
+
 except Exception:  # pragma: no cover
     Counter = Gauge = Histogram = None  # type: ignore
     payment_attempt_total = None
@@ -222,6 +249,9 @@ except Exception:  # pragma: no cover
     catalog_pivot_shadow_estimated_price_delta_ratio = None
     catalog_pivot_shadow_bad_price_anomaly_total = None
     retry_attempts_total = None
+    traffic_taxonomy_records_total = None
+    traffic_taxonomy_missing_total = None
+    traffic_taxonomy_diagnostics_warning_total = None
 
 
 def record_payment_attempt(
@@ -380,4 +410,33 @@ def record_retry_attempt(*, domain: str, category: str) -> None:
         retry_attempts_total.labels(
             domain=str(domain or "unknown"),
             category=str(category or "unknown"),
+        ).inc()
+
+
+def record_traffic_taxonomy(
+    *,
+    stage: str,
+    taxonomy: dict,
+    diagnostics_warning: bool = False,
+    warning_reason: str = "unknown_identity",
+) -> None:
+    if traffic_taxonomy_records_total is not None:
+        traffic_taxonomy_records_total.labels(stage=str(stage or "unknown")).inc()
+    if traffic_taxonomy_missing_total is not None:
+        for field in (
+            "source_channel",
+            "query_source",
+            "agent_id",
+            "protocol_name",
+        ):
+            value = str((taxonomy or {}).get(field) or "unknown").strip().lower()
+            if value in {"", "unknown"}:
+                traffic_taxonomy_missing_total.labels(
+                    stage=str(stage or "unknown"),
+                    field=field,
+                ).inc()
+    if diagnostics_warning and traffic_taxonomy_diagnostics_warning_total is not None:
+        traffic_taxonomy_diagnostics_warning_total.labels(
+            stage=str(stage or "unknown"),
+            reason=str(warning_reason or "unknown"),
         ).inc()

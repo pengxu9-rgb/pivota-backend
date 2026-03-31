@@ -10,10 +10,18 @@ from db.commerce_interactions import commerce_interaction_events, commerce_inter
 from db.database import database
 from db.surface_listing_registry import surface_listing_errors, surface_listing_states
 from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
+from services.traffic_taxonomy_service import taxonomy_from_row
 
 
 def _normalize_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _sample_with_taxonomy(sample: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        **sample,
+        "traffic_taxonomy": taxonomy_from_row(row),
+    }
 
 
 async def build_merchant_commerce_funnel_issues(
@@ -104,7 +112,10 @@ async def build_merchant_commerce_funnel_issues(
                 message="Click rows are missing canonical variant ids.",
                 severity="warning",
                 interaction_id=_normalize_text(row.get("interaction_id")) or None,
-                sample={"click_id": row.get("click_id"), "surface": row.get("surface")},
+                sample=_sample_with_taxonomy(
+                    {"click_id": row.get("click_id"), "surface": row.get("surface")},
+                    row,
+                ),
             )
 
     for row in edge_rows:
@@ -116,7 +127,10 @@ async def build_merchant_commerce_funnel_issues(
                 message="Orders reached attribution edges without a click_id.",
                 severity="critical",
                 interaction_id=interaction_id,
-                sample={"order_id": row.get("order_id"), "surface": row.get("surface")},
+                sample=_sample_with_taxonomy(
+                    {"order_id": row.get("order_id"), "surface": row.get("surface")},
+                    row,
+                ),
             )
             continue
         click_row = click_by_id.get(click_id)
@@ -126,7 +140,10 @@ async def build_merchant_commerce_funnel_issues(
                 message="Attribution edges reference clicks that are missing from click tracking.",
                 severity="critical",
                 interaction_id=interaction_id,
-                sample={"order_id": row.get("order_id"), "click_id": click_id},
+                sample=_sample_with_taxonomy(
+                    {"order_id": row.get("order_id"), "click_id": click_id},
+                    row,
+                ),
             )
             continue
         if _normalize_text(click_row.get("canonical_variant_id")) and _normalize_text(row.get("canonical_variant_id")) and _normalize_text(click_row.get("canonical_variant_id")) != _normalize_text(row.get("canonical_variant_id")):
@@ -140,6 +157,7 @@ async def build_merchant_commerce_funnel_issues(
                     "click_id": click_id,
                     "clicked_variant_id": click_row.get("canonical_variant_id"),
                     "ordered_variant_id": row.get("canonical_variant_id"),
+                    "traffic_taxonomy": taxonomy_from_row(row),
                 },
             )
 
@@ -158,7 +176,10 @@ async def build_merchant_commerce_funnel_issues(
             message=f"Observed {event_type} signals in the canonical event ledger.",
             severity="info",
             interaction_id=_normalize_text(row.get("interaction_id")) or None,
-            sample={"event_id": row.get("event_id"), "event_type": row.get("event_type")},
+            sample=_sample_with_taxonomy(
+                {"event_id": row.get("event_id"), "event_type": row.get("event_type")},
+                row,
+            ),
         )
 
     issues = sorted(

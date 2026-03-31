@@ -1173,6 +1173,48 @@ async def startup():
                 logger.info("✅ Fixed request_id constraint in agent_usage_logs")
             except Exception as e:
                 logger.warning(f"⚠️ Could not fix request_id constraint: {e}")
+
+            for statement in (
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+            ):
+                try:
+                    await database.execute(statement)
+                except Exception:
+                    pass
             
             # Create agent_merchants table
             await database.execute("""
@@ -1267,6 +1309,9 @@ async def startup():
             
             # Create performance indexes for agent tables
             await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_agent_id_timestamp ON agent_usage_logs(agent_id, timestamp DESC)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_source_channel_timestamp ON agent_usage_logs(source_channel, timestamp DESC)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_protocol_name_timestamp ON agent_usage_logs(protocol_name, timestamp DESC)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_query_source_timestamp ON agent_usage_logs(query_source, timestamp DESC)")
             await database.execute("CREATE INDEX IF NOT EXISTS idx_agents_agent_id ON agents(agent_id)")
             
             logger.info("✅ Integration tables created/verified")

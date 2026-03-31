@@ -10,11 +10,13 @@ from sqlalchemy import select
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
+from observability.reliability_metrics import record_traffic_taxonomy
 from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
 )
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 PVT_SURFACE = "pvt_surface"
 PVT_CLICK_ID = "pvt_click_id"
@@ -68,6 +70,15 @@ def materialize_attribution_context(
 ) -> Dict[str, Optional[str]]:
     source = dict(payload or {})
     merchant_value = _first_nonempty(source, "merchant_id", "merchantId") or merchant_id
+    taxonomy = build_traffic_taxonomy(
+        source,
+        default_source_channel=_first_nonempty(source, "source_channel", "source"),
+        default_query_source=_first_nonempty(source, "query_source"),
+        default_protocol_name=_first_nonempty(source, "protocol_name", "protocol"),
+        default_commerce_surface=_first_nonempty(source, "commerce_surface", "surface", "tool") or default_surface,
+        authenticated_agent_id=_first_nonempty(source, "agent_id"),
+        caller_id=_first_nonempty(source, "caller_id"),
+    )
 
     product_id = _first_nonempty(
         source,
@@ -93,7 +104,7 @@ def materialize_attribution_context(
     if not variant_id:
         variant_id = fallback_variant_id or product_id
 
-    return {
+    attribution = {
         PVT_SURFACE: normalize_surface(
             _first_nonempty(source, PVT_SURFACE, "surface", "tool") or default_surface
         ),
@@ -111,6 +122,8 @@ def materialize_attribution_context(
         "job_id": _first_nonempty(source, "jobId", "job_id"),
         "rule_id": _first_nonempty(source, "ruleId", "rule_id"),
     }
+    attribution.update(taxonomy)
+    return attribution
 
 
 def has_attribution_signal(payload: Optional[Dict[str, Any]]) -> bool:
@@ -161,6 +174,7 @@ async def record_surface_event(
         default_surface=str(token_payload.get("tool") or ctx.get("surface") or ""),
         merchant_id=_first_nonempty(ctx, "merchantId", "merchant_id"),
     )
+    context_with_taxonomy = attach_traffic_taxonomy({**ctx, **attribution}, attribution)
     click_id = attribution[PVT_CLICK_ID]
     now = _now()
     existing = await database.fetch_one(
@@ -172,17 +186,26 @@ async def record_surface_event(
     common_values = {
         "merchant_id": attribution.get("merchant_id"),
         "surface": attribution[PVT_SURFACE] or "unknown",
+        "commerce_surface": attribution.get("commerce_surface") or attribution[PVT_SURFACE] or "unknown",
         "canonical_product_id": attribution.get(PVT_PRODUCT_ID),
         "canonical_variant_id": attribution.get(PVT_VARIANT_ID),
         "prompt_cluster": attribution.get(PVT_PROMPT_CLUSTER),
         "rule_id": attribution.get("rule_id"),
         "job_id": attribution.get("job_id"),
         "session_id": attribution.get("session_id"),
+        "source_channel": attribution.get("source_channel"),
+        "source_family": attribution.get("source_family"),
+        "query_source": attribution.get("query_source"),
+        "agent_id": attribution.get("agent_id"),
+        "protocol_name": attribution.get("protocol_name"),
+        "llm_provider": attribution.get("llm_provider"),
+        "llm_model": attribution.get("llm_model"),
+        "caller_id": attribution.get("caller_id"),
         "destination_url": str(token_payload.get("dest") or "") or None,
         "dest_domain": str(token_payload.get("dest_domain") or "") or None,
         "user_agent": request_meta.get("user_agent"),
         "ip": request_meta.get("ip"),
-        "context": {**ctx, **attribution},
+        "context": context_with_taxonomy,
     }
 
     if existing:
@@ -219,6 +242,11 @@ async def record_surface_event(
             source="surface_click_events",
             upstream_idempotency_key=f"{click_id}:{event_type}",
         )
+        if event_type == "click":
+            record_traffic_taxonomy(
+                stage="click",
+                taxonomy=attribution,
+            )
         if not interaction_id:
             values["interaction_id"] = interaction_event["interaction_id"]
             await database.execute(
@@ -243,6 +271,11 @@ async def record_surface_event(
         source="surface_click_events",
         upstream_idempotency_key=f"{click_id}:{event_type}",
     )
+    if event_type == "click":
+        record_traffic_taxonomy(
+            stage="click",
+            taxonomy=attribution,
+        )
     values = {
         "click_id": click_id,
         **common_values,
@@ -274,6 +307,7 @@ async def upsert_order_attribution_edge(
         default_surface=_first_nonempty(payload, PVT_SURFACE, "surface"),
         merchant_id=merchant_id,
     )
+    payload_with_taxonomy = attach_traffic_taxonomy(payload, attribution)
 
     edge_id = f"cae_{uuid.uuid5(uuid.NAMESPACE_URL, f'{merchant_id}:{order_id}').hex[:24]}"
     now = _now()
@@ -283,17 +317,26 @@ async def upsert_order_attribution_edge(
         "click_id": attribution.get(PVT_CLICK_ID),
         "order_id": order_id,
         "surface": attribution.get(PVT_SURFACE),
+        "commerce_surface": attribution.get("commerce_surface") or attribution.get(PVT_SURFACE),
         "canonical_product_id": attribution.get(PVT_PRODUCT_ID),
         "canonical_variant_id": attribution.get(PVT_VARIANT_ID),
         "prompt_cluster": attribution.get(PVT_PROMPT_CLUSTER),
+        "source_channel": attribution.get("source_channel"),
+        "source_family": attribution.get("source_family"),
+        "query_source": attribution.get("query_source"),
+        "agent_id": attribution.get("agent_id"),
+        "protocol_name": attribution.get("protocol_name"),
+        "llm_provider": attribution.get("llm_provider"),
+        "llm_model": attribution.get("llm_model"),
+        "caller_id": attribution.get("caller_id"),
         "checkout_started_at": now,
-        "metadata": {**payload, **attribution},
+        "metadata": attach_traffic_taxonomy({**payload_with_taxonomy, **attribution}, attribution),
         "updated_at": now,
     }
     interaction_event = await record_commerce_event_best_effort(
         event_type="order.created",
         metadata={
-            **payload,
+            **payload_with_taxonomy,
             **attribution,
             "merchant_id": merchant_id,
             "interaction_id": _first_nonempty(payload, "interaction_id"),
@@ -307,6 +350,7 @@ async def upsert_order_attribution_edge(
         source="commerce_attribution_edges",
         upstream_idempotency_key=f"order:{order_id}",
     )
+    record_traffic_taxonomy(stage="order", taxonomy=attribution)
     values["interaction_id"] = interaction_event["interaction_id"]
     existing = await database.fetch_one(
         select(commerce_attribution_edges).where(commerce_attribution_edges.c.order_id == order_id)

@@ -70,6 +70,7 @@ from adapters.bigcommerce_adapter import (
     build_bigcommerce_headers,
     normalize_bigcommerce_store_hash,
 )
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
     send_invitation_email_from_order,
@@ -80,6 +81,14 @@ from routes.reviews_invitation_issuer import (
 from services.reviews_invitation_send_jobs_service import (
     enqueue_invitation_send_job_from_order as enqueue_reviews_invitation_send_job_from_order,
 )
+
+
+def _clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 _PG_SHOPIFY_LOCK_SUPPORTED: Optional[bool] = None
@@ -1452,6 +1461,17 @@ async def create_new_order(
             existing_promos = order_metadata.get("promotions") or {}
             # 促销信息统一挂在 metadata.promotions 下
             order_metadata["promotions"] = {**existing_promos, **promo_meta}
+
+        order_taxonomy = build_traffic_taxonomy(
+            order_metadata,
+            authenticated_agent_id=_clean_text(order_metadata.get("agent_id")) if isinstance(order_metadata, dict) else None,
+            caller_id=_clean_text(order_metadata.get("caller_id")) if isinstance(order_metadata, dict) else None,
+            default_source_channel=_clean_text(order_metadata.get("source_channel") or order_metadata.get("source")),
+            default_query_source=_clean_text(order_metadata.get("query_source")),
+            default_protocol_name=_clean_text(order_metadata.get("protocol_name") or order_metadata.get("protocol")),
+            default_commerce_surface=_clean_text(order_metadata.get("commerce_surface") or order_metadata.get("surface")),
+        )
+        order_metadata = attach_traffic_taxonomy(order_metadata, order_taxonomy)
 
         if has_attribution_signal(order_metadata):
             attribution_context = materialize_attribution_context(

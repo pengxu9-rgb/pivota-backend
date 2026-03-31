@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
 from db.database import database
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 
 logger = logging.getLogger("commerce_interaction_service")
@@ -146,7 +147,20 @@ async def ensure_interaction(
     latest_event_type: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    refs = _coerce_refs(metadata, **kwargs)
+    taxonomy = build_traffic_taxonomy(
+        metadata,
+        metadata=kwargs,
+        authenticated_agent_id=_normalize_text((metadata or {}).get("agent_id")) if isinstance(metadata, dict) else None,
+        caller_id=_normalize_text(kwargs.get("caller_id")),
+        default_source_channel=_normalize_text(kwargs.get("source_channel")),
+        default_query_source=_normalize_text(kwargs.get("query_source")),
+        default_protocol_name=_normalize_text(kwargs.get("protocol_name")),
+        default_commerce_surface=(
+            _normalize_text((metadata or {}).get("surface")) if isinstance(metadata, dict) else None
+        ) or _normalize_text(kwargs.get("surface")),
+    )
+    metadata_with_taxonomy = attach_traffic_taxonomy(metadata, taxonomy)
+    refs = _coerce_refs(metadata_with_taxonomy, **kwargs)
     merchant_id = refs.get("merchant_id")
     if not merchant_id:
         raise ValueError("merchant_id is required for commerce interaction tracking")
@@ -166,6 +180,7 @@ async def ensure_interaction(
         "merchant_id": merchant_id,
         "platform": refs.get("platform") or (existing or {}).get("platform"),
         "surface": refs.get("surface") or (existing or {}).get("surface"),
+        "commerce_surface": taxonomy.get("commerce_surface") or (existing or {}).get("commerce_surface"),
         "prompt_id": refs.get("prompt_id") or (existing or {}).get("prompt_id"),
         "result_id": refs.get("result_id") or (existing or {}).get("result_id"),
         "click_id": refs.get("click_id") or (existing or {}).get("click_id"),
@@ -180,9 +195,17 @@ async def ensure_interaction(
         "brief_id": refs.get("brief_id") or (existing or {}).get("brief_id"),
         "session_id": refs.get("session_id") or (existing or {}).get("session_id"),
         "buyer_id": refs.get("buyer_id") or (existing or {}).get("buyer_id"),
+        "source_channel": taxonomy.get("source_channel") or (existing or {}).get("source_channel"),
+        "source_family": taxonomy.get("source_family") or (existing or {}).get("source_family"),
+        "query_source": taxonomy.get("query_source") or (existing or {}).get("query_source"),
+        "agent_id": taxonomy.get("agent_id") or (existing or {}).get("agent_id"),
+        "protocol_name": taxonomy.get("protocol_name") or (existing or {}).get("protocol_name"),
+        "llm_provider": taxonomy.get("llm_provider") or (existing or {}).get("llm_provider"),
+        "llm_model": taxonomy.get("llm_model") or (existing or {}).get("llm_model"),
+        "caller_id": taxonomy.get("caller_id") or (existing or {}).get("caller_id"),
         "latest_event_type": latest_event_type or (existing or {}).get("latest_event_type"),
         "status": status,
-        "metadata": _merge_metadata((existing or {}).get("metadata"), metadata),
+        "metadata": _merge_metadata((existing or {}).get("metadata"), metadata_with_taxonomy),
         "first_occurred_at": min(
             [dt for dt in [first_seen, (existing or {}).get("first_occurred_at")] if dt is not None]
         ),
@@ -223,14 +246,27 @@ async def record_commerce_event(
     actor_id: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    refs = _coerce_refs(metadata, **kwargs)
+    taxonomy = build_traffic_taxonomy(
+        metadata,
+        metadata=kwargs,
+        authenticated_agent_id=_normalize_text((metadata or {}).get("agent_id")) if isinstance(metadata, dict) else None,
+        caller_id=_normalize_text(kwargs.get("caller_id")),
+        default_source_channel=_normalize_text(kwargs.get("source_channel")),
+        default_query_source=_normalize_text(kwargs.get("query_source")),
+        default_protocol_name=_normalize_text(kwargs.get("protocol_name")),
+        default_commerce_surface=(
+            _normalize_text((metadata or {}).get("surface")) if isinstance(metadata, dict) else None
+        ) or _normalize_text(kwargs.get("surface")),
+    )
+    metadata_with_taxonomy = attach_traffic_taxonomy(metadata, taxonomy)
+    refs = _coerce_refs(metadata_with_taxonomy, **kwargs)
     merchant_id = refs.get("merchant_id")
     if not merchant_id:
         raise ValueError("merchant_id is required for commerce interaction tracking")
 
     occurred = occurred_at or _now()
     interaction = await ensure_interaction(
-        metadata=metadata,
+        metadata=metadata_with_taxonomy,
         first_occurred_at=occurred,
         last_occurred_at=occurred,
         latest_event_type=event_type,
@@ -260,7 +296,7 @@ async def record_commerce_event(
     )
     payload = _make_json_safe(
         {
-            **(metadata or {}),
+            **(metadata_with_taxonomy or {}),
             **{key: value for key, value in refs.items() if value},
         }
     )

@@ -65,6 +65,7 @@ from observability.reliability_metrics import (
     record_catalog_search,
     record_catalog_upstream_fallback,
 )
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 import httpx
 import uuid
 
@@ -78,6 +79,15 @@ _ORDER_CREATE_LOCKS: Dict[str, asyncio.Lock] = {}
 
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
+
+
+def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[Dict[str, Any]]) -> None:
+    if request is None or taxonomy is None:
+        return
+    try:
+        request.state.traffic_taxonomy = dict(taxonomy)
+    except Exception:
+        return
 FIND_PRODUCTS_MULTI_SEED_BUDGET_MS = max(
     0,
     min(
@@ -1418,6 +1428,32 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
         if route_health.get("final_returned_count") is not None
         else md.get("final_returned_count")
     )
+    route_health["pivot_shadow_scheduled"] = bool(
+        route_health.get("pivot_shadow_scheduled")
+        if route_health.get("pivot_shadow_scheduled") is not None
+        else md.get("pivot_shadow_scheduled")
+    )
+    route_health["pivot_shadow_mode"] = (
+        str(
+            route_health.get("pivot_shadow_mode")
+            or md.get("pivot_shadow_mode")
+            or "disabled"
+        ).strip()
+        or "disabled"
+    )
+    route_health["pivot_rollout_mode"] = (
+        str(
+            route_health.get("pivot_rollout_mode")
+            or md.get("pivot_rollout_mode")
+            or "disabled"
+        ).strip()
+        or "disabled"
+    )
+    route_health["pivot_rollout_guard_passed"] = bool(
+        route_health.get("pivot_rollout_guard_passed")
+        if route_health.get("pivot_rollout_guard_passed") is not None
+        else md.get("pivot_rollout_guard_passed")
+    )
     fallback_reason = route_health.get("fallback_reason")
     if fallback_reason is None:
         fallback_reason = md.get("fallback_reason")
@@ -1457,6 +1493,10 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["fallback_attempt_count"] = route_health["fallback_attempt_count"]
     md["selected_fallback_attempt"] = route_health["selected_fallback_attempt"]
     md["final_returned_count"] = route_health["final_returned_count"]
+    md["pivot_shadow_scheduled"] = route_health["pivot_shadow_scheduled"]
+    md["pivot_shadow_mode"] = route_health["pivot_shadow_mode"]
+    md["pivot_rollout_mode"] = route_health["pivot_rollout_mode"]
+    md["pivot_rollout_guard_passed"] = route_health["pivot_rollout_guard_passed"]
     md["fallback_reason"] = fallback_reason
     if search_decision is not None:
         search_decision["query_semantic_class"] = route_health["query_semantic_class"]
@@ -6498,6 +6538,7 @@ async def agent_validate_cart(
 async def agent_create_order(
     order_request: CreateOrderRequest,
     background_tasks: BackgroundTasks,
+    request: Request = None,
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
     x_buyer_ref: Optional[str] = Header(None, alias="X-Buyer-Ref"),
@@ -6815,7 +6856,42 @@ async def agent_create_order(
             buyer_ref = _normalize_buyer_ref(x_buyer_ref)
             if buyer_ref and not order_request.metadata.get("buyer_ref"):
                 order_request.metadata["buyer_ref"] = buyer_ref
-        
+
+        request_context_meta = order_request.metadata.get("request_context") if isinstance(order_request.metadata, dict) else {}
+        request_context_meta = request_context_meta if isinstance(request_context_meta, dict) else {}
+        order_taxonomy = build_traffic_taxonomy(
+            order_request.metadata,
+            authenticated_agent_id=context.agent_id,
+            caller_id=context.agent_id,
+            default_source_channel=str(
+                order_request.metadata.get("source")
+                or order_request.metadata.get("source_channel")
+                or request_context_meta.get("channel")
+                or ""
+            ).strip()
+            or None,
+            default_query_source=str(
+                order_request.metadata.get("query_source")
+                or order_request.metadata.get("upstream_query_source")
+                or ""
+            ).strip()
+            or None,
+            default_protocol_name=str(
+                order_request.metadata.get("protocol_name")
+                or order_request.metadata.get("protocol")
+                or "rest"
+            ).strip()
+            or "rest",
+            default_commerce_surface=str(
+                order_request.metadata.get("commerce_surface")
+                or order_request.metadata.get("surface")
+                or "agent_api"
+            ).strip()
+            or "agent_api",
+        )
+        order_request.metadata = attach_traffic_taxonomy(order_request.metadata, order_taxonomy)
+        _set_request_taxonomy_state(request, order_taxonomy)
+
         order_request.metadata.update({
             "agent_id": context.agent_id,
             "agent_name": context.agent_name,

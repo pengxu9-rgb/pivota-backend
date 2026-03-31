@@ -78,9 +78,11 @@ from observability.reliability_metrics import (
     record_catalog_pivot_shadow_compare,
     record_catalog_search,
     record_catalog_upstream_fallback,
+    record_traffic_taxonomy,
     record_catalog_upstream_timeout,
     set_catalog_upstream_circuit,
 )
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 def _resolve_default_agent_api_base() -> str:
     configured = str(os.getenv("AGENT_API_BASE", "") or "").strip().rstrip("/")
@@ -2090,6 +2092,78 @@ def _is_shopping_multi_source(source: Optional[str]) -> bool:
     if "aurora" in normalized:
         return True
     return False
+
+
+def _normalize_gateway_request_metadata(
+    *,
+    metadata: Optional[Dict[str, Any]],
+    payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    normalized_metadata: Dict[str, Any] = dict(metadata or {})
+    payload_dict = payload if isinstance(payload, dict) else {}
+    payload_metadata = payload_dict.get("metadata") if isinstance(payload_dict.get("metadata"), dict) else {}
+
+    if not normalized_metadata.get("creator_id"):
+        for key in ("creatorId", "creator_id"):
+            if key in payload_dict and payload_dict.get(key):
+                normalized_metadata["creator_id"] = payload_dict.get(key)
+                break
+    if not normalized_metadata.get("creator_name"):
+        for key in ("creatorName", "creator_name"):
+            if key in payload_dict and payload_dict.get(key):
+                normalized_metadata["creator_name"] = payload_dict.get(key)
+                break
+    if not normalized_metadata.get("source") and payload_metadata.get("source"):
+        normalized_metadata["source"] = payload_metadata.get("source")
+    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
+        for key in ("trace_id", "traceId"):
+            if payload_metadata.get(key):
+                normalized_metadata[key] = payload_metadata.get(key)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for key in ("page_request_id", "pageRequestId"):
+            if payload_metadata.get(key):
+                normalized_metadata[key] = payload_metadata.get(key)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for key in ("page_request_id", "pageRequestId"):
+            if payload_dict.get(key):
+                normalized_metadata[key] = payload_dict.get(key)
+                break
+
+    query_source = str(
+        normalized_metadata.get("query_source")
+        or payload_metadata.get("query_source")
+        or payload_dict.get("query_source")
+        or ""
+    ).strip() or None
+    commerce_surface = str(
+        normalized_metadata.get("commerce_surface")
+        or payload_metadata.get("commerce_surface")
+        or payload_dict.get("commerce_surface")
+        or payload_metadata.get("surface")
+        or payload_dict.get("surface")
+        or ""
+    ).strip() or None
+    taxonomy = build_traffic_taxonomy(
+        normalized_metadata,
+        metadata=payload_metadata,
+        default_source_channel=str(
+            normalized_metadata.get("source")
+            or payload_metadata.get("source")
+            or ""
+        ).strip()
+        or None,
+        default_query_source=query_source,
+        default_protocol_name=str(
+            normalized_metadata.get("protocol_name")
+            or payload_metadata.get("protocol_name")
+            or "rest"
+        ).strip()
+        or "rest",
+        default_commerce_surface=commerce_surface,
+    )
+    return attach_traffic_taxonomy(normalized_metadata, taxonomy)
 
 
 def _catalog_rel_v2_enabled() -> bool:
@@ -10653,40 +10727,16 @@ async def create_creator_task(
       - GET  /agent/shop/v1/creator/tasks/{task_id} -> status + result/error
     """
     operation = (request.operation or "").strip()
-    normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
-    payload_metadata = request.payload.get("metadata") if isinstance(request.payload, dict) else None
-    if not isinstance(payload_metadata, dict):
-        payload_metadata = {}
-    if not normalized_metadata.get("creator_id"):
-        for k in ("creatorId", "creator_id"):
-            if k in request.payload:
-                normalized_metadata["creator_id"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("creator_name"):
-        for k in ("creatorName", "creator_name"):
-            if k in request.payload:
-                normalized_metadata["creator_name"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("source"):
-        for k in ("source",):
-            if payload_metadata.get(k):
-                normalized_metadata["source"] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
-        for k in ("trace_id", "traceId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if k in request.payload and request.payload.get(k):
-                normalized_metadata[k] = request.payload.get(k)
-                break
+    normalized_metadata = _normalize_gateway_request_metadata(
+        metadata=request.metadata,
+        payload=request.payload,
+    )
+    try:
+        http_request.state.traffic_taxonomy = dict(normalized_metadata.get("traffic") or {})
+    except Exception:
+        pass
+    if isinstance(normalized_metadata.get("traffic"), dict):
+        record_traffic_taxonomy(stage="gateway_request", taxonomy=normalized_metadata["traffic"])
 
     # For now we support async tasks for the heavy operations only.
     if operation == "find_products_multi":
@@ -11025,8 +11075,43 @@ async def _proxy_agent_api(
         raise HTTPException(status_code=502, detail="Invalid JSON from agent API")
 
 
-async def _handle_create_order(order: OrderPayloadBody, *, checkout_token: Optional[str]) -> Dict[str, Any]:
+async def _handle_create_order(
+    order: OrderPayloadBody,
+    *,
+    checkout_token: Optional[str],
+    request_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Proxy create_order to Agent API (/agent/v1/orders/create)."""
+    order_metadata = dict(order.metadata or {})
+    request_taxonomy = build_traffic_taxonomy(
+        request_metadata or {},
+        metadata=order_metadata,
+        default_source_channel=str(
+            order_metadata.get("source")
+            or (request_metadata or {}).get("source")
+            or ""
+        ).strip()
+        or None,
+        default_query_source=str(
+            order_metadata.get("query_source")
+            or (request_metadata or {}).get("query_source")
+            or ""
+        ).strip()
+        or None,
+        default_protocol_name=str(
+            order_metadata.get("protocol_name")
+            or (request_metadata or {}).get("protocol_name")
+            or "rest"
+        ).strip()
+        or "rest",
+        default_commerce_surface=str(
+            order_metadata.get("commerce_surface")
+            or (request_metadata or {}).get("commerce_surface")
+            or "agent_api"
+        ).strip()
+        or "agent_api",
+    )
+    order_metadata = attach_traffic_taxonomy(order_metadata, request_taxonomy)
     body = {
         "merchant_id": order.merchant_id,
         "customer_email": order.customer_email,
@@ -11036,7 +11121,7 @@ async def _handle_create_order(order: OrderPayloadBody, *, checkout_token: Optio
         **({"quote_id": order.quote_id} if order.quote_id else {}),
         **({"discount_codes": order.discount_codes} if isinstance(order.discount_codes, list) else {}),
         **({"selected_delivery_option": order.selected_delivery_option} if isinstance(order.selected_delivery_option, dict) else {}),
-        **({"metadata": order.metadata} if isinstance(order.metadata, dict) else {}),
+        **({"metadata": order_metadata} if order_metadata else {}),
         **({"idempotency_key": order.idempotency_key} if order.idempotency_key else {}),
         "items": [
             {
@@ -11128,38 +11213,10 @@ async def invoke_shop_operation(
     checkout_token = (http_request.headers.get("x-checkout-token") or "").strip() or None
 
     # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
-    normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
-    payload_metadata = request.payload.get("metadata") if isinstance(request.payload, dict) else None
-    if not isinstance(payload_metadata, dict):
-        payload_metadata = {}
-    if not normalized_metadata.get("creator_id"):
-        for k in ("creatorId", "creator_id"):
-            if k in request.payload:
-                normalized_metadata["creator_id"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("creator_name"):
-        for k in ("creatorName", "creator_name"):
-            if k in request.payload:
-                normalized_metadata["creator_name"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("source"):
-        if payload_metadata.get("source"):
-            normalized_metadata["source"] = payload_metadata.get("source")
-    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
-        for k in ("trace_id", "traceId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if k in request.payload and request.payload.get(k):
-                normalized_metadata[k] = request.payload.get(k)
-                break
+    normalized_metadata = _normalize_gateway_request_metadata(
+        metadata=request.metadata,
+        payload=request.payload,
+    )
 
     if operation == "find_products":
         normalized_find_products = _normalize_find_products_payload(request.payload)
@@ -11712,7 +11769,11 @@ async def invoke_shop_operation(
 
     if operation == "create_order":
         payload = CreateOrderPayload(**request.payload)
-        return await _handle_create_order(payload.order, checkout_token=checkout_token)
+        return await _handle_create_order(
+            payload.order,
+            checkout_token=checkout_token,
+            request_metadata=normalized_metadata,
+        )
 
     if operation == "find_products_multi":
         started = time.time()
